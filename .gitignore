@@ -1,0 +1,16 @@
+# Python virtual environment & bytecode
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# SQLite WAL database (contains live wallet_address, private_key, gemini_api_key)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Runtime logs & local environment overrides
+logs/*.log
+.env
