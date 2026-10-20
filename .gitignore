@@ -11,6 +11,7 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 
-# Runtime logs & local environment overrides
+# Runtime logs & temporary files (all config & credentials live exclusively in SQLite system_config)
 logs/*.log
 .env
+Platform_Specs.md

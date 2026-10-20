@@ -1,0 +1,21 @@
+[Unit]
+Description=Aegis Quant (v0.1.0-dev) Autonomous Web3 DEX Quantitative Trading Platform
+After=network-online.target chronyd.service
+Wants=network-online.target chronyd.service
+
+[Service]
+Type=simple
+User=fedora
+Group=fedora
+WorkingDirectory=/home/fedora/aegis
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/home/fedora/aegis"
+ExecStart=/usr/bin/bash -c "exec /home/fedora/aegis/venv/bin/python -m engine.main"
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

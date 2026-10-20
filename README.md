@@ -15,3 +15,11 @@ Autonomous, self-custodial Web3 DEX quantitative crypto trading platform targeti
 - `sql/schema_and_seed.sql` — SQLite WAL schema, 3 views, 60 seed config variables, and 31 universe rows
 - `engine/` — `database.py`, `ingestion.py`, `signals.py`, `risk.py`, `execution.py`, `calibration.py`, `main.py` (`__version__ = "0.1.0-dev"`)
 - `web/` — `server.py` & `static/index.html` FastAPI REST + SSE live telemetry dashboard (`:8000`)
+
+## Centralized SQLite Configuration & Web3 DEX Credentials
+All 60 operational parameters and Web3 DEX credentials (`wallet_address`, `private_key`, `gemini_api_key`, `hyperliquid_vault_address`, `hyperliquid_testnet`, `execution_mode`) are stored **exclusively inside the SQLite WAL `system_config` table (`data/aegis_quant.db`)** — never in `.env` files, environment variables, or external Linux configuration files.
+
+Parameters and credentials in `system_config` can be inspected or updated directly in SQLite via:
+- **Web Dashboard (`:8000`) / REST API**: `GET/POST /api/v1/credentials` and `GET/POST /api/v1/config`
+- **SQLite CLI**: `sqlite3 data/aegis_quant.db "UPDATE system_config SET config_value = '...' WHERE config_key = 'wallet_address';"`
+- **Engine CLI**: `python -m engine.main --configure-only --testnet --execution-mode LIVE --wallet-address 0x... --private-key 0x...`

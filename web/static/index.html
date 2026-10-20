@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Aegis Quant (v0.1.0-dev) — Web3 DEX Quantitative Telemetry</title>
+  <style>
+    :root {
+      --bg-primary: #0b0f17;
+      --bg-panel: #131b29;
+      --bg-card: #1a2436;
+      --border: #26354d;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --bull: #10b981;
+      --bear: #ef4444;
+      --chop: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg-primary);
+      color: var(--text-main);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      line-height: 1.5;
+      padding: 1.25rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    .brand h1 { font-size: 1.35rem; color: var(--accent); letter-spacing: 0.5px; }
+    .brand p { font-size: 0.82rem; color: var(--text-muted); }
+    .badge {
+      display: inline-block;
+      padding: 0.25rem 0.65rem;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+    }
+    .badge.BULL { color: var(--bull); border-color: var(--bull); }
+    .badge.BEAR { color: var(--bear); border-color: var(--bear); }
+    .badge.CHOP { color: var(--chop); border-color: var(--chop); }
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.25rem;
+    }
+    .card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .card-label { font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; }
+    .card-value { font-size: 1.45rem; font-weight: 700; margin-top: 0.25rem; }
+    .card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.2rem; }
+    .section-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 1.25rem;
+    }
+    @media (max-width: 960px) { .section-grid { grid-template-columns: 1fr; } }
+    h2 { font-size: 1rem; color: var(--accent); margin-bottom: 0.75rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    th, td {
+      padding: 0.5rem 0.6rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th { color: var(--text-muted); font-weight: 600; }
+    .pos-LONG { color: var(--bull); font-weight: 700; }
+    .pos-SHORT { color: var(--bear); font-weight: 700; }
+    .pos-BASIS_HARVEST { color: var(--accent); font-weight: 700; }
+    .cred-panel { margin-top: 1.25rem; }
+    .cred-form {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.85rem;
+      align-items: end;
+      margin-top: 0.75rem;
+    }
+    .form-group label {
+      display: block;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 0.25rem;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 0.45rem 0.6rem;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.82rem;
+    }
+    .btn-save {
+      background: var(--accent);
+      color: #0b0f17;
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 4px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.82rem;
+    }
+    .btn-save:hover { opacity: 0.9; }
+    .cred-status-msg { font-size: 0.78rem; margin-top: 0.5rem; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.1.0-dev</span></h1>
+      <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL</p>
+    </div>
+    <div>
+      <span class="badge" id="routing-badge">ROUTING: PAPER</span>
+      <span class="badge" id="wal-badge">SQLite: WAL</span>
+      <span class="badge CHOP" id="regime-badge">HMM: CHOP</span>
+    </div>
+  </header>
+
+  <section class="metrics-grid">
+    <div class="card">
+      <div class="card-label">Total Equity (USDC)</div>
+      <div class="card-value" id="val-equity">$10,000.00</div>
+      <div class="card-sub">Initial Baseline: $10,000.00</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Portfolio Heat Cap ($400 / 4%)</div>
+      <div class="card-value" id="val-heat">$0.00 (0.00%)</div>
+      <div class="card-sub">Conviction Risk: $50 – $150 / trade</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Gross Leverage (Max 1.5x)</div>
+      <div class="card-value" id="val-leverage">0.00x</div>
+      <div class="card-sub" id="val-notional">Deployed: $0.00 / $15,000</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Idle Basis / HLP Harvest</div>
+      <div class="card-value" id="val-basis">$0.00</div>
+      <div class="card-sub" id="val-yield">Accrued Yield: $0.0000</div>
+    </div>
+    <div class="card">
+      <div class="card-label">3-State HMM (540-Bar 4H)</div>
+      <div class="card-value" id="val-hmm-probs">B:33% | S:33% | C:34%</div>
+      <div class="card-sub">Diagonal-Covariance Gaussian</div>
+    </div>
+  </section>
+
+  <section class="section-grid">
+    <div class="card">
+      <h2>MACE (35%) + Continuous SNR (65%) Cross-Pair Signal Matrix (15 ALT/BTC:SYNTH Pairs)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Asset</th>
+            <th>Exec Contract</th>
+            <th>Synth Pair</th>
+            <th>SNR (65%)</th>
+            <th>MACE (35%)</th>
+            <th>Conviction</th>
+            <th>1H Funding</th>
+            <th>Gate Action</th>
+          </tr>
+        </thead>
+        <tbody id="signals-tbody">
+          <tr><td colspan="9">Loading live telemetry...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Active Positions & Chandelier Trailing Stops</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Notional</th>
+            <th>Risk ($)</th>
+            <th>Chandelier Stop</th>
+          </tr>
+        </thead>
+        <tbody id="trades-tbody">
+          <tr><td colspan="5">No open directional positions</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card cred-panel">
+    <h2>Hyperliquid L1 Web3 DEX Credentials & Routing Mode (Mainnet / Testnet / Paper)</h2>
+    <form class="cred-form" id="cred-form">
+      <div class="form-group">
+        <label for="inp-mode">Execution Mode</label>
+        <select id="inp-mode">
+          <option value="PAPER">PAPER (Simulated Fills)</option>
+          <option value="TESTNET">TESTNET (Hyperliquid Testnet CLOB)</option>
+          <option value="LIVE">LIVE (Hyperliquid L1 Routing)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="inp-network">Hyperliquid Network Target</label>
+        <select id="inp-network">
+          <option value="true">Testnet (api.hyperliquid-testnet.xyz)</option>
+          <option value="false">Mainnet (api.hyperliquid.xyz)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="inp-wallet">Main Arbitrum Wallet Address (USDC Collateral)</label>
+        <input type="text" id="inp-wallet" placeholder="0x..." autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="inp-privkey">Trade-Only Agent Private Key (No Withdrawals)</label>
+        <input type="password" id="inp-privkey" placeholder="0x... (64 hex chars)" autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="inp-vault">Optional Vault / Sub-Account Address</label>
+        <input type="text" id="inp-vault" placeholder="0x... (optional)" autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <button type="submit" class="btn-save">Save DEX Credentials</button>
+      </div>
+    </form>
+    <div class="cred-status-msg" id="cred-status-msg">Endpoint: https://api.hyperliquid-testnet.xyz • Credentials: Not Configured</div>
+  </section>
+
+  <script>
+    function renderPortfolio(p) {
+      if (!p) return;
+      const eq = Number(p.total_equity_usdc ?? 10000).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+      document.getElementById('val-equity').textContent = `$${eq}`;
+      const heat = Number(p.portfolio_heat_usdc ?? 0).toFixed(2);
+      const heatPct = (Number(p.portfolio_heat_pct ?? 0) * 100).toFixed(2);
+      document.getElementById('val-heat').textContent = `$${heat} (${heatPct}%)`;
+      document.getElementById('val-leverage').textContent = `${Number(p.gross_leverage ?? 0).toFixed(2)}x`;
+      document.getElementById('val-notional').textContent = `Deployed: $${Number(p.deployed_notional_usdc ?? 0).toFixed(2)} / $15,000`;
+      document.getElementById('val-basis').textContent = `$${Number(p.basis_harvest_notional_usdc ?? 0).toFixed(2)}`;
+      document.getElementById('val-yield').textContent = `Accrued Yield: $${Number(p.accrued_yield_usdc ?? 0).toFixed(4)}`;
+
+      const regime = p.hmm_regime || 'CHOP';
+      const badge = document.getElementById('regime-badge');
+      badge.textContent = `HMM: ${regime}`;
+      badge.className = `badge ${regime}`;
+
+      const bullP = Math.round(Number(p.prob_bull ?? p.regime_probabilities?.bull ?? 0.33) * 100);
+      const bearP = Math.round(Number(p.prob_bear ?? p.regime_probabilities?.bear ?? 0.33) * 100);
+      const chopP = Math.round(Number(p.prob_chop ?? p.regime_probabilities?.chop ?? 0.34) * 100);
+      document.getElementById('val-hmm-probs').textContent = `Bull:${bullP}% | Bear:${bearP}% | Chop:${chopP}%`;
+    }
+
+    function renderSignals(signals) {
+      const tbody = document.getElementById('signals-tbody');
+      if (!signals || !signals.length) return;
+      tbody.innerHTML = signals.map(s => `
+        <tr>
+          <td>#${s.rs_rank}</td>
+          <td><strong>${s.base_asset}</strong></td>
+          <td>${s.exec_symbol}</td>
+          <td>${s.synth_symbol}</td>
+          <td>${Number(s.snr_score).toFixed(3)}</td>
+          <td>${Number(s.mace_score).toFixed(3)}</td>
+          <td><strong>${Number(s.blended_conviction).toFixed(3)}</strong></td>
+          <td>${(Number(s.funding_rate_hourly) * 100).toFixed(4)}%/h</td>
+          <td class="pos-${s.signal_action}">${s.signal_action}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderTrades(trades) {
+      const tbody = document.getElementById('trades-tbody');
+      if (!trades || !trades.length) {
+        tbody.innerHTML = '<tr><td colspan="5">No open directional positions (Idle Cash in Basis/HLP)</td></tr>';
+        return;
+      }
+      tbody.innerHTML = trades.map(t => `
+        <tr>
+          <td>${t.symbol}</td>
+          <td class="pos-${t.side}">${t.side}</td>
+          <td>$${Number(t.notional_usdc).toFixed(2)}</td>
+          <td>$${Number(t.risk_budget_usdc).toFixed(2)}</td>
+          <td>$${Number(t.chandelier_stop_price).toFixed(4)}</td>
+        </tr>
+      `).join('');
+    }
+
+    function renderCredentials(c) {
+      if (!c) return;
+      const rBadge = document.getElementById('routing-badge');
+      rBadge.textContent = `ROUTING: ${c.active_routing || c.execution_mode}`;
+      rBadge.className = `badge ${c.credentials_ready ? 'BULL' : 'CHOP'}`;
+
+      document.getElementById('inp-mode').value = c.execution_mode || 'PAPER';
+      document.getElementById('inp-network').value = c.hyperliquid_testnet ? 'true' : 'false';
+      document.getElementById('inp-wallet').value = c.wallet_address || '';
+      document.getElementById('inp-vault').value = c.hyperliquid_vault_address || '';
+      const privInput = document.getElementById('inp-privkey');
+      privInput.value = '';
+      privInput.placeholder = c.private_key_masked ? `Configured (${c.private_key_masked})` : '0x... (64 hex chars)';
+
+      document.getElementById('cred-status-msg').textContent =
+        `Active Routing: ${c.active_routing} • Network: ${(c.network || '').toUpperCase()} (${c.api_endpoint}) • Agent Key: ${c.private_key_configured ? c.private_key_masked : 'Not Set'}`;
+    }
+
+    document.getElementById('inp-mode').addEventListener('change', (ev) => {
+      if (ev.target.value === 'TESTNET') {
+        document.getElementById('inp-network').value = 'true';
+      }
+    });
+
+    document.getElementById('cred-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const msgEl = document.getElementById('cred-status-msg');
+      const selectedMode = document.getElementById('inp-mode').value;
+      if (selectedMode === 'TESTNET') {
+        document.getElementById('inp-network').value = 'true';
+      }
+      const payload = {
+        execution_mode: selectedMode,
+        hyperliquid_testnet: document.getElementById('inp-network').value === 'true',
+        wallet_address: document.getElementById('inp-wallet').value.trim(),
+        hyperliquid_vault_address: document.getElementById('inp-vault').value.trim(),
+      };
+      const privVal = document.getElementById('inp-privkey').value.trim();
+      if (privVal) {
+        payload.private_key = privVal;
+      }
+      try {
+        const res = await fetch('/api/v1/credentials', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msgEl.textContent = `Configuration error: ${data.detail || res.statusText}`;
+          return;
+        }
+        renderCredentials(data.credentials);
+      } catch (err) {
+        msgEl.textContent = `Request failed: ${err}`;
+      }
+    });
+
+    async function bootstrapLoad() {
+      try {
+        const [pRes, sRes, cRes] = await Promise.all([
+          fetch('/api/v1/portfolio'),
+          fetch('/api/v1/signals'),
+          fetch('/api/v1/credentials')
+        ]);
+        const pData = await pRes.json();
+        const sData = await sRes.json();
+        const cData = await cRes.json();
+        renderPortfolio(pData);
+        renderSignals(sData.signals || []);
+        renderTrades(pData.open_positions || []);
+        renderCredentials(cData);
+      } catch (err) {
+        console.error('Initial telemetry fetch error:', err);
+      }
+
+      const evt = new EventSource('/api/v1/stream');
+      evt.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          renderPortfolio(data.portfolio);
+          renderSignals(data.signals);
+          renderTrades(data.open_trades);
+        } catch (err) {}
+      };
+    }
+
+    bootstrapLoad();
+  </script>
+</body>
+</html>
