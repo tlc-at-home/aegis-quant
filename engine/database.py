@@ -16,11 +16,22 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "aegis_quant.db"
 DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "sql" / "schema_and_seed.sql"
+MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
+MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
 
 _EVM_ADDRESS_RE = re.compile(r"^0[xX][0-9a-fA-F]{40}$")
 _HEX_PRIVKEY_RE = re.compile(r"^(?:0[xX])?[0-9a-fA-F]{64}$")
 _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 _VALID_EXECUTION_MODES = {"PAPER", "LIVE", "TESTNET"}
+_VALID_FSM_STATES = {
+    "PENDING",
+    "OPEN_ON_BOOK",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCELLED",
+    "REJECTED",
+    "EXPIRED",
+}
 
 
 def validate_evm_address(value: str, field_name: str = "wallet_address") -> str:
@@ -182,6 +193,60 @@ class DatabaseManager:
 
         return self.verify_integrity()
 
+    @staticmethod
+    def _execute_sql_idempotent(conn: sqlite3.Connection, sql_script: str) -> None:
+        """Execute a multi-statement SQL script, ignoring duplicate column errors on re-run."""
+        buffer: list[str] = []
+        for line in sql_script.splitlines():
+            stripped = line.strip()
+            if not stripped and not buffer:
+                continue
+            if stripped.startswith("--") and not buffer:
+                continue
+            buffer.append(line)
+            candidate_stmt = "\n".join(buffer)
+            if sqlite3.complete_statement(candidate_stmt):
+                buffer.clear()
+                clean_stmt = "\n".join(
+                    ln for ln in candidate_stmt.splitlines() if not ln.strip().startswith("--")
+                ).strip()
+                if not clean_stmt:
+                    continue
+                try:
+                    conn.execute(clean_stmt)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" in str(exc).lower():
+                        continue
+                    raise
+        if buffer:
+            rem = "\n".join(
+                ln for ln in buffer if not ln.strip().startswith("--")
+            ).strip()
+            if rem:
+                try:
+                    conn.execute(rem)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+
+    def _ensure_order_fsm_schema(self, conn: sqlite3.Connection) -> None:
+        """Ensure Migration 002 columns on trades and order_state_audit table exist."""
+        cols = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(trades);").fetchall()
+        }
+        has_audit = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='order_state_audit';"
+        ).fetchone()
+        if (
+            not {"client_order_id", "fsm_state", "exchange_order_id", "avg_fill_price", "filled_units", "slippage_paid_usd"}.issubset(cols)
+            or not has_audit
+        ):
+            if MIGRATION_002_PATH.exists():
+                self._execute_sql_idempotent(
+                    conn, MIGRATION_002_PATH.read_text(encoding="utf-8")
+                )
+
     def apply_migration(self, migration_path: Path | str) -> dict[str, Any]:
         """Execute a versioned DDL/DML SQL migration script and return updated integrity counts."""
         mig_path = Path(migration_path)
@@ -202,7 +267,7 @@ class DatabaseManager:
 
         sql_script = mig_path.read_text(encoding="utf-8")
         with self.connection() as conn:
-            conn.executescript(sql_script)
+            self._execute_sql_idempotent(conn, sql_script)
 
         integrity = self.verify_integrity()
         self.log_telemetry(
@@ -673,47 +738,362 @@ class DatabaseManager:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @staticmethod
+    def _normalize_trade_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        """Normalize a trades row dict with Order FSM and reconciliation aliases."""
+        d = dict(row)
+        trade_id = d.get("trade_id", 0)
+        ex_id = d.get("exchange_order_id")
+        cli_id = d.get("client_order_id") or ex_id or f"trade-{trade_id}"
+        d["client_order_id"] = str(cli_id)
+        stop_px = d.get("chandelier_stop_price")
+        if stop_px is None:
+            stop_px = d.get("initial_stop_price", d.get("entry_price", 0.0))
+        d["current_stop_price"] = float(stop_px or 0.0)
+        d["fsm_state"] = str(d.get("fsm_state") or "FILLED")
+        if d.get("avg_fill_price") is None and d.get("entry_price") is not None:
+            d["avg_fill_price"] = float(d["entry_price"])
+        if d.get("filled_units") is None:
+            d["filled_units"] = float(d.get("quantity") or 0.0)
+        if d.get("slippage_paid_usd") is None:
+            d["slippage_paid_usd"] = 0.0
+        return d
+
     def get_open_trades(self) -> list[dict[str, Any]]:
         """Return all currently open positions."""
         with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
             rows = conn.execute(
                 "SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at ASC;"
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._normalize_trade_row(r) for r in rows]
 
     def get_recent_trades(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return recent open and closed trades."""
         with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
             rows = conn.execute(
                 "SELECT * FROM trades ORDER BY trade_id DESC LIMIT ?;",
                 (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._normalize_trade_row(r) for r in rows]
+
+    def get_trade_by_client_order_id(self, client_order_id: str) -> dict[str, Any] | None:
+        """Fetch a trade record by client_order_id, exchange_order_id, or trade-<id>."""
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            row = conn.execute(
+                """
+                SELECT * FROM trades
+                WHERE client_order_id = ? OR exchange_order_id = ?
+                ORDER BY trade_id DESC
+                LIMIT 1;
+                """,
+                (client_order_id, client_order_id),
+            ).fetchone()
+            if row is None and str(client_order_id).startswith("trade-"):
+                try:
+                    tid = int(str(client_order_id).split("-", 1)[1])
+                    row = conn.execute(
+                        "SELECT * FROM trades WHERE trade_id = ?;",
+                        (tid,),
+                    ).fetchone()
+                except ValueError:
+                    pass
+        return self._normalize_trade_row(row) if row is not None else None
 
     def insert_trade(self, trade: dict[str, Any]) -> int:
-        """Insert a new trade record and return its trade_id."""
+        """Insert a new trade record (with Order FSM tracking columns) and return its trade_id."""
+        import uuid
+
+        symbol = str(trade.get("symbol", "SOL/USDC:USDC"))
+        base_asset = str(
+            trade.get("base_asset") or symbol.split("/")[0].split(":")[0]
+        )
+        side = str(trade.get("side", "LONG")).upper()
+        status = str(trade.get("status", "OPEN")).upper()
+        fsm_state = str(trade.get("fsm_state", "FILLED")).upper()
+        if fsm_state not in _VALID_FSM_STATES:
+            raise ValueError(
+                f"Invalid fsm_state '{fsm_state}': must be one of {sorted(_VALID_FSM_STATES)}"
+            )
+
+        entry_price = float(
+            trade.get("entry_price")
+            if trade.get("entry_price") is not None
+            else (trade.get("avg_fill_price") or 0.0)
+        )
+        current_price = float(
+            trade.get("current_price")
+            if trade.get("current_price") is not None
+            else entry_price
+        )
+        quantity = float(
+            trade.get("quantity")
+            if trade.get("quantity") is not None
+            else (trade.get("filled_units") or 0.0)
+        )
+        notional_usdc = float(
+            trade.get("notional_usdc")
+            if trade.get("notional_usdc") is not None
+            else round(quantity * entry_price, 2)
+        )
+        risk_budget_usdc = float(
+            trade.get("risk_budget_usdc")
+            if trade.get("risk_budget_usdc") is not None
+            else round(notional_usdc * 0.04, 2)
+        )
+        conviction_multiplier = float(trade.get("conviction_multiplier", 1.0))
+
+        default_stop = (
+            entry_price * 0.95 if side == "LONG" else entry_price * 1.05
+        )
+        stop_override = trade.get("current_stop_price")
+        initial_stop_price = float(
+            trade.get("initial_stop_price")
+            if trade.get("initial_stop_price") is not None
+            else (stop_override if stop_override is not None else default_stop)
+        )
+        chandelier_stop_price = float(
+            trade.get("chandelier_stop_price")
+            if trade.get("chandelier_stop_price") is not None
+            else (stop_override if stop_override is not None else initial_stop_price)
+        )
+        highest_price_seen = float(
+            trade.get("highest_price_seen")
+            if trade.get("highest_price_seen") is not None
+            else entry_price
+        )
+        lowest_price_seen = float(
+            trade.get("lowest_price_seen")
+            if trade.get("lowest_price_seen") is not None
+            else entry_price
+        )
+        fees_paid_usdc = float(trade.get("fees_paid_usdc", 0.0))
+        funding_accrued_usdc = float(trade.get("funding_accrued_usdc", 0.0))
+        unrealized_pnl_usdc = float(trade.get("unrealized_pnl_usdc", 0.0))
+        exchange_order_id = trade.get("exchange_order_id")
+        client_order_id = str(
+            trade.get("client_order_id")
+            or exchange_order_id
+            or f"cli-{uuid.uuid4().hex[:12]}"
+        )
+        avg_fill_price = (
+            float(trade["avg_fill_price"])
+            if trade.get("avg_fill_price") is not None
+            else (entry_price if fsm_state == "FILLED" else None)
+        )
+        filled_units = (
+            float(trade["filled_units"])
+            if trade.get("filled_units") is not None
+            else (quantity if fsm_state == "FILLED" else 0.0)
+        )
+        slippage_paid_usd = float(trade.get("slippage_paid_usd", 0.0))
+
+        payload = {
+            "client_order_id": client_order_id,
+            "symbol": symbol,
+            "base_asset": base_asset,
+            "side": side,
+            "status": status,
+            "fsm_state": fsm_state,
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "quantity": quantity,
+            "notional_usdc": notional_usdc,
+            "risk_budget_usdc": risk_budget_usdc,
+            "conviction_multiplier": conviction_multiplier,
+            "initial_stop_price": initial_stop_price,
+            "chandelier_stop_price": chandelier_stop_price,
+            "highest_price_seen": highest_price_seen,
+            "lowest_price_seen": lowest_price_seen,
+            "fees_paid_usdc": fees_paid_usdc,
+            "funding_accrued_usdc": funding_accrued_usdc,
+            "unrealized_pnl_usdc": unrealized_pnl_usdc,
+            "exchange_order_id": exchange_order_id,
+            "avg_fill_price": avg_fill_price,
+            "filled_units": filled_units,
+            "slippage_paid_usd": slippage_paid_usd,
+        }
+
         with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
             cur = conn.execute(
                 """
                 INSERT INTO trades (
-                    symbol, base_asset, side, status,
+                    client_order_id, symbol, base_asset, side, status, fsm_state,
                     entry_price, current_price, quantity, notional_usdc,
                     risk_budget_usdc, conviction_multiplier,
                     initial_stop_price, chandelier_stop_price,
                     highest_price_seen, lowest_price_seen,
-                    fees_paid_usdc, exchange_order_id
+                    fees_paid_usdc, funding_accrued_usdc, unrealized_pnl_usdc,
+                    exchange_order_id, avg_fill_price, filled_units, slippage_paid_usd
                 ) VALUES (
-                    :symbol, :base_asset, :side, 'OPEN',
+                    :client_order_id, :symbol, :base_asset, :side, :status, :fsm_state,
                     :entry_price, :current_price, :quantity, :notional_usdc,
                     :risk_budget_usdc, :conviction_multiplier,
                     :initial_stop_price, :chandelier_stop_price,
                     :highest_price_seen, :lowest_price_seen,
-                    :fees_paid_usdc, :exchange_order_id
+                    :fees_paid_usdc, :funding_accrued_usdc, :unrealized_pnl_usdc,
+                    :exchange_order_id, :avg_fill_price, :filled_units, :slippage_paid_usd
                 );
                 """,
-                trade,
+                payload,
             )
             return int(cur.lastrowid or 0)
+
+    def log_order_state_transition(
+        self,
+        client_order_id: str,
+        from_state: str,
+        to_state: str,
+        reason: str | None = None,
+        timestamp_utc: int | None = None,
+    ) -> int:
+        """Record an Order FSM state transition in order_state_audit."""
+        ts_utc = (
+            int(timestamp_utc)
+            if timestamp_utc is not None
+            else (
+                int(self.pit_timestamp_ms)
+                if self.pit_timestamp_ms is not None
+                else int(time.time() * 1000)
+            )
+        )
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            cur = conn.execute(
+                """
+                INSERT INTO order_state_audit (
+                    client_order_id, from_state, to_state, timestamp_utc, reason
+                ) VALUES (?, ?, ?, ?, ?);
+                """,
+                (str(client_order_id), str(from_state), str(to_state), ts_utc, reason),
+            )
+            return int(cur.lastrowid or 0)
+
+    def transition_order_state(
+        self,
+        client_order_id: str,
+        to_state: str,
+        *,
+        from_state: str | None = None,
+        reason: str | None = None,
+        exchange_order_id: str | None = None,
+        avg_fill_price: float | None = None,
+        filled_units: float | None = None,
+        quantity: float | None = None,
+        notional_usdc: float | None = None,
+        slippage_paid_usd: float | None = None,
+        fees_paid_usdc: float | None = None,
+        status: str | None = None,
+        timestamp_utc: int | None = None,
+    ) -> None:
+        """Transition a trade's Order FSM state and write an audit log entry."""
+        to_up = str(to_state).upper().strip()
+        if to_up not in _VALID_FSM_STATES:
+            raise ValueError(
+                f"Invalid target fsm_state '{to_state}': must be one of {sorted(_VALID_FSM_STATES)}"
+            )
+        ts_utc = (
+            int(timestamp_utc)
+            if timestamp_utc is not None
+            else (
+                int(self.pit_timestamp_ms)
+                if self.pit_timestamp_ms is not None
+                else int(time.time() * 1000)
+            )
+        )
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            row = conn.execute(
+                """
+                SELECT trade_id, fsm_state
+                FROM trades
+                WHERE client_order_id = ? OR exchange_order_id = ?
+                ORDER BY trade_id DESC
+                LIMIT 1;
+                """,
+                (client_order_id, client_order_id),
+            ).fetchone()
+
+            prior_state = str(
+                from_state
+                if from_state is not None
+                else (row["fsm_state"] if row is not None and row["fsm_state"] else "PENDING")
+            )
+
+            if row is not None:
+                updates = ["fsm_state = ?"]
+                params: list[Any] = [to_up]
+                if exchange_order_id is not None:
+                    updates.append("exchange_order_id = ?")
+                    params.append(str(exchange_order_id))
+                if avg_fill_price is not None:
+                    updates.append("avg_fill_price = ?")
+                    params.append(float(avg_fill_price))
+                    updates.append("entry_price = ?")
+                    params.append(float(avg_fill_price))
+                    updates.append("current_price = ?")
+                    params.append(float(avg_fill_price))
+                if filled_units is not None:
+                    updates.append("filled_units = ?")
+                    params.append(float(filled_units))
+                if quantity is not None:
+                    updates.append("quantity = ?")
+                    params.append(float(quantity))
+                if notional_usdc is not None:
+                    updates.append("notional_usdc = ?")
+                    params.append(float(notional_usdc))
+                if slippage_paid_usd is not None:
+                    updates.append("slippage_paid_usd = ?")
+                    params.append(float(slippage_paid_usd))
+                if fees_paid_usdc is not None:
+                    updates.append("fees_paid_usdc = ?")
+                    params.append(float(fees_paid_usdc))
+                if status is not None:
+                    updates.append("status = ?")
+                    params.append(str(status).upper())
+                params.append(int(row["trade_id"]))
+                conn.execute(
+                    f"UPDATE trades SET {', '.join(updates)} WHERE trade_id = ?;",
+                    tuple(params),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO order_state_audit (
+                    client_order_id, from_state, to_state, timestamp_utc, reason
+                ) VALUES (?, ?, ?, ?, ?);
+                """,
+                (str(client_order_id), prior_state, to_up, ts_utc, reason),
+            )
+
+    def get_order_state_audit(
+        self, client_order_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return order state transition audit rows ordered chronologically."""
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            if client_order_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT id, client_order_id, from_state, to_state, timestamp_utc, reason
+                    FROM order_state_audit
+                    WHERE client_order_id = ?
+                    ORDER BY id ASC;
+                    """,
+                    (str(client_order_id),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, client_order_id, from_state, to_state, timestamp_utc, reason
+                    FROM order_state_audit
+                    ORDER BY id ASC;
+                    """
+                ).fetchall()
+        return [dict(r) for r in rows]
 
     def update_open_trade(
         self,
@@ -727,6 +1107,7 @@ class DatabaseManager:
     ) -> None:
         """Update mark price, trailing Chandelier stop, and unrealized PnL of an open trade."""
         with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
             conn.execute(
                 """
                 UPDATE trades
@@ -749,15 +1130,59 @@ class DatabaseManager:
                 ),
             )
 
-    def close_trade(
+    def reconcile_open_trade_size(
         self,
         trade_id: int,
-        exit_price: float,
-        realized_pnl_usdc: float,
-        fees_paid_usdc: float,
-        exit_reason: str,
+        on_chain_size: float,
     ) -> None:
-        """Close an open position and record realized PnL."""
+        """Synchronize an open trade's quantity, filled_units, notional, and risk budget to on_chain_size."""
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            row = conn.execute(
+                "SELECT * FROM trades WHERE trade_id = ? AND status = 'OPEN';",
+                (int(trade_id),),
+            ).fetchone()
+            if row is None:
+                return
+            old_qty = float(
+                row["filled_units"]
+                if row["filled_units"] and float(row["filled_units"]) > 0
+                else (row["quantity"] or 1.0)
+            )
+            entry_px = float(row["entry_price"] or 0.0)
+            old_risk = float(row["risk_budget_usdc"] or 0.0)
+            scale = float(on_chain_size) / max(old_qty, 1e-12)
+            new_notional = round(float(on_chain_size) * entry_px, 2)
+            new_risk = round(old_risk * scale, 2)
+            conn.execute(
+                """
+                UPDATE trades
+                SET quantity = ?,
+                    filled_units = ?,
+                    notional_usdc = ?,
+                    risk_budget_usdc = ?
+                WHERE trade_id = ? AND status = 'OPEN';
+                """,
+                (
+                    float(on_chain_size),
+                    float(on_chain_size),
+                    new_notional,
+                    new_risk,
+                    int(trade_id),
+                ),
+            )
+
+    def close_trade(
+        self,
+        trade_id: int | None = None,
+        exit_price: float = 0.0,
+        realized_pnl_usdc: float | None = None,
+        fees_paid_usdc: float | None = None,
+        exit_reason: str = "MANUAL_CLOSE",
+        *,
+        client_order_id: str | None = None,
+    ) -> None:
+        """Close an open position by trade_id or client_order_id and record realized PnL."""
         import datetime as dt
 
         if self.pit_timestamp_ms is not None:
@@ -768,6 +1193,59 @@ class DatabaseManager:
             closed_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            row = None
+            if trade_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM trades WHERE trade_id = ?;",
+                    (int(trade_id),),
+                ).fetchone()
+            elif client_order_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM trades
+                    WHERE client_order_id = ? OR exchange_order_id = ?
+                    ORDER BY trade_id DESC
+                    LIMIT 1;
+                    """,
+                    (str(client_order_id), str(client_order_id)),
+                ).fetchone()
+                if row is None and str(client_order_id).startswith("trade-"):
+                    try:
+                        tid = int(str(client_order_id).split("-", 1)[1])
+                        row = conn.execute(
+                            "SELECT * FROM trades WHERE trade_id = ?;",
+                            (tid,),
+                        ).fetchone()
+                    except ValueError:
+                        pass
+
+            if row is None:
+                return
+
+            target_trade_id = int(row["trade_id"])
+            entry_px = float(row["entry_price"] or 0.0)
+            qty = float(
+                row["filled_units"]
+                if row["filled_units"] and float(row["filled_units"]) > 0
+                else (row["quantity"] or 0.0)
+            )
+            funding = float(row["funding_accrued_usdc"] or 0.0)
+            existing_fees = float(row["fees_paid_usdc"] or 0.0)
+            side = str(row["side"] or "LONG").upper()
+
+            eff_fees = float(fees_paid_usdc) if fees_paid_usdc is not None else existing_fees
+            if realized_pnl_usdc is not None:
+                eff_realized = float(realized_pnl_usdc)
+            else:
+                if side == "LONG":
+                    gross_pnl = (float(exit_price) - entry_px) * qty + funding
+                elif side == "SHORT":
+                    gross_pnl = (entry_px - float(exit_price)) * qty + funding
+                else:
+                    gross_pnl = funding
+                eff_realized = round(gross_pnl - eff_fees, 4)
+
             conn.execute(
                 """
                 UPDATE trades
@@ -782,13 +1260,13 @@ class DatabaseManager:
                 WHERE trade_id = ?;
                 """,
                 (
-                    exit_price,
-                    exit_price,
-                    realized_pnl_usdc,
-                    fees_paid_usdc,
+                    float(exit_price),
+                    float(exit_price),
+                    eff_realized,
+                    eff_fees,
                     closed_iso,
                     exit_reason,
-                    trade_id,
+                    target_trade_id,
                 ),
             )
 

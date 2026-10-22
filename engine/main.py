@@ -25,6 +25,7 @@ from web.server import create_app
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "engine.log"
 MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
+MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
 
 
 def setup_logging() -> logging.Logger:
@@ -117,6 +118,8 @@ class AegisOrchestrator:
         integrity = self.db.init_db()
         if MIGRATION_001_PATH.exists():
             integrity = self.db.apply_migration(MIGRATION_001_PATH)
+        if MIGRATION_002_PATH.exists():
+            integrity = self.db.apply_migration(MIGRATION_002_PATH)
         self.logger.info(
             "Starting %s v%s | SQLite journal_mode=%s | config=%d | USDC_PERP=%d | BTC_SYNTH=%d",
             __platform__,
@@ -174,7 +177,7 @@ class AegisOrchestrator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aegis Quant v0.1.0-dev Orchestrator")
+    parser = argparse.ArgumentParser(description="Aegis Quant v0.2.0-alpha2 Orchestrator")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -238,6 +241,8 @@ def main() -> None:
     orchestrator.db.init_db()
     if MIGRATION_001_PATH.exists():
         orchestrator.db.apply_migration(MIGRATION_001_PATH)
+    if MIGRATION_002_PATH.exists():
+        orchestrator.db.apply_migration(MIGRATION_002_PATH)
 
     testnet_flag: bool | None = None
     if args.testnet:

@@ -109,6 +109,9 @@ class BacktestEngine:
         self.mem_db.init_db()
         if MIGRATION_001_PATH.exists():
             self.mem_db.apply_migration(MIGRATION_001_PATH)
+        mig_002 = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
+        if mig_002.exists():
+            self.mem_db.apply_migration(mig_002)
 
         if self.source_db_path.exists():
             src_db = DatabaseManager(self.source_db_path)
