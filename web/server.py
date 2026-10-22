@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 from engine import __platform__, __version__
+from engine.alerts import AlertEngine
 from engine.database import DatabaseManager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -27,7 +28,7 @@ class ConfigUpdatePayload(BaseModel):
 
 
 class CredentialsUpdatePayload(BaseModel):
-    """Payload for configuring Hyperliquid Mainnet/Testnet Web3 DEX credentials."""
+    """Payload for configuring Hyperliquid Mainnet/Testnet Web3 DEX and Telegram alerting credentials."""
 
     wallet_address: str | None = None
     private_key: str | None = None
@@ -35,7 +36,25 @@ class CredentialsUpdatePayload(BaseModel):
     execution_mode: str | None = None
     hyperliquid_vault_address: str | None = None
     gemini_api_key: str | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    max_daily_drawdown_alert_pct: float | None = None
     require_credentials_for_live: bool = True
+
+
+class TelegramAlertsUpdatePayload(BaseModel):
+    """Payload for configuring Telegram Bot API alerting in SQLite system_config."""
+
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    max_daily_drawdown_alert_pct: float | None = None
+
+
+class TestAlertPayload(BaseModel):
+    """Payload for triggering a test Telegram alert notification from the dashboard."""
+
+    message: str = "v0.2.0-rc1 Telegram Alert Verified"
+    level: str = "INFO"
 
 
 def create_app(db: DatabaseManager | None = None) -> FastAPI:
@@ -54,7 +73,7 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
     async def serve_dashboard() -> HTMLResponse:
         if INDEX_HTML_PATH.exists():
             return HTMLResponse(content=INDEX_HTML_PATH.read_text(encoding="utf-8"))
-        return HTMLResponse(content="<h1>Aegis Quant v0.1.0-dev Dashboard</h1>")
+        return HTMLResponse(content=f"<h1>Aegis Quant v{__version__} Dashboard</h1>")
 
     @app.get("/api/v1/status")
     async def get_status() -> dict[str, Any]:
@@ -68,6 +87,7 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
             "platform": __platform__,
             "version": f"v{__version__}",
             "release": __version__,
+            "schema_version": integrity.get("schema_version", 0),
             "exchange": cfg.get("exchange_id", "hyperliquid"),
             "execution_mode": cfg.get("execution_mode", "PAPER"),
             "hyperliquid_testnet": cred_status["hyperliquid_testnet"],
@@ -75,6 +95,8 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
             "api_endpoint": cred_status["api_endpoint"],
             "credentials_ready": cred_status["credentials_ready"],
             "active_routing": cred_status["active_routing"],
+            "alert_channel": "TELEGRAM",
+            "telegram_alerts_ready": cred_status["telegram_alerts_ready"],
             "environment": cfg.get("environment", "sandbox"),
             "polling_interval_seconds": int(cfg.get("polling_interval_seconds", 15)),
             "journal_mode": integrity["journal_mode"],
@@ -201,6 +223,9 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
                 execution_mode=payload.execution_mode,
                 hyperliquid_vault_address=payload.hyperliquid_vault_address,
                 gemini_api_key=payload.gemini_api_key,
+                telegram_bot_token=payload.telegram_bot_token,
+                telegram_chat_id=payload.telegram_chat_id,
+                max_daily_drawdown_alert_pct=payload.max_daily_drawdown_alert_pct,
                 require_credentials_for_live=payload.require_credentials_for_live,
             )
         except ValueError as exc:
@@ -217,9 +242,53 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
                 "private_key_masked": status["private_key_masked"],
                 "credentials_ready": status["credentials_ready"],
                 "active_routing": status["active_routing"],
+                "telegram_alerts_ready": status["telegram_alerts_ready"],
             },
         )
         return {"status": "updated", "credentials": status}
+
+    @app.get("/api/v1/alerts")
+    async def get_alerts_config() -> dict[str, Any]:
+        cred = db_manager.get_credentials_status()
+        return {
+            "alert_channel": "TELEGRAM",
+            "telegram_alerts_ready": cred["telegram_alerts_ready"],
+            "telegram_bot_token_configured": cred["telegram_bot_token_configured"],
+            "telegram_bot_token_masked": cred["telegram_bot_token_masked"],
+            "telegram_chat_id": cred["telegram_chat_id"],
+            "max_daily_drawdown_alert_pct": cred["max_daily_drawdown_alert_pct"],
+        }
+
+    @app.post("/api/v1/alerts")
+    async def update_alerts_config(payload: TelegramAlertsUpdatePayload) -> dict[str, Any]:
+        try:
+            status = db_manager.configure_telegram_alerts(
+                telegram_bot_token=payload.telegram_bot_token,
+                telegram_chat_id=payload.telegram_chat_id,
+                max_daily_drawdown_alert_pct=payload.max_daily_drawdown_alert_pct,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        db_manager.log_telemetry(
+            "INFO",
+            "web.alerts",
+            f"Updated Telegram alerting config | ready={status['telegram_alerts_ready']} | chat_id={status['telegram_chat_id']}",
+            {
+                "alert_channel": "TELEGRAM",
+                "telegram_alerts_ready": status["telegram_alerts_ready"],
+                "telegram_bot_token_masked": status["telegram_bot_token_masked"],
+                "telegram_chat_id": status["telegram_chat_id"],
+                "max_daily_drawdown_alert_pct": status["max_daily_drawdown_alert_pct"],
+            },
+        )
+        return {"status": "updated", "alerts": status}
+
+    @app.post("/api/v1/alerts/test")
+    async def test_telegram_alert(payload: TestAlertPayload) -> dict[str, Any]:
+        alert_engine = AlertEngine(db_manager)
+        report = await alert_engine.run_test_alert(payload.message, level=payload.level)
+        return report
 
     @app.get("/api/v1/logs")
     async def get_logs() -> dict[str, Any]:

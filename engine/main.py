@@ -1,4 +1,4 @@
-"""Master asyncio orchestrator for Aegis Quant (v0.1.0-dev)."""
+"""Master asyncio orchestrator for Aegis Quant (v0.2.0-rc1)."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ import json
 import logging
 import signal
 import sys
-from pathlib import Path
 from typing import Any
 
 import uvicorn
 
 from engine import __platform__, __version__
+from engine.alerts import AlertEngine
 from engine.calibration import WalkForwardCalibrator
 from engine.database import PROJECT_ROOT, DatabaseManager
 from engine.execution import ExecutionEngine
@@ -26,6 +26,7 @@ LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "engine.log"
 MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
 MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
+MIGRATION_003_PATH = PROJECT_ROOT / "sql" / "migrations" / "003_v020_schema_versioning.sql"
 
 
 def setup_logging() -> logging.Logger:
@@ -41,11 +42,12 @@ def setup_logging() -> logging.Logger:
 
 
 class AegisOrchestrator:
-    """Master asyncio orchestrator coordinating ingestion, HMM/MACE signals, risk, and FastAPI."""
+    """Master asyncio orchestrator coordinating ingestion, HMM/MACE signals, risk, alerts, and FastAPI."""
 
     def __init__(self, db: DatabaseManager | None = None) -> None:
         self.logger = setup_logging()
         self.db = db or DatabaseManager()
+        self.alerts = AlertEngine(self.db)
         self.ingestion = MarketIngestionEngine(self.db)
         self.signals = SignalEngine(self.db)
         self.risk = RiskEngine(self.db)
@@ -55,11 +57,21 @@ class AegisOrchestrator:
         self._cycle_count = 0
 
     async def run_single_cycle(self) -> dict[str, Any]:
-        """Execute one full ingestion, HMM/MACE signal, risk, and execution cycle."""
+        """Execute one full ingestion, HMM/MACE signal, risk, alerting, and execution cycle."""
         self._cycle_count += 1
         ingest_stats = await self.ingestion.ingest_universe()
         regime_state, evaluations = await asyncio.to_thread(self.signals.evaluate_universe)
+        await self.alerts.check_and_alert_regime_flip(
+            None,
+            regime_state.regime,
+            prob_bull=regime_state.prob_bull,
+            prob_bear=regime_state.prob_bear,
+            prob_chop=regime_state.prob_chop,
+        )
         exec_stats = await self.execution.reconcile_cycle(regime_state, evaluations)
+        await self.alerts.check_and_alert_daily_drawdown(
+            current_equity_usdc=float(exec_stats.get("total_equity_usdc", 10000.0))
+        )
 
         if self._cycle_count == 1 or self._cycle_count % 24 == 0:
             await asyncio.to_thread(self.calibrator.calibrate_universe)
@@ -105,6 +117,9 @@ class AegisOrchestrator:
                 self.logger.exception("Error in quantitative trading cycle: %s", exc)
                 try:
                     self.db.log_telemetry("ERROR", "engine.orchestrator", str(exc))
+                    await self.alerts.notify_critical_event(
+                        "Trading Cycle Exception", str(exc), exc=exc
+                    )
                 except Exception:
                     pass
 
@@ -120,6 +135,8 @@ class AegisOrchestrator:
             integrity = self.db.apply_migration(MIGRATION_001_PATH)
         if MIGRATION_002_PATH.exists():
             integrity = self.db.apply_migration(MIGRATION_002_PATH)
+        if MIGRATION_003_PATH.exists():
+            integrity = self.db.apply_migration(MIGRATION_003_PATH)
         self.logger.info(
             "Starting %s v%s | SQLite journal_mode=%s | config=%d | USDC_PERP=%d | BTC_SYNTH=%d",
             __platform__,
@@ -177,7 +194,7 @@ class AegisOrchestrator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aegis Quant v0.2.0-alpha2 Orchestrator")
+    parser = argparse.ArgumentParser(description="Aegis Quant v0.2.0-rc1 Orchestrator")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -243,6 +260,8 @@ def main() -> None:
         orchestrator.db.apply_migration(MIGRATION_001_PATH)
     if MIGRATION_002_PATH.exists():
         orchestrator.db.apply_migration(MIGRATION_002_PATH)
+    if MIGRATION_003_PATH.exists():
+        orchestrator.db.apply_migration(MIGRATION_003_PATH)
 
     testnet_flag: bool | None = None
     if args.testnet:

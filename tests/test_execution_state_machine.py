@@ -695,7 +695,57 @@ class TestExecutionStateMachine(unittest.TestCase):
         self.assertAlmostEqual(float(sol_trade["notional_usdc"]), 600.0, places=2)
         self.assertAlmostEqual(float(sol_trade["risk_budget_usdc"]), 40.0, places=2)
 
+    def test_10_reconcile_exchange_state_dispatches_webhook_alert_via_alert_engine(self) -> None:
+        """Verify on-chain position drift reconciliation dispatches CRITICAL Telegram Bot alerts."""
+        from engine.alerts import AlertEngine
+
+        self.db.apply_migration("sql/migrations/003_v020_schema_versioning.sql")
+        self.db.set_config_value("telegram_bot_token", "123456789:AAE_drift_alert_token")
+        self.db.set_config_value("telegram_chat_id", "-1001122334455")
+        self.db.insert_trade(
+            {
+                "client_order_id": "cli-alert-drift-sol",
+                "symbol": "SOL/USDC:USDC",
+                "base_asset": "SOL",
+                "side": "LONG",
+                "entry_price": 160.0,
+                "current_price": 158.0,
+                "quantity": 5.0,
+                "notional_usdc": 800.0,
+                "risk_budget_usdc": 50.0,
+                "initial_stop_price": 150.0,
+                "chandelier_stop_price": 152.0,
+            }
+        )
+
+        dispatched: list[tuple[str, dict[str, Any]]] = []
+
+        async def _capture_post(url: str, payload: dict[str, Any]) -> int:
+            dispatched.append((url, payload))
+            return 200
+
+        mock_ex = AsyncMock()
+        mock_ex.fetch_positions.return_value = []
+        exec_engine = ExecutionEngine(
+            self.db, self.risk, exchange=mock_ex, execution_mode="LIVE"
+        )
+        exec_engine.alerts = AlertEngine(self.db, http_post=_capture_post)
+
+        reconciled = asyncio.run(exec_engine.reconcile_exchange_state())
+        self.assertEqual(reconciled, 1)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(
+            dispatched[0][0],
+            "https://api.telegram.org/bot123456789:AAE_drift_alert_token/sendMessage",
+        )
+        self.assertEqual(dispatched[0][1]["chat_id"], "-1001122334455")
+        self.assertIn(
+            "[CRITICAL] 🛡️ AEGIS QUANT: Position Drift Reconciliation",
+            dispatched[0][1]["text"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

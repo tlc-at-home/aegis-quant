@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Aegis Quant (v0.1.0-dev) — Web3 DEX Quantitative Telemetry</title>
+  <title>Aegis Quant (v0.2.0-rc1) — Web3 DEX Quantitative Telemetry</title>
   <style>
     :root {
       --bg-primary: #0b0f17;
@@ -34,6 +34,8 @@
       border-radius: 8px;
       padding: 1rem 1.5rem;
       margin-bottom: 1.25rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
     }
     .brand h1 { font-size: 1.35rem; color: var(--accent); letter-spacing: 0.5px; }
     .brand p { font-size: 0.82rem; color: var(--text-muted); }
@@ -105,6 +107,10 @@
       font-family: inherit;
       font-size: 0.82rem;
     }
+    .btn-row {
+      display: flex;
+      gap: 0.6rem;
+    }
     .btn-save {
       background: var(--accent);
       color: #0b0f17;
@@ -115,19 +121,30 @@
       cursor: pointer;
       font-size: 0.82rem;
     }
-    .btn-save:hover { opacity: 0.9; }
+    .btn-secondary {
+      background: var(--bg-card);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      padding: 0.5rem 1rem;
+      border-radius: 4px;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.82rem;
+    }
+    .btn-save:hover, .btn-secondary:hover { opacity: 0.9; }
     .cred-status-msg { font-size: 0.78rem; margin-top: 0.5rem; color: var(--text-muted); }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
-      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.1.0-dev</span></h1>
-      <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL</p>
+      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.2.0-rc1</span></h1>
+      <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL + Fernet AES-128</p>
     </div>
     <div>
       <span class="badge" id="routing-badge">ROUTING: PAPER</span>
-      <span class="badge" id="wal-badge">SQLite: WAL</span>
+      <span class="badge CHOP" id="telegram-badge">TELEGRAM: STANDBY</span>
+      <span class="badge" id="wal-badge">SQLite: WAL (v3)</span>
       <span class="badge CHOP" id="regime-badge">HMM: CHOP</span>
     </div>
   </header>
@@ -225,7 +242,7 @@
         <input type="text" id="inp-wallet" placeholder="0x..." autocomplete="off" />
       </div>
       <div class="form-group">
-        <label for="inp-privkey">Trade-Only Agent Private Key (No Withdrawals)</label>
+        <label for="inp-privkey">Trade-Only Agent Private Key (Fernet AES-128 Encrypted)</label>
         <input type="password" id="inp-privkey" placeholder="0x... (64 hex chars)" autocomplete="off" />
       </div>
       <div class="form-group">
@@ -237,6 +254,31 @@
       </div>
     </form>
     <div class="cred-status-msg" id="cred-status-msg">Endpoint: https://api.hyperliquid-testnet.xyz • Credentials: Not Configured</div>
+  </section>
+
+  <section class="card cred-panel">
+    <h2>Telegram Bot Alerting & Drawdown Guard (Primary Operational Alerting Channel)</h2>
+    <form class="cred-form" id="telegram-form">
+      <div class="form-group">
+        <label for="inp-tg-token">Telegram Bot Token (Fernet AES-128 Encrypted at Rest)</label>
+        <input type="password" id="inp-tg-token" placeholder="123456789:AAH... (@BotFather)" autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="inp-tg-chat">Telegram Target Chat ID</label>
+        <input type="text" id="inp-tg-chat" placeholder="-1001234567890" autocomplete="off" />
+      </div>
+      <div class="form-group">
+        <label for="inp-dd-pct">Daily Drawdown Alert Threshold (%)</label>
+        <input type="number" id="inp-dd-pct" step="0.1" min="0.5" max="50.0" value="3.0" />
+      </div>
+      <div class="form-group btn-row">
+        <button type="submit" class="btn-save">Save Telegram Config</button>
+        <button type="button" class="btn-secondary" id="btn-test-telegram">Send Test Alert</button>
+      </div>
+    </form>
+    <div class="cred-status-msg" id="telegram-status-msg">
+      Channel: TELEGRAM Bot API • Status: Standby • Triggers: CRITICAL Logs, HMM Regime Flips, Position Drift, Daily Drawdown &ge; 3.0%
+    </div>
   </section>
 
   <script>
@@ -298,6 +340,26 @@
       `).join('');
     }
 
+    function renderTelegramAlerts(c) {
+      if (!c) return;
+      const tgBadge = document.getElementById('telegram-badge');
+      const ready = Boolean(c.telegram_alerts_ready);
+      tgBadge.textContent = ready ? 'TELEGRAM: ACTIVE' : 'TELEGRAM: STANDBY';
+      tgBadge.className = `badge ${ready ? 'BULL' : 'CHOP'}`;
+
+      const tokInput = document.getElementById('inp-tg-token');
+      tokInput.value = '';
+      tokInput.placeholder = c.telegram_bot_token_configured
+        ? `Encrypted (${c.telegram_bot_token_masked})`
+        : '123456789:AAH... (@BotFather)';
+      document.getElementById('inp-tg-chat').value = c.telegram_chat_id || '';
+      const ddPct = Number(c.max_daily_drawdown_alert_pct ?? 0.03) * 100;
+      document.getElementById('inp-dd-pct').value = ddPct.toFixed(1);
+
+      document.getElementById('telegram-status-msg').textContent =
+        `Channel: TELEGRAM Bot API • Status: ${ready ? 'ACTIVE' : 'STANDBY'} • Bot Token: ${c.telegram_bot_token_configured ? c.telegram_bot_token_masked : 'Not Set'} • Chat ID: ${c.telegram_chat_id || 'Not Set'} • Daily DD Guard: ${ddPct.toFixed(1)}%`;
+    }
+
     function renderCredentials(c) {
       if (!c) return;
       const rBadge = document.getElementById('routing-badge');
@@ -310,10 +372,12 @@
       document.getElementById('inp-vault').value = c.hyperliquid_vault_address || '';
       const privInput = document.getElementById('inp-privkey');
       privInput.value = '';
-      privInput.placeholder = c.private_key_masked ? `Configured (${c.private_key_masked})` : '0x... (64 hex chars)';
+      privInput.placeholder = c.private_key_masked ? `Encrypted (${c.private_key_masked})` : '0x... (64 hex chars)';
 
       document.getElementById('cred-status-msg').textContent =
         `Active Routing: ${c.active_routing} • Network: ${(c.network || '').toUpperCase()} (${c.api_endpoint}) • Agent Key: ${c.private_key_configured ? c.private_key_masked : 'Not Set'}`;
+
+      renderTelegramAlerts(c);
     }
 
     document.getElementById('inp-mode').addEventListener('change', (ev) => {
@@ -353,6 +417,51 @@
         renderCredentials(data.credentials);
       } catch (err) {
         msgEl.textContent = `Request failed: ${err}`;
+      }
+    });
+
+    document.getElementById('telegram-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const msgEl = document.getElementById('telegram-status-msg');
+      const ddPctInput = Number(document.getElementById('inp-dd-pct').value || 3.0);
+      const payload = {
+        telegram_chat_id: document.getElementById('inp-tg-chat').value.trim(),
+        max_daily_drawdown_alert_pct: ddPctInput / 100.0,
+      };
+      const tokVal = document.getElementById('inp-tg-token').value.trim();
+      if (tokVal) {
+        payload.telegram_bot_token = tokVal;
+      }
+      try {
+        const res = await fetch('/api/v1/alerts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msgEl.textContent = `Telegram configuration error: ${data.detail || res.statusText}`;
+          return;
+        }
+        renderTelegramAlerts(data.alerts);
+      } catch (err) {
+        msgEl.textContent = `Telegram config request failed: ${err}`;
+      }
+    });
+
+    document.getElementById('btn-test-telegram').addEventListener('click', async () => {
+      const msgEl = document.getElementById('telegram-status-msg');
+      msgEl.textContent = 'Dispatching Telegram test alert...';
+      try {
+        const res = await fetch('/api/v1/alerts/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: 'v0.2.0-rc1 Dashboard Telegram Test Alert', level: 'INFO' }),
+        });
+        const data = await res.json();
+        msgEl.textContent = `Telegram Test Result: ${data.status} (telegram_sent=${data.telegram_sent}, verified=${Boolean(data.webhook_payload_verified)})`;
+      } catch (err) {
+        msgEl.textContent = `Telegram test alert failed: ${err}`;
       }
     });
 

@@ -696,6 +696,71 @@ class TestSignalsHMMMace(unittest.TestCase):
         stats_reopen = asyncio.run(exec_engine.reconcile_cycle(regime_bull, sol_eval))
         self.assertEqual(stats_reopen["opened_trades"], 1)
 
+    def test_hmm_regime_decoding_on_synthetic_bull_bear_chop_series(self) -> None:
+        """
+        Validate 3-State Diagonal-Covariance Gaussian HMM regime decoding accuracy across
+        synthetic Bear, Chop, and Bull market series segments.
+        """
+        rng = np.random.default_rng(2026)
+        rets_bear = -0.009 + rng.normal(0.0, 0.004, size=100)
+        rets_chop = 0.000 + rng.normal(0.0, 0.0015, size=100)
+        rets_bull = +0.009 + rng.normal(0.0, 0.003, size=100)
+
+        def _build_3phase_df(rets: np.ndarray) -> pd.DataFrame:
+            n = len(rets)
+            closes = 50000.0 * np.exp(np.cumsum(rets))
+            opens = np.roll(closes, 1)
+            opens[0] = 50000.0
+            highs = np.maximum(opens, closes) * 1.002
+            lows = np.minimum(opens, closes) * 0.998
+            ts = np.arange(n, dtype=np.int64) * 14_400_000 + 1750000000000
+            return pd.DataFrame(
+                {
+                    "timestamp_ms": ts,
+                    "timestamp_utc": ts,
+                    "open": opens,
+                    "high": highs,
+                    "low": lows,
+                    "close": closes,
+                    "volume": np.full(n, 2500.0, dtype=np.float64),
+                    "funding_rate_hourly": np.zeros(n, dtype=np.float64),
+                    "is_synthetic": np.zeros(n, dtype=np.int64),
+                }
+            )
+
+        # 1. Decode ending in BULL phase (Bear -> Chop -> Bull)
+        df_end_bull = _build_3phase_df(np.concatenate([rets_bear, rets_chop, rets_bull]))
+        pc1_bull = pd.Series(np.concatenate([rets_bear, rets_chop, rets_bull]) * 1.1)
+        self.engine._hmm_cache.clear()
+        reg_bull, p_bull, p_bear, p_chop = self.engine.decode_hmm_regime_states(
+            df_end_bull, pc1_bull, self.cfg
+        )
+        self.assertEqual(reg_bull, "BULL")
+        self.assertGreater(p_bull, 0.55)
+        self.assertAlmostEqual(p_bull + p_bear + p_chop, 1.0, places=5)
+
+        # 2. Decode ending in BEAR phase (Chop -> Bull -> Bear)
+        df_end_bear = _build_3phase_df(np.concatenate([rets_chop, rets_bull, rets_bear]))
+        pc1_bear = pd.Series(np.concatenate([rets_chop, rets_bull, rets_bear]) * 1.1)
+        self.engine._hmm_cache.clear()
+        reg_bear, p_bull_b, p_bear_b, p_chop_b = self.engine.decode_hmm_regime_states(
+            df_end_bear, pc1_bear, self.cfg
+        )
+        self.assertEqual(reg_bear, "BEAR")
+        self.assertGreater(p_bear_b, 0.55)
+        self.assertAlmostEqual(p_bull_b + p_bear_b + p_chop_b, 1.0, places=5)
+
+        # 3. Decode ending in CHOP phase (Bear -> Bull -> Chop)
+        df_end_chop = _build_3phase_df(np.concatenate([rets_bear, rets_bull, rets_chop]))
+        pc1_chop = pd.Series(np.concatenate([rets_bear, rets_bull, rets_chop]) * 1.1)
+        self.engine._hmm_cache.clear()
+        reg_chop, p_bull_c, p_bear_c, p_chop_c = self.engine.decode_hmm_regime_states(
+            df_end_chop, pc1_chop, self.cfg
+        )
+        self.assertEqual(reg_chop, "CHOP")
+        self.assertGreater(p_chop_c, 0.50)
+        self.assertAlmostEqual(p_bull_c + p_bear_c + p_chop_c, 1.0, places=5)
+
 
 def test_mace_no_lookahead_leakage() -> None:
     """Standalone pytest function entry point for test_mace_no_lookahead_leakage."""
@@ -709,4 +774,5 @@ def test_mace_no_lookahead_leakage() -> None:
 
 if __name__ == "__main__":
     unittest.main()
+
 

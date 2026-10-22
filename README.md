@@ -1,10 +1,10 @@
-# Aegis Quant (`v0.2.0-alpha2`)
+# Aegis Quant (`v0.2.0-rc1`)
 
 Autonomous, self-custodial Web3 DEX quantitative crypto trading platform targeting **Hyperliquid USDC Perpetuals (`USDC_PERP`)** on **Fedora 45 Minimal** (`/home/fedora/aegis`).
 
 ---
 
-## Key Capabilities (`v0.2.0-alpha2` — Quant Core, Backtester & Execution FSM)
+## Key Capabilities (`v0.2.0-rc1` — Quant Core, Execution FSM, Security & CI)
 
 - **Hyperliquid L1 Native Execution & Order Finite State Machine (`engine/execution.py`)**:
   - Non-custodial routing via a Main Arbitrum Wallet (`wallet_address`) and Trade-Only Agent Wallet (`private_key`), modeling `1.5 bps` maker / `4.5 bps` taker fees and 1-hour funding settlement.
@@ -12,6 +12,11 @@ Autonomous, self-custodial Web3 DEX quantitative crypto trading platform targeti
   - **On-Chain Position Drift Reconciliation (`reconcile_exchange_state()`)**: Compares live Hyperliquid L1 positions (`exchange.fetch_positions()`) against local `OPEN` trades every 15s cycle, force-closing drifted positions with `exit_reason='EXCHANGE_RECONCILE'` (plus `CRITICAL` telemetry alerts) and syncing partial size reductions.
   - **Exact 1H Funding Settlement Sync (`sync_funding_payments()`)**: Queries `exchange.fetch_funding_history(symbol, since=last_sync)` in `LIVE`/`TESTNET` modes to record exact USDC funding transfers.
   - **Realistic Paper Fill & Dynamic Slippage Model (`simulate_paper_fill()`)**: Models volatility-and-size slippage $\text{Slippage}_{\text{eff}} = \text{default\_slippage\_bps} + \text{impact\_coeff} \times (\text{ATR}_{14}/\text{Close}) \times (\text{Notional}_{\text{USD}}/10000)$ and next-bar `low <= limit_price` (`BUY`) / `high >= limit_price` (`SELL`) maker fill verification.
+- **Security Hardening, Webhook Alerting & CI Pipeline (`v0.2.0-rc1`)**:
+  - **Fernet AES-128-CBC + HMAC-SHA256 Encryption at Rest (`engine/database.py`)**: Encrypts sensitive configuration secrets (`private_key`, `gemini_api_key`, `telegram_bot_token`) in SQLite (`gAAAAAB...` tokens on disk) with systemd `LoadCredentialEncrypted=` / environment master key derivation, transparent in-memory decryption (`get_decrypted_config()`), and atomic master key rotation (`rotate_master_key()`).
+  - **Schema Versioning Ledger (`sql/migrations/003_v020_schema_versioning.sql`)**: Tracks applied schema migrations (`schema_version = 3`) in `schema_migrations`.
+  - **Asynchronous Telegram Bot & Discord Webhook Alerting (`engine/alerts.py`)**: Dispatches real-time notifications on `CRITICAL` log events, HMM regime flips (`CHOP` $\rightarrow$ `BULL` / `BEAR`), on-chain position reconciliation mismatches, and daily portfolio drawdown breaches (`>= 3.0%`), configurable via the Web UI (`:8000`) and `/api/v1/alerts`.
+  - **GitHub Actions CI/CD Pipeline (`.github/workflows/ci.yml`)**: Automatically runs `ruff check .`, `mypy --ignore-missing-imports engine/`, and `pytest tests/ -v` on Python 3.12 across every push and pull request to `main`.
 - **Synthetic `ALT/BTC` Cross-Pair Engine (`BTC_SYNTH`)**:
   - Computes timestamp-aligned `ALT/BTC:SYNTH` OHLCV candles from `ALT/USDC:USDC` and `BTC/USDC:USDC` perpetuals ($P_{\text{Alt/BTC}}(t) = P_{\text{Alt/USDC}}(t) / P_{\text{BTC/USDC}}(t)$).
 - **Cached Warm-Start 3-State Gaussian HMM Regime Gate (540-Bar 4H Window)**:
@@ -45,39 +50,43 @@ Autonomous, self-custodial Web3 DEX quantitative crypto trading platform targeti
 
 ## Repository Structure
 
+- `.github/workflows/ci.yml` — GitHub Actions CI pipeline (`ruff`, `mypy`, `pytest` on Python 3.12)
 - `deploy/bootstrap_vm.sh` & `deploy/aegis-quant.service` — Fedora 45 Minimal provisioning & systemd service (`User=fedora`)
-- `sql/schema_and_seed.sql`, `sql/migrations/001_v020_config_expansion.sql`, `sql/migrations/002_v020_order_fsm.sql` — SQLite WAL schema, `order_state_audit` FSM table, 3 views, 92 `system_config` hyperparameters, and 31 universe rows
+- `sql/schema_and_seed.sql` & `sql/migrations/001..003_*.sql` — SQLite WAL schema, `order_state_audit` FSM table, `schema_migrations` ledger (`schema_version = 3`), 3 views, 95 `system_config` hyperparameters, and 31 universe rows
 - `data/real_4h_backfill.json` — 1,950 real historical Hyperliquid L1 4H OHLCV candles per asset (`2025-11-30` $\rightarrow$ `2026-10-21`)
-- `engine/` — `database.py`, `ingestion.py`, `signals.py`, `risk.py`, `execution.py`, `calibration.py`, `backtest.py`, `main.py` (`__version__ = "0.2.0-alpha2"`)
-- `web/` — `server.py` & `static/index.html` FastAPI REST + SSE live telemetry dashboard (`:8000`)
-- `tests/` — `test_hyperliquid_credentials.py`, `test_signals_hmm_mace.py`, `test_execution_state_machine.py`, `test_paper_fill_model.py` (32 unit & integration tests)
+- `engine/` — `database.py`, `ingestion.py`, `signals.py`, `risk.py`, `execution.py`, `alerts.py`, `calibration.py`, `backtest.py`, `main.py` (`__version__ = "0.2.0-rc1"`)
+- `web/` — `server.py` & `static/index.html` FastAPI REST + SSE live telemetry, credential & Telegram alert dashboard (`:8000`)
+- `tests/` — `test_hyperliquid_credentials.py`, `test_signals_hmm_mace.py`, `test_execution_state_machine.py`, `test_paper_fill_model.py`, `test_risk_boundaries.py` (41 unit & integration tests)
 
 ---
 
 ## CLI Usage & Verification Commands
 
 ```bash
-# 1. Apply schema migrations 001 & 002
+# 1. Apply schema migrations 001, 002 & 003 (schema_version = 3, 95 system_config keys)
 python3 -m engine.database --apply-migration sql/migrations/001_v020_config_expansion.sql
 python3 -m engine.database --apply-migration sql/migrations/002_v020_order_fsm.sql
+python3 -m engine.database --apply-migration sql/migrations/003_v020_schema_versioning.sql
 
-# 2. Run 90-day Commit Point 1 point-in-time backtest
+# 2. Verify Fernet AES-128 encryption at rest & webhook alerting
+python3 -m engine.database --test-encryption
+python3 -m engine.alerts --test-alert "v0.2.0-rc1 Deployment Ready"
+
+# 3. Run 90-day & full YTD point-in-time backtests
 python3 -m engine.backtest --start-date 2026-07-20 --end-date 2026-10-20 --initial-equity 10000
-
-# 3. Run full YTD real-data intra-bar wick stress-test backtest
 python3 -m engine.backtest --start-date 2026-01-01 --end-date 2026-10-22 --initial-equity 10000
 
-# 4. Run the full 32-test verification suite (Quant Core, Calibrations 1-3, Order FSM & Paper Fill Model)
+# 4. Run the full 41-test verification suite
 python3 -m unittest discover -s tests -v
 ```
 
 ---
 
-## Centralized SQLite Configuration & Web3 DEX Credentials
+## Centralized SQLite Configuration & Encrypted Web3 DEX Credentials
 
-All 92 operational parameters and Web3 DEX credentials (`wallet_address`, `private_key`, `gemini_api_key`, `hyperliquid_vault_address`, `hyperliquid_testnet`, `execution_mode`) are stored **exclusively inside the SQLite WAL `system_config` table (`data/aegis_quant.db`)** — never in `.env` files, environment variables, or external Linux configuration files.
+All 95 operational parameters, Web3 DEX credentials (`wallet_address`, `private_key`, `gemini_api_key`, `hyperliquid_vault_address`, `hyperliquid_testnet`, `execution_mode`), and alerting secrets (`telegram_bot_token`, `telegram_chat_id`, `discord_webhook_url`) are stored **exclusively inside the SQLite WAL `system_config` table (`data/aegis_quant.db`)** with sensitive credentials encrypted at rest using Fernet AES-128-CBC + HMAC-SHA256 — never in `.env` files, environment variables, or external Linux configuration files.
 
 Parameters and credentials in `system_config` can be inspected or updated directly in SQLite via:
-- **Web Dashboard (`:8000`) / REST API**: `GET/POST /api/v1/credentials` and `GET/POST /api/v1/config`
+- **Web Dashboard (`:8000`) / REST API**: `GET/POST /api/v1/credentials`, `GET/POST /api/v1/alerts`, and `GET/POST /api/v1/config`
 - **SQLite CLI**: `sqlite3 data/aegis_quant.db "UPDATE system_config SET config_value = '...' WHERE config_key = 'wallet_address';"`
 - **Engine CLI**: `python3 -m engine.main --configure-only --testnet --execution-mode LIVE --wallet-address 0x... --private-key 0x...`

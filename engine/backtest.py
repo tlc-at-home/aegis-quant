@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import math
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,7 @@ from engine.calibration import WalkForwardCalibrator
 from engine.database import DEFAULT_DB_PATH, PROJECT_ROOT, DatabaseManager
 from engine.ingestion import BASE_PRICES_USDC, MarketIngestionEngine
 from engine.risk import PositionSizeResult, RiskEngine
-from engine.signals import RegimeState, SignalEngine
+from engine.signals import SignalEngine
 
 logger = logging.getLogger("aegis.backtest")
 

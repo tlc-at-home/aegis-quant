@@ -6,7 +6,6 @@ import asyncio
 import datetime as dt
 import logging
 import time
-import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -15,6 +14,7 @@ from unittest.mock import AsyncMock
 import ccxt.async_support as ccxt
 import pandas as pd
 
+from engine.alerts import AlertEngine
 from engine.database import DatabaseManager
 from engine.risk import PositionSizeResult, RiskEngine
 from engine.signals import RegimeState
@@ -78,6 +78,7 @@ class ExecutionEngine:
         self.db = db
         self.risk_engine = risk_engine
         self.exchange: Any | None = exchange
+        self.alerts = AlertEngine(self.db)
         self._execution_mode_override: str | None = (
             execution_mode.strip().upper() if execution_mode is not None else None
         )
@@ -1186,17 +1187,7 @@ class ExecutionEngine:
     ) -> None:
         """Dispatch optional Telegram/Discord webhook alert for critical reconciliation events."""
         try:
-            cfg = self.db.load_config()
-            webhook_url = str(cfg.get("discord_webhook_url", "")).strip()
-            if webhook_url and webhook_url.startswith("http"):
-                payload = f'{{"content": "[{level}] AEGIS QUANT: {title} - {message}"}}'.encode("utf-8")
-                req = urllib.request.Request(
-                    webhook_url,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                await asyncio.to_thread(urllib.request.urlopen, req, timeout=3.0)
+            await self.alerts.send_alert(title=title, message=message, level=level)
         except Exception:
             pass
 
