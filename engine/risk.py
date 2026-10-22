@@ -29,6 +29,21 @@ class PositionSizeResult:
     atr_value: float
 
 
+@dataclass
+class ChandelierStopEvaluation:
+    """Result of Two-Tier Chandelier Stop evaluation (catastrophic wick vs bar_close ratchet)."""
+
+    triggered: bool
+    is_wick_stop: bool
+    exit_reason: str | None
+    exit_fill_price: float
+    exit_slippage_usdc: float
+    chandelier_stop_price: float
+    highest_price_seen: float
+    lowest_price_seen: float
+    effective_atr: float
+
+
 class RiskEngine:
     """
     Enforces conviction-scaled risk sizing ($50 to $150 per trade, 0.5x to 1.5x),
@@ -94,6 +109,147 @@ class RiskEngine:
             return value
         decimals = max(0, int(round(-math.log10(step)))) if step < 1 else 0
         return round(math.floor(value / step) * step, decimals)
+
+    def evaluate_two_tier_chandelier_stop(
+        self,
+        *,
+        side: str,
+        entry_price: float,
+        active_stop: float,
+        highest_price_seen: float,
+        lowest_price_seen: float,
+        bar_open: float,
+        bar_high: float,
+        bar_low: float,
+        bar_close: float,
+        atr_value: float,
+        quantity: float = 1.0,
+        config: dict[str, Any] | None = None,
+    ) -> ChandelierStopEvaluation:
+        """
+        Evaluate Two-Tier Chandelier Trailing Stop (Calibration 1):
+        - Tier 1 (Catastrophic Wick Liquidation Stop): triggers only if intra-bar low/high
+          overshoots `active_stop` by `chandelier_wick_overshoot_atr` (0.85x ATR), applying
+          base stop slippage (`stop_slippage_bps`, 8 bps) + `wick_overshoot_slippage_fraction` (15%)
+          of the wick overshoot distance.
+        - Tier 2 (Confirmed Bar-Close Ratchet & Trailing Stop): ratchets `highest_price_seen` /
+          `lowest_price_seen` strictly on confirmed `bar_close` prices (immune to transient intra-bar
+          spikes), uses 3.0x ATR for LONG and 3.8x ATR for SHORT, and evaluates standard Chandelier
+          trailing stops on `bar_close` (8 bps slippage).
+        """
+        cfg = config if config is not None else self.db.load_config()
+        long_mult = float(cfg.get("chandelier_atr_multiplier_long", 3.0))
+        short_mult = float(cfg.get("chandelier_atr_multiplier_short", 3.8))
+        wick_overshoot_atr = float(cfg.get("chandelier_wick_overshoot_atr", 0.85))
+        stop_slippage_rate = float(cfg.get("stop_slippage_bps", 8.0)) / 10000.0
+        wick_overshoot_frac = float(cfg.get("wick_overshoot_slippage_fraction", 0.15))
+        min_atr_pct = float(cfg.get("chandelier_min_atr_pct", 0.022))
+
+        eff_atr = max(float(atr_value), float(bar_close) * min_atr_pct)
+        qty = float(quantity)
+        side_up = str(side).upper()
+
+        if side_up == "LONG":
+            wick_stop_trigger = float(active_stop) - wick_overshoot_atr * eff_atr
+            if float(bar_low) <= wick_stop_trigger:
+                trigger_px = min(wick_stop_trigger, float(bar_open))
+                wick_overshoot = max(0.0, trigger_px - float(bar_low)) * wick_overshoot_frac
+                base_wick_px = max(float(bar_low), trigger_px - wick_overshoot)
+                exit_fill_price = base_wick_px * (1.0 - stop_slippage_rate)
+                exit_slip_usdc = max(0.0, (trigger_px - exit_fill_price) * qty)
+                return ChandelierStopEvaluation(
+                    triggered=True,
+                    is_wick_stop=True,
+                    exit_reason="INTRABAR_LOW_WICK_CHANDELIER_STOP_LONG",
+                    exit_fill_price=exit_fill_price,
+                    exit_slippage_usdc=exit_slip_usdc,
+                    chandelier_stop_price=float(active_stop),
+                    highest_price_seen=float(highest_price_seen),
+                    lowest_price_seen=float(lowest_price_seen),
+                    effective_atr=eff_atr,
+                )
+
+            new_highest = max(float(highest_price_seen), float(bar_close))
+            cand_stop = new_highest - long_mult * eff_atr
+            new_stop = max(float(active_stop), cand_stop)
+            if float(bar_close) <= new_stop:
+                exit_fill_price = float(bar_close) * (1.0 - stop_slippage_rate)
+                exit_slip_usdc = float(bar_close) * stop_slippage_rate * qty
+                return ChandelierStopEvaluation(
+                    triggered=True,
+                    is_wick_stop=False,
+                    exit_reason="CHANDELIER_TRAILING_STOP_LONG",
+                    exit_fill_price=exit_fill_price,
+                    exit_slippage_usdc=exit_slip_usdc,
+                    chandelier_stop_price=new_stop,
+                    highest_price_seen=new_highest,
+                    lowest_price_seen=float(lowest_price_seen),
+                    effective_atr=eff_atr,
+                )
+
+            return ChandelierStopEvaluation(
+                triggered=False,
+                is_wick_stop=False,
+                exit_reason=None,
+                exit_fill_price=float(bar_close),
+                exit_slippage_usdc=0.0,
+                chandelier_stop_price=new_stop,
+                highest_price_seen=new_highest,
+                lowest_price_seen=float(lowest_price_seen),
+                effective_atr=eff_atr,
+            )
+
+        # SHORT position
+        wick_stop_trigger = float(active_stop) + wick_overshoot_atr * eff_atr
+        if float(bar_high) >= wick_stop_trigger:
+            trigger_px = max(wick_stop_trigger, float(bar_open))
+            wick_overshoot = max(0.0, float(bar_high) - trigger_px) * wick_overshoot_frac
+            base_wick_px = min(float(bar_high), trigger_px + wick_overshoot)
+            exit_fill_price = base_wick_px * (1.0 + stop_slippage_rate)
+            exit_slip_usdc = max(0.0, (exit_fill_price - trigger_px) * qty)
+            return ChandelierStopEvaluation(
+                triggered=True,
+                is_wick_stop=True,
+                exit_reason="INTRABAR_HIGH_WICK_CHANDELIER_STOP_SHORT",
+                exit_fill_price=exit_fill_price,
+                exit_slippage_usdc=exit_slip_usdc,
+                chandelier_stop_price=float(active_stop),
+                highest_price_seen=float(highest_price_seen),
+                lowest_price_seen=float(lowest_price_seen),
+                effective_atr=eff_atr,
+            )
+
+        new_lowest = min(float(lowest_price_seen), float(bar_close))
+        cand_stop = new_lowest + short_mult * eff_atr
+        if float(entry_price) - new_lowest >= 1.6 * eff_atr:
+            cand_stop = min(cand_stop, float(entry_price) - 0.45 * eff_atr)
+        new_stop = min(float(active_stop), cand_stop)
+        if float(bar_close) >= new_stop:
+            exit_fill_price = float(bar_close) * (1.0 + stop_slippage_rate)
+            exit_slip_usdc = float(bar_close) * stop_slippage_rate * qty
+            return ChandelierStopEvaluation(
+                triggered=True,
+                is_wick_stop=False,
+                exit_reason="INVERTED_CHANDELIER_STOP_SHORT",
+                exit_fill_price=exit_fill_price,
+                exit_slippage_usdc=exit_slip_usdc,
+                chandelier_stop_price=new_stop,
+                highest_price_seen=float(highest_price_seen),
+                lowest_price_seen=new_lowest,
+                effective_atr=eff_atr,
+            )
+
+        return ChandelierStopEvaluation(
+            triggered=False,
+            is_wick_stop=False,
+            exit_reason=None,
+            exit_fill_price=float(bar_close),
+            exit_slippage_usdc=0.0,
+            chandelier_stop_price=new_stop,
+            highest_price_seen=float(highest_price_seen),
+            lowest_price_seen=new_lowest,
+            effective_atr=eff_atr,
+        )
 
     def evaluate_order_risk(
         self,
@@ -199,16 +355,21 @@ class RiskEngine:
         )
         allocated_risk_usdc = min(desired_risk_usdc, remaining_heat)
 
+        min_atr_pct = float(cfg.get("chandelier_min_atr_pct", 0.022))
+        eff_atr = max(atr_val, entry_price * min_atr_pct)
         if side == "LONG":
             atr_mult = float(cfg.get("chandelier_atr_multiplier_long", 3.0))
-            stop_distance = max(atr_mult * atr_val, entry_price * 0.01)
+            stop_distance = max(atr_mult * eff_atr, entry_price * 0.01)
             stop_price = max(entry_price - stop_distance, entry_price * 0.10)
+            sizing_distance = max(atr_mult * atr_val, entry_price * 0.01)
         else:
-            atr_mult = float(cfg.get("chandelier_atr_multiplier_short", 2.5))
-            stop_distance = max(atr_mult * atr_val, entry_price * 0.01)
+            atr_mult = float(cfg.get("chandelier_atr_multiplier_short", 3.8))
+            stop_distance = max(atr_mult * eff_atr, entry_price * 0.01)
             stop_price = entry_price + stop_distance
+            sizing_mult = float(cfg.get("short_sizing_atr_multiplier", 2.5))
+            sizing_distance = max(sizing_mult * atr_val, entry_price * 0.01)
 
-        stop_pct = stop_distance / max(entry_price, 1e-12)
+        stop_pct = sizing_distance / max(entry_price, 1e-12)
         raw_notional = allocated_risk_usdc / max(stop_pct, 1e-6)
 
         capped_notional = min(raw_notional, max_single_asset_usdc, remaining_notional)
@@ -248,3 +409,4 @@ class RiskEngine:
             initial_stop_price=rounded_stop,
             atr_value=atr_val,
         )
+

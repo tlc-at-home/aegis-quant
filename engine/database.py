@@ -95,19 +95,49 @@ class DatabaseManager:
         db_path: Path | str = DEFAULT_DB_PATH,
         schema_path: Path | str = DEFAULT_SCHEMA_PATH,
     ) -> None:
-        self.db_path = Path(db_path)
+        raw_path = str(db_path).strip()
+        self._is_memory = raw_path == ":memory:" or raw_path.startswith("file::memory:")
+        self.db_path = Path(raw_path) if not self._is_memory else Path(":memory:")
         self.schema_path = Path(schema_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._memory_conn: sqlite3.Connection | None = None
+        self.pit_timestamp_ms: int | None = None
+        if not self._is_memory:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def close(self) -> None:
+        """Close persistent in-memory SQLite connection if open."""
+        if self._memory_conn is not None:
+            try:
+                self._memory_conn.close()
+            except Exception:
+                pass
+            self._memory_conn = None
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
         """Yield a SQLite connection pre-configured for WAL concurrency with cross-VM retry."""
+        if self._is_memory:
+            if self._memory_conn is None:
+                self._memory_conn = sqlite3.connect(":memory:", timeout=30.0, check_same_thread=False)
+                self._memory_conn.row_factory = sqlite3.Row
+                self._memory_conn.execute("PRAGMA temp_store = MEMORY;")
+                self._memory_conn.execute("PRAGMA synchronous = NORMAL;")
+                self._memory_conn.execute("PRAGMA foreign_keys = ON;")
+            try:
+                yield self._memory_conn
+                self._memory_conn.commit()
+            except Exception:
+                self._memory_conn.rollback()
+                raise
+            return
+
         conn: sqlite3.Connection | None = None
         last_err: Exception | None = None
         for attempt in range(16):
             try:
                 conn = sqlite3.connect(str(self.db_path), timeout=30.0)
                 conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA temp_store = MEMORY;")
                 conn.execute("PRAGMA busy_timeout = 15000;")
                 cur_mode = conn.execute("PRAGMA journal_mode;").fetchone()
                 if not cur_mode or str(cur_mode[0]).lower() != "wal":
@@ -146,11 +176,46 @@ class DatabaseManager:
         sql_script = self.schema_path.read_text(encoding="utf-8")
         with self.connection() as conn:
             cur_mode = conn.execute("PRAGMA journal_mode;").fetchone()
-            if cur_mode and str(cur_mode[0]).lower() == "wal":
+            if self._is_memory or (cur_mode and str(cur_mode[0]).lower() == "wal"):
                 sql_script = sql_script.replace("PRAGMA journal_mode = WAL;", "")
             conn.executescript(sql_script)
 
         return self.verify_integrity()
+
+    def apply_migration(self, migration_path: Path | str) -> dict[str, Any]:
+        """Execute a versioned DDL/DML SQL migration script and return updated integrity counts."""
+        mig_path = Path(migration_path)
+        if not mig_path.exists():
+            candidate = PROJECT_ROOT / migration_path
+            if candidate.exists():
+                mig_path = candidate
+            else:
+                raise FileNotFoundError(f"Migration SQL file not found: {migration_path}")
+
+        # Ensure base tables exist before applying incremental migration
+        with self.connection() as conn:
+            has_cfg = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='system_config';"
+            ).fetchone()
+        if not has_cfg:
+            self.init_db()
+
+        sql_script = mig_path.read_text(encoding="utf-8")
+        with self.connection() as conn:
+            conn.executescript(sql_script)
+
+        integrity = self.verify_integrity()
+        self.log_telemetry(
+            "INFO",
+            "engine.database",
+            f"Applied SQLite migration {mig_path.name}",
+            {"migration_file": str(mig_path), **integrity},
+        )
+        return {
+            "status": "APPLIED",
+            "migration_file": str(mig_path.name),
+            **integrity,
+        }
 
     def verify_integrity(self) -> dict[str, Any]:
         """Verify WAL journal mode, 60 config keys, and 31 universe asset views."""
@@ -516,21 +581,39 @@ class DatabaseManager:
         return len(rows)
 
     def get_ohlcv_df(
-        self, symbol: str, timeframe: str, limit: int = 600
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = 600,
+        max_timestamp_ms: int | None = None,
     ) -> pd.DataFrame:
         """Fetch historical OHLCV bars for a symbol/timeframe sorted chronologically."""
+        eff_max_ts = max_timestamp_ms if max_timestamp_ms is not None else self.pit_timestamp_ms
         with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT timestamp_ms, open, high, low, close, volume,
-                       funding_rate_hourly, is_synthetic
-                FROM market_ohlcv
-                WHERE symbol = ? AND timeframe = ?
-                ORDER BY timestamp_ms DESC
-                LIMIT ?;
-                """,
-                (symbol, timeframe, limit),
-            ).fetchall()
+            if eff_max_ts is not None:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp_ms, open, high, low, close, volume,
+                           funding_rate_hourly, is_synthetic
+                    FROM market_ohlcv
+                    WHERE symbol = ? AND timeframe = ? AND timestamp_ms <= ?
+                    ORDER BY timestamp_ms DESC
+                    LIMIT ?;
+                    """,
+                    (symbol, timeframe, int(eff_max_ts), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp_ms, open, high, low, close, volume,
+                           funding_rate_hourly, is_synthetic
+                    FROM market_ohlcv
+                    WHERE symbol = ? AND timeframe = ?
+                    ORDER BY timestamp_ms DESC
+                    LIMIT ?;
+                    """,
+                    (symbol, timeframe, limit),
+                ).fetchall()
 
         if not rows:
             return pd.DataFrame(
@@ -675,6 +758,15 @@ class DatabaseManager:
         exit_reason: str,
     ) -> None:
         """Close an open position and record realized PnL."""
+        import datetime as dt
+
+        if self.pit_timestamp_ms is not None:
+            closed_iso = dt.datetime.fromtimestamp(
+                int(self.pit_timestamp_ms) / 1000.0, tz=dt.timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            closed_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         with self.connection() as conn:
             conn.execute(
                 """
@@ -685,11 +777,19 @@ class DatabaseManager:
                     realized_pnl_usdc = ?,
                     unrealized_pnl_usdc = 0.0,
                     fees_paid_usdc = ?,
-                    closed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    closed_at = ?,
                     exit_reason = ?
                 WHERE trade_id = ?;
                 """,
-                (exit_price, exit_price, realized_pnl_usdc, fees_paid_usdc, exit_reason, trade_id),
+                (
+                    exit_price,
+                    exit_price,
+                    realized_pnl_usdc,
+                    fees_paid_usdc,
+                    closed_iso,
+                    exit_reason,
+                    trade_id,
+                ),
             )
 
     def save_portfolio_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -773,3 +873,40 @@ class DatabaseManager:
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def main() -> None:
+    """CLI entrypoint for SQLite schema initialization and versioned DDL migrations."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Aegis Quant SQLite WAL Database & Migration Manager")
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default=str(DEFAULT_DB_PATH),
+        help="Path to SQLite database file (default: data/aegis_quant.db)",
+    )
+    parser.add_argument(
+        "--init-db",
+        action="store_true",
+        help="Initialize base SQLite WAL schema and seed configuration",
+    )
+    parser.add_argument(
+        "--apply-migration",
+        type=str,
+        default=None,
+        help="Apply a versioned SQL migration script (e.g., sql/migrations/001_v020_config_expansion.sql)",
+    )
+    args = parser.parse_args()
+
+    db = DatabaseManager(db_path=args.db_path)
+    if args.apply_migration:
+        result = db.apply_migration(args.apply_migration)
+    else:
+        result = db.init_db()
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+

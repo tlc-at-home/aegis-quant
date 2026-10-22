@@ -89,7 +89,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('atr_period', '14', 'int', 'stops', 'Average True Range lookback period in bars'),
     ('chandelier_lookback_bars', '22', 'int', 'stops', 'Lookback bars for Chandelier high/low anchor'),
     ('chandelier_atr_multiplier_long', '3.0', 'float', 'stops', 'Chandelier trailing stop ATR multiplier for Long positions'),
-    ('chandelier_atr_multiplier_short', '2.5', 'float', 'stops', 'Inverted Chandelier trailing stop ATR multiplier for Short positions'),
+    ('chandelier_atr_multiplier_short', '3.8', 'float', 'stops', 'Inverted Chandelier trailing stop ATR multiplier for Short positions'),
     ('polling_interval_seconds', '15', 'int', 'orchestrator', 'Main engine ingestion and signal evaluation loop interval in seconds'),
     ('ohlcv_fetch_limit', '600', 'int', 'orchestrator', 'Number of historical candles fetched per symbol (>= 540 HMM bars)'),
     ('calibration_walk_forward_days', '90', 'int', 'calibration', 'Walk-forward window in days for per-asset timeframe calibration'),

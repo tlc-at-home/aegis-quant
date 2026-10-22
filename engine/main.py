@@ -24,6 +24,7 @@ from web.server import create_app
 
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_FILE = LOG_DIR / "engine.log"
+MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
 
 
 def setup_logging() -> logging.Logger:
@@ -114,6 +115,8 @@ class AegisOrchestrator:
     async def run_forever(self) -> None:
         """Initialize SQLite WAL, launch FastAPI on :8000, and run the trading engine loop."""
         integrity = self.db.init_db()
+        if MIGRATION_001_PATH.exists():
+            integrity = self.db.apply_migration(MIGRATION_001_PATH)
         self.logger.info(
             "Starting %s v%s | SQLite journal_mode=%s | config=%d | USDC_PERP=%d | BTC_SYNTH=%d",
             __platform__,
@@ -233,6 +236,8 @@ def main() -> None:
 
     orchestrator = AegisOrchestrator()
     orchestrator.db.init_db()
+    if MIGRATION_001_PATH.exists():
+        orchestrator.db.apply_migration(MIGRATION_001_PATH)
 
     testnet_flag: bool | None = None
     if args.testnet:

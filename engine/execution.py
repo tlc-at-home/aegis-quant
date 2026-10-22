@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import time
 import uuid
@@ -26,6 +27,63 @@ class ExecutionEngine:
         self.db = db
         self.risk_engine = risk_engine
         self._last_funding_settlement_hour: int = int(time.time() // 3600)
+        self._cooldown_until_ms: dict[str, int] = {}
+        self._cooldown_until_step: dict[str, int] = {}
+        self._step_counter: int = 0
+        self._restore_cooldowns_from_db()
+
+    def _restore_cooldowns_from_db(self) -> None:
+        """Reconstruct active per-asset post-stop cooldown timestamps from SQLite closed trades."""
+        try:
+            cfg = self.db.load_config()
+            cooldown_bars = int(cfg.get("post_stop_cooldown_bars", 14))
+            cooldown_ms = cooldown_bars * 4 * 3_600_000
+            with self.db.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, closed_at
+                    FROM trades
+                    WHERE status = 'CLOSED' AND closed_at IS NOT NULL
+                    ORDER BY trade_id ASC;
+                    """
+                ).fetchall()
+            for row in rows:
+                sym = str(row["symbol"])
+                raw_closed = str(row["closed_at"]).strip()
+                if not raw_closed:
+                    continue
+                parsed = dt.datetime.fromisoformat(raw_closed.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=dt.timezone.utc)
+                closed_ts_ms = int(parsed.timestamp() * 1000)
+                until_ms = closed_ts_ms + cooldown_ms
+                if until_ms > self._cooldown_until_ms.get(sym, 0):
+                    self._cooldown_until_ms[sym] = until_ms
+        except Exception:
+            pass
+
+    def is_in_cooldown(
+        self,
+        symbol: str,
+        now_ms: int | None = None,
+        step_idx: int | None = None,
+    ) -> bool:
+        """Check whether `symbol` is inside its post-stop cooldown window (14 bars / 56h)."""
+        if step_idx is not None and now_ms is not None:
+            in_step = (
+                symbol in self._cooldown_until_step
+                and step_idx < self._cooldown_until_step[symbol]
+            )
+            in_time = (
+                symbol in self._cooldown_until_ms
+                and now_ms < self._cooldown_until_ms[symbol]
+            )
+            return bool(in_step or in_time)
+        if step_idx is not None and symbol in self._cooldown_until_step:
+            return step_idx < self._cooldown_until_step[symbol]
+        if now_ms is not None and symbol in self._cooldown_until_ms:
+            return now_ms < self._cooldown_until_ms[symbol]
+        return False
 
     @staticmethod
     def _build_hyperliquid_client(config: dict[str, Any]) -> tuple[ccxt.hyperliquid, bool]:
@@ -162,11 +220,16 @@ class ExecutionEngine:
         maker_fee_rate = float(config.get("maker_fee_bps", 1.5)) / 10000.0
         taker_fee_rate = float(config.get("taker_fee_bps", 4.5)) / 10000.0
         atr_period = int(config.get("atr_period", 14))
-        long_atr_mult = float(config.get("chandelier_atr_multiplier_long", 3.0))
-        short_atr_mult = float(config.get("chandelier_atr_multiplier_short", 2.5))
         short_adverse_funding = float(config.get("short_max_adverse_funding_rate_hourly", -0.0005))
+        cooldown_bars = int(config.get("post_stop_cooldown_bars", 14))
 
-        current_hour = int(time.time() // 3600)
+        self._step_counter += 1
+        now_ms = (
+            int(self.db.pit_timestamp_ms)
+            if self.db.pit_timestamp_ms is not None
+            else int(time.time() * 1000)
+        )
+        current_hour = int(now_ms // 3_600_000)
         settle_funding_now = current_hour > self._last_funding_settlement_hour
         if settle_funding_now:
             self._last_funding_settlement_hour = current_hour
@@ -174,11 +237,13 @@ class ExecutionEngine:
         open_trades = self.db.get_open_trades()
         closed_count = 0
 
-        # 1. Update open trades, Chandelier stops, 1H funding carry, and exit conditions
+        # 1. Update open trades, Two-Tier Chandelier stops, 1H funding carry, and exit conditions
         for trade in list(open_trades):
             trade_id = int(trade["trade_id"])
             symbol = str(trade["symbol"])
             side = str(trade["side"])
+            if side not in ("LONG", "SHORT"):
+                continue
             pair_meta = alt_pairs.get(symbol, {"exec_timeframe": "1h", "tick_size": 0.01})
             exec_tf = str(pair_meta.get("exec_timeframe", "1h"))
 
@@ -186,6 +251,7 @@ class ExecutionEngine:
             if df.empty:
                 continue
 
+            bar_open = float(df["open"].iloc[-1])
             current_price = float(df["close"].iloc[-1])
             bar_high = float(df["high"].iloc[-1])
             bar_low = float(df["low"].iloc[-1])
@@ -195,8 +261,6 @@ class ExecutionEngine:
             entry_price = float(trade["entry_price"])
             qty = float(trade["quantity"])
             notional = qty * current_price
-            highest_seen = max(float(trade["highest_price_seen"]), bar_high, current_price)
-            lowest_seen = min(float(trade["lowest_price_seen"]), bar_low, current_price)
             prev_stop = float(trade["chandelier_stop_price"])
             funding_accrued = float(trade.get("funding_accrued_usdc", 0.0))
 
@@ -207,28 +271,40 @@ class ExecutionEngine:
                 elif side == "SHORT":
                     funding_accrued += notional * funding_hourly
 
-            exit_reason: str | None = None
+            stop_eval = self.risk_engine.evaluate_two_tier_chandelier_stop(
+                side=side,
+                entry_price=entry_price,
+                active_stop=prev_stop,
+                highest_price_seen=float(trade["highest_price_seen"]),
+                lowest_price_seen=float(trade["lowest_price_seen"]),
+                bar_open=bar_open,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                bar_close=current_price,
+                atr_value=atr_val,
+                quantity=qty,
+                config=config,
+            )
+            highest_seen = stop_eval.highest_price_seen
+            lowest_seen = stop_eval.lowest_price_seen
+            new_stop = stop_eval.chandelier_stop_price
+            exit_reason: str | None = stop_eval.exit_reason
+            exit_fill_price = stop_eval.exit_fill_price
 
             if side == "LONG":
-                candidate_stop = highest_seen - long_atr_mult * atr_val
-                new_stop = max(prev_stop, candidate_stop)
-                unrealized_pnl = (current_price - entry_price) * qty + funding_accrued
-                if current_price <= new_stop:
-                    exit_reason = "CHANDELIER_TRAILING_STOP_LONG"
-                elif regime_state.regime == "BEAR":
+                if exit_reason is None and regime_state.regime == "BEAR":
                     exit_reason = "HMM_REGIME_FLIP_TO_BEAR"
-            elif side == "SHORT":
-                candidate_stop = lowest_seen + short_atr_mult * atr_val
-                new_stop = min(prev_stop, candidate_stop)
-                unrealized_pnl = (entry_price - current_price) * qty + funding_accrued
-                if current_price >= new_stop:
-                    exit_reason = "INVERTED_CHANDELIER_STOP_SHORT"
-                elif funding_hourly < short_adverse_funding:
-                    exit_reason = "ADVERSE_1H_FUNDING_CARRY_PROTECTION"
-                elif regime_state.regime == "BULL":
-                    exit_reason = "HMM_REGIME_FLIP_TO_BULL"
+                    exit_fill_price = current_price
+                unrealized_pnl = (exit_fill_price - entry_price) * qty + funding_accrued
             else:
-                continue
+                if exit_reason is None:
+                    if funding_hourly < short_adverse_funding:
+                        exit_reason = "ADVERSE_1H_FUNDING_CARRY_PROTECTION"
+                        exit_fill_price = current_price
+                    elif regime_state.regime == "BULL":
+                        exit_reason = "HMM_REGIME_FLIP_TO_BULL"
+                        exit_fill_price = current_price
+                unrealized_pnl = (entry_price - exit_fill_price) * qty + funding_accrued
 
             if exit_reason:
                 close_side = "SHORT" if side == "LONG" else "LONG"
@@ -237,7 +313,7 @@ class ExecutionEngine:
                         symbol=symbol,
                         side=close_side,
                         quantity=qty,
-                        price=current_price,
+                        price=exit_fill_price,
                         config=config,
                         reduce_only=True,
                     )
@@ -249,16 +325,18 @@ class ExecutionEngine:
                         {"trade_id": trade_id, "symbol": symbol, "side": side, "error": str(exc)},
                     )
                     continue
-                exit_fee = notional * taker_fee_rate
+                exit_fee = (qty * exit_fill_price) * taker_fee_rate
                 total_fees = float(trade.get("fees_paid_usdc", 0.0)) + exit_fee
                 realized_pnl = unrealized_pnl - total_fees
                 self.db.close_trade(
                     trade_id=trade_id,
-                    exit_price=current_price,
+                    exit_price=exit_fill_price,
                     realized_pnl_usdc=round(realized_pnl, 4),
                     fees_paid_usdc=round(total_fees, 4),
                     exit_reason=exit_reason,
                 )
+                self._cooldown_until_step[symbol] = self._step_counter + cooldown_bars
+                self._cooldown_until_ms[symbol] = now_ms + cooldown_bars * 4 * 3_600_000
                 closed_count += 1
             else:
                 self.db.update_open_trade(
@@ -300,6 +378,8 @@ class ExecutionEngine:
             action = str(ev["signal_action"])
             symbol = str(ev["exec_symbol"])
             if action not in ("LONG", "SHORT") or symbol in open_symbols:
+                continue
+            if self.is_in_cooldown(symbol, now_ms=now_ms, step_idx=self._step_counter):
                 continue
             if action == "LONG" and len(open_longs) >= max_longs:
                 continue
@@ -397,7 +477,7 @@ class ExecutionEngine:
                 )
 
         snapshot = {
-            "timestamp_ms": int(time.time() * 1000),
+            "timestamp_ms": now_ms,
             "total_equity_usdc": current_equity,
             "available_cash_usdc": available_cash,
             "deployed_notional_usdc": deployed_notional,
