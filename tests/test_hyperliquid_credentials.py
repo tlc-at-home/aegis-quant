@@ -385,6 +385,8 @@ class TestHyperliquidCredentials(unittest.TestCase):
         self.assertEqual(cfg["polling_interval_seconds"], 15)
 
         live_db = DatabaseManager()
+        if not live_db.db_path.exists():
+            live_db.init_db()
         live_cfg = live_db.load_config()
         self.assertEqual(live_cfg["polling_interval_seconds"], 15)
 
