@@ -1386,11 +1386,14 @@ class ExecutionEngine:
                 entry_sym = entry.get("symbol")
                 if entry_sym and str(entry_sym) != symbol:
                     continue
-                info = entry.get("info") if isinstance(entry.get("info"), dict) else {}
-                delta = (
-                    info.get("delta")
-                    if isinstance(info.get("delta"), dict)
-                    else (entry.get("delta") if isinstance(entry.get("delta"), dict) else {})
+                raw_info = entry.get("info")
+                info: dict[str, Any] = raw_info if isinstance(raw_info, dict) else {}
+                raw_info_delta = info.get("delta")
+                raw_entry_delta = entry.get("delta")
+                delta: dict[str, Any] = (
+                    raw_info_delta
+                    if isinstance(raw_info_delta, dict)
+                    else (raw_entry_delta if isinstance(raw_entry_delta, dict) else {})
                 )
                 delta_coin = delta.get("coin")
                 if delta_coin and str(delta_coin).upper() != base_coin:
@@ -1652,12 +1655,12 @@ class ExecutionEngine:
             if action == "SHORT" and len(open_shorts) >= max_shorts:
                 continue
 
-            pair_meta = alt_pairs.get(symbol)
-            if not pair_meta:
+            cand_meta = alt_pairs.get(symbol)
+            if not cand_meta:
                 continue
-            exec_df = self.db.get_ohlcv_df(symbol, str(pair_meta["exec_timeframe"]), limit=100)
+            exec_df = self.db.get_ohlcv_df(symbol, str(cand_meta["exec_timeframe"]), limit=100)
             sizing: PositionSizeResult = self.risk_engine.evaluate_order_risk(
-                pair_meta=pair_meta,
+                pair_meta=cand_meta,
                 side=action,
                 blended_conviction=float(ev["blended_conviction"]),
                 exec_df=exec_df,
@@ -1727,7 +1730,7 @@ class ExecutionEngine:
             new_trade: dict[str, Any] = {
                 "client_order_id": cli_order_id,
                 "symbol": symbol,
-                "base_asset": str(pair_meta["base_asset"]),
+                "base_asset": str(cand_meta["base_asset"]),
                 "side": action,
                 "fsm_state": fsm_state,
                 "entry_price": eff_entry_price,

@@ -1150,7 +1150,7 @@ class SignalEngine:
         """
         if isinstance(synth_df_or_cfg, dict):
             synth_df: pd.DataFrame | None = None
-            eff_cfg = synth_df_or_cfg
+            eff_cfg: dict[str, Any] | None = synth_df_or_cfg
         else:
             synth_df = synth_df_or_cfg
             eff_cfg = cfg

@@ -1389,27 +1389,27 @@ class DatabaseManager:
             )
 
         entry_price = float(
-            trade.get("entry_price")
+            trade["entry_price"]
             if trade.get("entry_price") is not None
             else (trade.get("avg_fill_price") or 0.0)
         )
         current_price = float(
-            trade.get("current_price")
+            trade["current_price"]
             if trade.get("current_price") is not None
             else entry_price
         )
         quantity = float(
-            trade.get("quantity")
+            trade["quantity"]
             if trade.get("quantity") is not None
             else (trade.get("filled_units") or 0.0)
         )
         notional_usdc = float(
-            trade.get("notional_usdc")
+            trade["notional_usdc"]
             if trade.get("notional_usdc") is not None
             else round(quantity * entry_price, 2)
         )
         risk_budget_usdc = float(
-            trade.get("risk_budget_usdc")
+            trade["risk_budget_usdc"]
             if trade.get("risk_budget_usdc") is not None
             else round(notional_usdc * 0.04, 2)
         )
@@ -1420,22 +1420,22 @@ class DatabaseManager:
         )
         stop_override = trade.get("current_stop_price")
         initial_stop_price = float(
-            trade.get("initial_stop_price")
+            trade["initial_stop_price"]
             if trade.get("initial_stop_price") is not None
             else (stop_override if stop_override is not None else default_stop)
         )
         chandelier_stop_price = float(
-            trade.get("chandelier_stop_price")
+            trade["chandelier_stop_price"]
             if trade.get("chandelier_stop_price") is not None
             else (stop_override if stop_override is not None else initial_stop_price)
         )
         highest_price_seen = float(
-            trade.get("highest_price_seen")
+            trade["highest_price_seen"]
             if trade.get("highest_price_seen") is not None
             else entry_price
         )
         lowest_price_seen = float(
-            trade.get("lowest_price_seen")
+            trade["lowest_price_seen"]
             if trade.get("lowest_price_seen") is not None
             else entry_price
         )

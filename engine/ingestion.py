@@ -139,7 +139,8 @@ class MarketIngestionEngine:
     @staticmethod
     def _extract_snapshot_entry(item: dict[str, Any]) -> tuple[float | None, float | None]:
         """Extract (price, funding_rate_hourly) from a CCXT Hyperliquid funding/ticker dict."""
-        info = item.get("info") if isinstance(item.get("info"), dict) else {}
+        raw_info = item.get("info")
+        info: dict[str, Any] = raw_info if isinstance(raw_info, dict) else {}
         price: float | None = None
         for raw_px in (
             info.get("midPx"),
