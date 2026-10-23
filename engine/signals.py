@@ -829,7 +829,7 @@ class SignalEngine:
             df_perp = synth_df
             pre_features = cfg if isinstance(cfg, pd.DataFrame) else None
             pre_target = n_estimators if isinstance(n_estimators, pd.Series) else None
-            config = max_depth if isinstance(max_depth, dict) else {}
+            config: dict[str, Any] = max_depth if isinstance(max_depth, dict) else {}
             k = max(1, int(config.get("mace_forward_horizon_bars", 4)))
             refit_interval = int(config.get("mace_refit_interval_bars", 36))
             min_ic_floor = float(config.get("mace_min_ic_floor", 0.05))
@@ -870,13 +870,19 @@ class SignalEngine:
                 x_std[x_std == 0.0] = 1.0
                 x_train_norm = (x_train - x_center) / x_std
 
-                ridge = Ridge(alpha=float(config.get("mace_ridge_alpha", 1.0)), random_state=42)
+                raw_ridge_alpha = config.get("mace_ridge_alpha", 1.0)
+                ridge = Ridge(
+                    alpha=float(raw_ridge_alpha if raw_ridge_alpha is not None else 1.0),
+                    random_state=42,
+                )
                 ridge.fit(x_train_norm, y_train)
 
+                rf_n_est = int(config.get("mace_rf_n_estimators", 60) or 60)
+                rf_trees_cfg = int(config.get("mace_rf_trees", rf_n_est) or rf_n_est)
                 rf = RandomForestRegressor(
-                    n_estimators=int(config.get("mace_rf_trees", config.get("mace_rf_n_estimators", 60))),
-                    max_depth=int(config.get("mace_rf_max_depth", 4)),
-                    min_samples_leaf=int(config.get("mace_rf_min_samples_leaf", 8)),
+                    n_estimators=rf_trees_cfg,
+                    max_depth=int(config.get("mace_rf_max_depth", 4) or 4),
+                    min_samples_leaf=int(config.get("mace_rf_min_samples_leaf", 8) or 8),
                     random_state=42,
                     n_jobs=1,
                 )
@@ -914,20 +920,16 @@ class SignalEngine:
         min_ic_floor = float(config.get("mace_min_ic_floor", 0.05))
         warmup = 32
         tanh_scale = float(config.get("mace_tanh_scale", 1.25))
-        rf_trees = int(
-            n_estimators
-            if isinstance(n_estimators, int)
-            else config.get("mace_rf_n_estimators", config.get("mace_rf_trees", 60))
-        )
-        rf_depth = int(
-            max_depth if isinstance(max_depth, int) else config.get("mace_rf_max_depth", 4)
-        )
-        rf_leaf = int(
-            min_samples_leaf
-            if min_samples_leaf is not None
-            else config.get("mace_rf_min_samples_leaf", 10)
-        )
-        alpha = float(ridge_alpha if ridge_alpha is not None else config.get("mace_ridge_alpha", 1.0))
+        default_rf_trees = int(config.get("mace_rf_trees", 60) or 60)
+        cfg_rf_trees = int(config.get("mace_rf_n_estimators", default_rf_trees) or default_rf_trees)
+        rf_trees = n_estimators if isinstance(n_estimators, int) else cfg_rf_trees
+        cfg_rf_depth = int(config.get("mace_rf_max_depth", 4) or 4)
+        rf_depth = max_depth if isinstance(max_depth, int) else cfg_rf_depth
+        cfg_rf_leaf = int(config.get("mace_rf_min_samples_leaf", 10) or 10)
+        rf_leaf = min_samples_leaf if min_samples_leaf is not None else cfg_rf_leaf
+        raw_ridge_alpha = config.get("mace_ridge_alpha", 1.0)
+        cfg_ridge_alpha = float(raw_ridge_alpha if raw_ridge_alpha is not None else 1.0)
+        alpha = float(ridge_alpha) if ridge_alpha is not None else cfg_ridge_alpha
         fast_span = int(config.get("snr_fast_span", 16))
         slow_span = int(config.get("snr_slow_span", 64))
 
