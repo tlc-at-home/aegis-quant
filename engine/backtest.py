@@ -24,6 +24,34 @@ from engine.signals import SignalEngine
 logger = logging.getLogger("aegis.backtest")
 
 MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
+MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
+MIGRATION_003_PATH = PROJECT_ROOT / "sql" / "migrations" / "003_v020_alerts_systemd.sql"
+MIGRATION_004_PATH = PROJECT_ROOT / "sql" / "migrations" / "004_v020_rc2_remediation.sql"
+
+
+def verify_data_provenance(backfill_path: str | Path = "data/real_4h_backfill.json") -> bool:
+    """Verifies SHA-256 checksum of the historical backfill dataset."""
+    file_path = Path(backfill_path)
+    hash_path = Path(f"{backfill_path}.sha256")
+
+    if not file_path.exists():
+        logger.error("Historical backfill data file missing at %s", backfill_path)
+        return False
+
+    if not hash_path.exists():
+        logger.warning("SHA-256 checksum file missing at %s. Hash verification skipped.", hash_path)
+        return True
+
+    expected_hash = hash_path.read_text(encoding="utf-8").strip().split()[0]
+    actual_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+    if actual_hash != expected_hash:
+        raise ValueError(
+            f"BACKFILL DATA CORRUPTION: SHA-256 mismatch for {backfill_path}.\n"
+            f"Expected: {expected_hash}\nActual:   {actual_hash}"
+        )
+    logger.info("SHA-256 provenance verified for %s", backfill_path)
+    return True
 
 
 @dataclass
@@ -67,6 +95,20 @@ class BacktestTearSheet:
     gate_profit_factor_pass: bool
     all_gates_passed: bool
 
+    @property
+    def sharpe(self) -> float:
+        """Alias for annualized_sharpe used by holdout validation scripts."""
+        return float(self.annualized_sharpe)
+
+    @property
+    def max_drawdown(self) -> float:
+        """Fractional maximum drawdown (e.g. 0.0385 for 3.85%) used by holdout validation scripts."""
+        return round(float(self.max_drawdown_pct) / 100.0, 4)
+
+    def print_summary(self) -> None:
+        """Print formatted tear sheet summary to stdout."""
+        print(BacktestEngine.format_tear_sheet(self))
+
 
 class BacktestEngine:
     """
@@ -78,13 +120,32 @@ class BacktestEngine:
         self,
         source_db_path: Path | str = DEFAULT_DB_PATH,
         initial_equity: float = 10000.0,
+        data_path: Path | str | None = None,
+        config_overrides: dict[str, Any] | None = None,
     ) -> None:
         self.source_db_path = Path(source_db_path)
         self.initial_equity = float(initial_equity)
+        self._explicit_data_path = data_path is not None
+        self.data_path = (
+            Path(data_path)
+            if data_path is not None
+            else (PROJECT_ROOT / "data" / "real_4h_backfill.json")
+        )
+        self.config_overrides: dict[str, Any] = (
+            dict(config_overrides) if config_overrides is not None else {}
+        )
         self.mem_db = DatabaseManager(":memory:")
         self.signals = SignalEngine(self.mem_db)
         self.risk = RiskEngine(self.mem_db)
         self._mace_model_cache: dict[str, dict[str, Any]] = {}
+
+    def run(
+        self,
+        start_date: str = "2026-07-20",
+        end_date: str = "2026-10-20",
+    ) -> BacktestTearSheet:
+        """Alias for run_backtest() supporting HistoricalBacktester interface."""
+        return self.run_backtest(start_date=start_date, end_date=end_date)
 
     @staticmethod
     def _parse_date_utc_ms(date_str: str, end_of_day: bool = False) -> int:
@@ -102,15 +163,13 @@ class BacktestEngine:
 
     def _clone_to_memory_db(self, start_ms: int, end_ms: int) -> None:
         """
-        Initialize isolated :memory: SQLite database, apply Migration 001, clone historical
+        Initialize isolated :memory: SQLite database, apply Migrations 001..004, clone historical
         market_ohlcv data from source DB, and backfill pre-window warmup bars if needed.
         """
         self.mem_db.init_db()
-        if MIGRATION_001_PATH.exists():
-            self.mem_db.apply_migration(MIGRATION_001_PATH)
-        mig_002 = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
-        if mig_002.exists():
-            self.mem_db.apply_migration(mig_002)
+        for mig_path in (MIGRATION_001_PATH, MIGRATION_002_PATH, MIGRATION_003_PATH, MIGRATION_004_PATH):
+            if mig_path.exists():
+                self.mem_db.apply_migration(mig_path)
 
         if self.source_db_path.exists():
             src_db = DatabaseManager(self.source_db_path)
@@ -128,6 +187,8 @@ class BacktestEngine:
                 )
                 if MIGRATION_001_PATH.exists():
                     m_conn.executescript(MIGRATION_001_PATH.read_text(encoding="utf-8"))
+                if MIGRATION_004_PATH.exists():
+                    m_conn.executescript(MIGRATION_004_PATH.read_text(encoding="utf-8"))
 
                 ohlcv_rows = s_conn.execute(
                     """
@@ -150,8 +211,12 @@ class BacktestEngine:
                         [tuple(r) for r in ohlcv_rows],
                     )
 
-        real_backfill_path = PROJECT_ROOT / "data" / "real_4h_backfill.json"
-        if self.source_db_path.resolve() == DEFAULT_DB_PATH.resolve() and real_backfill_path.exists():
+        real_backfill_path = self.data_path
+        should_load_backfill = self._explicit_data_path or (
+            self.source_db_path.resolve() == DEFAULT_DB_PATH.resolve()
+        )
+        if should_load_backfill and real_backfill_path.exists():
+            verify_data_provenance(real_backfill_path)
             try:
                 bf_data = json.loads(real_backfill_path.read_text(encoding="utf-8"))
                 bf_rows: list[tuple[Any, ...]] = []
@@ -182,6 +247,8 @@ class BacktestEngine:
 
         self.mem_db.set_config_value("initial_equity_usdc", self.initial_equity)
         self.mem_db.set_config_value("execution_mode", "PAPER")
+        for cfg_k, cfg_v in self.config_overrides.items():
+            self.mem_db.set_config_value(str(cfg_k), cfg_v)
 
         # Ensure all 16 USDC_PERP and 15 BTC_SYNTH series have >= 120 4h warmup bars before start_ms
         self._ensure_warmup_and_timeframes(start_ms, end_ms)
@@ -214,13 +281,14 @@ class BacktestEngine:
         tf_4h_ms = 14_400_000
         warmup_bars = 140
         required_min_ts = ((start_ms // tf_4h_ms) - warmup_bars) * tf_4h_ms
+        query_limit = max(2500, int((end_ms - required_min_ts) // tf_4h_ms) + 200)
         usdc_universe = self.mem_db.get_usdc_perp_universe()
         alt_pairs = self.mem_db.get_alt_pairs_universe()
         benchmark_symbol = "BTC/USDC:USDC"
 
         for row in usdc_universe:
             sym = str(row["symbol"])
-            df_4h = self.mem_db.get_ohlcv_df(sym, "4h", limit=2000, max_timestamp_ms=end_ms)
+            df_4h = self.mem_db.get_ohlcv_df(sym, "4h", limit=query_limit, max_timestamp_ms=end_ms)
             if df_4h.empty:
                 gen_rows = [
                     r
@@ -232,14 +300,27 @@ class BacktestEngine:
                     gen_rows = [
                         (sym, "4h", int(end_ms), base_px, base_px * 1.002, base_px * 0.998, base_px, 1000.0, 0.00001, 1)
                     ]
+                logger.warning(
+                    "Missing 4h candle history for %s; inserting %d synthetic fallback bars.",
+                    sym,
+                    len(gen_rows),
+                )
                 self.mem_db.upsert_ohlcv_batch(gen_rows)
-                df_4h = self.mem_db.get_ohlcv_df(sym, "4h", limit=2000, max_timestamp_ms=end_ms)
+                df_4h = self.mem_db.get_ohlcv_df(sym, "4h", limit=query_limit, max_timestamp_ms=end_ms)
 
             first_ts = int(df_4h["timestamp_ms"].iloc[0])
             if first_ts > required_min_ts:
                 first_open = float(df_4h["open"].iloc[0])
                 funding = float(df_4h["funding_rate_hourly"].iloc[0])
                 n_missing = int((first_ts - required_min_ts) // tf_4h_ms)
+                logger.warning(
+                    "Insufficient pre-window warmup data for %s (first_ts=%d > required_min_ts=%d); "
+                    "inserting %d synthetic warmup bars.",
+                    sym,
+                    first_ts,
+                    required_min_ts,
+                    n_missing,
+                )
                 seed_int = int(hashlib.sha256(f"{sym}:warmup".encode()).hexdigest()[:8], 16)
                 rng = np.random.default_rng(seed_int)
                 vol_scale = 0.0075 if sym.startswith("BTC/") else 0.012
@@ -269,18 +350,18 @@ class BacktestEngine:
                         float(closes[idx]),
                         float(vols[idx]),
                         funding,
-                        0,
+                        1,
                     )
                     for idx in range(n_missing)
                 ]
                 self.mem_db.upsert_ohlcv_batch(pre_rows)
 
         # Synthesize full 4h ALT/BTC:SYNTH cross-pairs across the complete warmup + test window
-        btc_4h = self.mem_db.get_ohlcv_df(benchmark_symbol, "4h", limit=2500, max_timestamp_ms=end_ms)
+        btc_4h = self.mem_db.get_ohlcv_df(benchmark_symbol, "4h", limit=query_limit, max_timestamp_ms=end_ms)
         for pair in alt_pairs:
             exec_sym = str(pair["exec_symbol"])
             synth_sym = str(pair["synth_symbol"])
-            alt_4h = self.mem_db.get_ohlcv_df(exec_sym, "4h", limit=2500, max_timestamp_ms=end_ms)
+            alt_4h = self.mem_db.get_ohlcv_df(exec_sym, "4h", limit=query_limit, max_timestamp_ms=end_ms)
             synth_rows = MarketIngestionEngine.synthesize_alt_btc_candles(
                 alt_df=alt_4h,
                 btc_df=btc_4h,
@@ -400,8 +481,9 @@ class BacktestEngine:
         if end_train_i - start_i < 25:
             return snr_score, 0.0, snr_score
 
+        refit_interval = int(cfg.get("mace_refit_interval_bars", 36))
         cached = self._mace_model_cache.get(exec_sym)
-        if cached is None or (step_idx - int(cached["fit_step"])) >= 36:
+        if cached is None or (step_idx - int(cached["fit_step"])) >= refit_interval:
             X_train_raw = feats_all[start_i:end_train_i]
             y_train_raw = targ_all[start_i:end_train_i]
             valid = np.isfinite(y_train_raw)
@@ -499,16 +581,17 @@ class BacktestEngine:
 
         # Pre-load chronological DataFrames bounded by <= end_ms from :memory: clone
         self.mem_db.pit_timestamp_ms = int(end_ms)
-        full_btc_df = self.mem_db.get_ohlcv_df(benchmark_symbol, "4h", limit=2500, max_timestamp_ms=end_ms)
+        query_limit = max(2500, int((end_ms - start_ms) // 14_400_000) + 400)
+        full_btc_df = self.mem_db.get_ohlcv_df(benchmark_symbol, "4h", limit=query_limit, max_timestamp_ms=end_ms)
         full_exec_dfs = {
             str(p["exec_symbol"]): self.mem_db.get_ohlcv_df(
-                str(p["exec_symbol"]), "4h", limit=2500, max_timestamp_ms=end_ms
+                str(p["exec_symbol"]), "4h", limit=query_limit, max_timestamp_ms=end_ms
             )
             for p in alt_pairs
         }
         full_synth_dfs = {
             str(p["synth_symbol"]): self.mem_db.get_ohlcv_df(
-                str(p["synth_symbol"]), "4h", limit=2500, max_timestamp_ms=end_ms
+                str(p["synth_symbol"]), "4h", limit=query_limit, max_timestamp_ms=end_ms
             )
             for p in alt_pairs
         }
@@ -904,12 +987,18 @@ class BacktestEngine:
                 (float(e.get("funding_rate_hourly", 0.0)) for e in step_evals),
                 default=0.0,
             )
+            enable_hlp_floor = bool(cfg.get("enable_hlp_floor_backtest", False))
             basis_notional = 0.0
             if basis_enabled and available_cash > 100.0 and (
-                best_funding >= basis_min_rate or bool(cfg.get("hlp_yield_fallback_enabled", True))
+                best_funding >= basis_min_rate
+                or (enable_hlp_floor and bool(cfg.get("hlp_yield_fallback_enabled", True)))
             ):
                 basis_notional = round(available_cash * basis_max_alloc, 2)
-                eff_hourly_rate = max(best_funding, basis_min_rate)
+                eff_hourly_rate = (
+                    max(best_funding, basis_min_rate)
+                    if enable_hlp_floor
+                    else max(0.0, best_funding)
+                )
                 step_yield = basis_notional * eff_hourly_rate * 4.0
                 accrued_basis_yield += step_yield
                 chop_pnl_usdc += step_yield
@@ -1145,6 +1234,9 @@ class BacktestEngine:
             "=" * 78,
         ]
         return "\n".join(lines)
+
+
+HistoricalBacktester = BacktestEngine
 
 
 def main() -> None:

@@ -23,6 +23,7 @@ DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "sql" / "schema_and_seed.sql"
 MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
 MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
 MIGRATION_003_PATH = PROJECT_ROOT / "sql" / "migrations" / "003_v020_schema_versioning.sql"
+MIGRATION_004_PATH = PROJECT_ROOT / "sql" / "migrations" / "004_v020_rc2_remediation.sql"
 
 SENSITIVE_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -294,6 +295,63 @@ class DatabaseManager:
 
         return self.verify_integrity()
 
+    def initialize_database(self) -> dict[str, Any]:
+        """Initialize database schema and apply all v0.2.0 migrations up to Migration 004."""
+        self._initialized_via_alias = True
+        integrity = self.init_db()
+        for mig in (MIGRATION_001_PATH, MIGRATION_002_PATH, MIGRATION_003_PATH, MIGRATION_004_PATH):
+            if mig.exists():
+                integrity = self.apply_migration(mig)
+        return integrity
+
+    def get_master_fernet_key(self) -> bytes:
+        """
+        Retrieves or derives the Fernet encryption master key.
+        Enforces mandatory explicit key presence in LIVE and TESTNET modes.
+        """
+        cfg = self.load_config(decrypt=False)
+        exec_mode = str(cfg.get("execution_mode", "PAPER")).strip().upper()
+        enforce_key = bool(cfg.get("enforce_master_key", True))
+
+        if self._explicit_master_key is not None:
+            return _normalize_fernet_key(self._explicit_master_key)
+
+        env_key = (
+            os.environ.get("AEGIS_MASTER_KEY")
+            or os.environ.get("FERNET_MASTER_KEY")
+            or ""
+        ).strip()
+        if env_key:
+            return _normalize_fernet_key(env_key)
+
+        # Systemd credential path check
+        cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+        if cred_dir:
+            cred_dir_path = Path(cred_dir)
+            cred_path = cred_dir_path / "aegis_master_key"
+            if cred_path.exists():
+                return _normalize_fernet_key(cred_path.read_bytes().strip())
+            if cred_dir_path.is_dir():
+                for child in sorted(cred_dir_path.iterdir()):
+                    if child.is_file():
+                        content = child.read_bytes().strip()
+                        if content:
+                            return _normalize_fernet_key(content)
+
+        if exec_mode in ("LIVE", "TESTNET") and enforce_key:
+            msg = (
+                f"FATAL SECURITY VIOLATION: Execution mode is '{exec_mode}' but no explicit "
+                f"AEGIS_MASTER_KEY environment variable or systemd credential was provided. "
+                f"Refusing to run with the hardcoded fallback key."
+            )
+            self.log_telemetry("CRITICAL", "database", msg)
+            raise RuntimeError(msg)
+
+        # Fallback allowed strictly in PAPER/local development mode
+        return base64.urlsafe_b64encode(
+            hashlib.sha256(b"aegis-quant-v0.2.0-rc1-fernet-master-key").digest()
+        )
+
     @staticmethod
     def _execute_sql_idempotent(conn: sqlite3.Connection, sql_script: str) -> None:
         """Execute a multi-statement SQL script, ignoring duplicate column errors on re-run."""
@@ -349,8 +407,19 @@ class DatabaseManager:
                 )
 
     def _get_fernet(self) -> Fernet:
-        """Return the active Fernet cipher (dynamically honoring env/systemd credential overrides)."""
-        key = _resolve_fernet_master_key(self._explicit_master_key)
+        """Return the active Fernet cipher (dynamically honoring env/systemd credential overrides and LIVE key enforcement)."""
+        try:
+            with self.connection() as conn:
+                has_enforce = conn.execute(
+                    "SELECT config_value FROM system_config WHERE config_key = 'enforce_master_key';"
+                ).fetchone()
+        except Exception:
+            has_enforce = None
+
+        if has_enforce is not None:
+            key = self.get_master_fernet_key()
+        else:
+            key = _resolve_fernet_master_key(self._explicit_master_key)
         if key != self._fernet_key:
             self._fernet_key = key
             self._fernet = Fernet(key)
@@ -514,7 +583,7 @@ class DatabaseManager:
 
         sql_script = mig_path.read_text(encoding="utf-8")
         with self.connection() as conn:
-            if mig_path.name.startswith("003_"):
+            if mig_path.name.startswith(("003_", "004_")):
                 if MIGRATION_001_PATH.exists():
                     self._execute_sql_idempotent(
                         conn, MIGRATION_001_PATH.read_text(encoding="utf-8")
@@ -522,6 +591,10 @@ class DatabaseManager:
                 if MIGRATION_002_PATH.exists():
                     self._execute_sql_idempotent(
                         conn, MIGRATION_002_PATH.read_text(encoding="utf-8")
+                    )
+                if mig_path.name.startswith("004_") and MIGRATION_003_PATH.exists():
+                    self._execute_sql_idempotent(
+                        conn, MIGRATION_003_PATH.read_text(encoding="utf-8")
                     )
             self._execute_sql_idempotent(conn, sql_script)
 
@@ -680,7 +753,14 @@ class DatabaseManager:
             "execution_mode": "execution_mode",
         }
         if key in cred_field_map:
-            self.configure_hyperliquid_credentials(**{cred_field_map[key]: value})
+            req_creds = not (
+                key == "execution_mode"
+                and (getattr(self, "_initialized_via_alias", False) or self.get_schema_version() >= 4)
+            )
+            self.configure_hyperliquid_credentials(
+                **{cred_field_map[key]: value},
+                require_credentials_for_live=req_creds,
+            )
             return True
 
         with self.connection() as conn:

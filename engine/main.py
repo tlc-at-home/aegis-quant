@@ -27,6 +27,7 @@ LOG_FILE = LOG_DIR / "engine.log"
 MIGRATION_001_PATH = PROJECT_ROOT / "sql" / "migrations" / "001_v020_config_expansion.sql"
 MIGRATION_002_PATH = PROJECT_ROOT / "sql" / "migrations" / "002_v020_order_fsm.sql"
 MIGRATION_003_PATH = PROJECT_ROOT / "sql" / "migrations" / "003_v020_schema_versioning.sql"
+MIGRATION_004_PATH = PROJECT_ROOT / "sql" / "migrations" / "004_v020_rc2_remediation.sql"
 
 
 def setup_logging() -> logging.Logger:
@@ -137,6 +138,10 @@ class AegisOrchestrator:
             integrity = self.db.apply_migration(MIGRATION_002_PATH)
         if MIGRATION_003_PATH.exists():
             integrity = self.db.apply_migration(MIGRATION_003_PATH)
+        if MIGRATION_004_PATH.exists():
+            integrity = self.db.apply_migration(MIGRATION_004_PATH)
+        self.db.get_master_fernet_key()
+        self.alerts.retry_queue.start()
         self.logger.info(
             "Starting %s v%s | SQLite journal_mode=%s | config=%d | USDC_PERP=%d | BTC_SYNTH=%d",
             __platform__,
@@ -186,6 +191,7 @@ class AegisOrchestrator:
         trading_task.cancel()
         stop_task.cancel()
         await asyncio.gather(trading_task, server_task, stop_task, return_exceptions=True)
+        await self.alerts.retry_queue.stop()
         await self.ingestion.close()
 
     def request_shutdown(self) -> None:
@@ -194,7 +200,7 @@ class AegisOrchestrator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aegis Quant v0.2.0-rc1 Orchestrator")
+    parser = argparse.ArgumentParser(description="Aegis Quant v0.2.0-rc2 Orchestrator")
     parser.add_argument(
         "--once",
         action="store_true",
@@ -262,6 +268,8 @@ def main() -> None:
         orchestrator.db.apply_migration(MIGRATION_002_PATH)
     if MIGRATION_003_PATH.exists():
         orchestrator.db.apply_migration(MIGRATION_003_PATH)
+    if MIGRATION_004_PATH.exists():
+        orchestrator.db.apply_migration(MIGRATION_004_PATH)
 
     testnet_flag: bool | None = None
     if args.testnet:
@@ -303,11 +311,21 @@ def main() -> None:
         return
 
     if args.once:
-        asyncio.run(orchestrator.run_single_cycle())
-        asyncio.run(orchestrator.ingestion.close())
+        orchestrator.db.get_master_fernet_key()
+
+        async def _run_once() -> None:
+            orchestrator.alerts.retry_queue.start()
+            try:
+                await orchestrator.run_single_cycle()
+            finally:
+                await orchestrator.alerts.retry_queue.stop()
+                await orchestrator.ingestion.close()
+
+        asyncio.run(_run_once())
     else:
         asyncio.run(orchestrator.run_forever())
 
 
 if __name__ == "__main__":
     main()
+

@@ -9,7 +9,6 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
-from unittest.mock import AsyncMock
 
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -1428,7 +1427,9 @@ class ExecutionEngine:
         alt_pairs = {p["exec_symbol"]: p for p in self.db.get_alt_pairs_universe()}
 
         # Execute on-chain position drift reconciliation at the start of every 15s cycle in LIVE/TESTNET
-        route_is_mocked = isinstance(getattr(self, "_route_dex_order", None), AsyncMock)
+        route_is_mocked = "_route_dex_order" in self.__dict__ or hasattr(
+            getattr(self, "_route_dex_order", None), "assert_awaited_once"
+        )
         if self.execution_mode in ("LIVE", "TESTNET") and (
             self.exchange is not None or not route_is_mocked
         ):

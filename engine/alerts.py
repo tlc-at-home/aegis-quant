@@ -1,9 +1,10 @@
-"""Asynchronous Telegram Bot alerting subsystem for Aegis Quant (v0.2.0-rc1)."""
+"""Asynchronous Telegram Bot alerting subsystem with exponential backoff retry queue for Aegis Quant (v0.2.0-rc2)."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime, timezone
 import http.server
 import json
 import logging
@@ -17,6 +18,135 @@ from engine.database import DEFAULT_DB_PATH, DatabaseManager
 logger = logging.getLogger("aegis.alerts")
 
 HttpPostHandler = Callable[[str, dict[str, Any]], Awaitable[int]]
+
+
+class AlertRetryQueue:
+    """Asynchronous worker for reliable alert delivery with exponential backoff."""
+
+    def __init__(
+        self,
+        db_manager: DatabaseManager | None = None,
+        http_post: HttpPostHandler | None = None,
+        telegram_api_base: str = "https://api.telegram.org",
+    ) -> None:
+        self.db = db_manager or DatabaseManager()
+        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._worker_task: asyncio.Task[Any] | None = None
+        self._http_post = http_post
+        self._telegram_api_base = telegram_api_base.rstrip("/")
+        self.delivered_count: int = 0
+        self.permanent_failure_count: int = 0
+
+    def start(self) -> None:
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._process_queue())
+
+    async def stop(self) -> None:
+        if self._worker_task is not None and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        self._worker_task = None
+
+    async def enqueue_alert(self, title: str, message: str, level: str = "INFO") -> None:
+        await self.queue.put({
+            "title": title,
+            "message": message,
+            "level": level,
+            "attempts": 0,
+            "timestamp": int(datetime.now(timezone.utc).timestamp()),
+        })
+
+    async def _post_json(self, url: str, payload: dict[str, Any]) -> int:
+        if self._http_post is not None:
+            return int(await self._http_post(url, payload))
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "AegisQuant-TelegramAlertEngine/0.2.0-rc2",
+            },
+            method="POST",
+        )
+
+        def _send() -> int:
+            if url.startswith(("http://127.0.0.1", "http://localhost")):
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=5.0) as resp:
+                    return int(getattr(resp, "status", 200))
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                return int(getattr(resp, "status", 200))
+
+        return await asyncio.to_thread(_send)
+
+    async def _dispatch_http(self, item: dict[str, Any]) -> bool:
+        """Dispatch a queued alert item to Telegram or Discord webhook, returning True on 2xx."""
+        cfg = self.db.get_decrypted_config()
+        token = str(cfg.get("telegram_bot_token") or "").strip()
+        chat_id = str(cfg.get("telegram_chat_id") or "").strip()
+        webhook_url = str(cfg.get("discord_webhook_url") or "").strip()
+
+        norm_level = str(item.get("level") or "INFO").strip().upper()
+        title = str(item.get("title") or "")
+        message = str(item.get("message") or "")
+        formatted_msg = f"[{norm_level}] 🛡️ AEGIS QUANT: {title}\n{message}"
+
+        dispatched = False
+        if token and chat_id:
+            tg_url = f"{self._telegram_api_base}/bot{token}/sendMessage"
+            tg_payload: dict[str, Any] = {"chat_id": chat_id, "text": formatted_msg}
+            try:
+                status_code = await self._post_json(tg_url, tg_payload)
+                if 200 <= status_code < 300:
+                    dispatched = True
+            except Exception as exc:
+                logger.debug("Retry queue Telegram dispatch error: %s", exc)
+
+        if webhook_url:
+            dc_payload: dict[str, Any] = {"content": formatted_msg}
+            try:
+                status_code = await self._post_json(webhook_url, dc_payload)
+                if 200 <= status_code < 300:
+                    dispatched = True
+            except Exception as exc:
+                logger.debug("Retry queue Discord dispatch error: %s", exc)
+
+        return dispatched
+
+    async def _process_queue(self) -> None:
+        while True:
+            item = await self.queue.get()
+            cfg = self.db.load_config(decrypt=False)
+            max_retries = int(cfg.get("alert_max_retries", 5))
+            base_delay = float(cfg.get("alert_backoff_base_sec", 2.0))
+
+            try:
+                success = await self._dispatch_http(item)
+            except Exception as exc:
+                logger.debug("Exception in _dispatch_http: %s", exc)
+                success = False
+
+            if success:
+                self.delivered_count += 1
+            elif item["attempts"] < max_retries:
+                item["attempts"] += 1
+                delay = base_delay * (2 ** (item["attempts"] - 1))
+                logger.warning(
+                    "Alert delivery failed ('%s'). Retrying in %.1fs (Attempt %d/%d)...",
+                    item["title"], delay, item["attempts"], max_retries
+                )
+                await asyncio.sleep(delay)
+                await self.queue.put(item)
+            else:
+                self.permanent_failure_count += 1
+                logger.error("PERMANENT ALERT FAILURE: Exhausted %d retries for '%s'.", max_retries, item["title"])
+
+            self.queue.task_done()
 
 
 class AlertEngine:
@@ -38,6 +168,11 @@ class AlertEngine:
         self.db = db_manager or DatabaseManager()
         self._http_post = http_post
         self._telegram_api_base = telegram_api_base.rstrip("/")
+        self.retry_queue = AlertRetryQueue(
+            self.db,
+            http_post=http_post,
+            telegram_api_base=self._telegram_api_base,
+        )
         self._last_regime: str | None = None
         self._daily_drawdown_alerted: bool = False
 
@@ -52,7 +187,7 @@ class AlertEngine:
             data=data,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "AegisQuant-TelegramAlertEngine/0.2.0-rc1",
+                "User-Agent": "AegisQuant-TelegramAlertEngine/0.2.0-rc2",
             },
             method="POST",
         )
@@ -92,6 +227,8 @@ class AlertEngine:
             try:
                 status_code = await self._post_json(tg_url, tg_payload)
                 telegram_dispatched = 200 <= status_code < 300
+                if not telegram_dispatched:
+                    errors.append(f"telegram: HTTP {status_code}")
             except Exception as exc:
                 logger.warning("Telegram alert delivery failed: %s", exc)
                 errors.append(f"telegram: {exc}")
@@ -101,9 +238,18 @@ class AlertEngine:
             try:
                 status_code = await self._post_json(webhook_url, dc_payload)
                 discord_dispatched = 200 <= status_code < 300
+                if not discord_dispatched:
+                    errors.append(f"discord: HTTP {status_code}")
             except Exception as exc:
                 logger.warning("Webhook alert delivery failed: %s", exc)
                 errors.append(f"discord: {exc}")
+
+        if errors and not (telegram_dispatched or discord_dispatched):
+            self.retry_queue._telegram_api_base = self._telegram_api_base
+            self.retry_queue.start()
+            await self.retry_queue.enqueue_alert(
+                title=title, message=message, level=norm_level
+            )
 
         report: dict[str, Any] = {
             "status": (

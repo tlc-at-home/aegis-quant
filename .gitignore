@@ -16,3 +16,4 @@ logs/*.log
 .env
 Platform_Specs.md
 blueprint-*.md
+.Trash-*/

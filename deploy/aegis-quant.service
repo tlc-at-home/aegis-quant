@@ -1,5 +1,5 @@
 [Unit]
-Description=Aegis Quant (v0.2.0-rc1) Autonomous Web3 DEX Quantitative Trading Platform
+Description=Aegis Quant (v0.2.0-rc2) Autonomous Web3 DEX Quantitative Trading Platform
 After=network-online.target chronyd.service
 Wants=network-online.target chronyd.service
 

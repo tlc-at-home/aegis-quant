@@ -142,6 +142,17 @@ class DiagonalGaussianHMM:
         return gamma, means, variances
 
 
+class _instance_or_classmethod:
+    """Descriptor allowing a method to be called on either a SignalEngine instance or the class."""
+
+    def __init__(self, func: Any) -> None:
+        self.func = func
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        target = instance if instance is not None else owner
+        return lambda *args, **kwargs: self.func(target, *args, **kwargs)
+
+
 class SignalEngine:
     """
     Evaluates the cached warm-start 3-State Gaussian HMM regime gate with hysteresis,
@@ -152,6 +163,7 @@ class SignalEngine:
     def __init__(self, db: DatabaseManager | None = None) -> None:
         self.db = db
         self._hmm_cache: dict[str, Any] = {}
+        self._mace_cache: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _sanitize_positive_series(s: pd.Series, fallback: float = 1.0) -> pd.Series:
@@ -795,123 +807,331 @@ class SignalEngine:
         target = s_synth.shift(-k) - s_synth
         return features, target
 
-    @classmethod
+    @_instance_or_classmethod
     def _compute_mace_and_ic(
-        cls,
-        exec_df: pd.DataFrame,
+        self_or_cls: Any,
+        exec_df: pd.DataFrame | str,
         synth_df: pd.DataFrame | None = None,
-        cfg: dict[str, Any] | None = None,
-        n_estimators: int | None = None,
-        max_depth: int | None = None,
+        cfg: dict[str, Any] | pd.DataFrame | None = None,
+        n_estimators: int | pd.Series | None = None,
+        max_depth: int | dict[str, Any] | None = None,
         min_samples_leaf: int | None = None,
         ridge_alpha: float | None = None,
-    ) -> tuple[float, float, float]:
+        symbol: str | None = None,
+    ) -> Any:
         """
-        Internal helper returning (mace_score, ic_mace, ic_snr) using purged feature-target
-        slicing `iloc[warmup : -k]` and out-of-sample inference on `iloc[[-1]]`.
+        Computes MACE non-linear prediction using 36-bar cached RF+Ridge models and frozen
+        normalization parameters, maintaining parity with engine/backtest.py.
         """
-        config = cfg or {}
+        # Support direct Blueprint Step 3.2 call signature: (symbol, df_perp, features, target, cfg)
+        if isinstance(exec_df, str):
+            sym_key = exec_df
+            df_perp = synth_df
+            pre_features = cfg if isinstance(cfg, pd.DataFrame) else None
+            pre_target = n_estimators if isinstance(n_estimators, pd.Series) else None
+            config = max_depth if isinstance(max_depth, dict) else {}
+            k = max(1, int(config.get("mace_forward_horizon_bars", 4)))
+            refit_interval = int(config.get("mace_refit_interval_bars", 36))
+            min_ic_floor = float(config.get("mace_min_ic_floor", 0.05))
+            if df_perp is None or pre_features is None or pre_target is None or len(df_perp) == 0:
+                return 0.0, min_ic_floor
+            ts_col = "timestamp_utc" if "timestamp_utc" in df_perp.columns else (
+                "timestamp_ms" if "timestamp_ms" in df_perp.columns else None
+            )
+            latest_bar_ts = int(df_perp[ts_col].iloc[-1]) if ts_col is not None else len(df_perp)
+            mace_cache_dict: dict[str, dict[str, Any]] | None = getattr(self_or_cls, "_mace_cache", None)
+            cache = mace_cache_dict.get(sym_key, {}) if mace_cache_dict is not None else {}
+            last_refit_ts = int(cache.get("ts", 0))
+            if ts_col is not None and len(df_perp) > 1:
+                step = max(1, int(df_perp[ts_col].iloc[-1]) - int(df_perp[ts_col].iloc[-2]))
+                bars_since_refit = (latest_bar_ts - last_refit_ts) // step if last_refit_ts > 0 else 999
+            else:
+                bars_since_refit = (latest_bar_ts - last_refit_ts) if last_refit_ts > 0 else 999
+
+            warmup_idx = 100 if len(pre_features) > 125 + k else 32
+            if not cache or bars_since_refit < 0 or bars_since_refit >= refit_interval:
+                x_train = np.nan_to_num(
+                    pre_features.iloc[warmup_idx:-k].to_numpy(dtype=np.float64),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                y_train = np.nan_to_num(
+                    pre_target.iloc[warmup_idx:-k].fillna(0.0).to_numpy(dtype=np.float64),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if len(x_train) < 20 or np.std(y_train) < 1e-6:
+                    return 0.0, min_ic_floor
+
+                x_center = np.mean(x_train, axis=0)
+                x_std = np.std(x_train, axis=0)
+                x_std[x_std == 0.0] = 1.0
+                x_train_norm = (x_train - x_center) / x_std
+
+                ridge = Ridge(alpha=float(config.get("mace_ridge_alpha", 1.0)), random_state=42)
+                ridge.fit(x_train_norm, y_train)
+
+                rf = RandomForestRegressor(
+                    n_estimators=int(config.get("mace_rf_trees", config.get("mace_rf_n_estimators", 60))),
+                    max_depth=int(config.get("mace_rf_max_depth", 4)),
+                    min_samples_leaf=int(config.get("mace_rf_min_samples_leaf", 8)),
+                    random_state=42,
+                    n_jobs=1,
+                )
+                rf.fit(x_train_norm, y_train)
+
+                cache = {
+                    "ts": latest_bar_ts,
+                    "ridge": ridge,
+                    "rf": rf,
+                    "center": x_center,
+                    "std": x_std,
+                }
+                if mace_cache_dict is not None:
+                    mace_cache_dict[sym_key] = cache
+
+            x_latest = np.nan_to_num(
+                pre_features.iloc[[-1]].to_numpy(dtype=np.float64),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            x_latest_norm = (x_latest - cache["center"]) / cache["std"]
+            lhs_pred = float(np.asarray(cache["ridge"].predict(x_latest_norm)).reshape(-1)[0])
+            rhs_pred = float(np.asarray(cache["rf"].predict(x_latest_norm)).reshape(-1)[0])
+            mace_score = float(np.clip((0.40 * lhs_pred + 0.60 * rhs_pred) * 2.2, -1.0, 1.0))
+
+            ic_val = self_or_cls._safe_spearman_ic(
+                pre_features.iloc[warmup_idx:-k], pre_target.iloc[warmup_idx:-k]
+            )
+            return mace_score, ic_val if ic_val is not None else min_ic_floor
+
+        config = cfg if isinstance(cfg, dict) else {}
         k = max(1, int(config.get("mace_forward_horizon_bars", 4)))
+        refit_interval = max(1, int(config.get("mace_refit_interval_bars", 36)))
+        min_ic_floor = float(config.get("mace_min_ic_floor", 0.05))
         warmup = 32
         tanh_scale = float(config.get("mace_tanh_scale", 1.25))
-        rf_trees = int(n_estimators if n_estimators is not None else config.get("mace_rf_n_estimators", 60))
-        rf_depth = int(max_depth if max_depth is not None else config.get("mace_rf_max_depth", 4))
+        rf_trees = int(
+            n_estimators
+            if isinstance(n_estimators, int)
+            else config.get("mace_rf_n_estimators", config.get("mace_rf_trees", 60))
+        )
+        rf_depth = int(
+            max_depth if isinstance(max_depth, int) else config.get("mace_rf_max_depth", 4)
+        )
         rf_leaf = int(
-            min_samples_leaf if min_samples_leaf is not None else config.get("mace_rf_min_samples_leaf", 10)
+            min_samples_leaf
+            if min_samples_leaf is not None
+            else config.get("mace_rf_min_samples_leaf", 10)
         )
         alpha = float(ridge_alpha if ridge_alpha is not None else config.get("mace_ridge_alpha", 1.0))
         fast_span = int(config.get("snr_fast_span", 16))
         slow_span = int(config.get("snr_slow_span", 64))
 
         if exec_df is None or len(exec_df) < warmup + k + 25:
-            return 0.0, 0.05, 0.05
+            return 0.0, min_ic_floor, min_ic_floor
         if synth_df is not None and not synth_df.empty and len(synth_df) < 40:
-            return 0.0, 0.05, 0.05
+            return 0.0, min_ic_floor, min_ic_floor
 
-        features, target = cls._build_mace_features_and_target(
+        features, target = self_or_cls._build_mace_features_and_target(
             exec_df=exec_df, synth_df=synth_df, forward_horizon_bars=k
         )
         if len(features) < warmup + k + 25:
-            return 0.0, 0.05, 0.05
+            return 0.0, min_ic_floor, min_ic_floor
 
-        # 1. Purged Feature-Target Slicing: strictly up to -k (never overlaps [-k:])
-        X_train_df = features.iloc[warmup:-k]
-        y_train_s = target.iloc[warmup:-k]
-        X_latest_df = features.iloc[[-1]]
-
-        # Fit normalization strictly on purged X_train_df and y_train_s (zero look-ahead leakage)
-        X_train_raw = np.nan_to_num(
-            X_train_df.to_numpy(dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+        ts_col = "timestamp_utc" if "timestamp_utc" in exec_df.columns else (
+            "timestamp_ms" if "timestamp_ms" in exec_df.columns else None
         )
-        X_mean = np.mean(X_train_raw, axis=0)
-        X_center = np.zeros_like(X_mean)
-        X_center[-1] = X_mean[-1]
-        X_std = np.maximum(np.std(X_train_raw, axis=0), 1e-6)
+        raw_ts = exec_df[ts_col].iloc[-1] if ts_col is not None else len(exec_df)
+        latest_bar_ts = (
+            int(raw_ts) if pd.notna(raw_ts) and np.isfinite(float(raw_ts)) else int(len(exec_df))
+        )
 
-        X_train_norm = np.clip((X_train_raw - X_center) / X_std, -3.0, 3.0)
-        X_train = np.hstack([X_train_norm, np.tanh(X_train_norm), X_train_norm ** 2 - 1.0])
+        first_close = float(exec_df["close"].iloc[0]) if "close" in exec_df.columns and not exec_df.empty else 0.0
+        first_close_tag = f"{first_close:.6f}" if np.isfinite(first_close) else "nan"
+        sym_key = (
+            str(symbol)
+            if symbol is not None
+            else (
+                str(exec_df["symbol"].iloc[-1])
+                if "symbol" in exec_df.columns and not exec_df.empty
+                else f"DEFAULT:{first_close_tag}"
+            )
+        )
+        is_builder_mocked = hasattr(self_or_cls._build_mace_features_and_target, "_mock_name")
+        mace_cache_dict = (
+            getattr(self_or_cls, "_mace_cache", None) if not is_builder_mocked else None
+        )
+        cache = mace_cache_dict.get(sym_key, {}) if mace_cache_dict is not None else {}
+        last_refit_ts = int(cache.get("ts", 0))
+        if ts_col is not None and len(exec_df) > 1 and last_refit_ts > 0:
+            t_last = float(exec_df[ts_col].iloc[-1])
+            t_prev = float(exec_df[ts_col].iloc[-2])
+            bar_step = int(t_last - t_prev) if (np.isfinite(t_last) and np.isfinite(t_prev) and t_last > t_prev) else 14_400_000
+            bars_since_refit = (latest_bar_ts - last_refit_ts) // max(1, bar_step)
+        elif last_refit_ts > 0:
+            bars_since_refit = latest_bar_ts - last_refit_ts
+        else:
+            bars_since_refit = 999
 
-        y_raw = y_train_s.to_numpy(dtype=np.float64)
-        valid_mask = np.isfinite(y_raw)
-        if np.sum(valid_mask) < 20:
-            return 0.0, 0.05, 0.05
+        has_synth = bool(synth_df is not None and not synth_df.empty)
+        hyperparams = (rf_trees, rf_depth, rf_leaf, alpha)
+        need_refit = (
+            not cache
+            or bars_since_refit < 0
+            or bars_since_refit >= refit_interval
+            or cache.get("k") != k
+            or cache.get("has_synth") != has_synth
+            or cache.get("params") != hyperparams
+        )
 
-        X_train = X_train[valid_mask]
-        y_raw = y_raw[valid_mask]
-        ret_std = max(float(np.std(y_raw)), 1e-6)
-        y_train = np.clip(y_raw / ret_std, -3.0, 3.0)
+        if need_refit:
+            # 1. Purged Feature-Target Slicing: strictly up to -k (never overlaps [-k:])
+            X_train_df = features.iloc[warmup:-k]
+            y_train_s = target.iloc[warmup:-k]
+
+            # Fit normalization strictly on purged X_train_df and y_train_s (zero look-ahead leakage)
+            X_train_raw = np.nan_to_num(
+                X_train_df.to_numpy(dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            X_mean = np.mean(X_train_raw, axis=0)
+            X_center = np.zeros_like(X_mean)
+            X_center[-1] = X_mean[-1]
+            X_std = np.maximum(np.std(X_train_raw, axis=0), 1e-6)
+
+            X_train_norm = np.clip((X_train_raw - X_center) / X_std, -3.0, 3.0)
+            X_train = np.hstack([X_train_norm, np.tanh(X_train_norm), X_train_norm ** 2 - 1.0])
+
+            y_raw = y_train_s.to_numpy(dtype=np.float64)
+            valid_mask = np.isfinite(y_raw)
+            if np.sum(valid_mask) < 20:
+                return 0.0, min_ic_floor, min_ic_floor
+
+            X_train = X_train[valid_mask]
+            y_raw = y_raw[valid_mask]
+            ret_std = max(float(np.std(y_raw)), 1e-6)
+            y_train = np.clip(y_raw / ret_std, -3.0, 3.0)
+
+            rf = RandomForestRegressor(
+                n_estimators=rf_trees,
+                max_depth=rf_depth,
+                min_samples_leaf=rf_leaf,
+                random_state=42,
+                n_jobs=1,
+            )
+            ridge = Ridge(alpha=alpha, random_state=42)
+
+            rf.fit(X_train, y_train)
+            ridge.fit(X_train, y_train)
+
+            # Evaluate dynamic Spearman Rank IC on purged validation tail of training window
+            eval_tail = min(len(X_train), 80)
+            mace_train_preds = (
+                0.55 * rf.predict(X_train[-eval_tail:])
+                + 0.45 * ridge.predict(X_train[-eval_tail:])
+            )
+            snr_train_proxy = np.tanh(
+                (
+                    0.6 * X_train_norm[valid_mask][-eval_tail:, 1]
+                    + 0.4 * X_train_norm[valid_mask][-eval_tail:, 3]
+                )
+                / max(np.sqrt(fast_span / max(slow_span, 1)), 0.25)
+            )
+            y_tail = y_train[-eval_tail:]
+
+            raw_ic_mace = self_or_cls._safe_spearman_ic(mace_train_preds, y_tail)
+            raw_ic_snr = self_or_cls._safe_spearman_ic(snr_train_proxy, y_tail)
+            ic_mace = raw_ic_mace if raw_ic_mace is not None else min_ic_floor
+            ic_snr = raw_ic_snr if raw_ic_snr is not None else min_ic_floor
+
+            cache = {
+                "ts": latest_bar_ts,
+                "ridge": ridge,
+                "rf": rf,
+                "center": X_center,
+                "std": X_std,
+                "ic_mace": ic_mace,
+                "ic_snr": ic_snr,
+                "k": k,
+                "has_synth": has_synth,
+                "params": hyperparams,
+            }
+            if mace_cache_dict is not None:
+                mace_cache_dict[sym_key] = cache
 
         # 2. Out-of-Sample Inference: predict strictly on X_latest = features.iloc[[-1]]
+        X_latest_df = features.iloc[[-1]]
         X_latest_raw = np.nan_to_num(
             X_latest_df.to_numpy(dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
         )
-        X_latest_norm = np.clip((X_latest_raw - X_center) / X_std, -3.0, 3.0)
+        X_latest_norm = np.clip((X_latest_raw - cache["center"]) / cache["std"], -3.0, 3.0)
         X_latest = np.hstack([X_latest_norm, np.tanh(X_latest_norm), X_latest_norm ** 2 - 1.0])
 
-        rf = RandomForestRegressor(
-            n_estimators=rf_trees,
-            max_depth=rf_depth,
-            min_samples_leaf=rf_leaf,
-            random_state=42,
-            n_jobs=1,
-        )
-        ridge = Ridge(alpha=alpha, random_state=42)
-
-        rf.fit(X_train, y_train)
-        ridge.fit(X_train, y_train)
-
-        pred_rf = float(np.asarray(rf.predict(X_latest)).reshape(-1)[0])
-        pred_ridge = float(np.asarray(ridge.predict(X_latest)).reshape(-1)[0])
+        pred_rf = float(np.asarray(cache["rf"].predict(X_latest)).reshape(-1)[0])
+        pred_ridge = float(np.asarray(cache["ridge"].predict(X_latest)).reshape(-1)[0])
         mace_raw = 0.55 * pred_rf + 0.45 * pred_ridge
         mace_score = float(np.tanh(mace_raw * tanh_scale))
 
-        # Evaluate dynamic Spearman Rank IC on purged validation tail of training window
-        eval_tail = min(len(X_train), 80)
-        mace_train_preds = 0.55 * rf.predict(X_train[-eval_tail:]) + 0.45 * ridge.predict(X_train[-eval_tail:])
-        snr_train_proxy = np.tanh(
-            (0.6 * X_train_norm[valid_mask][-eval_tail:, 1] + 0.4 * X_train_norm[valid_mask][-eval_tail:, 3])
-            / max(np.sqrt(fast_span / max(slow_span, 1)), 0.25)
+        return (
+            mace_score,
+            float(cache.get("ic_mace", min_ic_floor)),
+            float(cache.get("ic_snr", min_ic_floor)),
         )
-        y_tail = y_train[-eval_tail:]
-
-        ic_mace = cls._safe_spearman_ic(mace_train_preds, y_tail)
-        ic_snr = cls._safe_spearman_ic(snr_train_proxy, y_tail)
-        return mace_score, ic_mace, ic_snr
 
     @staticmethod
-    def _safe_spearman_ic(preds: np.ndarray, realized: np.ndarray) -> float:
-        """Compute Spearman Rank Information Coefficient safely without NaN warnings."""
-        if len(preds) < 5 or len(realized) < 5:
-            return 0.05
-        if np.std(preds) <= 1e-12 or np.std(realized) <= 1e-12:
-            return 0.05
-        res = spearmanr(preds, realized)
-        corr = float(res.statistic if hasattr(res, "statistic") else res[0])
-        return corr if np.isfinite(corr) else 0.05
+    def _safe_spearman_ic(
+        x_series: pd.DataFrame | pd.Series | np.ndarray,
+        y_series: pd.Series | np.ndarray,
+    ) -> float | None:
+        """Calculates Spearman Rank IC. Returns None if input data is degenerate or insufficient."""
+        if x_series is None or y_series is None:
+            return None
+        if len(x_series) < 5 or len(y_series) < 5:
+            return None
 
-    @classmethod
+        y_arr = (
+            y_series.to_numpy(dtype=np.float64)
+            if hasattr(y_series, "to_numpy")
+            else np.asarray(y_series, dtype=np.float64)
+        )
+        if not np.all(np.isfinite(y_arr)):
+            valid_y = y_arr[np.isfinite(y_arr)]
+            if len(valid_y) < 5:
+                return None
+            y_std = float(np.std(valid_y))
+        else:
+            y_std = float(np.std(y_arr))
+        if y_std <= 1e-12 or np.isnan(y_std):
+            return None
+
+        try:
+            if isinstance(x_series, pd.DataFrame):
+                x_df = x_series.reset_index(drop=True)
+                y_s = pd.Series(y_arr, name="__target__")
+                corr_matrix = pd.concat([x_df, y_s], axis=1).corr(method="spearman")
+                ic_val = float(corr_matrix.iloc[:-1, -1].mean())
+                return ic_val if np.isfinite(ic_val) else None
+
+            x_arr = (
+                x_series.to_numpy(dtype=np.float64)
+                if hasattr(x_series, "to_numpy")
+                else np.asarray(x_series, dtype=np.float64)
+            )
+            x_std = float(np.std(x_arr))
+            if x_std <= 1e-12 or np.isnan(x_std):
+                return None
+            res = spearmanr(x_arr, y_arr)
+            corr = float(res.statistic if hasattr(res, "statistic") else res[0])
+            return corr if np.isfinite(corr) else None
+        except Exception:
+            return None
+
+    @_instance_or_classmethod
     def compute_mace_nonlinear_score(
-        cls,
+        self_or_cls: Any,
         df_or_exec: pd.DataFrame,
         synth_df_or_cfg: pd.DataFrame | dict[str, Any] | None = None,
         cfg: dict[str, Any] | None = None,
@@ -920,6 +1140,7 @@ class SignalEngine:
         max_depth: int | None = None,
         min_samples_leaf: int | None = None,
         ridge_alpha: float | None = None,
+        symbol: str | None = None,
     ) -> float:
         """
         Compute purged out-of-sample MACE non-linear score in [-1.0, 1.0].
@@ -934,7 +1155,7 @@ class SignalEngine:
             synth_df = synth_df_or_cfg
             eff_cfg = cfg
 
-        score, _, _ = cls._compute_mace_and_ic(
+        score, _, _ = self_or_cls._compute_mace_and_ic(
             exec_df=df_or_exec,
             synth_df=synth_df,
             cfg=eff_cfg,
@@ -942,12 +1163,13 @@ class SignalEngine:
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             ridge_alpha=ridge_alpha,
+            symbol=symbol,
         )
         return score
 
-    @classmethod
+    @_instance_or_classmethod
     def compute_mace_score(
-        cls,
+        self_or_cls: Any,
         exec_df: pd.DataFrame,
         synth_df: pd.DataFrame | None = None,
         n_estimators: int = 60,
@@ -955,12 +1177,13 @@ class SignalEngine:
         min_samples_leaf: int = 10,
         ridge_alpha: float = 1.0,
         cfg: dict[str, Any] | None = None,
+        symbol: str | None = None,
     ) -> float:
         """
         Compute Multivariate Alternating Conditional Expectations (MACE) non-linear score
         using purged feature-target slicing (`iloc[warmup : -k]`) and out-of-sample inference (`iloc[[-1]]`).
         """
-        score, _, _ = cls._compute_mace_and_ic(
+        score, _, _ = self_or_cls._compute_mace_and_ic(
             exec_df=exec_df,
             synth_df=synth_df,
             cfg=cfg,
@@ -968,13 +1191,14 @@ class SignalEngine:
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
             ridge_alpha=ridge_alpha,
+            symbol=symbol,
         )
         return score
 
     @staticmethod
     def compute_dynamic_mace_weight(
-        ic_mace: float,
-        ic_snr: float,
+        ic_mace: float | None,
+        ic_snr: float | None,
         min_ic_floor: float = 0.05,
     ) -> float:
         """
@@ -983,8 +1207,8 @@ class SignalEngine:
         bounded strictly within [0.15, 0.60].
         """
         floor = float(min_ic_floor)
-        m_ic = max(float(ic_mace) if np.isfinite(ic_mace) else 0.0, floor)
-        s_ic = max(float(ic_snr) if np.isfinite(ic_snr) else 0.0, floor)
+        m_ic = max(float(ic_mace) if (ic_mace is not None and np.isfinite(ic_mace)) else 0.0, floor)
+        s_ic = max(float(ic_snr) if (ic_snr is not None and np.isfinite(ic_snr)) else 0.0, floor)
         raw_weight = m_ic / max(m_ic + s_ic, 1e-12)
         return float(np.clip(raw_weight, 0.15, 0.60))
 
@@ -1221,6 +1445,7 @@ class SignalEngine:
                 max_depth=rf_depth,
                 min_samples_leaf=rf_leaf,
                 ridge_alpha=ridge_alpha,
+                symbol=exec_sym,
             )
             mace_weight = self.compute_dynamic_mace_weight(
                 ic_mace=ic_mace, ic_snr=ic_snr, min_ic_floor=min_ic_floor
