@@ -1,0 +1,27 @@
+[project]
+name = "aegis-quant"
+version = "0.2.0rc2"
+description = "Aegis Quant Regime-Gated Cross-Sectional Crypto Relative-Value Trading System"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -71,7 +71,7 @@ class DiagonalGaussianHMM:
         Fit the 3-State Diagonal-Covariance Gaussian HMM over `features` (T, D)
         and return (posterior_gamma (T, K), means (K, D), variances (K, D)).
         """
-        T, D = features.shape
+        T, _ = features.shape
         K = self.n_states
 
         gmm = GaussianMixture(
@@ -296,7 +296,7 @@ class SignalEngine:
             else:
                 weights = np.full(R.shape[1], 1.0 / R.shape[1], dtype=np.float64)
             pc1 = np.nan_to_num(R @ weights, nan=0.0, posinf=0.0, neginf=0.0)
-        except Exception:
+        except (np.linalg.LinAlgError, ValueError, TypeError, ArithmeticError, RuntimeError):
             pc1 = np.nan_to_num(np.mean(R, axis=1), nan=0.0, posinf=0.0, neginf=0.0)
 
         return pd.Series(pc1, index=df_btc.index, dtype=np.float64)
@@ -1126,7 +1126,7 @@ class SignalEngine:
             res = spearmanr(x_arr, y_arr)
             corr = float(res.statistic if hasattr(res, "statistic") else res[0])
             return corr if np.isfinite(corr) else None
-        except Exception:
+        except (ValueError, TypeError, KeyError, IndexError, ArithmeticError, RuntimeError):
             return None
 
     @_instance_or_classmethod
@@ -1359,7 +1359,8 @@ class SignalEngine:
         Decode the cached warm-start 3-State HMM regime and evaluate purged MACE + SNR
         with dynamic Spearman IC blending across all 15 paired assets in v_universe_alt_pairs.
         """
-        assert self.db is not None
+        if self.db is None:
+            raise RuntimeError("SignalEngine requires a DatabaseManager instance for evaluate_universe.")
         cfg = config or self.db.load_config()
         alt_pairs = self.db.get_alt_pairs_universe()
 

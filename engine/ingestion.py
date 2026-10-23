@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import logging
 import math
+import sqlite3
 import time
+from contextlib import suppress
 from typing import Any
 
 import ccxt.async_support as ccxt
@@ -124,7 +126,7 @@ class MarketIngestionEngine:
         if self._exchange is not None:
             try:
                 await self._exchange.close()
-            except Exception as exc:
+            except (ccxt.BaseError, OSError, RuntimeError) as exc:
                 logger.debug("Error closing Hyperliquid client: %s", exc)
             finally:
                 self._exchange = None
@@ -147,24 +149,20 @@ class MarketIngestionEngine:
             item.get("last"),
         ):
             if raw_px is not None and not isinstance(raw_px, bool):
-                try:
+                with suppress(ValueError, TypeError):
                     val = float(raw_px)
                     if math.isfinite(val) and val > 0.0:
                         price = val
                         break
-                except (ValueError, TypeError):
-                    pass
 
         funding: float | None = None
         for raw_fr in (item.get("fundingRate"), info.get("funding")):
             if raw_fr is not None and not isinstance(raw_fr, bool):
-                try:
+                with suppress(ValueError, TypeError):
                     val = float(raw_fr)
                     if math.isfinite(val):
                         funding = val
                         break
-                except (ValueError, TypeError):
-                    pass
 
         return price, funding
 
@@ -203,7 +201,7 @@ class MarketIngestionEngine:
                             snapshot[sym] = {"price": px, "funding_rate": fr}
                     if snapshot:
                         fetched_any = True
-            except Exception as exc:
+            except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 last_err = exc
 
         has_any_price = any(v.get("price") is not None for v in snapshot.values())
@@ -223,7 +221,7 @@ class MarketIngestionEngine:
                             }
                     if snapshot:
                         fetched_any = True
-            except Exception as exc:
+            except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 last_err = exc
 
         if not fetched_any and last_err is not None:
@@ -372,7 +370,7 @@ class MarketIngestionEngine:
                     snapshot: dict[str, dict[str, float | None]] = {}
                     try:
                         snapshot = await self._get_live_market_snapshot(exchange)
-                    except Exception:
+                    except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError):
                         snapshot = {}
 
                     snap_item = snapshot.get(symbol, {})
@@ -381,14 +379,14 @@ class MarketIngestionEngine:
                     elif symbol in self._cycle_funding_cache:
                         funding_hourly = self._cycle_funding_cache[symbol]
                     else:
-                        try:
+                        with suppress(
+                            ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError
+                        ):
                             fr_data = await exchange.fetch_funding_rate(symbol)
                             if isinstance(fr_data, dict) and fr_data.get("fundingRate") is not None:
                                 funding_hourly = float(fr_data["fundingRate"])
                                 self._cycle_single_funding_calls += 1
                                 self._cycle_funding_cache[symbol] = funding_hourly
-                        except Exception:
-                            pass
 
                     if raw_candles and len(raw_candles) >= 50:
                         self._last_full_ohlcv_sync_bar[(symbol, timeframe)] = now_aligned_ms
@@ -478,7 +476,15 @@ class MarketIngestionEngine:
                             0,
                         )
                     ]
-            except Exception as exc:
+            except (
+                ccxt.BaseError,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RuntimeError,
+            ) as exc:
                 self._cycle_network_offline = True
                 logger.warning(
                     "Hyperliquid live/testnet fetch fallback for %s (%s): %s",
@@ -577,8 +583,6 @@ class MarketIngestionEngine:
             return []
 
         btc_open = np.maximum(merged["open_btc"].to_numpy(dtype=np.float64), 1e-12)
-        btc_high = np.maximum(merged["high_btc"].to_numpy(dtype=np.float64), 1e-12)
-        btc_low = np.maximum(merged["low_btc"].to_numpy(dtype=np.float64), 1e-12)
         btc_close = np.maximum(merged["close_btc"].to_numpy(dtype=np.float64), 1e-12)
 
         alt_open = merged["open_alt"].to_numpy(dtype=np.float64)

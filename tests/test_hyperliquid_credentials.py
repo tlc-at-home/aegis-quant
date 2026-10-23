@@ -343,7 +343,7 @@ class TestHyperliquidCredentials(unittest.TestCase):
                         ("PAPER_SIMULATION", "LIVE_TESTNET", "LIVE_MAINNET"),
                     )
                     self.db.upsert_ohlcv_batch(sample_bars[:10])
-                except Exception as exc:  # pragma: no cover
+                except (AssertionError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:  # pragma: no cover
                     errors.append(exc)
                     break
 

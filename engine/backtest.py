@@ -242,7 +242,7 @@ class BacktestEngine:
                             )
                 if bf_rows:
                     self.mem_db.upsert_ohlcv_batch(bf_rows)
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.warning("Could not load real_4h_backfill.json: %s", exc)
 
         self.mem_db.set_config_value("initial_equity_usdc", self.initial_equity)
@@ -688,7 +688,7 @@ class BacktestEngine:
                     else np.full(R_pit.shape[1], 1.0 / R_pit.shape[1], dtype=np.float64)
                 )
                 pc1_vals = R_pit @ w_pc1
-            except Exception:
+            except (np.linalg.LinAlgError, ValueError, TypeError, ArithmeticError):
                 pc1_vals = np.mean(R_pit, axis=1)
             pc1_pit = pd.Series(pc1_vals, index=btc_pit.index, dtype=np.float64)
 
@@ -950,7 +950,7 @@ class BacktestEngine:
                 total_slippage_usdc += entry_slip_cost
                 entry_fee = round(sizing.notional_usdc * maker_fee_rate, 4)
                 total_fees_paid += entry_fee
-                trade_record = {
+                trade_record: dict[str, Any] = {
                     "symbol": sym,
                     "base_asset": str(pair_meta["base_asset"]),
                     "side": action,
@@ -1007,7 +1007,7 @@ class BacktestEngine:
                 self.initial_equity + realized_pnl_total + unrealized_total + accrued_basis_yield,
                 4,
             )
-            snapshot = {
+            snapshot: dict[str, Any] = {
                 "timestamp_ms": ts_int,
                 "total_equity_usdc": round(current_equity, 2),
                 "available_cash_usdc": round(available_cash, 2),
@@ -1205,7 +1205,7 @@ class BacktestEngine:
             " AEGIS QUANT (v0.2.0-alpha1) — POINT-IN-TIME BACKTEST TEAR SHEET",
             "=" * 78,
             f" Replay Window        : {ts.start_date} -> {ts.end_date} ({ts.duration_days:.1f} days / {ts.bars_replayed} 4H bars)",
-            f" Execution Isolation  : SQLite (:memory:) Point-in-Time Clone | Hyperliquid L1 Fees",
+            " Execution Isolation  : SQLite (:memory:) Point-in-Time Clone | Hyperliquid L1 Fees",
             f" Initial Equity       : ${ts.initial_equity_usdc:,.2f} USDC",
             f" Final Equity         : ${ts.final_equity_usdc:,.2f} USDC ({ts.total_return_pct:+.2f}% | CAGR: {ts.annualized_return_pct:+.2f}%)",
             "-" * 78,

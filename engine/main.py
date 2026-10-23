@@ -7,9 +7,12 @@ import asyncio
 import json
 import logging
 import signal
+import sqlite3
 import sys
+from contextlib import suppress
 from typing import Any
 
+import ccxt.async_support as ccxt
 import uvicorn
 
 from engine import __platform__, __version__
@@ -77,7 +80,7 @@ class AegisOrchestrator:
         if self._cycle_count == 1 or self._cycle_count % 24 == 0:
             await asyncio.to_thread(self.calibrator.calibrate_universe)
 
-        summary = {
+        summary: dict[str, Any] = {
             "cycle": self._cycle_count,
             "hmm_regime": regime_state.regime,
             "prob_bull": regime_state.prob_bull,
@@ -114,20 +117,24 @@ class AegisOrchestrator:
                 await self.run_single_cycle()
                 cfg = self.db.load_config()
                 interval = max(5, int(cfg.get("polling_interval_seconds", 15)))
-            except Exception as exc:
+            except (
+                ccxt.BaseError,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RuntimeError,
+            ) as exc:
                 self.logger.exception("Error in quantitative trading cycle: %s", exc)
-                try:
+                with suppress(sqlite3.Error, OSError, ValueError, TypeError, KeyError, RuntimeError):
                     self.db.log_telemetry("ERROR", "engine.orchestrator", str(exc))
                     await self.alerts.notify_critical_event(
                         "Trading Cycle Exception", str(exc), exc=exc
                     )
-                except Exception:
-                    pass
 
-            try:
+            with suppress(TimeoutError):
                 await asyncio.wait_for(self._stop_event.wait(), timeout=float(interval))
-            except asyncio.TimeoutError:
-                pass
 
     async def run_forever(self) -> None:
         """Initialize SQLite WAL, launch FastAPI on :8000, and run the trading engine loop."""
@@ -173,10 +180,8 @@ class AegisOrchestrator:
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, self.request_shutdown)
-            except NotImplementedError:
-                pass
 
         trading_task = asyncio.create_task(self._trading_loop())
         server_task = asyncio.create_task(server.serve())

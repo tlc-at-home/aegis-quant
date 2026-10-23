@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime, timezone
+import contextlib
 import http.server
 import json
 import logging
 import socketserver
+import sqlite3
 import threading
 import urllib.request
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Any
 
 from engine.database import DEFAULT_DB_PATH, DatabaseManager
 
@@ -44,10 +47,8 @@ class AlertRetryQueue:
     async def stop(self) -> None:
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
-            except asyncio.CancelledError:
-                pass
         self._worker_task = None
 
     async def enqueue_alert(self, title: str, message: str, level: str = "INFO") -> None:
@@ -104,7 +105,7 @@ class AlertRetryQueue:
                 status_code = await self._post_json(tg_url, tg_payload)
                 if 200 <= status_code < 300:
                     dispatched = True
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.debug("Retry queue Telegram dispatch error: %s", exc)
 
         if webhook_url:
@@ -113,7 +114,7 @@ class AlertRetryQueue:
                 status_code = await self._post_json(webhook_url, dc_payload)
                 if 200 <= status_code < 300:
                     dispatched = True
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.debug("Retry queue Discord dispatch error: %s", exc)
 
         return dispatched
@@ -127,7 +128,7 @@ class AlertRetryQueue:
 
             try:
                 success = await self._dispatch_http(item)
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.debug("Exception in _dispatch_http: %s", exc)
                 success = False
 
@@ -229,7 +230,7 @@ class AlertEngine:
                 telegram_dispatched = 200 <= status_code < 300
                 if not telegram_dispatched:
                     errors.append(f"telegram: HTTP {status_code}")
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.warning("Telegram alert delivery failed: %s", exc)
                 errors.append(f"telegram: {exc}")
 
@@ -240,7 +241,7 @@ class AlertEngine:
                 discord_dispatched = 200 <= status_code < 300
                 if not discord_dispatched:
                     errors.append(f"discord: HTTP {status_code}")
-            except Exception as exc:
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.warning("Webhook alert delivery failed: %s", exc)
                 errors.append(f"discord: {exc}")
 
@@ -278,8 +279,8 @@ class AlertEngine:
                     "discord_sent": discord_dispatched,
                 },
             )
-        except Exception:
-            pass
+        except (sqlite3.Error, OSError, ValueError, TypeError, RuntimeError) as exc:
+            logger.debug("Telemetry logging skipped during send_alert: %s", exc)
         return report
 
     async def notify_critical_event(
@@ -315,7 +316,7 @@ class AlertEngine:
                     ).fetchone()
                 if row is not None and row["hmm_regime"]:
                     prev = str(row["hmm_regime"]).strip().upper()
-            except Exception:
+            except (sqlite3.Error, OSError, ValueError, TypeError, KeyError):
                 prev = None
 
         self._last_regime = curr
@@ -382,8 +383,8 @@ class AlertEngine:
                         ).fetchone()
                         if peak_row is not None and peak_row["peak_eq"] is not None:
                             ref_eq = max(ref_eq, float(peak_row["peak_eq"]))
-            except Exception:
-                pass
+            except (sqlite3.Error, OSError, ValueError, TypeError, KeyError) as exc:
+                logger.debug("Drawdown peak lookup fallback: %s", exc)
 
         if ref_eq <= 0.0:
             return None
@@ -427,19 +428,19 @@ class AlertEngine:
         received_payloads: list[dict[str, Any]] = []
 
         class _TelegramBotHandler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw_body = self.rfile.read(length).decode("utf-8")
                 try:
                     received_payloads.append(json.loads(raw_body))
-                except Exception:
+                except (ValueError, TypeError):
                     received_payloads.append({"raw": raw_body})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"ok": true}')
 
-            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            def log_message(self, _format: str, *_args: Any) -> None:
                 return
 
         class _ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):

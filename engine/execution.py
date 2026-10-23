@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import sqlite3
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -97,7 +99,7 @@ class ExecutionEngine:
         try:
             cfg = self.db.load_config()
             return str(cfg.get("execution_mode", "PAPER")).strip().upper()
-        except Exception:
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, RuntimeError):
             return "PAPER"
 
     @execution_mode.setter
@@ -134,8 +136,8 @@ class ExecutionEngine:
                 until_ms = closed_ts_ms + cooldown_ms
                 if until_ms > self._cooldown_until_ms.get(sym, 0):
                     self._cooldown_until_ms[sym] = until_ms
-        except Exception:
-            pass
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            logger.debug("Cooldown cache restore skipped: %s", exc)
 
     def is_in_cooldown(
         self,
@@ -438,8 +440,8 @@ class ExecutionEngine:
                         px = float(book_side[0][0])
                         if px > 0:
                             return px
-        except Exception:
-            pass
+        except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            logger.debug("Order book quote fetch fallback on %s: %s", symbol, exc)
 
         try:
             fetch_ticker = getattr(exchange, "fetch_ticker", None)
@@ -450,8 +452,8 @@ class ExecutionEngine:
                     px = float(ticker.get(key) or ticker.get("close") or ticker.get("last") or 0.0)
                     if px > 0:
                         return px
-        except Exception:
-            pass
+        except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            logger.debug("Ticker quote fetch fallback on %s: %s", symbol, exc)
 
         return fallback_price
 
@@ -546,7 +548,7 @@ class ExecutionEngine:
                     price=current_limit_price,
                     params=order_params,
                 )
-            except Exception as exc:
+            except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 self.db.transition_order_state(
                     cli_id,
                     "REJECTED",
@@ -658,7 +660,6 @@ class ExecutionEngine:
 
             # Step 2: Poll exchange.fetch_order(order_id, symbol) across N chase intervals
             prev_filled_on_current_order = 0.0
-            consecutive_timeouts = 0
             order_active_on_book = True
 
             for interval_idx in range(max_intervals):
@@ -668,9 +669,7 @@ class ExecutionEngine:
                 if order_active_on_book:
                     try:
                         polled = await exchange.fetch_order(exchange_order_id, symbol)
-                        consecutive_timeouts = 0
-                    except Exception as poll_exc:
-                        consecutive_timeouts += 1
+                    except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as poll_exc:
                         logger.warning(
                             "Maker limit chaser poll timeout/error (%d/%d) on %s [%s]: %s",
                             interval_idx + 1,
@@ -915,7 +914,14 @@ class ExecutionEngine:
                                 await cancel_fn(exchange_order_id, symbol)
                                 order_active_on_book = False
                                 prev_filled_on_current_order = 0.0
-                            except Exception as cancel_exc:
+                            except (
+                                ccxt.BaseError,
+                                OSError,
+                                ValueError,
+                                TypeError,
+                                KeyError,
+                                RuntimeError,
+                            ) as cancel_exc:
                                 logger.warning(
                                     "Chaser cancel_order step %d failed for %s: %s",
                                     interval_idx + 1,
@@ -944,7 +950,14 @@ class ExecutionEngine:
                                 order_active_on_book = True
                             current_limit_price = new_best_px
                             prev_filled_on_current_order = 0.0
-                        except Exception as reprice_exc:
+                        except (
+                            ccxt.BaseError,
+                            OSError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                            RuntimeError,
+                        ) as reprice_exc:
                             current_limit_price = new_best_px
                             logger.warning(
                                 "Chaser reprice step %d failed for %s: %s",
@@ -955,12 +968,12 @@ class ExecutionEngine:
 
             # Step 3: Unfilled after N chase intervals -> Cancel resting maker limit & transition to EXPIRED
             if order_active_on_book:
-                try:
-                    cancel_fn = getattr(exchange, "cancel_order", None)
-                    if callable(cancel_fn):
+                cancel_fn = getattr(exchange, "cancel_order", None)
+                if callable(cancel_fn):
+                    with suppress(
+                        ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError
+                    ):
                         await cancel_fn(exchange_order_id, symbol)
-                except Exception:
-                    pass
 
             partial_avg = (
                 total_fill_notional / total_filled_units if total_filled_units > 0 else None
@@ -1030,7 +1043,7 @@ class ExecutionEngine:
                     price=ioc_ref_price,
                     params=ioc_params,
                 )
-            except Exception as ioc_exc:
+            except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as ioc_exc:
                 logger.error("MARKET_IOC fallback failed on %s: %s", symbol, ioc_exc)
                 res = OrderExecutionResult(
                     client_order_id=cli_id,
@@ -1185,10 +1198,8 @@ class ExecutionEngine:
         self, title: str, message: str, level: str = "CRITICAL"
     ) -> None:
         """Dispatch optional Telegram/Discord webhook alert for critical reconciliation events."""
-        try:
+        with suppress(sqlite3.Error, OSError, ValueError, TypeError, KeyError, RuntimeError):
             await self.alerts.send_alert(title=title, message=message, level=level)
-        except Exception:
-            pass
 
     async def reconcile_exchange_state(self) -> int:
         """
@@ -1302,7 +1313,15 @@ class ExecutionEngine:
                     )
                     reconciled_count += 1
             return reconciled_count
-        except Exception as exc:
+        except (
+            ccxt.BaseError,
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RuntimeError,
+        ) as exc:
             logger.error("Failed to execute exchange position reconciliation: %s", exc)
             return 0
         finally:
@@ -1403,7 +1422,15 @@ class ExecutionEngine:
 
             self._last_funding_sync_ms[symbol] = max_ts + 1
             return round(net_funding_usdc, 6)
-        except Exception as exc:
+        except (
+            ccxt.BaseError,
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RuntimeError,
+        ) as exc:
             logger.warning("Failed to sync on-chain funding history for %s: %s", symbol, exc)
             return None
         finally:
@@ -1548,7 +1575,15 @@ class ExecutionEngine:
                         reduce_only=True,
                         atr_14=atr_val,
                     )
-                except Exception as exc:
+                except (
+                    ccxt.BaseError,
+                    sqlite3.Error,
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    RuntimeError,
+                ) as exc:
                     self.db.log_telemetry(
                         "ERROR",
                         "engine.execution",
@@ -1643,7 +1678,15 @@ class ExecutionEngine:
                     config=config,
                     atr_14=sizing.atr_value,
                 )
-            except Exception as exc:
+            except (
+                ccxt.BaseError,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+                TypeError,
+                KeyError,
+                RuntimeError,
+            ) as exc:
                 self.db.log_telemetry(
                     "ERROR",
                     "engine.execution",
@@ -1681,7 +1724,7 @@ class ExecutionEngine:
             )
             fsm_state = order_res.fsm_state if order_res is not None else "FILLED"
 
-            new_trade = {
+            new_trade: dict[str, Any] = {
                 "client_order_id": cli_order_id,
                 "symbol": symbol,
                 "base_asset": str(pair_meta["base_asset"]),
@@ -1743,7 +1786,7 @@ class ExecutionEngine:
                     prev_accrued_yield + basis_notional * effective_hourly_rate, 4
                 )
 
-        snapshot = {
+        snapshot: dict[str, Any] = {
             "timestamp_ms": now_ms,
             "total_equity_usdc": current_equity,
             "available_cash_usdc": available_cash,

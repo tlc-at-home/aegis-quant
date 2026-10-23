@@ -12,10 +12,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from engine.backtest import HistoricalBacktester
-
 
 def main() -> None:
+    from engine.backtest import HistoricalBacktester
+
     print("=================================================================")
     print("  AEGIS QUANT v0.2.0-rc2: 2025 Frozen-Calibration Holdout Replay ")
     print("=================================================================")

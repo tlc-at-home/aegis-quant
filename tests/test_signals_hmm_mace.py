@@ -116,7 +116,7 @@ class TestSignalsHMMMace(unittest.TestCase):
                 mutated_exec_future, mutated_synth_future, forward_horizon_bars=k
             )
             # Confirm the unpurged tail [eval_cutoff - k : eval_cutoff] actually changed in full_targ_mut
-            clean_feats_full, clean_targ_full = orig_builder(
+            _, clean_targ_full = orig_builder(
                 full_exec_df, full_synth_df, forward_horizon_bars=k
             )
             self.assertFalse(
@@ -314,7 +314,7 @@ class TestSignalsHMMMace(unittest.TestCase):
             self.engine, "_fit_baum_welch_log", wraps=self.engine._fit_baum_welch_log
         ) as spy_em:
             t1 = time.perf_counter()
-            regime_2, bull_2, bear_2, chop_2 = self.engine.decode_hmm_regime_states(
+            _, bull_2, bear_2, chop_2 = self.engine.decode_hmm_regime_states(
                 btc_tick, alt_pc1, self.cfg
             )
             cached_elapsed = time.perf_counter() - t1

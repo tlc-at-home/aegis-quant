@@ -17,14 +17,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import ccxt
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from engine.backtest import verify_data_provenance
-from engine.ingestion import BASE_PRICES_USDC
-
-UNIVERSE_COINS = [sym.split("/")[0] for sym in BASE_PRICES_USDC]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,17 +30,36 @@ logging.basicConfig(
 logger = logging.getLogger("aegis.refresh_backfill")
 
 DEFAULT_BACKFILL_PATH = PROJECT_ROOT / "data" / "real_4h_backfill.json"
+UNIVERSE_COINS = [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "DOGE",
+    "AVAX",
+    "LINK",
+    "SUI",
+    "DOT",
+    "NEAR",
+    "APT",
+    "ARB",
+    "OP",
+    "INJ",
+    "TIA",
+    "RENDER",
+]
 
 
 def fetch_hyperliquid_4h_backfill(limit: int = 1950) -> dict[str, Any]:
     """Fetch 4H OHLCV history for all 16 universe assets from Hyperliquid via CCXT."""
-    import ccxt
+    from engine.ingestion import BASE_PRICES_USDC
 
+    universe_coins = [sym.split("/")[0] for sym in BASE_PRICES_USDC] or UNIVERSE_COINS
     exchange = ccxt.hyperliquid({"enableRateLimit": True, "timeout": 15000})
     coins_payload: dict[str, Any] = {}
     max_ts_seen = 0
 
-    for coin in UNIVERSE_COINS:
+    for coin in universe_coins:
         symbol = f"{coin}/USDC:USDC"
         candles_raw = exchange.fetch_ohlcv(symbol, timeframe="4h", limit=limit)
         candles = [
@@ -83,6 +99,8 @@ def refresh_and_sign_backfill(
     Ensure `data/real_4h_backfill.json` is present and valid for all 16 universe assets,
     write `data/real_4h_backfill.json.sha256`, and verify SHA-256 provenance.
     """
+    from engine.backtest import verify_data_provenance
+
     backfill_path.parent.mkdir(parents=True, exist_ok=True)
 
     if live_fetch or not backfill_path.exists():
@@ -90,7 +108,7 @@ def refresh_and_sign_backfill(
             logger.info("Fetching live 4H OHLCV backfill from Hyperliquid via CCXT...")
             payload = fetch_hyperliquid_4h_backfill()
             backfill_path.write_text(json.dumps(payload), encoding="utf-8")
-        except Exception as exc:
+        except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
             if not backfill_path.exists():
                 raise RuntimeError(f"Failed to fetch backfill and no local dataset exists: {exc}") from exc
             logger.warning(

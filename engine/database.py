@@ -10,9 +10,10 @@ import os
 import re
 import sqlite3
 import time
-from contextlib import contextmanager
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 import pandas as pd
 from cryptography.fernet import Fernet, InvalidToken
@@ -220,10 +221,8 @@ class DatabaseManager:
     def close(self) -> None:
         """Close persistent in-memory SQLite connection if open."""
         if self._memory_conn is not None:
-            try:
+            with suppress(sqlite3.Error, OSError):
                 self._memory_conn.close()
-            except Exception:
-                pass
             self._memory_conn = None
 
     @contextmanager
@@ -245,7 +244,6 @@ class DatabaseManager:
             return
 
         conn: sqlite3.Connection | None = None
-        last_err: Exception | None = None
         for attempt in range(16):
             try:
                 conn = sqlite3.connect(str(self.db_path), timeout=30.0)
@@ -258,20 +256,18 @@ class DatabaseManager:
                 conn.execute("PRAGMA synchronous = NORMAL;")
                 conn.execute("PRAGMA foreign_keys = ON;")
                 break
-            except sqlite3.OperationalError as exc:
-                last_err = exc
+            except sqlite3.OperationalError:
                 if conn is not None:
-                    try:
+                    with suppress(sqlite3.Error, OSError):
                         conn.close()
-                    except Exception:
-                        pass
                     conn = None
                 if attempt < 15:
                     time.sleep(0.25)
                 else:
-                    raise last_err
+                    raise
 
-        assert conn is not None
+        if conn is None:
+            raise sqlite3.OperationalError("Failed to establish SQLite connection.")
         try:
             yield conn
             conn.commit()
@@ -341,8 +337,8 @@ class DatabaseManager:
         if exec_mode in ("LIVE", "TESTNET") and enforce_key:
             msg = (
                 f"FATAL SECURITY VIOLATION: Execution mode is '{exec_mode}' but no explicit "
-                f"AEGIS_MASTER_KEY environment variable or systemd credential was provided. "
-                f"Refusing to run with the hardcoded fallback key."
+                "AEGIS_MASTER_KEY environment variable or systemd credential was provided. "
+                "Refusing to run with the hardcoded fallback key."
             )
             self.log_telemetry("CRITICAL", "database", msg)
             raise RuntimeError(msg)
@@ -413,7 +409,7 @@ class DatabaseManager:
                 has_enforce = conn.execute(
                     "SELECT config_value FROM system_config WHERE config_key = 'enforce_master_key';"
                 ).fetchone()
-        except Exception:
+        except (sqlite3.Error, OSError, ValueError, RuntimeError):
             has_enforce = None
 
         if has_enforce is not None:
@@ -441,11 +437,9 @@ class DatabaseManager:
         cipher = self._get_fernet()
         raw_token = val[4:] if val.startswith("ENC:") else val
         if raw_token.startswith("gAAAAAB"):
-            try:
+            with suppress(InvalidToken, ValueError, TypeError):
                 cipher.decrypt(raw_token.encode("utf-8"))
                 return raw_token
-            except (InvalidToken, ValueError, TypeError):
-                pass
         return cipher.encrypt(val.encode("utf-8")).decode("utf-8")
 
     def decrypt_config_value(self, raw_value: str) -> str:
@@ -461,17 +455,17 @@ class DatabaseManager:
         cipher = self._get_fernet()
         try:
             return cipher.decrypt(token.encode("utf-8")).decode("utf-8")
-        except (InvalidToken, ValueError, TypeError):
+        except (InvalidToken, ValueError, TypeError) as exc:
             if self._explicit_master_key is None and self._fernet_key != _DEFAULT_HOST_FERNET_KEY:
-                try:
+                with suppress(InvalidToken, ValueError, TypeError):
                     return (
                         Fernet(_DEFAULT_HOST_FERNET_KEY)
                         .decrypt(token.encode("utf-8"))
                         .decode("utf-8")
                     )
-                except (InvalidToken, ValueError, TypeError):
-                    pass
-            raise ValueError("Failed to decrypt Fernet-encrypted configuration value: invalid master key or corrupted token.")
+            raise ValueError(
+                "Failed to decrypt Fernet-encrypted configuration value: invalid master key or corrupted token."
+            ) from exc
 
     def _try_decrypt_or_empty(self, raw_value: str) -> str:
         """Decrypt a config value in memory or return empty string if encrypted under a rotated/stale master key."""
@@ -1147,7 +1141,7 @@ class DatabaseManager:
         if not verified:
             raise RuntimeError("Fernet AES-128 configuration encryption verification failed.")
 
-        report = {
+        report: dict[str, Any] = {
             "status": "VERIFIED",
             "cipher": "AES-128-CBC + HMAC-SHA256 (cryptography.fernet.Fernet)",
             "encrypted_keys_verified": ["private_key", "gemini_api_key"],
@@ -1370,14 +1364,12 @@ class DatabaseManager:
                 (client_order_id, client_order_id),
             ).fetchone()
             if row is None and str(client_order_id).startswith("trade-"):
-                try:
+                with suppress(ValueError):
                     tid = int(str(client_order_id).split("-", 1)[1])
                     row = conn.execute(
                         "SELECT * FROM trades WHERE trade_id = ?;",
                         (tid,),
                     ).fetchone()
-                except ValueError:
-                    pass
         return self._normalize_trade_row(row) if row is not None else None
 
     def insert_trade(self, trade: dict[str, Any]) -> int:
@@ -1468,7 +1460,7 @@ class DatabaseManager:
         )
         slippage_paid_usd = float(trade.get("slippage_paid_usd", 0.0))
 
-        payload = {
+        payload: dict[str, Any] = {
             "client_order_id": client_order_id,
             "symbol": symbol,
             "base_asset": base_asset,
@@ -1772,7 +1764,7 @@ class DatabaseManager:
 
         with self.connection() as conn:
             self._ensure_order_fsm_schema(conn)
-            row = None
+            row: sqlite3.Row | None = None
             if trade_id is not None:
                 row = conn.execute(
                     "SELECT * FROM trades WHERE trade_id = ?;",
@@ -1789,14 +1781,12 @@ class DatabaseManager:
                     (str(client_order_id), str(client_order_id)),
                 ).fetchone()
                 if row is None and str(client_order_id).startswith("trade-"):
-                    try:
+                    with suppress(ValueError):
                         tid = int(str(client_order_id).split("-", 1)[1])
                         row = conn.execute(
                             "SELECT * FROM trades WHERE trade_id = ?;",
                             (tid,),
                         ).fetchone()
-                    except ValueError:
-                        pass
 
             if row is None:
                 return
