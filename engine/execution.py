@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import math
 import sqlite3
 import time
 import uuid
@@ -72,12 +73,12 @@ class ExecutionEngine:
     def __init__(
         self,
         db: DatabaseManager,
-        risk_engine: RiskEngine,
+        risk_engine: RiskEngine | None = None,
         exchange: Any | None = None,
         execution_mode: str | None = None,
     ) -> None:
         self.db = db
-        self.risk_engine = risk_engine
+        self.risk_engine = risk_engine if risk_engine is not None else RiskEngine(self.db)
         self.exchange: Any | None = exchange
         self.alerts = AlertEngine(self.db)
         self._execution_mode_override: str | None = (
@@ -238,6 +239,121 @@ class ExecutionEngine:
             }
         finally:
             await exchange.close()
+
+    @staticmethod
+    def _extract_usdc_balance_tuple(bal: dict[str, Any] | None) -> tuple[float, float, float]:
+        """Extract (total_usdc, free_usdc, used_usdc) from a CCXT Hyperliquid balance response."""
+        if not isinstance(bal, dict):
+            return 0.0, 0.0, 0.0
+        raw_usdc = bal.get("USDC")
+        usdc_entry: dict[str, Any] = raw_usdc if isinstance(raw_usdc, dict) else {}
+        raw_total_map = bal.get("total")
+        total_map: dict[str, Any] = raw_total_map if isinstance(raw_total_map, dict) else {}
+        raw_free_map = bal.get("free")
+        free_map: dict[str, Any] = raw_free_map if isinstance(raw_free_map, dict) else {}
+        raw_used_map = bal.get("used")
+        used_map: dict[str, Any] = raw_used_map if isinstance(raw_used_map, dict) else {}
+
+        raw_total = usdc_entry.get("total")
+        if raw_total is None:
+            raw_total = total_map.get("USDC")
+        raw_info = bal.get("info")
+        if raw_total is None and isinstance(raw_info, dict):
+            margin_sum = raw_info.get("marginSummary") or raw_info.get("crossMarginSummary") or {}
+            if isinstance(margin_sum, dict):
+                raw_total = margin_sum.get("accountValue")
+
+        raw_free = usdc_entry.get("free")
+        if raw_free is None:
+            raw_free = free_map.get("USDC")
+        raw_used = usdc_entry.get("used")
+        if raw_used is None:
+            raw_used = used_map.get("USDC")
+
+        total_val = float(raw_total or 0.0)
+        used_val = float(raw_used or 0.0)
+        free_val = float(raw_free) if raw_free is not None else max(0.0, total_val - used_val)
+        return total_val, free_val, used_val
+
+    async def sync_wallet_equity(
+        self,
+        *,
+        scale_risk_caps: bool = True,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Query live Hyperliquid Mainnet/Testnet USDC balance via CCXT `fetch_balance()`
+        and automatically update `initial_equity_usdc` (and optionally proportional risk caps).
+        """
+        cfg = config if config is not None else self.db.load_config()
+        wallet = str(cfg.get("wallet_address", "")).strip()
+        vault = str(cfg.get("hyperliquid_vault_address", "")).strip()
+        target_user = vault if vault else wallet
+        if not target_user:
+            raise ValueError(
+                "Cannot sync wallet equity: configure your Main Arbitrum Wallet Address (wallet_address) first."
+            )
+
+        owns_exchange = False
+        exchange = self.exchange
+        if exchange is None:
+            exchange, is_testnet = self._build_hyperliquid_client(cfg)
+            owns_exchange = True
+        else:
+            raw_testnet = cfg.get("hyperliquid_testnet", False)
+            mode = str(cfg.get("execution_mode", "PAPER")).strip().upper()
+            is_testnet = bool(raw_testnet) or mode == "TESTNET"
+
+        network_label = "testnet" if is_testnet else "mainnet"
+        try:
+            swap_bal = await exchange.fetch_balance({"user": target_user})
+            total_usdc, free_usdc, used_usdc = self._extract_usdc_balance_tuple(swap_bal)
+            account_type = "perps"
+
+            if total_usdc <= 0.0:
+                with suppress(Exception):
+                    spot_bal = await exchange.fetch_balance(
+                        {"user": target_user, "type": "spot", "enableUnifiedMargin": False}
+                    )
+                    sp_tot, sp_free, sp_used = self._extract_usdc_balance_tuple(spot_bal)
+                    if sp_tot > 0.0:
+                        total_usdc, free_usdc, used_usdc = sp_tot, sp_free, sp_used
+                        account_type = "spot"
+        finally:
+            if owns_exchange and exchange is not None:
+                await exchange.close()
+
+        rounded_eq = round(total_usdc, 2)
+        if not math.isfinite(rounded_eq) or rounded_eq <= 0.0:
+            raise ValueError(
+                f"Hyperliquid {network_label.upper()} wallet {target_user} returned $0.00 USDC balance."
+            )
+
+        scaled_caps: dict[str, float] | None = None
+        if scale_risk_caps:
+            scaled_caps = self.db.scale_risk_caps_for_equity(rounded_eq)
+        else:
+            self.db.set_config_value("initial_equity_usdc", rounded_eq)
+
+        report: dict[str, Any] = {
+            "status": "synced",
+            "network": network_label,
+            "wallet_address": target_user,
+            "account_type": account_type,
+            "wallet_balance_usdc": rounded_eq,
+            "free_usdc": round(free_usdc, 2),
+            "used_margin_usdc": round(used_usdc, 2),
+            "initial_equity_usdc": rounded_eq,
+            "scale_risk_caps": scale_risk_caps,
+            "scaled_risk_caps": scaled_caps,
+        }
+        self.db.log_telemetry(
+            "INFO",
+            "engine.execution",
+            f"Synced initial_equity_usdc=${rounded_eq:.2f} from Hyperliquid {network_label.upper()} wallet {target_user}",
+            report,
+        )
+        return report
 
     # -------------------------------------------------------------------------
     # Step 3.5: Realistic Paper Fill & Dynamic Slippage Model

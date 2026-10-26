@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from engine import __platform__, __version__
 from engine.alerts import AlertEngine
 from engine.database import DatabaseManager
+from engine.execution import ExecutionEngine
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_HTML_PATH = STATIC_DIR / "index.html"
@@ -26,6 +27,20 @@ class ConfigUpdatePayload(BaseModel):
 
     config_key: str
     config_value: Any
+    scale_risk_caps: bool = False
+
+
+class ConfigBatchUpdatePayload(BaseModel):
+    """Payload for updating multiple configuration variables in SQLite system_config."""
+
+    updates: dict[str, Any]
+    scale_risk_caps: bool = False
+
+
+class WalletSyncPayload(BaseModel):
+    """Payload for syncing initial_equity_usdc from live Hyperliquid wallet USDC balance."""
+
+    scale_risk_caps: bool = True
 
 
 class CredentialsUpdatePayload(BaseModel):
@@ -131,10 +146,18 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
             "deployed_notional_usdc": float(snap.get("deployed_notional_usdc", 0.0)),
             "gross_leverage": float(snap.get("gross_leverage", 0.0)),
             "max_gross_leverage": float(cfg.get("max_gross_leverage", 1.5)),
+            "max_gross_leverage_notional_usdc": float(
+                cfg.get("max_gross_leverage_notional_usdc", initial_eq * 1.5)
+            ),
             "portfolio_heat_usdc": float(snap.get("portfolio_heat_usdc", 0.0)),
             "max_portfolio_heat_usdc": float(cfg.get("max_portfolio_heat_usdc", 400.0)),
             "portfolio_heat_pct": float(snap.get("portfolio_heat_pct", 0.0)),
             "max_portfolio_heat_pct": float(cfg.get("max_portfolio_heat_pct", 0.04)),
+            "baseline_risk_per_trade_usdc": float(
+                cfg.get("baseline_risk_per_trade_usdc", 100.0)
+            ),
+            "min_risk_per_trade_usdc": float(cfg.get("min_risk_per_trade_usdc", 50.0)),
+            "max_risk_per_trade_usdc": float(cfg.get("max_risk_per_trade_usdc", 150.0)),
             "single_asset_cap_usdc": float(cfg.get("max_single_asset_notional_usdc", 2500.0)),
             "basis_harvest_notional_usdc": float(snap.get("basis_harvest_notional_usdc", 0.0)),
             "accrued_yield_usdc": float(snap.get("accrued_yield_usdc", 0.0)),
@@ -197,6 +220,15 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
     async def update_config(payload: ConfigUpdatePayload) -> dict[str, Any]:
         try:
             updated = db_manager.set_config_value(payload.config_key, payload.config_value)
+            scaled_caps: dict[str, float] | None = None
+            if (
+                updated
+                and payload.scale_risk_caps
+                and payload.config_key == "initial_equity_usdc"
+            ):
+                scaled_caps = db_manager.scale_risk_caps_for_equity(
+                    float(payload.config_value)
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not updated:
@@ -207,8 +239,49 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
             "INFO",
             "web.config",
             f"Updated system_config key '{payload.config_key}'",
+            {"scale_risk_caps": payload.scale_risk_caps} if payload.scale_risk_caps else None,
         )
-        return {"status": "updated", "config_key": payload.config_key}
+        out: dict[str, Any] = {"status": "updated", "config_key": payload.config_key}
+        if scaled_caps is not None:
+            out["scaled_risk_caps"] = scaled_caps
+        return out
+
+    @app.post("/api/v1/config/batch")
+    async def update_config_batch(payload: ConfigBatchUpdatePayload) -> dict[str, Any]:
+        try:
+            updated_keys = db_manager.set_config_batch(
+                payload.updates, scale_risk_caps=payload.scale_risk_caps
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        db_manager.log_telemetry(
+            "INFO",
+            "web.config",
+            f"Updated {len(updated_keys)} system_config keys in batch",
+            {"updated_keys": updated_keys, "scale_risk_caps": payload.scale_risk_caps},
+        )
+        return {
+            "status": "updated",
+            "count": len(updated_keys),
+            "updated_keys": updated_keys,
+        }
+
+    @app.post("/api/v1/config/sync-wallet")
+    async def sync_wallet_equity(payload: WalletSyncPayload) -> dict[str, Any]:
+        exec_engine = ExecutionEngine(db_manager)
+        try:
+            report = await exec_engine.sync_wallet_equity(
+                scale_risk_caps=payload.scale_risk_caps
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Hyperliquid wallet balance fetch failed: {exc}"
+            ) from exc
+        return report
 
     @app.get("/api/v1/credentials")
     async def get_credentials() -> dict[str, Any]:
@@ -302,13 +375,32 @@ def create_app(db: DatabaseManager | None = None) -> FastAPI:
             while True:
                 cfg = db_manager.load_config()
                 snap = db_manager.get_latest_portfolio_snapshot()
+                initial_eq = float(cfg.get("initial_equity_usdc", 10000.0))
+                portfolio_payload = {
+                    **snap,
+                    "initial_equity_usdc": initial_eq,
+                    "max_portfolio_heat_usdc": float(cfg.get("max_portfolio_heat_usdc", 400.0)),
+                    "max_portfolio_heat_pct": float(cfg.get("max_portfolio_heat_pct", 0.04)),
+                    "min_risk_per_trade_usdc": float(cfg.get("min_risk_per_trade_usdc", 50.0)),
+                    "max_risk_per_trade_usdc": float(cfg.get("max_risk_per_trade_usdc", 150.0)),
+                    "baseline_risk_per_trade_usdc": float(
+                        cfg.get("baseline_risk_per_trade_usdc", 100.0)
+                    ),
+                    "max_gross_leverage": float(cfg.get("max_gross_leverage", 1.5)),
+                    "max_gross_leverage_notional_usdc": float(
+                        cfg.get("max_gross_leverage_notional_usdc", initial_eq * 1.5)
+                    ),
+                    "single_asset_cap_usdc": float(
+                        cfg.get("max_single_asset_notional_usdc", 2500.0)
+                    ),
+                }
                 signals = db_manager.get_latest_signals(limit=15)
                 open_trades = db_manager.get_open_trades()
                 payload = {
                     "timestamp_ms": int(time.time() * 1000),
                     "version": f"v{__version__}",
                     "polling_interval_seconds": int(cfg.get("polling_interval_seconds", 15)),
-                    "portfolio": snap,
+                    "portfolio": portfolio_payload,
                     "signals": signals,
                     "open_trades": open_trades,
                 }

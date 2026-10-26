@@ -828,6 +828,10 @@ class DatabaseManager:
                     raise ValueError(
                         "Invalid max_daily_drawdown_alert_pct: must be a fraction in (0.0, 1.0), e.g. 0.03 for 3%."
                     )
+                if key == "initial_equity_usdc" and f_val <= 0.0:
+                    raise ValueError(
+                        f"Invalid initial_equity_usdc '{value!r}': must be > 0.0."
+                    )
                 str_val = str(f_val)
             else:
                 if key == "telegram_chat_id" and isinstance(value, int) and not isinstance(value, bool):
@@ -854,18 +858,110 @@ class DatabaseManager:
                 (stored_val, key),
             )
             if key == "initial_equity_usdc" and cur.rowcount > 0:
+                new_base_eq = float(str_val)
                 trade_cnt_row = conn.execute("SELECT COUNT(*) FROM trades;").fetchone()
                 if trade_cnt_row and int(trade_cnt_row[0]) == 0:
                     conn.execute(
                         """
                         UPDATE portfolio_snapshots
                         SET total_equity_usdc = ?,
-                            available_cash_usdc = ?
-                        WHERE deployed_notional_usdc = 0.0 AND accrued_yield_usdc = 0.0;
+                            available_cash_usdc = ?,
+                            accrued_yield_usdc = 0.0,
+                            basis_harvest_notional_usdc = CASE
+                                WHEN basis_harvest_notional_usdc > 0.0 THEN ROUND(? * 0.50, 2)
+                                ELSE 0.0
+                            END
+                        WHERE deployed_notional_usdc = 0.0;
                         """,
-                        (float(str_val), float(str_val)),
+                        (new_base_eq, new_base_eq, new_base_eq),
                     )
+                else:
+                    latest_snap = conn.execute(
+                        """
+                        SELECT snapshot_id, deployed_notional_usdc, accrued_yield_usdc, portfolio_heat_usdc
+                        FROM portfolio_snapshots
+                        ORDER BY snapshot_id DESC
+                        LIMIT 1;
+                        """
+                    ).fetchone()
+                    if latest_snap is not None:
+                        realized_row = conn.execute(
+                            "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) AS r_pnl FROM trades WHERE status = 'CLOSED';"
+                        ).fetchone()
+                        unrealized_row = conn.execute(
+                            "SELECT COALESCE(SUM(unrealized_pnl_usdc), 0.0) AS u_pnl FROM trades WHERE status = 'OPEN';"
+                        ).fetchone()
+                        r_pnl = float(realized_row["r_pnl"]) if realized_row else 0.0
+                        u_pnl = float(unrealized_row["u_pnl"]) if unrealized_row else 0.0
+                        accrued = float(latest_snap["accrued_yield_usdc"] or 0.0)
+                        deployed = float(latest_snap["deployed_notional_usdc"] or 0.0)
+                        heat_usdc = float(latest_snap["portfolio_heat_usdc"] or 0.0)
+                        new_total_eq = round(new_base_eq + r_pnl + u_pnl + accrued, 2)
+                        new_avail_cash = max(0.0, round(new_total_eq - deployed, 2))
+                        new_heat_pct = round(heat_usdc / max(new_total_eq, 1.0), 4)
+                        new_gross_lev = round(deployed / max(new_total_eq, 1.0), 4)
+                        conn.execute(
+                            """
+                            UPDATE portfolio_snapshots
+                            SET total_equity_usdc = ?,
+                                available_cash_usdc = ?,
+                                portfolio_heat_pct = ?,
+                                gross_leverage = ?
+                            WHERE snapshot_id = ?;
+                            """,
+                            (
+                                new_total_eq,
+                                new_avail_cash,
+                                new_heat_pct,
+                                new_gross_lev,
+                                int(latest_snap["snapshot_id"]),
+                            ),
+                        )
             return cur.rowcount > 0
+
+    def scale_risk_caps_for_equity(self, initial_equity_usdc: float) -> dict[str, float]:
+        """Scale dollar-denominated risk parameters proportionally to initial_equity_usdc."""
+        eq = float(initial_equity_usdc)
+        if not math.isfinite(eq) or eq <= 0.0:
+            raise ValueError(f"Invalid initial_equity_usdc '{initial_equity_usdc!r}': must be > 0.0.")
+        cfg = self.load_config(decrypt=False)
+        heat_pct = float(cfg.get("max_portfolio_heat_pct", 0.04))
+        single_pct = float(cfg.get("max_single_asset_pct", 0.25))
+        gross_lev = float(cfg.get("max_gross_leverage", 1.5))
+        scale_min = float(cfg.get("conviction_scale_min", 0.5))
+        scale_max = float(cfg.get("conviction_scale_max", 1.5))
+        baseline_risk = round(eq * 0.01, 2)
+        scaled: dict[str, float] = {
+            "initial_equity_usdc": round(eq, 2),
+            "baseline_risk_per_trade_usdc": baseline_risk,
+            "min_risk_per_trade_usdc": round(baseline_risk * scale_min, 2),
+            "max_risk_per_trade_usdc": round(baseline_risk * scale_max, 2),
+            "max_portfolio_heat_usdc": round(eq * heat_pct, 2),
+            "max_single_asset_notional_usdc": round(eq * single_pct, 2),
+            "max_gross_leverage_notional_usdc": round(eq * gross_lev, 2),
+        }
+        for k, v in scaled.items():
+            self.set_config_value(k, v)
+        return scaled
+
+    def set_config_batch(
+        self, updates: dict[str, Any], *, scale_risk_caps: bool = False
+    ) -> list[str]:
+        """Validate and update a batch of system_config keys."""
+        if not updates:
+            return []
+        updated_keys: list[str] = []
+        for k, v in updates.items():
+            ok = self.set_config_value(str(k), v)
+            if not ok:
+                raise KeyError(f"Unknown config_key: {k}")
+            updated_keys.append(str(k))
+        if scale_risk_caps and "initial_equity_usdc" in updates:
+            scaled = self.scale_risk_caps_for_equity(float(updates["initial_equity_usdc"]))
+            for sk in scaled:
+                if sk not in updated_keys:
+                    updated_keys.append(sk)
+        return updated_keys
 
     def get_credentials_status(
         self, config: dict[str, Any] | None = None

@@ -632,6 +632,51 @@ class TestHyperliquidCredentials(unittest.TestCase):
 
         asyncio.run(_run_bad_symbol_check())
 
+    def test_13_sync_wallet_equity_and_batch_config_webui(self) -> None:
+        client = TestClient(create_app(self.db))
+
+        # 1. Without wallet_address configured, sync-wallet returns 400
+        res_no_wallet = client.post("/api/v1/config/sync-wallet", json={"scale_risk_caps": True})
+        self.assertEqual(res_no_wallet.status_code, 400)
+
+        # 2. Configure wallet_address and mock CCXT fetch_balance returning 998.54 USDC on Testnet
+        self.db.configure_hyperliquid_credentials(
+            wallet_address=SAMPLE_WALLET,
+            private_key=SAMPLE_PRIVKEY,
+            hyperliquid_testnet=True,
+            execution_mode="TESTNET",
+        )
+        mock_ex = AsyncMock()
+        mock_ex.fetch_balance.return_value = {
+            "USDC": {"total": 998.54, "free": 998.54, "used": 0.0},
+            "total": {"USDC": 998.54},
+            "info": {"marginSummary": {"accountValue": "998.54", "totalMarginUsed": "0.0"}},
+        }
+        mock_ex.close = AsyncMock()
+
+        with patch.object(
+            ExecutionEngine,
+            "_build_hyperliquid_client",
+            return_value=(mock_ex, True),
+        ):
+            res_sync = client.post("/api/v1/config/sync-wallet", json={"scale_risk_caps": True})
+            self.assertEqual(res_sync.status_code, 200, res_sync.text)
+            body = res_sync.json()
+            self.assertEqual(body["status"], "synced")
+            self.assertEqual(body["network"], "testnet")
+            self.assertEqual(body["wallet_balance_usdc"], 998.54)
+            self.assertEqual(body["initial_equity_usdc"], 998.54)
+            self.assertEqual(body["scaled_risk_caps"]["max_portfolio_heat_usdc"], 39.94)
+
+        p_after = client.get("/api/v1/portfolio").json()
+        self.assertEqual(p_after["initial_equity_usdc"], 998.54)
+        self.assertEqual(p_after["total_equity_usdc"], 998.54)
+
+        # 3. Verify WebUI HTML includes the Sync from Hyperliquid Wallet button
+        html_text = client.get("/").text
+        self.assertIn("btn-sync-wallet", html_text)
+        self.assertIn("Sync from Hyperliquid Wallet", html_text)
+
 
 if __name__ == "__main__":
     unittest.main()

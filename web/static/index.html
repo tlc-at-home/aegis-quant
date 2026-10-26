@@ -192,6 +192,135 @@
       border: 1px solid var(--bear);
       color: #fecaca;
     }
+    input:focus-visible, select:focus-visible, button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    input:user-invalid,
+    input.user-invalid-fallback {
+      border-color: var(--bear);
+      background-color: rgba(239, 68, 68, 0.12);
+    }
+    input:user-valid,
+    input.user-valid-fallback {
+      border-color: var(--bull);
+    }
+    .hint {
+      display: block;
+      color: var(--text-muted);
+      font-size: 0.72rem;
+      margin-bottom: 0.25rem;
+    }
+    .error-msg {
+      display: none;
+      color: var(--bear);
+      font-size: 0.75rem;
+      margin-top: 0.25rem;
+    }
+    input:user-invalid + .error-msg,
+    input.user-invalid-fallback + .error-msg {
+      display: block;
+    }
+    fieldset.settings-fieldset {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.85rem 1rem;
+      margin-bottom: 1rem;
+      background: rgba(26, 36, 54, 0.55);
+    }
+    fieldset.settings-fieldset legend {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--accent);
+      padding: 0 0.45rem;
+    }
+    .equity-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: flex-end;
+    }
+    .preset-pills, .cat-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-top: 0.5rem;
+    }
+    .pill-btn {
+      background: var(--bg-card);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0.28rem 0.7rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .pill-btn:hover, .pill-btn.active {
+      color: #0b0f17;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .cfg-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 0.85rem;
+      margin-bottom: 0.75rem;
+    }
+    .cfg-table-wrap {
+      max-height: 540px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-top: 0.65rem;
+    }
+    .cfg-table th {
+      position: sticky;
+      top: 0;
+      background: var(--bg-card);
+      z-index: 2;
+    }
+    .cfg-row-dirty {
+      background: rgba(56, 189, 248, 0.09);
+    }
+    .cfg-input {
+      width: 100%;
+      min-width: 140px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 0.35rem 0.5rem;
+      border-radius: 4px;
+      font-family: inherit;
+      font-size: 0.8rem;
+    }
+    .type-pill {
+      display: inline-block;
+      padding: 0.12rem 0.45rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      text-transform: lowercase;
+    }
+    .checkbox-inline {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.8rem;
+      color: var(--text-main);
+      cursor: pointer;
+      padding-bottom: 0.35rem;
+    }
+    .checkbox-inline input[type="checkbox"] {
+      width: 1rem;
+      height: 1rem;
+      accent-color: var(--accent);
+    }
   </style>
 </head>
 <body>
@@ -215,12 +344,12 @@
       <div class="card-sub" id="val-initial-equity">Initial Baseline: $10,000.00</div>
     </div>
     <div class="card">
-      <div class="card-label">Portfolio Heat Cap ($400 / 4%)</div>
+      <div class="card-label" id="lbl-heat-cap">Portfolio Heat Cap ($400 / 4%)</div>
       <div class="card-value" id="val-heat">$0.00 (0.00%)</div>
-      <div class="card-sub">Conviction Risk: $50 – $150 / trade</div>
+      <div class="card-sub" id="val-risk-range">Conviction Risk: $50 – $150 / trade</div>
     </div>
     <div class="card">
-      <div class="card-label">Gross Leverage (Max 1.5x)</div>
+      <div class="card-label" id="lbl-leverage-cap">Gross Leverage (Max 1.5x)</div>
       <div class="card-value" id="val-leverage">0.00x</div>
       <div class="card-sub" id="val-notional">Deployed: $0.00 / $15,000</div>
     </div>
@@ -365,6 +494,106 @@
     </div>
   </section>
 
+  <section class="card cred-panel" id="system-settings-panel">
+    <h2>System Settings &amp; Quantitative Engine Parameters (SQLite <code>system_config</code> — <span id="cfg-total-count">100</span> Keys)</h2>
+
+    <form id="equity-scale-form" action="/api/v1/config" method="POST">
+      <fieldset class="settings-fieldset">
+        <legend>Capital Baseline &amp; Proportional Risk Scaling</legend>
+        <div class="equity-bar">
+          <div class="form-group" style="min-width: 240px; flex: 1;">
+            <label for="inp-initial-equity">Initial Portfolio Equity Baseline (USDC)</label>
+            <span id="equity-hint" class="hint">Updates initial_equity_usdc and recalculates portfolio total equity</span>
+            <input
+              type="number"
+              id="inp-initial-equity"
+              name="initial_equity_usdc"
+              step="0.01"
+              min="100"
+              required
+              value="10000"
+              aria-describedby="equity-hint"
+              aria-errormessage="equity-error"
+            />
+            <div id="equity-error" class="error-msg">
+              <span aria-hidden="true">❌</span> Enter a valid initial equity (&ge; $100 USDC).
+            </div>
+          </div>
+
+          <div class="form-group" style="flex: 2; min-width: 280px;">
+            <label class="checkbox-inline" for="chk-scale-risk">
+              <input type="checkbox" id="chk-scale-risk" name="scale_risk_caps" checked />
+              <span>Auto-scale dollar risk caps (1% baseline risk, 0.5%–1.5% trade risk, 4% heat, 25% single-asset, 1.5x gross notional)</span>
+            </label>
+            <div class="preset-pills" role="group" aria-label="Equity Presets">
+              <button type="button" class="pill-btn eq-preset-btn" data-eq="1000">$1,000</button>
+              <button type="button" class="pill-btn eq-preset-btn" data-eq="5000">$5,000</button>
+              <button type="button" class="pill-btn eq-preset-btn active" data-eq="10000">$10,000</button>
+              <button type="button" class="pill-btn eq-preset-btn" data-eq="25000">$25,000</button>
+              <button type="button" class="pill-btn eq-preset-btn" data-eq="50000">$50,000</button>
+              <button type="button" class="pill-btn eq-preset-btn" data-eq="100000">$100,000</button>
+            </div>
+          </div>
+
+          <div class="form-group btn-row">
+            <button type="submit" class="btn-save" id="btn-save-equity">Apply Equity &amp; Risk Baseline</button>
+            <button type="button" class="btn-secondary" id="btn-sync-wallet">Sync from Hyperliquid Wallet</button>
+          </div>
+        </div>
+      </fieldset>
+    </form>
+
+    <form id="sys-config-form" action="/api/v1/config/batch" method="POST">
+      <fieldset class="settings-fieldset" style="margin-bottom: 0;">
+        <legend>All System Configuration Keys (Risk, Execution, Stops, HMM, MACE, Signals, Orchestrator)</legend>
+
+        <div class="cfg-toolbar">
+          <div class="form-group" style="min-width: 280px; flex: 1;">
+            <label for="inp-cfg-search">Search Settings by Key, Category, or Description</label>
+            <input
+              type="text"
+              id="inp-cfg-search"
+              name="cfg_search"
+              placeholder="Filter (e.g. initial_equity, chandelier, hmm, snr, leverage, polling)..."
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+          </div>
+          <div class="btn-row">
+            <button type="submit" class="btn-save" id="btn-save-all-cfg">
+              Save Modified Settings (<span id="cfg-dirty-count">0</span>)
+            </button>
+            <button type="button" class="btn-secondary" id="btn-reload-cfg">Reload Settings</button>
+          </div>
+        </div>
+
+        <div class="cat-pills" id="cfg-category-pills" role="group" aria-label="Filter by configuration category"></div>
+
+        <div id="sys-config-banner" class="state-banner" role="status" aria-live="polite"></div>
+
+        <div class="cfg-table-wrap">
+          <table class="cfg-table">
+            <thead>
+              <tr>
+                <th>Category</th>
+                <th>Config Key</th>
+                <th>Type</th>
+                <th>Value</th>
+                <th>Description</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="sys-config-tbody">
+              <tr><td colspan="6">Loading system_config parameters...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </fieldset>
+    </form>
+  </section>
+
   <script>
     function shortAddr(addr) {
       if (!addr || addr.length < 12) return addr || 'Not Set';
@@ -390,8 +619,22 @@
       const heat = Number(p.portfolio_heat_usdc ?? 0).toFixed(2);
       const heatPct = (Number(p.portfolio_heat_pct ?? 0) * 100).toFixed(2);
       document.getElementById('val-heat').textContent = `$${heat} (${heatPct}%)`;
+      if (p.max_portfolio_heat_usdc !== undefined) {
+        const maxHeat = Number(p.max_portfolio_heat_usdc).toLocaleString(undefined, {maximumFractionDigits: 0});
+        const maxHeatPct = Math.round(Number(p.max_portfolio_heat_pct ?? 0.04) * 100);
+        document.getElementById('lbl-heat-cap').textContent = `Portfolio Heat Cap ($${maxHeat} / ${maxHeatPct}%)`;
+      }
+      if (p.min_risk_per_trade_usdc !== undefined && p.max_risk_per_trade_usdc !== undefined) {
+        const minR = Number(p.min_risk_per_trade_usdc).toLocaleString(undefined, {maximumFractionDigits: 2});
+        const maxR = Number(p.max_risk_per_trade_usdc).toLocaleString(undefined, {maximumFractionDigits: 2});
+        document.getElementById('val-risk-range').textContent = `Conviction Risk: $${minR} – $${maxR} / trade`;
+      }
+      if (p.max_gross_leverage !== undefined) {
+        document.getElementById('lbl-leverage-cap').textContent = `Gross Leverage (Max ${Number(p.max_gross_leverage).toFixed(1)}x)`;
+      }
       document.getElementById('val-leverage').textContent = `${Number(p.gross_leverage ?? 0).toFixed(2)}x`;
-      document.getElementById('val-notional').textContent = `Deployed: $${Number(p.deployed_notional_usdc ?? 0).toFixed(2)} / $15,000`;
+      const maxGrossNotional = Number(p.max_gross_leverage_notional_usdc ?? 15000).toLocaleString(undefined, {maximumFractionDigits: 0});
+      document.getElementById('val-notional').textContent = `Deployed: $${Number(p.deployed_notional_usdc ?? 0).toFixed(2)} / $${maxGrossNotional}`;
       document.getElementById('val-basis').textContent = `$${Number(p.basis_harvest_notional_usdc ?? 0).toFixed(2)}`;
       document.getElementById('val-yield').textContent = `Accrued Yield: $${Number(p.accrued_yield_usdc ?? 0).toFixed(4)}`;
 
@@ -700,13 +943,589 @@
       }
     });
 
+    // --- System Settings & Configuration Manager ---
+    const SECRET_CFG_KEYS = new Set(['private_key', 'gemini_api_key', 'telegram_bot_token']);
+    let allConfigRows = [];
+    let activeCfgCategory = 'ALL';
+    const dirtyConfigValues = new Map();
+
+    function escapeHtml(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function updateDirtyCount() {
+      const el = document.getElementById('cfg-dirty-count');
+      if (el) el.textContent = String(dirtyConfigValues.size);
+    }
+
+    function castControlValue(rawVal, valueType) {
+      const vt = String(valueType || 'string').toLowerCase();
+      if (vt === 'bool') {
+        return String(rawVal).toLowerCase() === 'true';
+      }
+      if (vt === 'int') {
+        const n = Number(rawVal);
+        return Number.isFinite(n) ? Math.trunc(n) : rawVal;
+      }
+      if (vt === 'float') {
+        const n = Number(rawVal);
+        return Number.isFinite(n) ? n : rawVal;
+      }
+      return String(rawVal);
+    }
+
+    function renderCategoryPills() {
+      const container = document.getElementById('cfg-category-pills');
+      if (!container) return;
+      const counts = new Map();
+      for (const r of allConfigRows) {
+        const cat = r.category || 'general';
+        counts.set(cat, (counts.get(cat) || 0) + 1);
+      }
+      const categories = ['ALL', ...Array.from(counts.keys())];
+      container.innerHTML = categories.map(cat => {
+        const cnt = cat === 'ALL' ? allConfigRows.length : counts.get(cat);
+        const isActive = activeCfgCategory === cat ? 'active' : '';
+        return `<button type="button" class="pill-btn ${isActive}" data-cat="${escapeHtml(cat)}">${escapeHtml(cat)} (${cnt})</button>`;
+      }).join('');
+
+      container.querySelectorAll('.pill-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          activeCfgCategory = btn.getAttribute('data-cat') || 'ALL';
+          renderCategoryPills();
+          renderSystemConfigTable();
+        });
+      });
+    }
+
+    function renderSystemConfigTable() {
+      const tbody = document.getElementById('sys-config-tbody');
+      if (!tbody) return;
+      const searchQ = (document.getElementById('inp-cfg-search')?.value || '').trim().toLowerCase();
+
+      const filtered = allConfigRows.filter(r => {
+        if (activeCfgCategory !== 'ALL' && r.category !== activeCfgCategory) return false;
+        if (!searchQ) return true;
+        return (
+          String(r.config_key || '').toLowerCase().includes(searchQ) ||
+          String(r.category || '').toLowerCase().includes(searchQ) ||
+          String(r.description || '').toLowerCase().includes(searchQ)
+        );
+      });
+
+      if (!filtered.length) {
+        tbody.innerHTML = '<tr><td colspan="6">No matching configuration parameters found.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(r => {
+        const key = String(r.config_key);
+        const vtype = String(r.value_type || 'string').toLowerCase();
+        const isSecret = SECRET_CFG_KEYS.has(key);
+        const isDirty = dirtyConfigValues.has(key);
+        const currentVal = isDirty ? dirtyConfigValues.get(key) : String(r.config_value ?? '');
+        const inputId = `cfg-inp-${key}`;
+        const descId = `cfg-desc-${key}`;
+
+        let controlHtml = '';
+        if (vtype === 'bool') {
+          const isTrue = String(currentVal).toLowerCase() === 'true';
+          controlHtml = `
+            <select id="${escapeHtml(inputId)}" name="${escapeHtml(key)}" class="cfg-input" data-key="${escapeHtml(key)}" data-type="bool" aria-describedby="${escapeHtml(descId)}">
+              <option value="true" ${isTrue ? 'selected' : ''}>true</option>
+              <option value="false" ${!isTrue ? 'selected' : ''}>false</option>
+            </select>
+          `;
+        } else if (isSecret) {
+          const maskedPlaceholder = r.config_value ? `Encrypted (${r.config_value})` : 'Not Set (enter new secret)';
+          controlHtml = `
+            <input
+              type="password"
+              id="${escapeHtml(inputId)}"
+              name="${escapeHtml(key)}"
+              class="cfg-input"
+              data-key="${escapeHtml(key)}"
+              data-type="string"
+              value="${isDirty ? escapeHtml(currentVal) : ''}"
+              placeholder="${escapeHtml(maskedPlaceholder)}"
+              autocomplete="off"
+              aria-describedby="${escapeHtml(descId)}"
+            />
+          `;
+        } else if (vtype === 'int') {
+          controlHtml = `
+            <input
+              type="number"
+              step="1"
+              id="${escapeHtml(inputId)}"
+              name="${escapeHtml(key)}"
+              class="cfg-input"
+              data-key="${escapeHtml(key)}"
+              data-type="int"
+              value="${escapeHtml(currentVal)}"
+              required
+              aria-describedby="${escapeHtml(descId)}"
+            />
+          `;
+        } else if (vtype === 'float') {
+          controlHtml = `
+            <input
+              type="number"
+              step="any"
+              id="${escapeHtml(inputId)}"
+              name="${escapeHtml(key)}"
+              class="cfg-input"
+              data-key="${escapeHtml(key)}"
+              data-type="float"
+              value="${escapeHtml(currentVal)}"
+              required
+              aria-describedby="${escapeHtml(descId)}"
+            />
+          `;
+        } else {
+          controlHtml = `
+            <input
+              type="text"
+              id="${escapeHtml(inputId)}"
+              name="${escapeHtml(key)}"
+              class="cfg-input"
+              data-key="${escapeHtml(key)}"
+              data-type="string"
+              value="${escapeHtml(currentVal)}"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-describedby="${escapeHtml(descId)}"
+            />
+          `;
+        }
+
+        return `
+          <tr id="cfg-row-${escapeHtml(key)}" class="${isDirty ? 'cfg-row-dirty' : ''}">
+            <td><span class="type-pill">${escapeHtml(r.category)}</span></td>
+            <td><label for="${escapeHtml(inputId)}"><code>${escapeHtml(key)}</code></label></td>
+            <td><span class="type-pill">${escapeHtml(vtype)}</span></td>
+            <td>${controlHtml}</td>
+            <td id="${escapeHtml(descId)}" style="color: var(--text-muted); font-size: 0.76rem;">${escapeHtml(r.description || '—')}</td>
+            <td>
+              <button type="button" class="btn-secondary btn-row-save" data-key="${escapeHtml(key)}" style="padding: 0.3rem 0.65rem; font-size: 0.75rem;">
+                Save
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+
+      tbody.querySelectorAll('.cfg-input').forEach(inp => {
+        const handler = () => {
+          const key = inp.getAttribute('data-key');
+          const origRow = allConfigRows.find(r => r.config_key === key);
+          if (!key || !origRow) return;
+          const val = inp.value;
+          const isSecret = SECRET_CFG_KEYS.has(key);
+          const changed = isSecret ? val.trim().length > 0 : String(val) !== String(origRow.config_value ?? '');
+          const tr = document.getElementById(`cfg-row-${key}`);
+          if (changed) {
+            dirtyConfigValues.set(key, val);
+            if (tr) tr.classList.add('cfg-row-dirty');
+          } else {
+            dirtyConfigValues.delete(key);
+            if (tr) tr.classList.remove('cfg-row-dirty');
+          }
+          updateDirtyCount();
+        };
+        inp.addEventListener('input', handler);
+        inp.addEventListener('change', handler);
+      });
+
+      tbody.querySelectorAll('.btn-row-save').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const key = btn.getAttribute('data-key');
+          const inp = document.getElementById(`cfg-inp-${key}`);
+          if (!key || !inp) return;
+          await saveSingleConfigKey(key, inp.value, inp.getAttribute('data-type') || 'string', btn);
+        });
+      });
+    }
+
+    async function refreshTelemetryState() {
+      const [pRes, cRes] = await Promise.all([
+        fetch('/api/v1/portfolio'),
+        fetch('/api/v1/credentials')
+      ]);
+      if (pRes.ok) renderPortfolio(await pRes.json());
+      if (cRes.ok) renderCredentials(await cRes.json());
+    }
+
+    async function loadSystemConfig() {
+      try {
+        const res = await fetch('/api/v1/config');
+        if (!res.ok) return;
+        const data = await res.json();
+        allConfigRows = data.config || [];
+        dirtyConfigValues.clear();
+        updateDirtyCount();
+
+        const countEl = document.getElementById('cfg-total-count');
+        if (countEl) countEl.textContent = String(allConfigRows.length);
+
+        const eqRow = allConfigRows.find(r => r.config_key === 'initial_equity_usdc');
+        if (eqRow) {
+          const eqVal = Number(eqRow.config_value || 10000);
+          const eqInput = document.getElementById('inp-initial-equity');
+          if (eqInput) eqInput.value = String(eqVal);
+          document.querySelectorAll('.eq-preset-btn').forEach(b => {
+            b.classList.toggle('active', Number(b.getAttribute('data-eq')) === eqVal);
+          });
+        }
+
+        renderCategoryPills();
+        renderSystemConfigTable();
+      } catch (err) {
+        console.error('Failed to load system_config:', err);
+      }
+    }
+
+    async function applyProportionalRiskCapsViaSingleEndpoint(eqVal) {
+      const eq = Number(eqVal);
+      if (!Number.isFinite(eq) || eq <= 0) return;
+      const getRowNum = (k, defVal) => {
+        const r = allConfigRows.find(x => x.config_key === k);
+        const n = r ? Number(r.config_value) : defVal;
+        return Number.isFinite(n) && n > 0 ? n : defVal;
+      };
+      const heatPct = getRowNum('max_portfolio_heat_pct', 0.04);
+      const singlePct = getRowNum('max_single_asset_pct', 0.25);
+      const grossLev = getRowNum('max_gross_leverage', 1.5);
+      const scaleMin = getRowNum('conviction_scale_min', 0.5);
+      const scaleMax = getRowNum('conviction_scale_max', 1.5);
+      const baseRisk = Math.round(eq * 0.01 * 100) / 100;
+      const capUpdates = [
+        ['baseline_risk_per_trade_usdc', baseRisk],
+        ['min_risk_per_trade_usdc', Math.round(baseRisk * scaleMin * 100) / 100],
+        ['max_risk_per_trade_usdc', Math.round(baseRisk * scaleMax * 100) / 100],
+        ['max_portfolio_heat_usdc', Math.round(eq * heatPct * 100) / 100],
+        ['max_single_asset_notional_usdc', Math.round(eq * singlePct * 100) / 100],
+        ['max_gross_leverage_notional_usdc', Math.round(eq * grossLev * 100) / 100],
+      ];
+      for (const [k, v] of capUpdates) {
+        await fetch('/api/v1/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ config_key: k, config_value: v }),
+        });
+      }
+    }
+
+    async function saveSingleConfigKey(key, rawValue, valueType, triggerBtn) {
+      const bannerEl = document.getElementById('sys-config-banner');
+      if (SECRET_CFG_KEYS.has(key) && !String(rawValue).trim()) {
+        bannerEl.className = 'state-banner warn';
+        bannerEl.textContent = `Enter a new value for secret key '${key}' before saving.`;
+        return;
+      }
+      const scaleCaps = key === 'initial_equity_usdc' && Boolean(document.getElementById('chk-scale-risk')?.checked);
+      if (triggerBtn) triggerBtn.disabled = true;
+      try {
+        const res = await fetch('/api/v1/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            config_key: key,
+            config_value: castControlValue(rawValue, valueType),
+            scale_risk_caps: scaleCaps,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          bannerEl.className = 'state-banner err';
+          bannerEl.textContent = `Failed to update '${key}': ${data.detail || res.statusText}`;
+          return;
+        }
+        if (scaleCaps && !data.scaled_risk_caps) {
+          await applyProportionalRiskCapsViaSingleEndpoint(rawValue);
+        }
+        bannerEl.className = 'state-banner ok';
+        bannerEl.textContent = scaleCaps
+          ? `Updated '${key}' to $${Number(rawValue).toLocaleString()} and scaled all dollar risk caps proportionally.`
+          : `Updated system_config parameter '${key}' = ${SECRET_CFG_KEYS.has(key) ? '***' : rawValue}.`;
+        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
+      } catch (err) {
+        bannerEl.className = 'state-banner err';
+        bannerEl.textContent = `Request failed saving '${key}': ${err}`;
+      } finally {
+        if (triggerBtn) triggerBtn.disabled = false;
+      }
+    }
+
+    document.querySelectorAll('.eq-preset-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const eqVal = btn.getAttribute('data-eq');
+        const eqInput = document.getElementById('inp-initial-equity');
+        if (eqInput && eqVal) {
+          eqInput.value = eqVal;
+          document.querySelectorAll('.eq-preset-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        }
+      });
+    });
+
+    document.getElementById('equity-scale-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const eqInput = document.getElementById('inp-initial-equity');
+      const saveBtn = document.getElementById('btn-save-equity');
+      if (!eqInput || !eqInput.checkValidity()) return;
+      await saveSingleConfigKey('initial_equity_usdc', eqInput.value, 'float', saveBtn);
+    });
+
+    async function fallbackSyncWalletFromBrowser(scaleCaps) {
+      const credRes = await fetch('/api/v1/credentials');
+      if (!credRes.ok) {
+        throw new Error('Could not read wallet_address from /api/v1/credentials');
+      }
+      const cred = await credRes.json();
+      const targetUser = (cred.hyperliquid_vault_address || cred.wallet_address || '').trim();
+      if (!targetUser) {
+        throw new Error('Configure your Main Arbitrum Wallet Address (wallet_address) first.');
+      }
+      const isTestnet = Boolean(cred.hyperliquid_testnet);
+      const apiBase = (cred.api_endpoint || (isTestnet ? 'https://api.hyperliquid-testnet.xyz' : 'https://api.hyperliquid.xyz')).replace(/\/+$/, '');
+      const networkLabel = isTestnet ? 'TESTNET' : 'MAINNET';
+
+      let totalUsdc = 0;
+      let accountType = 'perps';
+
+      const perpsRes = await fetch(`${apiBase}/info`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'clearinghouseState', user: targetUser }),
+      });
+      if (perpsRes.ok) {
+        const perpsData = await perpsRes.json();
+        const marginSum = perpsData?.marginSummary || perpsData?.crossMarginSummary || {};
+        totalUsdc = Number(marginSum.accountValue || 0);
+      }
+
+      if (!(totalUsdc > 0)) {
+        const spotRes = await fetch(`${apiBase}/info`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'spotClearinghouseState', user: targetUser }),
+        });
+        if (spotRes.ok) {
+          const spotData = await spotRes.json();
+          const balances = Array.isArray(spotData?.balances) ? spotData.balances : [];
+          const usdcObj = balances.find(b => String(b?.coin || '').toUpperCase().startsWith('USDC'));
+          const spTot = Number(usdcObj?.total || 0);
+          if (spTot > 0) {
+            totalUsdc = spTot;
+            accountType = 'spot';
+          }
+        }
+      }
+
+      const roundedEq = Math.round(totalUsdc * 100) / 100;
+      if (!(roundedEq > 0)) {
+        throw new Error(`Hyperliquid ${networkLabel} wallet ${targetUser} returned $0.00 USDC balance.`);
+      }
+
+      const saveRes = await fetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_key: 'initial_equity_usdc', config_value: roundedEq, scale_risk_caps: scaleCaps }),
+      });
+      if (!saveRes.ok) {
+        const errBody = await saveRes.json().catch(() => ({}));
+        throw new Error(errBody.detail || saveRes.statusText);
+      }
+      if (scaleCaps) {
+        await applyProportionalRiskCapsViaSingleEndpoint(roundedEq);
+      }
+      return {
+        wallet_balance_usdc: roundedEq,
+        network: networkLabel,
+        account_type: accountType,
+        wallet_address: targetUser,
+      };
+    }
+
+    document.getElementById('btn-sync-wallet').addEventListener('click', async () => {
+      const bannerEl = document.getElementById('sys-config-banner');
+      const syncBtn = document.getElementById('btn-sync-wallet');
+      const scaleCaps = Boolean(document.getElementById('chk-scale-risk')?.checked);
+      if (syncBtn) syncBtn.disabled = true;
+      bannerEl.className = 'state-banner warn';
+      bannerEl.textContent = 'Querying live Hyperliquid wallet USDC balance...';
+      try {
+        const res = await fetch('/api/v1/config/sync-wallet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scale_risk_caps: scaleCaps }),
+        });
+        let data = null;
+        if (res.status === 404) {
+          data = await fallbackSyncWalletFromBrowser(scaleCaps);
+        } else {
+          data = await res.json();
+          if (!res.ok) {
+            bannerEl.className = 'state-banner err';
+            bannerEl.textContent = `Wallet sync failed: ${data.detail || res.statusText}`;
+            return;
+          }
+        }
+        const eqFormatted = Number(data.wallet_balance_usdc).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        });
+        bannerEl.className = 'state-banner ok';
+        bannerEl.textContent = `Synced initial_equity_usdc = $${eqFormatted} USDC from Hyperliquid ${String(data.network || '').toUpperCase()} (${data.account_type || 'perps'} account, wallet ${shortAddr(data.wallet_address)})${scaleCaps ? ' and scaled all dollar risk caps proportionally.' : '.'}`;
+        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
+      } catch (err) {
+        bannerEl.className = 'state-banner err';
+        bannerEl.textContent = `Wallet sync failed: ${err.message || err}`;
+      } finally {
+        if (syncBtn) syncBtn.disabled = false;
+      }
+    });
+
+    document.getElementById('inp-cfg-search').addEventListener('input', () => {
+      renderSystemConfigTable();
+    });
+
+    document.getElementById('btn-reload-cfg').addEventListener('click', async () => {
+      const bannerEl = document.getElementById('sys-config-banner');
+      await loadSystemConfig();
+      bannerEl.className = 'state-banner ok';
+      bannerEl.textContent = 'Reloaded all system_config parameters from SQLite.';
+    });
+
+    document.getElementById('sys-config-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const bannerEl = document.getElementById('sys-config-banner');
+      const saveAllBtn = document.getElementById('btn-save-all-cfg');
+      if (dirtyConfigValues.size === 0) {
+        bannerEl.className = 'state-banner warn';
+        bannerEl.textContent = 'No modified settings to save. Edit one or more values in the table below first.';
+        return;
+      }
+      const updates = {};
+      for (const [k, rawV] of dirtyConfigValues.entries()) {
+        const row = allConfigRows.find(r => r.config_key === k);
+        updates[k] = castControlValue(rawV, row ? row.value_type : 'string');
+      }
+      const scaleCaps = updates.initial_equity_usdc !== undefined && Boolean(document.getElementById('chk-scale-risk')?.checked);
+      if (saveAllBtn) saveAllBtn.disabled = true;
+      try {
+        const res = await fetch('/api/v1/config/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ updates, scale_risk_caps: scaleCaps }),
+        });
+        if (res.status === 404) {
+          const savedKeys = [];
+          for (const [k, v] of Object.entries(updates)) {
+            const singleRes = await fetch('/api/v1/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ config_key: k, config_value: v }),
+            });
+            const singleData = await singleRes.json();
+            if (!singleRes.ok) {
+              bannerEl.className = 'state-banner err';
+              bannerEl.textContent = `Update rejected on '${k}': ${singleData.detail || singleRes.statusText}`;
+              return;
+            }
+            savedKeys.push(k);
+          }
+          if (scaleCaps) {
+            await applyProportionalRiskCapsViaSingleEndpoint(updates.initial_equity_usdc);
+          }
+          bannerEl.className = 'state-banner ok';
+          bannerEl.textContent = `Saved ${savedKeys.length} configuration parameter(s): ${savedKeys.join(', ')}`;
+          await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
+          return;
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          bannerEl.className = 'state-banner err';
+          bannerEl.textContent = `Batch update rejected: ${data.detail || res.statusText}`;
+          return;
+        }
+        bannerEl.className = 'state-banner ok';
+        bannerEl.textContent = `Saved ${data.count} configuration parameter(s): ${(data.updated_keys || []).join(', ')}`;
+        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
+      } catch (err) {
+        bannerEl.className = 'state-banner err';
+        bannerEl.textContent = `Batch update failed: ${err}`;
+      } finally {
+        if (saveAllBtn) saveAllBtn.disabled = false;
+      }
+    });
+
+    // Interaction-deferred validation & ARIA synchronization
+    const UserInvalidFallback = (() => {
+      const dirtyState = new WeakMap();
+      const updateState = (input) => {
+        const isValid = input.checkValidity();
+        input.classList.toggle('user-invalid-fallback', !isValid);
+        input.classList.toggle('user-valid-fallback', isValid);
+        if (!isValid) {
+          input.setAttribute('aria-invalid', 'true');
+        } else {
+          input.removeAttribute('aria-invalid');
+        }
+      };
+      const handleEvent = (event) => {
+        const input = event.target;
+        if (!input || !input.checkValidity) return;
+        if (event.type === 'input' || event.type === 'change') {
+          const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
+          state.hasInteracted = true;
+          dirtyState.set(input, state);
+          if (state.hasBlurred) updateState(input);
+        } else if (event.type === 'blur') {
+          const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
+          state.hasBlurred = true;
+          dirtyState.set(input, state);
+          if (state.hasInteracted) updateState(input);
+        }
+      };
+      const init = (root = document) => {
+        if (typeof CSS !== 'undefined' && CSS.supports && CSS.supports('selector(:user-invalid)')) return;
+        root.addEventListener('blur', handleEvent, true);
+        root.addEventListener('input', handleEvent);
+        root.addEventListener('change', handleEvent);
+      };
+      return { init };
+    })();
+    UserInvalidFallback.init(document);
+
+    const syncAria = (el) => {
+      if (el && el.matches && el.setAttribute) {
+        try {
+          el.setAttribute('aria-invalid', el.matches(':user-invalid') ? 'true' : 'false');
+        } catch (err) {}
+      }
+    };
+    document.addEventListener('blur', (e) => syncAria(e.target), true);
+    document.addEventListener('input', (e) => {
+      if (e.target && e.target.hasAttribute && e.target.hasAttribute('aria-invalid')) syncAria(e.target);
+    });
+
     async function bootstrapLoad() {
       try {
         const [stRes, pRes, sRes, cRes] = await Promise.all([
           fetch('/api/v1/status'),
           fetch('/api/v1/portfolio'),
           fetch('/api/v1/signals'),
-          fetch('/api/v1/credentials')
+          fetch('/api/v1/credentials'),
+          loadSystemConfig()
         ]);
         const stData = await stRes.json();
         const pData = await pRes.json();
