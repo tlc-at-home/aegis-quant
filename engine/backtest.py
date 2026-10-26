@@ -122,6 +122,7 @@ class BacktestEngine:
         initial_equity: float = 10000.0,
         data_path: Path | str | None = None,
         config_overrides: dict[str, Any] | None = None,
+        excluded_assets: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.source_db_path = Path(source_db_path)
         self.initial_equity = float(initial_equity)
@@ -134,6 +135,9 @@ class BacktestEngine:
         self.config_overrides: dict[str, Any] = (
             dict(config_overrides) if config_overrides is not None else {}
         )
+        self.excluded_assets: list[str] = [
+            str(a).strip().upper() for a in (excluded_assets or []) if str(a).strip()
+        ]
         self.mem_db = DatabaseManager(":memory:")
         self.signals = SignalEngine(self.mem_db)
         self.risk = RiskEngine(self.mem_db)
@@ -241,11 +245,27 @@ class BacktestEngine:
                                 )
                             )
                 if bf_rows:
+                    with self.mem_db.connection() as m_conn:
+                        m_conn.execute("DELETE FROM market_ohlcv WHERE timeframe = '4h';")
                     self.mem_db.upsert_ohlcv_batch(bf_rows)
             except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
                 logger.warning("Could not load real_4h_backfill.json: %s", exc)
 
+        if self.excluded_assets:
+            with self.mem_db.connection() as m_conn:
+                for asset in self.excluded_assets:
+                    m_conn.execute(
+                        "UPDATE universe_assets SET is_active = 0 WHERE UPPER(base_asset) = ? OR UPPER(symbol) = ?;",
+                        (asset, asset),
+                    )
+
         self.mem_db.set_config_value("initial_equity_usdc", self.initial_equity)
+        self.mem_db.set_config_value("baseline_risk_per_trade_usdc", round(self.initial_equity * 0.01, 2))
+        self.mem_db.set_config_value("min_risk_per_trade_usdc", round(self.initial_equity * 0.005, 2))
+        self.mem_db.set_config_value("max_risk_per_trade_usdc", round(self.initial_equity * 0.015, 2))
+        self.mem_db.set_config_value("max_portfolio_heat_usdc", round(self.initial_equity * 0.04, 2))
+        self.mem_db.set_config_value("max_single_asset_notional_usdc", round(self.initial_equity * 0.25, 2))
+        self.mem_db.set_config_value("max_gross_leverage_notional_usdc", round(self.initial_equity * 1.50, 2))
         self.mem_db.set_config_value("execution_mode", "PAPER")
         for cfg_k, cfg_v in self.config_overrides.items():
             self.mem_db.set_config_value(str(cfg_k), cfg_v)
@@ -281,7 +301,7 @@ class BacktestEngine:
         tf_4h_ms = 14_400_000
         warmup_bars = 140
         required_min_ts = ((start_ms // tf_4h_ms) - warmup_bars) * tf_4h_ms
-        query_limit = max(2500, int((end_ms - required_min_ts) // tf_4h_ms) + 200)
+        query_limit = max(5000, int((end_ms - required_min_ts) // tf_4h_ms) + 800)
         usdc_universe = self.mem_db.get_usdc_perp_universe()
         alt_pairs = self.mem_db.get_alt_pairs_universe()
         benchmark_symbol = "BTC/USDC:USDC"
@@ -581,7 +601,7 @@ class BacktestEngine:
 
         # Pre-load chronological DataFrames bounded by <= end_ms from :memory: clone
         self.mem_db.pit_timestamp_ms = int(end_ms)
-        query_limit = max(2500, int((end_ms - start_ms) // 14_400_000) + 400)
+        query_limit = max(5000, int((end_ms - start_ms) // 14_400_000) + 800)
         full_btc_df = self.mem_db.get_ohlcv_df(benchmark_symbol, "4h", limit=query_limit, max_timestamp_ms=end_ms)
         full_exec_dfs = {
             str(p["exec_symbol"]): self.mem_db.get_ohlcv_df(

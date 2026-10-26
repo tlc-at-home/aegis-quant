@@ -159,12 +159,18 @@ def validate_private_key(value: str) -> str:
         raise ValueError(
             "Invalid private_key: must be a 64-hex-character (32-byte) private key."
         )
-    cleaned = value.strip()
+    cleaned = value.strip().strip("'\"")
     if not cleaned:
         return ""
-    if not _HEX_PRIVKEY_RE.match(cleaned):
+    if _EVM_ADDRESS_RE.match(cleaned):
         raise ValueError(
-            "Invalid private_key: must be a 64-hex-character (32-byte) private key."
+            "Invalid private_key: must be a 64-hex-character (32-byte) private key "
+            "(you entered a 42-character 0x wallet address — please paste the 64-hex Agent Private Key, not the Wallet Address)."
+        )
+    if not _HEX_PRIVKEY_RE.match(cleaned):
+        raw_candidate = cleaned[2:] if cleaned.lower().startswith("0x") else cleaned
+        raise ValueError(
+            f"Invalid private_key: must be a 64-hex-character (32-byte) private key (received {len(raw_candidate)} characters after 0x prefix)."
         )
     raw_hex = cleaned[2:] if cleaned.lower().startswith("0x") else cleaned
     scalar = int(raw_hex, 16)
@@ -189,9 +195,11 @@ def _cast_config_value(raw_val: str, value_type: str) -> Any:
     """Convert string representation in system_config into native Python type."""
     vtype = (value_type or "string").lower().strip()
     if vtype == "int":
-        return int(float(raw_val))
+        f_val = float(raw_val)
+        return int(f_val) if math.isfinite(f_val) else 0
     if vtype == "float":
-        return float(raw_val)
+        f_val = float(raw_val)
+        return f_val if math.isfinite(f_val) else 0.0
     if vtype == "bool":
         return raw_val.strip().lower() in ("true", "1", "yes", "on")
     return raw_val
@@ -845,6 +853,18 @@ class DatabaseManager:
                 """,
                 (stored_val, key),
             )
+            if key == "initial_equity_usdc" and cur.rowcount > 0:
+                trade_cnt_row = conn.execute("SELECT COUNT(*) FROM trades;").fetchone()
+                if trade_cnt_row and int(trade_cnt_row[0]) == 0:
+                    conn.execute(
+                        """
+                        UPDATE portfolio_snapshots
+                        SET total_equity_usdc = ?,
+                            available_cash_usdc = ?
+                        WHERE deployed_notional_usdc = 0.0 AND accrued_yield_usdc = 0.0;
+                        """,
+                        (float(str_val), float(str_val)),
+                    )
             return cur.rowcount > 0
 
     def get_credentials_status(
@@ -1027,11 +1047,15 @@ class DatabaseManager:
                 "SELECT config_key, config_value, value_type FROM system_config;"
             ).fetchall()
             current_cfg: dict[str, Any] = {}
+            raw_priv_on_disk = ""
             for row in rows:
+                r_key = str(row["config_key"])
                 r_val = str(row["config_value"] or "")
+                if r_key == "private_key":
+                    raw_priv_on_disk = r_val
                 if self.is_encrypted_value(r_val):
                     r_val = self._try_decrypt_or_empty(r_val)
-                current_cfg[str(row["config_key"])] = _cast_config_value(
+                current_cfg[r_key] = _cast_config_value(
                     r_val, str(row["value_type"])
                 )
 
@@ -1048,7 +1072,10 @@ class DatabaseManager:
             if require_credentials_for_live and effective_mode in ("LIVE", "TESTNET"):
                 try:
                     valid_w = bool(effective_wallet and validate_evm_address(effective_wallet))
-                    valid_p = bool(effective_priv and validate_private_key(effective_priv))
+                    valid_p = bool(
+                        (effective_priv and validate_private_key(effective_priv))
+                        or ("private_key" not in updates and self.is_encrypted_value(raw_priv_on_disk))
+                    )
                 except ValueError:
                     valid_w = False
                     valid_p = False
@@ -1863,17 +1890,27 @@ class DatabaseManager:
             )
 
     def get_latest_portfolio_snapshot(self) -> dict[str, Any]:
-        """Return the latest portfolio snapshot, or default $10,000 baseline."""
+        """Return the latest portfolio snapshot, or configured initial_equity_usdc baseline."""
+        initial_eq = 10000.0
         with self.connection() as conn:
             row = conn.execute(
                 "SELECT * FROM portfolio_snapshots ORDER BY snapshot_id DESC LIMIT 1;"
             ).fetchone()
+            if not row:
+                eq_row = conn.execute(
+                    "SELECT config_value FROM system_config WHERE config_key = 'initial_equity_usdc';"
+                ).fetchone()
+                if eq_row and eq_row["config_value"]:
+                    with suppress(ValueError, TypeError):
+                        val = float(eq_row["config_value"])
+                        if math.isfinite(val) and val > 0.0:
+                            initial_eq = val
         if row:
             return dict(row)
         return {
             "timestamp_ms": int(time.time() * 1000),
-            "total_equity_usdc": 10000.0,
-            "available_cash_usdc": 10000.0,
+            "total_equity_usdc": initial_eq,
+            "available_cash_usdc": initial_eq,
             "deployed_notional_usdc": 0.0,
             "gross_leverage": 0.0,
             "portfolio_heat_usdc": 0.0,

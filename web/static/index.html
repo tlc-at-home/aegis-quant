@@ -132,19 +132,78 @@
       font-size: 0.82rem;
     }
     .btn-save:hover, .btn-secondary:hover { opacity: 0.9; }
-    .cred-status-msg { font-size: 0.78rem; margin-top: 0.5rem; color: var(--text-muted); }
+    .cred-status-msg { font-size: 0.78rem; margin-top: 0.65rem; color: var(--text-muted); }
+    .state-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 0.85rem;
+    }
+    .state-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.6rem 0.75rem;
+    }
+    .state-box-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
+    }
+    .state-box-value {
+      font-size: 0.86rem;
+      font-weight: 700;
+      margin-top: 0.2rem;
+      word-break: break-all;
+    }
+    .state-box-sub {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-top: 0.15rem;
+    }
+    .text-ok { color: var(--bull); }
+    .text-warn { color: var(--chop); }
+    .text-err { color: var(--bear); }
+    .text-accent { color: var(--accent); }
+    .state-banner {
+      display: none;
+      margin-top: 0.75rem;
+      padding: 0.6rem 0.85rem;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      line-height: 1.4;
+    }
+    .state-banner.warn {
+      display: block;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid var(--chop);
+      color: #fde68a;
+    }
+    .state-banner.ok {
+      display: block;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid var(--bull);
+      color: #a7f3d0;
+    }
+    .state-banner.err {
+      display: block;
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid var(--bear);
+      color: #fecaca;
+    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
-      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.2.0-rc1</span></h1>
+      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.2.0-rc2</span></h1>
       <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL + Fernet AES-128</p>
     </div>
     <div>
       <span class="badge" id="routing-badge">ROUTING: PAPER</span>
       <span class="badge CHOP" id="telegram-badge">TELEGRAM: STANDBY</span>
-      <span class="badge" id="wal-badge">SQLite: WAL (v3)</span>
+      <span class="badge" id="wal-badge">SQLite: WAL (v4)</span>
       <span class="badge CHOP" id="regime-badge">HMM: CHOP</span>
     </div>
   </header>
@@ -153,7 +212,7 @@
     <div class="card">
       <div class="card-label">Total Equity (USDC)</div>
       <div class="card-value" id="val-equity">$10,000.00</div>
-      <div class="card-sub">Initial Baseline: $10,000.00</div>
+      <div class="card-sub" id="val-initial-equity">Initial Baseline: $10,000.00</div>
     </div>
     <div class="card">
       <div class="card-label">Portfolio Heat Cap ($400 / 4%)</div>
@@ -221,17 +280,41 @@
 
   <section class="card cred-panel">
     <h2>Hyperliquid L1 Web3 DEX Credentials & Routing Mode (Mainnet / Testnet / Paper)</h2>
+
+    <div class="state-strip" aria-live="polite">
+      <div class="state-box">
+        <div class="state-box-label">1. Configured Setting (SQLite)</div>
+        <div class="state-box-value text-accent" id="st-configured-mode">Loading...</div>
+        <div class="state-box-sub" id="st-configured-sub">system_config target</div>
+      </div>
+      <div class="state-box">
+        <div class="state-box-label">2. Effective Active Routing</div>
+        <div class="state-box-value" id="st-active-routing">Loading...</div>
+        <div class="state-box-sub" id="st-active-routing-sub">Current order execution path</div>
+      </div>
+      <div class="state-box">
+        <div class="state-box-label">3. Target DEX Network & API</div>
+        <div class="state-box-value" id="st-network-target">Loading...</div>
+        <div class="state-box-sub" id="st-network-endpoint">https://api.hyperliquid-testnet.xyz</div>
+      </div>
+      <div class="state-box">
+        <div class="state-box-label">4. L1 Signing Credentials</div>
+        <div class="state-box-value" id="st-creds-ready">Loading...</div>
+        <div class="state-box-sub" id="st-creds-detail">Wallet &amp; Agent Private Key status</div>
+      </div>
+    </div>
+
     <form class="cred-form" id="cred-form">
       <div class="form-group">
-        <label for="inp-mode">Execution Mode</label>
+        <label for="inp-mode">Configured Execution Mode</label>
         <select id="inp-mode">
-          <option value="PAPER">PAPER (Simulated Fills)</option>
-          <option value="TESTNET">TESTNET (Hyperliquid Testnet CLOB)</option>
-          <option value="LIVE">LIVE (Hyperliquid L1 Routing)</option>
+          <option value="PAPER">PAPER — Local Simulated Fills (No DEX Orders)</option>
+          <option value="TESTNET">TESTNET — Hyperliquid Testnet CLOB Routing</option>
+          <option value="LIVE">LIVE MAINNET — Hyperliquid Mainnet L1 Routing</option>
         </select>
       </div>
       <div class="form-group">
-        <label for="inp-network">Hyperliquid Network Target</label>
+        <label for="inp-network">Hyperliquid Network Target (Market Data &amp; CLOB)</label>
         <select id="inp-network">
           <option value="true">Testnet (api.hyperliquid-testnet.xyz)</option>
           <option value="false">Mainnet (api.hyperliquid.xyz)</option>
@@ -242,8 +325,8 @@
         <input type="text" id="inp-wallet" placeholder="0x..." autocomplete="off" />
       </div>
       <div class="form-group">
-        <label for="inp-privkey">Trade-Only Agent Private Key (Fernet AES-128 Encrypted)</label>
-        <input type="password" id="inp-privkey" placeholder="0x... (64 hex chars)" autocomplete="off" />
+        <label for="inp-privkey">Trade-Only Agent Private Key (64 Hex Chars / 32 Bytes)</label>
+        <input type="password" id="inp-privkey" placeholder="0x... (64 hex chars, NOT 40-hex address)" autocomplete="off" />
       </div>
       <div class="form-group">
         <label for="inp-vault">Optional Vault / Sub-Account Address</label>
@@ -253,6 +336,7 @@
         <button type="submit" class="btn-save">Save DEX Credentials</button>
       </div>
     </form>
+    <div id="cred-banner" class="state-banner" role="status"></div>
     <div class="cred-status-msg" id="cred-status-msg">Endpoint: https://api.hyperliquid-testnet.xyz • Credentials: Not Configured</div>
   </section>
 
@@ -282,10 +366,27 @@
   </section>
 
   <script>
+    function shortAddr(addr) {
+      if (!addr || addr.length < 12) return addr || 'Not Set';
+      return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+    }
+
+    function resolveUiExecutionMode(c) {
+      const rawMode = String(c.execution_mode || 'PAPER').toUpperCase();
+      const isTestnet = Boolean(c.hyperliquid_testnet) || rawMode === 'TESTNET';
+      if (rawMode === 'PAPER') return 'PAPER';
+      if (isTestnet) return 'TESTNET';
+      return 'LIVE';
+    }
+
     function renderPortfolio(p) {
       if (!p) return;
       const eq = Number(p.total_equity_usdc ?? 10000).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
       document.getElementById('val-equity').textContent = `$${eq}`;
+      if (p.initial_equity_usdc !== undefined) {
+        const initEq = Number(p.initial_equity_usdc).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        document.getElementById('val-initial-equity').textContent = `Initial Baseline: $${initEq}`;
+      }
       const heat = Number(p.portfolio_heat_usdc ?? 0).toFixed(2);
       const heatPct = (Number(p.portfolio_heat_pct ?? 0) * 100).toFixed(2);
       document.getElementById('val-heat').textContent = `$${heat} (${heatPct}%)`;
@@ -362,36 +463,166 @@
 
     function renderCredentials(c) {
       if (!c) return;
-      const rBadge = document.getElementById('routing-badge');
-      rBadge.textContent = `ROUTING: ${c.active_routing || c.execution_mode}`;
-      rBadge.className = `badge ${c.credentials_ready ? 'BULL' : 'CHOP'}`;
+      const uiMode = resolveUiExecutionMode(c);
+      const isTestnet = Boolean(c.hyperliquid_testnet);
+      const activeRouting = c.active_routing || 'PAPER_SIMULATION';
+      const credsReady = Boolean(c.credentials_ready);
+      const walletOk = Boolean(c.wallet_configured);
+      const privOk = Boolean(c.private_key_configured);
 
-      document.getElementById('inp-mode').value = c.execution_mode || 'PAPER';
-      document.getElementById('inp-network').value = c.hyperliquid_testnet ? 'true' : 'false';
+      // 1. Update Header Routing Badge
+      const rBadge = document.getElementById('routing-badge');
+      if (activeRouting === 'LIVE_TESTNET') {
+        rBadge.textContent = 'ROUTING: LIVE TESTNET';
+        rBadge.className = 'badge BULL';
+      } else if (activeRouting === 'LIVE_MAINNET') {
+        rBadge.textContent = 'ROUTING: LIVE MAINNET';
+        rBadge.className = 'badge BULL';
+      } else if (uiMode !== 'PAPER' && !credsReady) {
+        rBadge.textContent = `ROUTING: PAPER FALLBACK (${uiMode} KEY MISSING)`;
+        rBadge.className = 'badge CHOP';
+      } else {
+        rBadge.textContent = 'ROUTING: PAPER SIMULATION';
+        rBadge.className = 'badge';
+      }
+
+      // 2. Update 4-Box State Strip
+      const stModeEl = document.getElementById('st-configured-mode');
+      const stModeSubEl = document.getElementById('st-configured-sub');
+      if (uiMode === 'TESTNET') {
+        stModeEl.textContent = 'TESTNET (Hyperliquid Testnet CLOB)';
+        stModeEl.className = 'state-box-value text-accent';
+        stModeSubEl.textContent = 'SQLite: execution_mode=LIVE, hyperliquid_testnet=true';
+      } else if (uiMode === 'LIVE') {
+        stModeEl.textContent = 'LIVE MAINNET (Hyperliquid L1 CLOB)';
+        stModeEl.className = 'state-box-value text-ok';
+        stModeSubEl.textContent = 'SQLite: execution_mode=LIVE, hyperliquid_testnet=false';
+      } else {
+        stModeEl.textContent = 'PAPER (Simulated Local Fills)';
+        stModeEl.className = 'state-box-value';
+        stModeSubEl.textContent = `SQLite: execution_mode=PAPER, market_data=${isTestnet ? 'Testnet' : 'Mainnet'}`;
+      }
+
+      const stRouteEl = document.getElementById('st-active-routing');
+      const stRouteSubEl = document.getElementById('st-active-routing-sub');
+      if (activeRouting === 'LIVE_TESTNET') {
+        stRouteEl.textContent = 'LIVE_TESTNET (Active)';
+        stRouteEl.className = 'state-box-value text-ok';
+        stRouteSubEl.textContent = 'Orders signed & routed to Hyperliquid Testnet';
+      } else if (activeRouting === 'LIVE_MAINNET') {
+        stRouteEl.textContent = 'LIVE_MAINNET (Active)';
+        stRouteEl.className = 'state-box-value text-ok';
+        stRouteSubEl.textContent = 'Orders signed & routed to Hyperliquid Mainnet';
+      } else if (uiMode !== 'PAPER' && !credsReady) {
+        stRouteEl.textContent = 'PAPER_SIMULATION (Safety Fallback)';
+        stRouteEl.className = 'state-box-value text-warn';
+        stRouteSubEl.textContent = `Paused ${uiMode} CLOB routing until Agent Key is set`;
+      } else {
+        stRouteEl.textContent = 'PAPER_SIMULATION';
+        stRouteEl.className = 'state-box-value';
+        stRouteSubEl.textContent = 'Simulated Maker/Taker fills (no on-chain orders)';
+      }
+
+      const stNetEl = document.getElementById('st-network-target');
+      const stNetSubEl = document.getElementById('st-network-endpoint');
+      stNetEl.textContent = isTestnet ? 'TESTNET (Sandbox L1)' : 'MAINNET (Production L1)';
+      stNetEl.className = `state-box-value ${isTestnet ? 'text-accent' : 'text-ok'}`;
+      stNetSubEl.textContent = c.api_endpoint || (isTestnet ? 'https://api.hyperliquid-testnet.xyz' : 'https://api.hyperliquid.xyz');
+
+      const stCredEl = document.getElementById('st-creds-ready');
+      const stCredSubEl = document.getElementById('st-creds-detail');
+      if (credsReady) {
+        stCredEl.textContent = 'READY (Wallet + Agent Key Verified)';
+        stCredEl.className = 'state-box-value text-ok';
+      } else if (walletOk && !privOk) {
+        stCredEl.textContent = 'INCOMPLETE (Agent Private Key Missing)';
+        stCredEl.className = 'state-box-value text-warn';
+      } else {
+        stCredEl.textContent = 'NOT CONFIGURED';
+        stCredEl.className = 'state-box-value text-warn';
+      }
+      stCredSubEl.textContent = `Wallet: ${walletOk ? shortAddr(c.wallet_address) : 'Not Set'} • Agent Key: ${privOk ? c.private_key_masked : 'Not Set'}`;
+
+      // 3. Synchronize Form Controls Without Conflicting Labels
+      document.getElementById('inp-mode').value = uiMode;
+      document.getElementById('inp-network').value = isTestnet ? 'true' : 'false';
       document.getElementById('inp-wallet').value = c.wallet_address || '';
       document.getElementById('inp-vault').value = c.hyperliquid_vault_address || '';
       const privInput = document.getElementById('inp-privkey');
       privInput.value = '';
-      privInput.placeholder = c.private_key_masked ? `Encrypted (${c.private_key_masked})` : '0x... (64 hex chars)';
+      privInput.placeholder = privOk
+        ? `Encrypted & Verified (${c.private_key_masked})`
+        : 'Not Set — Enter 0x... (64 hex chars) to enable CLOB signing';
+
+      // 4. Contextual Banner & Status Line
+      const bannerEl = document.getElementById('cred-banner');
+      if (uiMode !== 'PAPER' && !credsReady) {
+        bannerEl.className = 'state-banner warn';
+        bannerEl.textContent =
+          `Notice: System is configured for ${uiMode} (${c.api_endpoint}), but Effective Active Routing is currently PAPER_SIMULATION because ${!walletOk ? 'the Wallet Address and ' : ''}the Trade-Only Agent Private Key is not set (or could not be decrypted with the active master key). Enter your 64-character hex Agent Private Key above and click "Save DEX Credentials" to activate ${uiMode === 'TESTNET' ? 'LIVE_TESTNET' : 'LIVE_MAINNET'} routing.`;
+      } else if (activeRouting === 'LIVE_TESTNET' || activeRouting === 'LIVE_MAINNET') {
+        bannerEl.className = 'state-banner ok';
+        bannerEl.textContent =
+          `Active: ${activeRouting} order routing is live on ${(c.network || '').toUpperCase()} (${c.api_endpoint}) with wallet ${shortAddr(c.wallet_address)} and encrypted agent key ${c.private_key_masked}.`;
+      } else {
+        bannerEl.className = 'state-banner';
+        bannerEl.textContent = '';
+      }
 
       document.getElementById('cred-status-msg').textContent =
-        `Active Routing: ${c.active_routing} • Network: ${(c.network || '').toUpperCase()} (${c.api_endpoint}) • Agent Key: ${c.private_key_configured ? c.private_key_masked : 'Not Set'}`;
+        `Configured Mode: ${uiMode} • Effective Routing: ${activeRouting} • Network: ${(c.network || '').toUpperCase()} (${c.api_endpoint}) • Agent Key: ${privOk ? c.private_key_masked : 'Not Set'}`;
 
       renderTelegramAlerts(c);
     }
 
     document.getElementById('inp-mode').addEventListener('change', (ev) => {
-      if (ev.target.value === 'TESTNET') {
+      const modeVal = ev.target.value;
+      if (modeVal === 'TESTNET') {
         document.getElementById('inp-network').value = 'true';
+      } else if (modeVal === 'LIVE') {
+        document.getElementById('inp-network').value = 'false';
+      }
+    });
+
+    document.getElementById('inp-network').addEventListener('change', (ev) => {
+      const isTestnetSelected = ev.target.value === 'true';
+      const currentMode = document.getElementById('inp-mode').value;
+      if (isTestnetSelected && currentMode === 'LIVE') {
+        document.getElementById('inp-mode').value = 'TESTNET';
+      } else if (!isTestnetSelected && currentMode === 'TESTNET') {
+        document.getElementById('inp-mode').value = 'LIVE';
+      }
+    });
+
+    document.getElementById('inp-privkey').addEventListener('input', (ev) => {
+      const bannerEl = document.getElementById('cred-banner');
+      const raw = ev.target.value.trim().replace(/^['"]|['"]$/g, '');
+      if (!raw) return;
+      const hexPart = raw.toLowerCase().startsWith('0x') ? raw.slice(2) : raw;
+      if (/^[0-9a-fA-F]{40}$/.test(hexPart)) {
+        bannerEl.className = 'state-banner err';
+        bannerEl.textContent =
+          'Input Warning: You pasted a 42-character Wallet Address (40 hex chars). Hyperliquid Agent Private Keys are 64 hex characters (66 chars with 0x). In Hyperliquid (More -> API), copy the "Private Key" generated when creating the API wallet, not the API wallet address.';
+      } else if (/^[0-9a-fA-F]{64}$/.test(hexPart)) {
+        bannerEl.className = 'state-banner ok';
+        bannerEl.textContent =
+          'Valid 64-hex-character (32-byte) Agent Private Key format detected. Click "Save DEX Credentials" to encrypt and activate routing.';
+      } else {
+        bannerEl.className = 'state-banner warn';
+        bannerEl.textContent =
+          `Agent Private Key must be 64 hexadecimal characters (currently ${hexPart.length} chars after 0x prefix).`;
       }
     });
 
     document.getElementById('cred-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const msgEl = document.getElementById('cred-status-msg');
+      const bannerEl = document.getElementById('cred-banner');
       const selectedMode = document.getElementById('inp-mode').value;
       if (selectedMode === 'TESTNET') {
         document.getElementById('inp-network').value = 'true';
+      } else if (selectedMode === 'LIVE') {
+        document.getElementById('inp-network').value = 'false';
       }
       const payload = {
         execution_mode: selectedMode,
@@ -411,11 +642,15 @@
         });
         const data = await res.json();
         if (!res.ok) {
+          bannerEl.className = 'state-banner err';
+          bannerEl.textContent = `Configuration rejected: ${data.detail || res.statusText}`;
           msgEl.textContent = `Configuration error: ${data.detail || res.statusText}`;
           return;
         }
         renderCredentials(data.credentials);
       } catch (err) {
+        bannerEl.className = 'state-banner err';
+        bannerEl.textContent = `Request failed: ${err}`;
         msgEl.textContent = `Request failed: ${err}`;
       }
     });
@@ -456,7 +691,7 @@
         const res = await fetch('/api/v1/alerts/test', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: 'v0.2.0-rc1 Dashboard Telegram Test Alert', level: 'INFO' }),
+          body: JSON.stringify({ message: 'v0.2.0-rc2 Dashboard Telegram Test Alert', level: 'INFO' }),
         });
         const data = await res.json();
         msgEl.textContent = `Telegram Test Result: ${data.status} (telegram_sent=${data.telegram_sent}, verified=${Boolean(data.webhook_payload_verified)})`;
@@ -467,14 +702,23 @@
 
     async function bootstrapLoad() {
       try {
-        const [pRes, sRes, cRes] = await Promise.all([
+        const [stRes, pRes, sRes, cRes] = await Promise.all([
+          fetch('/api/v1/status'),
           fetch('/api/v1/portfolio'),
           fetch('/api/v1/signals'),
           fetch('/api/v1/credentials')
         ]);
+        const stData = await stRes.json();
         const pData = await pRes.json();
         const sData = await sRes.json();
         const cData = await cRes.json();
+        if (stData.version) {
+          document.getElementById('ver-badge').textContent = stData.version;
+        }
+        if (stData.journal_mode) {
+          const sVer = stData.schema_version ?? 4;
+          document.getElementById('wal-badge').textContent = `SQLite: ${String(stData.journal_mode).toUpperCase()} (v${sVer})`;
+        }
         renderPortfolio(pData);
         renderSignals(sData.signals || []);
         renderTrades(pData.open_positions || []);

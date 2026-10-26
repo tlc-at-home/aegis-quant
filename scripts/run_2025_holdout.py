@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -14,15 +15,30 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="2025 Frozen-Calibration Out-of-Sample Holdout Replay Runner"
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="Optional list of base assets to exclude from the universe (e.g. HYPE)",
+    )
+    args = parser.parse_args()
+    excluded = [str(a).strip().upper() for a in (args.exclude or []) if str(a).strip()]
+
     from engine.backtest import HistoricalBacktester
 
     print("=================================================================")
     print("  AEGIS QUANT v0.2.0-rc2: 2025 Frozen-Calibration Holdout Replay ")
+    if excluded:
+        print(f"  Universe Filter: Excluded {', '.join(excluded)}")
     print("=================================================================")
 
     backtester = HistoricalBacktester(
         data_path="data/real_4h_backfill.json",
         initial_equity=10000.0,
+        excluded_assets=excluded,
     )
     try:
         tear_sheet = backtester.run(start_date="2025-01-01", end_date="2025-12-31")

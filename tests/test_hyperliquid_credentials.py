@@ -547,6 +547,92 @@ class TestHyperliquidCredentials(unittest.TestCase):
 
         asyncio.run(_run_minute_simulation())
 
+    def test_12_bad_symbol_isolation_and_testnet_scaling(self) -> None:
+        import ccxt.async_support as ccxt
+
+        self.db.configure_hyperliquid_credentials(
+            wallet_address="0xef377c1d5444786236aa34fa72e5879372e0eaec",
+            private_key=SAMPLE_PRIVKEY,
+            hyperliquid_testnet=True,
+            execution_mode="LIVE",
+        )
+        ing = MarketIngestionEngine(self.db)
+        usdc_symbols = [r["symbol"] for r in self.db.get_usdc_perp_universe()]
+        base_4h_ms = 1700006400000
+        current_time_sec = (base_4h_ms // 1000) + 600
+
+        mock_ex = AsyncMock()
+        xrp_calls = {"count": 0}
+
+        async def _fake_fetch_ohlcv(
+            symbol: str, timeframe: str = "1h", limit: int = 600
+        ) -> list[list[float]]:
+            if symbol == "XRP/USDC:USDC":
+                xrp_calls["count"] += 1
+                raise ccxt.BadSymbol("hyperliquid does not have market symbol XRP/USDC:USDC")
+            tf_ms = 3600000 if timeframe == "1h" else 14400000
+            aligned_ms = (int(current_time_sec * 1000) // tf_ms) * tf_ms
+            start_ms = aligned_ms - 599 * tf_ms
+            px = 70000.0 if symbol.startswith("BTC/") else 150.0
+            return [
+                [float(start_ms + idx * tf_ms), px * 0.99, px * 1.01, px * 0.98, px, 500.0]
+                for idx in range(600)
+            ]
+
+        mock_ex.fetch_ohlcv.side_effect = _fake_fetch_ohlcv
+        mock_ex.fetch_funding_rates.return_value = {
+            sym: {
+                "symbol": sym,
+                "markPrice": 70100.0 if sym.startswith("BTC/") else 152.0,
+                "fundingRate": 0.00002,
+            }
+            for sym in usdc_symbols
+            if sym != "XRP/USDC:USDC"
+        }
+
+        async def _run_bad_symbol_check() -> None:
+            nonlocal current_time_sec
+            with patch.object(ing, "_get_exchange", new=AsyncMock(return_value=mock_ex)):
+                with patch("engine.ingestion.time.time", side_effect=lambda: float(current_time_sec)):
+                    stats_c1 = await ing.ingest_universe()
+                # XRP/USDC:USDC fails once on 1h, is added to _unsupported_symbols, and skipped on 4h.
+                # All 15 other symbols (30 symbol-tf pairs) still fetch live OHLCV without going offline.
+                self.assertEqual(xrp_calls["count"], 1)
+                self.assertIn("XRP/USDC:USDC", ing._unsupported_symbols)
+                self.assertFalse(ing._cycle_network_offline)
+                self.assertEqual(stats_c1["ohlcv_fetch_calls"], 30)
+
+                # Subsequent 15s intra-bar tick does not call fetch_ohlcv for XRP or any other symbol
+                current_time_sec += 15
+                with patch("engine.ingestion.time.time", side_effect=lambda: float(current_time_sec)):
+                    stats_c2 = await ing.ingest_universe()
+                self.assertEqual(xrp_calls["count"], 1)
+                self.assertEqual(stats_c2["ohlcv_fetch_calls"], 0)
+                self.assertEqual(stats_c2["batch_snapshot_calls"], 1)
+
+                # Verify symbols ordered after XRP (e.g., DOGE/USDC:USDC, INJ/USDC:USDC) received live prices
+                doge_df = self.db.get_ohlcv_df("DOGE/USDC:USDC", "1h", limit=2)
+                self.assertAlmostEqual(float(doge_df.iloc[-1]["close"]), 152.0, places=4)
+                self.assertEqual(int(doge_df.iloc[-1]["is_synthetic"]), 0)
+
+                xrp_df = self.db.get_ohlcv_df("XRP/USDC:USDC", "1h", limit=2)
+                self.assertEqual(int(xrp_df.iloc[-1]["is_synthetic"]), 1)
+
+                from engine.signals import SignalEngine
+
+                _, evals = SignalEngine(self.db).evaluate_universe()
+                xrp_eval = next(e for e in evals if e["exec_symbol"] == "XRP/USDC:USDC")
+                self.assertEqual(xrp_eval["rs_rank"], 15)
+                self.assertEqual(xrp_eval["signal_action"], "FLAT")
+
+                self.db.set_config_value("initial_equity_usdc", 1000.0)
+                snap = self.db.get_latest_portfolio_snapshot()
+                self.assertAlmostEqual(float(snap["total_equity_usdc"]), 1000.0, places=2)
+                self.assertAlmostEqual(float(snap["available_cash_usdc"]), 1000.0, places=2)
+
+        asyncio.run(_run_bad_symbol_check())
+
 
 if __name__ == "__main__":
     unittest.main()
+

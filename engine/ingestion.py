@@ -67,9 +67,23 @@ class MarketIngestionEngine:
         self._paper_tick_counter: int = 0
         self._cycle_funding_cache: dict[str, float] = {}
         self._last_full_ohlcv_sync_bar: dict[tuple[str, str], int] = {}
+        self._unsupported_symbols: set[str] = set()
         self._cycle_ohlcv_calls: int = 0
         self._cycle_snapshot_calls: int = 0
         self._cycle_single_funding_calls: int = 0
+
+    @staticmethod
+    def _is_unsupported_symbol_error(exc: BaseException) -> bool:
+        """Return True if `exc` indicates a market symbol is not listed on the active exchange."""
+        if isinstance(exc, ccxt.BadSymbol):
+            return True
+        msg = str(exc).lower()
+        return (
+            "does not have market symbol" in msg
+            or "unknown symbol" in msg
+            or "invalid symbol" in msg
+            or "bad symbol" in msg
+        )
 
     async def _get_exchange(self, config: dict[str, Any]) -> ccxt.hyperliquid:
         """Initialize or return the async CCXT Hyperliquid client, reloading if credentials change."""
@@ -116,6 +130,7 @@ class MarketIngestionEngine:
         self._exchange = exchange
         self._exchange_config_sig = sig
         self._last_full_ohlcv_sync_bar.clear()
+        self._unsupported_symbols.clear()
         self._cycle_market_snapshot = None
         self._cycle_paper_snapshot.clear()
         self._cycle_funding_cache.clear()
@@ -135,6 +150,7 @@ class MarketIngestionEngine:
                 self._cycle_paper_snapshot.clear()
                 self._cycle_funding_cache.clear()
                 self._last_full_ohlcv_sync_bar.clear()
+                self._unsupported_symbols.clear()
 
     @staticmethod
     def _extract_snapshot_entry(item: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -275,7 +291,7 @@ class MarketIngestionEngine:
 
     @staticmethod
     def _generate_synthetic_usdc_series(
-        symbol: str, timeframe: str, limit: int = 600
+        symbol: str, timeframe: str, limit: int = 600, is_synthetic: int = 0
     ) -> list[tuple[str, str, int, float, float, float, float, float, float, int]]:
         """Generate deterministic 600-bar OHLCV series when offline or seeding sandbox."""
         tf_sec = TIMEFRAME_SECONDS.get(timeframe, 3600)
@@ -312,6 +328,7 @@ class MarketIngestionEngine:
 
         rows: list[tuple[str, str, int, float, float, float, float, float, float, int]] = []
         start_ts = now_aligned_ms - (limit - 1) * tf_ms
+        synth_flag = int(bool(is_synthetic))
         for i in range(limit):
             ts = int(start_ts + i * tf_ms)
             rows.append(
@@ -325,7 +342,7 @@ class MarketIngestionEngine:
                     float(closes[i]),
                     float(volumes[i]),
                     funding_rate,
-                    0,
+                    synth_flag,
                 )
             )
         return rows
@@ -354,7 +371,11 @@ class MarketIngestionEngine:
 
         # Attempt live public/authenticated Hyperliquid polling if network is reachable
         mode = str(cfg.get("execution_mode", "PAPER")).strip().upper()
-        if mode in ("LIVE", "TESTNET") and not self._cycle_network_offline:
+        if (
+            mode in ("LIVE", "TESTNET")
+            and not self._cycle_network_offline
+            and symbol not in self._unsupported_symbols
+        ):
             try:
                 exchange = await self._get_exchange(cfg)
                 already_synced_bar = (
@@ -367,6 +388,7 @@ class MarketIngestionEngine:
                         symbol, timeframe=timeframe, limit=limit
                     )
                     self._cycle_ohlcv_calls += 1
+                    self._last_full_ohlcv_sync_bar[(symbol, timeframe)] = now_aligned_ms
                     funding_hourly = 0.000018
                     snapshot: dict[str, dict[str, float | None]] = {}
                     try:
@@ -390,7 +412,6 @@ class MarketIngestionEngine:
                                 self._cycle_funding_cache[symbol] = funding_hourly
 
                     if raw_candles and len(raw_candles) >= 50:
-                        self._last_full_ohlcv_sync_bar[(symbol, timeframe)] = now_aligned_ms
                         bars: list[
                             tuple[str, str, int, float, float, float, float, float, float, int]
                         ] = [
@@ -486,15 +507,25 @@ class MarketIngestionEngine:
                 KeyError,
                 RuntimeError,
             ) as exc:
-                self._cycle_network_offline = True
-                logger.warning(
-                    "Hyperliquid live/testnet fetch fallback for %s (%s): %s",
-                    symbol,
-                    timeframe,
-                    exc,
-                )
+                if self._is_unsupported_symbol_error(exc):
+                    if symbol not in self._unsupported_symbols:
+                        self._unsupported_symbols.add(symbol)
+                        logger.warning(
+                            "Hyperliquid symbol %s is not listed on active network; using synthetic fallback: %s",
+                            symbol,
+                            exc,
+                        )
+                else:
+                    self._cycle_network_offline = True
+                    logger.warning(
+                        "Hyperliquid live/testnet fetch fallback for %s (%s): %s",
+                        symbol,
+                        timeframe,
+                        exc,
+                    )
 
         # In sandbox / paper mode, if we already have >= 540 bars, update active bar intra-bar or step on new interval
+        is_unsupported = symbol in self._unsupported_symbols
         if len(existing_df) >= 540:
             poll_sec = max(5, int(cfg.get("polling_interval_seconds", 15)))
             last_row = existing_df.iloc[-1]
@@ -518,7 +549,7 @@ class MarketIngestionEngine:
                         live_price,
                         float(last_row["volume"]),
                         live_funding,
-                        int(last_row["is_synthetic"]),
+                        1 if is_unsupported else int(last_row["is_synthetic"]),
                     )
                 ]
             if self._in_universe_cycle and symbol in self._cycle_paper_snapshot:
@@ -552,11 +583,13 @@ class MarketIngestionEngine:
                     new_close,
                     vol,
                     funding,
-                    0,
+                    1 if is_unsupported else 0,
                 )
             ]
 
-        return self._generate_synthetic_usdc_series(symbol, timeframe, limit=limit)
+        return self._generate_synthetic_usdc_series(
+            symbol, timeframe, limit=limit, is_synthetic=1 if is_unsupported else 0
+        )
 
     @staticmethod
     def synthesize_alt_btc_candles(

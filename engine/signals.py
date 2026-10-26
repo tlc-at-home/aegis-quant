@@ -1390,6 +1390,10 @@ class SignalEngine:
             else int(time.time() * 1000)
         )
         raw_evals: list[dict[str, Any]] = []
+        is_live_mode = str(cfg.get("execution_mode", "PAPER")).strip().upper() in (
+            "LIVE",
+            "TESTNET",
+        )
 
         for pair in alt_pairs:
             base_asset = pair["base_asset"]
@@ -1400,6 +1404,12 @@ class SignalEngine:
 
             exec_df = self.db.get_ohlcv_df(exec_sym, exec_tf, limit=window_limit)
             synth_df = self.db.get_ohlcv_df(synth_sym, rs_tf, limit=window_limit)
+            is_unsupported_live = bool(
+                is_live_mode
+                and not exec_df.empty
+                and "is_synthetic" in exec_df.columns
+                and int(exec_df["is_synthetic"].iloc[-1]) == 1
+            )
 
             snr_score = self.compute_continuous_snr(
                 exec_df=exec_df,
@@ -1476,31 +1486,41 @@ class SignalEngine:
                     "mace_score": round(mace_score, 4),
                     "blended_conviction": round(blended, 4),
                     "funding_rate_hourly": round(funding_hourly, 6),
+                    "_unsupported_live": is_unsupported_live,
                 }
             )
 
-        # Rank descending by blended_conviction (Rank 1 = strongest leader, Rank 15 = weakest laggard)
-        raw_evals.sort(key=lambda x: x["blended_conviction"], reverse=True)
-        total_assets = len(raw_evals)
+        # Rank descending by blended_conviction (with live-tradable symbols ranked ahead of unsupported symbols)
+        raw_evals.sort(
+            key=lambda x: (not x.get("_unsupported_live", False), x["blended_conviction"]),
+            reverse=True,
+        )
+        tradable_assets = (
+            sum(1 for x in raw_evals if not x.get("_unsupported_live", False))
+            or len(raw_evals)
+        )
 
         for idx, item in enumerate(raw_evals):
             rank = idx + 1
             item["rs_rank"] = rank
-            item["signal_action"] = self.classify_signal_action(
-                regime=regime_state.regime,
-                prob_bull=regime_state.prob_bull,
-                prob_bear=regime_state.prob_bear,
-                rs_rank=rank,
-                total_assets=total_assets,
-                blended_conviction=float(item["blended_conviction"]),
-                snr_synth=float(item["snr_synth"]),
-                mace_score=float(item["mace_score"]),
-                rs_96=float(item["rs_96"]),
-                r_usdc_8=float(item["r_usdc_8"]),
-                funding_rate_hourly=float(item["funding_rate_hourly"]),
-                btc_macro=btc_macro,
-                cfg=cfg,
-            )
+            if item.pop("_unsupported_live", False):
+                item["signal_action"] = "FLAT"
+            else:
+                item["signal_action"] = self.classify_signal_action(
+                    regime=regime_state.regime,
+                    prob_bull=regime_state.prob_bull,
+                    prob_bear=regime_state.prob_bear,
+                    rs_rank=rank,
+                    total_assets=tradable_assets,
+                    blended_conviction=float(item["blended_conviction"]),
+                    snr_synth=float(item["snr_synth"]),
+                    mace_score=float(item["mace_score"]),
+                    rs_96=float(item["rs_96"]),
+                    r_usdc_8=float(item["r_usdc_8"]),
+                    funding_rate_hourly=float(item["funding_rate_hourly"]),
+                    btc_macro=btc_macro,
+                    cfg=cfg,
+                )
 
         if persist:
             self.db.save_signal_evaluations(raw_evals)

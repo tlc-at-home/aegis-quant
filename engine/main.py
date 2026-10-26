@@ -193,6 +193,7 @@ class AegisOrchestrator:
         )
         self._stop_event.set()
         server.should_exit = True
+        server.force_exit = True
         trading_task.cancel()
         stop_task.cancel()
         await asyncio.gather(trading_task, server_task, stop_task, return_exceptions=True)
