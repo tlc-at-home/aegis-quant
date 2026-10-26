@@ -867,13 +867,10 @@ class DatabaseManager:
                         SET total_equity_usdc = ?,
                             available_cash_usdc = ?,
                             accrued_yield_usdc = 0.0,
-                            basis_harvest_notional_usdc = CASE
-                                WHEN basis_harvest_notional_usdc > 0.0 THEN ROUND(? * 0.50, 2)
-                                ELSE 0.0
-                            END
+                            basis_harvest_notional_usdc = 0.0
                         WHERE deployed_notional_usdc = 0.0;
                         """,
-                        (new_base_eq, new_base_eq, new_base_eq),
+                        (new_base_eq, new_base_eq),
                     )
                 else:
                     latest_snap = conn.execute(

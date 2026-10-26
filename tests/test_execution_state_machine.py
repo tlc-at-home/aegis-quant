@@ -744,6 +744,143 @@ class TestExecutionStateMachine(unittest.TestCase):
             dispatched[0][1]["text"],
         )
 
+    def test_11_on_chain_hlp_vault_deposit_withdrawal_and_dashboard_reality(self) -> None:
+        """
+        Verify on-chain Hyperliquid HLP vault harvesting & reconciliation:
+        1. Queries `userVaultEquities` and `vaultDetails` on-chain.
+        2. Executes `vaultTransfer` deposit (with 6-decimal micro-USDC `usd`) when idle cash > target.
+        3. Executes `vaultTransfer` withdrawal when unlocked, or queues when inside 4-day lockup.
+        4. Reports exact on-chain reality (`$0.00` when rejected, or exact on-chain vault equity & PnL).
+        """
+        self.db.set_config_value("initial_equity_usdc", 999.0)
+        self.db.set_config_value("wallet_address", "0xef377c1d5444786236aa34fa72e5879372e0eaec")
+
+        mock_ex = AsyncMock()
+        mock_ex.fetch_positions.return_value = []
+        mock_ex.milliseconds = lambda: 1793022000000
+        mock_ex.sign_l1_action = lambda action, nonce: {"r": "0x1", "s": "0x2", "v": 27}
+
+        # Scenario A: Vault initially has $0.00 on-chain, and L1 rejects vaultTransfer (e.g. trade-only agent key).
+        # Dashboard snapshot MUST reflect $0.00 harvest and $999.00 equity (no fake $499.58!).
+        mock_ex.fetch_balance.return_value = {
+            "USDC": {"total": 999.0, "free": 999.0, "used": 0.0},
+            "total": {"USDC": 999.0},
+        }
+
+        async def _post_info_zero(payload: dict[str, Any]) -> Any:
+            if payload.get("type") == "userVaultEquities":
+                return []
+            if payload.get("type") == "vaultDetails":
+                return {
+                    "vaultAddress": "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0",
+                    "apr": 0.06,
+                    "allowDeposits": True,
+                    "isClosed": False,
+                    "followerState": None,
+                }
+            return None
+
+        mock_ex.publicPostInfo.side_effect = _post_info_zero
+        mock_ex.privatePostExchange.return_value = {
+            "status": "err",
+            "response": "Must sign with master wallet",
+        }
+
+        exec_engine = ExecutionEngine(
+            self.db, self.risk, exchange=mock_ex, execution_mode="TESTNET"
+        )
+        regime_chop = RegimeState("CHOP", 0.05, 0.05, 0.90, 540)
+        res_rejected = asyncio.run(exec_engine.reconcile_cycle(regime_chop, []))
+
+        self.assertEqual(res_rejected["total_equity_usdc"], 999.0)
+        self.assertEqual(res_rejected["basis_harvest_notional_usdc"], 0.0)
+        snap_rej = self.db.get_latest_portfolio_snapshot()
+        self.assertEqual(float(snap_rej["basis_harvest_notional_usdc"]), 0.0)
+        self.assertEqual(float(snap_rej["accrued_yield_usdc"]), 0.0)
+        self.assertEqual(float(snap_rej["total_equity_usdc"]), 999.0)
+
+        # Verify vaultTransfer deposit payload used 6-decimal micro-USDC ($499.50 -> 499500000)
+        mock_ex.privatePostExchange.assert_awaited_once()
+        dep_call = mock_ex.privatePostExchange.call_args.args[0]
+        self.assertEqual(dep_call["action"]["type"], "vaultTransfer")
+        self.assertTrue(dep_call["action"]["isDeposit"])
+        self.assertEqual(dep_call["action"]["usd"], 499_500_000)
+
+        # Scenario B: On-chain deposit succeeds -> vault holds $499.50 equity + $1.25 PnL, perp holds $499.50
+        exec_engine._last_vault_transfer_attempt_ms = 0
+        mock_ex.privatePostExchange.reset_mock()
+        mock_ex.privatePostExchange.return_value = {"status": "ok", "response": {"type": "default"}}
+
+        state_step = {"deposited": False}
+
+        async def _post_info_deposit(payload: dict[str, Any]) -> Any:
+            if payload.get("type") == "userVaultEquities":
+                if state_step["deposited"]:
+                    return [
+                        {
+                            "vaultAddress": "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0",
+                            "equity": "500.75",
+                            "lockedUntilTimestamp": 1793000000000,
+                        }
+                    ]
+                return []
+            if payload.get("type") == "vaultDetails":
+                if state_step["deposited"]:
+                    return {
+                        "vaultAddress": "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0",
+                        "apr": 0.08,
+                        "allowDeposits": True,
+                        "isClosed": False,
+                        "followerState": {
+                            "vaultEquity": "500.75",
+                            "pnl": "1.25",
+                            "allTimePnl": "1.25",
+                            "lockupUntil": 1793000000000,
+                        },
+                    }
+                return {
+                    "vaultAddress": "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0",
+                    "apr": 0.08,
+                    "allowDeposits": True,
+                    "isClosed": False,
+                    "followerState": None,
+                }
+            return None
+
+        async def _accept_deposit(req: dict[str, Any]) -> dict[str, Any]:
+            if req["action"]["isDeposit"]:
+                state_step["deposited"] = True
+                mock_ex.fetch_balance.return_value = {
+                    "USDC": {"total": 499.50, "free": 499.50, "used": 0.0},
+                    "total": {"USDC": 499.50},
+                }
+            else:
+                state_step["deposited"] = False
+                mock_ex.fetch_balance.return_value = {
+                    "USDC": {"total": 1000.25, "free": 1000.25, "used": 0.0},
+                    "total": {"USDC": 1000.25},
+                }
+            return {"status": "ok", "response": {"type": "default"}}
+
+        mock_ex.publicPostInfo.side_effect = _post_info_deposit
+        mock_ex.privatePostExchange.side_effect = _accept_deposit
+
+        res_dep = asyncio.run(exec_engine.reconcile_cycle(regime_chop, []))
+        self.assertEqual(res_dep["basis_harvest_notional_usdc"], 500.75)
+        snap_dep = self.db.get_latest_portfolio_snapshot()
+        self.assertEqual(float(snap_dep["basis_harvest_notional_usdc"]), 500.75)
+        self.assertEqual(float(snap_dep["accrued_yield_usdc"]), 1.25)
+
+        # Scenario C: Disabling basis_harvest_enabled triggers on-chain withdrawal back to Perp account
+        self.db.set_config_value("basis_harvest_enabled", False)
+        self.db.pit_timestamp_ms = 1793025000000
+        res_wd = asyncio.run(exec_engine.reconcile_cycle(regime_chop, []))
+        self.assertEqual(res_wd["basis_harvest_notional_usdc"], 0.0)
+        wd_call = mock_ex.privatePostExchange.call_args.args[0]
+        self.assertEqual(wd_call["action"]["type"], "vaultTransfer")
+        self.assertFalse(wd_call["action"]["isDeposit"])
+        self.assertEqual(wd_call["action"]["usd"], 500_750_000)
+
 
 if __name__ == "__main__":
     unittest.main()

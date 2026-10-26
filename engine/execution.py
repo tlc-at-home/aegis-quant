@@ -33,6 +33,9 @@ VALID_FSM_STATES = (
     "EXPIRED",
 )
 
+MAINNET_HLP_VAULT_ADDRESS = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+TESTNET_HLP_VAULT_ADDRESS = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0"
+
 
 @dataclass
 class OrderExecutionResult:
@@ -90,6 +93,8 @@ class ExecutionEngine:
         self._cooldown_until_step: dict[str, int] = {}
         self._step_counter: int = 0
         self._last_order_result: OrderExecutionResult | None = None
+        self._last_vault_transfer_attempt_ms: int = 0
+        self._last_vault_lockup_log_ms: int = 0
         self._restore_cooldowns_from_db()
 
     @property
@@ -201,6 +206,32 @@ class ExecutionEngine:
             exchange.set_sandbox_mode(True)
         return exchange, is_testnet
 
+    @staticmethod
+    def get_hlp_vault_address(
+        config: dict[str, Any] | None = None,
+        is_testnet: bool | None = None,
+    ) -> str:
+        """Resolve the active Hyperliquid HLP (Hyperliquidity Provider) protocol vault address."""
+        cfg = config or {}
+        explicit = str(cfg.get("hlp_vault_address", "")).strip()
+        if explicit.startswith("0x") and len(explicit) == 42:
+            return explicit.lower()
+        if is_testnet is None:
+            raw_testnet = cfg.get("hyperliquid_testnet", False)
+            if isinstance(raw_testnet, str):
+                testnet_bool = raw_testnet.strip().lower() in (
+                    "true",
+                    "1",
+                    "yes",
+                    "on",
+                    "testnet",
+                )
+            else:
+                testnet_bool = bool(raw_testnet)
+            mode = str(cfg.get("execution_mode", "PAPER")).strip().upper()
+            is_testnet = testnet_bool or (mode == "TESTNET")
+        return TESTNET_HLP_VAULT_ADDRESS if is_testnet else MAINNET_HLP_VAULT_ADDRESS
+
     async def verify_dex_credentials(
         self, config: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -305,6 +336,7 @@ class ExecutionEngine:
             is_testnet = bool(raw_testnet) or mode == "TESTNET"
 
         network_label = "testnet" if is_testnet else "mainnet"
+        vault_equity_usdc = 0.0
         try:
             swap_bal = await exchange.fetch_balance({"user": target_user})
             total_usdc, free_usdc, used_usdc = self._extract_usdc_balance_tuple(swap_bal)
@@ -319,11 +351,24 @@ class ExecutionEngine:
                     if sp_tot > 0.0:
                         total_usdc, free_usdc, used_usdc = sp_tot, sp_free, sp_used
                         account_type = "spot"
+
+            post_info = getattr(exchange, "publicPostInfo", None)
+            if callable(post_info):
+                with suppress(Exception):
+                    vault_equities = await post_info(
+                        {"type": "userVaultEquities", "user": target_user}
+                    )
+                    if isinstance(vault_equities, list):
+                        for entry in vault_equities:
+                            if isinstance(entry, dict) and entry.get("equity") is not None:
+                                eq_val = float(entry["equity"])
+                                if math.isfinite(eq_val) and eq_val > 0.0:
+                                    vault_equity_usdc += eq_val
         finally:
             if owns_exchange and exchange is not None:
                 await exchange.close()
 
-        rounded_eq = round(total_usdc, 2)
+        rounded_eq = round(total_usdc + vault_equity_usdc, 2)
         if not math.isfinite(rounded_eq) or rounded_eq <= 0.0:
             raise ValueError(
                 f"Hyperliquid {network_label.upper()} wallet {target_user} returned $0.00 USDC balance."
@@ -335,6 +380,20 @@ class ExecutionEngine:
         else:
             self.db.set_config_value("initial_equity_usdc", rounded_eq)
 
+        with suppress(sqlite3.Error, OSError, ValueError, TypeError):
+            with self.db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE portfolio_snapshots
+                    SET basis_harvest_notional_usdc = ?,
+                        accrued_yield_usdc = 0.0
+                    WHERE snapshot_id = (
+                        SELECT snapshot_id FROM portfolio_snapshots ORDER BY snapshot_id DESC LIMIT 1
+                    );
+                    """,
+                    (round(vault_equity_usdc, 2),),
+                )
+
         report: dict[str, Any] = {
             "status": "synced",
             "network": network_label,
@@ -343,6 +402,7 @@ class ExecutionEngine:
             "wallet_balance_usdc": rounded_eq,
             "free_usdc": round(free_usdc, 2),
             "used_margin_usdc": round(used_usdc, 2),
+            "vault_equity_usdc": round(vault_equity_usdc, 2),
             "initial_equity_usdc": rounded_eq,
             "scale_risk_caps": scale_risk_caps,
             "scaled_risk_caps": scaled_caps,
@@ -1557,6 +1617,283 @@ class ExecutionEngine:
                 await exchange.close()
 
     # -------------------------------------------------------------------------
+    # Step 3.6: On-Chain Hyperliquid HLP Vault State, Deposits & Withdrawals
+    # -------------------------------------------------------------------------
+    async def fetch_hlp_vault_state(
+        self,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Query actual on-chain Hyperliquid HLP (Hyperliquidity Provider) vault equity,
+        accrued PnL yield, lockup expiration, and perp collateral balance via the
+        Hyperliquid L1 Info API (`userVaultEquities` and `vaultDetails`).
+        """
+        if self.execution_mode == "PAPER" and self.exchange is None:
+            return None
+
+        cfg = config if config is not None else self.db.load_config()
+        wallet = str(cfg.get("wallet_address", "")).strip()
+        priv_key = str(cfg.get("private_key", "")).strip()
+        if self.exchange is None and not (wallet and priv_key):
+            return None
+
+        raw_testnet = cfg.get("hyperliquid_testnet", False)
+        if isinstance(raw_testnet, str):
+            testnet_bool = raw_testnet.strip().lower() in ("true", "1", "yes", "on", "testnet")
+        else:
+            testnet_bool = bool(raw_testnet)
+        is_testnet = testnet_bool or (self.execution_mode == "TESTNET")
+        hlp_vault = self.get_hlp_vault_address(cfg, is_testnet=is_testnet)
+        target_user = wallet or hlp_vault
+
+        owns_exchange = False
+        exchange = self.exchange
+        try:
+            if exchange is None:
+                exchange, is_testnet = self._build_hyperliquid_client(cfg)
+                owns_exchange = True
+
+            post_info = getattr(exchange, "publicPostInfo", None)
+            if not callable(post_info):
+                return None
+
+            equities_resp: Any = None
+            details_resp: Any = None
+            with suppress(ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError):
+                equities_resp = await post_info(
+                    {"type": "userVaultEquities", "user": target_user}
+                )
+            with suppress(ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError):
+                details_resp = await post_info(
+                    {
+                        "type": "vaultDetails",
+                        "vaultAddress": hlp_vault,
+                        "user": target_user,
+                    }
+                )
+
+            has_valid_list = isinstance(equities_resp, list)
+            has_valid_dict = isinstance(details_resp, dict) and (
+                "vaultAddress" in details_resp
+                or "followerState" in details_resp
+                or "apr" in details_resp
+                or "allowDeposits" in details_resp
+            )
+            if not has_valid_list and not has_valid_dict:
+                return None
+
+            vault_equity_usdc = 0.0
+            locked_until_ms = 0
+            accrued_yield_usdc = 0.0
+            apr = 0.0
+            allow_deposits = True
+
+            if has_valid_list:
+                for entry in equities_resp:
+                    if not isinstance(entry, dict):
+                        continue
+                    raw_eq = entry.get("equity")
+                    if raw_eq is not None:
+                        with suppress(ValueError, TypeError):
+                            eq_val = float(raw_eq)
+                            if math.isfinite(eq_val) and eq_val > 0.0:
+                                vault_equity_usdc += eq_val
+                    raw_lock = entry.get("lockedUntilTimestamp")
+                    if raw_lock is not None:
+                        with suppress(ValueError, TypeError):
+                            locked_until_ms = max(locked_until_ms, int(float(raw_lock)))
+
+            if has_valid_dict:
+                with suppress(ValueError, TypeError):
+                    if details_resp.get("apr") is not None:
+                        apr = float(details_resp["apr"])
+                allow_deposits = bool(details_resp.get("allowDeposits", True)) and not bool(
+                    details_resp.get("isClosed", False)
+                )
+                follower = details_resp.get("followerState")
+                if isinstance(follower, dict):
+                    raw_feq = follower.get("vaultEquity")
+                    if raw_feq is not None:
+                        with suppress(ValueError, TypeError):
+                            feq_val = float(raw_feq)
+                            if math.isfinite(feq_val) and feq_val >= 0.0:
+                                vault_equity_usdc = max(vault_equity_usdc, feq_val)
+                    raw_pnl = (
+                        follower.get("allTimePnl")
+                        if follower.get("allTimePnl") is not None
+                        else follower.get("pnl")
+                    )
+                    if raw_pnl is not None:
+                        with suppress(ValueError, TypeError):
+                            pnl_val = float(raw_pnl)
+                            if math.isfinite(pnl_val):
+                                accrued_yield_usdc = pnl_val
+                    raw_flock = follower.get("lockupUntil")
+                    if raw_flock is not None:
+                        with suppress(ValueError, TypeError):
+                            locked_until_ms = max(locked_until_ms, int(float(raw_flock)))
+
+            perp_total: float | None = None
+            perp_free: float | None = None
+            perp_used: float | None = None
+            fetch_bal = getattr(exchange, "fetch_balance", None)
+            if callable(fetch_bal) and wallet:
+                with suppress(ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError):
+                    bal_resp = await fetch_bal({"user": wallet})
+                    if isinstance(bal_resp, dict) and (
+                        "USDC" in bal_resp or "total" in bal_resp or "info" in bal_resp
+                    ):
+                        p_tot, p_free, p_used = self._extract_usdc_balance_tuple(bal_resp)
+                        perp_total = round(p_tot, 2)
+                        perp_free = round(p_free, 2)
+                        perp_used = round(p_used, 2)
+
+            return {
+                "vault_address": hlp_vault,
+                "vault_equity_usdc": round(max(0.0, vault_equity_usdc), 2),
+                "accrued_yield_usdc": round(accrued_yield_usdc, 4),
+                "locked_until_ms": int(locked_until_ms),
+                "apr": float(apr),
+                "allow_deposits": bool(allow_deposits),
+                "perp_equity_usdc": perp_total,
+                "perp_free_usdc": perp_free,
+                "perp_used_usdc": perp_used,
+            }
+        except (
+            ccxt.BaseError,
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RuntimeError,
+        ) as exc:
+            logger.warning("Failed to query on-chain HLP vault state: %s", exc)
+            return None
+        finally:
+            if owns_exchange and exchange is not None:
+                await exchange.close()
+
+    async def execute_hlp_vault_transfer(
+        self,
+        amount_usdc: float,
+        is_deposit: bool,
+        *,
+        vault_address: str | None = None,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Execute an on-chain Hyperliquid L1 `vaultTransfer` action to deposit idle USDC into
+        or withdraw USDC from the Hyperliquidity Provider (HLP) protocol vault.
+        """
+        cfg = config if config is not None else self.db.load_config()
+        target_vault = (vault_address or self.get_hlp_vault_address(cfg)).strip().lower()
+        direction = "DEPOSIT" if is_deposit else "WITHDRAW"
+        usd_micro = int(round(float(amount_usdc) * 1_000_000))
+        if usd_micro <= 0:
+            return {
+                "status": "skipped",
+                "direction": direction,
+                "amount_usdc": 0.0,
+                "usd_micro": 0,
+                "vault_address": target_vault,
+            }
+
+        owns_exchange = False
+        exchange = self.exchange
+        try:
+            if exchange is None:
+                exchange, _ = self._build_hyperliquid_client(cfg)
+                owns_exchange = True
+
+            ms_fn = getattr(exchange, "milliseconds", None)
+            nonce = int(ms_fn()) if callable(ms_fn) else int(time.time() * 1000)
+            action: dict[str, Any] = {
+                "type": "vaultTransfer",
+                "vaultAddress": target_vault,
+                "isDeposit": bool(is_deposit),
+                "usd": usd_micro,
+            }
+            signature = exchange.sign_l1_action(action, nonce)
+            request: dict[str, Any] = {
+                "action": action,
+                "nonce": nonce,
+                "signature": signature,
+            }
+            response = await exchange.privatePostExchange(request)
+            resp_status = (
+                str(response.get("status", "ok")).strip().lower()
+                if isinstance(response, dict)
+                else "ok"
+            )
+            if resp_status == "ok":
+                result = {
+                    "status": "ok",
+                    "direction": direction,
+                    "amount_usdc": round(float(amount_usdc), 2),
+                    "usd_micro": usd_micro,
+                    "vault_address": target_vault,
+                    "nonce": nonce,
+                    "response": response,
+                }
+                self.db.log_telemetry(
+                    "INFO",
+                    "engine.execution",
+                    f"Executed on-chain HLP vault {direction} of ${float(amount_usdc):.2f} USDC ({target_vault})",
+                    result,
+                )
+                return result
+
+            err_detail = (
+                str(response.get("response", response))
+                if isinstance(response, dict)
+                else str(response)
+            )
+            err_result = {
+                "status": "error",
+                "direction": direction,
+                "amount_usdc": round(float(amount_usdc), 2),
+                "usd_micro": usd_micro,
+                "vault_address": target_vault,
+                "nonce": nonce,
+                "error": err_detail,
+            }
+            self.db.log_telemetry(
+                "WARNING",
+                "engine.execution",
+                f"On-chain HLP vault {direction} (${float(amount_usdc):.2f}) rejected by Hyperliquid L1: {err_detail}",
+                err_result,
+            )
+            return err_result
+        except (
+            ccxt.BaseError,
+            sqlite3.Error,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            RuntimeError,
+        ) as exc:
+            err_result = {
+                "status": "error",
+                "direction": direction,
+                "amount_usdc": round(float(amount_usdc), 2),
+                "usd_micro": usd_micro,
+                "vault_address": target_vault,
+                "error": str(exc),
+            }
+            self.db.log_telemetry(
+                "WARNING",
+                "engine.execution",
+                f"On-chain HLP vault {direction} (${float(amount_usdc):.2f}) failed: {exc}",
+                err_result,
+            )
+            return err_result
+        finally:
+            if owns_exchange and exchange is not None:
+                await exchange.close()
+
+    # -------------------------------------------------------------------------
     # Main Execution & Reconciliation Cycle
     # -------------------------------------------------------------------------
     async def reconcile_cycle(
@@ -1750,9 +2087,27 @@ class ExecutionEngine:
 
         total_unrealized_pnl = sum(float(t.get("unrealized_pnl_usdc", 0.0)) for t in open_trades)
         prev_accrued_yield = float(latest_snap.get("accrued_yield_usdc", 0.0))
-        current_equity = round(
-            base_equity + total_realized_pnl + total_unrealized_pnl + prev_accrued_yield, 2
-        )
+
+        on_chain_vault_state: dict[str, Any] | None = None
+        if self.execution_mode in ("LIVE", "TESTNET") and (
+            self.exchange is not None or not route_is_mocked
+        ):
+            on_chain_vault_state = await self.fetch_hlp_vault_state(config=config)
+
+        if on_chain_vault_state is not None:
+            vault_eq_now = float(on_chain_vault_state.get("vault_equity_usdc", 0.0))
+            vault_yield_now = float(on_chain_vault_state.get("accrued_yield_usdc", 0.0))
+            perp_eq_now = on_chain_vault_state.get("perp_equity_usdc")
+            if perp_eq_now is not None and (float(perp_eq_now) > 0.0 or vault_eq_now > 0.0):
+                current_equity = round(float(perp_eq_now) + vault_eq_now, 2)
+            else:
+                current_equity = round(
+                    base_equity + total_realized_pnl + total_unrealized_pnl + vault_yield_now, 2
+                )
+        else:
+            current_equity = round(
+                base_equity + total_realized_pnl + total_unrealized_pnl + prev_accrued_yield, 2
+            )
 
         # 2. Evaluate new Long Leaders (Bull) or Short Laggards (Bear)
         max_longs = int(config.get("max_concurrent_long_positions", 2))
@@ -1786,6 +2141,34 @@ class ExecutionEngine:
             )
             if not sizing.approved:
                 continue
+
+            # Recall collateral from HLP vault before order placement if perp free margin is insufficient
+            if on_chain_vault_state is not None:
+                v_eq = float(on_chain_vault_state.get("vault_equity_usdc", 0.0))
+                p_free = on_chain_vault_state.get("perp_free_usdc")
+                locked_until = int(on_chain_vault_state.get("locked_until_ms", 0))
+                if (
+                    v_eq > 0.0
+                    and p_free is not None
+                    and float(p_free) < sizing.notional_usdc
+                    and now_ms >= locked_until
+                ):
+                    recall_usdc = round(
+                        min(v_eq, max(10.0, sizing.notional_usdc - float(p_free))), 2
+                    )
+                    recall_res = await self.execute_hlp_vault_transfer(
+                        amount_usdc=recall_usdc,
+                        is_deposit=False,
+                        vault_address=str(on_chain_vault_state.get("vault_address", "")),
+                        config=config,
+                    )
+                    if recall_res.get("status") == "ok":
+                        on_chain_vault_state["vault_equity_usdc"] = round(
+                            max(0.0, v_eq - recall_usdc), 2
+                        )
+                        on_chain_vault_state["perp_free_usdc"] = round(
+                            float(p_free) + recall_usdc, 2
+                        )
 
             self._last_order_result = None
             try:
@@ -1893,12 +2276,125 @@ class ExecutionEngine:
             (float(e.get("funding_rate_hourly", 0.0)) for e in evaluations),
             default=0.0,
         )
+        should_harvest = (
+            basis_enabled
+            and available_cash > 100.0
+            and (
+                best_funding >= basis_min_rate
+                or bool(config.get("hlp_yield_fallback_enabled", True))
+            )
+        )
+        target_basis_notional = (
+            round(available_cash * basis_max_alloc, 2) if should_harvest else 0.0
+        )
+
         basis_notional = 0.0
         new_accrued_yield = prev_accrued_yield
-        if basis_enabled and available_cash > 100.0 and (
-            best_funding >= basis_min_rate or bool(config.get("hlp_yield_fallback_enabled", True))
-        ):
-            basis_notional = round(available_cash * basis_max_alloc, 2)
+
+        if on_chain_vault_state is not None:
+            vault_eq = float(on_chain_vault_state.get("vault_equity_usdc", 0.0))
+            vault_addr = str(
+                on_chain_vault_state.get("vault_address") or self.get_hlp_vault_address(config)
+            )
+            delta_usdc = round(target_basis_notional - vault_eq, 2)
+            min_transfer_usdc = max(
+                float(config.get("hlp_min_transfer_usdc", 10.0)),
+                round(target_basis_notional * 0.05, 2),
+            )
+            transfer_cooldown_ms = int(config.get("hlp_transfer_cooldown_ms", 300_000))
+
+            if delta_usdc >= min_transfer_usdc and bool(
+                on_chain_vault_state.get("allow_deposits", True)
+            ):
+                perp_free = on_chain_vault_state.get("perp_free_usdc")
+                max_depositable = (
+                    round(float(perp_free), 2)
+                    if perp_free is not None
+                    else max(0.0, round(available_cash - vault_eq, 2))
+                )
+                deposit_amt = round(min(delta_usdc, max_depositable), 2)
+                if deposit_amt >= 10.0 and (
+                    self._last_vault_transfer_attempt_ms == 0
+                    or now_ms - self._last_vault_transfer_attempt_ms >= transfer_cooldown_ms
+                ):
+                    self._last_vault_transfer_attempt_ms = now_ms
+                    dep_res = await self.execute_hlp_vault_transfer(
+                        amount_usdc=deposit_amt,
+                        is_deposit=True,
+                        vault_address=vault_addr,
+                        config=config,
+                    )
+                    if dep_res.get("status") == "ok":
+                        self._last_vault_transfer_attempt_ms = 0
+                        refreshed = await self.fetch_hlp_vault_state(config=config)
+                        if (
+                            refreshed is not None
+                            and float(refreshed.get("vault_equity_usdc", 0.0)) > vault_eq
+                        ):
+                            on_chain_vault_state = refreshed
+                        else:
+                            on_chain_vault_state["vault_equity_usdc"] = round(
+                                vault_eq + deposit_amt, 2
+                            )
+            elif delta_usdc <= -min_transfer_usdc and vault_eq > 0.0:
+                withdraw_amt = round(min(abs(delta_usdc), vault_eq), 2)
+                locked_until_ms = int(on_chain_vault_state.get("locked_until_ms", 0))
+                if now_ms >= locked_until_ms:
+                    if withdraw_amt >= 1.0 and (
+                        self._last_vault_transfer_attempt_ms == 0
+                        or now_ms - self._last_vault_transfer_attempt_ms >= transfer_cooldown_ms
+                    ):
+                        self._last_vault_transfer_attempt_ms = now_ms
+                        wd_res = await self.execute_hlp_vault_transfer(
+                            amount_usdc=withdraw_amt,
+                            is_deposit=False,
+                            vault_address=vault_addr,
+                            config=config,
+                        )
+                        if wd_res.get("status") == "ok":
+                            self._last_vault_transfer_attempt_ms = 0
+                            refreshed = await self.fetch_hlp_vault_state(config=config)
+                            if (
+                                refreshed is not None
+                                and float(refreshed.get("vault_equity_usdc", 0.0)) < vault_eq
+                            ):
+                                on_chain_vault_state = refreshed
+                            else:
+                                on_chain_vault_state["vault_equity_usdc"] = round(
+                                    max(0.0, vault_eq - withdraw_amt), 2
+                                )
+                elif (
+                    self._last_vault_lockup_log_ms == 0
+                    or now_ms - self._last_vault_lockup_log_ms >= 3_600_000
+                ):
+                    self._last_vault_lockup_log_ms = now_ms
+                    self.db.log_telemetry(
+                        "INFO",
+                        "engine.execution",
+                        f"On-chain HLP vault withdrawal of ${withdraw_amt:.2f} USDC queued pending 4-day lockup expiry ({locked_until_ms})",
+                        {
+                            "withdraw_usdc": withdraw_amt,
+                            "locked_until_ms": locked_until_ms,
+                            "vault_address": vault_addr,
+                        },
+                    )
+
+            basis_notional = round(float(on_chain_vault_state.get("vault_equity_usdc", 0.0)), 2)
+            new_accrued_yield = round(
+                float(on_chain_vault_state.get("accrued_yield_usdc", 0.0)), 4
+            )
+            perp_eq_final = on_chain_vault_state.get("perp_equity_usdc")
+            if perp_eq_final is not None and (float(perp_eq_final) > 0.0 or basis_notional > 0.0):
+                # Note: if a deposit/withdrawal just succeeded without refreshed fetch_balance,
+                # total equity (perp + vault) remains invariant across internal vaultTransfer.
+                pass
+            else:
+                current_equity = round(
+                    base_equity + total_realized_pnl + total_unrealized_pnl + new_accrued_yield, 2
+                )
+            available_cash = max(0.0, round(current_equity - deployed_notional, 2))
+        elif should_harvest:
+            basis_notional = target_basis_notional
             effective_hourly_rate = max(best_funding, basis_min_rate)
             if settle_funding_now:
                 new_accrued_yield = round(
