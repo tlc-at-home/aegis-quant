@@ -10,6 +10,7 @@ Group=fedora
 WorkingDirectory=/home/fedora/aegis
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=/home/fedora/aegis"
+LoadCredential=aegis_master_key:/home/fedora/aegis/data/.aegis_master_key
 ExecStart=/usr/bin/bash -c "exec /home/fedora/aegis/venv/bin/python -m engine.main"
 Restart=always
 RestartSec=5

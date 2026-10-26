@@ -494,6 +494,25 @@ class TestAuditRemediationRC2(unittest.TestCase):
             finally:
                 bt.mem_db.close()
 
+    def test_check_mainnet_readiness_script(self) -> None:
+        """Verifies scripts/check_mainnet_readiness.py evaluates all 5 readiness gates."""
+        from scripts.check_mainnet_readiness import evaluate_readiness
+
+        test_db_path = self.tmp_path / "readiness_test.db"
+        db = DatabaseManager(test_db_path)
+        db.initialize_database()
+
+        checks, summary = evaluate_readiness(
+            test_db_path,
+            min_soak_hours=1.0,
+            min_closed_trades=1,
+            error_window_hours=24.0,
+        )
+        self.assertGreaterEqual(len(checks), 11)
+        self.assertFalse(bool(summary["mainnet_ready"]))
+        check_ids = {c.check_id for c in checks}
+        self.assertTrue({"1.1", "1.2", "2.1", "2.2", "3.1", "4.2", "5.1"}.issubset(check_ids))
+
 
 if __name__ == "__main__":
     unittest.main()

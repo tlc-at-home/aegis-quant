@@ -95,13 +95,27 @@ def _normalize_fernet_key(raw_key: str | bytes) -> bytes:
         return base64.urlsafe_b64encode(hashlib.sha256(raw_bytes).digest())
 
 
-def _resolve_fernet_master_key(master_key: str | bytes | None = None) -> bytes:
+def _is_usable_env_key(raw_val: str) -> bool:
+    """Return True if an environment key string is non-empty and not a documentation placeholder."""
+    cleaned = raw_val.strip()
+    if not cleaned:
+        return False
+    if cleaned.startswith("<") and cleaned.endswith(">"):
+        return False
+    return True
+
+
+def _resolve_fernet_master_key(
+    master_key: str | bytes | None = None,
+    db_path: Path | None = None,
+) -> bytes:
     """
     Resolve the AES-128 Fernet master key from:
     1. Explicit `master_key` argument
     2. systemd `LoadCredentialEncrypted=` / `LoadCredential=` (`$CREDENTIALS_DIRECTORY`)
     3. Environment variable (`AEGIS_MASTER_KEY` or `FERNET_MASTER_KEY`)
-    4. Deterministic platform fallback key
+    4. Local keyfile (`<db_dir>/.aegis_master_key`, chmod 0600)
+    5. Deterministic platform fallback key
     """
     if master_key is not None:
         return _normalize_fernet_key(master_key)
@@ -127,8 +141,15 @@ def _resolve_fernet_master_key(master_key: str | bytes | None = None) -> bytes:
         or os.environ.get("FERNET_MASTER_KEY")
         or ""
     ).strip()
-    if env_key:
+    if _is_usable_env_key(env_key):
         return _normalize_fernet_key(env_key)
+
+    if db_path is not None and str(db_path) != ":memory:":
+        key_file = db_path.parent / ".aegis_master_key"
+        if key_file.is_file():
+            content = key_file.read_bytes().strip()
+            if content:
+                return _normalize_fernet_key(content)
 
     return _DEFAULT_HOST_FERNET_KEY
 
@@ -221,7 +242,7 @@ class DatabaseManager:
         self._memory_conn: sqlite3.Connection | None = None
         self.pit_timestamp_ms: int | None = None
         self._explicit_master_key: str | bytes | None = master_key
-        self._fernet_key: bytes = _resolve_fernet_master_key(master_key)
+        self._fernet_key: bytes = _resolve_fernet_master_key(master_key, self.db_path)
         self._fernet: Fernet = Fernet(self._fernet_key)
         if not self._is_memory:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +346,7 @@ class DatabaseManager:
             or os.environ.get("FERNET_MASTER_KEY")
             or ""
         ).strip()
-        if env_key:
+        if _is_usable_env_key(env_key):
             return _normalize_fernet_key(env_key)
 
         # Systemd credential path check
@@ -342,7 +363,15 @@ class DatabaseManager:
                         if content:
                             return _normalize_fernet_key(content)
 
-        if exec_mode in ("LIVE", "TESTNET") and enforce_key:
+        # Local keyfile check (<db_dir>/.aegis_master_key, chmod 0600)
+        key_dir = DEFAULT_DB_PATH.parent if self._is_memory else self.db_path.parent
+        key_file = key_dir / ".aegis_master_key"
+        if (not self._is_memory or exec_mode in ("LIVE", "TESTNET")) and key_file.is_file():
+            content = key_file.read_bytes().strip()
+            if content:
+                return _normalize_fernet_key(content)
+
+        if not self._is_memory and exec_mode in ("LIVE", "TESTNET") and enforce_key:
             msg = (
                 f"FATAL SECURITY VIOLATION: Execution mode is '{exec_mode}' but no explicit "
                 "AEGIS_MASTER_KEY environment variable or systemd credential was provided. "
@@ -423,7 +452,7 @@ class DatabaseManager:
         if has_enforce is not None:
             key = self.get_master_fernet_key()
         else:
-            key = _resolve_fernet_master_key(self._explicit_master_key)
+            key = _resolve_fernet_master_key(self._explicit_master_key, self.db_path)
         if key != self._fernet_key:
             self._fernet_key = key
             self._fernet = Fernet(key)
@@ -486,7 +515,7 @@ class DatabaseManager:
             return s
         try:
             return self.decrypt_config_value(s)
-        except ValueError:
+        except (ValueError, RuntimeError):
             return ""
 
     def rotate_master_key(self, new_master_key: str | bytes) -> dict[str, Any]:
