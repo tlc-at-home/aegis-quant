@@ -1853,6 +1853,7 @@ class DatabaseManager:
         self,
         trade_id: int,
         on_chain_size: float,
+        entry_price: float | None = None,
     ) -> None:
         """Synchronize an open trade's quantity, filled_units, notional, and risk budget to on_chain_size."""
         with self.connection() as conn:
@@ -1868,7 +1869,11 @@ class DatabaseManager:
                 if row["filled_units"] and float(row["filled_units"]) > 0
                 else (row["quantity"] or 1.0)
             )
-            entry_px = float(row["entry_price"] or 0.0)
+            entry_px = (
+                float(entry_price)
+                if entry_price is not None and float(entry_price) > 0
+                else float(row["entry_price"] or 0.0)
+            )
             old_risk = float(row["risk_budget_usdc"] or 0.0)
             scale = float(on_chain_size) / max(old_qty, 1e-12)
             new_notional = round(float(on_chain_size) * entry_px, 2)
@@ -1878,6 +1883,8 @@ class DatabaseManager:
                 UPDATE trades
                 SET quantity = ?,
                     filled_units = ?,
+                    entry_price = ?,
+                    avg_fill_price = ?,
                     notional_usdc = ?,
                     risk_budget_usdc = ?
                 WHERE trade_id = ? AND status = 'OPEN';
@@ -1885,11 +1892,165 @@ class DatabaseManager:
                 (
                     float(on_chain_size),
                     float(on_chain_size),
+                    entry_px,
+                    entry_px,
                     new_notional,
                     new_risk,
                     int(trade_id),
                 ),
             )
+
+    def reconcile_on_chain_orphan_position(
+        self,
+        symbol: str,
+        side: str,
+        on_chain_size: float,
+        entry_price: float = 0.0,
+        mark_price: float = 0.0,
+        unrealized_pnl_usdc: float = 0.0,
+    ) -> dict[str, Any] | None:
+        """Re-open a prematurely closed trade or adopt an untracked on-chain position."""
+        norm_side = "LONG" if str(side).upper() in ("LONG", "BUY") else "SHORT"
+        with self.connection() as conn:
+            self._ensure_order_fsm_schema(conn)
+            row = conn.execute(
+                """
+                SELECT * FROM trades
+                WHERE symbol = ? AND side = ? AND status = 'CLOSED'
+                ORDER BY trade_id DESC
+                LIMIT 1;
+                """,
+                (str(symbol), norm_side),
+            ).fetchone()
+
+            if row is not None:
+                trade_id = int(row["trade_id"])
+                old_qty = float(
+                    row["filled_units"]
+                    if row["filled_units"] and float(row["filled_units"]) > 0
+                    else (row["quantity"] or 1.0)
+                )
+                eff_entry = (
+                    float(entry_price)
+                    if float(entry_price) > 0
+                    else float(row["entry_price"] or 0.0)
+                )
+                eff_curr = (
+                    float(mark_price)
+                    if float(mark_price) > 0
+                    else float(row["current_price"] or eff_entry)
+                )
+                scale = float(on_chain_size) / max(old_qty, 1e-12)
+                new_notional = round(float(on_chain_size) * eff_entry, 2)
+                old_risk = float(row["risk_budget_usdc"] or 0.0)
+                new_risk = (
+                    round(old_risk * scale, 2)
+                    if old_risk > 0
+                    else round(new_notional * 0.04, 2)
+                )
+                default_stop = (
+                    eff_entry * 0.90 if norm_side == "LONG" else eff_entry * 1.10
+                )
+                init_stop = float(row["initial_stop_price"] or default_stop)
+                chand_stop = float(row["chandelier_stop_price"] or init_stop)
+                high_seen = max(eff_entry, eff_curr)
+                low_seen = min(eff_entry, eff_curr)
+                if (norm_side == "LONG" and eff_curr <= chand_stop) or (
+                    norm_side == "SHORT" and eff_curr >= chand_stop
+                ):
+                    chand_stop = init_stop
+                    if (norm_side == "LONG" and eff_curr <= chand_stop) or (
+                        norm_side == "SHORT" and eff_curr >= chand_stop
+                    ):
+                        chand_stop = default_stop
+                        init_stop = default_stop
+
+                conn.execute(
+                    """
+                    UPDATE trades
+                    SET status = 'OPEN',
+                        fsm_state = 'FILLED',
+                        quantity = ?,
+                        filled_units = ?,
+                        entry_price = ?,
+                        avg_fill_price = ?,
+                        current_price = ?,
+                        notional_usdc = ?,
+                        risk_budget_usdc = ?,
+                        initial_stop_price = ?,
+                        chandelier_stop_price = ?,
+                        highest_price_seen = ?,
+                        lowest_price_seen = ?,
+                        unrealized_pnl_usdc = ?,
+                        realized_pnl_usdc = 0.0,
+                        exit_price = NULL,
+                        exit_reason = NULL,
+                        closed_at = NULL
+                    WHERE trade_id = ?;
+                    """,
+                    (
+                        float(on_chain_size),
+                        float(on_chain_size),
+                        eff_entry,
+                        eff_entry,
+                        eff_curr,
+                        new_notional,
+                        new_risk,
+                        init_stop,
+                        chand_stop,
+                        high_seen,
+                        low_seen,
+                        round(float(unrealized_pnl_usdc), 4),
+                        trade_id,
+                    ),
+                )
+                return {
+                    "trade_id": trade_id,
+                    "client_order_id": str(row["client_order_id"] or f"reconcile-{trade_id}"),
+                    "action": "REOPENED",
+                    "symbol": str(symbol),
+                    "side": norm_side,
+                    "quantity": float(on_chain_size),
+                    "entry_price": eff_entry,
+                }
+
+        if float(entry_price) > 0 and str(symbol) in set(self.get_alt_pairs_universe()):
+            eff_entry = float(entry_price)
+            eff_curr = float(mark_price) if float(mark_price) > 0 else eff_entry
+            new_notional = round(float(on_chain_size) * eff_entry, 2)
+            init_stop = eff_entry * 0.90 if norm_side == "LONG" else eff_entry * 1.10
+            cli_id = f"reconcile-{uuid.uuid4().hex[:12]}"
+            new_trade_id = self.open_trade(
+                {
+                    "client_order_id": cli_id,
+                    "symbol": str(symbol),
+                    "side": norm_side,
+                    "status": "OPEN",
+                    "fsm_state": "FILLED",
+                    "entry_price": eff_entry,
+                    "current_price": eff_curr,
+                    "quantity": float(on_chain_size),
+                    "filled_units": float(on_chain_size),
+                    "avg_fill_price": eff_entry,
+                    "notional_usdc": new_notional,
+                    "risk_budget_usdc": round(new_notional * 0.04, 2),
+                    "initial_stop_price": init_stop,
+                    "chandelier_stop_price": init_stop,
+                    "highest_price_seen": max(eff_entry, eff_curr),
+                    "lowest_price_seen": min(eff_entry, eff_curr),
+                    "unrealized_pnl_usdc": round(float(unrealized_pnl_usdc), 4),
+                }
+            )
+            return {
+                "trade_id": new_trade_id,
+                "client_order_id": cli_id,
+                "action": "ADOPTED",
+                "symbol": str(symbol),
+                "side": norm_side,
+                "quantity": float(on_chain_size),
+                "entry_price": eff_entry,
+            }
+        return None
 
     def close_trade(
         self,

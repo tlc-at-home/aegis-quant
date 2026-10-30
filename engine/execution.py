@@ -715,6 +715,8 @@ class ExecutionEngine:
             if reduce_only:
                 order_params["reduceOnly"] = True
 
+            initial_order: dict[str, Any] | None = None
+            init_reject_reason: str | None = None
             try:
                 initial_order = await exchange.create_order(
                     symbol=symbol,
@@ -725,45 +727,137 @@ class ExecutionEngine:
                     params=order_params,
                 )
             except (ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
-                self.db.transition_order_state(
-                    cli_id,
-                    "REJECTED",
-                    from_state="PENDING",
-                    reason=f"ORDER_PLACEMENT_REJECTED: {exc}",
-                    status="CANCELLED",
-                )
-                state_history.append("REJECTED")
-                res = OrderExecutionResult(
-                    client_order_id=cli_id,
-                    exchange_order_id="",
-                    symbol=symbol,
-                    side=norm_side,
-                    fsm_state="REJECTED",
-                    requested_units=float(quantity),
-                    filled_units=0.0,
-                    avg_fill_price=0.0,
-                    slippage_paid_usd=0.0,
-                    effective_slippage_bps=0.0,
-                    fees_paid_usdc=0.0,
-                    is_maker=False,
-                    fill_type="NONE",
-                    state_history=state_history,
-                )
-                self._last_order_result = res
-                return res
+                init_reject_reason = f"ORDER_PLACEMENT_REJECTED: {exc}"
 
-            init_status = str(initial_order.get("status") or "open").lower()
-            exchange_order_id = str(
-                initial_order.get("id") or f"{prefix}-{uuid.uuid4().hex[:10]}"
+            init_status = (
+                str(initial_order.get("status") or "open").lower()
+                if isinstance(initial_order, dict)
+                else "rejected"
             )
+            if isinstance(initial_order, dict):
+                exchange_order_id = str(
+                    initial_order.get("id") or f"{prefix}-{uuid.uuid4().hex[:10]}"
+                )
+            if init_reject_reason is None and init_status == "rejected":
+                init_reject_reason = "EXCHANGE_STATUS_REJECTED"
 
-            if init_status == "rejected":
+            if init_reject_reason is not None:
+                if fallback_to_ioc:
+                    ioc_params_init: dict[str, Any] = {"timeInForce": "IOC"}
+                    if reduce_only:
+                        ioc_params_init["reduceOnly"] = True
+                    eff_slip_bps_init = self.calculate_dynamic_slippage_bps(
+                        atr_14=atr_14,
+                        close_price=float(price),
+                        notional_usd=float(quantity) * float(price),
+                        config=cfg,
+                    )
+                    slip_rate_init = eff_slip_bps_init / 10000.0
+                    ioc_ref_px_init = (
+                        current_limit_price * (1.0 + slip_rate_init)
+                        if is_buy
+                        else current_limit_price * (1.0 - slip_rate_init)
+                    )
+                    with suppress(
+                        ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError
+                    ):
+                        ioc_init_order = await exchange.create_order(
+                            symbol=symbol,
+                            type="market",
+                            side=ccxt_side,
+                            amount=float(quantity),
+                            price=ioc_ref_px_init,
+                            params=ioc_params_init,
+                        )
+                        ioc_init_status = (
+                            str(ioc_init_order.get("status") or "closed").lower()
+                            if isinstance(ioc_init_order, dict)
+                            else "closed"
+                        )
+                        raw_init_filled = (
+                            ioc_init_order.get("filled")
+                            if isinstance(ioc_init_order, dict)
+                            else None
+                        )
+                        ioc_init_filled = (
+                            float(raw_init_filled)
+                            if raw_init_filled is not None
+                            else (
+                                float(quantity)
+                                if ioc_init_status not in ("expired", "canceled", "cancelled", "rejected")
+                                else 0.0
+                            )
+                        )
+                        if ioc_init_filled > 0.0:
+                            ioc_init_avg_px = (
+                                float(
+                                    ioc_init_order.get("average")
+                                    or ioc_init_order.get("price")
+                                    or ioc_ref_px_init
+                                )
+                                if isinstance(ioc_init_order, dict)
+                                else ioc_ref_px_init
+                            )
+                            if isinstance(ioc_init_order, dict) and ioc_init_order.get("id"):
+                                exchange_order_id = str(ioc_init_order["id"])
+                            elif not exchange_order_id:
+                                exchange_order_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
+                            self.db.transition_order_state(
+                                cli_id,
+                                "EXPIRED",
+                                from_state="PENDING",
+                                reason=f"POST_ONLY_BYPASSED_TO_IOC: {init_reject_reason}",
+                                exchange_order_id=exchange_order_id,
+                            )
+                            state_history.append("EXPIRED")
+                            fill_notional_init = ioc_init_filled * ioc_init_avg_px
+                            fees_init = fill_notional_init * taker_fee_rate
+                            slip_init_usd = abs(ioc_init_avg_px - float(price)) * ioc_init_filled
+                            target_init_state = (
+                                "FILLED"
+                                if ioc_init_filled >= float(quantity) - 1e-9
+                                else "PARTIALLY_FILLED"
+                            )
+                            self.db.transition_order_state(
+                                cli_id,
+                                target_init_state,
+                                from_state="EXPIRED",
+                                reason="MARKET_IOC_FALLBACK_FILLED",
+                                exchange_order_id=exchange_order_id,
+                                avg_fill_price=ioc_init_avg_px,
+                                filled_units=ioc_init_filled,
+                                quantity=ioc_init_filled,
+                                notional_usdc=round(fill_notional_init, 2),
+                                slippage_paid_usd=slip_init_usd,
+                                fees_paid_usdc=fees_init,
+                                status="OPEN",
+                            )
+                            state_history.append(target_init_state)
+                            res = OrderExecutionResult(
+                                client_order_id=cli_id,
+                                exchange_order_id=exchange_order_id,
+                                symbol=symbol,
+                                side=norm_side,
+                                fsm_state=target_init_state,
+                                requested_units=float(quantity),
+                                filled_units=round(ioc_init_filled, 8),
+                                avg_fill_price=round(ioc_init_avg_px, 8),
+                                slippage_paid_usd=round(slip_init_usd, 6),
+                                effective_slippage_bps=round(eff_slip_bps_init, 6),
+                                fees_paid_usdc=round(fees_init, 6),
+                                is_maker=False,
+                                fill_type="MARKET_IOC_FALLBACK",
+                                state_history=state_history,
+                            )
+                            self._last_order_result = res
+                            return res
+
                 self.db.transition_order_state(
                     cli_id,
                     "REJECTED",
                     from_state="PENDING",
-                    reason="EXCHANGE_STATUS_REJECTED",
-                    exchange_order_id=exchange_order_id,
+                    reason=init_reject_reason,
+                    exchange_order_id=exchange_order_id if exchange_order_id else None,
                     status="CANCELLED",
                 )
                 state_history.append("REJECTED")
@@ -1104,52 +1198,251 @@ class ExecutionEngine:
                                     symbol,
                                     cancel_exc,
                                 )
-                        try:
-                            repriced_order = await exchange.create_order(
-                                symbol=symbol,
-                                type="limit",
-                                side=ccxt_side,
-                                amount=remaining_units,
-                                price=new_best_px,
-                                params=order_params,
-                            )
-                            rep_status = (
-                                str(repriced_order.get("status") or "open").lower()
-                                if isinstance(repriced_order, dict)
-                                else "open"
-                            )
-                            if rep_status in ("rejected", "canceled", "cancelled"):
-                                order_active_on_book = False
-                            else:
-                                if isinstance(repriced_order, dict) and repriced_order.get("id"):
-                                    exchange_order_id = str(repriced_order["id"])
-                                order_active_on_book = True
-                            current_limit_price = new_best_px
-                            prev_filled_on_current_order = 0.0
-                        except (
+                                with suppress(
+                                    ccxt.BaseError,
+                                    OSError,
+                                    ValueError,
+                                    TypeError,
+                                    KeyError,
+                                    RuntimeError,
+                                ):
+                                    late_polled = await exchange.fetch_order(
+                                        exchange_order_id, symbol
+                                    )
+                                    if isinstance(late_polled, dict):
+                                        late_status = str(
+                                            late_polled.get("status") or "open"
+                                        ).lower()
+                                        raw_late_filled = late_polled.get("filled")
+                                        late_filled = (
+                                            float(raw_late_filled)
+                                            if raw_late_filled is not None
+                                            else (
+                                                float(quantity) - total_filled_units
+                                                if late_status in ("closed", "filled")
+                                                else 0.0
+                                            )
+                                        )
+                                        late_avg_px = float(
+                                            late_polled.get("average")
+                                            or late_polled.get("price")
+                                            or current_limit_price
+                                        )
+                                        late_delta = max(
+                                            0.0, late_filled - prev_filled_on_current_order
+                                        )
+                                        if late_delta > 0.0:
+                                            total_filled_units = min(
+                                                float(quantity),
+                                                total_filled_units + late_delta,
+                                            )
+                                            total_fill_notional += late_delta * late_avg_px
+                                            total_fees_usdc += (
+                                                late_delta * late_avg_px
+                                            ) * maker_fee_rate
+                                            prev_filled_on_current_order = late_filled
+                                        if total_filled_units >= float(
+                                            quantity
+                                        ) - 1e-9 or late_status in ("closed", "filled"):
+                                            if total_filled_units < float(quantity):
+                                                rem = float(quantity) - total_filled_units
+                                                total_filled_units = float(quantity)
+                                                total_fill_notional += rem * late_avg_px
+                                                total_fees_usdc += (
+                                                    rem * late_avg_px
+                                                ) * maker_fee_rate
+                                            avg_px = total_fill_notional / max(
+                                                total_filled_units, 1e-12
+                                            )
+                                            slip_usd = (
+                                                abs(avg_px - float(price)) * total_filled_units
+                                            )
+                                            self.db.transition_order_state(
+                                                cli_id,
+                                                "FILLED",
+                                                from_state=current_state,
+                                                reason="MAKER_LIMIT_FILLED_ON_CANCEL_RACE",
+                                                exchange_order_id=exchange_order_id,
+                                                avg_fill_price=avg_px,
+                                                filled_units=total_filled_units,
+                                                quantity=total_filled_units,
+                                                notional_usdc=round(total_fill_notional, 2),
+                                                slippage_paid_usd=slip_usd,
+                                                fees_paid_usdc=total_fees_usdc,
+                                                status="OPEN",
+                                            )
+                                            current_state = "FILLED"
+                                            state_history.append("FILLED")
+                                            res = OrderExecutionResult(
+                                                client_order_id=cli_id,
+                                                exchange_order_id=exchange_order_id,
+                                                symbol=symbol,
+                                                side=norm_side,
+                                                fsm_state="FILLED",
+                                                requested_units=float(quantity),
+                                                filled_units=round(total_filled_units, 8),
+                                                avg_fill_price=round(avg_px, 8),
+                                                slippage_paid_usd=round(slip_usd, 6),
+                                                effective_slippage_bps=0.0,
+                                                fees_paid_usdc=round(total_fees_usdc, 6),
+                                                is_maker=True,
+                                                fill_type="MAKER_LIMIT",
+                                                state_history=state_history,
+                                            )
+                                            self._last_order_result = res
+                                            return res
+                                        if late_status in (
+                                            "canceled",
+                                            "cancelled",
+                                            "expired",
+                                        ):
+                                            order_active_on_book = False
+                                            prev_filled_on_current_order = 0.0
+                        remaining_units = round(float(quantity) - total_filled_units, 8)
+                        if not order_active_on_book and remaining_units > 0:
+                            try:
+                                repriced_order = await exchange.create_order(
+                                    symbol=symbol,
+                                    type="limit",
+                                    side=ccxt_side,
+                                    amount=remaining_units,
+                                    price=new_best_px,
+                                    params=order_params,
+                                )
+                                rep_status = (
+                                    str(repriced_order.get("status") or "open").lower()
+                                    if isinstance(repriced_order, dict)
+                                    else "open"
+                                )
+                                if rep_status in ("rejected", "canceled", "cancelled"):
+                                    order_active_on_book = False
+                                else:
+                                    if isinstance(repriced_order, dict) and repriced_order.get("id"):
+                                        exchange_order_id = str(repriced_order["id"])
+                                    order_active_on_book = True
+                                current_limit_price = new_best_px
+                                prev_filled_on_current_order = 0.0
+                            except (
+                                ccxt.BaseError,
+                                OSError,
+                                ValueError,
+                                TypeError,
+                                KeyError,
+                                RuntimeError,
+                            ) as reprice_exc:
+                                current_limit_price = new_best_px
+                                logger.warning(
+                                    "Chaser reprice step %d failed for %s: %s",
+                                    interval_idx + 1,
+                                    symbol,
+                                    reprice_exc,
+                                )
+
+            # Step 3: Unfilled after N chase intervals -> Cancel resting maker limit & transition to EXPIRED
+            if order_active_on_book:
+                cancel_fn = getattr(exchange, "cancel_order", None)
+                if callable(cancel_fn):
+                    try:
+                        await cancel_fn(exchange_order_id, symbol)
+                    except (
+                        ccxt.BaseError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        RuntimeError,
+                    ) as final_cancel_exc:
+                        logger.warning(
+                            "Chaser final cancel_order failed for %s [%s]: %s",
+                            symbol,
+                            exchange_order_id,
+                            final_cancel_exc,
+                        )
+                        with suppress(
                             ccxt.BaseError,
                             OSError,
                             ValueError,
                             TypeError,
                             KeyError,
                             RuntimeError,
-                        ) as reprice_exc:
-                            current_limit_price = new_best_px
-                            logger.warning(
-                                "Chaser reprice step %d failed for %s: %s",
-                                interval_idx + 1,
-                                symbol,
-                                reprice_exc,
-                            )
-
-            # Step 3: Unfilled after N chase intervals -> Cancel resting maker limit & transition to EXPIRED
-            if order_active_on_book:
-                cancel_fn = getattr(exchange, "cancel_order", None)
-                if callable(cancel_fn):
-                    with suppress(
-                        ccxt.BaseError, OSError, ValueError, TypeError, KeyError, RuntimeError
-                    ):
-                        await cancel_fn(exchange_order_id, symbol)
+                        ):
+                            late_polled = await exchange.fetch_order(exchange_order_id, symbol)
+                            if isinstance(late_polled, dict):
+                                late_status = str(late_polled.get("status") or "open").lower()
+                                raw_late_filled = late_polled.get("filled")
+                                late_filled = (
+                                    float(raw_late_filled)
+                                    if raw_late_filled is not None
+                                    else (
+                                        float(quantity) - total_filled_units
+                                        if late_status in ("closed", "filled")
+                                        else 0.0
+                                    )
+                                )
+                                late_avg_px = float(
+                                    late_polled.get("average")
+                                    or late_polled.get("price")
+                                    or current_limit_price
+                                )
+                                late_delta = max(
+                                    0.0, late_filled - prev_filled_on_current_order
+                                )
+                                if late_delta > 0.0:
+                                    total_filled_units = min(
+                                        float(quantity), total_filled_units + late_delta
+                                    )
+                                    total_fill_notional += late_delta * late_avg_px
+                                    total_fees_usdc += (
+                                        late_delta * late_avg_px
+                                    ) * maker_fee_rate
+                                    prev_filled_on_current_order = late_filled
+                                if total_filled_units >= float(quantity) - 1e-9 or late_status in (
+                                    "closed",
+                                    "filled",
+                                ):
+                                    if total_filled_units < float(quantity):
+                                        rem = float(quantity) - total_filled_units
+                                        total_filled_units = float(quantity)
+                                        total_fill_notional += rem * late_avg_px
+                                        total_fees_usdc += (rem * late_avg_px) * maker_fee_rate
+                                    avg_px = total_fill_notional / max(
+                                        total_filled_units, 1e-12
+                                    )
+                                    slip_usd = abs(avg_px - float(price)) * total_filled_units
+                                    self.db.transition_order_state(
+                                        cli_id,
+                                        "FILLED",
+                                        from_state=current_state,
+                                        reason="MAKER_LIMIT_FILLED_ON_CANCEL_RACE",
+                                        exchange_order_id=exchange_order_id,
+                                        avg_fill_price=avg_px,
+                                        filled_units=total_filled_units,
+                                        quantity=total_filled_units,
+                                        notional_usdc=round(total_fill_notional, 2),
+                                        slippage_paid_usd=slip_usd,
+                                        fees_paid_usdc=total_fees_usdc,
+                                        status="OPEN",
+                                    )
+                                    current_state = "FILLED"
+                                    state_history.append("FILLED")
+                                    res = OrderExecutionResult(
+                                        client_order_id=cli_id,
+                                        exchange_order_id=exchange_order_id,
+                                        symbol=symbol,
+                                        side=norm_side,
+                                        fsm_state="FILLED",
+                                        requested_units=float(quantity),
+                                        filled_units=round(total_filled_units, 8),
+                                        avg_fill_price=round(avg_px, 8),
+                                        slippage_paid_usd=round(slip_usd, 6),
+                                        effective_slippage_bps=0.0,
+                                        fees_paid_usdc=round(total_fees_usdc, 6),
+                                        is_maker=True,
+                                        fill_type="MAKER_LIMIT",
+                                        state_history=state_history,
+                                    )
+                                    self._last_order_result = res
+                                    return res
 
             partial_avg = (
                 total_fill_notional / total_filled_units if total_filled_units > 0 else None
@@ -1347,7 +1640,7 @@ class ExecutionEngine:
                 reduce_only=reduce_only,
                 atr_14=atr_14,
             )
-            if result.fsm_state in ("REJECTED", "CANCELLED") and result.filled_units <= 0:
+            if result.fsm_state in ("REJECTED", "CANCELLED", "EXPIRED") and result.filled_units <= 0:
                 raise RuntimeError(
                     f"Order {result.client_order_id} on {symbol} terminated in state {result.fsm_state}"
                 )
@@ -1405,6 +1698,9 @@ class ExecutionEngine:
             on_chain_positions = await exchange.fetch_positions()
             pos_map: dict[str, float] = {}
             side_map: dict[str, str] = {}
+            entry_map: dict[str, float] = {}
+            mark_map: dict[str, float] = {}
+            upnl_map: dict[str, float] = {}
             for p in on_chain_positions or []:
                 if not isinstance(p, dict):
                     continue
@@ -1417,9 +1713,19 @@ class ExecutionEngine:
                         side_map[sym] = "LONG"
                     elif raw_side in ("SHORT", "SELL"):
                         side_map[sym] = "SHORT"
+                    if p.get("entryPrice") is not None:
+                        with suppress(ValueError, TypeError):
+                            entry_map[sym] = float(p["entryPrice"])
+                    if p.get("markPrice") is not None:
+                        with suppress(ValueError, TypeError):
+                            mark_map[sym] = float(p["markPrice"])
+                    if p.get("unrealizedPnl") is not None:
+                        with suppress(ValueError, TypeError):
+                            upnl_map[sym] = float(p["unrealizedPnl"])
 
             local_trades = self.db.get_open_trades()
             reconciled_count = 0
+            matched_local_symbols: set[str] = set()
             for trade in local_trades:
                 sym = str(trade["symbol"])
                 local_side = str(trade.get("side", "LONG")).upper()
@@ -1464,28 +1770,67 @@ class ExecutionEngine:
                         level="CRITICAL",
                     )
                     reconciled_count += 1
-                elif 0.0 < on_chain_size < local_qty - 1e-8 and trade.get("trade_id") is not None:
+                else:
+                    matched_local_symbols.add(sym)
+                    if (
+                        on_chain_size > 0.0
+                        and abs(on_chain_size - local_qty) > 1e-8
+                        and trade.get("trade_id") is not None
+                    ):
+                        logger.warning(
+                            "RECONCILIATION PARTIAL DRIFT: Symbol %s local size %.6f != on-chain %.6f. Syncing size.",
+                            sym,
+                            local_qty,
+                            on_chain_size,
+                        )
+                        self.db.reconcile_open_trade_size(
+                            trade_id=int(trade["trade_id"]),
+                            on_chain_size=on_chain_size,
+                            entry_price=entry_map.get(sym),
+                        )
+                        self.db.log_telemetry(
+                            "WARNING",
+                            "engine.execution",
+                            f"RECONCILIATION PARTIAL DRIFT: Symbol {sym} synced from {local_qty} to {on_chain_size} contracts.",
+                            {
+                                "symbol": sym,
+                                "client_order_id": trade["client_order_id"],
+                                "trade_id": trade.get("trade_id"),
+                                "previous_quantity": local_qty,
+                                "on_chain_size": on_chain_size,
+                            },
+                        )
+                        reconciled_count += 1
+
+            for sym, on_chain_size in pos_map.items():
+                if sym in matched_local_symbols:
+                    continue
+                on_chain_side = side_map.get(sym)
+                if on_chain_side not in ("LONG", "SHORT"):
+                    continue
+                reconciled_orphan = self.db.reconcile_on_chain_orphan_position(
+                    symbol=sym,
+                    side=on_chain_side,
+                    on_chain_size=on_chain_size,
+                    entry_price=entry_map.get(sym, 0.0),
+                    mark_price=mark_map.get(sym, 0.0),
+                    unrealized_pnl_usdc=upnl_map.get(sym, 0.0),
+                )
+                if reconciled_orphan is not None:
+                    self._cooldown_until_ms.pop(sym, None)
+                    self._cooldown_until_step.pop(sym, None)
                     logger.warning(
-                        "RECONCILIATION PARTIAL DRIFT: Symbol %s local size %.6f > on-chain %.6f. Syncing size.",
+                        "RECONCILIATION ON-CHAIN POSITION RESTORED: Symbol %s (%s) %.6f contracts restored (%s).",
                         sym,
-                        local_qty,
+                        on_chain_side,
                         on_chain_size,
-                    )
-                    self.db.reconcile_open_trade_size(
-                        trade_id=int(trade["trade_id"]),
-                        on_chain_size=on_chain_size,
+                        reconciled_orphan["action"],
                     )
                     self.db.log_telemetry(
                         "WARNING",
                         "engine.execution",
-                        f"RECONCILIATION PARTIAL DRIFT: Symbol {sym} synced from {local_qty} to {on_chain_size} contracts.",
-                        {
-                            "symbol": sym,
-                            "client_order_id": trade["client_order_id"],
-                            "trade_id": trade.get("trade_id"),
-                            "previous_quantity": local_qty,
-                            "on_chain_size": on_chain_size,
-                        },
+                        f"RECONCILIATION ON-CHAIN POSITION RESTORED: Symbol {sym} ({on_chain_side}) synced at {on_chain_size} contracts.",
+                        reconciled_orphan,
                     )
                     reconciled_count += 1
             return reconciled_count
@@ -2021,12 +2366,18 @@ class ExecutionEngine:
 
             if exit_reason:
                 close_side = "SHORT" if side == "LONG" else "LONG"
+                order_target_price = (
+                    current_price
+                    if (self.execution_mode in ("LIVE", "TESTNET") or self.exchange is not None)
+                    else exit_fill_price
+                )
+                self._last_order_result = None
                 try:
                     await self._route_dex_order(
                         symbol=symbol,
                         side=close_side,
                         quantity=qty,
-                        price=exit_fill_price,
+                        price=order_target_price,
                         config=config,
                         reduce_only=True,
                         atr_14=atr_val,
@@ -2047,7 +2398,19 @@ class ExecutionEngine:
                         {"trade_id": trade_id, "symbol": symbol, "side": side, "error": str(exc)},
                     )
                     continue
-                exit_fee = (qty * exit_fill_price) * taker_fee_rate
+                if (
+                    (self.execution_mode in ("LIVE", "TESTNET") or self.exchange is not None)
+                    and self._last_order_result is not None
+                    and self._last_order_result.avg_fill_price > 0
+                ):
+                    exit_fill_price = float(self._last_order_result.avg_fill_price)
+                    if side == "LONG":
+                        unrealized_pnl = (exit_fill_price - entry_price) * qty + funding_accrued
+                    else:
+                        unrealized_pnl = (entry_price - exit_fill_price) * qty + funding_accrued
+                    exit_fee = float(self._last_order_result.fees_paid_usdc)
+                else:
+                    exit_fee = (qty * exit_fill_price) * taker_fee_rate
                 total_fees = float(trade.get("fees_paid_usdc", 0.0)) + exit_fee
                 realized_pnl = unrealized_pnl - total_fees
                 self.db.close_trade(

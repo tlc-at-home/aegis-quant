@@ -881,6 +881,153 @@ class TestExecutionStateMachine(unittest.TestCase):
         self.assertFalse(wd_call["action"]["isDeposit"])
         self.assertEqual(wd_call["action"]["usd"], 500_750_000)
 
+    def test_12_maker_cancel_race_upward_drift_and_orphan_position_reconciliation(self) -> None:
+        """
+        Verify:
+        1. Maker limit cancel race (`cancel_order` raises OrderNotFound because the maker limit filled
+           milliseconds before cancel) detects the fill via `fetch_order` and returns MAKER_LIMIT FILLED
+           without placing a duplicate MARKET_IOC order.
+        2. Initial `postOnly=True` rejection falls back to `MARKET_IOC` when `fallback_to_ioc=True`.
+        3. `reconcile_exchange_state()` syncs upward size drift (`on_chain_size > local_qty`) and
+           re-opens a prematurely `CLOSED` trade when the on-chain position is still active.
+        """
+        # 1. Maker cancel race -> no duplicate MARKET_IOC order
+        mock_ex_race = AsyncMock()
+        mock_ex_race.create_order.return_value = {
+            "id": "hl-arb-maker-1",
+            "status": "open",
+            "price": 0.16482,
+            "filled": 0.0,
+        }
+        mock_ex_race.fetch_order.side_effect = [
+            {"id": "hl-arb-maker-1", "status": "open", "filled": 0.0, "price": 0.16482},
+            {"id": "hl-arb-maker-1", "status": "closed", "filled": 908.0, "average": 0.16482},
+        ]
+        mock_ex_race.cancel_order.side_effect = ccxt.OrderNotFound(
+            "Order was never placed, already canceled, or filled."
+        )
+        exec_race = ExecutionEngine(
+            self.db, self.risk, exchange=mock_ex_race, execution_mode="LIVE"
+        )
+        res_race = asyncio.run(
+            exec_race.execute_maker_limit_chaser(
+                symbol="ARB/USDC:USDC",
+                side="SHORT",
+                quantity=908.0,
+                price=0.16482,
+                client_order_id="cli-arb-race-1",
+                chase_intervals=1,
+                chase_interval_seconds=0.0,
+                fallback_to_ioc=True,
+            )
+        )
+        self.assertEqual(res_race.fsm_state, "FILLED")
+        self.assertTrue(res_race.is_maker)
+        self.assertEqual(res_race.fill_type, "MAKER_LIMIT")
+        self.assertAlmostEqual(res_race.filled_units, 908.0, places=6)
+        self.assertAlmostEqual(res_race.avg_fill_price, 0.16482, places=6)
+        self.assertEqual(mock_ex_race.create_order.await_count, 1)
+
+        # 2. Initial postOnly rejection falls back to MARKET_IOC when second call succeeds
+        mock_ex_post_only = AsyncMock()
+        mock_ex_post_only.create_order.side_effect = [
+            ccxt.InvalidOrder("Post only order would have immediately matched."),
+            {
+                "id": "hl-arb-ioc-2",
+                "status": "closed",
+                "type": "market",
+                "filled": 908.0,
+                "average": 0.16216,
+            },
+        ]
+        exec_po = ExecutionEngine(
+            self.db, self.risk, exchange=mock_ex_post_only, execution_mode="LIVE"
+        )
+        res_po = asyncio.run(
+            exec_po.execute_maker_limit_chaser(
+                symbol="ARB/USDC:USDC",
+                side="LONG",
+                quantity=908.0,
+                price=0.16216,
+                client_order_id="cli-arb-po-fallback",
+                chase_intervals=1,
+                chase_interval_seconds=0.0,
+                fallback_to_ioc=True,
+                reduce_only=True,
+            )
+        )
+        self.assertEqual(res_po.fsm_state, "FILLED")
+        self.assertFalse(res_po.is_maker)
+        self.assertEqual(res_po.fill_type, "MARKET_IOC_FALLBACK")
+        self.assertAlmostEqual(res_po.filled_units, 908.0, places=6)
+        self.assertEqual(res_po.state_history, ["PENDING", "EXPIRED", "FILLED"])
+
+        # 3. Upward on-chain size drift (1816.0 > 908.0) and premature CLOSED position reconciliation
+        arb_tid = self.db.insert_trade(
+            {
+                "client_order_id": "aegis-arb-drift",
+                "symbol": "ARB/USDC:USDC",
+                "base_asset": "ARB",
+                "side": "SHORT",
+                "status": "OPEN",
+                "fsm_state": "FILLED",
+                "entry_price": 0.16486,
+                "current_price": 0.16404,
+                "quantity": 908.0,
+                "filled_units": 908.0,
+                "notional_usdc": 149.69,
+                "risk_budget_usdc": 9.6,
+                "initial_stop_price": 0.1809,
+                "chandelier_stop_price": 0.1809,
+            }
+        )
+        mock_ex_reconcile = AsyncMock()
+        mock_ex_reconcile.fetch_positions.return_value = [
+            {
+                "symbol": "ARB/USDC:USDC",
+                "contracts": 1816.0,
+                "side": "short",
+                "entryPrice": 0.16484,
+                "markPrice": 0.16404,
+                "unrealizedPnl": 1.45,
+            }
+        ]
+        exec_rec = ExecutionEngine(
+            self.db, self.risk, exchange=mock_ex_reconcile, execution_mode="LIVE"
+        )
+        rec_up = asyncio.run(exec_rec.reconcile_exchange_state())
+        self.assertEqual(rec_up, 1)
+        arb_synced = self.db.get_trade_by_client_order_id("aegis-arb-drift")
+        assert arb_synced is not None
+        self.assertAlmostEqual(float(arb_synced["quantity"]), 1816.0, places=6)
+        self.assertAlmostEqual(float(arb_synced["entry_price"]), 0.16484, places=6)
+
+        # Now simulate premature local close while 908.0 ARB remains open on-chain
+        self.db.close_trade(
+            trade_id=arb_tid,
+            exit_price=0.16216,
+            exit_reason="INVERTED_CHANDELIER_STOP_SHORT",
+        )
+        self.assertEqual(len(self.db.get_open_trades()), 0)
+        mock_ex_reconcile.fetch_positions.return_value = [
+            {
+                "symbol": "ARB/USDC:USDC",
+                "contracts": 908.0,
+                "side": "short",
+                "entryPrice": 0.16484,
+                "markPrice": 0.16404,
+                "unrealizedPnl": 0.7264,
+            }
+        ]
+        rec_reopen = asyncio.run(exec_rec.reconcile_exchange_state())
+        self.assertEqual(rec_reopen, 1)
+        open_after = self.db.get_open_trades()
+        self.assertEqual(len(open_after), 1)
+        self.assertEqual(open_after[0]["symbol"], "ARB/USDC:USDC")
+        self.assertEqual(open_after[0]["status"], "OPEN")
+        self.assertAlmostEqual(float(open_after[0]["quantity"]), 908.0, places=6)
+        self.assertAlmostEqual(float(open_after[0]["entry_price"]), 0.16484, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
