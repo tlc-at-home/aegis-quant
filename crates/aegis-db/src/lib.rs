@@ -1598,6 +1598,11 @@ impl DatabaseManager {
                 .unchecked_transaction()
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             {
+                let mut del_stmt = tx
+                    .prepare_cached(
+                        "DELETE FROM signal_evaluations WHERE timestamp_ms = ?1 AND base_asset = ?2;",
+                    )
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
                 let mut stmt = tx
                     .prepare_cached(
                         "INSERT INTO signal_evaluations (
@@ -1609,6 +1614,9 @@ impl DatabaseManager {
                     )
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 for ev in evaluations {
+                    del_stmt
+                        .execute(params![ev.timestamp_ms, ev.base_asset])
+                        .map_err(|e| AegisError::Database(e.to_string()))?;
                     stmt.execute(params![
                         ev.timestamp_ms,
                         ev.base_asset,
@@ -1655,7 +1663,12 @@ impl DatabaseManager {
                             snr_score, mace_score, blended_conviction,
                             rs_rank, signal_action, funding_rate_hourly, created_at
                      FROM signal_evaluations
-                     WHERE timestamp_ms = ?1
+                     WHERE eval_id IN (
+                         SELECT MAX(eval_id)
+                         FROM signal_evaluations
+                         WHERE timestamp_ms = ?1
+                         GROUP BY base_asset
+                     )
                      ORDER BY rs_rank ASC
                      LIMIT ?2;",
                 )

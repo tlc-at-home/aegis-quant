@@ -1355,10 +1355,7 @@ impl SignalEngine {
         let btc_macro_confirm = Self::compute_btc_macro_confirmation(&btc_bars);
 
         let alt_pairs = self.db.get_alt_pairs_universe()?;
-        let now_ms = btc_bars
-            .last()
-            .map(|b| b.timestamp_ms)
-            .unwrap_or_else(|| self.db.now_ms());
+        let now_ms = self.db.now_ms();
 
         struct RawMetrics {
             base_asset: String,
