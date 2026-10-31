@@ -1337,6 +1337,8 @@ impl SignalEngine {
     /// Evaluates the full cross-sectional 15-altcoin universe (`ALT/USDC:USDC` + `ALT/BTC:SYNTH`).
     pub fn evaluate_universe(&self, save_to_db: bool) -> Result<Vec<SignalEvaluation>> {
         let cfg = self.db.load_config()?;
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_live_mode = mode == "LIVE" || mode == "TESTNET";
         let hmm_window = cfg.get_usize("hmm_lookback_candles", 250);
         let snr_fast = cfg.get_usize("snr_ema_fast_period", 16);
         let snr_slow = cfg.get_usize("snr_ema_slow_period", 64);
@@ -1370,6 +1372,7 @@ impl SignalEngine {
             rs_96: f64,
             r_usdc_8: f64,
             funding_rate_hourly: f64,
+            is_unsupported_live: bool,
         }
 
         let mut raw_metrics = Vec::with_capacity(alt_pairs.len());
@@ -1383,6 +1386,12 @@ impl SignalEngine {
             if usdc_bars.len() < 20 || synth_bars.len() < 20 {
                 continue;
             }
+
+            let is_unsupported_live = is_live_mode
+                && usdc_bars
+                    .last()
+                    .map(|b| b.is_synthetic == 1)
+                    .unwrap_or(false);
 
             let (snr, snr_synth) =
                 Self::compute_continuous_snr(&synth_bars, &usdc_bars, snr_fast, snr_slow);
@@ -1419,39 +1428,54 @@ impl SignalEngine {
                 rs_96,
                 r_usdc_8,
                 funding_rate_hourly: funding,
+                is_unsupported_live,
             });
         }
 
+        // Rank tradable live assets ahead of unsupported synthetic assets
         raw_metrics.sort_by(|a, b| {
-            b.rs_composite
-                .partial_cmp(&a.rs_composite)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            match (a.is_unsupported_live, b.is_unsupported_live) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => b
+                    .rs_composite
+                    .partial_cmp(&a.rs_composite)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            }
         });
-        let total_assets = raw_metrics.len();
-        let mut evaluations = Vec::with_capacity(total_assets);
+        let tradable_assets = raw_metrics
+            .iter()
+            .filter(|m| !m.is_unsupported_live)
+            .count()
+            .max(1);
+        let mut evaluations = Vec::with_capacity(raw_metrics.len());
 
         for (idx, m) in raw_metrics.into_iter().enumerate() {
             let rank = idx + 1;
-            let action = Self::classify_signal_action(
-                &regime.regime,
-                regime.prob_bull,
-                regime.prob_bear,
-                regime.prob_chop,
-                m.blended_conviction,
-                m.snr,
-                m.snr_synth,
-                m.mace,
-                m.rs_96,
-                m.r_usdc_8,
-                rank,
-                total_assets,
-                m.funding_rate_hourly,
-                long_thresh,
-                short_thresh,
-                chop_thresh,
-                basis_floor,
-                btc_macro_confirm,
-            );
+            let action = if m.is_unsupported_live {
+                "FLAT".to_string()
+            } else {
+                Self::classify_signal_action(
+                    &regime.regime,
+                    regime.prob_bull,
+                    regime.prob_bear,
+                    regime.prob_chop,
+                    m.blended_conviction,
+                    m.snr,
+                    m.snr_synth,
+                    m.mace,
+                    m.rs_96,
+                    m.r_usdc_8,
+                    rank,
+                    tradable_assets,
+                    m.funding_rate_hourly,
+                    long_thresh,
+                    short_thresh,
+                    chop_thresh,
+                    basis_floor,
+                    btc_macro_confirm,
+                )
+            };
 
             evaluations.push(SignalEvaluation {
                 eval_id: None,

@@ -186,7 +186,11 @@ impl AegisOrchestrator {
         let t0 = Instant::now();
         self.cycle_count += 1;
 
-        if self.cycle_count > 1 && self.cycle_count % 20 == 0 {
+        let cfg = self.db.load_config().unwrap_or_default();
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_live_mode = mode == "LIVE" || mode == "TESTNET";
+
+        if is_live_mode || (self.cycle_count > 1 && self.cycle_count % 20 == 0) {
             let _ = self.execution.reconcile_exchange_state(None, None);
         }
 

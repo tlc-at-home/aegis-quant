@@ -259,7 +259,7 @@ impl MarketIngestionEngine {
                 close: round_dp(close_px, 8),
                 volume: round_dp(volume, 4),
                 funding_rate_hourly: round_dp(funding, 6),
-                is_synthetic: 0,
+                is_synthetic: 1,
             });
             price = close_px;
         }
@@ -823,6 +823,296 @@ impl ExecutionEngine {
             }
         }
 
+        let cfg = self.db.load_config().unwrap_or_default();
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_live_mode = (mode == "LIVE" || mode == "TESTNET")
+            && force_partial_ratio.is_none()
+            && simulate_book_scenario.is_none();
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+
+        if is_live_mode {
+            let wallet = cfg.get_str("wallet_address", "");
+            let priv_key = cfg.get_str("private_key", "");
+            if wallet.is_empty() || priv_key.is_empty() {
+                let _ = self.db.log_order_state_transition(
+                    &cli_id,
+                    "PENDING",
+                    "REJECTED",
+                    Some("MISSING_CREDENTIALS"),
+                );
+                return OrderExecutionResult {
+                    client_order_id: cli_id,
+                    exchange_order_id: String::new(),
+                    symbol: asset.symbol.clone(),
+                    side: side.to_string(),
+                    fsm_state: "REJECTED".to_string(),
+                    requested_units: quantity,
+                    filled_units: 0.0,
+                    avg_fill_price: 0.0,
+                    slippage_paid_usd: 0.0,
+                    effective_slippage_bps: 0.0,
+                    fees_paid_usdc: 0.0,
+                    is_maker: false,
+                    fill_type: "REJECTED".to_string(),
+                    state_history: vec!["PENDING".to_string(), "REJECTED".to_string()],
+                };
+            }
+
+            let Some(asset_idx) =
+                self.fetch_hyperliquid_universe_asset_index(&asset.base_asset, is_testnet)
+            else {
+                let _ = self.db.log_order_state_transition(
+                    &cli_id,
+                    "PENDING",
+                    "REJECTED",
+                    Some("UNSUPPORTED_EXCHANGE_ASSET"),
+                );
+                return OrderExecutionResult {
+                    client_order_id: cli_id,
+                    exchange_order_id: String::new(),
+                    symbol: asset.symbol.clone(),
+                    side: side.to_string(),
+                    fsm_state: "REJECTED".to_string(),
+                    requested_units: quantity,
+                    filled_units: 0.0,
+                    avg_fill_price: 0.0,
+                    slippage_paid_usd: 0.0,
+                    effective_slippage_bps: 0.0,
+                    fees_paid_usdc: 0.0,
+                    is_maker: false,
+                    fill_type: "REJECTED".to_string(),
+                    state_history: vec!["PENDING".to_string(), "REJECTED".to_string()],
+                };
+            };
+
+            let is_buy = side.eq_ignore_ascii_case("LONG") || side.eq_ignore_ascii_case("BUY");
+            let px_decimals = if asset.tick_size > 0.0 {
+                (-asset.tick_size.log10()).round().max(0.0) as usize
+            } else {
+                4
+            };
+            let sz_decimals = if asset.lot_step_size > 0.0 {
+                (-asset.lot_step_size.log10()).round().max(0.0) as usize
+            } else {
+                2
+            };
+            let px_str = format!("{:.prec$}", reference_price, prec = px_decimals);
+            let sz_str = format!("{:.prec$}", quantity, prec = sz_decimals);
+            let nonce = Utc::now().timestamp_millis() as u64;
+
+            let action = json!({
+                "type": "order",
+                "orders": [{
+                    "a": asset_idx,
+                    "b": is_buy,
+                    "p": px_str,
+                    "s": sz_str,
+                    "r": _is_reduce_only,
+                    "t": {
+                        "limit": {
+                            "tif": "Alo"
+                        }
+                    }
+                }],
+                "grouping": "na"
+            });
+
+            match Self::sign_hyperliquid_action(&priv_key, &action, nonce, None, !is_testnet) {
+                Ok(sig) => {
+                    let url = if is_testnet {
+                        HYPERLIQUID_TESTNET_EXCHANGE_URL
+                    } else {
+                        HYPERLIQUID_EXCHANGE_URL
+                    };
+                    let payload = json!({
+                        "action": action,
+                        "nonce": nonce,
+                        "signature": {
+                            "r": sig["r"],
+                            "s": sig["s"],
+                            "v": sig["v"],
+                        }
+                    });
+
+                    if let Some(resp) = self.http_post_json(url, &payload) {
+                        let status_str = resp.get("status").and_then(Value::as_str).unwrap_or("");
+                        if status_str == "ok" {
+                            let statuses = resp
+                                .get("response")
+                                .and_then(|r| r.get("data"))
+                                .and_then(|d| d.get("statuses"))
+                                .and_then(Value::as_array);
+
+                            if let Some(first_st) = statuses.and_then(|arr| arr.first()) {
+                                if let Some(resting) = first_st.get("resting") {
+                                    let oid = resting
+                                        .get("oid")
+                                        .and_then(|v| {
+                                            v.as_u64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse().ok())
+                                            })
+                                        })
+                                        .unwrap_or(0);
+                                    let ex_id = format!("hl-{}", oid);
+                                    let _ = self.db.log_order_state_transition(
+                                        &cli_id,
+                                        "PENDING",
+                                        "OPEN_ON_BOOK",
+                                        Some("ALO_POSTED_TO_EXCHANGE"),
+                                    );
+                                    return OrderExecutionResult {
+                                        client_order_id: cli_id,
+                                        exchange_order_id: ex_id,
+                                        symbol: asset.symbol.clone(),
+                                        side: side.to_string(),
+                                        fsm_state: "OPEN_ON_BOOK".to_string(),
+                                        requested_units: quantity,
+                                        filled_units: 0.0,
+                                        avg_fill_price: 0.0,
+                                        slippage_paid_usd: 0.0,
+                                        effective_slippage_bps: 0.0,
+                                        fees_paid_usdc: 0.0,
+                                        is_maker: true,
+                                        fill_type: "POSTED_MAKER_ALO".to_string(),
+                                        state_history: vec![
+                                            "PENDING".to_string(),
+                                            "OPEN_ON_BOOK".to_string(),
+                                        ],
+                                    };
+                                } else if let Some(filled) = first_st.get("filled") {
+                                    let oid = filled
+                                        .get("oid")
+                                        .and_then(|v| {
+                                            v.as_u64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse().ok())
+                                            })
+                                        })
+                                        .unwrap_or(0);
+                                    let ex_id = format!("hl-{}", oid);
+                                    let fill_px = filled
+                                        .get("avgPx")
+                                        .and_then(|v| {
+                                            v.as_f64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse().ok())
+                                            })
+                                        })
+                                        .unwrap_or(reference_price);
+                                    let fill_sz = filled
+                                        .get("totalSz")
+                                        .and_then(|v| {
+                                            v.as_f64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse().ok())
+                                            })
+                                        })
+                                        .unwrap_or(quantity);
+                                    let _ = self.db.log_order_state_transition(
+                                        &cli_id,
+                                        "PENDING",
+                                        "FILLED",
+                                        Some("EXCHANGE_FILL"),
+                                    );
+                                    return OrderExecutionResult {
+                                        client_order_id: cli_id,
+                                        exchange_order_id: ex_id,
+                                        symbol: asset.symbol.clone(),
+                                        side: side.to_string(),
+                                        fsm_state: "FILLED".to_string(),
+                                        requested_units: quantity,
+                                        filled_units: fill_sz,
+                                        avg_fill_price: fill_px,
+                                        slippage_paid_usd: 0.0,
+                                        effective_slippage_bps: 0.0,
+                                        fees_paid_usdc: 0.0,
+                                        is_maker: true,
+                                        fill_type: "EXCHANGE_FILL".to_string(),
+                                        state_history: vec![
+                                            "PENDING".to_string(),
+                                            "FILLED".to_string(),
+                                        ],
+                                    };
+                                } else if let Some(err_txt) =
+                                    first_st.get("error").and_then(Value::as_str)
+                                {
+                                    let _ = self.db.log_order_state_transition(
+                                        &cli_id,
+                                        "PENDING",
+                                        "REJECTED",
+                                        Some(err_txt),
+                                    );
+                                    return OrderExecutionResult {
+                                        client_order_id: cli_id,
+                                        exchange_order_id: String::new(),
+                                        symbol: asset.symbol.clone(),
+                                        side: side.to_string(),
+                                        fsm_state: "REJECTED".to_string(),
+                                        requested_units: quantity,
+                                        filled_units: 0.0,
+                                        avg_fill_price: 0.0,
+                                        slippage_paid_usd: 0.0,
+                                        effective_slippage_bps: 0.0,
+                                        fees_paid_usdc: 0.0,
+                                        is_maker: false,
+                                        fill_type: "REJECTED".to_string(),
+                                        state_history: vec![
+                                            "PENDING".to_string(),
+                                            "REJECTED".to_string(),
+                                        ],
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = self.db.log_order_state_transition(
+                        &cli_id,
+                        "PENDING",
+                        "REJECTED",
+                        Some("EXCHANGE_ORDER_DISPATCH_FAILED"),
+                    );
+                    return OrderExecutionResult {
+                        client_order_id: cli_id,
+                        exchange_order_id: String::new(),
+                        symbol: asset.symbol.clone(),
+                        side: side.to_string(),
+                        fsm_state: "REJECTED".to_string(),
+                        requested_units: quantity,
+                        filled_units: 0.0,
+                        avg_fill_price: 0.0,
+                        slippage_paid_usd: 0.0,
+                        effective_slippage_bps: 0.0,
+                        fees_paid_usdc: 0.0,
+                        is_maker: false,
+                        fill_type: "REJECTED".to_string(),
+                        state_history: vec!["PENDING".to_string(), "REJECTED".to_string()],
+                    };
+                }
+                Err(e) => {
+                    let _ = self.db.log_order_state_transition(
+                        &cli_id,
+                        "PENDING",
+                        "REJECTED",
+                        Some(&format!("SIGNING_FAILED: {e}")),
+                    );
+                    return OrderExecutionResult {
+                        client_order_id: cli_id,
+                        exchange_order_id: String::new(),
+                        symbol: asset.symbol.clone(),
+                        side: side.to_string(),
+                        fsm_state: "REJECTED".to_string(),
+                        requested_units: quantity,
+                        filled_units: 0.0,
+                        avg_fill_price: 0.0,
+                        slippage_paid_usd: 0.0,
+                        effective_slippage_bps: 0.0,
+                        fees_paid_usdc: 0.0,
+                        is_maker: false,
+                        fill_type: "REJECTED".to_string(),
+                        state_history: vec!["PENDING".to_string(), "REJECTED".to_string()],
+                    };
+                }
+            }
+        }
+
         let res = self.simulate_paper_fill(
             &asset.symbol,
             side,
@@ -848,6 +1138,29 @@ impl ExecutionEngine {
             );
         }
         res
+    }
+
+    pub fn fetch_hyperliquid_universe_asset_index(
+        &self,
+        coin: &str,
+        is_testnet: bool,
+    ) -> Option<u32> {
+        let url = if is_testnet {
+            HYPERLIQUID_TESTNET_INFO_URL
+        } else {
+            HYPERLIQUID_INFO_URL
+        };
+        let resp = self.http_post_json(url, &json!({"type": "metaAndAssetCtxs"}))?;
+        let arr = resp.as_array()?;
+        let universe = arr.first()?.get("universe")?.as_array()?;
+        for (idx, u) in universe.iter().enumerate() {
+            if let Some(name) = u.get("name").and_then(Value::as_str) {
+                if name.eq_ignore_ascii_case(coin) {
+                    return Some(idx as u32);
+                }
+            }
+        }
+        None
     }
 
     /// Signs a Hyperliquid L1 action payload using EIP-712 / secp256k1 recoverable ECDSA signature.
@@ -1844,7 +2157,7 @@ impl ExecutionEngine {
                 last_bar.low,
                 last_bar.volume,
                 None,
-                None,
+                if is_backtest { Some("PAPER") } else { None },
                 None,
                 false,
             );
