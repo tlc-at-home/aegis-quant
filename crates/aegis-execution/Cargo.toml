@@ -1,0 +1,25 @@
+[package]
+name = "aegis-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aegis-alerts = { workspace = true }
+aegis-core = { workspace = true }
+aegis-db = { workspace = true }
+aegis-risk = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+k256 = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

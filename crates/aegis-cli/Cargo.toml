@@ -1,0 +1,28 @@
+[package]
+name = "aegis-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aegis-quant"
+path = "src/main.rs"
+
+[dependencies]
+aegis-alerts = { workspace = true }
+aegis-backtest = { workspace = true }
+aegis-core = { workspace = true }
+aegis-db = { workspace = true }
+aegis-execution = { workspace = true }
+aegis-risk = { workspace = true }
+aegis-signals = { workspace = true }
+aegis-web = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

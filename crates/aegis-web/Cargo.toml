@@ -1,0 +1,24 @@
+[package]
+name = "aegis-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aegis-alerts = { workspace = true }
+aegis-backtest = { workspace = true }
+aegis-core = { workspace = true }
+aegis-db = { workspace = true }
+aegis-execution = { workspace = true }
+aegis-risk = { workspace = true }
+aegis-signals = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }

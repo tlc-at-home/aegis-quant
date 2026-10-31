@@ -1,0 +1,1029 @@
+//! Unified CLI & Daemon Orchestrator (`aegis-quant`) for Aegis Quant (`v0.2.0-rc2`).
+//!
+//! 1:1 port of `engine/main.py`, `engine/database.py` CLI, `engine/backtest.py` CLI,
+//! `engine/alerts.py` CLI, and `scripts/check_mainnet_readiness.py`.
+
+use aegis_alerts::AlertEngine;
+use aegis_backtest::BacktestEngine;
+use aegis_core::{
+    resolve_project_root, round_dp, validate_evm_address, validate_private_key,
+    verify_data_provenance, CheckResult, ExecutionMode, PortfolioSnapshot, Result,
+    SENSITIVE_CONFIG_KEYS,
+};
+use aegis_db::{
+    fernet::{
+        default_host_fernet_key_b64, generate_fernet_key, is_encrypted_value,
+        resolve_fernet_master_key,
+    },
+    DatabaseManager,
+};
+use aegis_execution::{ExecutionEngine, MarketIngestionEngine};
+use aegis_risk::RiskEngine;
+use aegis_signals::{SignalEngine, WalkForwardCalibrator};
+use aegis_web::serve_web;
+use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "aegis-quant",
+    version = "0.2.0-rc2",
+    about = "Aegis Quant Institutional Crypto Quantitative Trading & Portfolio Management Platform (Hyperliquid L1)"
+)]
+struct Cli {
+    /// Path to SQLite WAL database (`data/aegis_quant.db`)
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
+
+    /// Run a single ingestion + signal + execution cycle and exit
+    #[arg(long)]
+    once: bool,
+
+    /// Run walk-forward timeframe calibration (`1H` vs `4H`) before cycle
+    #[arg(long)]
+    calibrate: bool,
+
+    /// WebUI bind host
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
+    /// WebUI bind port
+    #[arg(long, default_value_t = 8000)]
+    port: u16,
+
+    /// Disable embedded Axum WebUI server
+    #[arg(long)]
+    no_web: bool,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Start the AegisOrchestrator daemon & WebUI server (or run `--once`)
+    Run {
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        calibrate: bool,
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        #[arg(long)]
+        no_web: bool,
+    },
+    /// Database initialization, migrations, Fernet AES-128 verification, and key rotation
+    Db {
+        /// Initialize SQLite WAL schema and seed 31-instrument universe
+        #[arg(long)]
+        init: bool,
+        /// Force drop and recreate schema tables during `--init`
+        #[arg(long)]
+        force: bool,
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..004_*.sql`)
+        #[arg(long)]
+        migrate: bool,
+        /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
+        #[arg(long)]
+        test_encryption: bool,
+        /// Atomically rotate the Fernet master key across all encrypted `system_config` keys
+        #[arg(long)]
+        rotate_key: bool,
+        /// Prior Fernet master key for `--rotate-key`
+        #[arg(long)]
+        old_key: Option<String>,
+        /// New Fernet master key for `--rotate-key`
+        #[arg(long)]
+        new_key: Option<String>,
+        /// Generate a fresh 32-byte URL-safe base64 Fernet master key
+        #[arg(long)]
+        generate_key: bool,
+    },
+    /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
+    Backtest {
+        /// Historical simulation window in days
+        #[arg(long, default_value_t = 365)]
+        days: usize,
+        /// Force synthetic multi-regime data instead of `data/real_4h_backfill.json`
+        #[arg(long)]
+        synthetic: bool,
+    },
+    /// Verify real-time Telegram/Discord operational alerting & retry queue
+    Alerts {
+        /// Run live or loopback webhook verification test
+        #[arg(long)]
+        test: bool,
+    },
+    /// Run the 5-Gate Institutional Mainnet Go/No-Go Readiness Suite
+    Readiness {
+        /// Override target execution mode (`PAPER`, `TESTNET`, `LIVE`)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Skip full 365-day backtest in Gate 5
+        #[arg(long)]
+        skip_backtest: bool,
+        /// Emit machine-readable JSON readiness report
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Top-level orchestrator coordinating SQLite WAL, Ingestion, Signals, Risk, Execution, and WebUI (`engine/main.py`).
+pub struct AegisOrchestrator {
+    pub db: DatabaseManager,
+    pub ingestion: MarketIngestionEngine,
+    pub signals: SignalEngine,
+    pub risk: RiskEngine,
+    pub execution: ExecutionEngine,
+    pub calibrator: WalkForwardCalibrator,
+    pub cycle_count: usize,
+}
+
+impl AegisOrchestrator {
+    pub fn new(db: DatabaseManager) -> Self {
+        let ingestion = MarketIngestionEngine::new(db.clone());
+        let signals = SignalEngine::new(db.clone());
+        let risk = RiskEngine::new(db.clone());
+        let execution = ExecutionEngine::new(db.clone());
+        let calibrator = WalkForwardCalibrator::new(db.clone());
+        Self {
+            db,
+            ingestion,
+            signals,
+            risk,
+            execution,
+            calibrator,
+            cycle_count: 0,
+        }
+    }
+
+    pub fn initialize(&self, run_calibration: bool) -> Result<()> {
+        self.db.initialize_schema(false)?;
+        let recon = self.execution.reconcile_exchange_state(None, None);
+        tracing::info!(
+            "Startup exchange reconciliation: status={} discrepancies={}",
+            recon["status"].as_str().unwrap_or("UNKNOWN"),
+            recon["discrepancies_found"].as_u64().unwrap_or(0)
+        );
+        if run_calibration {
+            self.ingestion.ingest_universe(220, false)?;
+            let _ = self.calibrator.calibrate_universe(true)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_single_cycle(&mut self, lookback_bars: usize) -> Result<PortfolioSnapshot> {
+        let t0 = Instant::now();
+        self.cycle_count += 1;
+
+        if self.cycle_count > 1 && self.cycle_count % 20 == 0 {
+            let _ = self.execution.reconcile_exchange_state(None, None);
+        }
+
+        let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
+        let evaluations = self.signals.evaluate_universe(true)?;
+        let snapshot = self.execution.reconcile_cycle(&evaluations, false)?;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let mut actions_summary = std::collections::HashMap::<String, usize>::new();
+        for ev in &evaluations {
+            *actions_summary.entry(ev.signal_action.clone()).or_insert(0) += 1;
+        }
+
+        self.db.log_telemetry(
+            "INFO",
+            "engine.orchestrator",
+            &format!(
+                "Cycle #{} complete in {:.0}ms | Regime={} (B:{:.0}%/Be:{:.0}%/C:{:.0}%) | Equity=${:.2} | Longs={} Shorts={}",
+                self.cycle_count,
+                elapsed_ms,
+                snapshot.hmm_regime,
+                snapshot.prob_bull * 100.0,
+                snapshot.prob_bear * 100.0,
+                snapshot.prob_chop * 100.0,
+                snapshot.total_equity_usdc,
+                snapshot.open_long_count,
+                snapshot.open_short_count,
+            ),
+            Some(json!({
+                "cycle": self.cycle_count,
+                "elapsed_ms": round_dp(elapsed_ms, 1),
+                "ingest": ingest_stats,
+                "actions": actions_summary,
+            })),
+        )?;
+
+        println!(
+            "\n------------------------------------------------------------------------------"
+        );
+        println!(
+            "AEGIS QUANT v0.2.0-rc2 | CYCLE #{} | {:.0} ms",
+            self.cycle_count, elapsed_ms
+        );
+        println!(
+            "Regime : {:6} (Bull: {:5.1}% | Bear: {:5.1}% | Chop: {:5.1}%)",
+            snapshot.hmm_regime,
+            snapshot.prob_bull * 100.0,
+            snapshot.prob_bear * 100.0,
+            snapshot.prob_chop * 100.0
+        );
+        println!(
+            "Equity : ${:.2} USDC | Cash: ${:.2} | Deployed: ${:.2} ({:.2}x)",
+            snapshot.total_equity_usdc,
+            snapshot.available_cash_usdc,
+            snapshot.deployed_notional_usdc,
+            snapshot.gross_leverage
+        );
+        println!(
+            "Risk   : Heat ${:.2} ({:.2}% / 4.00% cap) | Open Longs: {} | Open Shorts: {}",
+            snapshot.portfolio_heat_usdc,
+            snapshot.portfolio_heat_pct * 100.0,
+            snapshot.open_long_count,
+            snapshot.open_short_count
+        );
+        println!(
+            "Yield  : Basis Harvest Notional ${:.2} | Accrued Yield: +${:.2} USDC",
+            snapshot.basis_harvest_notional_usdc, snapshot.accrued_yield_usdc
+        );
+        println!(
+            "------------------------------------------------------------------------------"
+        );
+        println!(
+            "{:<4} | {:<6} | {:<14} | {:>7} | {:>7} | {:>7} | {:<13}",
+            "Rank", "Asset", "Exec Symbol", "SNR", "MACE", "Conv", "Action"
+        );
+        println!(
+            "------------------------------------------------------------------------------"
+        );
+        for ev in evaluations.iter().take(8) {
+            println!(
+                "#{:<3} | {:<6} | {:<14} | {:+7.3} | {:+7.3} | {:+7.3} | {:<13}",
+                ev.rs_rank,
+                ev.base_asset,
+                ev.exec_symbol,
+                ev.snr_score,
+                ev.mace_score,
+                ev.blended_conviction,
+                ev.signal_action
+            );
+        }
+        println!(
+            "------------------------------------------------------------------------------\n"
+        );
+
+        Ok(snapshot)
+    }
+}
+
+/// 5-Gate Institutional Mainnet Go/No-Go Readiness Verifier (`scripts/check_mainnet_readiness.py`).
+pub fn run_readiness_suite(
+    db: &DatabaseManager,
+    mode_override: Option<&str>,
+    skip_backtest: bool,
+) -> Result<(bool, String, Vec<CheckResult>)> {
+    db.initialize_schema(false)?;
+    let cfg = db.load_config()?;
+    let target_mode = mode_override
+        .map(|s| s.trim().to_ascii_uppercase())
+        .unwrap_or_else(|| cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase());
+    let is_live_or_testnet = target_mode == "LIVE" || target_mode == "TESTNET";
+
+    let mut checks: Vec<CheckResult> = Vec::new();
+
+    // =========================================================================
+    // GATE 1: DATABASE & SCHEMA INTEGRITY
+    // =========================================================================
+    let (jmode, fk, schema_ver, usdc_cnt, synth_cnt, pair_cnt) = db.with_conn(|conn| {
+        let jm: String = conn
+            .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
+            .unwrap_or_default();
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+            .unwrap_or(0);
+        let sv = db.get_schema_version().unwrap_or(0);
+        let uc = db.get_usdc_perp_universe().map(|v| v.len()).unwrap_or(0);
+        let sc = db.get_btc_synth_universe().map(|v| v.len()).unwrap_or(0);
+        let pc = db.get_alt_pairs_universe().map(|v| v.len()).unwrap_or(0);
+        Ok((jm.to_ascii_lowercase(), fk_on, sv, uc, sc, pc))
+    })?;
+
+    checks.push(CheckResult {
+        gate: "Gate 1: Database & Schema".to_string(),
+        check_id: "DB-01".to_string(),
+        name: "SQLite WAL Mode & Foreign Keys".to_string(),
+        status: if jmode == "wal" && fk == 1 {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        },
+        observed: format!("journal_mode={jmode}, foreign_keys={fk}"),
+        requirement: "journal_mode=wal, foreign_keys=1".to_string(),
+        remediation: "Run: aegis-quant db --init".to_string(),
+    });
+
+    checks.push(CheckResult {
+        gate: "Gate 1: Database & Schema".to_string(),
+        check_id: "DB-02".to_string(),
+        name: "Schema Migration Version".to_string(),
+        status: if schema_ver >= 4 {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        },
+        observed: format!("schema_version={schema_ver}"),
+        requirement: "schema_version >= 4 (migrations 001..004 applied)".to_string(),
+        remediation: "Run: aegis-quant db --migrate".to_string(),
+    });
+
+    checks.push(CheckResult {
+        gate: "Gate 1: Database & Schema".to_string(),
+        check_id: "DB-03".to_string(),
+        name: "31-Instrument Universe Seeded".to_string(),
+        status: if usdc_cnt == 16 && synth_cnt == 15 && pair_cnt == 15 {
+            "PASS".to_string()
+        } else {
+            "FAIL".to_string()
+        },
+        observed: format!("USDC_PERP={usdc_cnt}, BTC_SYNTH={synth_cnt}, ALT_PAIRS={pair_cnt}"),
+        requirement: "16 USDC_PERP + 15 BTC_SYNTH (15 Alt Pairs)".to_string(),
+        remediation: "Run: aegis-quant db --init --force".to_string(),
+    });
+
+    // =========================================================================
+    // GATE 2: SECURITY & KEY MANAGEMENT
+    // =========================================================================
+    let (active_key_b64, _) = resolve_fernet_master_key(None, Some(&db.db_path));
+    let default_key_b64 = default_host_fernet_key_b64();
+    let using_external_key = active_key_b64 != default_key_b64;
+    let project_root = resolve_project_root();
+    let key_file = project_root.join(".aegis_master_key");
+    let mut key_perms_ok = true;
+    let mut key_source = "FALLBACK_HOST_KEY".to_string();
+
+    if std::env::var("CREDENTIALS_DIRECTORY")
+        .ok()
+        .filter(|d| PathBuf::from(d).join("aegis_master_key").exists())
+        .is_some()
+    {
+        key_source = "SYSTEMD_LOAD_CREDENTIAL".to_string();
+    } else if std::env::var("AEGIS_MASTER_KEY")
+        .or_else(|_| std::env::var("FERNET_MASTER_KEY"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some()
+    {
+        key_source = "ENV_AEGIS_MASTER_KEY".to_string();
+    } else if key_file.exists() {
+        key_source = format!("FILE({})", key_file.display());
+        if let Ok(meta) = fs::metadata(&key_file) {
+            let mode_bits = meta.permissions().mode() & 0o777;
+            key_perms_ok = (mode_bits & 0o077) == 0;
+        }
+    }
+
+    let sec01_status = if using_external_key && key_perms_ok {
+        "PASS"
+    } else if !is_live_or_testnet {
+        "WARN"
+    } else {
+        "FAIL"
+    };
+    checks.push(CheckResult {
+        gate: "Gate 2: Security & Key Mgmt".to_string(),
+        check_id: "SEC-01".to_string(),
+        name: "Fernet Master Key Isolation".to_string(),
+        status: sec01_status.to_string(),
+        observed: format!(
+            "source={key_source}, external={using_external_key}, perms_0600={key_perms_ok}"
+        ),
+        requirement: "External AEGIS_MASTER_KEY or chmod 600 .aegis_master_key".to_string(),
+        remediation:
+            "Generate key: aegis-quant db --generate-key > .aegis_master_key && chmod 600 .aegis_master_key"
+                .to_string(),
+    });
+
+    let mut plaintext_leaks = Vec::new();
+    for &skey in SENSITIVE_CONFIG_KEYS {
+        if let Ok(Some(raw_v)) = db.get_raw_config_value(skey) {
+            if !raw_v.trim().is_empty() && !is_encrypted_value(&raw_v) {
+                plaintext_leaks.push(skey);
+            }
+        }
+    }
+    let enc_report = db.test_encryption();
+    let sec02_ok = plaintext_leaks.is_empty() && enc_report.is_ok();
+    checks.push(CheckResult {
+        gate: "Gate 2: Security & Key Mgmt".to_string(),
+        check_id: "SEC-02".to_string(),
+        name: "Fernet AES-128 Encryption at Rest".to_string(),
+        status: if sec02_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: if sec02_ok {
+            "All sensitive keys encrypted (ENC:gAAAA...) & round-trip verified".to_string()
+        } else {
+            format!("Plaintext leaks={plaintext_leaks:?}")
+        },
+        requirement: "0 plaintext sensitive keys on disk; AES-128-CBC + HMAC-SHA256 verified"
+            .to_string(),
+        remediation: "Run: aegis-quant db --test-encryption".to_string(),
+    });
+
+    let wallet_addr = cfg.get_str("wallet_address", "");
+    let priv_key = cfg.get_str("private_key", "");
+    let wallet_ok =
+        !wallet_addr.is_empty() && validate_evm_address(&wallet_addr, "wallet_address").is_ok();
+    let priv_ok = !priv_key.is_empty() && validate_private_key(&priv_key).is_ok();
+    let creds_ready = wallet_ok && priv_ok;
+    let sec03_status = if creds_ready {
+        "PASS"
+    } else if !is_live_or_testnet {
+        "WARN"
+    } else {
+        "FAIL"
+    };
+    checks.push(CheckResult {
+        gate: "Gate 2: Security & Key Mgmt".to_string(),
+        check_id: "SEC-03".to_string(),
+        name: "Trade-Only Agent Wallet & Key".to_string(),
+        status: sec03_status.to_string(),
+        observed: format!(
+            "wallet_valid={wallet_ok}, private_key_valid={priv_ok} (mode={target_mode})"
+        ),
+        requirement: "Valid 42-char 0x wallet_address + 64-hex secp256k1 Agent private_key"
+            .to_string(),
+        remediation:
+            "Configure Trade-Only API Wallet in WebUI Settings or PUT /api/v1/credentials"
+                .to_string(),
+    });
+
+    let backfill_path = project_root.join("data").join("real_4h_backfill.json");
+    let sha_path = project_root
+        .join("data")
+        .join("real_4h_backfill.json.sha256");
+    let prov_ok =
+        backfill_path.exists() && sha_path.exists() && verify_data_provenance(&backfill_path).unwrap_or(false);
+    checks.push(CheckResult {
+        gate: "Gate 2: Security & Key Mgmt".to_string(),
+        check_id: "SEC-04".to_string(),
+        name: "Backfill Dataset SHA-256 Provenance".to_string(),
+        status: if prov_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: if prov_ok {
+            "SHA-256 verified against real_4h_backfill.json.sha256".to_string()
+        } else {
+            "Checksum missing or mismatch".to_string()
+        },
+        requirement: "Exact SHA-256 match on data/real_4h_backfill.json".to_string(),
+        remediation: "Re-verify data/real_4h_backfill.json and data/real_4h_backfill.json.sha256"
+            .to_string(),
+    });
+
+    // =========================================================================
+    // GATE 3: RISK GUARDRAILS & CAPITAL SCALING
+    // =========================================================================
+    let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
+    let heat_usdc = cfg.get_f64("max_portfolio_heat_usdc", 400.0);
+    let single_usdc = cfg.get_f64("max_single_asset_notional_usdc", 2500.0);
+    let gross_usdc = cfg.get_f64("max_gross_leverage_notional_usdc", 15000.0);
+    let heat_ratio = heat_usdc / init_eq.max(1e-9);
+    let single_ratio = single_usdc / init_eq.max(1e-9);
+    let gross_ratio = gross_usdc / init_eq.max(1e-9);
+    let caps_ok = init_eq > 0.0
+        && (heat_ratio - 0.04).abs() <= 0.005
+        && (single_ratio - 0.25).abs() <= 0.01
+        && (gross_ratio - 1.50).abs() <= 0.05;
+
+    checks.push(CheckResult {
+        gate: "Gate 3: Risk Guardrails".to_string(),
+        check_id: "RISK-01".to_string(),
+        name: "Institutional Capital & Cap Alignment".to_string(),
+        status: if caps_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "Equity=${init_eq:.0} | Heat=${heat_usdc:.0} ({:.1}%) | Single=${single_usdc:.0} ({:.0}%) | Gross=${gross_usdc:.0} ({gross_ratio:.2}x)",
+            heat_ratio * 100.0,
+            single_ratio * 100.0
+        ),
+        requirement: "Heat = 4.0% equity, Single-Asset = 25% equity, Gross Leverage = 1.50x equity"
+            .to_string(),
+        remediation:
+            "Update initial_equity_usdc via POST /api/v1/config/batch with scale_risk_caps=true"
+                .to_string(),
+    });
+
+    let chand_long = cfg.get_f64("chandelier_atr_multiplier_long", 3.0);
+    let chand_short = cfg.get_f64("chandelier_atr_multiplier_short", 3.8);
+    let wick_buf = cfg.get_f64("chandelier_wick_buffer_atr", 0.85);
+    let stops_ok = (2.0..=5.0).contains(&chand_long)
+        && (2.5..=5.5).contains(&chand_short)
+        && (0.3..=1.5).contains(&wick_buf);
+
+    checks.push(CheckResult {
+        gate: "Gate 3: Risk Guardrails".to_string(),
+        check_id: "RISK-02".to_string(),
+        name: "Two-Tier Chandelier Stop Parameters".to_string(),
+        status: if stops_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "Long={chand_long}x ATR, Short={chand_short}x ATR, WickBuffer={wick_buf}x ATR"
+        ),
+        requirement: "Long in [2.0, 5.0]x, Short in [2.5, 5.5]x, WickBuffer in [0.3, 1.5]x"
+            .to_string(),
+        remediation: "Restore Calibration 2 Chandelier ATR parameters in system_config"
+            .to_string(),
+    });
+
+    // Self-test RiskEngine in isolated :memory: DB
+    let mem_db = DatabaseManager::memory();
+    mem_db.initialize_schema(false)?;
+    let risk_engine = RiskEngine::new(mem_db.clone());
+    let sample_asset = mem_db.get_usdc_perp_universe()?.into_iter().next().unwrap();
+    let res_ok = risk_engine.evaluate_order_risk(
+        &sample_asset,
+        "LONG",
+        100.0,
+        2.5,
+        10000.0,
+        Some(&[]),
+        0.8,
+        0.0,
+    );
+    let saturated_trade = aegis_core::TradeRecord {
+        trade_id: 1,
+        client_order_id: "sat-1".to_string(),
+        symbol: "ETH/USDC:USDC".to_string(),
+        base_asset: "ETH".to_string(),
+        side: "LONG".to_string(),
+        status: "OPEN".to_string(),
+        fsm_state: "FILLED".to_string(),
+        entry_price: 2500.0,
+        current_price: 2500.0,
+        exit_price: None,
+        quantity: 2.0,
+        filled_units: 2.0,
+        avg_fill_price: Some(2500.0),
+        notional_usdc: 5000.0,
+        risk_budget_usdc: 400.0,
+        conviction_multiplier: 1.0,
+        initial_stop_price: 2300.0,
+        chandelier_stop_price: 2300.0,
+        current_stop_price: 2300.0,
+        highest_price_seen: 2500.0,
+        lowest_price_seen: 2500.0,
+        realized_pnl_usdc: 0.0,
+        unrealized_pnl_usdc: 0.0,
+        fees_paid_usdc: 0.0,
+        funding_accrued_usdc: 0.0,
+        slippage_paid_usd: 0.0,
+        exchange_order_id: None,
+        opened_at: String::new(),
+        closed_at: None,
+        exit_reason: None,
+    };
+    let res_heat = risk_engine.evaluate_order_risk(
+        &sample_asset,
+        "LONG",
+        100.0,
+        2.5,
+        10000.0,
+        Some(&[saturated_trade]),
+        0.8,
+        0.0,
+    );
+    let guardrail_pass = res_ok.approved
+        && res_ok.notional_usdc <= 2500.0
+        && !res_heat.approved
+        && res_heat.reason.contains("PORTFOLIO_HEAT");
+
+    checks.push(CheckResult {
+        gate: "Gate 3: Risk Guardrails".to_string(),
+        check_id: "RISK-03".to_string(),
+        name: "Live Guardrail Rejection Self-Test".to_string(),
+        status: if guardrail_pass { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "NormalOrder={}, SaturatedHeatOrder={} ({})",
+            res_ok.approved, res_heat.approved, res_heat.reason
+        ),
+        requirement: "Approves valid order <= 25% cap; rejects order when heat >= 4.0%"
+            .to_string(),
+        remediation: "Inspect crates/aegis-risk/src/lib.rs evaluate_order_risk".to_string(),
+    });
+
+    // =========================================================================
+    // GATE 4: OPERATIONAL TELEMETRY & ALERTING
+    // =========================================================================
+    let tg_tok = cfg.get_str("telegram_bot_token", "");
+    let tg_chat = cfg.get_str("telegram_chat_id", "");
+    let disc_url = cfg.get_str("discord_webhook_url", "");
+    let live_alerts_configured = (!tg_tok.is_empty() && !tg_chat.is_empty()) || !disc_url.is_empty();
+
+    let mut test_alert_engine = AlertEngine::new(mem_db.clone());
+    let alert_res = test_alert_engine.run_test_alert(true)?;
+    let loopback_ok = alert_res.get("status").and_then(Value::as_str) == Some("DELIVERED");
+    let ops01_status = if live_alerts_configured && loopback_ok {
+        "PASS"
+    } else if loopback_ok && !is_live_or_testnet {
+        "WARN"
+    } else if !loopback_ok {
+        "FAIL"
+    } else {
+        "WARN"
+    };
+
+    checks.push(CheckResult {
+        gate: "Gate 4: Operational Readiness".to_string(),
+        check_id: "OPS-01".to_string(),
+        name: "Real-Time Alert Channel & Retry Queue".to_string(),
+        status: ops01_status.to_string(),
+        observed: format!(
+            "loopback_self_test={loopback_ok}, live_webhook_configured={live_alerts_configured}"
+        ),
+        requirement: "Loopback self-test DELIVERED + Telegram/Discord configured for LIVE"
+            .to_string(),
+        remediation: "Configure Telegram Bot Token & Chat ID in WebUI Settings".to_string(),
+    });
+
+    let exec_self = ExecutionEngine::new(mem_db.clone());
+    let fsm_res = exec_self.execute_maker_limit_chaser(
+        &sample_asset,
+        "LONG",
+        1.0,
+        100.0,
+        101.0,
+        99.0,
+        5000.0,
+        Some(0.5),
+        None,
+        Some("readiness-fsm-check"),
+        false,
+    );
+    let audit_rows = mem_db.get_order_state_audit(Some("readiness-fsm-check"), 20)?;
+    let fsm_ok = fsm_res.fsm_state == "FILLED" && audit_rows.len() >= 3;
+
+    checks.push(CheckResult {
+        gate: "Gate 4: Operational Readiness".to_string(),
+        check_id: "OPS-02".to_string(),
+        name: "Order FSM & Audit Trail Integrity".to_string(),
+        status: if fsm_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "terminal_state={}, audit_transitions={}",
+            fsm_res.fsm_state,
+            audit_rows.len()
+        ),
+        requirement: "PENDING -> OPEN_ON_BOOK -> PARTIALLY_FILLED -> FILLED logged in order_state_audit"
+            .to_string(),
+        remediation: "Inspect crates/aegis-execution/src/lib.rs execute_maker_limit_chaser"
+            .to_string(),
+    });
+
+    let mut sim_ex = std::collections::HashMap::new();
+    sim_ex.insert(
+        "SOL".to_string(),
+        json!({"szi": 2.5, "entryPx": 180.0, "markPx": 182.0, "unrealizedPnl": 5.0}),
+    );
+    let recon_res = exec_self.reconcile_exchange_state(Some(&sim_ex), Some(&[]));
+    let recon_ok = recon_res.get("status").and_then(Value::as_str) == Some("RECONCILED")
+        && recon_res.get("discrepancies_found").and_then(Value::as_u64).unwrap_or(0) >= 1;
+
+    checks.push(CheckResult {
+        gate: "Gate 4: Operational Readiness".to_string(),
+        check_id: "OPS-03".to_string(),
+        name: "Exchange Position Drift Reconciliation".to_string(),
+        status: if recon_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "status={}, discrepancies_reconciled={}",
+            recon_res["status"].as_str().unwrap_or("ERROR"),
+            recon_res["discrepancies_found"].as_u64().unwrap_or(0)
+        ),
+        requirement: "Automatically detects and reconciles orphan/phantom/size-drift positions"
+            .to_string(),
+        remediation: "Inspect crates/aegis-execution/src/lib.rs reconcile_exchange_state"
+            .to_string(),
+    });
+
+    // =========================================================================
+    // GATE 5: OUT-OF-SAMPLE QUANTITATIVE ACCEPTANCE (365-DAY BACKTEST)
+    // =========================================================================
+    if skip_backtest {
+        checks.push(CheckResult {
+            gate: "Gate 5: Quant Acceptance".to_string(),
+            check_id: "QUANT-01".to_string(),
+            name: "365-Day Point-in-Time Backtest".to_string(),
+            status: "WARN".to_string(),
+            observed: "SKIPPED (--skip-backtest)".to_string(),
+            requirement: "Sharpe >= 1.20, Max Drawdown <= 20.0%, Profit Factor >= 1.30".to_string(),
+            remediation: "Run without --skip-backtest before Mainnet Go-Live".to_string(),
+        });
+    } else {
+        let pre_trades = db.get_recent_trades(1000)?.len();
+        let bt = BacktestEngine::new(db.clone(), 365);
+        let ts = bt.run_backtest(None, None, true)?;
+        let post_trades = db.get_recent_trades(1000)?.len();
+        let isolation_ok = pre_trades == post_trades;
+
+        checks.push(CheckResult {
+            gate: "Gate 5: Quant Acceptance".to_string(),
+            check_id: "QUANT-01".to_string(),
+            name: "Out-of-Sample Annualized Sharpe Ratio".to_string(),
+            status: if ts.gate_sharpe_pass { "PASS" } else { "FAIL" }.to_string(),
+            observed: format!("Sharpe = {:.2}", ts.annualized_sharpe),
+            requirement: "Annualized Sharpe >= 1.20".to_string(),
+            remediation: "Run walk-forward calibration: aegis-quant run --once --calibrate"
+                .to_string(),
+        });
+
+        checks.push(CheckResult {
+            gate: "Gate 5: Quant Acceptance".to_string(),
+            check_id: "QUANT-02".to_string(),
+            name: "Out-of-Sample Maximum Drawdown (MDD)".to_string(),
+            status: if ts.gate_mdd_pass { "PASS" } else { "FAIL" }.to_string(),
+            observed: format!("Max Drawdown = {:.2}%", ts.max_drawdown_pct),
+            requirement: "Maximum Drawdown <= 20.0%".to_string(),
+            remediation: "Tighten chandelier_atr_multiplier or conviction thresholds".to_string(),
+        });
+
+        checks.push(CheckResult {
+            gate: "Gate 5: Quant Acceptance".to_string(),
+            check_id: "QUANT-03".to_string(),
+            name: "Out-of-Sample Profit Factor".to_string(),
+            status: if ts.gate_profit_factor_pass {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+            .to_string(),
+            observed: format!(
+                "Profit Factor = {:.2} (Trade PF = {:.2}, Return = {:+.2}%)",
+                ts.profit_factor, ts.trade_profit_factor, ts.total_return_pct
+            ),
+            requirement: "Profit Factor >= 1.30".to_string(),
+            remediation: "Inspect fee drag and MACE/SNR conviction thresholds".to_string(),
+        });
+
+        checks.push(CheckResult {
+            gate: "Gate 5: Quant Acceptance".to_string(),
+            check_id: "QUANT-04".to_string(),
+            name: "In-Memory Backtest DB Isolation".to_string(),
+            status: if isolation_ok { "PASS" } else { "FAIL" }.to_string(),
+            observed: format!("live_db_trades_before={pre_trades}, after={post_trades}"),
+            requirement: "Backtest runs in :memory: without mutating live SQLite WAL tables"
+                .to_string(),
+            remediation: "Ensure BacktestEngine clones to :memory: SQLite connection".to_string(),
+        });
+    }
+
+    let fail_count = checks.iter().filter(|c| c.status == "FAIL").count();
+    let warn_count = checks.iter().filter(|c| c.status == "WARN").count();
+    let is_go = if is_live_or_testnet {
+        fail_count == 0
+            && checks
+                .iter()
+                .filter(|c| c.check_id == "SEC-01" || c.check_id == "SEC-03")
+                .all(|c| c.status == "PASS")
+    } else {
+        fail_count == 0
+    };
+    let verdict = if is_go {
+        format!("GO FOR {target_mode}")
+    } else {
+        format!(
+            "NO-GO FOR {target_mode} ({fail_count} FAIL, {warn_count} WARN)"
+        )
+    };
+
+    Ok((is_go, verdict, checks))
+}
+
+fn print_readiness_report(target_mode: &str, verdict: &str, checks: &[CheckResult]) {
+    println!("{}", "=".repeat(100));
+    println!(
+        "AEGIS QUANT v0.2.0-rc2 — INSTITUTIONAL MAINNET GO/NO-GO READINESS REPORT (Target Mode: {target_mode})"
+    );
+    println!("{}", "=".repeat(100));
+    println!(
+        "{:<8} | {:<6} | {:<36} | {:<42}",
+        "ID", "STATUS", "CHECK NAME", "OBSERVED TELEMETRY"
+    );
+    println!("{}", "-".repeat(100));
+    let mut current_gate = "";
+    for c in checks {
+        if c.gate != current_gate {
+            current_gate = &c.gate;
+            println!("[{current_gate}]");
+        }
+        println!(
+            "  {:<6} | {:<6} | {:<36} | {}",
+            c.check_id, c.status, c.name, c.observed
+        );
+        if c.status == "FAIL" || c.status == "WARN" {
+            println!("         -> Requirement : {}", c.requirement);
+            println!("         -> Remediation : {}", c.remediation);
+        }
+    }
+    println!("{}", "=".repeat(100));
+    println!("FINAL VERDICT: {verdict}");
+    println!("{}", "=".repeat(100));
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    let db = match &cli.db {
+        Some(p) => DatabaseManager::new(p),
+        None => DatabaseManager::default_db(),
+    };
+
+    match cli.command {
+        Some(Commands::Db {
+            init,
+            force,
+            migrate,
+            test_encryption,
+            rotate_key,
+            old_key,
+            new_key,
+            generate_key,
+        }) => {
+            if generate_key {
+                println!("{}", generate_fernet_key());
+                return Ok(());
+            }
+            if init {
+                db.initialize_schema(force)?;
+                println!(
+                    "Initialized SQLite WAL database at {} (schema_version={})",
+                    db.db_path.display(),
+                    db.get_schema_version()?
+                );
+            }
+            if migrate {
+                let applied = db.run_migrations()?;
+                println!(
+                    "Applied {} migration(s): {:?} (schema_version={})",
+                    applied.len(),
+                    applied,
+                    db.get_schema_version()?
+                );
+            }
+            if rotate_key {
+                let _ = old_key;
+                let target_new = new_key.unwrap_or_else(generate_fernet_key);
+                let res = db.rotate_master_key(&target_new)?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            }
+            if test_encryption {
+                db.initialize_schema(false)?;
+                let rep = db.test_encryption()?;
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            }
+            if !init && !migrate && !rotate_key && !test_encryption {
+                db.initialize_schema(false)?;
+                println!(
+                    "Database ready at {} (schema_version={})",
+                    db.db_path.display(),
+                    db.get_schema_version()?
+                );
+            }
+        }
+        Some(Commands::Backtest { days, synthetic }) => {
+            db.initialize_schema(false)?;
+            let bt = BacktestEngine::new(db, days);
+            let ts = bt.run_backtest(None, None, !synthetic)?;
+            println!("{}", BacktestEngine::format_tear_sheet(&ts));
+            if !ts.all_gates_passed {
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Alerts { test: _ }) => {
+            db.initialize_schema(false)?;
+            let mut alerts = AlertEngine::new(db);
+            let res = alerts.run_test_alert(true)?;
+            println!("{}", serde_json::to_string_pretty(&res)?);
+        }
+        Some(Commands::Readiness {
+            mode,
+            skip_backtest,
+            json: json_out,
+        }) => {
+            let (is_go, verdict, checks) =
+                run_readiness_suite(&db, mode.as_deref(), skip_backtest)?;
+            let target_mode = mode.unwrap_or_else(|| {
+                db.load_config()
+                    .map(|c| c.get_str("execution_mode", "PAPER"))
+                    .unwrap_or_else(|_| "PAPER".to_string())
+            });
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "target_mode": target_mode,
+                        "is_go": is_go,
+                        "verdict": verdict,
+                        "checks": checks,
+                    }))?
+                );
+            } else {
+                print_readiness_report(&target_mode, &verdict, &checks);
+            }
+            if !is_go {
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Run {
+            once,
+            calibrate,
+            host,
+            port,
+            no_web,
+        }) => {
+            run_orchestrator(db, once, calibrate, &host, port, no_web).await?;
+        }
+        None => {
+            run_orchestrator(
+                db,
+                cli.once,
+                cli.calibrate,
+                &cli.host,
+                cli.port,
+                cli.no_web,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_orchestrator(
+    db: DatabaseManager,
+    once: bool,
+    calibrate: bool,
+    host: &str,
+    port: u16,
+    no_web: bool,
+) -> anyhow::Result<()> {
+    let mut orchestrator = AegisOrchestrator::new(db.clone());
+    orchestrator.initialize(calibrate)?;
+
+    if once {
+        orchestrator.run_single_cycle(140)?;
+        return Ok(());
+    }
+
+    if !no_web {
+        let web_db = db.clone();
+        let bind_host = host.to_string();
+        tokio::spawn(async move {
+            tracing::info!(
+                "Starting Aegis Quant Axum WebUI & SSE server on http://{}:{}",
+                bind_host,
+                port
+            );
+            if let Err(e) = serve_web(web_db, &bind_host, port).await {
+                tracing::error!("Web server error: {e}");
+            }
+        });
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_sig = running.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Received Ctrl-C, initiating graceful shutdown...");
+            r_sig.store(false, Ordering::SeqCst);
+        }
+    });
+
+    while running.load(Ordering::SeqCst) {
+        if let Err(e) = orchestrator.run_single_cycle(140) {
+            tracing::error!("Orchestrator cycle error: {e}");
+        }
+        let poll_sec = db
+            .load_config()
+            .map(|c| c.get_i64("polling_interval_seconds", 15).max(1) as u64)
+            .unwrap_or(15);
+
+        for _ in 0..poll_sec {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    let _ = ExecutionMode::Paper;
+    Ok(())
+}

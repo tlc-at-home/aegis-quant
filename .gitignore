@@ -1,10 +1,15 @@
-# Python virtual environment & bytecode
+# Rust build artifacts & compiled release binary
+/target/
+/bin/
+
+# Legacy Python virtual environments & caches
 venv/
 .venv/
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.mypy_cache/
 
 # SQLite WAL database & local master key (contains live credentials and encryption keys)
 data/*.db

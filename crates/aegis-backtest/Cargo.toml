@@ -1,0 +1,20 @@
+[package]
+name = "aegis-backtest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aegis-core = { workspace = true }
+aegis-db = { workspace = true }
+aegis-execution = { workspace = true }
+aegis-risk = { workspace = true }
+aegis-signals = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }

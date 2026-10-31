@@ -1,0 +1,5 @@
+# Cargo workspace configuration for SSHFS-mounted VM workspace (/home/tony/dev/AEGIS-LOCAL).
+# Directs intermediate build artifacts (.rlib, .o, incremental cache, cargo locks) to local tmpfs
+# so builds run at RAM speed on the Fedora Dev PC without thrashing fuse.sshfs or filling VM disk.
+[build]
+target-dir = "/tmp/aegis-cargo-target"

@@ -330,6 +330,7 @@
       <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL + Fernet AES-128</p>
     </div>
     <div>
+      <span class="badge BULL" id="runtime-badge">ENGINE: RUST NATIVE</span>
       <span class="badge" id="routing-badge">ROUTING: PAPER</span>
       <span class="badge CHOP" id="telegram-badge">TELEGRAM: STANDBY</span>
       <span class="badge" id="wal-badge">SQLite: WAL (v4)</span>
@@ -1534,6 +1535,12 @@
         if (stData.version) {
           document.getElementById('ver-badge').textContent = stData.version;
         }
+        const rtBadge = document.getElementById('runtime-badge');
+        if (rtBadge) {
+          const isRust = String(stData.runtime || '').toUpperCase().includes('RUST');
+          rtBadge.textContent = isRust ? 'ENGINE: RUST NATIVE' : 'ENGINE: PYTHON';
+          rtBadge.className = `badge ${isRust ? 'BULL' : 'CHOP'}`;
+        }
         if (stData.journal_mode) {
           const sVer = stData.schema_version ?? 4;
           document.getElementById('wal-badge').textContent = `SQLite: ${String(stData.journal_mode).toUpperCase()} (v${sVer})`;
@@ -1550,6 +1557,12 @@
       evt.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data);
+          const rtBadge = document.getElementById('runtime-badge');
+          if (rtBadge && data.runtime) {
+            const isRust = String(data.runtime).toUpperCase().includes('RUST');
+            rtBadge.textContent = isRust ? 'ENGINE: RUST NATIVE' : 'ENGINE: PYTHON';
+            rtBadge.className = `badge ${isRust ? 'BULL' : 'CHOP'}`;
+          }
           renderPortfolio(data.portfolio);
           renderSignals(data.signals);
           renderTrades(data.open_trades);

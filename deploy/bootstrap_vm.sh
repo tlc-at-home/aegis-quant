@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Aegis Quant (v0.1.0-dev) — Automated Fedora 45 Minimal Bootstrap Script
+# Aegis Quant (v0.2.0-rc2 Rust Native) — Automated Fedora 45 Minimal Bootstrap
 # Target Root: /home/fedora/aegis
 # =============================================================================
 set -euo pipefail
@@ -8,49 +8,35 @@ set -euo pipefail
 AEGIS_ROOT="/home/fedora/aegis"
 DATA_DIR="${AEGIS_ROOT}/data"
 LOG_DIR="${AEGIS_ROOT}/logs"
+BIN_DIR="${AEGIS_ROOT}/bin"
 DB_PATH="${DATA_DIR}/aegis_quant.db"
-SCHEMA_SQL="${AEGIS_ROOT}/sql/schema_and_seed.sql"
-VENV_DIR="${AEGIS_ROOT}/venv"
 SERVICE_SRC="${AEGIS_ROOT}/deploy/aegis-quant.service"
 SERVICE_DST="/etc/systemd/system/aegis-quant.service"
 
-echo "[1/6] Verifying system dependencies & chronyd time synchronization on Fedora..."
-sudo dnf install -y --skip-unavailable \
-    python3 python3-pip python3-virtualenv python3-devel \
-    python3-cffi python3-pycares python3-aiodns \
-    gcc make libffi-devel c-ares-devel \
-    sqlite chrony curl
-
+echo "[1/5] Verifying system dependencies & chronyd time synchronization on Fedora..."
+sudo dnf install -y --skip-unavailable sqlite chrony curl
 sudo systemctl enable --now chronyd.service
 chronyc tracking || true
 
-echo "[2/6] Preparing Aegis Quant directories (${DATA_DIR}, ${LOG_DIR})..."
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+echo "[2/5] Preparing Aegis Quant directories (${DATA_DIR}, ${LOG_DIR}, ${BIN_DIR})..."
+mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BIN_DIR}"
 chmod 700 "${DATA_DIR}"
-chmod 755 "${LOG_DIR}"
+chmod 755 "${LOG_DIR}" "${BIN_DIR}"
 
-echo "[3/6] Setting up Python virtual environment & installing requirements.txt..."
-if [ ! -x "${VENV_DIR}/bin/uvicorn" ]; then
-    rm -rf "${VENV_DIR}"
-    python3 -m venv --system-site-packages "${VENV_DIR}"
+echo "[3/5] Verifying Aegis Quant Rust binary (${BIN_DIR}/aegis-quant)..."
+if [ ! -x "${BIN_DIR}/aegis-quant" ]; then
+    echo "Building release binary via cargo..."
+    cargo build --release --manifest-path "${AEGIS_ROOT}/Cargo.toml"
+    cp /tmp/aegis-cargo-target/release/aegis-quant "${BIN_DIR}/aegis-quant"
 fi
-"${VENV_DIR}/bin/pip" install --upgrade pip
-"${VENV_DIR}/bin/pip" install -r "${AEGIS_ROOT}/requirements.txt"
-chcon -R -t bin_t "${VENV_DIR}/bin" 2>/dev/null || true
+chmod 755 "${BIN_DIR}/aegis-quant"
+chcon -t bin_t "${BIN_DIR}/aegis-quant" 2>/dev/null || true
 
-echo "[4/6] Initializing SQLite WAL database (${DB_PATH})..."
-sqlite3 "${DB_PATH}" < "${SCHEMA_SQL}"
+echo "[4/5] Initializing/verifying SQLite WAL database (${DB_PATH})..."
+"${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --init
 chmod 600 "${DB_PATH}"
 
-JOURNAL_MODE=$(sqlite3 "${DB_PATH}" "PRAGMA journal_mode;")
-CFG_COUNT=$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM system_config;")
-USDC_COUNT=$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM v_universe_usdc_perp;")
-SYNTH_COUNT=$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM v_universe_btc_synth;")
-PAIRS_COUNT=$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM v_universe_alt_pairs;")
-
-echo "  -> journal_mode=${JOURNAL_MODE} | system_config=${CFG_COUNT} | usdc_perp=${USDC_COUNT} | btc_synth=${SYNTH_COUNT} | alt_pairs=${PAIRS_COUNT}"
-
-echo "[5/6] Installing and starting systemd service (aegis-quant.service)..."
+echo "[5/5] Installing and starting systemd service (aegis-quant.service)..."
 sudo cp "${SERVICE_SRC}" "${SERVICE_DST}"
 sudo chmod 644 "${SERVICE_DST}"
 sudo restorecon -v "${SERVICE_DST}" 2>/dev/null || true
@@ -58,7 +44,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable aegis-quant.service
 sudo systemctl restart aegis-quant.service
 
-echo "[6/6] Waiting for Aegis Quant FastAPI server on http://127.0.0.1:8000..."
+echo "Waiting for Aegis Quant Axum WebUI server on http://127.0.0.1:8000..."
 for _ in $(seq 1 30); do
     if curl -fsS http://127.0.0.1:8000/api/v1/status >/dev/null 2>&1; then
         break
@@ -73,4 +59,3 @@ curl -fsS http://127.0.0.1:8000/api/v1/status
 echo ""
 curl -fsS http://127.0.0.1:8000/api/v1/portfolio
 echo ""
-
