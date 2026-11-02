@@ -26,6 +26,7 @@ use chrono::Utc;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::Keccak256;
@@ -38,6 +39,189 @@ pub const HYPERLIQUID_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 pub const HYPERLIQUID_TESTNET_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
 pub const HYPERLIQUID_EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
 pub const HYPERLIQUID_TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-testnet.xyz/exchange";
+
+/// Formats a float into a wire string matching Hyperliquid's `float_to_wire` specification.
+pub fn float_to_wire(x: f64) -> String {
+    let s = format!("{:.8}", x);
+    let mut trimmed = s.trim_end_matches('0');
+    if trimmed.ends_with('.') {
+        trimmed = &trimmed[..trimmed.len() - 1];
+    }
+    if trimmed == "-0" || trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LimitOrderType {
+    pub tif: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TriggerOrderTypeWire {
+    #[serde(rename = "triggerPx")]
+    pub trigger_px: String,
+    #[serde(rename = "isMarket")]
+    pub is_market: bool,
+    pub tpsl: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderTypeWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<LimitOrderType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<TriggerOrderTypeWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderWire {
+    pub a: u32,
+    pub b: bool,
+    pub p: String,
+    pub s: String,
+    pub r: bool,
+    pub t: OrderTypeWire,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub orders: Vec<OrderWire>,
+    pub grouping: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelWire {
+    pub a: u32,
+    pub o: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub cancels: Vec<CancelWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultTransferAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub vault_address: String,
+    pub is_deposit: bool,
+    pub usd: i64,
+}
+
+/// Computes the exact Hyperliquid MessagePack + Keccak256 `action_hash` / phantom agent connection ID.
+pub fn compute_l1_action_hash<T: Serialize>(
+    action: &T,
+    vault_address: Option<&str>,
+    nonce: u64,
+    expires_after: Option<u64>,
+) -> Result<[u8; 32]> {
+    let mut data = rmp_serde::encode::to_vec_named(action)
+        .map_err(|e| AegisError::Execution(format!("Msgpack serialization error: {e}")))?;
+    data.extend_from_slice(&nonce.to_be_bytes());
+    match vault_address {
+        None => data.push(0x00),
+        Some(v) if v.trim().is_empty() => data.push(0x00),
+        Some(v) => {
+            data.push(0x01);
+            let clean = v.strip_prefix("0x").unwrap_or(v);
+            let addr_bytes = hex::decode(clean)
+                .map_err(|e| AegisError::Validation(format!("Invalid vault address hex: {e}")))?;
+            if addr_bytes.len() != 20 {
+                return Err(AegisError::Validation(format!(
+                    "Vault address must be 20 bytes, got {}",
+                    addr_bytes.len()
+                )));
+            }
+            data.extend_from_slice(&addr_bytes);
+        }
+    }
+    if let Some(exp) = expires_after {
+        data.push(0x00);
+        data.extend_from_slice(&exp.to_be_bytes());
+    }
+    let hash: [u8; 32] = Keccak256::digest(&data).into();
+    Ok(hash)
+}
+
+/// Signs an L1 action payload using MessagePack binary serialization, action_hash, and EIP-712 structured data signing.
+pub fn sign_l1_action<T: Serialize>(
+    private_key_hex: &str,
+    action: &T,
+    vault_address: Option<&str>,
+    nonce: u64,
+    expires_after: Option<u64>,
+    is_mainnet: bool,
+) -> Result<Value> {
+    let normalized_pk = validate_private_key(private_key_hex)?;
+    let raw_bytes = hex::decode(&normalized_pk[2..])
+        .map_err(|e| AegisError::Crypto(format!("Invalid private_key hex: {e}")))?;
+    let signing_key = SigningKey::from_slice(&raw_bytes)
+        .map_err(|e| AegisError::Crypto(format!("Invalid secp256k1 signing key: {e}")))?;
+
+    let action_h = compute_l1_action_hash(action, vault_address, nonce, expires_after)?;
+
+    // 1. EIP-712 Domain Separator for "Exchange"
+    let mut domain_buf = Vec::with_capacity(32 * 5);
+    domain_buf.extend_from_slice(&Keccak256::digest(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    ));
+    domain_buf.extend_from_slice(&Keccak256::digest(b"Exchange"));
+    domain_buf.extend_from_slice(&Keccak256::digest(b"1"));
+    let mut chain_id_bytes = [0u8; 32];
+    chain_id_bytes[30..32].copy_from_slice(&1337u16.to_be_bytes());
+    domain_buf.extend_from_slice(&chain_id_bytes);
+    domain_buf.extend_from_slice(&[0u8; 32]);
+    let domain_separator: [u8; 32] = Keccak256::digest(&domain_buf).into();
+
+    // 2. Struct Hash for Agent(string source,bytes32 connectionId)
+    let mut agent_buf = Vec::with_capacity(32 * 3);
+    agent_buf.extend_from_slice(&Keccak256::digest(b"Agent(string source,bytes32 connectionId)"));
+    let source_str = if is_mainnet { "a" } else { "b" };
+    agent_buf.extend_from_slice(&Keccak256::digest(source_str.as_bytes()));
+    agent_buf.extend_from_slice(&action_h);
+    let struct_hash: [u8; 32] = Keccak256::digest(&agent_buf).into();
+
+    // 3. EIP-712 Signable Digest
+    let mut digest_buf = Vec::with_capacity(2 + 32 + 32);
+    digest_buf.extend_from_slice(b"\x19\x01");
+    digest_buf.extend_from_slice(&domain_separator);
+    digest_buf.extend_from_slice(&struct_hash);
+    let digest: [u8; 32] = Keccak256::digest(&digest_buf).into();
+
+    // 4. ECDSA Secp256k1 Recoverable Signature
+    let (sig, rec_id) = signing_key
+        .sign_prehash_recoverable(&digest)
+        .map_err(|e| AegisError::Crypto(format!("ECDSA signing failed: {e}")))?;
+    let sig_bytes = sig.to_bytes();
+    let r_hex = format!("0x{}", hex::encode(&sig_bytes[..32]));
+    let s_hex = format!("0x{}", hex::encode(&sig_bytes[32..64]));
+    let v = 27u8 + rec_id.to_byte();
+
+    let verify_key = VerifyingKey::from(&signing_key);
+    let uncompressed = verify_key.to_encoded_point(false);
+    let pub_bytes = &uncompressed.as_bytes()[1..];
+    let pub_hash = Keccak256::digest(pub_bytes);
+    let signer_address = format!("0x{}", hex::encode(&pub_hash[12..]));
+
+    Ok(json!({
+        "r": r_hex,
+        "s": s_hex,
+        "v": v,
+        "signer": signer_address,
+        "connection_id": format!("0x{}", hex::encode(action_h)),
+    }))
+}
 
 /// Market Data Ingestion & `ALT/BTC:SYNTH` Synthesis Engine (`engine/ingestion.py`).
 #[derive(Clone)]
@@ -896,28 +1080,32 @@ impl ExecutionEngine {
             } else {
                 2
             };
-            let px_str = format!("{:.prec$}", reference_price, prec = px_decimals);
-            let sz_str = format!("{:.prec$}", quantity, prec = sz_decimals);
+            let rounded_px = round_dp(reference_price, px_decimals as i32);
+            let rounded_sz = round_dp(quantity, sz_decimals as i32);
+            let px_str = float_to_wire(rounded_px);
+            let sz_str = float_to_wire(rounded_sz);
             let nonce = Utc::now().timestamp_millis() as u64;
 
-            let action = json!({
-                "type": "order",
-                "orders": [{
-                    "a": asset_idx,
-                    "b": is_buy,
-                    "p": px_str,
-                    "s": sz_str,
-                    "r": _is_reduce_only,
-                    "t": {
-                        "limit": {
-                            "tif": "Alo"
-                        }
-                    }
+            let order_action = OrderAction {
+                action_type: "order".to_string(),
+                orders: vec![OrderWire {
+                    a: asset_idx,
+                    b: is_buy,
+                    p: px_str,
+                    s: sz_str,
+                    r: _is_reduce_only,
+                    t: OrderTypeWire {
+                        limit: Some(LimitOrderType {
+                            tif: "Alo".to_string(),
+                        }),
+                        trigger: None,
+                    },
+                    c: None,
                 }],
-                "grouping": "na"
-            });
+                grouping: "na".to_string(),
+            };
 
-            match Self::sign_hyperliquid_action(&priv_key, &action, nonce, None, !is_testnet) {
+            match sign_l1_action(&priv_key, &order_action, None, nonce, None, !is_testnet) {
                 Ok(sig) => {
                     let url = if is_testnet {
                         HYPERLIQUID_TESTNET_EXCHANGE_URL
@@ -925,13 +1113,14 @@ impl ExecutionEngine {
                         HYPERLIQUID_EXCHANGE_URL
                     };
                     let payload = json!({
-                        "action": action,
+                        "action": serde_json::to_value(&order_action).unwrap_or_default(),
                         "nonce": nonce,
                         "signature": {
                             "r": sig["r"],
                             "s": sig["s"],
                             "v": sig["v"],
-                        }
+                        },
+                        "vaultAddress": serde_json::Value::Null,
                     });
 
                     if let Some(resp) = self.http_post_json(url, &payload) {
@@ -1060,6 +1249,34 @@ impl ExecutionEngine {
                                     };
                                 }
                             }
+                        } else if status_str == "err" {
+                            let err_msg = resp
+                                .get("response")
+                                .and_then(Value::as_str)
+                                .unwrap_or("EXCHANGE_ERROR");
+                            tracing::error!("Hyperliquid order rejected by exchange: {}", err_msg);
+                            let _ = self.db.log_order_state_transition(
+                                &cli_id,
+                                "PENDING",
+                                "REJECTED",
+                                Some(err_msg),
+                            );
+                            return OrderExecutionResult {
+                                client_order_id: cli_id,
+                                exchange_order_id: String::new(),
+                                symbol: asset.symbol.clone(),
+                                side: side.to_string(),
+                                fsm_state: "REJECTED".to_string(),
+                                requested_units: quantity,
+                                filled_units: 0.0,
+                                avg_fill_price: 0.0,
+                                slippage_paid_usd: 0.0,
+                                effective_slippage_bps: 0.0,
+                                fees_paid_usdc: 0.0,
+                                is_maker: false,
+                                fill_type: "REJECTED".to_string(),
+                                state_history: vec!["PENDING".to_string(), "REJECTED".to_string()],
+                            };
                         }
                     }
 
@@ -1171,49 +1388,7 @@ impl ExecutionEngine {
         vault_address: Option<&str>,
         is_mainnet: bool,
     ) -> Result<Value> {
-        let normalized_pk = validate_private_key(private_key_hex)?;
-        let raw_bytes = hex::decode(&normalized_pk[2..])
-            .map_err(|e| AegisError::Crypto(format!("Invalid private_key hex: {e}")))?;
-        let signing_key = SigningKey::from_slice(&raw_bytes)
-            .map_err(|e| AegisError::Crypto(format!("Invalid secp256k1 signing key: {e}")))?;
-
-        let mut hasher = Keccak256::new();
-        hasher.update(action.to_string().as_bytes());
-        hasher.update(nonce.to_be_bytes());
-        if let Some(v) = vault_address.filter(|s| !s.is_empty()) {
-            hasher.update(v.to_ascii_lowercase().as_bytes());
-        }
-        hasher.update(if is_mainnet { b"a" } else { b"b" });
-        let connection_id = hasher.finalize();
-
-        // EIP-712 Agent phantom struct digest
-        let mut msg_hasher = Keccak256::new();
-        msg_hasher.update(b"\x19\x01HyperliquidSignTransaction:");
-        msg_hasher.update(connection_id);
-        let digest = msg_hasher.finalize();
-
-        let (sig, rec_id) = signing_key
-            .sign_prehash_recoverable(&digest)
-            .map_err(|e| AegisError::Crypto(format!("ECDSA signing failed: {e}")))?;
-        let sig_bytes = sig.to_bytes();
-        let r_hex = format!("0x{}", hex::encode(&sig_bytes[..32]));
-        let s_hex = format!("0x{}", hex::encode(&sig_bytes[32..64]));
-        let v = 27u8 + rec_id.to_byte();
-
-        // Derive EVM signer address from uncompressed secp256k1 public key
-        let verify_key = VerifyingKey::from(&signing_key);
-        let uncompressed = verify_key.to_encoded_point(false);
-        let pub_bytes = &uncompressed.as_bytes()[1..];
-        let pub_hash = Keccak256::digest(pub_bytes);
-        let signer_address = format!("0x{}", hex::encode(&pub_hash[12..]));
-
-        Ok(json!({
-            "r": r_hex,
-            "s": s_hex,
-            "v": v,
-            "signer": signer_address,
-            "connection_id": format!("0x{}", hex::encode(connection_id)),
-        }))
+        sign_l1_action(private_key_hex, action, vault_address, nonce, None, is_mainnet)
     }
 
     pub fn fetch_hyperliquid_clearinghouse_state(
@@ -1562,14 +1737,14 @@ impl ExecutionEngine {
         }
 
         let nonce = Utc::now().timestamp_millis() as u64;
-        let action = json!({
-            "type": "vaultTransfer",
-            "vaultAddress": vault,
-            "isDeposit": is_deposit,
-            "usd": usd_micro,
-        });
+        let action = VaultTransferAction {
+            action_type: "vaultTransfer".to_string(),
+            vault_address: vault.clone(),
+            is_deposit,
+            usd: usd_micro,
+        };
 
-        match Self::sign_hyperliquid_action(&priv_key, &action, nonce, None, !is_testnet) {
+        match sign_l1_action(&priv_key, &action, None, nonce, None, !is_testnet) {
             Ok(sig) => {
                 let url = if is_testnet {
                     HYPERLIQUID_TESTNET_EXCHANGE_URL
@@ -1577,13 +1752,14 @@ impl ExecutionEngine {
                     HYPERLIQUID_EXCHANGE_URL
                 };
                 let payload = json!({
-                    "action": action,
+                    "action": serde_json::to_value(&action).unwrap_or_default(),
                     "nonce": nonce,
                     "signature": {
                         "r": sig["r"],
                         "s": sig["s"],
                         "v": sig["v"],
-                    }
+                    },
+                    "vaultAddress": serde_json::Value::Null,
                 });
                 if let Some(resp) = self.http_post_json(url, &payload) {
                     *self.hlp_vault_error_streak.lock() = 0;
@@ -2377,5 +2553,80 @@ mod tests {
         .unwrap();
         assert!(sig["r"].as_str().unwrap().starts_with("0x"));
         assert!(sig["signer"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[test]
+    fn test_hyperliquid_python_sdk_action_hash_vector() {
+        let order_action = OrderAction {
+            action_type: "order".to_string(),
+            orders: vec![OrderWire {
+                a: 4,
+                b: true,
+                p: "1670.1".to_string(),
+                s: "0.0147".to_string(),
+                r: false,
+                t: OrderTypeWire {
+                    limit: Some(LimitOrderType {
+                        tif: "Ioc".to_string(),
+                    }),
+                    trigger: None,
+                },
+                c: None,
+            }],
+            grouping: "na".to_string(),
+        };
+
+        let hash = compute_l1_action_hash(&order_action, None, 1677777606040, None).unwrap();
+        assert_eq!(
+            format!("0x{}", hex::encode(hash)),
+            "0x0fcbeda5ae3c4950a548021552a4fea2226858c4453571bf3f24ba017eac2908"
+        );
+    }
+
+    #[test]
+    fn test_hyperliquid_python_sdk_l1_signing_order_vector() {
+        let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
+        let order_action = OrderAction {
+            action_type: "order".to_string(),
+            orders: vec![OrderWire {
+                a: 1,
+                b: true,
+                p: "100".to_string(),
+                s: "100".to_string(),
+                r: false,
+                t: OrderTypeWire {
+                    limit: Some(LimitOrderType {
+                        tif: "Gtc".to_string(),
+                    }),
+                    trigger: None,
+                },
+                c: None,
+            }],
+            grouping: "na".to_string(),
+        };
+
+        // Mainnet signature test vector from hyperliquid-python-sdk signing_test.py
+        let sig_mainnet = sign_l1_action(pk, &order_action, None, 0, None, true).unwrap();
+        assert_eq!(
+            sig_mainnet["r"].as_str().unwrap(),
+            "0xd65369825a9df5d80099e513cce430311d7d26ddf477f5b3a33d2806b100d78e"
+        );
+        assert_eq!(
+            sig_mainnet["s"].as_str().unwrap(),
+            "0x2b54116ff64054968aa237c20ca9ff68000f977c93289157748a3162b6ea940e"
+        );
+        assert_eq!(sig_mainnet["v"].as_u64().unwrap(), 28);
+
+        // Testnet signature test vector from hyperliquid-python-sdk signing_test.py
+        let sig_testnet = sign_l1_action(pk, &order_action, None, 0, None, false).unwrap();
+        assert_eq!(
+            sig_testnet["r"].as_str().unwrap(),
+            "0x82b2ba28e76b3d761093aaded1b1cdad4960b3af30212b343fb2e6cdfa4e3d54"
+        );
+        assert_eq!(
+            sig_testnet["s"].as_str().unwrap(),
+            "0x6b53878fc99d26047f4d7e8c90eb98955a109f44209163f52d8dc4278cbbd9f5"
+        );
+        assert_eq!(sig_testnet["v"].as_u64().unwrap(), 27);
     }
 }
