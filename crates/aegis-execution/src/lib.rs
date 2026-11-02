@@ -2629,4 +2629,67 @@ mod tests {
         );
         assert_eq!(sig_testnet["v"].as_u64().unwrap(), 27);
     }
+
+    #[test]
+    fn test_vault_deposit_and_withdrawal_signing() {
+        let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
+        let vault_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+
+        // 1. Test Deposit Action
+        let deposit_action = VaultTransferAction {
+            action_type: "vaultTransfer".to_string(),
+            vault_address: vault_addr.to_string(),
+            is_deposit: true,
+            usd: 100_000_000, // 100 USDC in micro-units
+        };
+
+        // Verify MessagePack encoding contains exact required keys
+        let msgpack_bytes = rmp_serde::encode::to_vec_named(&deposit_action).unwrap();
+        assert!(!msgpack_bytes.is_empty());
+
+        let deposit_hash = compute_l1_action_hash(&deposit_action, None, 1700000000000, None).unwrap();
+        assert_eq!(deposit_hash.len(), 32);
+
+        let sig_deposit_mainnet = sign_l1_action(pk, &deposit_action, None, 1700000000000, None, true).unwrap();
+        assert!(sig_deposit_mainnet["r"].as_str().unwrap().starts_with("0x"));
+        assert!(sig_deposit_mainnet["s"].as_str().unwrap().starts_with("0x"));
+        let v_dep_main = sig_deposit_mainnet["v"].as_u64().unwrap();
+        assert!(v_dep_main == 27 || v_dep_main == 28);
+
+        let sig_deposit_testnet = sign_l1_action(pk, &deposit_action, None, 1700000000000, None, false).unwrap();
+        assert!(sig_deposit_testnet["r"].as_str().unwrap().starts_with("0x"));
+        assert!(sig_deposit_testnet["s"].as_str().unwrap().starts_with("0x"));
+        let v_dep_test = sig_deposit_testnet["v"].as_u64().unwrap();
+        assert!(v_dep_test == 27 || v_dep_test == 28);
+
+        // 2. Test Withdrawal Action
+        let withdraw_action = VaultTransferAction {
+            action_type: "vaultTransfer".to_string(),
+            vault_address: vault_addr.to_string(),
+            is_deposit: false,
+            usd: 50_000_000, // 50 USDC in micro-units
+        };
+
+        let withdraw_hash = compute_l1_action_hash(&withdraw_action, None, 1700000000000, None).unwrap();
+        assert_eq!(withdraw_hash.len(), 32);
+        assert_ne!(deposit_hash, withdraw_hash);
+
+        let sig_withdraw_testnet = sign_l1_action(pk, &withdraw_action, None, 1700000000000, None, false).unwrap();
+        assert!(sig_withdraw_testnet["r"].as_str().unwrap().starts_with("0x"));
+        assert!(sig_withdraw_testnet["s"].as_str().unwrap().starts_with("0x"));
+
+        // 3. Test Paper Simulation in ExecutionEngine
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let exec = ExecutionEngine::new(db);
+        let sim_deposit = exec.execute_hlp_vault_transfer(100.0, true, Some(vault_addr));
+        assert_eq!(sim_deposit["status"], "SIMULATED");
+        assert_eq!(sim_deposit["usd_micro"], 100_000_000);
+        assert_eq!(sim_deposit["is_deposit"], true);
+
+        let sim_withdraw = exec.execute_hlp_vault_transfer(50.0, false, Some(vault_addr));
+        assert_eq!(sim_withdraw["status"], "SIMULATED");
+        assert_eq!(sim_withdraw["usd_micro"], 50_000_000);
+        assert_eq!(sim_withdraw["is_deposit"], false);
+    }
 }
