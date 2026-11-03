@@ -1080,11 +1080,25 @@ impl ExecutionEngine {
             } else {
                 2
             };
-            let rounded_px = round_dp(reference_price, px_decimals as i32);
+            let target_px = if _is_reduce_only {
+                if is_buy {
+                    reference_price * 1.05
+                } else {
+                    reference_price * 0.95
+                }
+            } else {
+                reference_price
+            };
+            let rounded_px = round_dp(target_px, px_decimals as i32);
             let rounded_sz = round_dp(quantity, sz_decimals as i32);
             let px_str = float_to_wire(rounded_px);
             let sz_str = float_to_wire(rounded_sz);
             let nonce = Utc::now().timestamp_millis() as u64;
+            let tif = if _is_reduce_only {
+                "Ioc".to_string()
+            } else {
+                "Alo".to_string()
+            };
 
             let order_action = OrderAction {
                 action_type: "order".to_string(),
@@ -1096,7 +1110,7 @@ impl ExecutionEngine {
                     r: _is_reduce_only,
                     t: OrderTypeWire {
                         limit: Some(LimitOrderType {
-                            tif: "Alo".to_string(),
+                            tif,
                         }),
                         trigger: None,
                     },
@@ -2155,6 +2169,7 @@ impl ExecutionEngine {
         let initial_equity = cfg.get_f64("initial_equity_usdc", 10000.0);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
         let chop_prob_thresh = cfg.get_f64("hmm_chop_prob_threshold", 0.55);
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
 
         let now_ms = evaluations
             .first()
@@ -2232,18 +2247,60 @@ impl ExecutionEngine {
             }
 
             if let Some(reason) = exit_reason {
-                let exit_fee = (trade.quantity * exit_px) * (taker_fee_bps / 10000.0);
-                let total_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
-                let gross_pnl = if trade.side == "LONG" {
-                    (exit_px - trade.entry_price) * trade.quantity
+                let mut actual_exit_px = exit_px;
+                let mut actual_fees = trade.fees_paid_usdc;
+
+                if (mode == "LIVE" || mode == "TESTNET") && !is_backtest {
+                    let close_side = if trade.side == "LONG" { "SHORT" } else { "LONG" };
+                    let exec_close = self.execute_maker_limit_chaser(
+                        asset,
+                        close_side,
+                        trade.quantity,
+                        last_bar.close,
+                        last_bar.high,
+                        last_bar.low,
+                        last_bar.volume,
+                        None,
+                        None,
+                        None,
+                        true,
+                    );
+                    if exec_close.fsm_state == "FILLED" && exec_close.avg_fill_price > 0.0 {
+                        actual_exit_px = exec_close.avg_fill_price;
+                        actual_fees = round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
+                        tracing::info!(
+                            "Closed position on exchange for {} {}: fill_px={} fees={}",
+                            trade.symbol,
+                            close_side,
+                            actual_exit_px,
+                            exec_close.fees_paid_usdc
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Exit order for {} returned state {} on exchange: reason={}",
+                            trade.symbol,
+                            exec_close.fsm_state,
+                            reason
+                        );
+                    }
+                }
+
+                let exit_fee = (trade.quantity * actual_exit_px) * (taker_fee_bps / 10000.0);
+                let total_fees = if actual_fees > trade.fees_paid_usdc {
+                    actual_fees
                 } else {
-                    (trade.entry_price - exit_px) * trade.quantity
+                    round_dp(trade.fees_paid_usdc + exit_fee, 4)
+                };
+                let gross_pnl = if trade.side == "LONG" {
+                    (actual_exit_px - trade.entry_price) * trade.quantity
+                } else {
+                    (trade.entry_price - actual_exit_px) * trade.quantity
                 };
                 let net_pnl =
                     round_dp(gross_pnl - total_fees + trade.funding_accrued_usdc, 4);
                 self.db.close_trade(
                     trade.trade_id,
-                    exit_px,
+                    actual_exit_px,
                     net_pnl,
                     total_fees,
                     &reason,
@@ -2337,12 +2394,22 @@ impl ExecutionEngine {
                 None,
                 false,
             );
-            if exec_res.fsm_state != "FILLED" || exec_res.filled_units <= 0.0 {
+            let is_filled = exec_res.fsm_state == "FILLED" && exec_res.filled_units > 0.0;
+            let is_open_book = exec_res.fsm_state == "OPEN_ON_BOOK";
+            if !is_filled && !is_open_book {
                 continue;
             }
 
-            let fill_px = exec_res.avg_fill_price;
-            let filled_qty = exec_res.filled_units;
+            let fill_px = if exec_res.avg_fill_price > 0.0 {
+                exec_res.avg_fill_price
+            } else {
+                last_bar.close
+            };
+            let filled_qty = if exec_res.filled_units > 0.0 {
+                exec_res.filled_units
+            } else {
+                sizing.quantity
+            };
             let new_trade = TradeRecord {
                 trade_id: 0,
                 client_order_id: exec_res.client_order_id,
@@ -2350,7 +2417,7 @@ impl ExecutionEngine {
                 base_asset: asset.base_asset.clone(),
                 side: ev.signal_action.clone(),
                 status: "OPEN".to_string(),
-                fsm_state: "FILLED".to_string(),
+                fsm_state: exec_res.fsm_state.clone(),
                 entry_price: fill_px,
                 current_price: fill_px,
                 exit_price: None,

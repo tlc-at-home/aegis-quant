@@ -2195,7 +2195,8 @@ impl DatabaseManager {
                          filled_units = ?1,
                          entry_price = ?2,
                          avg_fill_price = ?2,
-                         notional_usdc = ?3
+                         notional_usdc = ?3,
+                         fsm_state = 'FILLED'
                      WHERE trade_id = ?4 AND status = 'OPEN';",
                     params![size, px, notional, trade_id],
                 )
@@ -2205,7 +2206,8 @@ impl DatabaseManager {
                     "UPDATE trades
                      SET quantity = ?1,
                          filled_units = ?1,
-                         notional_usdc = ?1 * entry_price
+                         notional_usdc = ?1 * entry_price,
+                         fsm_state = 'FILLED'
                      WHERE trade_id = ?2 AND status = 'OPEN';",
                     params![size, trade_id],
                 )
