@@ -512,6 +512,11 @@ impl MarketIngestionEngine {
             timeframes.insert(a.rs_timeframe.clone());
         }
 
+        let cfg = self.db.load_config().unwrap_or_default();
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_live_or_testnet =
+            mode == "LIVE" || mode == "TESTNET" || cfg.get_bool("hyperliquid_testnet", false);
+
         let funding_map = if force_synthetic {
             HashMap::new()
         } else {
@@ -522,31 +527,57 @@ impl MarketIngestionEngine {
         let mut total_usdc_bars = 0usize;
         let mut total_synth_bars = 0usize;
         let mut live_api_used = false;
+        let mut api_unreachable = false;
 
         let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
         sorted_tfs.sort();
 
         for tf in &sorted_tfs {
             let mut bars_opt = None;
-            if !force_synthetic {
+            if !force_synthetic && !api_unreachable {
                 let f_rate = funding_map.get("BTC").copied().unwrap_or(0.0001);
                 bars_opt = self.fetch_hyperliquid_candles("BTC", tf, lookback_bars, f_rate);
                 if bars_opt.is_some() {
                     live_api_used = true;
+                } else if funding_map.is_empty() {
+                    api_unreachable = true;
                 }
             }
-            let bars = bars_opt.unwrap_or_else(|| {
-                self.generate_synthetic_bars(
-                    "BTC/USDC:USDC",
-                    tf,
-                    lookback_bars,
-                    *base_prices.get("BTC/USDC:USDC").unwrap_or(&68500.0),
-                    None,
-                    1,
-                    None,
-                )
-            });
-            total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
+            let bars = match bars_opt {
+                Some(b) => {
+                    total_usdc_bars += self.db.upsert_ohlcv_batch(&b)?;
+                    b
+                }
+                None => {
+                    let existing = if !force_synthetic {
+                        self.db
+                            .get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
+                        tracing::warn!(
+                            "Transient candleSnapshot failure for BTC/USDC:USDC ({}); preserving {} existing bars",
+                            tf,
+                            existing.len()
+                        );
+                        existing
+                    } else {
+                        let synth = self.generate_synthetic_bars(
+                            "BTC/USDC:USDC",
+                            tf,
+                            lookback_bars,
+                            *base_prices.get("BTC/USDC:USDC").unwrap_or(&68500.0),
+                            None,
+                            1,
+                            None,
+                        );
+                        total_usdc_bars += self.db.upsert_ohlcv_batch(&synth)?;
+                        synth
+                    }
+                }
+            };
             btc_bars_by_tf.insert(tf.clone(), bars);
         }
 
@@ -566,26 +597,50 @@ impl MarketIngestionEngine {
 
             for tf in req_tfs {
                 let mut bars_opt = None;
-                if !force_synthetic {
+                if !force_synthetic && !api_unreachable {
                     bars_opt = self.fetch_hyperliquid_candles(
                         &asset.base_asset,
                         &tf,
                         lookback_bars,
                         f_rate,
                     );
+                    if bars_opt.is_some() {
+                        live_api_used = true;
+                    }
                 }
-                let bars = bars_opt.unwrap_or_else(|| {
-                    self.generate_synthetic_bars(
-                        &asset.symbol,
-                        &tf,
-                        lookback_bars,
-                        ref_px,
-                        btc_bars_by_tf.get(&tf).map(Vec::as_slice),
-                        (idx + 2) as u64,
-                        None,
-                    )
-                });
-                total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
+                match bars_opt {
+                    Some(bars) => {
+                        total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
+                    }
+                    None => {
+                        let existing = if !force_synthetic {
+                            self.db
+                                .get_ohlcv_bars(&asset.symbol, &tf, lookback_bars, None)
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
+                            tracing::warn!(
+                                "Transient candleSnapshot failure for {} ({}); preserving {} existing bars",
+                                asset.symbol,
+                                tf,
+                                existing.len()
+                            );
+                        } else {
+                            let bars = self.generate_synthetic_bars(
+                                &asset.symbol,
+                                &tf,
+                                lookback_bars,
+                                ref_px,
+                                btc_bars_by_tf.get(&tf).map(Vec::as_slice),
+                                (idx + 2) as u64,
+                                None,
+                            );
+                            total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
+                        }
+                    }
+                }
             }
         }
 
@@ -605,6 +660,8 @@ impl MarketIngestionEngine {
 
         let source_label = if live_api_used {
             "HYPERLIQUID_LIVE_API"
+        } else if !force_synthetic && (is_live_or_testnet || total_usdc_bars == 0) {
+            "CACHED_LIVE_BARS_OFFLINE"
         } else {
             "DETERMINISTIC_SYNTHETIC_FALLBACK"
         };
@@ -638,6 +695,7 @@ pub struct ExecutionEngine {
     last_funding_sync_hour_ts: Arc<Mutex<Option<i64>>>,
     stop_cooldown_until_ms: Arc<Mutex<HashMap<String, i64>>>,
     hlp_vault_error_streak: Arc<Mutex<usize>>,
+    asset_index_cache: Arc<Mutex<HashMap<(bool, String), u32>>>,
 }
 
 impl ExecutionEngine {
@@ -652,6 +710,7 @@ impl ExecutionEngine {
             last_funding_sync_hour_ts: Arc::new(Mutex::new(None)),
             stop_cooldown_until_ms: Arc::new(Mutex::new(HashMap::new())),
             hlp_vault_error_streak: Arc::new(Mutex::new(0)),
+            asset_index_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1376,22 +1435,114 @@ impl ExecutionEngine {
         coin: &str,
         is_testnet: bool,
     ) -> Option<u32> {
+        let coin_upper = coin.trim().to_ascii_uppercase();
+        if let Some(&cached_idx) = self
+            .asset_index_cache
+            .lock()
+            .get(&(is_testnet, coin_upper.clone()))
+        {
+            return Some(cached_idx);
+        }
+
         let url = if is_testnet {
             HYPERLIQUID_TESTNET_INFO_URL
         } else {
             HYPERLIQUID_INFO_URL
         };
-        let resp = self.http_post_json(url, &json!({"type": "metaAndAssetCtxs"}))?;
-        let arr = resp.as_array()?;
-        let universe = arr.first()?.get("universe")?.as_array()?;
-        for (idx, u) in universe.iter().enumerate() {
-            if let Some(name) = u.get("name").and_then(Value::as_str) {
-                if name.eq_ignore_ascii_case(coin) {
-                    return Some(idx as u32);
+
+        let resp_opt = self
+            .http_post_json(url, &json!({"type": "meta"}))
+            .or_else(|| self.http_post_json(url, &json!({"type": "metaAndAssetCtxs"})));
+
+        if let Some(resp) = resp_opt {
+            let universe_opt = resp
+                .get("universe")
+                .and_then(Value::as_array)
+                .or_else(|| {
+                    resp.as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|first| first.get("universe"))
+                        .and_then(Value::as_array)
+                });
+
+            if let Some(universe) = universe_opt {
+                let mut cache = self.asset_index_cache.lock();
+                let mut found = None;
+                for (idx, u) in universe.iter().enumerate() {
+                    if let Some(name) = u.get("name").and_then(Value::as_str) {
+                        let name_upper = name.to_ascii_uppercase();
+                        cache.insert((is_testnet, name_upper.clone()), idx as u32);
+                        if name_upper == coin_upper {
+                            found = Some(idx as u32);
+                        }
+                    }
+                }
+                if found.is_some() {
+                    return found;
                 }
             }
         }
-        None
+
+        let fallback_idx = if is_testnet {
+            match coin_upper.as_str() {
+                "SOL" => Some(0),
+                "APT" => Some(1),
+                "ATOM" => Some(2),
+                "BTC" => Some(3),
+                "ETH" => Some(4),
+                "MATIC" | "POL" => Some(5),
+                "BNB" => Some(6),
+                "AVAX" => Some(7),
+                "LTC" => Some(10),
+                "OP" => Some(11),
+                "ARB" => Some(13),
+                "INJ" => Some(18),
+                "SUI" => Some(25),
+                "LINK" => Some(28),
+                "UNI" => Some(37),
+                "ADA" => Some(45),
+                "DOT" => Some(47),
+                "NEAR" => Some(54),
+                "XRP" => Some(62),
+                "TIA" => Some(83),
+                "HYPE" => Some(135),
+                "DOGE" => Some(173),
+                _ => None,
+            }
+        } else {
+            match coin_upper.as_str() {
+                "BTC" => Some(0),
+                "ETH" => Some(1),
+                "ATOM" => Some(2),
+                "MATIC" | "POL" => Some(3),
+                "SOL" => Some(5),
+                "AVAX" => Some(6),
+                "BNB" => Some(7),
+                "OP" => Some(9),
+                "LTC" => Some(10),
+                "ARB" => Some(11),
+                "DOGE" => Some(12),
+                "INJ" => Some(13),
+                "SUI" => Some(14),
+                "LINK" => Some(18),
+                "APT" => Some(22),
+                "XRP" => Some(25),
+                "UNI" => Some(38),
+                "DOT" => Some(42),
+                "ADA" => Some(65),
+                "NEAR" => Some(74),
+                "TIA" => Some(96),
+                "HYPE" => Some(159),
+                _ => None,
+            }
+        };
+
+        if let Some(idx) = fallback_idx {
+            self.asset_index_cache
+                .lock()
+                .insert((is_testnet, coin_upper), idx);
+        }
+        fallback_idx
     }
 
     /// Signs a Hyperliquid L1 action payload using EIP-712 / secp256k1 recoverable ECDSA signature.
@@ -2204,6 +2355,14 @@ impl ExecutionEngine {
                 continue;
             }
             let last_bar = bars.last().unwrap();
+            if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && last_bar.is_synthetic != 0 {
+                tracing::warn!(
+                    "Skipping stop/exit evaluation for {} on synthetic bar (ts={})",
+                    trade.symbol,
+                    last_bar.timestamp_ms
+                );
+                continue;
+            }
             let atr = self.risk.compute_atr(&bars, 14);
 
             let stop_eval = self.risk.evaluate_two_tier_chandelier_stop(
@@ -2277,11 +2436,27 @@ impl ExecutionEngine {
                         );
                     } else {
                         tracing::warn!(
-                            "Exit order for {} returned state {} on exchange: reason={}",
+                            "Exit order for {} returned state {} on exchange (reason={}); keeping local trade #{} OPEN",
                             trade.symbol,
                             exec_close.fsm_state,
-                            reason
+                            reason,
+                            trade.trade_id
                         );
+                        let upnl = if trade.side == "LONG" {
+                            (last_bar.close - trade.entry_price) * trade.quantity
+                        } else {
+                            (trade.entry_price - last_bar.close) * trade.quantity
+                        };
+                        self.db.update_open_trade(
+                            trade.trade_id,
+                            last_bar.close,
+                            stop_eval.chandelier_stop_price,
+                            stop_eval.highest_price_seen,
+                            stop_eval.lowest_price_seen,
+                            round_dp(upnl, 4),
+                            trade.funding_accrued_usdc,
+                        )?;
+                        continue;
                     }
                 }
 
@@ -2513,12 +2688,17 @@ impl ExecutionEngine {
                 accrued_yield_usdc = round_dp(vault_yield_now, 4);
                 if let Some(peq) = perp_eq_now.filter(|&p| p > 0.0 || vault_eq_now > 0.0) {
                     total_equity = round_dp(peq + vault_eq_now, 2);
+                } else if prev_snap.total_equity_usdc > 0.0 {
+                    total_equity = prev_snap.total_equity_usdc;
                 } else {
                     total_equity = round_dp(
                         initial_equity + realized_after + total_upnl + accrued_yield_usdc,
                         2,
                     );
                 }
+            } else if prev_snap.total_equity_usdc > 0.0 {
+                basis_notional = prev_snap.basis_harvest_notional_usdc;
+                total_equity = prev_snap.total_equity_usdc;
             }
         } else {
             let available_cash = (initial_equity + realized_after + total_upnl + accrued_yield_usdc
@@ -2758,5 +2938,19 @@ mod tests {
         assert_eq!(sim_withdraw["status"], "SIMULATED");
         assert_eq!(sim_withdraw["usd_micro"], 50_000_000);
         assert_eq!(sim_withdraw["is_deposit"], false);
+    }
+
+    #[test]
+    fn test_asset_index_cache_and_fallback() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let mut exec = ExecutionEngine::new(db);
+        exec.timeout_sec = 1;
+
+        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ADA", true), Some(45));
+        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ada", true), Some(45));
+        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ADA", false), Some(65));
+        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("SOL", true), Some(0));
+        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("BTC", false), Some(0));
     }
 }
