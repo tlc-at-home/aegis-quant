@@ -1,0 +1,39 @@
+[Unit]
+Description=AEGIS-QUANT PP-50 Book B (The Pond — NPS-01 Bi-Directional Naked-Option Perp Scanner)
+After=network-online.target chronyd.service
+Wants=network-online.target chronyd.service
+
+[Service]
+Type=simple
+User=fedora
+Group=fedora
+WorkingDirectory=/home/fedora/aegis
+Environment="RUST_LOG=info"
+LoadCredential=aegis_master_key:/home/fedora/aegis/data/.aegis_master_key
+ExecStart=/home/fedora/aegis/bin/aegis-quant run --book pond --no-web --db /home/fedora/aegis/data/aegis_quant.db
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+# Systemd Service Hardening (S7)
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/fedora/aegis/data -/home/fedora/aegis/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

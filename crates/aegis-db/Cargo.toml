@@ -24,3 +24,9 @@ rand.workspace = true
 zeroize.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+clap.workspace = true
+
+[[bin]]
+name = "aegis-db-tool"
+path = "src/bin/aegis-db-tool.rs"
+

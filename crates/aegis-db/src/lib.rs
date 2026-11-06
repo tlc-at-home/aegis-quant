@@ -2,18 +2,23 @@
 //! and centralized variable loader (`system_config`) for Aegis Quant.
 
 pub mod fernet;
+pub mod pond_ops;
+pub mod scoped;
+pub mod trade_ops;
+
+pub use scoped::{BookScopedDb, PitConfig, PondConfig};
 
 use crate::fernet::{
-    default_host_fernet_key_b64, is_encrypted_value, normalize_fernet_key,
-    resolve_fernet_master_key, FernetCipher,
+    ensure_master_key_for_db, is_encrypted_value, is_legacy_public_fallback_key,
+    is_usable_env_key, master_key_file_for_db, normalize_fernet_key, resolve_fernet_master_key,
+    write_master_key_file, FernetCipher,
 };
 use aegis_core::{
     mask_secret, resolve_project_root, round_dp, validate_evm_address, validate_private_key,
-    AegisError, AltPairMetadata, ExecutionMode, OhlcvBar, OrderFsmState, PortfolioSnapshot, Result,
-    SignalEvaluation, TradeRecord, UniverseAsset, SENSITIVE_CONFIG_KEYS,
+    AegisError, ExecutionMode, PondDirectionPolicy, Result, IMMUTABLE_SECURITY_CONFIG_KEYS,
+    SENSITIVE_CONFIG_KEYS,
 };
-use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,7 +31,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// Typed configuration dictionary loaded from `system_config`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,7 +125,8 @@ pub fn cast_config_value(raw_val: &str, value_type: &str) -> Value {
     }
 }
 
-fn alert_config_defaults() -> HashMap<&'static str, (&'static str, &'static str, &'static str, &'static str)> {
+fn alert_config_defaults(
+) -> HashMap<&'static str, (&'static str, &'static str, &'static str, &'static str)> {
     HashMap::from([
         (
             "telegram_bot_token",
@@ -161,6 +167,15 @@ fn alert_config_defaults() -> HashMap<&'static str, (&'static str, &'static str,
     ])
 }
 
+/// Cached Fernet key and cipher state (`R5`).
+#[derive(Clone)]
+struct CachedFernetState {
+    key_b64: String,
+    is_explicit: bool,
+    env_override: Option<String>,
+    cipher: FernetCipher,
+}
+
 /// Thread-safe SQLite Write-Ahead Logging (WAL) and `:memory:` database manager.
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -168,8 +183,10 @@ pub struct DatabaseManager {
     pub schema_path: PathBuf,
     is_memory: bool,
     memory_conn: Option<Arc<Mutex<Connection>>>,
+    conn_pool: Arc<Mutex<Vec<Connection>>>,
     pit_timestamp_ms: Arc<AtomicI64>,
     explicit_master_key: Arc<Mutex<Option<String>>>,
+    cipher_cache: Arc<RwLock<Option<CachedFernetState>>>,
 }
 
 impl DatabaseManager {
@@ -220,9 +237,16 @@ impl DatabaseManager {
             schema_path: schema_path.as_ref().to_path_buf(),
             is_memory,
             memory_conn,
+            conn_pool: Arc::new(Mutex::new(Vec::with_capacity(8))),
             pit_timestamp_ms: Arc::new(AtomicI64::new(-1)),
             explicit_master_key: Arc::new(Mutex::new(master_key)),
+            cipher_cache: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn set_master_key(&self, master_key: Option<String>) {
+        *self.explicit_master_key.lock() = master_key;
+        *self.cipher_cache.write() = None;
     }
 
     pub fn set_pit_timestamp_ms(&self, ts: Option<i64>) {
@@ -241,31 +265,91 @@ impl DatabaseManager {
 
     pub fn now_ms(&self) -> i64 {
         self.get_pit_timestamp_ms()
-            .unwrap_or_else(|| Utc::now().timestamp_millis())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
     }
 
-    /// Execute a closure with a configured SQLite WAL or `:memory:` connection inside a transaction.
-    pub fn with_conn<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&Connection) -> Result<T>,
-    {
-        if let Some(mem_arc) = &self.memory_conn {
-            let conn = mem_arc.lock();
-            return f(&conn);
+    fn apply_configured_pragmas(conn: &Connection) {
+        let mut busy_ms: u64 = 15000;
+        let mut sync_mode = "NORMAL".to_string();
+        let mut cache_kib: i64 = -32000;
+        let mut mmap_bytes: i64 = 268_435_456;
+
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT config_key, config_value FROM system_config
+             WHERE config_key IN (
+                 'sqlite_busy_timeout_ms',
+                 'sqlite_synchronous_mode',
+                 'sqlite_cache_size_kib',
+                 'sqlite_mmap_size_bytes'
+             );",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            }) {
+                for row in rows.flatten() {
+                    match row.0.as_str() {
+                        "sqlite_busy_timeout_ms" => {
+                            if let Ok(v) = row.1.trim().parse::<u64>() {
+                                busy_ms = v.clamp(1000, 120_000);
+                            }
+                        }
+                        "sqlite_synchronous_mode" => {
+                            let m = row.1.trim().to_ascii_uppercase();
+                            if matches!(m.as_str(), "OFF" | "NORMAL" | "FULL" | "EXTRA") {
+                                sync_mode = m;
+                            }
+                        }
+                        "sqlite_cache_size_kib" => {
+                            if let Ok(v) = row.1.trim().parse::<i64>() {
+                                cache_kib = v;
+                            }
+                        }
+                        "sqlite_mmap_size_bytes" => {
+                            if let Ok(v) = row.1.trim().parse::<i64>() {
+                                mmap_bytes = v.max(0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
 
+        let _ = conn.busy_timeout(Duration::from_millis(busy_ms));
+        let pragma_sql = format!(
+            "PRAGMA synchronous = {sync_mode};
+             PRAGMA cache_size = {cache_kib};
+             PRAGMA mmap_size = {mmap_bytes};"
+        );
+        let _ = conn.execute_batch(&pragma_sql);
+    }
+
+    fn open_configured_file_conn(&self) -> Result<Connection> {
         let mut last_err = None;
         for attempt in 0..16 {
             match Connection::open(&self.db_path) {
                 Ok(conn) => {
                     let _ = conn.busy_timeout(Duration::from_millis(15000));
-                    let _ = conn.execute_batch(
+                    match conn.execute_batch(
                         "PRAGMA temp_store = MEMORY;
                          PRAGMA journal_mode = WAL;
                          PRAGMA synchronous = NORMAL;
                          PRAGMA foreign_keys = ON;",
-                    );
-                    return f(&conn);
+                    ) {
+                        Ok(()) => {
+                            Self::apply_configured_pragmas(&conn);
+                            return Ok(conn);
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            if attempt < 15 {
+                                thread::sleep(Duration::from_millis(250));
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -280,6 +364,36 @@ impl DatabaseManager {
             self.db_path.display(),
             last_err
         )))
+    }
+
+    /// Execute a closure with a pooled SQLite WAL or `:memory:` connection (`R2`).
+    pub fn with_conn<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        if let Some(mem_arc) = &self.memory_conn {
+            let conn = mem_arc.lock();
+            return f(&conn);
+        }
+
+        let conn = {
+            let mut pool = self.conn_pool.lock();
+            pool.pop()
+        };
+        let conn = match conn {
+            Some(c) => c,
+            None => self.open_configured_file_conn()?,
+        };
+
+        let result = f(&conn);
+
+        if conn.is_autocommit() {
+            let mut pool = self.conn_pool.lock();
+            if pool.len() < 8 {
+                pool.push(conn);
+            }
+        }
+        result
     }
 
     /// Execute multi-statement SQL idempotently, ignoring duplicate column errors on `ALTER TABLE`.
@@ -334,6 +448,9 @@ impl DatabaseManager {
     }
 
     pub fn init_db(&self) -> Result<Value> {
+        if !self.is_memory {
+            let _ = ensure_master_key_for_db(&self.db_path);
+        }
         if !self.schema_path.exists() {
             return Err(AegisError::NotFound(format!(
                 "Schema SQL file not found: {}",
@@ -360,6 +477,8 @@ impl DatabaseManager {
             "sql/migrations/002_v020_order_fsm.sql",
             "sql/migrations/003_v020_schema_versioning.sql",
             "sql/migrations/004_v020_rc2_remediation.sql",
+            "sql/migrations/005_v030_pp50_two_book.sql",
+            "sql/migrations/006_v030_review_remediation.sql",
         ];
         for rel in migrations {
             let p = root.join(rel);
@@ -367,18 +486,210 @@ impl DatabaseManager {
                 integrity = self.apply_migration(&p)?;
             }
         }
+        self.reconcile_routing_config();
+        let _ = self.redact_sensitive_telemetry_logs();
+        let _ = self.with_conn(|conn| {
+            Self::apply_configured_pragmas(conn);
+            Ok(())
+        });
         Ok(integrity)
     }
 
     pub fn initialize_schema(&self, force: bool) -> Result<Value> {
+        if !self.is_memory {
+            let _ = ensure_master_key_for_db(&self.db_path);
+        }
         if !force {
             if let Ok(ver) = self.get_schema_version() {
-                if ver >= 4 {
+                if ver >= 6 {
+                    self.reconcile_routing_config();
                     return self.verify_integrity();
                 }
             }
+        } else {
+            let _ = self.with_conn(|conn| {
+                for table in [
+                    "order_state_audit",
+                    "trades",
+                    "signal_evaluations",
+                    "portfolio_snapshots",
+                    "telemetry_logs",
+                    "pond_cells",
+                    "pond_scan_cycles",
+                    "pond_champions",
+                    "book_transfers",
+                    "pp50_platform_snapshots",
+                    "system_config",
+                    "books",
+                ] {
+                    let _ = conn.execute(&format!("DELETE FROM {table};"), []);
+                }
+                let _ = conn.execute(
+                    "DELETE FROM market_ohlcv
+                     WHERE symbol NOT IN (SELECT symbol FROM universe_assets WHERE is_active = 1)
+                        OR timeframe != '4h';",
+                    [],
+                );
+                Ok(())
+            });
         }
-        self.initialize_database()
+        let res = self.initialize_database()?;
+        self.reconcile_routing_config();
+        if force && !self.is_memory {
+            self.conn_pool.lock().clear();
+            let _ = self.with_conn(|conn| {
+                let _ = conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+                Ok(())
+            });
+        }
+        Ok(res)
+    }
+
+    /// Reconciles legacy or inconsistent execution routing mode rows in `system_config`
+    /// so that `execution_mode`, `hyperliquid_testnet`, `pond_execution_mode`, `environment`,
+    /// and descriptions never contradict each other across `PAPER`, `TESTNET`, and `LIVE`.
+    pub fn reconcile_routing_config(&self) {
+        let _ = self.with_conn(|conn| {
+            let mut stmt = match conn.prepare(
+                "SELECT config_key, config_value, description
+                 FROM system_config
+                 WHERE config_key IN ('execution_mode', 'pond_execution_mode', 'hyperliquid_testnet', 'environment');",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            let rows: Vec<(String, String, String)> = match stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            }) {
+                Ok(iter) => iter.flatten().collect(),
+                Err(_) => return Ok(()),
+            };
+            if rows.is_empty() {
+                return Ok(());
+            }
+
+            let mut cur_exec_mode: Option<String> = None;
+            let mut cur_pond_mode: Option<String> = None;
+            let mut cur_testnet: Option<String> = None;
+            let mut cur_env: Option<String> = None;
+            let mut cur_exec_desc: Option<String> = None;
+            let mut cur_pond_desc: Option<String> = None;
+
+            for (k, v, d) in rows {
+                match k.as_str() {
+                    "execution_mode" => {
+                        cur_exec_mode = Some(v);
+                        cur_exec_desc = Some(d);
+                    }
+                    "pond_execution_mode" => {
+                        cur_pond_mode = Some(v);
+                        cur_pond_desc = Some(d);
+                    }
+                    "hyperliquid_testnet" => {
+                        cur_testnet = Some(v);
+                    }
+                    "environment" => {
+                        cur_env = Some(v);
+                    }
+                    _ => {}
+                }
+            }
+
+            let raw_mode = cur_exec_mode
+                .as_deref()
+                .unwrap_or("PAPER")
+                .trim()
+                .to_ascii_uppercase();
+            let is_tn = matches!(
+                cur_testnet
+                    .as_deref()
+                    .unwrap_or("true")
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "true" | "1" | "yes" | "on" | "testnet"
+            );
+
+            let (target_mode, target_tn, target_env) =
+                if raw_mode == "TESTNET" || (raw_mode == "LIVE" && is_tn) {
+                    ("TESTNET", "true", "sandbox")
+                } else if raw_mode == "LIVE" {
+                    ("LIVE", "false", "production")
+                } else {
+                    ("PAPER", if is_tn { "true" } else { "false" }, "sandbox")
+                };
+
+            if cur_exec_mode.as_deref() != Some(target_mode) {
+                let _ = conn.execute(
+                    "UPDATE system_config
+                     SET config_value = ?1,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE config_key = 'execution_mode';",
+                    params![target_mode],
+                );
+            }
+            if let Some(ref pm) = cur_pond_mode {
+                if pm != target_mode {
+                    let _ = conn.execute(
+                        "UPDATE system_config
+                         SET config_value = ?1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE config_key = 'pond_execution_mode';",
+                        params![target_mode],
+                    );
+                }
+            }
+            if cur_testnet.as_deref() != Some(target_tn) {
+                let _ = conn.execute(
+                    "UPDATE system_config
+                     SET config_value = ?1,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE config_key = 'hyperliquid_testnet';",
+                    params![target_tn],
+                );
+            }
+            if let Some(ref env_val) = cur_env {
+                if env_val != target_env {
+                    let _ = conn.execute(
+                        "UPDATE system_config
+                         SET config_value = ?1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE config_key = 'environment';",
+                        params![target_env],
+                    );
+                }
+            }
+
+            let target_exec_desc =
+                "Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing";
+            if let Some(ref d) = cur_exec_desc {
+                if d != target_exec_desc {
+                    let _ = conn.execute(
+                        "UPDATE system_config
+                         SET description = ?1
+                         WHERE config_key = 'execution_mode';",
+                        params![target_exec_desc],
+                    );
+                }
+            }
+            let target_pond_desc =
+                "Pond execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing";
+            if let Some(ref d) = cur_pond_desc {
+                if d != target_pond_desc {
+                    let _ = conn.execute(
+                        "UPDATE system_config
+                         SET description = ?1
+                         WHERE config_key = 'pond_execution_mode';",
+                        params![target_pond_desc],
+                    );
+                }
+            }
+            Ok(())
+        });
     }
 
     pub fn run_migrations(&self) -> Result<Vec<String>> {
@@ -388,6 +699,8 @@ impl DatabaseManager {
             "sql/migrations/002_v020_order_fsm.sql",
             "sql/migrations/003_v020_schema_versioning.sql",
             "sql/migrations/004_v020_rc2_remediation.sql",
+            "sql/migrations/005_v030_pp50_two_book.sql",
+            "sql/migrations/006_v030_review_remediation.sql",
         ];
         let mut applied = Vec::new();
         for rel in migrations {
@@ -438,7 +751,11 @@ impl DatabaseManager {
         let sql_script = fs::read_to_string(&mig_path)?;
 
         self.with_conn(|conn| {
-            if file_name.starts_with("003_") || file_name.starts_with("004_") {
+            if file_name.starts_with("003_")
+                || file_name.starts_with("004_")
+                || file_name.starts_with("005_")
+                || file_name.starts_with("006_")
+            {
                 for prereq in [
                     "sql/migrations/001_v020_config_expansion.sql",
                     "sql/migrations/002_v020_order_fsm.sql",
@@ -450,10 +767,29 @@ impl DatabaseManager {
                         }
                     }
                 }
-                if file_name.starts_with("004_") {
+                if file_name.starts_with("004_")
+                    || file_name.starts_with("005_")
+                    || file_name.starts_with("006_")
+                {
                     let p3 = root.join("sql/migrations/003_v020_schema_versioning.sql");
                     if p3.exists() {
                         if let Ok(s) = fs::read_to_string(&p3) {
+                            Self::execute_sql_idempotent(conn, &s)?;
+                        }
+                    }
+                }
+                if file_name.starts_with("005_") || file_name.starts_with("006_") {
+                    let p4 = root.join("sql/migrations/004_v020_rc2_remediation.sql");
+                    if p4.exists() {
+                        if let Ok(s) = fs::read_to_string(&p4) {
+                            Self::execute_sql_idempotent(conn, &s)?;
+                        }
+                    }
+                }
+                if file_name.starts_with("006_") {
+                    let p5 = root.join("sql/migrations/005_v030_pp50_two_book.sql");
+                    if p5.exists() {
+                        if let Ok(s) = fs::read_to_string(&p5) {
                             Self::execute_sql_idempotent(conn, &s)?;
                         }
                     }
@@ -486,6 +822,7 @@ impl DatabaseManager {
             Ok(())
         })?;
 
+        self.reconcile_routing_config();
         let integrity = self.verify_integrity()?;
         let _ = self.log_telemetry(
             "INFO",
@@ -510,6 +847,13 @@ impl DatabaseManager {
             let config_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM system_config;", [], |r| r.get(0))
                 .unwrap_or(0);
+            let pond_config_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM system_config WHERE category IN ('pond', 'settling') OR config_key LIKE 'platform_pp50%' OR config_key = 'platform_settle_gate_enabled';",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             let usdc_perp_count: i64 = conn
                 .query_row("SELECT COUNT(*) FROM v_universe_usdc_perp;", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -521,6 +865,18 @@ impl DatabaseManager {
                 .unwrap_or(0);
             let total_universe: i64 = conn
                 .query_row("SELECT COUNT(*) FROM universe_assets;", [], |r| r.get(0))
+                .unwrap_or(0);
+            let books_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM books;", [], |r| r.get(0))
+                .unwrap_or(0);
+            let pond_universe_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pond_universe;", [], |r| r.get(0))
+                .unwrap_or(0);
+            let pond_champions_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pond_champions;", [], |r| r.get(0))
+                .unwrap_or(0);
+            let pond_cells_open_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM v_pond_cells_open;", [], |r| r.get(0))
                 .unwrap_or(0);
             let has_mig: Option<String> = conn
                 .query_row(
@@ -544,10 +900,15 @@ impl DatabaseManager {
             Ok(json!({
                 "journal_mode": journal_mode.to_ascii_lowercase(),
                 "system_config_count": config_count,
+                "pond_config_count": pond_config_count,
                 "v_universe_usdc_perp_count": usdc_perp_count,
                 "v_universe_btc_synth_count": btc_synth_count,
                 "v_universe_alt_pairs_count": alt_pairs_count,
                 "universe_assets_total": total_universe,
+                "books_count": books_count,
+                "pond_universe_count": pond_universe_count,
+                "pond_champions_count": pond_champions_count,
+                "pond_cells_open_count": pond_cells_open_count,
                 "schema_version": schema_version,
             }))
         })
@@ -558,52 +919,73 @@ impl DatabaseManager {
         Ok(v.get("schema_version").and_then(|x| x.as_i64()).unwrap_or(0))
     }
 
+    fn resolve_cached_fernet_state(&self) -> Result<CachedFernetState> {
+        let current_env = std::env::var("AEGIS_MASTER_KEY")
+            .ok()
+            .filter(|s| is_usable_env_key(s))
+            .or_else(|| {
+                std::env::var("FERNET_MASTER_KEY")
+                    .ok()
+                    .filter(|s| is_usable_env_key(s))
+            })
+            .map(|s| s.trim().to_string());
+
+        if let Some(cached) = self.cipher_cache.read().clone() {
+            if cached.env_override == current_env {
+                return Ok(cached);
+            }
+        }
+
+        let explicit = self.explicit_master_key.lock().clone();
+        let eff_db_path = if self.is_memory {
+            None
+        } else {
+            Some(self.db_path.as_path())
+        };
+        let (key_b64, is_explicit) = resolve_fernet_master_key(explicit.as_deref(), eff_db_path);
+        if is_legacy_public_fallback_key(&key_b64) {
+            return Err(AegisError::SecurityViolation(
+                "FATAL SECURITY VIOLATION: Retired public hardcoded fallback master key detected. Rotate or provision a CSPRNG .aegis_master_key."
+                    .to_string(),
+            ));
+        }
+        let cipher = FernetCipher::from_key_str(&key_b64)?;
+        let state = CachedFernetState {
+            key_b64,
+            is_explicit,
+            env_override: current_env,
+            cipher,
+        };
+        *self.cipher_cache.write() = Some(state.clone());
+        Ok(state)
+    }
+
     /// Retrieve or derive the Fernet encryption master key, enforcing mandatory explicit key
-    /// presence in `LIVE` and `TESTNET` modes when `enforce_master_key` is enabled.
+    /// presence (`S1`, `R5`).
     pub fn get_master_fernet_key(&self) -> Result<String> {
         let cfg = self.load_config_opts(false)?;
         let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let enforce_key = cfg.get_bool("enforce_master_key", true);
 
-        let explicit = self.explicit_master_key.lock().clone();
-        let root_db_dir = resolve_project_root().join("data").join("aegis_quant.db");
-        let eff_db_path = if self.is_memory && (exec_mode == "LIVE" || exec_mode == "TESTNET") {
-            Some(root_db_dir.as_path())
-        } else if self.is_memory {
-            None
-        } else {
-            Some(self.db_path.as_path())
-        };
-
-        let (key_b64, is_explicit) = resolve_fernet_master_key(explicit.as_deref(), eff_db_path);
+        let state = self.resolve_cached_fernet_state()?;
         if !self.is_memory
-            && (exec_mode == "LIVE" || exec_mode == "TESTNET")
-            && enforce_key
-            && !is_explicit
+            && (enforce_key || exec_mode == "LIVE" || exec_mode == "TESTNET")
+            && !state.is_explicit
         {
             let msg = format!(
-                "FATAL SECURITY VIOLATION: Execution mode is '{exec_mode}' but no explicit \
-                 AEGIS_MASTER_KEY environment variable or systemd credential was provided. \
-                 Refusing to run with the hardcoded fallback key."
+                "FATAL SECURITY VIOLATION: Execution mode is '{exec_mode}' (enforce_master_key={enforce_key}) \
+                 but no explicit AEGIS_MASTER_KEY environment variable, systemd credential, or .aegis_master_key \
+                 keyfile was provided."
             );
             let _ = self.log_telemetry("CRITICAL", "database", &msg, None);
             return Err(AegisError::SecurityViolation(msg));
         }
-        Ok(key_b64)
+        Ok(state.key_b64)
     }
 
     fn get_fernet(&self) -> Result<FernetCipher> {
-        let explicit = self.explicit_master_key.lock().clone();
-        let key_b64 = match self.get_master_fernet_key() {
-            Ok(k) => k,
-            Err(AegisError::SecurityViolation(msg)) => {
-                return Err(AegisError::SecurityViolation(msg))
-            }
-            Err(_) => {
-                resolve_fernet_master_key(explicit.as_deref(), Some(&self.db_path)).0
-            }
-        };
-        FernetCipher::from_key_str(&key_b64)
+        let _ = self.get_master_fernet_key()?;
+        Ok(self.resolve_cached_fernet_state()?.cipher)
     }
 
     pub fn encrypt_config_value(&self, plaintext: &str) -> Result<String> {
@@ -619,6 +1001,7 @@ impl DatabaseManager {
         cipher.encrypt(val.as_bytes())
     }
 
+    /// Decrypt a Fernet-encrypted `system_config` value without any silent fallback-key downgrade (`S2`).
     pub fn decrypt_config_value(&self, raw_value: &str) -> Result<String> {
         let s = raw_value.trim();
         if s.is_empty() {
@@ -629,21 +1012,7 @@ impl DatabaseManager {
             return Ok(s.to_string());
         }
         let cipher = self.get_fernet()?;
-        match cipher.decrypt(token) {
-            Ok(plain) => Ok(plain),
-            Err(e) => {
-                let is_explicit = self.explicit_master_key.lock().is_some();
-                let default_b64 = default_host_fernet_key_b64();
-                if !is_explicit && cipher.key_b64() != default_b64 {
-                    if let Ok(fallback) = FernetCipher::from_key_str(&default_b64) {
-                        if let Ok(plain) = fallback.decrypt(token) {
-                            return Ok(plain);
-                        }
-                    }
-                }
-                Err(e)
-            }
-        }
+        cipher.decrypt(token)
     }
 
     pub fn try_decrypt_or_empty(&self, raw_value: &str) -> String {
@@ -657,9 +1026,52 @@ impl DatabaseManager {
         self.decrypt_config_value(s).unwrap_or_default()
     }
 
+    /// Return the decrypted wallet `private_key` wrapped in `Zeroizing<String>` so secret bytes
+    /// are wiped from memory on drop (`S10`).
+    pub fn get_signing_private_key(&self) -> Result<Zeroizing<String>> {
+        let raw = self.get_raw_config_value("private_key")?.unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Zeroizing::new(String::new()));
+        }
+        let plain = self.decrypt_config_value(trimmed)?;
+        Ok(Zeroizing::new(plain))
+    }
+
     pub fn rotate_master_key(&self, new_master_key: &str) -> Result<Value> {
-        let new_b64 = normalize_fernet_key(new_master_key.as_bytes());
+        self.rotate_master_key_with_old(None, new_master_key)
+    }
+
+    /// Atomically rotate the Fernet master key across all sensitive `system_config` rows,
+    /// honouring an optional explicit `old_master_key`, verifying round-trip decryption before
+    /// committing, and updating `<db_dir>/.aegis_master_key` (`S5`).
+    pub fn rotate_master_key_with_old(
+        &self,
+        old_master_key: Option<&str>,
+        new_master_key: &str,
+    ) -> Result<Value> {
+        let new_trimmed = new_master_key.trim();
+        if new_trimmed.is_empty() {
+            return Err(AegisError::Validation(
+                "New master key cannot be empty.".to_string(),
+            ));
+        }
+        if is_legacy_public_fallback_key(new_trimmed) {
+            return Err(AegisError::SecurityViolation(
+                "Refusing to rotate to retired public fallback master key.".to_string(),
+            ));
+        }
+        let new_b64 = normalize_fernet_key(new_trimmed.as_bytes());
         let new_cipher = FernetCipher::from_key_str(&new_b64)?;
+
+        let old_cipher = match old_master_key.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(old_raw) => {
+                let old_b64 = normalize_fernet_key(old_raw.as_bytes());
+                FernetCipher::from_key_str(&old_b64)?
+            }
+            None => self.resolve_cached_fernet_state()?.cipher,
+        };
+
         let sensitive: HashSet<&str> = SENSITIVE_CONFIG_KEYS.iter().copied().collect();
 
         let rows: Vec<(String, String)> = self.with_conn(|conn| {
@@ -677,18 +1089,41 @@ impl DatabaseManager {
             Ok(iter.flatten().collect())
         })?;
 
-        let mut re_encrypted = Vec::new();
+        let mut updates: Vec<(String, String)> = Vec::new();
         for (k, raw_v) in rows {
-            if !sensitive.contains(k.as_str()) || raw_v.trim().is_empty() {
+            let trimmed = raw_v.trim();
+            if !sensitive.contains(k.as_str()) || trimmed.is_empty() {
                 continue;
             }
-            let plain = self.try_decrypt_or_empty(&raw_v);
+            let plain = Zeroizing::new(if is_encrypted_value(trimmed) {
+                let token = trimmed.strip_prefix("ENC:").unwrap_or(trimmed);
+                old_cipher.decrypt(token).map_err(|e| {
+                    AegisError::Crypto(format!(
+                        "Failed to decrypt sensitive key '{k}' with old master key during rotation: {e}"
+                    ))
+                })?
+            } else {
+                trimmed.to_string()
+            });
             if plain.is_empty() {
                 continue;
             }
             let enc_v = new_cipher.encrypt(plain.as_bytes())?;
-            self.with_conn(|conn| {
-                conn.execute(
+            let verified = Zeroizing::new(new_cipher.decrypt(&enc_v)?);
+            if *verified != *plain {
+                return Err(AegisError::Crypto(format!(
+                    "Round-trip verification failed for rotated key '{k}'"
+                )));
+            }
+            updates.push((k, enc_v));
+        }
+
+        self.with_conn(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            for (k, enc_v) in &updates {
+                tx.execute(
                     "UPDATE system_config
                      SET config_value = ?1,
                          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -696,15 +1131,27 @@ impl DatabaseManager {
                     params![enc_v, k],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
-                Ok(())
-            })?;
-            re_encrypted.push(k);
-        }
+            }
+            tx.commit()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })?;
+
+        let mut re_encrypted: Vec<String> = updates.into_iter().map(|(k, _)| k).collect();
         re_encrypted.sort();
-        *self.explicit_master_key.lock() = Some(new_master_key.to_string());
+
+        if !self.is_memory {
+            let key_path = master_key_file_for_db(&self.db_path);
+            write_master_key_file(&key_path, &new_b64)?;
+        }
+
+        *self.explicit_master_key.lock() = Some(new_b64);
+        *self.cipher_cache.write() = None;
+
         Ok(json!({
             "status": "ROTATED",
             "re_encrypted_keys": re_encrypted,
+            "rotated_count": re_encrypted.len(),
         }))
     }
 
@@ -721,6 +1168,7 @@ impl DatabaseManager {
     }
 
     pub fn load_config(&self) -> Result<ConfigMap> {
+        self.reconcile_routing_config();
         self.load_config_opts(true)
     }
 
@@ -742,10 +1190,26 @@ impl DatabaseManager {
             Ok(iter.flatten().collect())
         })?;
 
+        let cipher_opt = if decrypt {
+            self.resolve_cached_fernet_state().ok().map(|s| s.cipher)
+        } else {
+            None
+        };
+
         let mut map = ConfigMap::new();
         for (k, raw_v, vtype) in rows {
-            let eff_val = if decrypt && is_encrypted_value(&raw_v) {
-                self.try_decrypt_or_empty(&raw_v)
+            // S10: Never decrypt `private_key` into general-purpose `ConfigMap` clones;
+            // signing callers must use `get_signing_private_key()` which returns `Zeroizing<String>`.
+            let eff_val = if k == "private_key" {
+                raw_v
+            } else if decrypt && is_encrypted_value(&raw_v) {
+                let s = raw_v.trim();
+                let token = s.strip_prefix("ENC:").unwrap_or(s);
+                if let Some(ref c) = cipher_opt {
+                    c.decrypt(token).unwrap_or_default()
+                } else {
+                    self.try_decrypt_or_empty(&raw_v)
+                }
             } else {
                 raw_v
             };
@@ -755,7 +1219,9 @@ impl DatabaseManager {
     }
 
     pub fn get_config_rows(&self, mask_secrets: bool) -> Result<Vec<Value>> {
+        self.reconcile_routing_config();
         let sensitive: HashSet<&str> = SENSITIVE_CONFIG_KEYS.iter().copied().collect();
+        let immutable: HashSet<&str> = IMMUTABLE_SECURITY_CONFIG_KEYS.iter().copied().collect();
         let rows: Vec<(String, String, String, String, String, String)> =
             self.with_conn(|conn| {
                 let mut stmt = conn
@@ -803,6 +1269,7 @@ impl DatabaseManager {
                 "category": category,
                 "description": description,
                 "updated_at": updated_at,
+                "immutable": immutable.contains(key.as_str()),
             }));
         }
         Ok(out)
@@ -821,7 +1288,7 @@ impl DatabaseManager {
             other => other.to_string(),
         };
 
-        // Route credential keys through validation
+        // Route credential and routing-mode keys through unified validation & synchronization
         match key {
             "wallet_address" => {
                 self.configure_hyperliquid_credentials(
@@ -900,7 +1367,7 @@ impl DatabaseManager {
                 )?;
                 return Ok(true);
             }
-            "execution_mode" => {
+            "execution_mode" | "pond_execution_mode" => {
                 let req_creds = self.get_schema_version().unwrap_or(0) < 4;
                 self.configure_hyperliquid_credentials(
                     None,
@@ -912,6 +1379,27 @@ impl DatabaseManager {
                     req_creds,
                 )?;
                 return Ok(true);
+            }
+            "environment" => {
+                let norm_env = val_str.trim().to_ascii_lowercase();
+                if norm_env != "sandbox" && norm_env != "production" {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid environment '{val_str}': must be 'sandbox' or 'production'."
+                    )));
+                }
+                let cur_cfg = self.load_config_opts(false)?;
+                let cur_mode = cur_cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+                let expected_env =
+                    if cur_mode == "LIVE" && !cur_cfg.get_bool("hyperliquid_testnet", false) {
+                        "production"
+                    } else {
+                        "sandbox"
+                    };
+                if norm_env != expected_env {
+                    return Err(AegisError::Validation(format!(
+                        "Conflicting configuration: environment='{norm_env}' conflicts with execution_mode='{cur_mode}' (expected '{expected_env}'). Change execution_mode instead."
+                    )));
+                }
             }
             _ => {}
         }
@@ -1014,6 +1502,11 @@ impl DatabaseManager {
                         "Invalid initial_equity_usdc: must be > 0.0.".to_string(),
                     ));
                 }
+                if key == "settling_split_pct" && (f <= 0.0 || f >= 1.0) {
+                    return Err(AegisError::Validation(
+                        "Invalid settling_split_pct: must be in (0.0, 1.0).".to_string(),
+                    ));
+                }
                 f.to_string()
             }
             _ => {
@@ -1023,7 +1516,14 @@ impl DatabaseManager {
                         "Invalid empty string value for '{key}'"
                     )));
                 }
-                s
+                if key == "pond_direction_policy" {
+                    let pol = PondDirectionPolicy::parse(&s)?;
+                    pol.as_str().to_string()
+                } else if key == "environment" {
+                    s.to_ascii_lowercase()
+                } else {
+                    s
+                }
             }
         };
 
@@ -1054,11 +1554,10 @@ impl DatabaseManager {
                         let _ = conn.execute(
                             "UPDATE portfolio_snapshots
                              SET total_equity_usdc = ?1,
-                                 available_cash_usdc = ?2,
-                                 accrued_yield_usdc = 0.0,
-                                 basis_harvest_notional_usdc = 0.0
+                                 available_cash_usdc = ROUND(MAX(0.0, ?1 - COALESCE(basis_harvest_notional_usdc, 0.0)), 2),
+                                 accrued_yield_usdc = 0.0
                              WHERE deployed_notional_usdc = 0.0;",
-                            params![new_base_eq, new_base_eq],
+                            params![new_base_eq],
                         );
                     }
                 }
@@ -1067,7 +1566,10 @@ impl DatabaseManager {
         })
     }
 
-    pub fn scale_risk_caps_for_equity(&self, initial_equity_usdc: f64) -> Result<HashMap<String, f64>> {
+    pub fn scale_risk_caps_for_equity(
+        &self,
+        initial_equity_usdc: f64,
+    ) -> Result<HashMap<String, f64>> {
         if !initial_equity_usdc.is_finite() || initial_equity_usdc <= 0.0 {
             return Err(AegisError::Validation(format!(
                 "Invalid initial_equity_usdc '{initial_equity_usdc}': must be > 0.0."
@@ -1079,16 +1581,46 @@ impl DatabaseManager {
         let gross_lev = cfg.get_f64("max_gross_leverage", 1.5);
         let scale_min = cfg.get_f64("conviction_scale_min", 0.5);
         let scale_max = cfg.get_f64("conviction_scale_max", 1.5);
-        let baseline_risk = round_dp(initial_equity_usdc * 0.01, 2);
+
+        let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
+        let pit_book_eq = round_dp(initial_equity_usdc * split_pct, 2);
+        let baseline_risk = round_dp(pit_book_eq * 0.01, 2);
+
+        let pond_book_eq = round_dp(initial_equity_usdc * (1.0 - split_pct), 2);
+        let pond_heat_pct = cfg.get_f64("pond_max_heat_pct", 0.04);
+        let pond_cell_pct = cfg.get_f64("pond_max_cell_pct", 0.25);
+        let pond_scale_min = cfg.get_f64("pond_conviction_scale_min", 0.5);
+        let pond_scale_max = cfg.get_f64("pond_conviction_scale_max", 1.5);
+        let pond_baseline_risk = round_dp(pond_book_eq * 0.01, 2);
 
         let pairs = [
             ("initial_equity_usdc", round_dp(initial_equity_usdc, 2)),
             ("baseline_risk_per_trade_usdc", baseline_risk),
             ("min_risk_per_trade_usdc", round_dp(baseline_risk * scale_min, 2)),
             ("max_risk_per_trade_usdc", round_dp(baseline_risk * scale_max, 2)),
-            ("max_portfolio_heat_usdc", round_dp(initial_equity_usdc * heat_pct, 2)),
-            ("max_single_asset_notional_usdc", round_dp(initial_equity_usdc * single_pct, 2)),
-            ("max_gross_leverage_notional_usdc", round_dp(initial_equity_usdc * gross_lev, 2)),
+            ("max_portfolio_heat_usdc", round_dp(pit_book_eq * heat_pct, 2)),
+            (
+                "max_single_asset_notional_usdc",
+                round_dp(pit_book_eq * single_pct, 2),
+            ),
+            (
+                "max_gross_leverage_notional_usdc",
+                round_dp(pit_book_eq * gross_lev, 2),
+            ),
+            ("pond_baseline_risk_usdc", pond_baseline_risk),
+            (
+                "pond_min_risk_usdc",
+                round_dp(pond_baseline_risk * pond_scale_min, 2),
+            ),
+            (
+                "pond_max_risk_usdc",
+                round_dp(pond_baseline_risk * pond_scale_max, 2),
+            ),
+            ("pond_max_heat_usdc", round_dp(pond_book_eq * pond_heat_pct, 2)),
+            (
+                "pond_max_cell_notional_usdc",
+                round_dp(pond_book_eq * pond_cell_pct, 2),
+            ),
         ];
 
         let mut out = HashMap::new();
@@ -1104,8 +1636,27 @@ impl DatabaseManager {
         updates: &HashMap<String, Value>,
         scale_risk_caps: bool,
     ) -> Result<Vec<String>> {
+        let mut ordered_keys: Vec<&String> = updates.keys().collect();
+        ordered_keys.sort_by(|a, b| {
+            let prio = |k: &str| -> u8 {
+                match k {
+                    "wallet_address"
+                    | "private_key"
+                    | "hyperliquid_vault_address"
+                    | "gemini_api_key" => 0,
+                    "hyperliquid_testnet" => 2,
+                    "pond_execution_mode" => 3,
+                    "execution_mode" => 4,
+                    "environment" => 5,
+                    _ => 1,
+                }
+            };
+            prio(a.as_str()).cmp(&prio(b.as_str())).then_with(|| a.cmp(b))
+        });
+
         let mut updated_keys = Vec::new();
-        for (k, v) in updates {
+        for k in ordered_keys {
+            let v = &updates[k];
             let ok = self.set_config_value(k, v)?;
             if !ok {
                 return Err(AegisError::NotFound(format!("Unknown config_key: {k}")));
@@ -1130,42 +1681,66 @@ impl DatabaseManager {
     }
 
     pub fn get_credentials_status(&self) -> Result<Value> {
+        self.reconcile_routing_config();
         let cfg = self.load_config()?;
         let wallet = cfg.get_str("wallet_address", "");
-        let priv_key = self.try_decrypt_or_empty(&cfg.get_str("private_key", ""));
+        let priv_key = self.get_signing_private_key().unwrap_or_default();
         let vault = cfg.get_str("hyperliquid_vault_address", "");
-        let gemini_key = self.try_decrypt_or_empty(&cfg.get_str("gemini_api_key", ""));
-        let tg_token = self.try_decrypt_or_empty(&cfg.get_str("telegram_bot_token", ""));
+        let gemini_key =
+            Zeroizing::new(self.try_decrypt_or_empty(&cfg.get_str("gemini_api_key", "")));
+        let tg_token =
+            Zeroizing::new(self.try_decrypt_or_empty(&cfg.get_str("telegram_bot_token", "")));
         let tg_chat_id = cfg.get_str("telegram_chat_id", "");
         let dd_alert_pct = cfg.get_f64("max_daily_drawdown_alert_pct", 0.03);
 
         let raw_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || raw_mode == "TESTNET";
+        let testnet_flag = cfg.get_bool("hyperliquid_testnet", false);
+        let effective_mode = if raw_mode == "TESTNET" || (raw_mode == "LIVE" && testnet_flag) {
+            "TESTNET".to_string()
+        } else if raw_mode == "LIVE" {
+            "LIVE".to_string()
+        } else {
+            "PAPER".to_string()
+        };
+        let is_testnet = match effective_mode.as_str() {
+            "TESTNET" => true,
+            "LIVE" => false,
+            _ => testnet_flag,
+        };
 
-        let wallet_valid = !wallet.is_empty() && validate_evm_address(&wallet, "wallet_address").is_ok();
+        let wallet_valid =
+            !wallet.is_empty() && validate_evm_address(&wallet, "wallet_address").is_ok();
         let priv_valid = !priv_key.is_empty() && validate_private_key(&priv_key).is_ok();
         let credentials_ready = wallet_valid && priv_valid;
 
         let network = if is_testnet { "testnet" } else { "mainnet" };
         let api_endpoint = if is_testnet {
-            "https://api.hyperliquid-testnet.xyz"
+            let fallback = cfg.get_str(
+                "hyperliquid_testnet_url",
+                "https://api.hyperliquid-testnet.xyz",
+            );
+            cfg.get_str("hyperliquid_testnet_api_url", &fallback)
         } else {
-            "https://api.hyperliquid.xyz"
+            let fallback = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
+            cfg.get_str("hyperliquid_mainnet_api_url", &fallback)
         };
-        let active_routing = if (raw_mode == "LIVE" || raw_mode == "TESTNET") && credentials_ready {
-            if is_testnet {
-                "LIVE_TESTNET"
+        let active_routing =
+            if (effective_mode == "LIVE" || effective_mode == "TESTNET") && credentials_ready {
+                if is_testnet {
+                    "LIVE_TESTNET"
+                } else {
+                    "LIVE_MAINNET"
+                }
             } else {
-                "LIVE_MAINNET"
-            }
-        } else {
-            "PAPER_SIMULATION"
-        };
+                "PAPER_SIMULATION"
+            };
 
+        let pond_mode = cfg.get_str("pond_execution_mode", &effective_mode);
         Ok(json!({
             "exchange_id": cfg.get_str("exchange_id", "hyperliquid"),
             "environment": cfg.get_str("environment", "sandbox"),
-            "execution_mode": raw_mode,
+            "execution_mode": effective_mode,
+            "pond_execution_mode": pond_mode,
             "hyperliquid_testnet": is_testnet,
             "network": network,
             "api_endpoint": api_endpoint,
@@ -1194,12 +1769,12 @@ impl DatabaseManager {
         max_daily_drawdown_alert_pct: Option<f64>,
     ) -> Result<Value> {
         if let Some(tok) = telegram_bot_token {
-            let plain = if is_encrypted_value(tok) {
+            let plain = Zeroizing::new(if is_encrypted_value(tok) {
                 self.decrypt_config_value(tok)?
             } else {
                 tok.trim().to_string()
-            };
-            self.set_config_value("telegram_bot_token", &json!(plain))?;
+            });
+            self.set_config_value("telegram_bot_token", &json!(&*plain))?;
         }
         if let Some(cid) = telegram_chat_id {
             self.set_config_value("telegram_chat_id", &json!(cid.trim()))?;
@@ -1232,11 +1807,11 @@ impl DatabaseManager {
             updates.insert("wallet_address", validate_evm_address(w, "wallet_address")?);
         }
         if let Some(pk) = private_key {
-            let raw_pk = if is_encrypted_value(pk) {
+            let raw_pk = Zeroizing::new(if is_encrypted_value(pk) {
                 self.decrypt_config_value(pk)?
             } else {
                 pk.to_string()
-            };
+            });
             updates.insert("private_key", validate_private_key(&raw_pk)?);
         }
         if let Some(v) = hyperliquid_vault_address {
@@ -1261,17 +1836,49 @@ impl DatabaseManager {
         }
         if let Some(mode_str) = execution_mode {
             let mode = ExecutionMode::parse(mode_str)?;
-            if mode == ExecutionMode::Testnet {
-                if updates.get("hyperliquid_testnet").map(String::as_str) == Some("false") {
-                    return Err(AegisError::Validation(
-                        "Conflicting configuration: execution_mode='TESTNET' cannot be combined with hyperliquid_testnet=False."
-                            .to_string(),
-                    ));
+            match mode {
+                ExecutionMode::Testnet => {
+                    if updates.get("hyperliquid_testnet").map(String::as_str) == Some("false") {
+                        return Err(AegisError::Validation(
+                            "Conflicting configuration: execution_mode='TESTNET' cannot be combined with hyperliquid_testnet=False."
+                                .to_string(),
+                        ));
+                    }
+                    updates.insert("execution_mode", "TESTNET".to_string());
+                    updates.insert("hyperliquid_testnet", "true".to_string());
+                    updates.insert("pond_execution_mode", "TESTNET".to_string());
+                    updates.insert("environment", "sandbox".to_string());
                 }
+                ExecutionMode::Live => {
+                    if updates.get("hyperliquid_testnet").map(String::as_str) == Some("true") {
+                        updates.insert("execution_mode", "TESTNET".to_string());
+                        updates.insert("hyperliquid_testnet", "true".to_string());
+                        updates.insert("pond_execution_mode", "TESTNET".to_string());
+                        updates.insert("environment", "sandbox".to_string());
+                    } else {
+                        updates.insert("execution_mode", "LIVE".to_string());
+                        updates.insert("hyperliquid_testnet", "false".to_string());
+                        updates.insert("pond_execution_mode", "LIVE".to_string());
+                        updates.insert("environment", "production".to_string());
+                    }
+                }
+                ExecutionMode::Paper => {
+                    updates.insert("execution_mode", "PAPER".to_string());
+                    updates.insert("pond_execution_mode", "PAPER".to_string());
+                    updates.insert("environment", "sandbox".to_string());
+                }
+            }
+        } else if let Some(tn) = hyperliquid_testnet {
+            let cur_cfg = self.load_config_opts(false)?;
+            let cur_mode = cur_cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+            if tn && cur_mode == "LIVE" {
+                updates.insert("execution_mode", "TESTNET".to_string());
+                updates.insert("pond_execution_mode", "TESTNET".to_string());
+                updates.insert("environment", "sandbox".to_string());
+            } else if !tn && cur_mode == "TESTNET" {
                 updates.insert("execution_mode", "LIVE".to_string());
-                updates.insert("hyperliquid_testnet", "true".to_string());
-            } else {
-                updates.insert("execution_mode", mode.as_str().to_string());
+                updates.insert("pond_execution_mode", "LIVE".to_string());
+                updates.insert("environment", "production".to_string());
             }
         }
 
@@ -1280,10 +1887,10 @@ impl DatabaseManager {
             .get("wallet_address")
             .cloned()
             .unwrap_or_else(|| current_cfg.get_str("wallet_address", ""));
-        let eff_priv = updates
-            .get("private_key")
-            .cloned()
-            .unwrap_or_else(|| current_cfg.get_str("private_key", ""));
+        let eff_priv = match updates.get("private_key") {
+            Some(pk) => Zeroizing::new(pk.clone()),
+            None => self.get_signing_private_key().unwrap_or_default(),
+        };
         let eff_mode = updates
             .get("execution_mode")
             .cloned()
@@ -1322,44 +1929,52 @@ impl DatabaseManager {
         self.get_credentials_status()
     }
 
+    /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest using an isolated `:memory:`
+    /// database for write/read round-trips so live credentials in `self` are never mutated (`S9`).
     pub fn test_encryption(&self) -> Result<Value> {
-        let sample_priv = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
-        let sample_gemini = "AIzaSyAegisQuantFernetVerifiedKey020rc1";
+        let active_key = self.get_master_fernet_key()?;
+        let cipher = self.get_fernet()?;
 
-        let prior_priv_raw = self.get_raw_config_value("private_key")?.unwrap_or_default();
-        let prior_gemini_raw = self.get_raw_config_value("gemini_api_key")?.unwrap_or_default();
-
-        let prior_priv_dec = self.try_decrypt_or_empty(&prior_priv_raw);
-        let prior_gemini_dec = self.try_decrypt_or_empty(&prior_gemini_raw);
-
-        let target_priv = if prior_priv_dec.is_empty() {
-            sample_priv
-        } else {
-            &prior_priv_dec
-        };
-        let target_gemini = if prior_gemini_dec.is_empty() {
-            sample_gemini
-        } else {
-            &prior_gemini_dec
-        };
-
-        self.set_config_value("private_key", &json!(target_priv))?;
-        self.set_config_value("gemini_api_key", &json!(target_gemini))?;
-
-        let raw_priv_on_disk = self.get_raw_config_value("private_key")?.unwrap_or_default();
-        let raw_gemini_on_disk = self.get_raw_config_value("gemini_api_key")?.unwrap_or_default();
-
-        let priv_enc_ok = is_encrypted_value(&raw_priv_on_disk) && raw_priv_on_disk != target_priv;
-        let gemini_enc_ok =
-            is_encrypted_value(&raw_gemini_on_disk) && raw_gemini_on_disk != target_gemini;
-
-        let dec_cfg = self.load_config()?;
-        let priv_dec_ok = dec_cfg.get_str("private_key", "") == target_priv;
-        let gemini_dec_ok = dec_cfg.get_str("gemini_api_key", "") == target_gemini;
-
-        if prior_priv_dec.is_empty() {
-            self.set_config_value("private_key", &json!(""))?;
+        // 1. Read-only verification of any existing sensitive keys on `self`
+        for &key in SENSITIVE_CONFIG_KEYS {
+            if let Some(raw_val) = self.get_raw_config_value(key)? {
+                let trimmed = raw_val.trim();
+                if !trimmed.is_empty() {
+                    if !is_encrypted_value(trimmed) {
+                        return Err(AegisError::Crypto(format!(
+                            "Sensitive key '{key}' is stored unencrypted on disk."
+                        )));
+                    }
+                    let token = trimmed.strip_prefix("ENC:").unwrap_or(trimmed);
+                    let _ = Zeroizing::new(cipher.decrypt(token)?);
+                }
+            }
         }
+
+        // 2. Isolated `:memory:` write/read round-trip test using the active key
+        let iso_db = Self::with_paths(":memory:", &self.schema_path, Some(active_key));
+        iso_db.initialize_schema(false)?;
+
+        let sample_priv = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let sample_gemini = "AIzaSyAegisQuantFernetVerifiedKey030rc1";
+
+        iso_db.set_config_value("private_key", &json!(sample_priv))?;
+        iso_db.set_config_value("gemini_api_key", &json!(sample_gemini))?;
+
+        let raw_priv_on_disk = iso_db.get_raw_config_value("private_key")?.unwrap_or_default();
+        let raw_gemini_on_disk = iso_db
+            .get_raw_config_value("gemini_api_key")?
+            .unwrap_or_default();
+
+        let priv_enc_ok = is_encrypted_value(&raw_priv_on_disk) && raw_priv_on_disk != sample_priv;
+        let gemini_enc_ok =
+            is_encrypted_value(&raw_gemini_on_disk) && raw_gemini_on_disk != sample_gemini;
+
+        let dec_cfg = iso_db.load_config()?;
+        let dec_priv = iso_db.get_signing_private_key()?;
+        let priv_dec_ok =
+            *dec_priv == sample_priv && dec_cfg.get_str("private_key", "") != sample_priv;
+        let gemini_dec_ok = dec_cfg.get_str("gemini_api_key", "") == sample_gemini;
 
         if !(priv_enc_ok && gemini_enc_ok && priv_dec_ok && gemini_dec_ok) {
             return Err(AegisError::Crypto(
@@ -1376,1007 +1991,419 @@ impl DatabaseManager {
             "is_fernet_token": true,
             "unencrypted_on_disk": false,
             "transparent_decryption_verified": true,
+            "isolated_self_test": true,
             "schema_version": self.get_schema_version()?,
         });
         let _ = self.log_telemetry(
             "INFO",
             "engine.database",
-            "Verified Fernet AES-128 configuration encryption at rest",
+            "Verified Fernet AES-128 configuration encryption at rest (isolated self-test)",
             Some(report.clone()),
         );
         Ok(report)
     }
+}
 
-    pub fn get_usdc_perp_universe(&self) -> Result<Vec<UniverseAsset>> {
-        self.query_universe_view("SELECT * FROM v_universe_usdc_perp;")
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn get_btc_synth_universe(&self) -> Result<Vec<UniverseAsset>> {
-        self.query_universe_view("SELECT * FROM v_universe_btc_synth;")
-    }
+    const VALID_WALLET: &str = "0xef377c1d5444786236aa34fa72e5879372e0eaec";
+    const VALID_PK: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
 
-    fn query_universe_view(&self, sql: &str) -> Result<Vec<UniverseAsset>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map([], |r| {
-                    Ok(UniverseAsset {
-                        asset_id: r.get("asset_id")?,
-                        symbol: r.get("symbol")?,
-                        base_asset: r.get("base_asset")?,
-                        quote_asset: r.get("quote_asset")?,
-                        instrument_type: r.get("instrument_type")?,
-                        tier: r.get("tier")?,
-                        tier_name: r.get("tier_name")?,
-                        exec_timeframe: r.get("exec_timeframe")?,
-                        rs_timeframe: r.get("rs_timeframe")?,
-                        tick_size: r.get("tick_size")?,
-                        lot_step_size: r.get("lot_step_size")?,
-                        min_notional_usdc: r.get("min_notional_usdc")?,
-                        max_leverage: r.get("max_leverage")?,
-                        is_active: r.get("is_active")?,
-                        updated_at: r.get("updated_at")?,
-                    })
-                })
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
+    #[test]
+    fn test_execution_routing_mode_consistency_and_transitions() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
 
-    pub fn get_alt_pairs_universe(&self) -> Result<Vec<AltPairMetadata>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT * FROM v_universe_alt_pairs;")
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map([], |r| {
-                    Ok(AltPairMetadata {
-                        base_asset: r.get("base_asset")?,
-                        tier: r.get("tier")?,
-                        tier_name: r.get("tier_name")?,
-                        exec_symbol: r.get("exec_symbol")?,
-                        synth_symbol: r.get("synth_symbol")?,
-                        exec_timeframe: r.get("exec_timeframe")?,
-                        rs_timeframe: r.get("rs_timeframe")?,
-                        tick_size: r.get("tick_size")?,
-                        lot_step_size: r.get("lot_step_size")?,
-                        min_notional_usdc: r.get("min_notional_usdc")?,
-                        max_leverage: r.get("max_leverage")?,
-                    })
-                })
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
-
-    pub fn update_asset_timeframes(
-        &self,
-        base_asset: &str,
-        exec_timeframe: &str,
-        rs_timeframe: &str,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE universe_assets
-                 SET exec_timeframe = ?1,
-                     rs_timeframe = ?2,
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                 WHERE base_asset = ?3;",
-                params![exec_timeframe, rs_timeframe, base_asset],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn upsert_ohlcv_batch(&self, bars: &[OhlcvBar]) -> Result<usize> {
-        if bars.is_empty() {
-            return Ok(0);
-        }
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            {
-                let mut stmt = tx
-                    .prepare_cached(
-                        "INSERT INTO market_ohlcv (
-                            symbol, timeframe, timestamp_ms, open, high, low, close,
-                            volume, funding_rate_hourly, is_synthetic
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                        ON CONFLICT(symbol, timeframe, timestamp_ms) DO UPDATE SET
-                            open = excluded.open,
-                            high = excluded.high,
-                            low = excluded.low,
-                            close = excluded.close,
-                            volume = excluded.volume,
-                            funding_rate_hourly = excluded.funding_rate_hourly,
-                            is_synthetic = excluded.is_synthetic;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                for b in bars {
-                    stmt.execute(params![
-                        b.symbol,
-                        b.timeframe,
-                        b.timestamp_ms,
-                        b.open,
-                        b.high,
-                        b.low,
-                        b.close,
-                        b.volume,
-                        b.funding_rate_hourly,
-                        b.is_synthetic,
-                    ])
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                }
-            }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(bars.len())
-        })
-    }
-
-    pub fn get_ohlcv_bars(
-        &self,
-        symbol: &str,
-        timeframe: &str,
-        limit: usize,
-        max_timestamp_ms: Option<i64>,
-    ) -> Result<Vec<OhlcvBar>> {
-        let eff_max = max_timestamp_ms.or_else(|| self.get_pit_timestamp_ms());
-        self.with_conn(|conn| {
-            let mut bars: Vec<OhlcvBar> = if let Some(max_ts) = eff_max {
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT timestamp_ms, open, high, low, close, volume,
-                                funding_rate_hourly, is_synthetic
-                         FROM market_ohlcv
-                         WHERE symbol = ?1 AND timeframe = ?2 AND timestamp_ms <= ?3
-                         ORDER BY timestamp_ms DESC
-                         LIMIT ?4;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                let rows = stmt
-                    .query_map(params![symbol, timeframe, max_ts, limit as i64], |r| {
-                        Ok(OhlcvBar {
-                            symbol: symbol.to_string(),
-                            timeframe: timeframe.to_string(),
-                            timestamp_ms: r.get(0)?,
-                            open: r.get(1)?,
-                            high: r.get(2)?,
-                            low: r.get(3)?,
-                            close: r.get(4)?,
-                            volume: r.get(5)?,
-                            funding_rate_hourly: r.get(6)?,
-                            is_synthetic: r.get(7)?,
-                        })
-                    })
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                rows.flatten().collect()
-            } else {
-                let mut stmt = conn
-                    .prepare_cached(
-                        "SELECT timestamp_ms, open, high, low, close, volume,
-                                funding_rate_hourly, is_synthetic
-                         FROM market_ohlcv
-                         WHERE symbol = ?1 AND timeframe = ?2
-                         ORDER BY timestamp_ms DESC
-                         LIMIT ?3;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                let rows = stmt
-                    .query_map(params![symbol, timeframe, limit as i64], |r| {
-                        Ok(OhlcvBar {
-                            symbol: symbol.to_string(),
-                            timeframe: timeframe.to_string(),
-                            timestamp_ms: r.get(0)?,
-                            open: r.get(1)?,
-                            high: r.get(2)?,
-                            low: r.get(3)?,
-                            close: r.get(4)?,
-                            volume: r.get(5)?,
-                            funding_rate_hourly: r.get(6)?,
-                            is_synthetic: r.get(7)?,
-                        })
-                    })
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                rows.flatten().collect()
-            };
-            bars.reverse();
-            Ok(bars)
-        })
-    }
-
-    pub fn save_signal_evaluations(&self, evaluations: &[SignalEvaluation]) -> Result<()> {
-        if evaluations.is_empty() {
-            return Ok(());
-        }
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            {
-                let mut del_stmt = tx
-                    .prepare_cached(
-                        "DELETE FROM signal_evaluations WHERE timestamp_ms = ?1 AND base_asset = ?2;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                let mut stmt = tx
-                    .prepare_cached(
-                        "INSERT INTO signal_evaluations (
-                            timestamp_ms, base_asset, exec_symbol, synth_symbol,
-                            hmm_regime, prob_bull, prob_bear, prob_chop,
-                            snr_score, mace_score, blended_conviction,
-                            rs_rank, signal_action, funding_rate_hourly
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                for ev in evaluations {
-                    del_stmt
-                        .execute(params![ev.timestamp_ms, ev.base_asset])
-                        .map_err(|e| AegisError::Database(e.to_string()))?;
-                    stmt.execute(params![
-                        ev.timestamp_ms,
-                        ev.base_asset,
-                        ev.exec_symbol,
-                        ev.synth_symbol,
-                        ev.hmm_regime,
-                        ev.prob_bull,
-                        ev.prob_bear,
-                        ev.prob_chop,
-                        ev.snr_score,
-                        ev.mace_score,
-                        ev.blended_conviction,
-                        ev.rs_rank,
-                        ev.signal_action,
-                        ev.funding_rate_hourly,
-                    ])
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                }
-            }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn get_latest_signals(&self, limit: usize) -> Result<Vec<SignalEvaluation>> {
-        self.with_conn(|conn| {
-            let max_ts: Option<i64> = conn
-                .query_row(
-                    "SELECT MAX(timestamp_ms) FROM signal_evaluations;",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(|e| AegisError::Database(e.to_string()))?
-                .flatten();
-            let Some(ts) = max_ts else {
-                return Ok(Vec::new());
-            };
-            let mut stmt = conn
-                .prepare(
-                    "SELECT eval_id, timestamp_ms, base_asset, exec_symbol, synth_symbol,
-                            hmm_regime, prob_bull, prob_bear, prob_chop,
-                            snr_score, mace_score, blended_conviction,
-                            rs_rank, signal_action, funding_rate_hourly, created_at
-                     FROM signal_evaluations
-                     WHERE eval_id IN (
-                         SELECT MAX(eval_id)
-                         FROM signal_evaluations
-                         WHERE timestamp_ms = ?1
-                         GROUP BY base_asset
-                     )
-                     ORDER BY rs_rank ASC
-                     LIMIT ?2;",
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map(params![ts, limit as i64], |r| {
-                    Ok(SignalEvaluation {
-                        eval_id: Some(r.get(0)?),
-                        timestamp_ms: r.get(1)?,
-                        base_asset: r.get(2)?,
-                        exec_symbol: r.get(3)?,
-                        synth_symbol: r.get(4)?,
-                        hmm_regime: r.get(5)?,
-                        prob_bull: r.get(6)?,
-                        prob_bear: r.get(7)?,
-                        prob_chop: r.get(8)?,
-                        snr_score: r.get(9)?,
-                        snr_synth: r.get(9)?,
-                        rs_96: 0.0,
-                        r_usdc_8: 0.0,
-                        mace_score: r.get(10)?,
-                        blended_conviction: r.get(11)?,
-                        rs_rank: r.get(12)?,
-                        signal_action: r.get(13)?,
-                        funding_rate_hourly: r.get(14)?,
-                        created_at: r.get(15)?,
-                    })
-                })
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
-
-    fn map_trade_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TradeRecord> {
-        let trade_id: i64 = r.get("trade_id")?;
-        let ex_id: Option<String> = r.get("exchange_order_id").ok().flatten();
-        let raw_cli: Option<String> = r.get("client_order_id").ok().flatten();
-        let client_order_id = raw_cli
-            .or_else(|| ex_id.clone())
-            .unwrap_or_else(|| format!("trade-{trade_id}"));
-        let entry_price: f64 = r.get("entry_price")?;
-        let quantity: f64 = r.get("quantity")?;
-        let init_stop: f64 = r.get("initial_stop_price")?;
-        let chand_stop: f64 = r.get("chandelier_stop_price").unwrap_or(init_stop);
-        let fsm_state: String = r
-            .get::<_, Option<String>>("fsm_state")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "FILLED".to_string());
-        let avg_fill_price: Option<f64> = r
-            .get::<_, Option<f64>>("avg_fill_price")
-            .ok()
-            .flatten()
-            .or(Some(entry_price));
-        let filled_units: f64 = r
-            .get::<_, Option<f64>>("filled_units")
-            .ok()
-            .flatten()
-            .unwrap_or(quantity);
-        let slippage_paid_usd: f64 = r
-            .get::<_, Option<f64>>("slippage_paid_usd")
-            .ok()
-            .flatten()
-            .unwrap_or(0.0);
-
-        Ok(TradeRecord {
-            trade_id,
-            client_order_id,
-            symbol: r.get("symbol")?,
-            base_asset: r.get("base_asset")?,
-            side: r.get("side")?,
-            status: r.get("status")?,
-            fsm_state,
-            entry_price,
-            current_price: r.get("current_price")?,
-            exit_price: r.get("exit_price").ok().flatten(),
-            quantity,
-            filled_units,
-            avg_fill_price,
-            notional_usdc: r.get("notional_usdc")?,
-            risk_budget_usdc: r.get("risk_budget_usdc")?,
-            conviction_multiplier: r.get("conviction_multiplier")?,
-            initial_stop_price: init_stop,
-            chandelier_stop_price: chand_stop,
-            current_stop_price: chand_stop,
-            highest_price_seen: r.get("highest_price_seen")?,
-            lowest_price_seen: r.get("lowest_price_seen")?,
-            realized_pnl_usdc: r.get("realized_pnl_usdc")?,
-            unrealized_pnl_usdc: r.get("unrealized_pnl_usdc")?,
-            fees_paid_usdc: r.get("fees_paid_usdc")?,
-            funding_accrued_usdc: r.get("funding_accrued_usdc")?,
-            slippage_paid_usd,
-            exchange_order_id: ex_id,
-            opened_at: r.get("opened_at")?,
-            closed_at: r.get("closed_at").ok().flatten(),
-            exit_reason: r.get("exit_reason").ok().flatten(),
-        })
-    }
-
-    pub fn get_open_trades(&self) -> Result<Vec<TradeRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at ASC;")
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map([], Self::map_trade_row)
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
-
-    pub fn get_recent_trades(&self, limit: usize) -> Result<Vec<TradeRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare("SELECT * FROM trades ORDER BY trade_id DESC LIMIT ?1;")
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map(params![limit as i64], Self::map_trade_row)
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
-
-    pub fn insert_trade(&self, trade: &TradeRecord) -> Result<i64> {
-        let _ = OrderFsmState::parse(&trade.fsm_state)?;
-        let cli_id = if trade.client_order_id.trim().is_empty() {
-            format!("cli-{}", &Uuid::new_v4().simple().to_string()[..12])
-        } else {
-            trade.client_order_id.clone()
-        };
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO trades (
-                    client_order_id, symbol, base_asset, side, status, fsm_state,
-                    entry_price, current_price, quantity, notional_usdc,
-                    risk_budget_usdc, conviction_multiplier,
-                    initial_stop_price, chandelier_stop_price,
-                    highest_price_seen, lowest_price_seen,
-                    fees_paid_usdc, funding_accrued_usdc, unrealized_pnl_usdc,
-                    exchange_order_id, avg_fill_price, filled_units, slippage_paid_usd
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6,
-                    ?7, ?8, ?9, ?10,
-                    ?11, ?12,
-                    ?13, ?14,
-                    ?15, ?16,
-                    ?17, ?18, ?19,
-                    ?20, ?21, ?22, ?23
-                );",
-                params![
-                    cli_id,
-                    trade.symbol,
-                    trade.base_asset,
-                    trade.side,
-                    trade.status,
-                    trade.fsm_state,
-                    trade.entry_price,
-                    trade.current_price,
-                    trade.quantity,
-                    trade.notional_usdc,
-                    trade.risk_budget_usdc,
-                    trade.conviction_multiplier,
-                    trade.initial_stop_price,
-                    trade.chandelier_stop_price,
-                    trade.highest_price_seen,
-                    trade.lowest_price_seen,
-                    trade.fees_paid_usdc,
-                    trade.funding_accrued_usdc,
-                    trade.unrealized_pnl_usdc,
-                    trade.exchange_order_id,
-                    trade.avg_fill_price,
-                    trade.filled_units,
-                    trade.slippage_paid_usd,
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(conn.last_insert_rowid())
-        })
-    }
-
-    pub fn log_order_state_transition(
-        &self,
-        client_order_id: &str,
-        from_state: &str,
-        to_state: &str,
-        reason: Option<&str>,
-    ) -> Result<i64> {
-        let ts = self.now_ms();
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![client_order_id, from_state, to_state, ts, reason],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(conn.last_insert_rowid())
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn transition_order_state(
-        &self,
-        client_order_id: &str,
-        to_state: &str,
-        from_state: Option<&str>,
-        reason: Option<&str>,
-        exchange_order_id: Option<&str>,
-        avg_fill_price: Option<f64>,
-        filled_units: Option<f64>,
-        slippage_paid_usd: Option<f64>,
-        fees_paid_usdc: Option<f64>,
-        status: Option<&str>,
-    ) -> Result<()> {
-        let target_fsm = OrderFsmState::parse(to_state)?;
-        let ts = self.now_ms();
-        self.with_conn(|conn| {
-            let existing: Option<(i64, String)> = conn
-                .query_row(
-                    "SELECT trade_id, COALESCE(fsm_state, 'PENDING')
-                     FROM trades
-                     WHERE client_order_id = ?1 OR exchange_order_id = ?1
-                     ORDER BY trade_id DESC LIMIT 1;",
-                    params![client_order_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-
-            let prior_state = from_state
-                .map(str::to_string)
-                .or_else(|| existing.as_ref().map(|(_, s)| s.clone()))
-                .unwrap_or_else(|| "PENDING".to_string());
-
-            if let Some((trade_id, _)) = existing {
-                conn.execute(
-                    "UPDATE trades
-                     SET fsm_state = ?1,
-                         exchange_order_id = COALESCE(?2, exchange_order_id),
-                         avg_fill_price = COALESCE(?3, avg_fill_price),
-                         entry_price = COALESCE(?3, entry_price),
-                         current_price = COALESCE(?3, current_price),
-                         filled_units = COALESCE(?4, filled_units),
-                         slippage_paid_usd = COALESCE(?5, slippage_paid_usd),
-                         fees_paid_usdc = COALESCE(?6, fees_paid_usdc),
-                         status = COALESCE(?7, status)
-                     WHERE trade_id = ?8;",
-                    params![
-                        target_fsm.as_str(),
-                        exchange_order_id,
-                        avg_fill_price,
-                        filled_units,
-                        slippage_paid_usd,
-                        fees_paid_usdc,
-                        status,
-                        trade_id,
-                    ],
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            }
-
-            conn.execute(
-                "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![client_order_id, prior_state, target_fsm.as_str(), ts, reason],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn update_open_trade(
-        &self,
-        trade_id: i64,
-        current_price: f64,
-        chandelier_stop_price: f64,
-        highest_price_seen: f64,
-        lowest_price_seen: f64,
-        unrealized_pnl_usdc: f64,
-        funding_accrued_usdc: f64,
-    ) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE trades
-                 SET current_price = ?1,
-                     chandelier_stop_price = ?2,
-                     highest_price_seen = ?3,
-                     lowest_price_seen = ?4,
-                     unrealized_pnl_usdc = ?5,
-                     funding_accrued_usdc = ?6
-                 WHERE trade_id = ?7 AND status = 'OPEN';",
-                params![
-                    current_price,
-                    chandelier_stop_price,
-                    highest_price_seen,
-                    lowest_price_seen,
-                    unrealized_pnl_usdc,
-                    funding_accrued_usdc,
-                    trade_id,
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn close_trade(
-        &self,
-        trade_id: i64,
-        exit_price: f64,
-        realized_pnl_usdc: f64,
-        fees_paid_usdc: f64,
-        exit_reason: &str,
-    ) -> Result<()> {
-        let closed_iso = chrono::DateTime::from_timestamp_millis(self.now_ms())
-            .unwrap_or_else(Utc::now)
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-
-        self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE trades
-                 SET status = 'CLOSED',
-                     current_price = ?1,
-                     exit_price = ?1,
-                     realized_pnl_usdc = ?2,
-                     unrealized_pnl_usdc = 0.0,
-                     fees_paid_usdc = ?3,
-                     closed_at = ?4,
-                     exit_reason = ?5
-                 WHERE trade_id = ?6;",
-                params![
-                    exit_price,
-                    realized_pnl_usdc,
-                    fees_paid_usdc,
-                    closed_iso,
-                    exit_reason,
-                    trade_id
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn get_total_realized_pnl(&self) -> Result<f64> {
-        self.with_conn(|conn| {
-            let pnl: f64 = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM trades WHERE status = 'CLOSED';",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0.0);
-            Ok(pnl)
-        })
-    }
-
-    pub fn save_portfolio_snapshot(&self, snap: &PortfolioSnapshot) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO portfolio_snapshots (
-                    timestamp_ms, total_equity_usdc, available_cash_usdc,
-                    deployed_notional_usdc, gross_leverage,
-                    portfolio_heat_usdc, portfolio_heat_pct,
-                    basis_harvest_notional_usdc, accrued_yield_usdc,
-                    hmm_regime, prob_bull, prob_bear, prob_chop,
-                    open_long_count, open_short_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15);",
-                params![
-                    snap.timestamp_ms,
-                    snap.total_equity_usdc,
-                    snap.available_cash_usdc,
-                    snap.deployed_notional_usdc,
-                    snap.gross_leverage,
-                    snap.portfolio_heat_usdc,
-                    snap.portfolio_heat_pct,
-                    snap.basis_harvest_notional_usdc,
-                    snap.accrued_yield_usdc,
-                    snap.hmm_regime,
-                    snap.prob_bull,
-                    snap.prob_bear,
-                    snap.prob_chop,
-                    snap.open_long_count,
-                    snap.open_short_count,
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn get_latest_portfolio_snapshot(&self) -> Result<PortfolioSnapshot> {
-        self.with_conn(|conn| {
-            let row = conn
-                .query_row(
-                    "SELECT snapshot_id, timestamp_ms, total_equity_usdc, available_cash_usdc,
-                            deployed_notional_usdc, gross_leverage, portfolio_heat_usdc,
-                            portfolio_heat_pct, basis_harvest_notional_usdc, accrued_yield_usdc,
-                            hmm_regime, prob_bull, prob_bear, prob_chop,
-                            open_long_count, open_short_count, created_at
-                     FROM portfolio_snapshots
-                     ORDER BY snapshot_id DESC LIMIT 1;",
-                    [],
-                    |r| {
-                        Ok(PortfolioSnapshot {
-                            snapshot_id: Some(r.get(0)?),
-                            timestamp_ms: r.get(1)?,
-                            total_equity_usdc: r.get(2)?,
-                            available_cash_usdc: r.get(3)?,
-                            deployed_notional_usdc: r.get(4)?,
-                            gross_leverage: r.get(5)?,
-                            portfolio_heat_usdc: r.get(6)?,
-                            portfolio_heat_pct: r.get(7)?,
-                            basis_harvest_notional_usdc: r.get(8)?,
-                            accrued_yield_usdc: r.get(9)?,
-                            hmm_regime: r.get(10)?,
-                            prob_bull: r.get(11)?,
-                            prob_bear: r.get(12)?,
-                            prob_chop: r.get(13)?,
-                            open_long_count: r.get(14)?,
-                            open_short_count: r.get(15)?,
-                            created_at: r.get(16).ok(),
-                        })
-                    },
-                )
-                .optional()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-
-            if let Some(s) = row {
-                return Ok(s);
-            }
-            let init_eq: f64 = conn
-                .query_row(
-                    "SELECT config_value FROM system_config WHERE config_key = 'initial_equity_usdc';",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(10000.0);
-
-            Ok(PortfolioSnapshot {
-                snapshot_id: None,
-                timestamp_ms: self.now_ms(),
-                total_equity_usdc: init_eq,
-                available_cash_usdc: init_eq,
-                deployed_notional_usdc: 0.0,
-                gross_leverage: 0.0,
-                portfolio_heat_usdc: 0.0,
-                portfolio_heat_pct: 0.0,
-                basis_harvest_notional_usdc: 0.0,
-                accrued_yield_usdc: 0.0,
-                hmm_regime: "CHOP".to_string(),
-                prob_bull: 0.3333,
-                prob_bear: 0.3333,
-                prob_chop: 0.3334,
-                open_long_count: 0,
-                open_short_count: 0,
-                created_at: None,
-            })
-        })
-    }
-
-    pub fn log_telemetry(
-        &self,
-        level: &str,
-        component: &str,
-        message: &str,
-        details: Option<Value>,
-    ) -> Result<()> {
-        let details_str = details.map(|v| v.to_string());
-        let ts = Utc::now().timestamp_millis();
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO telemetry_logs (timestamp_ms, level, component, message, details_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![ts, level.to_ascii_uppercase(), component, message, details_str],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    pub fn get_recent_logs(&self, limit: usize) -> Result<Vec<Value>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT log_id, timestamp_ms, level, component, message, details_json, created_at
-                     FROM telemetry_logs
-                     ORDER BY log_id DESC
-                     LIMIT ?1;",
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let iter = stmt
-                .query_map(params![limit as i64], |r| {
-                    Ok(json!({
-                        "log_id": r.get::<_, i64>(0)?,
-                        "timestamp_ms": r.get::<_, i64>(1)?,
-                        "level": r.get::<_, String>(2)?,
-                        "component": r.get::<_, String>(3)?,
-                        "message": r.get::<_, String>(4)?,
-                        "details_json": r.get::<_, Option<String>>(5)?,
-                        "created_at": r.get::<_, String>(6)?,
-                    }))
-                })
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(iter.flatten().collect())
-        })
-    }
-
-    pub fn reconcile_open_trade_size(
-        &self,
-        trade_id: i64,
-        exchange_size: f64,
-        exchange_entry_price: Option<f64>,
-    ) -> Result<()> {
-        let size = exchange_size.abs();
-        self.with_conn(|conn| {
-            if let Some(px) = exchange_entry_price.filter(|&p| p > 0.0) {
-                let notional = size * px;
-                conn.execute(
-                    "UPDATE trades
-                     SET quantity = ?1,
-                         filled_units = ?1,
-                         entry_price = ?2,
-                         avg_fill_price = ?2,
-                         notional_usdc = ?3,
-                         fsm_state = 'FILLED'
-                     WHERE trade_id = ?4 AND status = 'OPEN';",
-                    params![size, px, notional, trade_id],
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            } else {
-                conn.execute(
-                    "UPDATE trades
-                     SET quantity = ?1,
-                         filled_units = ?1,
-                         notional_usdc = ?1 * entry_price,
-                         fsm_state = 'FILLED'
-                     WHERE trade_id = ?2 AND status = 'OPEN';",
-                    params![size, trade_id],
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            }
-            Ok(())
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn reconcile_on_chain_orphan_position(
-        &self,
-        symbol: &str,
-        base_asset: &str,
-        side: &str,
-        quantity: f64,
-        entry_price: f64,
-        mark_price: f64,
-        unrealized_pnl_usdc: f64,
-    ) -> Result<i64> {
-        let size = quantity.abs();
-        let px = if entry_price > 0.0 {
-            entry_price
-        } else {
-            mark_price
-        };
-        let notional = size * px;
-        let stop_mult = if side == "LONG" { 0.91 } else { 1.09 };
-        let default_stop = round_dp(px * stop_mult, 6);
-        let cli_id = format!("reconciled-{}", &Uuid::new_v4().simple().to_string()[..12]);
-        let ex_id = format!("onchain-reconciled-{base_asset}-{}", self.now_ms());
-
-        let rec = TradeRecord {
-            trade_id: 0,
-            client_order_id: cli_id.clone(),
-            symbol: symbol.to_string(),
-            base_asset: base_asset.to_string(),
-            side: side.to_string(),
-            status: "OPEN".to_string(),
-            fsm_state: "FILLED".to_string(),
-            entry_price: px,
-            current_price: if mark_price > 0.0 { mark_price } else { px },
-            exit_price: None,
-            quantity: size,
-            filled_units: size,
-            avg_fill_price: Some(px),
-            notional_usdc: notional,
-            risk_budget_usdc: round_dp((px - default_stop).abs() * size, 2),
-            conviction_multiplier: 1.0,
-            initial_stop_price: default_stop,
-            chandelier_stop_price: default_stop,
-            current_stop_price: default_stop,
-            highest_price_seen: px.max(mark_price),
-            lowest_price_seen: if mark_price > 0.0 {
-                px.min(mark_price)
-            } else {
-                px
-            },
-            realized_pnl_usdc: 0.0,
-            unrealized_pnl_usdc,
-            fees_paid_usdc: 0.0,
-            funding_accrued_usdc: 0.0,
-            slippage_paid_usd: 0.0,
-            exchange_order_id: Some(ex_id),
-            opened_at: String::new(),
-            closed_at: None,
-            exit_reason: None,
-        };
-        let tid = self.insert_trade(&rec)?;
-        let _ = self.log_order_state_transition(
-            &cli_id,
-            "PENDING",
-            "FILLED",
-            Some("ON_CHAIN_ORPHAN_RECONCILED"),
+        // 1. Require credentials when enabling TESTNET or LIVE with require_credentials_for_live=true
+        let err_missing = db.configure_hyperliquid_credentials(
+            None,
+            None,
+            Some(true),
+            Some("TESTNET"),
+            None,
+            None,
+            true,
         );
-        Ok(tid)
+        assert!(err_missing.is_err());
+
+        // 2. Reject conflicting execution_mode='TESTNET' + hyperliquid_testnet=false
+        let err_conflict = db.configure_hyperliquid_credentials(
+            Some(VALID_WALLET),
+            Some(VALID_PK),
+            Some(false),
+            Some("TESTNET"),
+            None,
+            None,
+            true,
+        );
+        assert!(err_conflict.is_err());
+
+        // 3. Configure TESTNET -> execution_mode must remain "TESTNET" (not overwritten to "LIVE")
+        let st_testnet = db
+            .configure_hyperliquid_credentials(
+                Some(VALID_WALLET),
+                Some(VALID_PK),
+                Some(true),
+                Some("TESTNET"),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(st_testnet["execution_mode"], "TESTNET");
+        assert_eq!(st_testnet["hyperliquid_testnet"], true);
+        assert_eq!(st_testnet["network"], "testnet");
+        assert_eq!(
+            st_testnet["api_endpoint"],
+            "https://api.hyperliquid-testnet.xyz"
+        );
+        assert_eq!(st_testnet["active_routing"], "LIVE_TESTNET");
+        assert_eq!(st_testnet["environment"], "sandbox");
+
+        let cfg = db.load_config().unwrap();
+        assert_eq!(cfg.get_str("execution_mode", ""), "TESTNET");
+        assert!(cfg.get_bool("hyperliquid_testnet", false));
+        assert_eq!(cfg.get_str("pond_execution_mode", ""), "TESTNET");
+        assert_eq!(cfg.get_str("environment", ""), "sandbox");
+
+        // 4. Transition to LIVE (Mainnet) via set_config_value("execution_mode", "LIVE")
+        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        let st_live = db.get_credentials_status().unwrap();
+        assert_eq!(st_live["execution_mode"], "LIVE");
+        assert_eq!(st_live["hyperliquid_testnet"], false);
+        assert_eq!(st_live["network"], "mainnet");
+        assert_eq!(st_live["api_endpoint"], "https://api.hyperliquid.xyz");
+        assert_eq!(st_live["active_routing"], "LIVE_MAINNET");
+        assert_eq!(st_live["environment"], "production");
+
+        let cfg_live = db.load_config().unwrap();
+        assert_eq!(cfg_live.get_str("execution_mode", ""), "LIVE");
+        assert!(!cfg_live.get_bool("hyperliquid_testnet", true));
+        assert_eq!(cfg_live.get_str("pond_execution_mode", ""), "LIVE");
+        assert_eq!(cfg_live.get_str("environment", ""), "production");
+
+        // 5. Toggle hyperliquid_testnet=true while in LIVE -> automatically reconciles to TESTNET
+        db.set_config_value("hyperliquid_testnet", &json!(true))
+            .unwrap();
+        let st_re_testnet = db.get_credentials_status().unwrap();
+        assert_eq!(st_re_testnet["execution_mode"], "TESTNET");
+        assert_eq!(st_re_testnet["hyperliquid_testnet"], true);
+        assert_eq!(st_re_testnet["active_routing"], "LIVE_TESTNET");
+        assert_eq!(st_re_testnet["environment"], "sandbox");
+
+        // 6. Transition back to PAPER
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        let st_paper = db.get_credentials_status().unwrap();
+        assert_eq!(st_paper["execution_mode"], "PAPER");
+        assert_eq!(st_paper["active_routing"], "PAPER_SIMULATION");
+        assert_eq!(st_paper["environment"], "sandbox");
+        let cfg_paper = db.load_config().unwrap();
+        assert_eq!(cfg_paper.get_str("pond_execution_mode", ""), "PAPER");
     }
 
-    pub fn get_order_state_audit(
-        &self,
-        client_order_id: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<Value>> {
-        self.with_conn(|conn| {
-            if let Some(cid) = client_order_id {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, client_order_id, from_state, to_state, timestamp_utc, reason
-                         FROM order_state_audit
-                         WHERE client_order_id = ?1
-                         ORDER BY id ASC
-                         LIMIT ?2;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                let iter = stmt
-                    .query_map(params![cid, limit as i64], |r| {
-                        Ok(json!({
-                            "id": r.get::<_, i64>(0)?,
-                            "client_order_id": r.get::<_, String>(1)?,
-                            "from_state": r.get::<_, String>(2)?,
-                            "to_state": r.get::<_, String>(3)?,
-                            "timestamp_utc": r.get::<_, i64>(4)?,
-                            "reason": r.get::<_, Option<String>>(5)?,
-                        }))
-                    })
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                Ok(iter.flatten().collect())
-            } else {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, client_order_id, from_state, to_state, timestamp_utc, reason
-                         FROM order_state_audit
-                         ORDER BY id DESC
-                         LIMIT ?1;",
-                    )
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                let iter = stmt
-                    .query_map(params![limit as i64], |r| {
-                        Ok(json!({
-                            "id": r.get::<_, i64>(0)?,
-                            "client_order_id": r.get::<_, String>(1)?,
-                            "from_state": r.get::<_, String>(2)?,
-                            "to_state": r.get::<_, String>(3)?,
-                            "timestamp_utc": r.get::<_, i64>(4)?,
-                            "reason": r.get::<_, Option<String>>(5)?,
-                        }))
-                    })
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
-                Ok(iter.flatten().collect())
-            }
-        })
-    }
+    #[test]
+    fn test_reconcile_legacy_contradictory_live_testnet_config() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
 
-    /// Creates an isolated `:memory:` SQLite database and copies `system_config` and `universe_assets`
-    /// from `self` so backtests never mutate the live/paper WAL database.
-    pub fn clone_to_memory(&self) -> Result<DatabaseManager> {
-        let mem_db = Self::with_paths(":memory:", &self.schema_path, None);
-        mem_db.initialize_schema(false)?;
+        db.configure_hyperliquid_credentials(
+            Some(VALID_WALLET),
+            Some(VALID_PK),
+            Some(true),
+            Some("PAPER"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
-        let cfg_rows: Vec<(String, String, String, String, String)> = self.with_conn(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT config_key, config_value, value_type, category, description FROM system_config;",
-                )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(rows.flatten().collect())
-        })?;
-
-        mem_db.with_conn(|conn| {
-            for (k, v, vt, cat, desc) in cfg_rows {
-                let _ = conn.execute(
-                    "INSERT INTO system_config (config_key, config_value, value_type, category, description)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(config_key) DO UPDATE SET
-                        config_value = excluded.config_value,
-                        value_type = excluded.value_type,
-                        category = excluded.category,
-                        description = excluded.description;",
-                    params![k, v, vt, cat, desc],
-                );
-            }
+        // Simulate legacy contradictory DB state: execution_mode='LIVE', hyperliquid_testnet='true', pond_execution_mode='PAPER'
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'LIVE' WHERE config_key = 'execution_mode';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'true' WHERE config_key = 'hyperliquid_testnet';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'PAPER' WHERE config_key = 'pond_execution_mode';",
+                [],
+            )
+            .unwrap();
             Ok(())
-        })?;
+        })
+        .unwrap();
 
-        Ok(mem_db)
+        let creds = db.get_credentials_status().unwrap();
+        assert_eq!(creds["execution_mode"], "TESTNET");
+        assert_eq!(creds["hyperliquid_testnet"], true);
+        assert_eq!(creds["active_routing"], "LIVE_TESTNET");
+        assert_eq!(creds["api_endpoint"], "https://api.hyperliquid-testnet.xyz");
+
+        let rows = db.get_config_rows(true).unwrap();
+        let exec_row = rows
+            .iter()
+            .find(|r| r["config_key"] == "execution_mode")
+            .unwrap();
+        let pond_row = rows
+            .iter()
+            .find(|r| r["config_key"] == "pond_execution_mode")
+            .unwrap();
+        assert_eq!(exec_row["config_value"], "TESTNET");
+        assert_eq!(pond_row["config_value"], "TESTNET");
+        assert!(exec_row["description"]
+            .as_str()
+            .unwrap()
+            .contains("TESTNET"));
+        assert!(pond_row["description"].as_str().unwrap().contains("LIVE"));
+    }
+
+    #[test]
+    fn test_pond_execution_mode_and_environment_synchronization() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        db.configure_hyperliquid_credentials(
+            Some(VALID_WALLET),
+            Some(VALID_PK),
+            Some(true),
+            Some("PAPER"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+            .unwrap();
+        let st_tn = db.get_credentials_status().unwrap();
+        assert_eq!(st_tn["execution_mode"], "TESTNET");
+        assert_eq!(st_tn["pond_execution_mode"], "TESTNET");
+        assert_eq!(st_tn["hyperliquid_testnet"], true);
+        assert_eq!(st_tn["active_routing"], "LIVE_TESTNET");
+        assert_eq!(st_tn["environment"], "sandbox");
+
+        assert!(db
+            .set_config_value("environment", &json!("production"))
+            .is_err());
+        assert!(db
+            .set_config_value("environment", &json!("sandbox"))
+            .is_ok());
+
+        db.set_config_value("pond_execution_mode", &json!("LIVE"))
+            .unwrap();
+        let st_live = db.get_credentials_status().unwrap();
+        assert_eq!(st_live["execution_mode"], "LIVE");
+        assert_eq!(st_live["pond_execution_mode"], "LIVE");
+        assert_eq!(st_live["hyperliquid_testnet"], false);
+        assert_eq!(st_live["active_routing"], "LIVE_MAINNET");
+        assert_eq!(st_live["environment"], "production");
+
+        assert!(db
+            .set_config_value("environment", &json!("sandbox"))
+            .is_err());
+
+        db.set_config_value("pond_execution_mode", &json!("PAPER"))
+            .unwrap();
+        let st_paper = db.get_credentials_status().unwrap();
+        assert_eq!(st_paper["execution_mode"], "PAPER");
+        assert_eq!(st_paper["pond_execution_mode"], "PAPER");
+        assert_eq!(st_paper["active_routing"], "PAPER_SIMULATION");
+        assert_eq!(st_paper["environment"], "sandbox");
+    }
+
+    #[test]
+    fn test_reconcile_out_of_sync_pond_and_environment_on_load_config() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'TESTNET' WHERE config_key = 'execution_mode';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'true' WHERE config_key = 'hyperliquid_testnet';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'PAPER' WHERE config_key = 'pond_execution_mode';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'production' WHERE config_key = 'environment';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let cfg_tn = db.load_config().unwrap();
+        assert_eq!(cfg_tn.get_str("execution_mode", ""), "TESTNET");
+        assert_eq!(cfg_tn.get_str("pond_execution_mode", ""), "TESTNET");
+        assert!(cfg_tn.get_bool("hyperliquid_testnet", false));
+        assert_eq!(cfg_tn.get_str("environment", ""), "sandbox");
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'LIVE' WHERE config_key = 'execution_mode';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'false' WHERE config_key = 'hyperliquid_testnet';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'PAPER' WHERE config_key = 'pond_execution_mode';",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = 'sandbox' WHERE config_key = 'environment';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let cfg_live = db.load_config().unwrap();
+        assert_eq!(cfg_live.get_str("execution_mode", ""), "LIVE");
+        assert_eq!(cfg_live.get_str("pond_execution_mode", ""), "LIVE");
+        assert!(!cfg_live.get_bool("hyperliquid_testnet", true));
+        assert_eq!(cfg_live.get_str("environment", ""), "production");
+    }
+
+    #[test]
+    fn test_set_config_batch_deterministic_routing_and_credentials() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let mut batch = HashMap::new();
+        batch.insert("execution_mode".to_string(), json!("TESTNET"));
+        batch.insert("hyperliquid_testnet".to_string(), json!(true));
+        batch.insert("wallet_address".to_string(), json!(VALID_WALLET));
+        batch.insert("private_key".to_string(), json!(VALID_PK));
+        batch.insert("environment".to_string(), json!("sandbox"));
+
+        let updated = db.set_config_batch(&batch, false).unwrap();
+        assert_eq!(updated.len(), 5);
+
+        let st = db.get_credentials_status().unwrap();
+        assert_eq!(st["execution_mode"], "TESTNET");
+        assert_eq!(st["pond_execution_mode"], "TESTNET");
+        assert_eq!(st["hyperliquid_testnet"], true);
+        assert_eq!(st["active_routing"], "LIVE_TESTNET");
+
+        let mut to_paper = HashMap::new();
+        to_paper.insert("execution_mode".to_string(), json!("PAPER"));
+        to_paper.insert("hyperliquid_testnet".to_string(), json!(false));
+        db.set_config_batch(&to_paper, false).unwrap();
+
+        let st_paper = db.get_credentials_status().unwrap();
+        assert_eq!(st_paper["execution_mode"], "PAPER");
+        assert_eq!(st_paper["pond_execution_mode"], "PAPER");
+        assert_eq!(st_paper["hyperliquid_testnet"], false);
+        assert_eq!(st_paper["active_routing"], "PAPER_SIMULATION");
+        assert_eq!(st_paper["environment"], "sandbox");
+    }
+
+    #[test]
+    fn test_isolated_encryption_self_test_never_mutates_live_credentials() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Ensure private_key is empty initially
+        assert_eq!(
+            db.get_raw_config_value("private_key").unwrap().unwrap_or_default(),
+            ""
+        );
+
+        let rep = db.test_encryption().unwrap();
+        assert_eq!(rep["status"], "VERIFIED");
+        assert_eq!(rep["isolated_self_test"], true);
+
+        // Live DB must still have empty private_key and gemini_api_key
+        assert_eq!(
+            db.get_raw_config_value("private_key").unwrap().unwrap_or_default(),
+            ""
+        );
+        assert_eq!(
+            db.get_raw_config_value("gemini_api_key")
+                .unwrap()
+                .unwrap_or_default(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_rotate_master_key_with_old_and_no_silent_fallback_downgrade() {
+        let key1 = crate::fernet::generate_fernet_key();
+        let key2 = crate::fernet::generate_fernet_key();
+        let wrong_key = crate::fernet::generate_fernet_key();
+
+        let db = DatabaseManager::with_paths(
+            ":memory:",
+            resolve_project_root().join("sql").join("schema_and_seed.sql"),
+            Some(key1.clone()),
+        );
+        db.initialize_schema(true).unwrap();
+
+        db.set_config_value("private_key", &json!(VALID_PK)).unwrap();
+        let raw_before = db.get_raw_config_value("private_key").unwrap().unwrap();
+        assert!(is_encrypted_value(&raw_before));
+
+        // Rotating with wrong old_master_key must fail without corrupting data
+        assert!(db
+            .rotate_master_key_with_old(Some(&wrong_key), &key2)
+            .is_err());
+
+        // Rotating with correct old_master_key succeeds and re-encrypts
+        let rot = db
+            .rotate_master_key_with_old(Some(&key1), &key2)
+            .unwrap();
+        assert_eq!(rot["status"], "ROTATED");
+        assert_eq!(rot["rotated_count"], 1);
+
+        let dec = db.get_signing_private_key().unwrap();
+        assert_eq!(&*dec, VALID_PK);
+
+        // Old ciphertext cannot be decrypted under new key (no silent fallback)
+        assert!(db.decrypt_config_value(&raw_before).is_err());
+    }
+
+    #[test]
+    fn test_telemetry_redacts_sensitive_keys_and_net_book_transfers() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        db.log_telemetry(
+            "INFO",
+            "web.config",
+            "Updated system_config (1 keys): private_key=0xdeadbeef",
+            Some(json!({"private_key": "0xdeadbeef", "safe_key": "ok"})),
+        )
+        .unwrap();
+
+        let logs = db.get_recent_logs(5).unwrap();
+        let msg = logs[0]["message"].as_str().unwrap();
+        let details = logs[0]["details_json"].as_str().unwrap();
+        assert!(!msg.contains("0xdeadbeef"));
+        assert!(msg.contains("[REDACTED]"));
+        assert!(!details.contains("0xdeadbeef"));
+        assert!(details.contains("[REDACTED]"));
     }
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily 00:05 UTC Timer for Aegis Quant Two-Book Settling & Rebalancing (C8)
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 UTC
+Persistent=true
+AccuracySec=1s
+Unit=aegis-settle.service
+
+[Install]
+WantedBy=timers.target

@@ -25,7 +25,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('platform_name', 'Aegis Quant', 'string', 'platform', 'Core platform brand and telemetry identifier'),
     ('platform_version', '0.1.0-dev', 'string', 'platform', 'SemVer pre-release tag'),
     ('environment', 'sandbox', 'string', 'platform', 'Deployment target environment (sandbox or production)'),
-    ('execution_mode', 'PAPER', 'string', 'platform', 'Execution mode: PAPER or LIVE Web3 DEX routing'),
+    ('execution_mode', 'PAPER', 'string', 'platform', 'Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing'),
     ('exchange_id', 'hyperliquid', 'string', 'platform', 'CCXT async exchange identifier (Hyperliquid L1 CLOB)'),
 
     -- Web3 DEX & AI Credentials (6-10)

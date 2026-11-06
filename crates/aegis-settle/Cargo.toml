@@ -1,0 +1,19 @@
+[package]
+name = "aegis-settle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aegis-settle-tool"
+path = "src/bin/aegis-settle-tool.rs"
+
+[dependencies]
+aegis-core = { workspace = true }
+aegis-db = { workspace = true }
+aegis-execution = { workspace = true }
+aegis-telemetry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }

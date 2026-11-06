@@ -18,12 +18,27 @@ type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type HmacSha256 = Hmac<Sha256>;
 
-pub const DEFAULT_HOST_FERNET_SEED: &[u8] = b"aegis-quant-v0.2.0-rc1-fernet-master-key";
+use std::os::unix::fs::PermissionsExt;
+use std::sync::OnceLock;
 
-/// Derive the deterministic fallback 44-byte URL-safe base64 Fernet key (strictly for PAPER/dev mode).
+const LEGACY_PUBLIC_FERNET_SEED_V1: &[u8] = b"aegis-quant-v0.2.0-rc1-fernet-master-key";
+const LEGACY_PUBLIC_FERNET_SEED_V2: &[u8] = b"aegis-quant-v0.2.0-local-fernet-master-key-seed";
+
+static EPHEMERAL_MEMORY_KEY: OnceLock<String> = OnceLock::new();
+
+/// Returns the ephemeral per-process CSPRNG Fernet key used exclusively for isolated `:memory:` databases.
 pub fn default_host_fernet_key_b64() -> String {
-    let digest = Sha256::digest(DEFAULT_HOST_FERNET_SEED);
-    URL_SAFE.encode(digest)
+    EPHEMERAL_MEMORY_KEY
+        .get_or_init(generate_fernet_key)
+        .clone()
+}
+
+/// Returns true if `candidate_b64` matches any retired hardcoded fallback seed (`S1`).
+pub fn is_legacy_public_fallback_key(candidate_b64: &str) -> bool {
+    let trimmed = candidate_b64.trim();
+    let legacy1 = URL_SAFE.encode(Sha256::digest(LEGACY_PUBLIC_FERNET_SEED_V1));
+    let legacy2 = URL_SAFE.encode(Sha256::digest(LEGACY_PUBLIC_FERNET_SEED_V2));
+    trimmed == legacy1 || trimmed == legacy2
 }
 
 /// Generate a fresh CSPRNG 32-byte URL-safe base64 Fernet master key.
@@ -58,16 +73,50 @@ pub fn is_usable_env_key(raw_val: &str) -> bool {
     !(cleaned.starts_with('<') && cleaned.ends_with('>'))
 }
 
+/// Return the canonical `.aegis_master_key` file path adjacent to `db_path` (`S4`).
+pub fn master_key_file_for_db(db_path: &Path) -> std::path::PathBuf {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(".aegis_master_key")
+}
+
+/// Write a normalized Fernet master key to `key_file` with `0600` permissions (`S4`, `S5`).
+pub fn write_master_key_file(key_file: &Path, key_b64: &str) -> Result<()> {
+    if let Some(parent) = key_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(key_file, format!("{}\n", key_b64.trim()))?;
+    let _ = fs::set_permissions(key_file, fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+/// Ensures that a file-backed database has an external key source or provisions `<db_dir>/.aegis_master_key` (`0600`).
+pub fn ensure_master_key_for_db(db_path: &Path) -> Result<String> {
+    let (key, has_ext) = resolve_fernet_master_key(None, Some(db_path));
+    if has_ext {
+        return Ok(key);
+    }
+    if db_path.to_string_lossy() == ":memory:" {
+        return Ok(key);
+    }
+    let key_file = master_key_file_for_db(db_path);
+    let fresh_key = generate_fernet_key();
+    write_master_key_file(&key_file, &fresh_key)?;
+    Ok(fresh_key)
+}
+
 /// Resolve the AES-128 Fernet master key from:
 /// 1. Explicit `master_key` argument
 /// 2. systemd `LoadCredentialEncrypted=` / `LoadCredential=` (`$CREDENTIALS_DIRECTORY`)
 /// 3. Environment variable (`AEGIS_MASTER_KEY` or `FERNET_MASTER_KEY`)
 /// 4. Local keyfile (`<db_dir>/.aegis_master_key`, chmod 0600)
-/// 5. Deterministic platform fallback key
+/// 5. Ephemeral per-process CSPRNG key (only for `:memory:` test instances; marked `external = false`)
 pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path>) -> (String, bool) {
     if let Some(explicit) = master_key {
         if !explicit.trim().is_empty() {
-            return (normalize_fernet_key(explicit.as_bytes()), true);
+            let norm = normalize_fernet_key(explicit.as_bytes());
+            if !is_legacy_public_fallback_key(&norm) {
+                return (norm, true);
+            }
         }
     }
 
@@ -81,7 +130,10 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
                     if cand.is_file() {
                         if let Ok(bytes) = fs::read(&cand) {
                             if !trim_ascii(&bytes).is_empty() {
-                                return (normalize_fernet_key(&bytes), true);
+                                let norm = normalize_fernet_key(&bytes);
+                                if !is_legacy_public_fallback_key(&norm) {
+                                    return (norm, true);
+                                }
                             }
                         }
                     }
@@ -93,7 +145,10 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
                         if child.is_file() {
                             if let Ok(bytes) = fs::read(&child) {
                                 if !trim_ascii(&bytes).is_empty() {
-                                    return (normalize_fernet_key(&bytes), true);
+                                    let norm = normalize_fernet_key(&bytes);
+                                    if !is_legacy_public_fallback_key(&norm) {
+                                        return (norm, true);
+                                    }
                                 }
                             }
                         }
@@ -112,7 +167,10 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
                 .filter(|s| is_usable_env_key(s))
         });
     if let Some(k) = env_key {
-        return (normalize_fernet_key(k.as_bytes()), true);
+        let norm = normalize_fernet_key(k.as_bytes());
+        if !is_legacy_public_fallback_key(&norm) {
+            return (norm, true);
+        }
     }
 
     if let Some(p) = db_path {
@@ -122,7 +180,10 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
                 if key_file.is_file() {
                     if let Ok(bytes) = fs::read(&key_file) {
                         if !trim_ascii(&bytes).is_empty() {
-                            return (normalize_fernet_key(&bytes), true);
+                            let norm = normalize_fernet_key(&bytes);
+                            if !is_legacy_public_fallback_key(&norm) {
+                                return (norm, true);
+                            }
                         }
                     }
                 }
@@ -144,6 +205,12 @@ pub struct FernetCipher {
 impl FernetCipher {
     pub fn from_key_str(raw_key: &str) -> Result<Self> {
         let norm_b64 = normalize_fernet_key(raw_key.as_bytes());
+        if is_legacy_public_fallback_key(&norm_b64) {
+            return Err(AegisError::SecurityViolation(
+                "Refusing to initialize FernetCipher with retired public fallback key seed (S1)."
+                    .to_string(),
+            ));
+        }
         let decoded = URL_SAFE
             .decode(norm_b64.as_bytes())
             .map_err(|e| AegisError::Crypto(format!("Invalid Fernet base64 key: {e}")))?;

@@ -3,16 +3,16 @@
 //! 1:1 port of `engine/backtest.py`:
 //! - Isolated `:memory:` SQLite database cloning (`clone_to_memory`) so backtests never overwrite
 //!   live or paper WAL state (`trades`, `portfolio_snapshots`, `signal_evaluations`, `market_ohlcv`)
-//! - SHA-256 dataset provenance verification (`data/real_4h_backfill.json`)
-//! - Parallel cross-sectional feature precomputation via `rayon` (`compute_continuous_snr_series`,
-//!   `build_mace_features_and_target`, `fit_predict_mace_series_from_xy`)
+//! - SHA-256 dataset provenance verification (`data/real_4h_backfill.json`) (`B5`)
+//! - Strictly causal cross-sectional feature precomputation via `rayon` (`compute_continuous_snr_series`,
+//!   `build_mace_features_and_target`, `fit_predict_mace_series_from_xy`, `compute_rs_lookbacks`) (`B6`, `C6`)
 //! - Strict point-in-time bar replay (`pit_timestamp_ms`) with Two-Tier Chandelier Stops,
-//!   14-bar post-stop cooldowns, dynamic slippage, and institutional acceptance gates
+//!   post-stop cooldowns, dynamic slippage, and DB-configured institutional acceptance gates
 
 use aegis_core::{
-    base_prices_usdc, resolve_project_root, round_dp, verify_data_provenance, AltPairMetadata,
-    BacktestTearSheet, OhlcvBar, PortfolioSnapshot, RegimeState, Result, SignalEvaluation,
-    TradeRecord, UniverseAsset,
+    base_prices_usdc, resolve_project_root, round_dp, verify_data_provenance, AegisError,
+    AltPairMetadata, BacktestTearSheet, OhlcvBar, PortfolioSnapshot, RegimeState, Result,
+    SignalEvaluation, TradeRecord, UniverseAsset,
 };
 use aegis_db::DatabaseManager;
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine};
@@ -47,9 +47,14 @@ struct PrecomputedPairSeries {
 
 impl BacktestEngine {
     pub fn new(db: DatabaseManager, days: usize) -> Self {
+        let min_days = db
+            .load_config()
+            .ok()
+            .map(|c| c.get_usize("backtest_min_days", 30).max(5))
+            .unwrap_or(30);
         Self {
             db,
-            days: days.max(30),
+            days: days.max(min_days),
         }
     }
 
@@ -59,8 +64,131 @@ impl BacktestEngine {
             .join("real_4h_backfill.json")
     }
 
-    /// Generates causal warmup bars prior to `first_real_bar` so HMM (`250` bars) and MACE (`96` bars)
-    /// are warmed up on Bar 0 of the evaluation window.
+    /// Parses historical 4H backfill JSON supporting both the nested `{"coins": {"BTC": {"funding_rate_hourly": ..., "candles": [...]}}}`
+    /// production schema (`B5`) and flat `{"candles": {"BTC": [...]}}` / `{"BTC": [...]}` schemas.
+    pub fn parse_backfill_json(raw_json: &str) -> Result<HashMap<String, Vec<OhlcvBar>>> {
+        let root_val: Value = serde_json::from_str(raw_json).map_err(|e| {
+            AegisError::Validation(format!("Invalid backfill JSON syntax: {e}"))
+        })?;
+        let Value::Object(root) = root_val else {
+            return Err(AegisError::Validation(
+                "Backfill JSON root must be an object".to_string(),
+            ));
+        };
+
+        let mut loaded_real: HashMap<String, Vec<OhlcvBar>> = HashMap::new();
+
+        let parse_candle_array =
+            |norm_sym: &str, arr: &[Value], default_funding: f64| -> Vec<OhlcvBar> {
+                let mut bars = Vec::with_capacity(arr.len());
+                for row in arr {
+                    let ts = row
+                        .get("timestamp_ms")
+                        .or_else(|| row.get("t"))
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    if ts <= 0 {
+                        continue;
+                    }
+                    let parse_f = |k1: &str, k2: &str, def: f64| -> f64 {
+                        row.get(k1)
+                            .or_else(|| row.get(k2))
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .unwrap_or(def)
+                    };
+                    bars.push(OhlcvBar {
+                        symbol: norm_sym.to_string(),
+                        timeframe: "4h".to_string(),
+                        timestamp_ms: ts,
+                        open: parse_f("open", "o", 0.0),
+                        high: parse_f("high", "h", 0.0),
+                        low: parse_f("low", "l", 0.0),
+                        close: parse_f("close", "c", 0.0),
+                        volume: parse_f("volume", "v", 1000.0),
+                        funding_rate_hourly: parse_f(
+                            "funding_rate_hourly",
+                            "f",
+                            default_funding,
+                        ),
+                        is_synthetic: 0,
+                    });
+                }
+                bars.sort_by_key(|b| b.timestamp_ms);
+                bars
+            };
+
+        // 1. Primary schema: root["coins"][coin] -> {"funding_rate_hourly": f64, "candles": [...]}
+        if let Some(coins_obj) = root.get("coins").and_then(Value::as_object) {
+            for (sym_key, coin_entry) in coins_obj {
+                let norm_sym = if sym_key.contains("/USDC:USDC") {
+                    sym_key.clone()
+                } else {
+                    format!("{}/USDC:USDC", sym_key.trim().to_uppercase())
+                };
+                if let Some(coin_obj) = coin_entry.as_object() {
+                    let default_funding = coin_obj
+                        .get("funding_rate_hourly")
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        })
+                        .unwrap_or(0.0001);
+                    if let Some(arr) = coin_obj.get("candles").and_then(Value::as_array) {
+                        let bars = parse_candle_array(&norm_sym, arr, default_funding);
+                        if !bars.is_empty() {
+                            loaded_real.insert(norm_sym, bars);
+                        }
+                    }
+                } else if let Some(arr) = coin_entry.as_array() {
+                    let bars = parse_candle_array(&norm_sym, arr, 0.0001);
+                    if !bars.is_empty() {
+                        loaded_real.insert(norm_sym, bars);
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback flat schema: root["candles"][coin] -> [...] or root[coin] -> [...]
+        if loaded_real.is_empty() {
+            let candles_obj = root
+                .get("candles")
+                .and_then(Value::as_object)
+                .unwrap_or(&root);
+            for (sym_key, entry_val) in candles_obj {
+                let norm_sym = if sym_key.contains("/USDC:USDC") {
+                    sym_key.clone()
+                } else {
+                    format!("{}/USDC:USDC", sym_key.trim().to_uppercase())
+                };
+                if let Some(arr) = entry_val.as_array() {
+                    let bars = parse_candle_array(&norm_sym, arr, 0.0001);
+                    if !bars.is_empty() {
+                        loaded_real.insert(norm_sym, bars);
+                    }
+                } else if let Some(arr) = entry_val
+                    .as_object()
+                    .and_then(|o| o.get("candles"))
+                    .and_then(Value::as_array)
+                {
+                    let def_f = entry_val
+                        .get("funding_rate_hourly")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0001);
+                    let bars = parse_candle_array(&norm_sym, arr, def_f);
+                    if !bars.is_empty() {
+                        loaded_real.insert(norm_sym, bars);
+                    }
+                }
+            }
+        }
+
+        Ok(loaded_real)
+    }
+
+    /// Generates causal warmup bars prior to `first_real_bar` when historical data is shorter than `warmup_count + replay_bars`.
     fn generate_warmup_bars(
         symbol: &str,
         timeframe: &str,
@@ -122,14 +250,20 @@ impl BacktestEngine {
         out
     }
 
-    /// Loads `data/real_4h_backfill.json` (verifying SHA-256 provenance) or generates deterministic bars.
+    /// Loads `data/real_4h_backfill.json` (verifying SHA-256 provenance) or generates deterministic bars (`B5`).
+    /// When `use_real_history` is `true`, hard-fails with `AegisError::Validation` if the dataset yields zero real bars.
+    #[allow(clippy::type_complexity)]
     fn load_historical_dataset(
         &self,
         bt_db: &DatabaseManager,
         replay_bars: usize,
         warmup_bars: usize,
         use_real_history: bool,
-    ) -> Result<(Vec<OhlcvBar>, HashMap<String, Vec<OhlcvBar>>, HashMap<String, Vec<OhlcvBar>>)> {
+    ) -> Result<(
+        Vec<OhlcvBar>,
+        HashMap<String, Vec<OhlcvBar>>,
+        HashMap<String, Vec<OhlcvBar>>,
+    )> {
         let ingestion = MarketIngestionEngine::new(bt_db.clone());
         let usdc_assets = bt_db.get_usdc_perp_universe()?;
         let alt_pairs = bt_db.get_alt_pairs_universe()?;
@@ -138,61 +272,21 @@ impl BacktestEngine {
         let backfill_file = Self::backfill_path();
         let mut loaded_real: HashMap<String, Vec<OhlcvBar>> = HashMap::new();
 
-        if use_real_history && verify_data_provenance(&backfill_file)? {
-            if let Ok(raw_json) = fs::read_to_string(&backfill_file) {
-                if let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&raw_json) {
-                    let candles_obj = root
-                        .get("candles")
-                        .and_then(Value::as_object)
-                        .unwrap_or(&root);
-                    for (sym_key, arr_val) in candles_obj {
-                        let Some(arr) = arr_val.as_array() else {
-                            continue;
-                        };
-                        let norm_sym = if sym_key.contains("/USDC:USDC") {
-                            sym_key.clone()
-                        } else {
-                            format!("{sym_key}/USDC:USDC")
-                        };
-                        let mut bars = Vec::with_capacity(arr.len());
-                        for row in arr {
-                            let ts = row
-                                .get("timestamp_ms")
-                                .or_else(|| row.get("t"))
-                                .and_then(Value::as_i64)
-                                .unwrap_or(0);
-                            if ts <= 0 {
-                                continue;
-                            }
-                            let parse_f = |k1: &str, k2: &str, def: f64| -> f64 {
-                                row.get(k1)
-                                    .or_else(|| row.get(k2))
-                                    .and_then(|v| {
-                                        v.as_f64().or_else(|| {
-                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
-                                        })
-                                    })
-                                    .unwrap_or(def)
-                            };
-                            bars.push(OhlcvBar {
-                                symbol: norm_sym.clone(),
-                                timeframe: "4h".to_string(),
-                                timestamp_ms: ts,
-                                open: parse_f("open", "o", 0.0),
-                                high: parse_f("high", "h", 0.0),
-                                low: parse_f("low", "l", 0.0),
-                                close: parse_f("close", "c", 0.0),
-                                volume: parse_f("volume", "v", 1000.0),
-                                funding_rate_hourly: parse_f("funding_rate_hourly", "f", 0.0001),
-                                is_synthetic: 0,
-                            });
-                        }
-                        bars.sort_by_key(|b| b.timestamp_ms);
-                        if !bars.is_empty() {
-                            loaded_real.insert(norm_sym, bars);
-                        }
-                    }
-                }
+        if use_real_history {
+            let verified = verify_data_provenance(&backfill_file)?;
+            if !verified {
+                return Err(AegisError::Validation(format!(
+                    "Dataset provenance verification failed for {}",
+                    backfill_file.display()
+                )));
+            }
+            let raw_json = fs::read_to_string(&backfill_file)?;
+            loaded_real = Self::parse_backfill_json(&raw_json)?;
+            if loaded_real.is_empty() || !loaded_real.contains_key("BTC/USDC:USDC") {
+                return Err(AegisError::Validation(format!(
+                    "Real historical dataset {} yielded zero usable BTC/USDC:USDC bars (refusing synthetic fallback when use_real_history=true)",
+                    backfill_file.display()
+                )));
             }
         }
 
@@ -200,14 +294,19 @@ impl BacktestEngine {
         let btc_sym = "BTC/USDC:USDC";
 
         let btc_bars = if let Some(real_btc) = loaded_real.get(btc_sym) {
-            let tail = if real_btc.len() > replay_bars {
-                &real_btc[real_btc.len() - replay_bars..]
+            if real_btc.len() >= total_needed {
+                real_btc[real_btc.len() - total_needed..].to_vec()
             } else {
-                &real_btc[..]
-            };
-            let mut warm = Self::generate_warmup_bars(btc_sym, "4h", &tail[0], warmup_bars, 1);
-            warm.extend_from_slice(tail);
-            warm
+                let missing = total_needed - real_btc.len();
+                let mut warm =
+                    Self::generate_warmup_bars(btc_sym, "4h", &real_btc[0], missing, 1);
+                warm.extend_from_slice(real_btc);
+                warm
+            }
+        } else if use_real_history {
+            return Err(AegisError::Validation(
+                "Missing real historical candles for BTC/USDC:USDC".to_string(),
+            ));
         } else {
             ingestion.generate_synthetic_bars(
                 btc_sym,
@@ -229,20 +328,25 @@ impl BacktestEngine {
                 continue;
             }
             let bars = if let Some(real_alt) = loaded_real.get(&asset.symbol) {
-                let tail = if real_alt.len() > replay_bars {
-                    &real_alt[real_alt.len() - replay_bars..]
+                if real_alt.len() >= total_needed {
+                    real_alt[real_alt.len() - total_needed..].to_vec()
                 } else {
-                    &real_alt[..]
-                };
-                let mut warm = Self::generate_warmup_bars(
-                    &asset.symbol,
-                    "4h",
-                    &tail[0],
-                    warmup_bars,
-                    (idx + 2) as u64,
-                );
-                warm.extend_from_slice(tail);
-                warm
+                    let missing = total_needed - real_alt.len();
+                    let mut warm = Self::generate_warmup_bars(
+                        &asset.symbol,
+                        "4h",
+                        &real_alt[0],
+                        missing,
+                        (idx + 2) as u64,
+                    );
+                    warm.extend_from_slice(real_alt);
+                    warm
+                }
+            } else if use_real_history {
+                return Err(AegisError::Validation(format!(
+                    "Missing real historical candles for {} in verified backfill dataset",
+                    asset.symbol
+                )));
             } else {
                 ingestion.generate_synthetic_bars(
                     &asset.symbol,
@@ -284,12 +388,34 @@ impl BacktestEngine {
         let bt_db = self.db.clone_to_memory()?;
         let cfg = bt_db.load_config()?;
 
+        let default_warmup = cfg.get_usize("backtest_warmup_bars", 110).max(60);
         let replay_bars = total_bars.unwrap_or(self.days * 6).max(60);
-        let warmup = warmup_bars.unwrap_or(110).max(60);
+        let warmup = warmup_bars.unwrap_or(default_warmup).max(60);
 
         let (btc_bars, usdc_map, synth_map) =
             self.load_historical_dataset(&bt_db, replay_bars, warmup, use_real_history)?;
 
+        let (tear_sheet, _, _) =
+            Self::execute_pit_replay(&bt_db, &btc_bars, &usdc_map, &synth_map, warmup)?;
+        Ok(tear_sheet)
+    }
+
+    /// Executes strict point-in-time bar replay over pre-loaded bars (`B6`, `C4`, `C6`).
+    /// Returns `(BacktestTearSheet, per_bar_signal_evaluations, per_bar_open_trades)` for causality verification.
+    #[allow(clippy::type_complexity)]
+    pub fn execute_pit_replay(
+        bt_db: &DatabaseManager,
+        btc_bars: &[OhlcvBar],
+        usdc_map: &HashMap<String, Vec<OhlcvBar>>,
+        synth_map: &HashMap<String, Vec<OhlcvBar>>,
+        warmup: usize,
+    ) -> Result<(
+        BacktestTearSheet,
+        Vec<Vec<SignalEvaluation>>,
+        Vec<Vec<TradeRecord>>,
+    )> {
+        let cfg = bt_db.load_config()?;
+        let scfg = aegis_signals::SignalConfig::from_config_map(&cfg);
         let n_total = btc_bars.len();
         let eval_start = warmup.min(n_total.saturating_sub(10));
 
@@ -297,22 +423,63 @@ impl BacktestEngine {
         let risk = RiskEngine::new(bt_db.clone());
         let exec = ExecutionEngine::new(bt_db.clone());
 
-        let hmm_window = cfg.get_usize("hmm_lookback_candles", 250);
-        let snr_fast = cfg.get_usize("snr_ema_fast_period", 16);
-        let snr_slow = cfg.get_usize("snr_ema_slow_period", 64);
-        let base_mace_w = cfg.get_f64("mace_conviction_weight", 0.35);
-        let long_thresh = cfg.get_f64("conviction_long_threshold", 0.38);
-        let short_thresh = cfg.get_f64("conviction_short_threshold", -0.38);
+        let hmm_window = cfg
+            .get_usize("hmm_lookback_bars", 0)
+            .max(cfg.get_usize("hmm_lookback_candles", 540));
+        let snr_fast = cfg.get_usize("snr_ema_fast_period", cfg.get_usize("snr_fast_span", 16));
+        let snr_slow = cfg.get_usize("snr_ema_slow_period", cfg.get_usize("snr_slow_span", 64));
+        let rs_fast = cfg.get_usize("rs_lookback_fast_bars", 24);
+        let rs_mid = cfg.get_usize("rs_lookback_mid_bars", 72);
+        let rs_slow = cfg.get_usize("rs_lookback_slow_bars", 96);
+        let rs_u8 = cfg.get_usize(
+            "rs_usdc_momentum_bars",
+            cfg.get_usize("rs_usdc_short_lookback_bars", 8),
+        );
+        let atr_period = cfg
+            .get_usize("atr_period", cfg.get_usize("atr_default_period", 14))
+            .max(1);
+        let base_mace_w = cfg.get_f64(
+            "mace_conviction_weight",
+            cfg.get_f64("mace_blend_weight", 0.35),
+        );
+        let long_thresh = cfg.get_f64(
+            "conviction_long_threshold",
+            cfg.get_f64("bull_conviction_gate", 0.32),
+        );
+        let short_thresh = cfg.get_f64(
+            "conviction_short_threshold",
+            cfg.get_f64("bear_conviction_gate", -0.32),
+        );
         let chop_thresh = cfg.get_f64("hmm_chop_prob_threshold", 0.55);
-        let basis_floor = cfg.get_f64("basis_harvest_min_funding_hourly", 0.00015);
+        let basis_harvest_enabled = cfg.get_bool("basis_harvest_enabled", true);
+        let basis_floor = cfg.get_f64(
+            "basis_harvest_min_funding_hourly",
+            cfg.get_f64("basis_min_hourly_funding_rate", 0.000015),
+        );
+        let basis_alloc_pct = cfg.get_f64("basis_max_idle_cash_allocation_pct", 0.50);
+        let bear_flip_prob = cfg.get_f64("execution_regime_flip_bear_prob", 0.62);
+        let bull_flip_prob = cfg.get_f64("execution_regime_flip_bull_prob", 0.60);
+        let chop_conv_max = cfg.get_f64("execution_high_chop_conviction_max", 0.08);
+        let chop_prob_offset = cfg.get_f64("execution_high_chop_prob_offset", 0.20);
+        let chop_prob_cap = cfg.get_f64("execution_high_chop_prob_cap", 0.82);
+        let rs_breakdown_long_snr = cfg.get_f64("execution_rs_breakdown_long_snr", -0.10);
+        let rs_reversal_short_snr = cfg.get_f64("execution_rs_reversal_short_snr", 0.10);
+        let cooldown_bars = cfg
+            .get_usize(
+                "execution_stop_cooldown_bars",
+                cfg.get_usize("post_stop_cooldown_bars", 14),
+            )
+            .max(1);
+        let max_longs = cfg.get_usize("max_concurrent_long_positions", 2);
+        let max_shorts = cfg.get_usize("max_concurrent_short_positions", 2);
         let initial_equity = cfg.get_f64("initial_equity_usdc", 10000.0);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
 
         let btc_ts: Vec<i64> = btc_bars.iter().map(|b| b.timestamp_ms).collect();
         let alt_pc1_series =
-            SignalEngine::compute_alt_pc1_series(&usdc_map, &btc_ts, n_total);
+            SignalEngine::compute_alt_pc1_series(usdc_map, &btc_ts, hmm_window);
         let regime_states: Vec<RegimeState> =
-            signals.decode_hmm_regime_states(&btc_bars, hmm_window, Some(&alt_pc1_series), None);
+            signals.decode_hmm_regime_states(btc_bars, hmm_window, Some(&alt_pc1_series), None);
 
         let usdc_assets = bt_db.get_usdc_perp_universe()?;
         let asset_by_sym: HashMap<String, UniverseAsset> = usdc_assets
@@ -332,9 +499,11 @@ impl BacktestEngine {
                     return None;
                 }
                 let (snr_series, snr_synth_series) =
-                    SignalEngine::compute_continuous_snr_series(&s_bars, &u_bars, snr_fast, snr_slow);
+                    SignalEngine::compute_continuous_snr_series_with_config(
+                        &s_bars, &u_bars, snr_fast, snr_slow, &scfg,
+                    );
                 let (mace_series, ic_series) = if let Some((x_raw, y_target, k)) =
-                    SignalEngine::build_mace_features_and_target(&s_bars, &u_bars)
+                    SignalEngine::build_mace_features_and_target_with_config(&s_bars, &u_bars, &scfg)
                 {
                     let local_sig = SignalEngine::new(bt_db.clone());
                     local_sig.fit_predict_mace_series_from_xy(&x_raw, &y_target, k, None)
@@ -342,20 +511,27 @@ impl BacktestEngine {
                     (vec![0.0; n_total], vec![0.0; n_total])
                 };
 
+                let s_closes: Vec<f64> = s_bars.iter().map(|b| b.close.max(1e-12)).collect();
+                let u_closes: Vec<f64> = u_bars.iter().map(|b| b.close.max(1e-12)).collect();
+
                 let mut rs_composite_series = vec![0.0; n_total];
                 let mut rs_96_series = vec![0.0; n_total];
                 let mut r_usdc_8_series = vec![0.0; n_total];
 
                 for t in 0..n_total {
-                    let sc = s_bars[t].close.max(1e-12);
-                    let uc = u_bars[t].close.max(1e-12);
-                    let rs_24 = (sc / s_bars[t.saturating_sub(24)].close.max(1e-12)).ln();
-                    let rs_72 = (sc / s_bars[t.saturating_sub(72)].close.max(1e-12)).ln();
-                    let rs_96 = (sc / s_bars[t.saturating_sub(96)].close.max(1e-12)).ln();
-                    let r_u8 = (uc / u_bars[t.saturating_sub(8)].close.max(1e-12)).ln();
+                    // C6: Require full lookbacks via compute_rs_lookbacks instead of saturating_sub clamping
+                    let (rs_24, rs_72, rs_96, r_u8) = aegis_signals::compute_rs_lookbacks(
+                        &s_closes[..=t],
+                        &u_closes[..=t],
+                        rs_fast,
+                        rs_mid,
+                        rs_slow,
+                        rs_u8,
+                    );
                     let snr_s = snr_synth_series.get(t).copied().unwrap_or(0.0);
-                    rs_composite_series[t] =
-                        0.45 * snr_s + 0.35 * (rs_24 * 6.0).tanh() + 0.20 * (rs_72 * 4.0).tanh();
+                    rs_composite_series[t] = scfg.rs_composite_snr_weight * snr_s
+                        + scfg.rs_composite_fast_weight * (rs_24 * scfg.rs_composite_fast_scale).tanh()
+                        + scfg.rs_composite_mid_weight * (rs_72 * scfg.rs_composite_mid_scale).tanh();
                     rs_96_series[t] = rs_96;
                     r_usdc_8_series[t] = r_u8;
                 }
@@ -377,6 +553,8 @@ impl BacktestEngine {
 
         let mut equity_curve = Vec::with_capacity(n_total - eval_start);
         let mut bar_returns = Vec::with_capacity(n_total - eval_start);
+        let mut per_bar_evals = Vec::with_capacity(n_total - eval_start);
+        let mut per_bar_open_trades = Vec::with_capacity(n_total - eval_start);
         let mut prev_equity = initial_equity;
         let mut accrued_yield_usdc = 0.0;
         let mut total_slippage_usdc = 0.0;
@@ -400,9 +578,9 @@ impl BacktestEngine {
                 _ => chop_bars += 1,
             }
 
-            let btc_macro = SignalEngine::compute_btc_macro_confirmation(&btc_bars[..=t]);
+            let btc_macro =
+                SignalEngine::compute_btc_macro_confirmation_with_config(&btc_bars[..=t], &scfg);
 
-            // Rank universe cross-sectionally at bar t
             let mut order_indices: Vec<usize> = (0..precomputed.len()).collect();
             order_indices.sort_by(|&i, &j| {
                 precomputed[j].rs_composite_series[t]
@@ -421,11 +599,12 @@ impl BacktestEngine {
                 let snr_s = p.snr_synth_series[t];
                 let mace = p.mace_series[t];
                 let ic = p.ic_series[t];
-                let dyn_w = SignalEngine::compute_dynamic_mace_weight(ic, base_mace_w);
+                let dyn_w =
+                    SignalEngine::compute_dynamic_mace_weight_with_config(ic, base_mace_w, &scfg);
                 let blended = round_dp(((1.0 - dyn_w) * snr + dyn_w * mace).clamp(-1.0, 1.0), 4);
                 let funding = p.usdc_bars[t].funding_rate_hourly;
 
-                let action = SignalEngine::classify_signal_action(
+                let action = SignalEngine::classify_signal_action_with_config(
                     &regime.regime,
                     regime.prob_bull,
                     regime.prob_bear,
@@ -444,6 +623,7 @@ impl BacktestEngine {
                     chop_thresh,
                     basis_floor,
                     btc_macro,
+                    &scfg,
                 );
 
                 let ev = SignalEvaluation {
@@ -474,12 +654,13 @@ impl BacktestEngine {
             // 1. Update & evaluate stops on open trades
             let open_trades = bt_db.get_open_trades()?;
             for trade in open_trades {
-                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == trade.symbol) else {
+                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == trade.symbol)
+                else {
                     continue;
                 };
                 let bar = &p.usdc_bars[t];
-                let atr_slice_start = t.saturating_sub(15);
-                let atr = risk.compute_atr(&p.usdc_bars[atr_slice_start..=t], 14);
+                let atr_slice_start = t.saturating_sub(atr_period + 1);
+                let atr = risk.compute_atr(&p.usdc_bars[atr_slice_start..=t], atr_period);
 
                 let stop_eval = risk.evaluate_two_tier_chandelier_stop(
                     &trade.side,
@@ -506,17 +687,33 @@ impl BacktestEngine {
 
                 if exit_reason.is_none() {
                     if let Some(ev) = ev_opt {
-                        if trade.side == "LONG" && ev.hmm_regime == "BEAR" && ev.prob_bear >= 0.62 {
+                        if trade.side == "LONG"
+                            && ev.hmm_regime == "BEAR"
+                            && ev.prob_bear >= bear_flip_prob
+                        {
                             exit_reason = Some("REGIME_FLIP_BEAR".to_string());
                             exit_px = bar.close;
-                        } else if trade.side == "SHORT" && ev.hmm_regime == "BULL" && ev.prob_bull >= 0.60 {
+                        } else if trade.side == "LONG" && ev.snr_synth < rs_breakdown_long_snr {
+                            exit_reason = Some("RS_SYNTH_BREAKDOWN_LONG".to_string());
+                            exit_px = bar.close;
+                        } else if trade.side == "SHORT"
+                            && ev.hmm_regime == "BULL"
+                            && ev.prob_bull >= bull_flip_prob
+                        {
                             exit_reason = Some("REGIME_FLIP_BULL".to_string());
+                            exit_px = bar.close;
+                        } else if trade.side == "SHORT" && ev.snr_synth > rs_reversal_short_snr {
+                            exit_reason = Some("RS_SYNTH_REVERSAL_SHORT".to_string());
+                            exit_px = bar.close;
+                        } else if ev.prob_chop >= (chop_thresh + chop_prob_offset).min(chop_prob_cap)
+                            && ev.blended_conviction.abs() < chop_conv_max
+                        {
+                            exit_reason = Some("HIGH_CHOP_DELEVERAGE".to_string());
                             exit_px = bar.close;
                         }
                     }
                 }
 
-                // 4H bar funding accrual
                 let funding_4h = if trade.side == "LONG" {
                     -(trade.quantity * bar.close) * bar.funding_rate_hourly * 4.0
                 } else {
@@ -539,7 +736,7 @@ impl BacktestEngine {
                     let net_pnl = round_dp(gross_pnl - total_fees + new_funding, 4);
                     bt_db.close_trade(trade.trade_id, exit_px, net_pnl, total_fees, &reason)?;
                     if stop_eval.triggered {
-                        cooldown_until_bar.insert(trade.symbol.clone(), t + 14);
+                        cooldown_until_bar.insert(trade.symbol.clone(), t + cooldown_bars);
                     }
                 } else {
                     let upnl = if trade.side == "LONG" {
@@ -566,13 +763,22 @@ impl BacktestEngine {
                 .iter()
                 .map(|tr| tr.unrealized_pnl_usdc + tr.funding_accrued_usdc)
                 .sum();
-            let cur_equity = (initial_equity + realized_pnl + cur_upnl + accrued_yield_usdc).max(100.0);
+            let cur_equity =
+                (initial_equity + realized_pnl + cur_upnl + accrued_yield_usdc).max(100.0);
 
-            for ev in &evals_t {
+            for (ev_idx, ev) in evals_t.iter().enumerate() {
                 if ev.signal_action != "LONG" && ev.signal_action != "SHORT" {
                     continue;
                 }
                 if active_trades.iter().any(|tr| tr.symbol == ev.exec_symbol) {
+                    continue;
+                }
+                let cur_longs = active_trades.iter().filter(|tr| tr.side == "LONG").count();
+                let cur_shorts = active_trades.iter().filter(|tr| tr.side == "SHORT").count();
+                if ev.signal_action == "LONG" && cur_longs >= max_longs {
+                    continue;
+                }
+                if ev.signal_action == "SHORT" && cur_shorts >= max_shorts {
                     continue;
                 }
                 if let Some(&cd_bar) = cooldown_until_bar.get(&ev.exec_symbol) {
@@ -580,12 +786,13 @@ impl BacktestEngine {
                         continue;
                     }
                 }
-                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == ev.exec_symbol) else {
+                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == ev.exec_symbol)
+                else {
                     continue;
                 };
                 let bar = &p.usdc_bars[t];
-                let atr_slice_start = t.saturating_sub(15);
-                let atr = risk.compute_atr(&p.usdc_bars[atr_slice_start..=t], 14);
+                let atr_slice_start = t.saturating_sub(atr_period + 1);
+                let atr = risk.compute_atr(&p.usdc_bars[atr_slice_start..=t], atr_period);
 
                 let sizing = risk.evaluate_order_risk(
                     &p.asset,
@@ -601,6 +808,7 @@ impl BacktestEngine {
                     continue;
                 }
 
+                let det_cid = format!("bt-{}-{}-{}", p.asset.base_asset, t, ev_idx);
                 let fill = exec.simulate_paper_fill(
                     &p.asset.symbol,
                     &ev.signal_action,
@@ -614,7 +822,7 @@ impl BacktestEngine {
                     false,
                     true,
                     None,
-                    None,
+                    Some(&det_cid),
                 );
                 if fill.fsm_state != "FILLED" || fill.filled_units <= 0.0 {
                     continue;
@@ -641,8 +849,8 @@ impl BacktestEngine {
                     initial_stop_price: sizing.initial_stop_price,
                     chandelier_stop_price: sizing.initial_stop_price,
                     current_stop_price: sizing.initial_stop_price,
-                    highest_price_seen: fill.avg_fill_price.max(bar.high),
-                    lowest_price_seen: fill.avg_fill_price.min(bar.low),
+                    highest_price_seen: fill.avg_fill_price,
+                    lowest_price_seen: fill.avg_fill_price,
                     realized_pnl_usdc: 0.0,
                     unrealized_pnl_usdc: 0.0,
                     fees_paid_usdc: fill.fees_paid_usdc,
@@ -673,19 +881,15 @@ impl BacktestEngine {
                 - deployed_notional)
                 .max(0.0);
 
-            let basis_count = evals_t
-                .iter()
-                .filter(|e| e.signal_action == "BASIS_HARVEST")
-                .count();
-            if (regime.regime == "CHOP" || regime.prob_chop >= chop_thresh) && basis_count > 0 {
-                let basis_notional = avail_cash * 0.35;
-                let avg_f = evals_t
+            if basis_harvest_enabled {
+                let best_funding = evals_t
                     .iter()
-                    .filter(|e| e.signal_action == "BASIS_HARVEST")
-                    .map(|e| e.funding_rate_hourly.max(0.00015))
-                    .sum::<f64>()
-                    / (basis_count as f64);
-                accrued_yield_usdc += basis_notional * avg_f * 4.0;
+                    .map(|e| e.funding_rate_hourly)
+                    .fold(0.0_f64, f64::max);
+                if best_funding >= basis_floor {
+                    let basis_notional = avail_cash * basis_alloc_pct;
+                    accrued_yield_usdc += basis_notional * best_funding * 4.0;
+                }
             }
 
             let bar_equity =
@@ -699,6 +903,8 @@ impl BacktestEngine {
             let bar_ret = (bar_equity - prev_equity) / prev_equity.max(1.0);
             bar_returns.push(bar_ret);
             equity_curve.push(bar_equity);
+            per_bar_evals.push(evals_t);
+            per_bar_open_trades.push(active_trades.clone());
             prev_equity = bar_equity;
 
             if t == n_total - 1 {
@@ -717,7 +923,8 @@ impl BacktestEngine {
                     prob_bull: regime.prob_bull,
                     prob_bear: regime.prob_bear,
                     prob_chop: regime.prob_chop,
-                    open_long_count: active_trades.iter().filter(|x| x.side == "LONG").count() as i64,
+                    open_long_count: active_trades.iter().filter(|x| x.side == "LONG").count()
+                        as i64,
                     open_short_count: active_trades.iter().filter(|x| x.side == "SHORT").count()
                         as i64,
                     created_at: None,
@@ -743,8 +950,10 @@ impl BacktestEngine {
         }
 
         let all_trades = bt_db.get_recent_trades(10_000)?;
-        let closed_trades: Vec<&TradeRecord> =
-            all_trades.iter().filter(|tr| tr.status == "CLOSED").collect();
+        let closed_trades: Vec<&TradeRecord> = all_trades
+            .iter()
+            .filter(|tr| tr.status == "CLOSED")
+            .collect();
 
         let total_trades = closed_trades.len();
         let winning_trades = closed_trades
@@ -776,7 +985,6 @@ impl BacktestEngine {
         let annualized_return_pct =
             ((final_equity / initial_equity).max(0.01).powf(1.0 / years) - 1.0) * 100.0;
 
-        // Sharpe & Sortino (4H bars = 2190 bars/year)
         let n_r = bar_returns.len().max(1) as f64;
         let mean_r = bar_returns.iter().sum::<f64>() / n_r;
         let var_r = bar_returns
@@ -805,7 +1013,6 @@ impl BacktestEngine {
             annualized_sharpe
         };
 
-        // Maximum Drawdown
         let mut peak = initial_equity;
         let mut max_dd = 0.0;
         for &eq in &equity_curve {
@@ -868,49 +1075,57 @@ impl BacktestEngine {
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "2025-01-01".to_string());
 
-        let gate_sharpe_pass = annualized_sharpe >= 1.2;
-        let gate_mdd_pass = max_drawdown_pct <= 20.0;
-        let gate_profit_factor_pass = profit_factor >= 1.3;
+        let min_sharpe = cfg.get_f64("backtest_gate_min_sharpe", 1.20);
+        let max_mdd = cfg.get_f64("backtest_gate_max_mdd_pct", 20.0);
+        let min_pf = cfg.get_f64("backtest_gate_min_profit_factor", 1.30);
+
+        let gate_sharpe_pass = annualized_sharpe >= min_sharpe;
+        let gate_mdd_pass = max_drawdown_pct <= max_mdd;
+        let gate_profit_factor_pass = profit_factor >= min_pf;
         let all_gates_passed = gate_sharpe_pass && gate_mdd_pass && gate_profit_factor_pass;
 
-        Ok(BacktestTearSheet {
-            start_date,
-            end_date,
-            duration_days: round_dp(duration_days, 1),
-            bars_replayed,
-            initial_equity_usdc: round_dp(initial_equity, 2),
-            final_equity_usdc: round_dp(final_equity, 2),
-            total_return_pct: round_dp(total_return_pct, 2),
-            annualized_return_pct: round_dp(annualized_return_pct, 2),
-            annualized_sharpe: round_dp(annualized_sharpe, 2),
-            sortino_ratio: round_dp(sortino_ratio, 2),
-            calmar_ratio: round_dp(calmar_ratio, 2),
-            max_drawdown_pct: round_dp(max_drawdown_pct, 2),
-            profit_factor: round_dp(profit_factor, 2),
-            trade_profit_factor: round_dp(trade_pf, 2),
-            win_rate_pct: round_dp(win_rate_pct, 2),
-            total_trades,
-            winning_trades,
-            losing_trades,
-            gross_profit_usdc: round_dp(gross_profit, 2),
-            gross_loss_usdc: round_dp(gross_loss, 2),
-            total_fees_usdc: round_dp(total_fees, 2),
-            total_slippage_usdc: round_dp(total_slippage_usdc, 2),
-            wick_stop_outs,
-            fee_drag_pct: round_dp(fee_drag_pct, 2),
-            funding_net_usdc: round_dp(funding_net, 2),
-            basis_yield_usdc: round_dp(accrued_yield_usdc, 2),
-            bull_regime_pnl_usdc: round_dp(bull_pnl, 2),
-            bear_regime_pnl_usdc: round_dp(bear_pnl, 2),
-            chop_regime_pnl_usdc: round_dp(chop_pnl, 2),
-            bull_bars_count: bull_bars,
-            bear_bars_count: bear_bars,
-            chop_bars_count: chop_bars,
-            gate_sharpe_pass,
-            gate_mdd_pass,
-            gate_profit_factor_pass,
-            all_gates_passed,
-        })
+        Ok((
+            BacktestTearSheet {
+                start_date,
+                end_date,
+                duration_days: round_dp(duration_days, 1),
+                bars_replayed,
+                initial_equity_usdc: round_dp(initial_equity, 2),
+                final_equity_usdc: round_dp(final_equity, 2),
+                total_return_pct: round_dp(total_return_pct, 2),
+                annualized_return_pct: round_dp(annualized_return_pct, 2),
+                annualized_sharpe: round_dp(annualized_sharpe, 2),
+                sortino_ratio: round_dp(sortino_ratio, 2),
+                calmar_ratio: round_dp(calmar_ratio, 2),
+                max_drawdown_pct: round_dp(max_drawdown_pct, 2),
+                profit_factor: round_dp(profit_factor, 2),
+                trade_profit_factor: round_dp(trade_pf, 2),
+                win_rate_pct: round_dp(win_rate_pct, 2),
+                total_trades,
+                winning_trades,
+                losing_trades,
+                gross_profit_usdc: round_dp(gross_profit, 2),
+                gross_loss_usdc: round_dp(gross_loss, 2),
+                total_fees_usdc: round_dp(total_fees, 2),
+                total_slippage_usdc: round_dp(total_slippage_usdc, 2),
+                wick_stop_outs,
+                fee_drag_pct: round_dp(fee_drag_pct, 2),
+                funding_net_usdc: round_dp(funding_net, 2),
+                basis_yield_usdc: round_dp(accrued_yield_usdc, 2),
+                bull_regime_pnl_usdc: round_dp(bull_pnl, 2),
+                bear_regime_pnl_usdc: round_dp(bear_pnl, 2),
+                chop_regime_pnl_usdc: round_dp(chop_pnl, 2),
+                bull_bars_count: bull_bars,
+                bear_bars_count: bear_bars,
+                chop_bars_count: chop_bars,
+                gate_sharpe_pass,
+                gate_mdd_pass,
+                gate_profit_factor_pass,
+                all_gates_passed,
+            },
+            per_bar_evals,
+            per_bar_open_trades,
+        ))
     }
 
     /// Formats the institutional ASCII Tear Sheet (`engine/backtest.py::format_tear_sheet`).
@@ -930,7 +1145,7 @@ impl BacktestEngine {
 
         format!(
             "==============================================================================\n\
-             AEGIS QUANT v0.2.0-rc2 — POINT-IN-TIME HISTORICAL BACKTEST TEAR SHEET\n\
+             AEGIS QUANT v0.3.0-rc1 — POINT-IN-TIME HISTORICAL BACKTEST TEAR SHEET\n\
              ==============================================================================\n\
              Window         : {} -> {} ({:.1} days | {} 4H bars)\n\
              Initial Equity : ${:.2} USDC\n\
@@ -995,5 +1210,189 @@ impl BacktestEngine {
             ts.chop_regime_pnl_usdc,
             overall,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_real_4h_backfill_schema_and_file() {
+        // 1. Parse nested production schema directly
+        let sample = json!({
+            "server_max_ts": 1792771200000i64,
+            "target_end_ts": 1792785600000i64,
+            "coins": {
+                "BTC": {
+                    "source": "hyperliquid",
+                    "funding_rate_hourly": 0.000015,
+                    "count": 2,
+                    "candles": [
+                        {"t": 1730419200000i64, "o": 70364.0, "h": 70522.0, "l": 68928.0, "c": 69417.0, "v": 2457.92721},
+                        {"t": 1730433600000i64, "o": 69417.0, "h": 69730.0, "l": 69111.0, "c": 69304.0, "v": 1076.2431}
+                    ]
+                }
+            }
+        });
+        let parsed = BacktestEngine::parse_backfill_json(&sample.to_string()).unwrap();
+        let btc = parsed.get("BTC/USDC:USDC").expect("BTC/USDC:USDC parsed");
+        assert_eq!(btc.len(), 2);
+        assert!((btc[0].open - 70364.0).abs() < 1e-6);
+        assert!((btc[0].funding_rate_hourly - 0.000015).abs() < 1e-10);
+        assert_eq!(btc[0].is_synthetic, 0);
+
+        // 2. Verify empty dataset is rejected when use_real_history is requested
+        let empty = BacktestEngine::parse_backfill_json(r#"{"coins": {}}"#).unwrap();
+        assert!(empty.is_empty());
+
+        // 3. Parse actual shipped data/real_4h_backfill.json
+        let path = BacktestEngine::backfill_path();
+        assert!(verify_data_provenance(&path).unwrap());
+        let raw = fs::read_to_string(&path).unwrap();
+        let full_map = BacktestEngine::parse_backfill_json(&raw).unwrap();
+        assert!(full_map.len() >= 16);
+        let btc_real = full_map.get("BTC/USDC:USDC").unwrap();
+        assert!(btc_real.len() >= 4000);
+        assert!(btc_real.iter().all(|b| b.is_synthetic == 0));
+    }
+
+    #[test]
+    fn test_zero_lookahead_causality_under_shuffled_future_bars() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let bt = BacktestEngine::new(db.clone(), 30);
+
+        let bt_db_a = db.clone_to_memory().unwrap();
+        let (btc_a, usdc_a, synth_a) = bt
+            .load_historical_dataset(&bt_db_a, 80, 70, true)
+            .unwrap();
+        assert!(btc_a.iter().all(|b| b.is_synthetic == 0));
+
+        let n_total = btc_a.len();
+        let warmup = 70usize;
+        let t_pivot = warmup + 40; // Bar index 110 out of 150
+        assert!(t_pivot + 10 < n_total);
+
+        let (_, evals_a, trades_a) =
+            BacktestEngine::execute_pit_replay(&bt_db_a, &btc_a, &usdc_a, &synth_a, warmup)
+                .unwrap();
+
+        // Construct dataset B identical on [0..=t_pivot] and wildly mutated/shuffled on [t_pivot + 1..n_total]
+        let bt_db_b = db.clone_to_memory().unwrap();
+        let mut btc_b = btc_a.clone();
+        let tail_len = n_total - (t_pivot + 1);
+        for offset in 0..tail_len {
+            let src_idx = n_total - 1 - offset;
+            let dst_idx = t_pivot + 1 + offset;
+            let ts_keep = btc_a[dst_idx].timestamp_ms;
+            let mut mutated = btc_a[src_idx].clone();
+            mutated.timestamp_ms = ts_keep;
+            mutated.close *= 1.35;
+            mutated.high *= 1.45;
+            mutated.low *= 0.65;
+            btc_b[dst_idx] = mutated;
+        }
+        bt_db_b.upsert_ohlcv_batch(&btc_b).unwrap();
+
+        let mut usdc_b = usdc_a.clone();
+        for bars in usdc_b.values_mut() {
+            let orig = bars.clone();
+            for offset in 0..tail_len {
+                let src_idx = n_total - 1 - offset;
+                let dst_idx = t_pivot + 1 + offset;
+                let ts_keep = orig[dst_idx].timestamp_ms;
+                let mut mutated = orig[src_idx].clone();
+                mutated.timestamp_ms = ts_keep;
+                mutated.close *= 0.55;
+                mutated.high *= 1.50;
+                mutated.low *= 0.45;
+                bars[dst_idx] = mutated;
+            }
+            bt_db_b.upsert_ohlcv_batch(bars).unwrap();
+        }
+
+        let mut synth_b = HashMap::new();
+        for pair in bt_db_b.get_alt_pairs_universe().unwrap() {
+            let alt_bars = usdc_b.get(&pair.exec_symbol).unwrap();
+            let s_bars = MarketIngestionEngine::synthesize_alt_btc_candles(
+                alt_bars,
+                &btc_b,
+                &pair.synth_symbol,
+                "4h",
+            );
+            bt_db_b.upsert_ohlcv_batch(&s_bars).unwrap();
+            synth_b.insert(pair.synth_symbol.clone(), s_bars);
+        }
+
+        let (_, evals_b, trades_b) =
+            BacktestEngine::execute_pit_replay(&bt_db_b, &btc_b, &usdc_b, &synth_b, warmup)
+                .unwrap();
+
+        let check_steps = t_pivot - warmup + 1;
+        for step in 0..check_steps {
+            let ev_a = &evals_a[step];
+            let ev_b = &evals_b[step];
+            assert_eq!(ev_a.len(), ev_b.len());
+            for (a, b) in ev_a.iter().zip(ev_b.iter()) {
+                assert_eq!(a.exec_symbol, b.exec_symbol, "rank mismatch at step {step}");
+                assert_eq!(
+                    a.hmm_regime, b.hmm_regime,
+                    "regime lookahead leak at step {step}"
+                );
+                assert!(
+                    (a.prob_bull - b.prob_bull).abs() < 1e-9,
+                    "prob_bull lookahead leak at step {step}"
+                );
+                assert!(
+                    (a.mace_score - b.mace_score).abs() < 1e-9,
+                    "mace_score lookahead leak at step {step}"
+                );
+                assert!(
+                    (a.blended_conviction - b.blended_conviction).abs() < 1e-9,
+                    "blended_conviction lookahead leak at step {step}"
+                );
+                assert_eq!(
+                    a.signal_action, b.signal_action,
+                    "signal_action lookahead leak at step {step}"
+                );
+            }
+
+            let tr_a = &trades_a[step];
+            let tr_b = &trades_b[step];
+            assert_eq!(
+                tr_a.len(),
+                tr_b.len(),
+                "open trade count mismatch at step {step}"
+            );
+            for (ta, tb) in tr_a.iter().zip(tr_b.iter()) {
+                assert_eq!(ta.symbol, tb.symbol);
+                assert_eq!(ta.side, tb.side);
+                assert!((ta.quantity - tb.quantity).abs() < 1e-9);
+                assert!((ta.entry_price - tb.entry_price).abs() < 1e-9);
+                assert!((ta.chandelier_stop_price - tb.chandelier_stop_price).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tear_sheet_gate_math_and_formatting() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let bt = BacktestEngine::new(db, 30);
+        let ts = bt.run_backtest(Some(90), Some(70), true).unwrap();
+        assert_eq!(ts.bars_replayed, 90);
+        assert_eq!(
+            ts.bull_bars_count + ts.bear_bars_count + ts.chop_bars_count,
+            90
+        );
+        assert_eq!(
+            ts.all_gates_passed,
+            ts.gate_sharpe_pass && ts.gate_mdd_pass && ts.gate_profit_factor_pass
+        );
+        let formatted = BacktestEngine::format_tear_sheet(&ts);
+        assert!(formatted.contains("POINT-IN-TIME HISTORICAL BACKTEST TEAR SHEET"));
+        assert!(formatted.contains("VERDICT:"));
     }
 }

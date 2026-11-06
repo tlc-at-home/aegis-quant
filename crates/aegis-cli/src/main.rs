@@ -1,24 +1,28 @@
-//! Unified CLI & Daemon Orchestrator (`aegis-quant`) for Aegis Quant (`v0.2.0-rc2`).
+//! Unified CLI & Daemon Orchestrator (`aegis-quant`) for Aegis Quant (`v0.3.0-rc1` PP-50 Two-Book Platform).
 //!
 //! 1:1 port of `engine/main.py`, `engine/database.py` CLI, `engine/backtest.py` CLI,
-//! `engine/alerts.py` CLI, and `scripts/check_mainnet_readiness.py`.
+//! `engine/alerts.py` CLI, and `scripts/check_mainnet_readiness.py`, extended with
+//! Book A (`PIT`), Book B (`POND`), and Daily 00:05 UTC Settling (`SETTLE`).
 
 use aegis_alerts::AlertEngine;
 use aegis_backtest::BacktestEngine;
 use aegis_core::{
     resolve_project_root, round_dp, validate_evm_address, validate_private_key,
-    verify_data_provenance, CheckResult, ExecutionMode, PortfolioSnapshot, Result,
-    SENSITIVE_CONFIG_KEYS,
+    verify_data_provenance, AegisError, CheckResult, PortfolioSnapshot, Result,
+    PLATFORM_VERSION, SENSITIVE_CONFIG_KEYS,
 };
 use aegis_db::{
     fernet::{
         default_host_fernet_key_b64, generate_fernet_key, is_encrypted_value,
-        resolve_fernet_master_key,
+        is_legacy_public_fallback_key, master_key_file_for_db, resolve_fernet_master_key,
     },
     DatabaseManager,
 };
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine};
+use aegis_pit::PitOrchestrator;
+use aegis_pond::PondOrchestrator;
 use aegis_risk::RiskEngine;
+use aegis_settle::{SettleController, SettleOverrideInput};
 use aegis_signals::{SignalEngine, WalkForwardCalibrator};
 use aegis_web::serve_web;
 use clap::{Parser, Subcommand};
@@ -35,13 +39,17 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "aegis-quant",
-    version = "0.2.0-rc2",
-    about = "Aegis Quant Institutional Crypto Quantitative Trading & Portfolio Management Platform (Hyperliquid L1)"
+    version = PLATFORM_VERSION,
+    about = "Aegis Quant PP-50 Two-Book Crypto Quantitative Trading & Portfolio Management Platform (Hyperliquid L1)"
 )]
 struct Cli {
-    /// Path to SQLite WAL database (`data/aegis_quant.db`)
+    /// Path to SQLite WAL database (`data/aegis.db`)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+
+    /// Which book(s) to run (`pit`, `pond`, or `both`)
+    #[arg(long, global = true, default_value = "both")]
+    book: String,
 
     /// Run a single ingestion + signal + execution cycle and exit
     #[arg(long)]
@@ -51,9 +59,13 @@ struct Cli {
     #[arg(long)]
     calibrate: bool,
 
-    /// WebUI bind host
-    #[arg(long, default_value = "0.0.0.0")]
+    /// WebUI bind host (defaults to loopback `127.0.0.1` for security)
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
+
+    /// Explicitly allow binding the WebUI server to a non-loopback network interface
+    #[arg(long)]
+    allow_remote_bind: bool,
 
     /// WebUI bind port
     #[arg(long, default_value_t = 8000)]
@@ -75,12 +87,40 @@ enum Commands {
         once: bool,
         #[arg(long)]
         calibrate: bool,
-        #[arg(long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        #[arg(long)]
+        allow_remote_bind: bool,
         #[arg(long, default_value_t = 8000)]
         port: u16,
         #[arg(long)]
         no_web: bool,
+        #[arg(long, default_value = "both")]
+        book: String,
+    },
+    /// Book B (The Pond) universe management and hourly S-Cycle scanner
+    Pond {
+        /// Run an hourly S-Cycle scan across the 80-coin Pond universe
+        #[arg(long)]
+        scan: bool,
+        /// Refresh the 80-coin dynamic Pond universe
+        #[arg(long)]
+        refresh_universe: bool,
+    },
+    /// Daily 00:05 UTC Two-Book 50/50 Settling Protocol
+    Settle {
+        /// Run settling in dry-run simulation mode
+        #[arg(long)]
+        dry_run: bool,
+        /// Optional `<PIT_USDC>:<POND_USDC>` equity override (e.g. `5000:5000`)
+        #[arg(long)]
+        initial_split: Option<String>,
+        /// Optional unlocked idle USDC override on the rich book
+        #[arg(long)]
+        rich_idle_usdc: Option<f64>,
+        /// Day index for the formatted daily report line
+        #[arg(long, default_value_t = 1)]
+        day_index: u32,
     },
     /// Database initialization, migrations, Fernet AES-128 verification, and key rotation
     Db {
@@ -90,7 +130,7 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..004_*.sql`)
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..006_*.sql`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -99,12 +139,18 @@ enum Commands {
         /// Atomically rotate the Fernet master key across all encrypted `system_config` keys
         #[arg(long)]
         rotate_key: bool,
-        /// Prior Fernet master key for `--rotate-key`
-        #[arg(long)]
+        /// Prior Fernet master key for `--rotate-key` (prefer `AEGIS_OLD_MASTER_KEY` env or `--old-key-file`)
+        #[arg(long, env = "AEGIS_OLD_MASTER_KEY")]
         old_key: Option<String>,
-        /// New Fernet master key for `--rotate-key`
+        /// Path to file containing the prior Fernet master key for `--rotate-key`
         #[arg(long)]
+        old_key_file: Option<PathBuf>,
+        /// New Fernet master key for `--rotate-key` (prefer `AEGIS_NEW_MASTER_KEY` env or `--new-key-file`)
+        #[arg(long, env = "AEGIS_NEW_MASTER_KEY")]
         new_key: Option<String>,
+        /// Path to file containing the new Fernet master key for `--rotate-key`
+        #[arg(long)]
+        new_key_file: Option<PathBuf>,
         /// Generate a fresh 32-byte URL-safe base64 Fernet master key
         #[arg(long)]
         generate_key: bool,
@@ -138,7 +184,46 @@ enum Commands {
     },
 }
 
-/// Top-level orchestrator coordinating SQLite WAL, Ingestion, Signals, Risk, Execution, and WebUI (`engine/main.py`).
+/// Validates that the WebUI bind address is loopback (`127.0.0.1`, `::1`, `localhost`) unless
+/// remote binding has been explicitly opted into via `--allow-remote-bind`, `AEGIS_ALLOW_REMOTE_BIND=1`,
+/// or `web_allow_remote_bind = true` in `system_config`.
+pub fn validate_bind_host(
+    db: &DatabaseManager,
+    host: &str,
+    allow_remote_bind_flag: bool,
+) -> Result<String> {
+    let cfg = db.load_config().unwrap_or_default();
+    let effective_host = if host.trim().is_empty() {
+        cfg.get_str("web_bind_host", "127.0.0.1")
+    } else {
+        host.trim().to_string()
+    };
+    let is_loopback = effective_host == "127.0.0.1"
+        || effective_host == "::1"
+        || effective_host.eq_ignore_ascii_case("localhost");
+    if is_loopback {
+        return Ok(effective_host);
+    }
+
+    let env_allow = std::env::var("AEGIS_ALLOW_REMOTE_BIND")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false);
+    let db_allow = cfg.get_bool("web_allow_remote_bind", false);
+
+    if allow_remote_bind_flag || env_allow || db_allow {
+        Ok(effective_host)
+    } else {
+        Err(AegisError::SecurityViolation(format!(
+            "Refusing to bind WebUI to non-loopback address '{effective_host}' without explicit --allow-remote-bind flag, AEGIS_ALLOW_REMOTE_BIND=1, or web_allow_remote_bind=true in system_config."
+        )))
+    }
+}
+
+/// Top-level orchestrator coordinating SQLite WAL, Book A (`PIT`), Book B (`POND`), and WebUI.
 pub struct AegisOrchestrator {
     pub db: DatabaseManager,
     pub ingestion: MarketIngestionEngine,
@@ -146,7 +231,10 @@ pub struct AegisOrchestrator {
     pub risk: RiskEngine,
     pub execution: ExecutionEngine,
     pub calibrator: WalkForwardCalibrator,
+    pub pit: PitOrchestrator,
+    pub pond: PondOrchestrator,
     pub cycle_count: usize,
+    pub last_pond_scan_hour_bucket: Option<i64>,
 }
 
 impl AegisOrchestrator {
@@ -156,6 +244,8 @@ impl AegisOrchestrator {
         let risk = RiskEngine::new(db.clone());
         let execution = ExecutionEngine::new(db.clone());
         let calibrator = WalkForwardCalibrator::new(db.clone());
+        let pit = PitOrchestrator::new(db.clone(), None);
+        let pond = PondOrchestrator::new(db.clone(), None);
         Self {
             db,
             ingestion,
@@ -163,21 +253,35 @@ impl AegisOrchestrator {
             risk,
             execution,
             calibrator,
+            pit,
+            pond,
             cycle_count: 0,
+            last_pond_scan_hour_bucket: None,
         }
     }
 
     pub fn initialize(&self, run_calibration: bool) -> Result<()> {
         self.db.initialize_schema(false)?;
+        if let Err(e) = self.db.prune_retention_data() {
+            tracing::warn!("Startup retention pruning warning: {e}");
+        }
+        let cfg = self.db.load_config()?;
         let recon = self.execution.reconcile_exchange_state(None, None);
         tracing::info!(
             "Startup exchange reconciliation: status={} discrepancies={}",
             recon["status"].as_str().unwrap_or("UNKNOWN"),
             recon["discrepancies_found"].as_u64().unwrap_or(0)
         );
+        if let Err(e) = self.pond.initialize_or_refresh_universe() {
+            tracing::error!("Startup Pond universe initialization failed: {e}");
+        }
         if run_calibration {
-            self.ingestion.ingest_universe(220, false)?;
+            let cal_bars = cfg
+                .get_i64("calibration_lookback_bars", 220)
+                .clamp(100, 1500) as usize;
+            self.ingestion.ingest_universe(cal_bars, false)?;
             let _ = self.calibrator.calibrate_universe(true)?;
+            self.signals.clear_caches();
         }
         Ok(())
     }
@@ -186,17 +290,69 @@ impl AegisOrchestrator {
         let t0 = Instant::now();
         self.cycle_count += 1;
 
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.db.load_config()?;
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_live_mode = mode == "LIVE" || mode == "TESTNET";
 
-        if is_live_mode || (self.cycle_count > 1 && self.cycle_count % 20 == 0) {
+        if is_live_mode || (self.cycle_count > 1 && self.cycle_count.is_multiple_of(20)) {
             let _ = self.execution.reconcile_exchange_state(None, None);
+        }
+        if self.cycle_count.is_multiple_of(240) {
+            if let Err(e) = self.db.prune_retention_data() {
+                tracing::warn!("Periodic retention pruning warning: {e}");
+            }
         }
 
         let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
         let evaluations = self.signals.evaluate_universe(true)?;
         let snapshot = self.execution.reconcile_cycle(&evaluations, false)?;
+        let now_hour_bucket = self.db.now_ms() / 3_600_000;
+        let pond_summary = if self.last_pond_scan_hour_bucket != Some(now_hour_bucket) {
+            match self.pond.run_scan_cycle(now_hour_bucket % 4 == 0) {
+                Ok(summary) => {
+                    self.last_pond_scan_hour_bucket = Some(now_hour_bucket);
+                    Some(summary)
+                }
+                Err(e) => {
+                    tracing::error!("Hourly Pond scan cycle failed: {e}");
+                    let _ = self.db.log_telemetry(
+                        "ERROR",
+                        "pond.orchestrator",
+                        &format!("Hourly Pond scan cycle failed: {e}"),
+                        None,
+                    );
+                    None
+                }
+            }
+        } else {
+            if let Err(e) = self.pond.run_tick_15s() {
+                tracing::error!("Pond 15s tick failed: {e}");
+                let _ = self.db.log_telemetry(
+                    "ERROR",
+                    "pond.orchestrator",
+                    &format!("Pond 15s tick failed: {e}"),
+                    None,
+                );
+            }
+            None
+        };
+        let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
+        let pit_eq_now = self
+            .pit
+            .compute_pit_equity_and_idle_usdc()
+            .ok()
+            .map(|(eq, _)| eq)
+            .unwrap_or_else(|| round_dp(cfg.get_f64("initial_equity_usdc", 10000.0) * split_pct, 2));
+        let pond_eq_now = pond_summary
+            .as_ref()
+            .map(|s| s.pond_equity_usdc)
+            .or_else(|| {
+                self.pond
+                    .compute_pond_equity_and_idle_usdc()
+                    .ok()
+                    .map(|(eq, _)| eq)
+            })
+            .unwrap_or_else(|| round_dp(cfg.get_f64("initial_equity_usdc", 10000.0) * (1.0 - split_pct), 2));
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let mut actions_summary = std::collections::HashMap::<String, usize>::new();
@@ -208,22 +364,23 @@ impl AegisOrchestrator {
             "INFO",
             "engine.orchestrator",
             &format!(
-                "Cycle #{} complete in {:.0}ms | Regime={} (B:{:.0}%/Be:{:.0}%/C:{:.0}%) | Equity=${:.2} | Longs={} Shorts={}",
+                "Cycle #{} complete in {:.0}ms | Regime={} (B:{:.0}%/Be:{:.0}%/C:{:.0}%) | PitEq=${:.2} | PondEq=${:.2} | WalletEq=${:.2}",
                 self.cycle_count,
                 elapsed_ms,
                 snapshot.hmm_regime,
                 snapshot.prob_bull * 100.0,
                 snapshot.prob_bear * 100.0,
                 snapshot.prob_chop * 100.0,
+                pit_eq_now,
+                pond_eq_now,
                 snapshot.total_equity_usdc,
-                snapshot.open_long_count,
-                snapshot.open_short_count,
             ),
             Some(json!({
                 "cycle": self.cycle_count,
                 "elapsed_ms": round_dp(elapsed_ms, 1),
                 "ingest": ingest_stats,
                 "actions": actions_summary,
+                "pond": pond_summary,
             })),
         )?;
 
@@ -231,8 +388,8 @@ impl AegisOrchestrator {
             "\n------------------------------------------------------------------------------"
         );
         println!(
-            "AEGIS QUANT v0.2.0-rc2 | CYCLE #{} | {:.0} ms",
-            self.cycle_count, elapsed_ms
+            "AEGIS QUANT v{} | CYCLE #{} | {:.0} ms",
+            PLATFORM_VERSION, self.cycle_count, elapsed_ms
         );
         println!(
             "Regime : {:6} (Bull: {:5.1}% | Bear: {:5.1}% | Chop: {:5.1}%)",
@@ -248,37 +405,15 @@ impl AegisOrchestrator {
             snapshot.deployed_notional_usdc,
             snapshot.gross_leverage
         );
-        println!(
-            "Risk   : Heat ${:.2} ({:.2}% / 4.00% cap) | Open Longs: {} | Open Shorts: {}",
-            snapshot.portfolio_heat_usdc,
-            snapshot.portfolio_heat_pct * 100.0,
-            snapshot.open_long_count,
-            snapshot.open_short_count
-        );
-        println!(
-            "Yield  : Basis Harvest Notional ${:.2} | Accrued Yield: +${:.2} USDC",
-            snapshot.basis_harvest_notional_usdc, snapshot.accrued_yield_usdc
-        );
-        println!(
-            "------------------------------------------------------------------------------"
-        );
-        println!(
-            "{:<4} | {:<6} | {:<14} | {:>7} | {:>7} | {:>7} | {:<13}",
-            "Rank", "Asset", "Exec Symbol", "SNR", "MACE", "Conv", "Action"
-        );
-        println!(
-            "------------------------------------------------------------------------------"
-        );
-        for ev in evaluations.iter().take(8) {
+        if let Some(ps) = &pond_summary {
             println!(
-                "#{:<3} | {:<6} | {:<14} | {:+7.3} | {:+7.3} | {:+7.3} | {:<13}",
-                ev.rs_rank,
-                ev.base_asset,
-                ev.exec_symbol,
-                ev.snr_score,
-                ev.mace_score,
-                ev.blended_conviction,
-                ev.signal_action
+                "Pond   : ${:.2} USDC | Champion: {} ({}) | Active Universe: {} | Open Cells: {} (Heat ${:.2})",
+                ps.pond_equity_usdc,
+                ps.champion_id,
+                ps.direction_policy,
+                ps.universe_active_count,
+                ps.open_cells_after,
+                ps.open_heat_usdc
             );
         }
         println!(
@@ -339,13 +474,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 4 {
+        status: if schema_ver >= 6 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 4 (migrations 001..004 applied)".to_string(),
+        requirement: "schema_version >= 6 (migrations 001..006 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -368,9 +503,10 @@ pub fn run_readiness_suite(
     // =========================================================================
     let (active_key_b64, _) = resolve_fernet_master_key(None, Some(&db.db_path));
     let default_key_b64 = default_host_fernet_key_b64();
-    let using_external_key = active_key_b64 != default_key_b64;
+    let using_external_key =
+        active_key_b64 != default_key_b64 && !is_legacy_public_fallback_key(&active_key_b64);
     let project_root = resolve_project_root();
-    let key_file = project_root.join(".aegis_master_key");
+    let key_file = master_key_file_for_db(&db.db_path);
     let mut key_perms_ok = true;
     let mut key_source = "FALLBACK_HOST_KEY".to_string();
 
@@ -383,7 +519,7 @@ pub fn run_readiness_suite(
     } else if std::env::var("AEGIS_MASTER_KEY")
         .or_else(|_| std::env::var("FERNET_MASTER_KEY"))
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| aegis_db::fernet::is_usable_env_key(s))
         .is_some()
     {
         key_source = "ENV_AEGIS_MASTER_KEY".to_string();
@@ -410,10 +546,15 @@ pub fn run_readiness_suite(
         observed: format!(
             "source={key_source}, external={using_external_key}, perms_0600={key_perms_ok}"
         ),
-        requirement: "External AEGIS_MASTER_KEY or chmod 600 .aegis_master_key".to_string(),
-        remediation:
-            "Generate key: aegis-quant db --generate-key > .aegis_master_key && chmod 600 .aegis_master_key"
-                .to_string(),
+        requirement: format!(
+            "External AEGIS_MASTER_KEY or chmod 600 {}",
+            key_file.display()
+        ),
+        remediation: format!(
+            "Generate key: aegis-quant db --generate-key > {} && chmod 600 {}",
+            key_file.display(),
+            key_file.display()
+        ),
     });
 
     let mut plaintext_leaks = Vec::new();
@@ -442,7 +583,7 @@ pub fn run_readiness_suite(
     });
 
     let wallet_addr = cfg.get_str("wallet_address", "");
-    let priv_key = cfg.get_str("private_key", "");
+    let priv_key = db.get_signing_private_key().unwrap_or_default();
     let wallet_ok =
         !wallet_addr.is_empty() && validate_evm_address(&wallet_addr, "wallet_address").is_ok();
     let priv_ok = !priv_key.is_empty() && validate_private_key(&priv_key).is_ok();
@@ -494,16 +635,30 @@ pub fn run_readiness_suite(
     // GATE 3: RISK GUARDRAILS & CAPITAL SCALING
     // =========================================================================
     let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
+    let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
     let heat_usdc = cfg.get_f64("max_portfolio_heat_usdc", 400.0);
     let single_usdc = cfg.get_f64("max_single_asset_notional_usdc", 2500.0);
     let gross_usdc = cfg.get_f64("max_gross_leverage_notional_usdc", 15000.0);
-    let heat_ratio = heat_usdc / init_eq.max(1e-9);
-    let single_ratio = single_usdc / init_eq.max(1e-9);
-    let gross_ratio = gross_usdc / init_eq.max(1e-9);
+    let pit_book_eq = round_dp(init_eq * split_pct, 2);
+    let is_book_scaled = (heat_usdc - pit_book_eq * 0.04).abs() < (heat_usdc - init_eq * 0.04).abs();
+    let pit_ref_eq = if is_book_scaled { pit_book_eq } else { init_eq };
+    let heat_ratio = heat_usdc / pit_ref_eq.max(1e-9);
+    let single_ratio = single_usdc / pit_ref_eq.max(1e-9);
+    let gross_ratio = gross_usdc / pit_ref_eq.max(1e-9);
+    let pond_book_eq = round_dp(init_eq * (1.0 - split_pct), 2);
+    let pond_heat_usdc = cfg.get_f64("pond_max_heat_usdc", 200.0);
+    let pond_cell_usdc = cfg.get_f64("pond_max_cell_notional_usdc", 1250.0);
+    let pond_caps_ok = if is_book_scaled {
+        ((pond_heat_usdc / pond_book_eq.max(1e-9)) - 0.04).abs() <= 0.005
+            && ((pond_cell_usdc / pond_book_eq.max(1e-9)) - 0.25).abs() <= 0.01
+    } else {
+        true
+    };
     let caps_ok = init_eq > 0.0
         && (heat_ratio - 0.04).abs() <= 0.005
         && (single_ratio - 0.25).abs() <= 0.01
-        && (gross_ratio - 1.50).abs() <= 0.05;
+        && (gross_ratio - 1.50).abs() <= 0.05
+        && pond_caps_ok;
 
     checks.push(CheckResult {
         gate: "Gate 3: Risk Guardrails".to_string(),
@@ -511,11 +666,11 @@ pub fn run_readiness_suite(
         name: "Institutional Capital & Cap Alignment".to_string(),
         status: if caps_ok { "PASS" } else { "FAIL" }.to_string(),
         observed: format!(
-            "Equity=${init_eq:.0} | Heat=${heat_usdc:.0} ({:.1}%) | Single=${single_usdc:.0} ({:.0}%) | Gross=${gross_usdc:.0} ({gross_ratio:.2}x)",
+            "Wallet=${init_eq:.2} (Book=${pit_ref_eq:.2}) | Heat=${heat_usdc:.2} ({:.1}%) | Single=${single_usdc:.2} ({:.0}%) | Gross=${gross_usdc:.2} ({gross_ratio:.2}x)",
             heat_ratio * 100.0,
             single_ratio * 100.0
         ),
-        requirement: "Heat = 4.0% equity, Single-Asset = 25% equity, Gross Leverage = 1.50x equity"
+        requirement: "Heat = 4.0% book equity, Single-Asset = 25% book equity, Gross Leverage = 1.50x book equity"
             .to_string(),
         remediation:
             "Update initial_equity_usdc via POST /api/v1/config/batch with scale_risk_caps=true"
@@ -543,7 +698,6 @@ pub fn run_readiness_suite(
             .to_string(),
     });
 
-    // Self-test RiskEngine in isolated :memory: DB
     let mem_db = DatabaseManager::memory();
     mem_db.initialize_schema(false)?;
     let risk_engine = RiskEngine::new(mem_db.clone());
@@ -807,7 +961,8 @@ pub fn run_readiness_suite(
 fn print_readiness_report(target_mode: &str, verdict: &str, checks: &[CheckResult]) {
     println!("{}", "=".repeat(100));
     println!(
-        "AEGIS QUANT v0.2.0-rc2 — INSTITUTIONAL MAINNET GO/NO-GO READINESS REPORT (Target Mode: {target_mode})"
+        "AEGIS QUANT v{} — INSTITUTIONAL MAINNET GO/NO-GO READINESS REPORT (Target Mode: {target_mode})",
+        PLATFORM_VERSION
     );
     println!("{}", "=".repeat(100));
     println!(
@@ -835,14 +990,8 @@ fn print_readiness_report(target_mode: &str, verdict: &str, checks: &[CheckResul
     println!("{}", "=".repeat(100));
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+fn main() -> anyhow::Result<()> {
+    aegis_telemetry::init_tracing();
 
     let cli = Cli::parse();
     let db = match &cli.db {
@@ -858,7 +1007,9 @@ async fn main() -> anyhow::Result<()> {
             test_encryption,
             rotate_key,
             old_key,
+            old_key_file,
             new_key,
+            new_key_file,
             generate_key,
         }) => {
             if generate_key {
@@ -883,9 +1034,32 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             if rotate_key {
-                let _ = old_key;
-                let target_new = new_key.unwrap_or_else(generate_fernet_key);
-                let res = db.rotate_master_key(&target_new)?;
+                let resolved_old = if let Some(path) = old_key_file {
+                    Some(
+                        fs::read_to_string(&path)?
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    )
+                } else {
+                    old_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                };
+                let target_new = if let Some(path) = new_key_file {
+                    fs::read_to_string(&path)?
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                } else {
+                    new_key
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(generate_fernet_key)
+                };
+                let res = db.rotate_master_key_with_old(resolved_old.as_deref(), &target_new)?;
                 println!("{}", serde_json::to_string_pretty(&res)?);
             }
             if test_encryption {
@@ -901,6 +1075,53 @@ async fn main() -> anyhow::Result<()> {
                     db.get_schema_version()?
                 );
             }
+        }
+        Some(Commands::Pond {
+            scan,
+            refresh_universe,
+        }) => {
+            db.initialize_schema(false)?;
+            let pond = PondOrchestrator::new(db, None);
+            if refresh_universe || !scan {
+                let rows = pond.initialize_or_refresh_universe()?;
+                println!("Refreshed Pond universe: {} coins tracked", rows.len());
+            }
+            if scan {
+                let summary = pond.run_scan_cycle(true)?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+        }
+        Some(Commands::Settle {
+            dry_run,
+            initial_split,
+            rich_idle_usdc,
+            day_index,
+        }) => {
+            db.initialize_schema(false)?;
+            let (pit_override, pond_override) = match initial_split.as_deref() {
+                Some(raw) => {
+                    let parts: Vec<&str> = raw.split(':').collect();
+                    if parts.len() == 2 {
+                        (
+                            parts[0].trim().parse::<f64>().ok(),
+                            parts[1].trim().parse::<f64>().ok(),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                None => (None, None),
+            };
+            let ctrl = SettleController::new(db, None);
+            let res = ctrl.run_settling(SettleOverrideInput {
+                pit_equity_usdc: pit_override,
+                pond_equity_usdc: pond_override,
+                rich_idle_usdc,
+                day_index: Some(day_index),
+                dry_run,
+            })?;
+            println!("{}", res.report_line);
+            println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Some(Commands::Backtest { days, synthetic }) => {
             db.initialize_schema(false)?;
@@ -950,10 +1171,21 @@ async fn main() -> anyhow::Result<()> {
             once,
             calibrate,
             host,
+            allow_remote_bind,
             port,
             no_web,
+            book,
         }) => {
-            run_orchestrator(db, once, calibrate, &host, port, no_web).await?;
+            run_orchestrator(
+                db,
+                once,
+                calibrate,
+                &host,
+                allow_remote_bind,
+                port,
+                no_web,
+                &book,
+            )?;
         }
         None => {
             run_orchestrator(
@@ -961,59 +1193,135 @@ async fn main() -> anyhow::Result<()> {
                 cli.once,
                 cli.calibrate,
                 &cli.host,
+                cli.allow_remote_bind,
                 cli.port,
                 cli.no_web,
-            )
-            .await?;
+                &cli.book,
+            )?;
         }
     }
 
     Ok(())
 }
 
-async fn run_orchestrator(
+#[allow(clippy::too_many_arguments)]
+fn run_orchestrator(
     db: DatabaseManager,
     once: bool,
     calibrate: bool,
     host: &str,
+    allow_remote_bind: bool,
     port: u16,
     no_web: bool,
+    book: &str,
 ) -> anyhow::Result<()> {
-    let mut orchestrator = AegisOrchestrator::new(db.clone());
-    orchestrator.initialize(calibrate)?;
+    db.initialize_schema(false)?;
+    let validated_host = if !once && !no_web {
+        validate_bind_host(&db, host, allow_remote_bind)?
+    } else {
+        host.to_string()
+    };
 
-    if once {
-        orchestrator.run_single_cycle(140)?;
-        return Ok(());
-    }
-
-    if !no_web {
+    let running = Arc::new(AtomicBool::new(true));
+    if !once {
+        let r_sig = running.clone();
         let web_db = db.clone();
-        let bind_host = host.to_string();
-        tokio::spawn(async move {
-            tracing::info!(
-                "Starting Aegis Quant Axum WebUI & SSE server on http://{}:{}",
-                bind_host,
-                port
-            );
-            if let Err(e) = serve_web(web_db, &bind_host, port).await {
-                tracing::error!("Web server error: {e}");
+        let bind_host = validated_host;
+
+        std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async move {
+                    if !no_web {
+                        let w_db = web_db.clone();
+                        let w_host = bind_host.clone();
+                        tokio::spawn(async move {
+                            tracing::info!(
+                                "Starting Aegis Quant Axum WebUI & SSE server on http://{}:{}",
+                                w_host,
+                                port
+                            );
+                            if let Err(e) = serve_web(w_db, &w_host, port).await {
+                                tracing::error!("Web server error: {e}");
+                            }
+                        });
+                    }
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        tracing::info!("Received Ctrl-C, initiating graceful shutdown...");
+                        r_sig.store(false, Ordering::SeqCst);
+                    }
+                });
             }
         });
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let r_sig = running.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Received Ctrl-C, initiating graceful shutdown...");
-            r_sig.store(false, Ordering::SeqCst);
+    let mut orchestrator = AegisOrchestrator::new(db.clone());
+    orchestrator.initialize(calibrate)?;
+    let cfg = db.load_config()?;
+    let lookback_bars = cfg.get_i64("ingest_lookback_bars", 140).clamp(60, 1500) as usize;
+
+    let book_mode = book.trim().to_ascii_lowercase();
+    if once {
+        match book_mode.as_str() {
+            "pit" => {
+                let sum = orchestrator.pit.run_cycle(true, false)?;
+                println!("{}", serde_json::to_string_pretty(&sum)?);
+            }
+            "pond" => {
+                let sum = orchestrator.pond.run_scan_cycle(true)?;
+                println!("{}", serde_json::to_string_pretty(&sum)?);
+            }
+            _ => {
+                let snap = orchestrator.run_single_cycle(lookback_bars)?;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            }
         }
-    });
+        return Ok(());
+    }
 
     while running.load(Ordering::SeqCst) {
-        if let Err(e) = orchestrator.run_single_cycle(140) {
-            tracing::error!("Orchestrator cycle error: {e}");
+        let cycle_bars = db
+            .load_config()
+            .map(|c| c.get_i64("ingest_lookback_bars", 140).clamp(60, 1500) as usize)
+            .unwrap_or(lookback_bars);
+        let res = match book_mode.as_str() {
+            "pit" => orchestrator.pit.run_cycle(true, false).map(|_| ()),
+            "pond" => {
+                let now_hour_bucket = db.now_ms() / 3_600_000;
+                if orchestrator.last_pond_scan_hour_bucket != Some(now_hour_bucket) {
+                    match orchestrator.pond.run_scan_cycle(now_hour_bucket % 4 == 0) {
+                        Ok(_) => {
+                            orchestrator.last_pond_scan_hour_bucket = Some(now_hour_bucket);
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = db.log_telemetry(
+                                "ERROR",
+                                "pond.orchestrator",
+                                &format!("Hourly Pond scan cycle failed: {e}"),
+                                None,
+                            );
+                            Err(e)
+                        }
+                    }
+                } else if let Err(e) = orchestrator.pond.run_tick_15s() {
+                    let _ = db.log_telemetry(
+                        "ERROR",
+                        "pond.orchestrator",
+                        &format!("Pond 15s tick failed: {e}"),
+                        None,
+                    );
+                    Err(e)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => orchestrator.run_single_cycle(cycle_bars).map(|_| ()),
+        };
+        if let Err(e) = res {
+            tracing::error!("Orchestrator cycle error ({book_mode}): {e}");
         }
         let poll_sec = db
             .load_config()
@@ -1024,10 +1332,70 @@ async fn run_orchestrator(
             if !running.load(Ordering::SeqCst) {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
-    let _ = ExecutionMode::Paper;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_b1_validate_bind_host_enforces_loopback_unless_opted_in() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Loopback hosts are allowed by default
+        assert_eq!(
+            validate_bind_host(&db, "127.0.0.1", false).unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            validate_bind_host(&db, "localhost", false).unwrap(),
+            "localhost"
+        );
+
+        // Non-loopback bind is rejected without explicit opt-in
+        assert!(validate_bind_host(&db, "0.0.0.0", false).is_err());
+
+        // Non-loopback bind succeeds with explicit --allow-remote-bind flag or DB config
+        assert_eq!(
+            validate_bind_host(&db, "0.0.0.0", true).unwrap(),
+            "0.0.0.0"
+        );
+        db.set_config_value("web_allow_remote_bind", &json!(true))
+            .unwrap();
+        assert_eq!(
+            validate_bind_host(&db, "0.0.0.0", false).unwrap(),
+            "0.0.0.0"
+        );
+    }
+
+    #[test]
+    fn test_s4_readiness_sec01_checks_db_dir_master_key() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_cli_sec01_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_test.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        let (is_go, _verdict, checks) = run_readiness_suite(&db, Some("PAPER"), true).unwrap();
+        assert!(is_go);
+        let sec01 = checks.iter().find(|c| c.check_id == "SEC-01").unwrap();
+        assert_eq!(sec01.status, "PASS");
+        let expected_keyfile = tmp_dir.join(".aegis_master_key");
+        assert!(expected_keyfile.exists());
+        assert!(sec01.remediation.contains(&expected_keyfile.display().to_string()));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }

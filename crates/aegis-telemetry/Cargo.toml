@@ -1,0 +1,17 @@
+[package]
+name = "aegis-telemetry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Tracing subscriber, Tokio inter-task telemetry channels, and Telegram/Discord AlertEngine re-export"
+
+[dependencies]
+aegis-core.workspace = true
+aegis-db.workspace = true
+aegis-alerts.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true

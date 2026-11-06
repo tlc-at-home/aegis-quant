@@ -1,0 +1,33 @@
+[Unit]
+Description=Aegis Quant Daily 00:05 UTC Two-Book Settling & Rebalancing Job (C8)
+After=network-online.target aegis-quant.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fedora
+Group=fedora
+WorkingDirectory=/home/fedora/aegis
+Environment="RUST_LOG=info"
+LoadCredential=aegis_master_key:/home/fedora/aegis/data/.aegis_master_key
+ExecStart=/home/fedora/aegis/bin/aegis-quant settle --execute
+StandardOutput=journal
+StandardError=journal
+
+# Systemd Service Hardening (S7)
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/fedora/aegis/data -/home/fedora/aegis/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

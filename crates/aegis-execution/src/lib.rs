@@ -12,24 +12,32 @@
 //!   - Realized 1H funding rate synchronization (`sync_funding_payments`)
 //!   - HLP Vault basis harvesting (`fetch_hlp_vault_state`, `execute_hlp_vault_transfer`)
 //!   - Live wallet equity synchronization (`sync_wallet_equity`)
-//!   - 14-bar post-stop cooldown & full portfolio execution cycle (`reconcile_cycle`)
+//!   - Post-stop cooldown & full portfolio execution cycle (`reconcile_cycle`)
+
+pub mod ingestion;
+pub mod signing;
+
+pub use ingestion::MarketIngestionEngine;
+pub use signing::{
+    compute_l1_action_hash, float_to_wire, sign_l1_action, CancelAction, CancelWire,
+    LimitOrderType, OrderAction, OrderTypeWire, OrderWire, SubAccountTransferAction,
+    TriggerOrderTypeWire, VaultTransferAction,
+};
 
 use aegis_alerts::AlertEngine;
 use aegis_core::{
-    base_prices_usdc, round_dp, timeframe_seconds, validate_evm_address, validate_private_key,
-    AegisError, OhlcvBar, OrderExecutionResult, PortfolioSnapshot, Result, SignalEvaluation,
-    TradeRecord, UniverseAsset, MAINNET_HLP_VAULT_ADDRESS, TESTNET_HLP_VAULT_ADDRESS,
+    round_dp, timeframe_seconds, validate_evm_address, OrderExecutionResult, PortfolioSnapshot,
+    Result, SignalEvaluation, TradeRecord, UniverseAsset, MAINNET_HLP_VAULT_ADDRESS,
+    TESTNET_HLP_VAULT_ADDRESS,
 };
 use aegis_db::{ConfigMap, DatabaseManager};
 use aegis_risk::RiskEngine;
 use chrono::Utc;
-use k256::ecdsa::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest as Sha2Digest, Sha256};
-use sha3::Keccak256;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,649 +48,12 @@ pub const HYPERLIQUID_TESTNET_INFO_URL: &str = "https://api.hyperliquid-testnet.
 pub const HYPERLIQUID_EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange";
 pub const HYPERLIQUID_TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-testnet.xyz/exchange";
 
-/// Formats a float into a wire string matching Hyperliquid's `float_to_wire` specification.
-pub fn float_to_wire(x: f64) -> String {
-    let s = format!("{:.8}", x);
-    let mut trimmed = s.trim_end_matches('0');
-    if trimmed.ends_with('.') {
-        trimmed = &trimmed[..trimmed.len() - 1];
-    }
-    if trimmed == "-0" || trimmed.is_empty() {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
+/// Status of a resting order on the exchange (`B8`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LimitOrderType {
-    pub tif: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TriggerOrderTypeWire {
-    #[serde(rename = "triggerPx")]
-    pub trigger_px: String,
-    #[serde(rename = "isMarket")]
-    pub is_market: bool,
-    pub tpsl: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OrderTypeWire {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<LimitOrderType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<TriggerOrderTypeWire>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OrderWire {
-    pub a: u32,
-    pub b: bool,
-    pub p: String,
-    pub s: String,
-    pub r: bool,
-    pub t: OrderTypeWire,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub c: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OrderAction {
-    #[serde(rename = "type")]
-    pub action_type: String,
-    pub orders: Vec<OrderWire>,
-    pub grouping: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CancelWire {
-    pub a: u32,
-    pub o: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CancelAction {
-    #[serde(rename = "type")]
-    pub action_type: String,
-    pub cancels: Vec<CancelWire>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultTransferAction {
-    #[serde(rename = "type")]
-    pub action_type: String,
-    pub vault_address: String,
-    pub is_deposit: bool,
-    pub usd: i64,
-}
-
-/// Computes the exact Hyperliquid MessagePack + Keccak256 `action_hash` / phantom agent connection ID.
-pub fn compute_l1_action_hash<T: Serialize>(
-    action: &T,
-    vault_address: Option<&str>,
-    nonce: u64,
-    expires_after: Option<u64>,
-) -> Result<[u8; 32]> {
-    let mut data = rmp_serde::encode::to_vec_named(action)
-        .map_err(|e| AegisError::Execution(format!("Msgpack serialization error: {e}")))?;
-    data.extend_from_slice(&nonce.to_be_bytes());
-    match vault_address {
-        None => data.push(0x00),
-        Some(v) if v.trim().is_empty() => data.push(0x00),
-        Some(v) => {
-            data.push(0x01);
-            let clean = v.strip_prefix("0x").unwrap_or(v);
-            let addr_bytes = hex::decode(clean)
-                .map_err(|e| AegisError::Validation(format!("Invalid vault address hex: {e}")))?;
-            if addr_bytes.len() != 20 {
-                return Err(AegisError::Validation(format!(
-                    "Vault address must be 20 bytes, got {}",
-                    addr_bytes.len()
-                )));
-            }
-            data.extend_from_slice(&addr_bytes);
-        }
-    }
-    if let Some(exp) = expires_after {
-        data.push(0x00);
-        data.extend_from_slice(&exp.to_be_bytes());
-    }
-    let hash: [u8; 32] = Keccak256::digest(&data).into();
-    Ok(hash)
-}
-
-/// Signs an L1 action payload using MessagePack binary serialization, action_hash, and EIP-712 structured data signing.
-pub fn sign_l1_action<T: Serialize>(
-    private_key_hex: &str,
-    action: &T,
-    vault_address: Option<&str>,
-    nonce: u64,
-    expires_after: Option<u64>,
-    is_mainnet: bool,
-) -> Result<Value> {
-    let normalized_pk = validate_private_key(private_key_hex)?;
-    let raw_bytes = hex::decode(&normalized_pk[2..])
-        .map_err(|e| AegisError::Crypto(format!("Invalid private_key hex: {e}")))?;
-    let signing_key = SigningKey::from_slice(&raw_bytes)
-        .map_err(|e| AegisError::Crypto(format!("Invalid secp256k1 signing key: {e}")))?;
-
-    let action_h = compute_l1_action_hash(action, vault_address, nonce, expires_after)?;
-
-    // 1. EIP-712 Domain Separator for "Exchange"
-    let mut domain_buf = Vec::with_capacity(32 * 5);
-    domain_buf.extend_from_slice(&Keccak256::digest(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    ));
-    domain_buf.extend_from_slice(&Keccak256::digest(b"Exchange"));
-    domain_buf.extend_from_slice(&Keccak256::digest(b"1"));
-    let mut chain_id_bytes = [0u8; 32];
-    chain_id_bytes[30..32].copy_from_slice(&1337u16.to_be_bytes());
-    domain_buf.extend_from_slice(&chain_id_bytes);
-    domain_buf.extend_from_slice(&[0u8; 32]);
-    let domain_separator: [u8; 32] = Keccak256::digest(&domain_buf).into();
-
-    // 2. Struct Hash for Agent(string source,bytes32 connectionId)
-    let mut agent_buf = Vec::with_capacity(32 * 3);
-    agent_buf.extend_from_slice(&Keccak256::digest(b"Agent(string source,bytes32 connectionId)"));
-    let source_str = if is_mainnet { "a" } else { "b" };
-    agent_buf.extend_from_slice(&Keccak256::digest(source_str.as_bytes()));
-    agent_buf.extend_from_slice(&action_h);
-    let struct_hash: [u8; 32] = Keccak256::digest(&agent_buf).into();
-
-    // 3. EIP-712 Signable Digest
-    let mut digest_buf = Vec::with_capacity(2 + 32 + 32);
-    digest_buf.extend_from_slice(b"\x19\x01");
-    digest_buf.extend_from_slice(&domain_separator);
-    digest_buf.extend_from_slice(&struct_hash);
-    let digest: [u8; 32] = Keccak256::digest(&digest_buf).into();
-
-    // 4. ECDSA Secp256k1 Recoverable Signature
-    let (sig, rec_id) = signing_key
-        .sign_prehash_recoverable(&digest)
-        .map_err(|e| AegisError::Crypto(format!("ECDSA signing failed: {e}")))?;
-    let sig_bytes = sig.to_bytes();
-    let r_hex = format!("0x{}", hex::encode(&sig_bytes[..32]));
-    let s_hex = format!("0x{}", hex::encode(&sig_bytes[32..64]));
-    let v = 27u8 + rec_id.to_byte();
-
-    let verify_key = VerifyingKey::from(&signing_key);
-    let uncompressed = verify_key.to_encoded_point(false);
-    let pub_bytes = &uncompressed.as_bytes()[1..];
-    let pub_hash = Keccak256::digest(pub_bytes);
-    let signer_address = format!("0x{}", hex::encode(&pub_hash[12..]));
-
-    Ok(json!({
-        "r": r_hex,
-        "s": s_hex,
-        "v": v,
-        "signer": signer_address,
-        "connection_id": format!("0x{}", hex::encode(action_h)),
-    }))
-}
-
-/// Market Data Ingestion & `ALT/BTC:SYNTH` Synthesis Engine (`engine/ingestion.py`).
-#[derive(Clone)]
-pub struct MarketIngestionEngine {
-    pub db: DatabaseManager,
-    pub timeout_sec: u64,
-}
-
-impl MarketIngestionEngine {
-    pub fn new(db: DatabaseManager) -> Self {
-        Self { db, timeout_sec: 8 }
-    }
-
-    fn info_url(&self) -> String {
-        let cfg = self.db.load_config().unwrap_or_default();
-        let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
-            || cfg.get_str("execution_mode", "PAPER").eq_ignore_ascii_case("TESTNET");
-        if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL.to_string()
-        } else {
-            HYPERLIQUID_INFO_URL.to_string()
-        }
-    }
-
-    fn http_post_json(&self, url: &str, payload: &Value) -> Option<Value> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(self.timeout_sec))
-            .build()
-            .ok()?;
-        let resp = client.post(url).json(payload).send().ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<Value>().ok()
-    }
-
-    pub fn fetch_hyperliquid_funding_map(&self) -> HashMap<String, f64> {
-        let mut out = HashMap::new();
-        let Some(resp) = self.http_post_json(&self.info_url(), &json!({"type": "metaAndAssetCtxs"})) else {
-            return out;
-        };
-        let Some(arr) = resp.as_array() else {
-            return out;
-        };
-        if arr.len() < 2 {
-            return out;
-        }
-        let universe = arr[0]
-            .get("universe")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let ctxs = arr[1].as_array().cloned().unwrap_or_default();
-        for (u, c) in universe.iter().zip(ctxs.iter()) {
-            if let Some(name) = u.get("name").and_then(Value::as_str) {
-                let f = c
-                    .get("funding")
-                    .and_then(|v| {
-                        v.as_f64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                    })
-                    .unwrap_or(0.0);
-                out.insert(name.to_uppercase(), f);
-            }
-        }
-        out
-    }
-
-    pub fn fetch_hyperliquid_candles(
-        &self,
-        coin: &str,
-        interval: &str,
-        lookback_bars: usize,
-        funding_hourly: f64,
-    ) -> Option<Vec<OhlcvBar>> {
-        let tf_sec = timeframe_seconds(interval);
-        let now_ms = Utc::now().timestamp_millis();
-        let start_ms = now_ms - ((lookback_bars as i64 + 2) * tf_sec * 1000);
-        let payload = json!({
-            "type": "candleSnapshot",
-            "req": {
-                "coin": coin,
-                "interval": interval,
-                "startTime": start_ms,
-                "endTime": now_ms,
-            }
-        });
-        let raw = self.http_post_json(&self.info_url(), &payload)?;
-        let list = raw.as_array()?;
-        if list.is_empty() {
-            return None;
-        }
-
-        let symbol = format!("{coin}/USDC:USDC");
-        let mut bars = Vec::with_capacity(list.len());
-        let parse_f = |v: Option<&Value>| -> f64 {
-            v.and_then(|x| {
-                x.as_f64()
-                    .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
-            })
-            .unwrap_or(0.0)
-        };
-
-        for item in list {
-            let ts = item.get("t").and_then(Value::as_i64).unwrap_or(0);
-            if ts <= 0 {
-                continue;
-            }
-            bars.push(OhlcvBar {
-                symbol: symbol.clone(),
-                timeframe: interval.to_string(),
-                timestamp_ms: ts,
-                open: parse_f(item.get("o")),
-                high: parse_f(item.get("h")),
-                low: parse_f(item.get("l")),
-                close: parse_f(item.get("c")),
-                volume: parse_f(item.get("v")),
-                funding_rate_hourly: funding_hourly,
-                is_synthetic: 0,
-            });
-        }
-        bars.sort_by_key(|b| b.timestamp_ms);
-        if bars.len() > lookback_bars {
-            bars = bars[bars.len() - lookback_bars..].to_vec();
-        }
-        Some(bars)
-    }
-
-    /// Generates realistic multi-regime OHLCV bars (`BEAR`, `CHOP`, `BULL`) for offline / sandbox testing.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_synthetic_bars(
-        &self,
-        symbol: &str,
-        timeframe: &str,
-        num_bars: usize,
-        base_price: f64,
-        btc_bars: Option<&[OhlcvBar]>,
-        seed_offset: u64,
-        end_ts_ms: Option<i64>,
-    ) -> Vec<OhlcvBar> {
-        let mut digest = Sha256::new();
-        digest.update(format!("{symbol}:{timeframe}:{seed_offset}").as_bytes());
-        let hash_bytes = digest.finalize();
-        let mut rng_state = u64::from_le_bytes(hash_bytes[0..8].try_into().unwrap_or([1; 8]));
-        let mut next_norm = || -> f64 {
-            // Box-Muller normal variate from deterministic LCG
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let u1 = ((rng_state >> 11) as f64 / ((1u64 << 53) as f64)).clamp(1e-9, 1.0 - 1e-9);
-            rng_state = rng_state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let u2 = ((rng_state >> 11) as f64 / ((1u64 << 53) as f64)).clamp(1e-9, 1.0 - 1e-9);
-            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-        };
-
-        let tf_sec = timeframe_seconds(timeframe);
-        let step_ms = tf_sec * 1000;
-        let now_aligned_ms = match end_ts_ms {
-            Some(ts) => (ts / step_ms) * step_ms,
-            None => (Utc::now().timestamp_millis() / step_ms) * step_ms,
-        };
-        let start_ms = now_aligned_ms - ((num_bars.saturating_sub(1)) as i64) * step_ms;
-
-        let seg1 = num_bars / 3;
-        let seg2 = (2 * num_bars) / 3;
-        let tf_scale = ((tf_sec as f64) / 3600.0).sqrt();
-        let is_btc = symbol.starts_with("BTC/");
-        let mut alpha_tilt = 0.0;
-        if !is_btc {
-            let leader_rank = (seed_offset % 15) as f64;
-            alpha_tilt = (7.0 - leader_rank) * 0.00028 * tf_scale;
-        }
-
-        let mut price = base_price * 0.88;
-        let mut bars = Vec::with_capacity(num_bars);
-
-        for i in 0..num_bars {
-            let ts = start_ms + (i as i64) * step_ms;
-            let (drift, vol, base_funding) = if i < seg1 {
-                (-0.0014 * tf_scale, 0.011 * tf_scale, -0.00008)
-            } else if i < seg2 {
-                (0.0001 * tf_scale, 0.006 * tf_scale, 0.00026)
-            } else {
-                (0.0022 * tf_scale + alpha_tilt, 0.009 * tf_scale, 0.00014)
-            };
-
-            let shock = if let Some(b_bars) = btc_bars {
-                if i > 0 && i < b_bars.len() {
-                    let btc_ret =
-                        (b_bars[i].close.max(1e-8) / b_bars[i - 1].close.max(1e-8)).ln();
-                    let beta = 1.05 + ((seed_offset % 5) as f64) * 0.08;
-                    beta * btc_ret + next_norm() * (vol * 0.55) + alpha_tilt
-                } else {
-                    drift + next_norm() * vol
-                }
-            } else {
-                drift + next_norm() * vol
-            };
-
-            let open_px = price;
-            let close_px = (open_px * shock.exp()).max(base_price * 0.05);
-            let wick_up = next_norm().abs() * vol * 0.65;
-            let wick_dn = next_norm().abs() * vol * 0.65;
-            let high_px = open_px.max(close_px) * (1.0 + wick_up);
-            let low_px = (open_px.min(close_px) * (1.0 - wick_dn)).max(1e-8);
-            let volume =
-                (150_000.0 / base_price.max(0.01)) * (1.0 + (shock / vol.max(1e-6)).abs());
-            let funding = base_funding + next_norm() * 0.00003;
-
-            bars.push(OhlcvBar {
-                symbol: symbol.to_string(),
-                timeframe: timeframe.to_string(),
-                timestamp_ms: ts,
-                open: round_dp(open_px, 8),
-                high: round_dp(high_px, 8),
-                low: round_dp(low_px, 8),
-                close: round_dp(close_px, 8),
-                volume: round_dp(volume, 4),
-                funding_rate_hourly: round_dp(funding, 6),
-                is_synthetic: 1,
-            });
-            price = close_px;
-        }
-        bars
-    }
-
-    /// Synthesizes `ALT/BTC:SYNTH` ratio OHLCV candles from timestamp-aligned `ALT/USDC` and `BTC/USDC` bars.
-    pub fn synthesize_alt_btc_candles(
-        alt_usdc_bars: &[OhlcvBar],
-        btc_usdc_bars: &[OhlcvBar],
-        synth_symbol: &str,
-        timeframe: &str,
-    ) -> Vec<OhlcvBar> {
-        if alt_usdc_bars.is_empty() || btc_usdc_bars.is_empty() {
-            return Vec::new();
-        }
-        let btc_by_ts: HashMap<i64, &OhlcvBar> = btc_usdc_bars
-            .iter()
-            .filter(|b| b.close > 0.0)
-            .map(|b| (b.timestamp_ms, b))
-            .collect();
-
-        let mut synth = Vec::with_capacity(alt_usdc_bars.len());
-        for a in alt_usdc_bars {
-            let Some(b) = btc_by_ts.get(&a.timestamp_ms) else {
-                continue;
-            };
-            if b.open <= 0.0 || b.close <= 0.0 {
-                continue;
-            }
-            let r_open = a.open / b.open;
-            let r_close = a.close / b.close;
-            let r_high = r_open.max(r_close).max(a.high / b.open.min(b.close).max(1e-8));
-            let r_low = r_open.min(r_close).min(a.low / b.open.max(b.close).max(1e-8));
-            let rel_funding = a.funding_rate_hourly - b.funding_rate_hourly;
-
-            synth.push(OhlcvBar {
-                symbol: synth_symbol.to_string(),
-                timeframe: timeframe.to_string(),
-                timestamp_ms: a.timestamp_ms,
-                open: round_dp(r_open, 10),
-                high: round_dp(r_high, 10),
-                low: round_dp(r_low, 10),
-                close: round_dp(r_close, 10),
-                volume: round_dp(a.volume * a.close, 2),
-                funding_rate_hourly: round_dp(rel_funding, 6),
-                is_synthetic: 1,
-            });
-        }
-        synth
-    }
-
-    /// Ingests all active `USDC_PERP` assets and synthesizes all 15 `ALT/BTC:SYNTH` relative-strength pairs.
-    pub fn ingest_universe(
-        &self,
-        lookback_bars: usize,
-        force_synthetic: bool,
-    ) -> Result<HashMap<String, usize>> {
-        let usdc_assets = self.db.get_usdc_perp_universe()?;
-        let alt_pairs = self.db.get_alt_pairs_universe()?;
-        let base_prices = base_prices_usdc();
-
-        let mut timeframes: HashSet<String> = HashSet::from(["4h".to_string(), "1h".to_string()]);
-        for a in &usdc_assets {
-            timeframes.insert(a.exec_timeframe.clone());
-            timeframes.insert(a.rs_timeframe.clone());
-        }
-
-        let cfg = self.db.load_config().unwrap_or_default();
-        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let is_live_or_testnet =
-            mode == "LIVE" || mode == "TESTNET" || cfg.get_bool("hyperliquid_testnet", false);
-
-        let funding_map = if force_synthetic {
-            HashMap::new()
-        } else {
-            self.fetch_hyperliquid_funding_map()
-        };
-
-        let mut btc_bars_by_tf: HashMap<String, Vec<OhlcvBar>> = HashMap::new();
-        let mut total_usdc_bars = 0usize;
-        let mut total_synth_bars = 0usize;
-        let mut live_api_used = false;
-        let mut api_unreachable = false;
-
-        let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
-        sorted_tfs.sort();
-
-        for tf in &sorted_tfs {
-            let mut bars_opt = None;
-            if !force_synthetic && !api_unreachable {
-                let f_rate = funding_map.get("BTC").copied().unwrap_or(0.0001);
-                bars_opt = self.fetch_hyperliquid_candles("BTC", tf, lookback_bars, f_rate);
-                if bars_opt.is_some() {
-                    live_api_used = true;
-                } else if funding_map.is_empty() {
-                    api_unreachable = true;
-                }
-            }
-            let bars = match bars_opt {
-                Some(b) => {
-                    total_usdc_bars += self.db.upsert_ohlcv_batch(&b)?;
-                    b
-                }
-                None => {
-                    let existing = if !force_synthetic {
-                        self.db
-                            .get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
-                        tracing::warn!(
-                            "Transient candleSnapshot failure for BTC/USDC:USDC ({}); preserving {} existing bars",
-                            tf,
-                            existing.len()
-                        );
-                        existing
-                    } else {
-                        let synth = self.generate_synthetic_bars(
-                            "BTC/USDC:USDC",
-                            tf,
-                            lookback_bars,
-                            *base_prices.get("BTC/USDC:USDC").unwrap_or(&68500.0),
-                            None,
-                            1,
-                            None,
-                        );
-                        total_usdc_bars += self.db.upsert_ohlcv_batch(&synth)?;
-                        synth
-                    }
-                }
-            };
-            btc_bars_by_tf.insert(tf.clone(), bars);
-        }
-
-        for (idx, asset) in usdc_assets.iter().enumerate() {
-            if asset.base_asset == "BTC" {
-                continue;
-            }
-            let mut req_tfs = vec![asset.exec_timeframe.clone()];
-            if asset.rs_timeframe != asset.exec_timeframe {
-                req_tfs.push(asset.rs_timeframe.clone());
-            }
-            let f_rate = funding_map
-                .get(&asset.base_asset)
-                .copied()
-                .unwrap_or(0.00012);
-            let ref_px = *base_prices.get(asset.symbol.as_str()).unwrap_or(&10.0);
-
-            for tf in req_tfs {
-                let mut bars_opt = None;
-                if !force_synthetic && !api_unreachable {
-                    bars_opt = self.fetch_hyperliquid_candles(
-                        &asset.base_asset,
-                        &tf,
-                        lookback_bars,
-                        f_rate,
-                    );
-                    if bars_opt.is_some() {
-                        live_api_used = true;
-                    }
-                }
-                match bars_opt {
-                    Some(bars) => {
-                        total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
-                    }
-                    None => {
-                        let existing = if !force_synthetic {
-                            self.db
-                                .get_ohlcv_bars(&asset.symbol, &tf, lookback_bars, None)
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-                        if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
-                            tracing::warn!(
-                                "Transient candleSnapshot failure for {} ({}); preserving {} existing bars",
-                                asset.symbol,
-                                tf,
-                                existing.len()
-                            );
-                        } else {
-                            let bars = self.generate_synthetic_bars(
-                                &asset.symbol,
-                                &tf,
-                                lookback_bars,
-                                ref_px,
-                                btc_bars_by_tf.get(&tf).map(Vec::as_slice),
-                                (idx + 2) as u64,
-                                None,
-                            );
-                            total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
-                        }
-                    }
-                }
-            }
-        }
-
-        for pair in &alt_pairs {
-            let tf = &pair.rs_timeframe;
-            let alt_bars = self
-                .db
-                .get_ohlcv_bars(&pair.exec_symbol, tf, lookback_bars, None)?;
-            let btc_bars = match btc_bars_by_tf.get(tf) {
-                Some(b) => b.clone(),
-                None => self.db.get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)?,
-            };
-            let synth_bars =
-                Self::synthesize_alt_btc_candles(&alt_bars, &btc_bars, &pair.synth_symbol, tf);
-            total_synth_bars += self.db.upsert_ohlcv_batch(&synth_bars)?;
-        }
-
-        let source_label = if live_api_used {
-            "HYPERLIQUID_LIVE_API"
-        } else if !force_synthetic && (is_live_or_testnet || total_usdc_bars == 0) {
-            "CACHED_LIVE_BARS_OFFLINE"
-        } else {
-            "DETERMINISTIC_SYNTHETIC_FALLBACK"
-        };
-        let _ = self.db.log_telemetry(
-            "INFO",
-            "engine.ingestion",
-            &format!(
-                "Ingested {total_usdc_bars} USDC perp bars and synthesized {total_synth_bars} ALT/BTC:SYNTH bars ({source_label})"
-            ),
-            Some(json!({
-                "usdc_bars": total_usdc_bars,
-                "synth_bars": total_synth_bars,
-                "source": source_label,
-            })),
-        );
-
-        Ok(HashMap::from([
-            ("usdc_bars_upserted".to_string(), total_usdc_bars),
-            ("synth_bars_upserted".to_string(), total_synth_bars),
-        ]))
-    }
+pub struct RestingOrderStatus {
+    pub state: String,
+    pub filled_units: f64,
+    pub entry_price: f64,
 }
 
 /// Hyperliquid L1 Order Execution, Paper Fill Simulator, and Reconciliation Engine (`engine/execution.py`).
@@ -692,6 +63,8 @@ pub struct ExecutionEngine {
     pub risk: RiskEngine,
     pub alerts: AlertEngine,
     pub timeout_sec: u64,
+    http_client: Client,
+    client_timeout_sec: u64,
     last_funding_sync_hour_ts: Arc<Mutex<Option<i64>>>,
     stop_cooldown_until_ms: Arc<Mutex<HashMap<String, i64>>>,
     hlp_vault_error_streak: Arc<Mutex<usize>>,
@@ -700,13 +73,30 @@ pub struct ExecutionEngine {
 
 impl ExecutionEngine {
     pub fn new(db: DatabaseManager) -> Self {
+        let timeout_sec = db
+            .load_config()
+            .ok()
+            .map(|c| {
+                c.get_i64(
+                    "execution_http_timeout_sec",
+                    c.get_i64("http_timeout_secs", 10),
+                )
+                .clamp(1, 60) as u64
+            })
+            .unwrap_or(10);
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(timeout_sec))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         let risk = RiskEngine::new(db.clone());
         let alerts = AlertEngine::new(db.clone());
         Self {
             db,
             risk,
             alerts,
-            timeout_sec: 10,
+            timeout_sec,
+            http_client,
+            client_timeout_sec: timeout_sec,
             last_funding_sync_hour_ts: Arc::new(Mutex::new(None)),
             stop_cooldown_until_ms: Arc::new(Mutex::new(HashMap::new())),
             hlp_vault_error_streak: Arc::new(Mutex::new(0)),
@@ -714,35 +104,135 @@ impl ExecutionEngine {
         }
     }
 
+    fn load_config_logged(&self, caller: &str) -> ConfigMap {
+        match self.db.load_config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::error!(
+                    caller = caller,
+                    error = %e,
+                    "ExecutionEngine failed to load system_config from SQLite; falling back to empty ConfigMap"
+                );
+                ConfigMap::default()
+            }
+        }
+    }
+
+    fn log_fsm_transition(
+        &self,
+        client_order_id: &str,
+        from_state: &str,
+        to_state: &str,
+        reason: Option<&str>,
+    ) {
+        if let Err(e) =
+            self.db
+                .log_order_state_transition(client_order_id, from_state, to_state, reason)
+        {
+            tracing::error!(
+                client_order_id = client_order_id,
+                from_state = from_state,
+                to_state = to_state,
+                reason = ?reason,
+                error = %e,
+                "Failed to persist order_state_audit transition"
+            );
+        }
+    }
+
+    fn info_url(&self, cfg: &ConfigMap, is_testnet: bool) -> String {
+        if is_testnet {
+            let base = cfg.get_str(
+                "hyperliquid_testnet_url",
+                "https://api.hyperliquid-testnet.xyz",
+            );
+            let fallback = format!("{}/info", base.trim_end_matches('/'));
+            cfg.get_str("hyperliquid_testnet_info_url", &fallback)
+        } else {
+            let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
+            let fallback = format!("{}/info", base.trim_end_matches('/'));
+            cfg.get_str("hyperliquid_info_url", &fallback)
+        }
+    }
+
+    fn exchange_url(&self, cfg: &ConfigMap, is_testnet: bool) -> String {
+        if is_testnet {
+            let base = cfg.get_str(
+                "hyperliquid_testnet_url",
+                "https://api.hyperliquid-testnet.xyz",
+            );
+            let fallback = format!("{}/exchange", base.trim_end_matches('/'));
+            cfg.get_str("hyperliquid_testnet_exchange_url", &fallback)
+        } else {
+            let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
+            let fallback = format!("{}/exchange", base.trim_end_matches('/'));
+            cfg.get_str("hyperliquid_exchange_url", &fallback)
+        }
+    }
+
     pub fn resolve_hlp_vault_address(cfg: &ConfigMap, is_testnet: bool) -> String {
+        let default_testnet = cfg.get_str(
+            "hyperliquid_default_vault_testnet",
+            TESTNET_HLP_VAULT_ADDRESS,
+        );
+        let default_mainnet = cfg.get_str(
+            "hyperliquid_default_vault_mainnet",
+            MAINNET_HLP_VAULT_ADDRESS,
+        );
         let configured = cfg.get_str("hyperliquid_vault_address", "").trim().to_string();
-        if !configured.is_empty() && validate_evm_address(&configured, "hyperliquid_vault_address").is_ok() {
-            if is_testnet && configured.eq_ignore_ascii_case(MAINNET_HLP_VAULT_ADDRESS) {
-                return TESTNET_HLP_VAULT_ADDRESS.to_string();
+        if !configured.is_empty()
+            && validate_evm_address(&configured, "hyperliquid_vault_address").is_ok()
+        {
+            if is_testnet && configured.eq_ignore_ascii_case(&default_mainnet) {
+                return default_testnet;
             }
             return configured;
         }
         if is_testnet {
-            TESTNET_HLP_VAULT_ADDRESS.to_string()
+            default_testnet
         } else {
-            MAINNET_HLP_VAULT_ADDRESS.to_string()
+            default_mainnet
         }
     }
 
     fn http_post_json(&self, url: &str, payload: &Value) -> Option<Value> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(self.timeout_sec))
-            .build()
-            .ok()?;
-        let resp = client.post(url).json(payload).send().ok()?;
+        let owned_client;
+        let client_ref = if self.timeout_sec == self.client_timeout_sec {
+            &self.http_client
+        } else {
+            owned_client = Client::builder()
+                .timeout(Duration::from_secs(self.timeout_sec.max(1)))
+                .build()
+                .ok()?;
+            &owned_client
+        };
+        let resp = match client_ref.post(url).json(payload).send() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST failed");
+                return None;
+            }
+        };
         if !resp.status().is_success() {
+            tracing::warn!(
+                url = url,
+                status = %resp.status(),
+                "Hyperliquid endpoint returned non-2xx HTTP status"
+            );
             return None;
         }
-        resp.json::<Value>().ok()
+        match resp.json::<Value>() {
+            Ok(val) => Some(val),
+            Err(e) => {
+                tracing::warn!(url = url, error = %e, "Failed to parse Hyperliquid JSON response");
+                None
+            }
+        }
     }
 
     /// Computes dynamic slippage in basis points (`bps`) as a function of bar range volatility
     /// and order notional relative to bar volume.
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate_dynamic_slippage_bps(
         &self,
         notional_usd: f64,
@@ -753,7 +243,7 @@ impl ExecutionEngine {
         is_maker: bool,
         base_slippage_bps: Option<f64>,
     ) -> f64 {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("calculate_dynamic_slippage_bps");
         let base_bps = base_slippage_bps.unwrap_or_else(|| {
             if is_maker {
                 cfg.get_f64("maker_slippage_bps", 0.5)
@@ -761,6 +251,11 @@ impl ExecutionEngine {
                 cfg.get_f64("paper_slippage_bps", 3.5)
             }
         });
+        let min_bar_liq = cfg.get_f64("slippage_min_bar_notional_liq_usdc", 25_000.0).max(1.0);
+        let max_part = cfg.get_f64("slippage_max_participation_rate", 0.25).clamp(0.01, 1.0);
+        let impact_factor = cfg.get_f64("slippage_liq_impact_factor_bps", 120.0).max(0.0);
+        let max_cap_bps = cfg.get_f64("slippage_max_cap_bps", 85.0).max(1.0);
+
         let close_px = bar_close.max(1e-8);
         let range_pct = if bar_high > bar_low && bar_low > 0.0 {
             (bar_high - bar_low).max(0.0) / close_px
@@ -768,15 +263,15 @@ impl ExecutionEngine {
             0.01
         };
         let vol_ratio = (range_pct / 0.01).clamp(0.4, 4.0);
-        let bar_notional_liq = (bar_volume.max(0.0) * close_px).max(25_000.0);
-        let participation = (notional_usd.max(0.0) / bar_notional_liq).clamp(0.0, 0.25);
-        let liq_impact_bps = participation * 120.0;
+        let bar_notional_liq = (bar_volume.max(0.0) * close_px).max(min_bar_liq);
+        let participation = (notional_usd.max(0.0) / bar_notional_liq).clamp(0.0, max_part);
+        let liq_impact_bps = participation * impact_factor;
         let eff_bps = if is_maker {
             base_bps * (0.5 + 0.5 * vol_ratio) + 0.25 * liq_impact_bps
         } else {
             base_bps * vol_ratio + liq_impact_bps
         };
-        round_dp(eff_bps.clamp(0.1, 85.0), 4)
+        round_dp(eff_bps.clamp(0.1, max_cap_bps), 4)
     }
 
     /// Simulates a realistic Paper order fill with dynamic slippage, partial fills, and fee accounting.
@@ -797,7 +292,7 @@ impl ExecutionEngine {
         force_partial_ratio: Option<f64>,
         client_order_id: Option<&str>,
     ) -> OrderExecutionResult {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("simulate_paper_fill");
         let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
         let cli_id = client_order_id
@@ -815,7 +310,7 @@ impl ExecutionEngine {
                 symbol: symbol.to_string(),
                 side: side.to_string(),
                 fsm_state: "REJECTED".to_string(),
-                requested_units: requested_units,
+                requested_units,
                 filled_units: 0.0,
                 avg_fill_price: 0.0,
                 slippage_paid_usd: 0.0,
@@ -971,7 +466,7 @@ impl ExecutionEngine {
         if let Some(scenario) = simulate_book_scenario {
             match scenario.to_ascii_uppercase().as_str() {
                 "REJECTED" => {
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "PENDING",
                         "REJECTED",
@@ -995,13 +490,13 @@ impl ExecutionEngine {
                     };
                 }
                 "CANCELLED" => {
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "PENDING",
                         "OPEN_ON_BOOK",
                         Some("ALO_POSTED_TO_BOOK"),
                     );
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "OPEN_ON_BOOK",
                         "CANCELLED",
@@ -1009,7 +504,10 @@ impl ExecutionEngine {
                     );
                     return OrderExecutionResult {
                         client_order_id: cli_id,
-                        exchange_order_id: format!("hl-cancel-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                        exchange_order_id: format!(
+                            "hl-cancel-{}",
+                            &Uuid::new_v4().simple().to_string()[..8]
+                        ),
                         symbol: asset.symbol.clone(),
                         side: side.to_string(),
                         fsm_state: "CANCELLED".to_string(),
@@ -1029,13 +527,13 @@ impl ExecutionEngine {
                     };
                 }
                 "EXPIRED" => {
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "PENDING",
                         "OPEN_ON_BOOK",
                         Some("ALO_POSTED_TO_BOOK"),
                     );
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "OPEN_ON_BOOK",
                         "EXPIRED",
@@ -1043,7 +541,10 @@ impl ExecutionEngine {
                     );
                     return OrderExecutionResult {
                         client_order_id: cli_id,
-                        exchange_order_id: format!("hl-exp-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                        exchange_order_id: format!(
+                            "hl-exp-{}",
+                            &Uuid::new_v4().simple().to_string()[..8]
+                        ),
                         symbol: asset.symbol.clone(),
                         side: side.to_string(),
                         fsm_state: "EXPIRED".to_string(),
@@ -1066,23 +567,26 @@ impl ExecutionEngine {
             }
         }
 
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("execute_maker_limit_chaser");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let is_live_mode = (mode == "LIVE" || mode == "TESTNET")
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &mode)
+            .to_ascii_uppercase();
+        let is_live_mode = (mode == "LIVE"
+            || mode == "TESTNET"
+            || pond_mode == "LIVE"
+            || pond_mode == "TESTNET")
             && force_partial_ratio.is_none()
             && simulate_book_scenario.is_none();
-        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
+            || mode == "TESTNET"
+            || pond_mode == "TESTNET";
 
         if is_live_mode {
             let wallet = cfg.get_str("wallet_address", "");
-            let priv_key = cfg.get_str("private_key", "");
+            let priv_key = self.db.get_signing_private_key().unwrap_or_default();
             if wallet.is_empty() || priv_key.is_empty() {
-                let _ = self.db.log_order_state_transition(
-                    &cli_id,
-                    "PENDING",
-                    "REJECTED",
-                    Some("MISSING_CREDENTIALS"),
-                );
+                self.log_fsm_transition(&cli_id, "PENDING", "REJECTED", Some("MISSING_CREDENTIALS"));
                 return OrderExecutionResult {
                     client_order_id: cli_id,
                     exchange_order_id: String::new(),
@@ -1101,14 +605,15 @@ impl ExecutionEngine {
                 };
             }
 
+            // S6: In LIVE/TESTNET modes, strictly require live exchange metadata; never use guessed fallback indices.
             let Some(asset_idx) =
-                self.fetch_hyperliquid_universe_asset_index(&asset.base_asset, is_testnet)
+                self.fetch_live_hyperliquid_universe_asset_index(&asset.base_asset, is_testnet)
             else {
-                let _ = self.db.log_order_state_transition(
+                self.log_fsm_transition(
                     &cli_id,
                     "PENDING",
                     "REJECTED",
-                    Some("UNSUPPORTED_EXCHANGE_ASSET"),
+                    Some("NO_LIVE_ASSET_INDEX_METADATA"),
                 );
                 return OrderExecutionResult {
                     client_order_id: cli_id,
@@ -1139,11 +644,17 @@ impl ExecutionEngine {
             } else {
                 2
             };
+            let reduce_slip_pct = cfg
+                .get_f64("execution_reduce_only_slippage_pct", 0.05)
+                .clamp(0.001, 0.25);
+            let ioc_slip_pct = cfg
+                .get_f64("execution_ioc_fallback_slippage_pct", 0.02)
+                .clamp(0.001, 0.20);
             let target_px = if _is_reduce_only {
                 if is_buy {
-                    reference_price * 1.05
+                    reference_price * (1.0 + reduce_slip_pct)
                 } else {
-                    reference_price * 0.95
+                    reference_price * (1.0 - reduce_slip_pct)
                 }
             } else {
                 reference_price
@@ -1165,12 +676,10 @@ impl ExecutionEngine {
                     a: asset_idx,
                     b: is_buy,
                     p: px_str,
-                    s: sz_str,
+                    s: sz_str.clone(),
                     r: _is_reduce_only,
                     t: OrderTypeWire {
-                        limit: Some(LimitOrderType {
-                            tif,
-                        }),
+                        limit: Some(LimitOrderType { tif }),
                         trigger: None,
                     },
                     c: None,
@@ -1180,11 +689,7 @@ impl ExecutionEngine {
 
             match sign_l1_action(&priv_key, &order_action, None, nonce, None, !is_testnet) {
                 Ok(sig) => {
-                    let url = if is_testnet {
-                        HYPERLIQUID_TESTNET_EXCHANGE_URL
-                    } else {
-                        HYPERLIQUID_EXCHANGE_URL
-                    };
+                    let url = self.exchange_url(&cfg, is_testnet);
                     let payload = json!({
                         "action": serde_json::to_value(&order_action).unwrap_or_default(),
                         "nonce": nonce,
@@ -1196,7 +701,7 @@ impl ExecutionEngine {
                         "vaultAddress": serde_json::Value::Null,
                     });
 
-                    if let Some(resp) = self.http_post_json(url, &payload) {
+                    if let Some(resp) = self.http_post_json(&url, &payload) {
                         let status_str = resp.get("status").and_then(Value::as_str).unwrap_or("");
                         if status_str == "ok" {
                             let statuses = resp
@@ -1216,7 +721,7 @@ impl ExecutionEngine {
                                         })
                                         .unwrap_or(0);
                                     let ex_id = format!("hl-{}", oid);
-                                    let _ = self.db.log_order_state_transition(
+                                    self.log_fsm_transition(
                                         &cli_id,
                                         "PENDING",
                                         "OPEN_ON_BOOK",
@@ -1267,7 +772,7 @@ impl ExecutionEngine {
                                             })
                                         })
                                         .unwrap_or(quantity);
-                                    let _ = self.db.log_order_state_transition(
+                                    self.log_fsm_transition(
                                         &cli_id,
                                         "PENDING",
                                         "FILLED",
@@ -1295,7 +800,126 @@ impl ExecutionEngine {
                                 } else if let Some(err_txt) =
                                     first_st.get("error").and_then(Value::as_str)
                                 {
-                                    let _ = self.db.log_order_state_transition(
+                                    let err_lower = err_txt.to_ascii_lowercase();
+                                    if !_is_reduce_only
+                                        && (err_lower.contains("post only")
+                                            || err_lower.contains("immediately matched")
+                                            || err_lower.contains("cross"))
+                                    {
+                                        let ioc_px = if is_buy {
+                                            reference_price * (1.0 + ioc_slip_pct)
+                                        } else {
+                                            reference_price * (1.0 - ioc_slip_pct)
+                                        };
+                                        let ioc_px_str =
+                                            float_to_wire(round_dp(ioc_px, px_decimals as i32));
+                                        let ioc_nonce = Utc::now().timestamp_millis() as u64 + 1;
+                                        let ioc_action = OrderAction {
+                                            action_type: "order".to_string(),
+                                            orders: vec![OrderWire {
+                                                a: asset_idx,
+                                                b: is_buy,
+                                                p: ioc_px_str,
+                                                s: sz_str.clone(),
+                                                r: false,
+                                                t: OrderTypeWire {
+                                                    limit: Some(LimitOrderType {
+                                                        tif: "Ioc".to_string(),
+                                                    }),
+                                                    trigger: None,
+                                                },
+                                                c: None,
+                                            }],
+                                            grouping: "na".to_string(),
+                                        };
+                                        if let Ok(ioc_sig) = sign_l1_action(
+                                            &priv_key,
+                                            &ioc_action,
+                                            None,
+                                            ioc_nonce,
+                                            None,
+                                            !is_testnet,
+                                        ) {
+                                            let ioc_payload = json!({
+                                                "action": serde_json::to_value(&ioc_action).unwrap_or_default(),
+                                                "nonce": ioc_nonce,
+                                                "signature": {
+                                                    "r": ioc_sig["r"],
+                                                    "s": ioc_sig["s"],
+                                                    "v": ioc_sig["v"],
+                                                },
+                                                "vaultAddress": serde_json::Value::Null,
+                                            });
+                                            if let Some(ioc_resp) =
+                                                self.http_post_json(&url, &ioc_payload)
+                                            {
+                                                if let Some(filled) = ioc_resp
+                                                    .get("response")
+                                                    .and_then(|r| r.get("data"))
+                                                    .and_then(|d| d.get("statuses"))
+                                                    .and_then(Value::as_array)
+                                                    .and_then(|arr| arr.first())
+                                                    .and_then(|st| st.get("filled"))
+                                                {
+                                                    let oid = filled
+                                                        .get("oid")
+                                                        .and_then(|v| {
+                                                            v.as_u64().or_else(|| {
+                                                                v.as_str()
+                                                                    .and_then(|s| s.parse().ok())
+                                                            })
+                                                        })
+                                                        .unwrap_or(0);
+                                                    let ex_id = format!("hl-{}", oid);
+                                                    let fill_px = filled
+                                                        .get("avgPx")
+                                                        .and_then(|v| {
+                                                            v.as_f64().or_else(|| {
+                                                                v.as_str()
+                                                                    .and_then(|s| s.parse().ok())
+                                                            })
+                                                        })
+                                                        .unwrap_or(reference_price);
+                                                    let fill_sz = filled
+                                                        .get("totalSz")
+                                                        .and_then(|v| {
+                                                            v.as_f64().or_else(|| {
+                                                                v.as_str()
+                                                                    .and_then(|s| s.parse().ok())
+                                                            })
+                                                        })
+                                                        .unwrap_or(quantity);
+                                                    self.log_fsm_transition(
+                                                        &cli_id,
+                                                        "PENDING",
+                                                        "FILLED",
+                                                        Some("TAKER_IOC_FALLBACK_FILL"),
+                                                    );
+                                                    return OrderExecutionResult {
+                                                        client_order_id: cli_id,
+                                                        exchange_order_id: ex_id,
+                                                        symbol: asset.symbol.clone(),
+                                                        side: side.to_string(),
+                                                        fsm_state: "FILLED".to_string(),
+                                                        requested_units: quantity,
+                                                        filled_units: fill_sz,
+                                                        avg_fill_price: fill_px,
+                                                        slippage_paid_usd: 0.0,
+                                                        effective_slippage_bps: 0.0,
+                                                        fees_paid_usdc: 0.0,
+                                                        is_maker: false,
+                                                        fill_type: "TAKER_IOC_FALLBACK".to_string(),
+                                                        state_history: vec![
+                                                            "PENDING".to_string(),
+                                                            "FILLED".to_string(),
+                                                        ],
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    self.log_fsm_transition(
                                         &cli_id,
                                         "PENDING",
                                         "REJECTED",
@@ -1328,12 +952,7 @@ impl ExecutionEngine {
                                 .and_then(Value::as_str)
                                 .unwrap_or("EXCHANGE_ERROR");
                             tracing::error!("Hyperliquid order rejected by exchange: {}", err_msg);
-                            let _ = self.db.log_order_state_transition(
-                                &cli_id,
-                                "PENDING",
-                                "REJECTED",
-                                Some(err_msg),
-                            );
+                            self.log_fsm_transition(&cli_id, "PENDING", "REJECTED", Some(err_msg));
                             return OrderExecutionResult {
                                 client_order_id: cli_id,
                                 exchange_order_id: String::new(),
@@ -1353,7 +972,7 @@ impl ExecutionEngine {
                         }
                     }
 
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "PENDING",
                         "REJECTED",
@@ -1377,7 +996,7 @@ impl ExecutionEngine {
                     };
                 }
                 Err(e) => {
-                    let _ = self.db.log_order_state_transition(
+                    self.log_fsm_transition(
                         &cli_id,
                         "PENDING",
                         "REJECTED",
@@ -1420,7 +1039,7 @@ impl ExecutionEngine {
         );
 
         for window in res.state_history.windows(2) {
-            let _ = self.db.log_order_state_transition(
+            self.log_fsm_transition(
                 &res.client_order_id,
                 &window[0],
                 &window[1],
@@ -1430,7 +1049,315 @@ impl ExecutionEngine {
         res
     }
 
-    pub fn fetch_hyperliquid_universe_asset_index(
+    /// Executes a Book B (`POND`) entry or exit order: routes to live Hyperliquid L1 (`execute_maker_limit_chaser`)
+    /// when `pond_execution_mode` / `execution_mode` is `LIVE` or `TESTNET`, and falls back to `simulate_paper_fill`
+    /// only in `PAPER` mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_pond_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity: f64,
+        reference_price: f64,
+        tick_size: f64,
+        lot_step_size: f64,
+        bar_high: f64,
+        bar_low: f64,
+        bar_volume: f64,
+        is_stop_exit: bool,
+        prefer_maker: bool,
+        is_reduce_only: bool,
+        client_order_id: Option<&str>,
+    ) -> OrderExecutionResult {
+        let cfg = self.load_config_logged("execute_pond_order");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_or_testnet = pond_mode == "LIVE"
+            || pond_mode == "TESTNET"
+            || exec_mode == "LIVE"
+            || exec_mode == "TESTNET";
+
+        if is_live_or_testnet {
+            let base_asset = symbol
+                .split('/')
+                .next()
+                .unwrap_or(symbol)
+                .trim()
+                .to_uppercase();
+            let asset = UniverseAsset {
+                asset_id: 0,
+                symbol: symbol.to_string(),
+                base_asset,
+                quote_asset: "USDC".to_string(),
+                instrument_type: "USDC_PERP".to_string(),
+                tier: 2,
+                tier_name: "POND_80_COIN".to_string(),
+                exec_timeframe: "1h".to_string(),
+                rs_timeframe: "4h".to_string(),
+                tick_size: tick_size.max(0.0001),
+                lot_step_size: lot_step_size.max(0.001),
+                min_notional_usdc: 10.0,
+                max_leverage: 3.0,
+                is_active: 1,
+                updated_at: String::new(),
+            };
+            let pond_cid = client_order_id
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("pond-{}-{}", asset.base_asset, self.db.now_ms()));
+            return self.execute_maker_limit_chaser(
+                &asset,
+                side,
+                quantity,
+                reference_price,
+                bar_high,
+                bar_low,
+                bar_volume,
+                None,
+                None,
+                Some(&pond_cid),
+                is_reduce_only || is_stop_exit || !prefer_maker,
+            );
+        }
+
+        self.simulate_paper_fill(
+            symbol,
+            side,
+            quantity,
+            reference_price,
+            tick_size,
+            lot_step_size,
+            bar_high,
+            bar_low,
+            bar_volume,
+            is_stop_exit,
+            prefer_maker,
+            None,
+            client_order_id,
+        )
+    }
+
+    /// Checks on-chain clearinghouse and open-orders state for a resting order (`B8`).
+    pub fn check_resting_order_status(
+        &self,
+        symbol: &str,
+        exchange_order_id: Option<&str>,
+    ) -> RestingOrderStatus {
+        let cfg = self.load_config_logged("check_resting_order_status");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_or_testnet = pond_mode == "LIVE"
+            || pond_mode == "TESTNET"
+            || exec_mode == "LIVE"
+            || exec_mode == "TESTNET";
+        if !is_live_or_testnet {
+            return RestingOrderStatus {
+                state: "OPEN_ON_BOOK".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            };
+        }
+
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
+            || exec_mode == "TESTNET"
+            || pond_mode == "TESTNET";
+        let wallet = cfg.get_str("wallet_address", "");
+        if wallet.trim().is_empty() {
+            return RestingOrderStatus {
+                state: "OFFLINE".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            };
+        }
+
+        let coin = symbol
+            .split('/')
+            .next()
+            .unwrap_or(symbol)
+            .trim()
+            .to_uppercase();
+
+        let Some(ch) = self.fetch_hyperliquid_clearinghouse_state(&wallet, is_testnet) else {
+            return RestingOrderStatus {
+                state: "OFFLINE".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            };
+        };
+
+        if let Some(asset_positions) = ch.get("assetPositions").and_then(Value::as_array) {
+            for item in asset_positions {
+                let pos = item.get("position").unwrap_or(item);
+                let pos_coin = pos
+                    .get("coin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_uppercase();
+                if pos_coin == coin {
+                    let szi = pos
+                        .get("szi")
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        })
+                        .unwrap_or(0.0);
+                    if szi.abs() > 1e-9 {
+                        let entry_px = pos
+                            .get("entryPx")
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .unwrap_or(0.0);
+                        return RestingOrderStatus {
+                            state: "FILLED".to_string(),
+                            filled_units: szi.abs(),
+                            entry_price: entry_px,
+                        };
+                    }
+                }
+            }
+        }
+
+        let Some(open_orders) = self.fetch_hyperliquid_open_orders(&wallet, is_testnet) else {
+            return RestingOrderStatus {
+                state: "OFFLINE".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            };
+        };
+
+        let target_oid = exchange_order_id.and_then(|s| {
+            s.strip_prefix("hl-")
+                .unwrap_or(s)
+                .parse::<u64>()
+                .ok()
+        });
+
+        let still_on_book = open_orders.iter().any(|ord| {
+            let ord_coin = ord
+                .get("coin")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            if ord_coin != coin {
+                return false;
+            }
+            if let Some(oid_target) = target_oid {
+                let ord_oid = ord
+                    .get("oid")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(0);
+                ord_oid == oid_target || oid_target == 0
+            } else {
+                true
+            }
+        });
+
+        if still_on_book {
+            RestingOrderStatus {
+                state: "OPEN_ON_BOOK".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            }
+        } else {
+            RestingOrderStatus {
+                state: "CANCELLED_OR_GONE".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+            }
+        }
+    }
+
+    /// Cancels a resting order on Hyperliquid L1 (`B8`).
+    pub fn cancel_resting_order(&self, symbol: &str, exchange_order_id: &str) -> Result<bool> {
+        let cfg = self.load_config_logged("cancel_resting_order");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_or_testnet = pond_mode == "LIVE"
+            || pond_mode == "TESTNET"
+            || exec_mode == "LIVE"
+            || exec_mode == "TESTNET";
+        if !is_live_or_testnet {
+            self.log_fsm_transition(
+                exchange_order_id,
+                "OPEN_ON_BOOK",
+                "CANCELLED",
+                Some("PAPER_RESTING_ORDER_CANCELLED"),
+            );
+            return Ok(true);
+        }
+
+        let oid = exchange_order_id
+            .strip_prefix("hl-")
+            .unwrap_or(exchange_order_id)
+            .parse::<u64>()
+            .unwrap_or(0);
+        if oid == 0 {
+            return Ok(false);
+        }
+
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
+            || exec_mode == "TESTNET"
+            || pond_mode == "TESTNET";
+        let coin = symbol
+            .split('/')
+            .next()
+            .unwrap_or(symbol)
+            .trim()
+            .to_uppercase();
+        let Some(asset_idx) = self.fetch_live_hyperliquid_universe_asset_index(&coin, is_testnet)
+        else {
+            return Ok(false);
+        };
+        let priv_key = self.db.get_signing_private_key()?;
+        if priv_key.is_empty() {
+            return Ok(false);
+        }
+
+        let nonce = Utc::now().timestamp_millis() as u64;
+        let cancel_action = CancelAction {
+            action_type: "cancel".to_string(),
+            cancels: vec![CancelWire {
+                a: asset_idx,
+                o: oid,
+            }],
+        };
+        let sig = sign_l1_action(&priv_key, &cancel_action, None, nonce, None, !is_testnet)?;
+        let url = self.exchange_url(&cfg, is_testnet);
+        let payload = json!({
+            "action": serde_json::to_value(&cancel_action).unwrap_or_default(),
+            "nonce": nonce,
+            "signature": {
+                "r": sig["r"],
+                "s": sig["s"],
+                "v": sig["v"],
+            },
+            "vaultAddress": Value::Null,
+        });
+
+        if let Some(resp) = self.http_post_json(&url, &payload) {
+            if resp.get("status").and_then(Value::as_str) == Some("ok") {
+                self.log_fsm_transition(
+                    exchange_order_id,
+                    "OPEN_ON_BOOK",
+                    "CANCELLED",
+                    Some("RESTING_ORDER_CANCELLED_ON_EXCHANGE"),
+                );
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Resolves a Hyperliquid asset index exclusively from live exchange `/info` metadata (`S6`).
+    /// Never guesses from a hardcoded table and never caches unverified fallback indices.
+    pub fn fetch_live_hyperliquid_universe_asset_index(
         &self,
         coin: &str,
         is_testnet: bool,
@@ -1444,15 +1371,12 @@ impl ExecutionEngine {
             return Some(cached_idx);
         }
 
-        let url = if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let cfg = self.load_config_logged("fetch_live_hyperliquid_universe_asset_index");
+        let url = self.info_url(&cfg, is_testnet);
 
         let resp_opt = self
-            .http_post_json(url, &json!({"type": "meta"}))
-            .or_else(|| self.http_post_json(url, &json!({"type": "metaAndAssetCtxs"})));
+            .http_post_json(&url, &json!({"type": "meta"}))
+            .or_else(|| self.http_post_json(&url, &json!({"type": "metaAndAssetCtxs"})));
 
         if let Some(resp) = resp_opt {
             let universe_opt = resp
@@ -1477,13 +1401,48 @@ impl ExecutionEngine {
                         }
                     }
                 }
-                if found.is_some() {
-                    return found;
-                }
+                return found;
             }
         }
 
-        let fallback_idx = if is_testnet {
+        None
+    }
+
+    /// Resolves a Hyperliquid universe asset index (`S6`).
+    /// In `LIVE` or `TESTNET` mode, strictly requires live exchange metadata and returns `None` when offline.
+    /// In `PAPER` mode only, returns an uncached reference index for offline unit tests.
+    pub fn fetch_hyperliquid_universe_asset_index(
+        &self,
+        coin: &str,
+        is_testnet: bool,
+    ) -> Option<u32> {
+        if let Some(live_idx) = self.fetch_live_hyperliquid_universe_asset_index(coin, is_testnet) {
+            return Some(live_idx);
+        }
+
+        let cfg = self.load_config_logged("fetch_hyperliquid_universe_asset_index");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_or_testnet = exec_mode == "LIVE"
+            || exec_mode == "TESTNET"
+            || pond_mode == "LIVE"
+            || pond_mode == "TESTNET";
+
+        // S6: Never guess asset indices in LIVE or TESTNET modes, and never cache fallback indices.
+        if is_live_or_testnet {
+            tracing::error!(
+                coin = coin,
+                is_testnet = is_testnet,
+                exec_mode = %exec_mode,
+                "Refusing to use hardcoded fallback asset index in LIVE/TESTNET mode when /info metadata is unavailable"
+            );
+            return None;
+        }
+
+        let coin_upper = coin.trim().to_ascii_uppercase();
+        if is_testnet {
             match coin_upper.as_str() {
                 "SOL" => Some(0),
                 "APT" => Some(1),
@@ -1535,14 +1494,7 @@ impl ExecutionEngine {
                 "HYPE" => Some(159),
                 _ => None,
             }
-        };
-
-        if let Some(idx) = fallback_idx {
-            self.asset_index_cache
-                .lock()
-                .insert((is_testnet, coin_upper), idx);
         }
-        fallback_idx
     }
 
     /// Signs a Hyperliquid L1 action payload using EIP-712 / secp256k1 recoverable ECDSA signature.
@@ -1564,13 +1516,10 @@ impl ExecutionEngine {
         if wallet_address.trim().is_empty() {
             return None;
         }
-        let url = if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let cfg = self.load_config_logged("fetch_hyperliquid_clearinghouse_state");
+        let url = self.info_url(&cfg, is_testnet);
         self.http_post_json(
-            url,
+            &url,
             &json!({
                 "type": "clearinghouseState",
                 "user": wallet_address.trim(),
@@ -1586,13 +1535,10 @@ impl ExecutionEngine {
         if wallet_address.trim().is_empty() {
             return None;
         }
-        let url = if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let cfg = self.load_config_logged("fetch_hyperliquid_spot_usdc_balance");
+        let url = self.info_url(&cfg, is_testnet);
         let resp = self.http_post_json(
-            url,
+            &url,
             &json!({
                 "type": "spotClearinghouseState",
                 "user": wallet_address.trim(),
@@ -1630,13 +1576,10 @@ impl ExecutionEngine {
         if wallet_address.trim().is_empty() {
             return None;
         }
-        let url = if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let cfg = self.load_config_logged("fetch_hyperliquid_open_orders");
+        let url = self.info_url(&cfg, is_testnet);
         let val = self.http_post_json(
-            url,
+            &url,
             &json!({
                 "type": "openOrders",
                 "user": wallet_address.trim(),
@@ -1654,13 +1597,10 @@ impl ExecutionEngine {
         if wallet_address.trim().is_empty() {
             return None;
         }
-        let url = if is_testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let cfg = self.load_config_logged("fetch_hyperliquid_user_funding");
+        let url = self.info_url(&cfg, is_testnet);
         let val = self.http_post_json(
-            url,
+            &url,
             &json!({
                 "type": "userFunding",
                 "user": wallet_address.trim(),
@@ -1677,7 +1617,7 @@ impl ExecutionEngine {
         vault_address: Option<&str>,
         is_testnet: Option<bool>,
     ) -> Value {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("fetch_hlp_vault_state");
         let testnet = is_testnet.unwrap_or_else(|| {
             cfg.get_bool("hyperliquid_testnet", false)
                 || cfg
@@ -1690,15 +1630,12 @@ impl ExecutionEngine {
         let vault = vault_address
             .map(str::to_string)
             .unwrap_or_else(|| Self::resolve_hlp_vault_address(&cfg, testnet));
-        let url = if testnet {
-            HYPERLIQUID_TESTNET_INFO_URL
-        } else {
-            HYPERLIQUID_INFO_URL
-        };
+        let url = self.info_url(&cfg, testnet);
 
+        let default_apr = cfg.get_f64("hlp_default_estimated_apr", 0.125);
         let mut user_equity_usdc = 0.0f64;
         let mut accrued_yield_usdc = 0.0f64;
-        let mut vault_apr = 0.125f64;
+        let mut vault_apr = default_apr;
         let mut lockup_until_ms = 0i64;
         let mut allow_deposits = true;
         let mut live_queried = false;
@@ -1706,7 +1643,7 @@ impl ExecutionEngine {
         if !wallet.is_empty() {
             if let Some(eq_arr) = self
                 .http_post_json(
-                    url,
+                    &url,
                     &json!({
                         "type": "userVaultEquities",
                         "user": wallet,
@@ -1731,9 +1668,10 @@ impl ExecutionEngine {
                         .get("lockedUntilTimestamp")
                         .and_then(|v| {
                             v.as_i64().or_else(|| {
-                                v.as_f64()
-                                    .map(|f| f as i64)
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok().map(|f| f as i64)))
+                                v.as_f64().map(|f| f as i64).or_else(|| {
+                                    v.as_str()
+                                        .and_then(|s| s.parse::<f64>().ok().map(|f| f as i64))
+                                })
                             })
                         })
                         .unwrap_or(0);
@@ -1744,7 +1682,7 @@ impl ExecutionEngine {
         }
 
         if let Some(details) = self.http_post_json(
-            url,
+            &url,
             &json!({
                 "type": "vaultDetails",
                 "vaultAddress": vault,
@@ -1759,7 +1697,7 @@ impl ExecutionEngine {
                         v.as_f64()
                             .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                     })
-                    .unwrap_or(0.125);
+                    .unwrap_or(default_apr);
                 let is_closed = details
                     .get("isClosed")
                     .and_then(Value::as_bool)
@@ -1790,9 +1728,10 @@ impl ExecutionEngine {
                     }
                     if let Some(flk) = follower.get("lockupUntil").and_then(|v| {
                         v.as_i64().or_else(|| {
-                            v.as_f64()
-                                .map(|f| f as i64)
-                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok().map(|f| f as i64)))
+                            v.as_f64().map(|f| f as i64).or_else(|| {
+                                v.as_str()
+                                    .and_then(|s| s.parse::<f64>().ok().map(|f| f as i64))
+                            })
                         })
                     }) {
                         lockup_until_ms = lockup_until_ms.max(flk);
@@ -1871,7 +1810,7 @@ impl ExecutionEngine {
         is_deposit: bool,
         vault_address: Option<&str>,
     ) -> Value {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("execute_hlp_vault_transfer");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
         let vault = vault_address
@@ -1892,7 +1831,7 @@ impl ExecutionEngine {
         }
 
         let wallet = cfg.get_str("wallet_address", "");
-        let priv_key = cfg.get_str("private_key", "");
+        let priv_key = self.db.get_signing_private_key().unwrap_or_default();
         if wallet.is_empty() || priv_key.is_empty() {
             return json!({
                 "status": "SKIPPED",
@@ -1911,11 +1850,7 @@ impl ExecutionEngine {
 
         match sign_l1_action(&priv_key, &action, None, nonce, None, !is_testnet) {
             Ok(sig) => {
-                let url = if is_testnet {
-                    HYPERLIQUID_TESTNET_EXCHANGE_URL
-                } else {
-                    HYPERLIQUID_EXCHANGE_URL
-                };
+                let url = self.exchange_url(&cfg, is_testnet);
                 let payload = json!({
                     "action": serde_json::to_value(&action).unwrap_or_default(),
                     "nonce": nonce,
@@ -1926,7 +1861,7 @@ impl ExecutionEngine {
                     },
                     "vaultAddress": serde_json::Value::Null,
                 });
-                if let Some(resp) = self.http_post_json(url, &payload) {
+                if let Some(resp) = self.http_post_json(&url, &payload) {
                     *self.hlp_vault_error_streak.lock() = 0;
                     return json!({
                         "status": "SUBMITTED",
@@ -1962,7 +1897,7 @@ impl ExecutionEngine {
 
     /// Queries on-chain Hyperliquid clearinghouse + HLP vault equity and optionally rescales risk caps.
     pub fn sync_wallet_equity(&self, update_risk_caps: bool) -> Value {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("sync_wallet_equity");
         let wallet = cfg.get_str("wallet_address", "");
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
             || cfg
@@ -2024,8 +1959,32 @@ impl ExecutionEngine {
             .unwrap_or(0.0);
         let total_eq = round_dp(perp_eq + vault_eq, 2);
 
-        if live_ok && total_eq > 0.0 && update_risk_caps {
-            let _ = self.db.scale_risk_caps_for_equity(total_eq);
+        if live_ok && total_eq > 0.0 {
+            if update_risk_caps {
+                if let Err(e) = self.db.scale_risk_caps_for_equity(total_eq) {
+                    tracing::error!(error = %e, "Failed to scale risk caps for equity");
+                }
+                let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                if let Err(e) = self
+                    .db
+                    .set_config_value("equity_baseline_reset_at", &json!(now_iso))
+                {
+                    tracing::error!(error = %e, "Failed to update equity_baseline_reset_at");
+                }
+            }
+            if let Ok(mut snap) = self.db.get_latest_portfolio_snapshot() {
+                let (_, _, _, total_deployed) = self
+                    .db
+                    .get_wallet_perps_margin_state()
+                    .unwrap_or((total_eq, perp_eq, vault_eq, 0.0));
+                snap.timestamp_ms = self.db.now_ms();
+                snap.total_equity_usdc = total_eq;
+                snap.basis_harvest_notional_usdc = round_dp(vault_eq, 2);
+                snap.available_cash_usdc = round_dp((perp_eq - total_deployed).max(0.0), 2);
+                if let Err(e) = self.db.save_portfolio_snapshot(&snap) {
+                    tracing::error!(error = %e, "Failed to save portfolio snapshot during sync_wallet_equity");
+                }
+            }
         }
 
         let eff_total = if total_eq > 0.0 {
@@ -2075,6 +2034,9 @@ impl ExecutionEngine {
         let mut net_funding_delta = 0.0;
 
         for trade in open_trades {
+            if trade.fsm_state == "OPEN_ON_BOOK" && trade.filled_units <= 0.0 {
+                continue;
+            }
             let bars = self
                 .db
                 .get_ohlcv_bars(&trade.symbol, "1h", 2, Some(now_ms))
@@ -2089,14 +2051,13 @@ impl ExecutionEngine {
                 .map(|b| b.close)
                 .unwrap_or(trade.current_price);
             let notional = trade.quantity.abs() * mark_px;
-            // LONG pays positive funding; SHORT receives positive funding
             let delta = if trade.side == "LONG" {
                 -notional * funding_rate
             } else {
                 notional * funding_rate
             };
             let new_funding = round_dp(trade.funding_accrued_usdc + delta, 4);
-            let _ = self.db.update_open_trade(
+            if let Err(e) = self.db.update_open_trade(
                 trade.trade_id,
                 mark_px,
                 trade.chandelier_stop_price,
@@ -2104,7 +2065,9 @@ impl ExecutionEngine {
                 trade.lowest_price_seen,
                 trade.unrealized_pnl_usdc,
                 new_funding,
-            );
+            ) {
+                tracing::error!(trade_id = trade.trade_id, error = %e, "Failed to update open trade funding");
+            }
             net_funding_delta += delta;
             updated += 1;
         }
@@ -2132,12 +2095,15 @@ impl ExecutionEngine {
         simulated_exchange_positions: Option<&HashMap<String, Value>>,
         simulated_open_orders: Option<&[Value]>,
     ) -> Value {
-        let cfg = self.db.load_config().unwrap_or_default();
+        let cfg = self.load_config_logged("reconcile_exchange_state");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
         let wallet = cfg.get_str("wallet_address", "");
 
-        if mode == "PAPER" && simulated_exchange_positions.is_none() && simulated_open_orders.is_none() {
+        if mode == "PAPER"
+            && simulated_exchange_positions.is_none()
+            && simulated_open_orders.is_none()
+        {
             let open_trades = self.db.get_open_trades().unwrap_or_default();
             return json!({
                 "status": "VERIFIED_PAPER",
@@ -2148,7 +2114,6 @@ impl ExecutionEngine {
             });
         }
 
-        // Build map of exchange positions: base_asset -> (szi, entry_px, mark_px, upnl)
         let mut ex_positions: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
         if let Some(sim_map) = simulated_exchange_positions {
             for (coin, v) in sim_map {
@@ -2209,7 +2174,26 @@ impl ExecutionEngine {
             });
         }
 
+        let live_open_orders: Vec<Value>;
+        let open_orders_slice: Option<&[Value]> = if let Some(sim_orders) = simulated_open_orders {
+            Some(sim_orders)
+        } else if simulated_exchange_positions.is_none() {
+            live_open_orders = self
+                .fetch_hyperliquid_open_orders(&wallet, is_testnet)
+                .unwrap_or_default();
+            Some(&live_open_orders)
+        } else {
+            None
+        };
+        let open_order_coins: HashSet<String> = open_orders_slice
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|ord| ord.get("coin").and_then(Value::as_str))
+            .map(|s| s.to_uppercase())
+            .collect();
+
         let local_trades = self.db.get_open_trades().unwrap_or_default();
+        let local_pond_cells = self.db.get_open_pond_cells().unwrap_or_default();
         let mut seen_coins: HashSet<String> = HashSet::new();
         let mut discrepancies: Vec<Value> = Vec::new();
 
@@ -2219,33 +2203,86 @@ impl ExecutionEngine {
 
             match ex_positions.get(&coin) {
                 None => {
-                    // Phantom local trade -> close in SQLite
-                    let _ = self.db.close_trade(
-                        lt.trade_id,
-                        lt.current_price,
-                        0.0,
-                        lt.fees_paid_usdc,
-                        "RECONCILED_CLOSED_ON_EXCHANGE",
-                    );
-                    discrepancies.push(json!({
-                        "type": "PHANTOM_LOCAL_CLOSED",
-                        "base_asset": coin,
-                        "trade_id": lt.trade_id,
-                    }));
+                    if !open_order_coins.contains(&coin) {
+                        if let Err(e) = self.db.close_trade(
+                            lt.trade_id,
+                            lt.current_price,
+                            0.0,
+                            lt.fees_paid_usdc,
+                            "RECONCILED_CLOSED_ON_EXCHANGE",
+                        ) {
+                            tracing::error!(trade_id = lt.trade_id, error = %e, "Failed to close phantom local trade");
+                        }
+                        discrepancies.push(json!({
+                            "type": "PHANTOM_LOCAL_CLOSED",
+                            "base_asset": coin,
+                            "trade_id": lt.trade_id,
+                        }));
+                    }
                 }
                 Some(&(szi, entry_px, _mark_px, _upnl)) => {
                     let ex_qty = szi.abs();
                     if (ex_qty - lt.quantity.abs()).abs() > 1e-6 {
-                        let _ = self.db.reconcile_open_trade_size(
-                            lt.trade_id,
-                            ex_qty,
-                            Some(entry_px),
-                        );
+                        if let Err(e) =
+                            self.db
+                                .reconcile_open_trade_size(lt.trade_id, ex_qty, Some(entry_px))
+                        {
+                            tracing::error!(trade_id = lt.trade_id, error = %e, "Failed to reconcile open trade size");
+                        }
                         discrepancies.push(json!({
                             "type": "SIZE_DRIFT_RECONCILED",
                             "base_asset": coin,
                             "trade_id": lt.trade_id,
                             "local_qty": lt.quantity,
+                            "exchange_qty": ex_qty,
+                        }));
+                    }
+                }
+            }
+        }
+
+        for cell in &local_pond_cells {
+            let coin = cell
+                .symbol
+                .split('/')
+                .next()
+                .unwrap_or(&cell.symbol)
+                .trim()
+                .to_uppercase();
+            seen_coins.insert(coin.clone());
+
+            match ex_positions.get(&coin) {
+                None => {
+                    if !open_order_coins.contains(&coin) {
+                        if let Err(e) = self.db.reconcile_close_phantom_pond_cell(
+                            cell.cell_id,
+                            cell.entry_price.unwrap_or(0.0),
+                            "RECONCILED_CLOSED_ON_EXCHANGE",
+                        ) {
+                            tracing::error!(cell_id = cell.cell_id, error = %e, "Failed to close phantom pond cell");
+                        }
+                        discrepancies.push(json!({
+                            "type": "PHANTOM_POND_CELL_CLOSED",
+                            "base_asset": coin,
+                            "cell_id": cell.cell_id,
+                        }));
+                    }
+                }
+                Some(&(szi, entry_px, _mark_px, _upnl)) => {
+                    let ex_qty = szi.abs();
+                    let local_qty = cell.quantity.unwrap_or(0.0).abs();
+                    if (ex_qty - local_qty).abs() > 1e-6 {
+                        if let Err(e) =
+                            self.db
+                                .reconcile_open_pond_cell_size(cell.cell_id, ex_qty, Some(entry_px))
+                        {
+                            tracing::error!(cell_id = cell.cell_id, error = %e, "Failed to reconcile pond cell size");
+                        }
+                        discrepancies.push(json!({
+                            "type": "SIZE_DRIFT_POND_CELL_RECONCILED",
+                            "base_asset": coin,
+                            "cell_id": cell.cell_id,
+                            "local_qty": local_qty,
                             "exchange_qty": ex_qty,
                         }));
                     }
@@ -2277,7 +2314,7 @@ impl ExecutionEngine {
             }
         }
 
-        if let Some(open_orders) = simulated_open_orders {
+        if let Some(open_orders) = open_orders_slice {
             for ord in open_orders {
                 let coin = ord
                     .get("coin")
@@ -2320,6 +2357,19 @@ impl ExecutionEngine {
         let initial_equity = cfg.get_f64("initial_equity_usdc", 10000.0);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
         let chop_prob_thresh = cfg.get_f64("hmm_chop_prob_threshold", 0.55);
+        let bear_flip_prob = cfg.get_f64("execution_regime_flip_bear_prob", 0.62);
+        let bull_flip_prob = cfg.get_f64("execution_regime_flip_bull_prob", 0.60);
+        let chop_conv_max = cfg.get_f64("execution_high_chop_conviction_max", 0.08);
+        let chop_prob_offset = cfg.get_f64("execution_high_chop_prob_offset", 0.20);
+        let chop_prob_cap = cfg.get_f64("execution_high_chop_prob_cap", 0.82);
+        let rs_breakdown_long_snr = cfg.get_f64("execution_rs_breakdown_long_snr", -0.10);
+        let rs_reversal_short_snr = cfg.get_f64("execution_rs_reversal_short_snr", 0.10);
+        let cooldown_bars = cfg
+            .get_i64(
+                "execution_stop_cooldown_bars",
+                cfg.get_i64("post_stop_cooldown_bars", 14),
+            )
+            .max(1);
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
 
         let now_ms = evaluations
@@ -2363,7 +2413,10 @@ impl ExecutionEngine {
                 );
                 continue;
             }
-            let atr = self.risk.compute_atr(&bars, 14);
+            let atr_period = cfg
+                .get_usize("atr_period", cfg.get_usize("atr_default_period", 14))
+                .max(2);
+            let atr = self.risk.compute_atr(&bars, atr_period);
 
             let stop_eval = self.risk.evaluate_two_tier_chandelier_stop(
                 &trade.side,
@@ -2390,14 +2443,26 @@ impl ExecutionEngine {
 
             if exit_reason.is_none() {
                 if let Some(ev) = ev_opt {
-                    if trade.side == "LONG" && ev.hmm_regime == "BEAR" && ev.prob_bear >= 0.62 {
+                    if trade.side == "LONG"
+                        && ev.hmm_regime == "BEAR"
+                        && ev.prob_bear >= bear_flip_prob
+                    {
                         exit_reason = Some("REGIME_FLIP_BEAR".to_string());
                         exit_px = last_bar.close;
-                    } else if trade.side == "SHORT" && ev.hmm_regime == "BULL" && ev.prob_bull >= 0.60 {
+                    } else if trade.side == "LONG" && ev.snr_synth < rs_breakdown_long_snr {
+                        exit_reason = Some("RS_SYNTH_BREAKDOWN_LONG".to_string());
+                        exit_px = last_bar.close;
+                    } else if trade.side == "SHORT"
+                        && ev.hmm_regime == "BULL"
+                        && ev.prob_bull >= bull_flip_prob
+                    {
                         exit_reason = Some("REGIME_FLIP_BULL".to_string());
                         exit_px = last_bar.close;
-                    } else if ev.prob_chop >= (chop_prob_thresh + 0.20).min(0.82)
-                        && ev.blended_conviction.abs() < 0.08
+                    } else if trade.side == "SHORT" && ev.snr_synth > rs_reversal_short_snr {
+                        exit_reason = Some("RS_SYNTH_REVERSAL_SHORT".to_string());
+                        exit_px = last_bar.close;
+                    } else if ev.prob_chop >= (chop_prob_thresh + chop_prob_offset).min(chop_prob_cap)
+                        && ev.blended_conviction.abs() < chop_conv_max
                     {
                         exit_reason = Some("HIGH_CHOP_DELEVERAGE".to_string());
                         exit_px = last_bar.close;
@@ -2471,8 +2536,7 @@ impl ExecutionEngine {
                 } else {
                     (trade.entry_price - actual_exit_px) * trade.quantity
                 };
-                let net_pnl =
-                    round_dp(gross_pnl - total_fees + trade.funding_accrued_usdc, 4);
+                let net_pnl = round_dp(gross_pnl - total_fees + trade.funding_accrued_usdc, 4);
                 self.db.close_trade(
                     trade.trade_id,
                     actual_exit_px,
@@ -2484,7 +2548,7 @@ impl ExecutionEngine {
                     let tf_ms = timeframe_seconds(&asset.exec_timeframe) * 1000;
                     self.stop_cooldown_until_ms
                         .lock()
-                        .insert(trade.symbol.clone(), now_ms + 14 * tf_ms);
+                        .insert(trade.symbol.clone(), now_ms + cooldown_bars * tf_ms);
                 }
             } else {
                 let upnl = if trade.side == "LONG" {
@@ -2511,18 +2575,68 @@ impl ExecutionEngine {
             .iter()
             .map(|t| t.unrealized_pnl_usdc + t.funding_accrued_usdc)
             .sum();
-        let current_equity = (initial_equity + realized_pnl + unrealized_pnl + accrued_yield_usdc)
-            .max(100.0);
 
-        let open_symbols: HashSet<String> =
+        let two_book_active = !is_backtest
+            && (cfg.get_bool("platform_pp50_enabled", false)
+                || cfg.get_bool("pond_enabled", false));
+        let split_pct = if two_book_active {
+            cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)
+        } else {
+            1.0
+        };
+        let net_pit_transfers = if two_book_active {
+            self.db.get_net_book_transfer_adjustment("PIT").unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let raw_platform_eq = if !is_backtest
+            && (mode == "LIVE" || mode == "TESTNET")
+            && prev_snap.total_equity_usdc > 0.0
+        {
+            prev_snap.total_equity_usdc + unrealized_pnl
+        } else {
+            initial_equity + realized_pnl + unrealized_pnl + accrued_yield_usdc
+        };
+        let current_equity = (raw_platform_eq * split_pct + net_pit_transfers).max(50.0);
+
+        let mut open_symbols: HashSet<String> =
             active_trades.iter().map(|t| t.symbol.clone()).collect();
+        if !is_backtest {
+            if let Ok(pond_syms) = self.db.get_open_pond_symbols() {
+                open_symbols.extend(pond_syms);
+            }
+        }
+
+        let (_wallet_tot_eq, perps_trading_eq, vault_eq, mut total_wallet_deployed) =
+            if !is_backtest {
+                self.db
+                    .get_wallet_perps_margin_state()
+                    .unwrap_or((initial_equity, initial_equity, 0.0, 0.0))
+            } else {
+                (initial_equity, initial_equity, 0.0, 0.0)
+            };
 
         // 3. Evaluate new directional entries for LONG / SHORT candidates
+        let atr_period = cfg
+            .get_usize("atr_period", cfg.get_usize("atr_default_period", 14))
+            .max(2);
+        let max_longs = cfg.get_usize("max_concurrent_long_positions", 2).max(1);
+        let max_shorts = cfg.get_usize("max_concurrent_short_positions", 2).max(1);
         for ev in evaluations {
             if ev.signal_action != "LONG" && ev.signal_action != "SHORT" {
                 continue;
             }
             if open_symbols.contains(&ev.exec_symbol) {
+                continue;
+            }
+            if ev.signal_action == "LONG"
+                && active_trades.iter().filter(|t| t.side == "LONG").count() >= max_longs
+            {
+                continue;
+            }
+            if ev.signal_action == "SHORT"
+                && active_trades.iter().filter(|t| t.side == "SHORT").count() >= max_shorts
+            {
                 continue;
             }
             if let Some(&cooldown_until) = self.stop_cooldown_until_ms.lock().get(&ev.exec_symbol) {
@@ -2540,9 +2654,9 @@ impl ExecutionEngine {
                 continue;
             }
             let last_bar = bars.last().unwrap();
-            let atr = self.risk.compute_atr(&bars, 14);
+            let atr = self.risk.compute_atr(&bars, atr_period);
 
-            let sizing = self.risk.evaluate_order_risk(
+            let mut sizing = self.risk.evaluate_order_risk(
                 asset,
                 &ev.signal_action,
                 last_bar.close,
@@ -2554,6 +2668,26 @@ impl ExecutionEngine {
             );
             if !sizing.approved {
                 continue;
+            }
+
+            if !is_backtest && vault_eq > 0.0 {
+                let remaining_perps_cap = (perps_trading_eq - total_wallet_deployed).max(0.0);
+                if remaining_perps_cap < asset.min_notional_usdc.max(10.0) {
+                    continue;
+                }
+                if sizing.notional_usdc > remaining_perps_cap {
+                    let capped_qty = RiskEngine::round_step(
+                        remaining_perps_cap / last_bar.close.max(1e-8),
+                        asset.lot_step_size,
+                        true,
+                    );
+                    let capped_notional = round_dp(capped_qty * last_bar.close, 2);
+                    if capped_qty <= 0.0 || capped_notional < asset.min_notional_usdc.max(10.0) {
+                        continue;
+                    }
+                    sizing.quantity = capped_qty;
+                    sizing.notional_usdc = capped_notional;
+                }
             }
 
             let exec_res = self.execute_maker_limit_chaser(
@@ -2580,11 +2714,12 @@ impl ExecutionEngine {
             } else {
                 last_bar.close
             };
-            let filled_qty = if exec_res.filled_units > 0.0 {
+            let order_qty = if exec_res.filled_units > 0.0 {
                 exec_res.filled_units
             } else {
                 sizing.quantity
             };
+            let filled_notional = round_dp(order_qty * fill_px, 2);
             let new_trade = TradeRecord {
                 trade_id: 0,
                 client_order_id: exec_res.client_order_id,
@@ -2596,17 +2731,21 @@ impl ExecutionEngine {
                 entry_price: fill_px,
                 current_price: fill_px,
                 exit_price: None,
-                quantity: filled_qty,
-                filled_units: filled_qty,
-                avg_fill_price: Some(fill_px),
-                notional_usdc: round_dp(filled_qty * fill_px, 2),
+                quantity: order_qty,
+                filled_units: exec_res.filled_units,
+                avg_fill_price: if exec_res.avg_fill_price > 0.0 {
+                    Some(exec_res.avg_fill_price)
+                } else {
+                    None
+                },
+                notional_usdc: filled_notional,
                 risk_budget_usdc: sizing.risk_budget_usdc,
                 conviction_multiplier: sizing.conviction_multiplier,
                 initial_stop_price: sizing.initial_stop_price,
                 chandelier_stop_price: sizing.initial_stop_price,
                 current_stop_price: sizing.initial_stop_price,
-                highest_price_seen: fill_px.max(last_bar.high),
-                lowest_price_seen: fill_px.min(last_bar.low),
+                highest_price_seen: fill_px,
+                lowest_price_seen: fill_px,
                 realized_pnl_usdc: 0.0,
                 unrealized_pnl_usdc: 0.0,
                 fees_paid_usdc: exec_res.fees_paid_usdc,
@@ -2620,6 +2759,8 @@ impl ExecutionEngine {
             let tid = self.db.insert_trade(&new_trade)?;
             let mut inserted = new_trade;
             inserted.trade_id = tid;
+            open_symbols.insert(asset.symbol.clone());
+            total_wallet_deployed = round_dp(total_wallet_deployed + filled_notional, 2);
             active_trades.push(inserted);
         }
 
@@ -2709,13 +2850,17 @@ impl ExecutionEngine {
                 .filter(|e| e.signal_action == "BASIS_HARVEST")
                 .count();
             if (hmm_regime == "CHOP" || prob_chop >= chop_prob_thresh) && basis_candidates > 0 {
-                let alloc_pct = cfg.get_f64("basis_max_idle_cash_allocation_pct", 0.35);
+                let alloc_pct = cfg.get_f64("basis_max_idle_cash_allocation_pct", 0.50);
+                let basis_floor = cfg.get_f64(
+                    "basis_harvest_min_funding_hourly",
+                    cfg.get_f64("basis_min_hourly_funding_rate", 0.000015),
+                );
                 basis_notional = round_dp(available_cash * alloc_pct, 2);
                 if is_backtest && cfg.get_bool("enable_hlp_floor_backtest", false) {
                     let avg_funding = evaluations
                         .iter()
                         .filter(|e| e.signal_action == "BASIS_HARVEST")
-                        .map(|e| e.funding_rate_hourly.max(0.00015))
+                        .map(|e| e.funding_rate_hourly.max(basis_floor))
                         .sum::<f64>()
                         / (basis_candidates as f64);
                     accrued_yield_usdc =
@@ -2726,14 +2871,38 @@ impl ExecutionEngine {
                 round_dp(initial_equity + realized_after + total_upnl + accrued_yield_usdc, 2);
         }
 
-        let gross_lev = round_dp(deployed_notional / total_equity.max(1.0), 4);
-        let heat_pct = round_dp(portfolio_heat / total_equity.max(1.0), 6);
+        let pond_deployed_now: f64 = if !is_backtest && (mode == "LIVE" || mode == "TESTNET") {
+            self.db
+                .get_open_pond_cells()
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.notional_usdc.unwrap_or(0.0))
+                .sum()
+        } else {
+            0.0
+        };
+        let available_perps_cash = if !is_backtest && (mode == "LIVE" || mode == "TESTNET") {
+            round_dp(
+                (total_equity - basis_notional - deployed_notional - pond_deployed_now).max(0.0),
+                2,
+            )
+        } else {
+            round_dp((total_equity - deployed_notional).max(0.0), 2)
+        };
+
+        let pit_book_equity = if two_book_active {
+            (total_equity * split_pct + net_pit_transfers).max(1.0)
+        } else {
+            total_equity.max(1.0)
+        };
+        let gross_lev = round_dp(deployed_notional / pit_book_equity, 4);
+        let heat_pct = round_dp(portfolio_heat / pit_book_equity, 6);
 
         let snap = PortfolioSnapshot {
             snapshot_id: None,
             timestamp_ms: now_ms,
             total_equity_usdc: total_equity,
-            available_cash_usdc: round_dp((total_equity - deployed_notional).max(0.0), 2),
+            available_cash_usdc: available_perps_cash,
             deployed_notional_usdc: round_dp(deployed_notional, 2),
             gross_leverage: gross_lev,
             portfolio_heat_usdc: round_dp(portfolio_heat, 2),
@@ -2758,6 +2927,106 @@ impl ExecutionEngine {
         }
 
         Ok(snap)
+    }
+
+    /// Executes an inter-book USDC transfer between Book A (PIT) and Book B (POND) (`C1`).
+    /// - When separate Hyperliquid sub-accounts (`pit_subaccount_address` / `pond_subaccount_address`)
+    ///   are configured in `LIVE` or `TESTNET` mode, signs and submits a real `subAccountTransfer` L1 action.
+    /// - When running in single-wallet or `PAPER` mode, records a deterministic `VIRTUAL_SINGLE_WALLET_LEDGER`
+    ///   rebalance entry that is persisted in `book_transfers` and applied via `get_net_book_transfer_adjustment`.
+    pub fn execute_subaccount_transfer(
+        &self,
+        from_book: &str,
+        to_book: &str,
+        amount_usdc: f64,
+        dry_run: bool,
+    ) -> Result<Value> {
+        let cfg = self.db.load_config()?;
+        let amt = round_dp(amount_usdc.max(0.0), 2);
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+
+        let pit_sub = cfg.get_str("pit_subaccount_address", "").trim().to_string();
+        let pond_sub = cfg.get_str("pond_subaccount_address", "").trim().to_string();
+        let has_live_subaccount = (mode == "LIVE" || mode == "TESTNET")
+            && ((!pit_sub.is_empty() && validate_evm_address(&pit_sub, "pit_subaccount_address").is_ok())
+                || (!pond_sub.is_empty()
+                    && validate_evm_address(&pond_sub, "pond_subaccount_address").is_ok()));
+
+        if !dry_run && has_live_subaccount {
+            let priv_key = self.db.get_signing_private_key()?;
+            if !priv_key.is_empty() {
+                let (sub_addr, is_deposit) = if to_book.eq_ignore_ascii_case("POND")
+                    && !pond_sub.is_empty()
+                {
+                    (pond_sub, true)
+                } else if from_book.eq_ignore_ascii_case("POND") && !pond_sub.is_empty() {
+                    (pond_sub, false)
+                } else if to_book.eq_ignore_ascii_case("PIT") && !pit_sub.is_empty() {
+                    (pit_sub, true)
+                } else {
+                    (pit_sub, false)
+                };
+                let usd_micro = (amt * 1e6).round() as i64;
+                let nonce = Utc::now().timestamp_millis() as u64;
+                let action = SubAccountTransferAction {
+                    action_type: "subAccountTransfer".to_string(),
+                    sub_account_user: sub_addr.clone(),
+                    is_deposit,
+                    usd: usd_micro,
+                };
+                if let Ok(sig) = sign_l1_action(&priv_key, &action, None, nonce, None, !is_testnet)
+                {
+                    let url = self.exchange_url(&cfg, is_testnet);
+                    let payload = json!({
+                        "action": serde_json::to_value(&action).unwrap_or_default(),
+                        "nonce": nonce,
+                        "signature": {
+                            "r": sig["r"],
+                            "s": sig["s"],
+                            "v": sig["v"],
+                        },
+                        "vaultAddress": Value::Null,
+                    });
+                    if let Some(resp) = self.http_post_json(&url, &payload) {
+                        if resp.get("status").and_then(Value::as_str) == Some("ok") {
+                            let tx_hash = sig["connection_id"]
+                                .as_str()
+                                .unwrap_or("0x0")
+                                .to_string();
+                            return Ok(json!({
+                                "status": "EXECUTED",
+                                "transfer_mode": "HYPERLIQUID_SUBACCOUNT_L1",
+                                "from_book": from_book,
+                                "to_book": to_book,
+                                "amount_usdc": amt,
+                                "tx_hash": tx_hash,
+                                "dry_run": false,
+                                "exchange_response": resp,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+
+        let digest_hex = hex::encode(Sha256::digest(
+            format!(
+                "VIRTUAL_LEDGER:{from_book}:{to_book}:{amt}:{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            )
+            .as_bytes(),
+        ));
+        let tx_hash = format!("0x{}", &digest_hex[..64]);
+        Ok(json!({
+            "status": if dry_run { "DRY_RUN_SIMULATED" } else { "EXECUTED" },
+            "transfer_mode": "VIRTUAL_SINGLE_WALLET_LEDGER",
+            "from_book": from_book,
+            "to_book": to_book,
+            "amount_usdc": amt,
+            "tx_hash": tx_hash,
+            "dry_run": dry_run,
+        }))
     }
 }
 
@@ -2787,7 +3056,9 @@ mod tests {
             false,
         );
         assert_eq!(partial.fsm_state, "FILLED");
-        assert!(partial.state_history.contains(&"PARTIALLY_FILLED".to_string()));
+        assert!(partial
+            .state_history
+            .contains(&"PARTIALLY_FILLED".to_string()));
 
         let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
         let sig = ExecutionEngine::sign_hyperliquid_action(
@@ -2852,7 +3123,6 @@ mod tests {
             grouping: "na".to_string(),
         };
 
-        // Mainnet signature test vector from hyperliquid-python-sdk signing_test.py
         let sig_mainnet = sign_l1_action(pk, &order_action, None, 0, None, true).unwrap();
         assert_eq!(
             sig_mainnet["r"].as_str().unwrap(),
@@ -2864,7 +3134,6 @@ mod tests {
         );
         assert_eq!(sig_mainnet["v"].as_u64().unwrap(), 28);
 
-        // Testnet signature test vector from hyperliquid-python-sdk signing_test.py
         let sig_testnet = sign_l1_action(pk, &order_action, None, 0, None, false).unwrap();
         assert_eq!(
             sig_testnet["r"].as_str().unwrap(),
@@ -2882,50 +3151,51 @@ mod tests {
         let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
         let vault_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
 
-        // 1. Test Deposit Action
         let deposit_action = VaultTransferAction {
             action_type: "vaultTransfer".to_string(),
             vault_address: vault_addr.to_string(),
             is_deposit: true,
-            usd: 100_000_000, // 100 USDC in micro-units
+            usd: 100_000_000,
         };
 
-        // Verify MessagePack encoding contains exact required keys
         let msgpack_bytes = rmp_serde::encode::to_vec_named(&deposit_action).unwrap();
         assert!(!msgpack_bytes.is_empty());
 
-        let deposit_hash = compute_l1_action_hash(&deposit_action, None, 1700000000000, None).unwrap();
+        let deposit_hash =
+            compute_l1_action_hash(&deposit_action, None, 1700000000000, None).unwrap();
         assert_eq!(deposit_hash.len(), 32);
 
-        let sig_deposit_mainnet = sign_l1_action(pk, &deposit_action, None, 1700000000000, None, true).unwrap();
+        let sig_deposit_mainnet =
+            sign_l1_action(pk, &deposit_action, None, 1700000000000, None, true).unwrap();
         assert!(sig_deposit_mainnet["r"].as_str().unwrap().starts_with("0x"));
         assert!(sig_deposit_mainnet["s"].as_str().unwrap().starts_with("0x"));
         let v_dep_main = sig_deposit_mainnet["v"].as_u64().unwrap();
         assert!(v_dep_main == 27 || v_dep_main == 28);
 
-        let sig_deposit_testnet = sign_l1_action(pk, &deposit_action, None, 1700000000000, None, false).unwrap();
+        let sig_deposit_testnet =
+            sign_l1_action(pk, &deposit_action, None, 1700000000000, None, false).unwrap();
         assert!(sig_deposit_testnet["r"].as_str().unwrap().starts_with("0x"));
         assert!(sig_deposit_testnet["s"].as_str().unwrap().starts_with("0x"));
         let v_dep_test = sig_deposit_testnet["v"].as_u64().unwrap();
         assert!(v_dep_test == 27 || v_dep_test == 28);
 
-        // 2. Test Withdrawal Action
         let withdraw_action = VaultTransferAction {
             action_type: "vaultTransfer".to_string(),
             vault_address: vault_addr.to_string(),
             is_deposit: false,
-            usd: 50_000_000, // 50 USDC in micro-units
+            usd: 50_000_000,
         };
 
-        let withdraw_hash = compute_l1_action_hash(&withdraw_action, None, 1700000000000, None).unwrap();
+        let withdraw_hash =
+            compute_l1_action_hash(&withdraw_action, None, 1700000000000, None).unwrap();
         assert_eq!(withdraw_hash.len(), 32);
         assert_ne!(deposit_hash, withdraw_hash);
 
-        let sig_withdraw_testnet = sign_l1_action(pk, &withdraw_action, None, 1700000000000, None, false).unwrap();
+        let sig_withdraw_testnet =
+            sign_l1_action(pk, &withdraw_action, None, 1700000000000, None, false).unwrap();
         assert!(sig_withdraw_testnet["r"].as_str().unwrap().starts_with("0x"));
         assert!(sig_withdraw_testnet["s"].as_str().unwrap().starts_with("0x"));
 
-        // 3. Test Paper Simulation in ExecutionEngine
         let db = DatabaseManager::memory();
         db.initialize_schema(false).unwrap();
         let exec = ExecutionEngine::new(db);
@@ -2944,13 +3214,163 @@ mod tests {
     fn test_asset_index_cache_and_fallback() {
         let db = DatabaseManager::memory();
         db.initialize_schema(false).unwrap();
-        let mut exec = ExecutionEngine::new(db);
+        // Force offline endpoint so test never depends on external network reachability
+        db.set_config_value("hyperliquid_info_url", &json!("http://127.0.0.1:1/info"))
+            .unwrap();
+        db.set_config_value(
+            "hyperliquid_testnet_info_url",
+            &json!("http://127.0.0.1:1/info"),
+        )
+        .unwrap();
+        let mut exec = ExecutionEngine::new(db.clone());
         exec.timeout_sec = 1;
 
-        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ADA", true), Some(45));
-        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ada", true), Some(45));
-        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("ADA", false), Some(65));
-        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("SOL", true), Some(0));
-        assert_eq!(exec.fetch_hyperliquid_universe_asset_index("BTC", false), Some(0));
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("ADA", true),
+            Some(45)
+        );
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("ada", true),
+            Some(45)
+        );
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("ADA", false),
+            Some(65)
+        );
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("SOL", true),
+            Some(0)
+        );
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("BTC", false),
+            Some(0)
+        );
+
+        // S6: Verify fallback indices are NEVER cached and LIVE/TESTNET mode refuses fallback indices
+        assert!(exec.asset_index_cache.lock().is_empty());
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
+        assert_eq!(
+            exec.fetch_hyperliquid_universe_asset_index("ADA", false),
+            None
+        );
+        assert_eq!(
+            exec.fetch_live_hyperliquid_universe_asset_index("BTC", false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_single_wallet_two_book_scaling_perps_cap_and_pond_reconciliation() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let scaled = db.scale_risk_caps_for_equity(956.80).unwrap();
+        assert!((scaled["initial_equity_usdc"] - 956.80).abs() < 1e-6);
+        assert!((scaled["baseline_risk_per_trade_usdc"] - 4.78).abs() < 1e-6);
+        assert!((scaled["min_risk_per_trade_usdc"] - 2.39).abs() < 1e-6);
+        assert!((scaled["max_risk_per_trade_usdc"] - 7.17).abs() < 1e-6);
+        assert!((scaled["max_portfolio_heat_usdc"] - 19.14).abs() < 1e-6);
+        assert!((scaled["max_single_asset_notional_usdc"] - 119.60).abs() < 1e-6);
+        assert!((scaled["max_gross_leverage_notional_usdc"] - 717.60).abs() < 1e-6);
+        assert!((scaled["pond_baseline_risk_usdc"] - 4.78).abs() < 1e-6);
+        assert!((scaled["pond_min_risk_usdc"] - 2.39).abs() < 1e-6);
+        assert!((scaled["pond_max_risk_usdc"] - 7.17).abs() < 1e-6);
+        assert!((scaled["pond_max_heat_usdc"] - 19.14).abs() < 1e-6);
+        assert!((scaled["pond_max_cell_notional_usdc"] - 119.60).abs() < 1e-6);
+
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+            .unwrap();
+        let mut snap = db.get_latest_portfolio_snapshot().unwrap();
+        snap.total_equity_usdc = 956.80;
+        snap.basis_harvest_notional_usdc = 429.93;
+        snap.available_cash_usdc = 526.87;
+        db.save_portfolio_snapshot(&snap).unwrap();
+
+        let (tot_eq, perps_eq, vault_eq, deployed) = db.get_wallet_perps_margin_state().unwrap();
+        assert!((tot_eq - 956.80).abs() < 1e-6);
+        assert!((perps_eq - 526.87).abs() < 1e-6);
+        assert!((vault_eq - 429.93).abs() < 1e-6);
+        assert!((deployed - 0.0).abs() < 1e-6);
+
+        let phantom_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "JUP/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(1.0),
+            quantity: Some(100.0),
+            notional_usdc: Some(100.0),
+            risk_budget_usdc: Some(4.78),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.5),
+            funding_rate_entry: Some(0.0005),
+            initial_stop: Some(1.1),
+            chandelier_stop: Some(1.1),
+            highest_price_seen: Some(1.0),
+            lowest_price_seen: Some(1.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            opened_at: Some("2026-11-05T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-05T00:00:00Z".to_string(),
+        };
+        db.upsert_pond_cell(&phantom_cell).unwrap();
+        assert!(db
+            .get_all_open_wallet_symbols()
+            .unwrap()
+            .contains("JUP/USDC:USDC"));
+
+        let exec = ExecutionEngine::new(db.clone());
+        let empty_on_chain = HashMap::new();
+
+        let resting_orders = vec![json!({"coin": "JUP", "oid": 99999})];
+        let recon_resting =
+            exec.reconcile_exchange_state(Some(&empty_on_chain), Some(&resting_orders));
+        assert_eq!(recon_resting["status"], "RECONCILED");
+        assert_eq!(recon_resting["discrepancies_found"], 0);
+        assert_eq!(db.get_open_pond_cells().unwrap().len(), 1);
+
+        let recon = exec.reconcile_exchange_state(Some(&empty_on_chain), None);
+        assert_eq!(recon["status"], "RECONCILED");
+        assert_eq!(recon["discrepancies_found"], 1);
+        assert_eq!(db.get_open_pond_cells().unwrap().len(), 0);
+        let closed_cells = db.get_pond_cells(10).unwrap();
+        assert_eq!(closed_cells[0].state, "CLOSED");
+        assert_eq!(
+            closed_cells[0].exit_reason.as_deref(),
+            Some("RECONCILED_CLOSED_ON_EXCHANGE")
+        );
+
+        let risk = RiskEngine::new(db.clone());
+        let (budget, mult) = risk.compute_conviction_risk_budget(0.5, 478.40, None);
+        assert!((budget - 4.78).abs() < 1e-6);
+        assert!((mult - 1.0).abs() < 1e-6);
+
+        let fill = exec.execute_pond_order(
+            "JUP/USDC:USDC",
+            "SELL",
+            100.0,
+            1.0,
+            0.0001,
+            0.1,
+            1.01,
+            0.99,
+            50_000.0,
+            false,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(fill.fsm_state, "REJECTED");
     }
 }

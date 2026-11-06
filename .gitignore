@@ -16,6 +16,8 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/.aegis_master_key
+.aegis_master_key
+**/.aegis_master_key
 *.key
 
 # Runtime logs & temporary files (all config & credentials live exclusively in SQLite system_config)

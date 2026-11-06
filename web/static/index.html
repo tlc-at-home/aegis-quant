@@ -3,955 +3,1374 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Aegis Quant (v0.2.0-rc1) — Web3 DEX Quantitative Telemetry</title>
+  <title>AEGIS-QUANT // v0.3.0-rc1 PP-50 Two-Book Platform (Hyperliquid L1)</title>
   <style>
     :root {
-      --bg-primary: #0b0f17;
-      --bg-panel: #131b29;
-      --bg-card: #1a2436;
-      --border: #26354d;
+      --bg-primary: #070a10;
+      --bg-secondary: #0d131f;
+      --bg-card: #111927;
+      --bg-hover: #182336;
+      --border: #1e2d44;
       --text-main: #e2e8f0;
-      --text-muted: #94a3b8;
-      --accent: #38bdf8;
-      --bull: #10b981;
-      --bear: #ef4444;
-      --chop: #f59e0b;
+      --text-muted: #8b9bb4;
+      --accent-blue: #38bdf8;
+      --accent-indigo: #6366f1;
+      --accent-green: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-red: #ef4444;
+      --accent-purple: #a855f7;
+      --pnl-pos-fg: #34d399;
+      --pnl-pos-bg: rgba(16, 185, 129, 0.14);
+      --pnl-pos-border: rgba(16, 185, 129, 0.42);
+      --pnl-neg-fg: #f87171;
+      --pnl-neg-bg: rgba(239, 68, 68, 0.14);
+      --pnl-neg-border: rgba(239, 68, 68, 0.42);
+      --pnl-flat-fg: #94a3b8;
+      --pnl-flat-bg: rgba(148, 163, 184, 0.12);
+      --pnl-flat-border: rgba(148, 163, 184, 0.3);
+      --font-mono: "JetBrains Mono", "Fira Code", Consolas, monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: var(--bg-primary);
+      background-color: var(--bg-primary);
       color: var(--text-main);
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-      line-height: 1.5;
-      padding: 1.25rem;
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-x: hidden;
     }
+
+    /* Top Header */
     header {
+      background: linear-gradient(90deg, #0b111e 0%, #131e32 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 22px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 1rem 1.5rem;
-      margin-bottom: 1.25rem;
       flex-wrap: wrap;
-      gap: 0.75rem;
-    }
-    .brand h1 { font-size: 1.35rem; color: var(--accent); letter-spacing: 0.5px; }
-    .brand p { font-size: 0.82rem; color: var(--text-muted); }
-    .badge {
-      display: inline-block;
-      padding: 0.25rem 0.65rem;
-      border-radius: 4px;
-      font-size: 0.78rem;
-      font-weight: 700;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-    }
-    .badge.BULL { color: var(--bull); border-color: var(--bull); }
-    .badge.BEAR { color: var(--bear); border-color: var(--bear); }
-    .badge.CHOP { color: var(--chop); border-color: var(--chop); }
-    .metrics-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 1rem;
-      margin-bottom: 1.25rem;
-    }
-    .card {
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 1rem;
-    }
-    .card-label { font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; }
-    .card-value { font-size: 1.45rem; font-weight: 700; margin-top: 0.25rem; }
-    .card-sub { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.2rem; }
-    .section-grid {
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      gap: 1.25rem;
-    }
-    @media (max-width: 960px) { .section-grid { grid-template-columns: 1fr; } }
-    h2 { font-size: 1rem; color: var(--accent); margin-bottom: 0.75rem; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-    th, td {
-      padding: 0.5rem 0.6rem;
-      text-align: left;
-      border-bottom: 1px solid var(--border);
-    }
-    th { color: var(--text-muted); font-weight: 600; }
-    .pos-LONG { color: var(--bull); font-weight: 700; }
-    .pos-SHORT { color: var(--bear); font-weight: 700; }
-    .pos-BASIS_HARVEST { color: var(--accent); font-weight: 700; }
-    .cred-panel { margin-top: 1.25rem; }
-    .cred-form {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 0.85rem;
-      align-items: end;
-      margin-top: 0.75rem;
-    }
-    .form-group label {
-      display: block;
-      font-size: 0.75rem;
-      color: var(--text-muted);
-      margin-bottom: 0.25rem;
-    }
-    .form-group input, .form-group select {
-      width: 100%;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      color: var(--text-main);
-      padding: 0.45rem 0.6rem;
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 0.82rem;
-    }
-    .btn-row {
-      display: flex;
-      gap: 0.6rem;
-    }
-    .btn-save {
-      background: var(--accent);
-      color: #0b0f17;
-      border: none;
-      padding: 0.5rem 1rem;
-      border-radius: 4px;
-      font-weight: 700;
-      cursor: pointer;
-      font-size: 0.82rem;
-    }
-    .btn-secondary {
-      background: var(--bg-card);
-      color: var(--accent);
-      border: 1px solid var(--accent);
-      padding: 0.5rem 1rem;
-      border-radius: 4px;
-      font-weight: 700;
-      cursor: pointer;
-      font-size: 0.82rem;
-    }
-    .btn-save:hover, .btn-secondary:hover { opacity: 0.9; }
-    .cred-status-msg { font-size: 0.78rem; margin-top: 0.65rem; color: var(--text-muted); }
-    .state-strip {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-      gap: 0.75rem;
-      margin-bottom: 0.85rem;
-    }
-    .state-box {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.6rem 0.75rem;
-    }
-    .state-box-label {
-      font-size: 0.7rem;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-      color: var(--text-muted);
-    }
-    .state-box-value {
-      font-size: 0.86rem;
-      font-weight: 700;
-      margin-top: 0.2rem;
-      word-break: break-all;
-    }
-    .state-box-sub {
-      font-size: 0.72rem;
-      color: var(--text-muted);
-      margin-top: 0.15rem;
-    }
-    .text-ok { color: var(--bull); }
-    .text-warn { color: var(--chop); }
-    .text-err { color: var(--bear); }
-    .text-accent { color: var(--accent); }
-    .state-banner {
-      display: none;
-      margin-top: 0.75rem;
-      padding: 0.6rem 0.85rem;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      line-height: 1.4;
-    }
-    .state-banner.warn {
-      display: block;
-      background: rgba(245, 158, 11, 0.12);
-      border: 1px solid var(--chop);
-      color: #fde68a;
-    }
-    .state-banner.ok {
-      display: block;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid var(--bull);
-      color: #a7f3d0;
-    }
-    .state-banner.err {
-      display: block;
-      background: rgba(239, 68, 68, 0.14);
-      border: 1px solid var(--bear);
-      color: #fecaca;
-    }
-    input:focus-visible, select:focus-visible, button:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-    }
-    input:user-invalid,
-    input.user-invalid-fallback {
-      border-color: var(--bear);
-      background-color: rgba(239, 68, 68, 0.12);
-    }
-    input:user-valid,
-    input.user-valid-fallback {
-      border-color: var(--bull);
-    }
-    .hint {
-      display: block;
-      color: var(--text-muted);
-      font-size: 0.72rem;
-      margin-bottom: 0.25rem;
-    }
-    .error-msg {
-      display: none;
-      color: var(--bear);
-      font-size: 0.75rem;
-      margin-top: 0.25rem;
-    }
-    input:user-invalid + .error-msg,
-    input.user-invalid-fallback + .error-msg {
-      display: block;
-    }
-    fieldset.settings-fieldset {
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 0.85rem 1rem;
-      margin-bottom: 1rem;
-      background: rgba(26, 36, 54, 0.55);
-    }
-    fieldset.settings-fieldset legend {
-      font-size: 0.82rem;
-      font-weight: 700;
-      color: var(--accent);
-      padding: 0 0.45rem;
-    }
-    .equity-bar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 1rem;
-      align-items: flex-end;
-    }
-    .preset-pills, .cat-pills {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.4rem;
-      margin-top: 0.5rem;
-    }
-    .pill-btn {
-      background: var(--bg-card);
-      color: var(--text-muted);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 0.28rem 0.7rem;
-      font-size: 0.75rem;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-    }
-    .pill-btn:hover, .pill-btn.active {
-      color: #0b0f17;
-      background: var(--accent);
-      border-color: var(--accent);
-    }
-    .cfg-toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: flex-end;
-      gap: 0.85rem;
-      margin-bottom: 0.75rem;
-    }
-    .cfg-table-wrap {
-      max-height: 540px;
-      overflow-y: auto;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      margin-top: 0.65rem;
-    }
-    .cfg-table th {
+      gap: 12px;
       position: sticky;
       top: 0;
-      background: var(--bg-card);
-      z-index: 2;
+      z-index: 100;
     }
-    .cfg-row-dirty {
-      background: rgba(56, 189, 248, 0.09);
-    }
-    .cfg-input {
-      width: 100%;
-      min-width: 140px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      color: var(--text-main);
-      padding: 0.35rem 0.5rem;
-      border-radius: 4px;
-      font-family: inherit;
-      font-size: 0.8rem;
-    }
-    .type-pill {
-      display: inline-block;
-      padding: 0.12rem 0.45rem;
-      border-radius: 4px;
-      font-size: 0.7rem;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      text-transform: lowercase;
-    }
-    .checkbox-inline {
+
+    .brand {
       display: flex;
       align-items: center;
-      gap: 0.45rem;
-      font-size: 0.8rem;
-      color: var(--text-main);
-      cursor: pointer;
-      padding-bottom: 0.35rem;
+      gap: 12px;
     }
-    .checkbox-inline input[type="checkbox"] {
-      width: 1rem;
-      height: 1rem;
-      accent-color: var(--accent);
+
+    .brand-logo {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 10px var(--accent-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .brand-title {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: 0.6px;
+      color: #fff;
+    }
+
+    .brand-sub {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-family: var(--font-mono);
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    /* 4-Page Navigation Bar */
+    .page-nav-bar {
+      background: #0a101b;
+      border-bottom: 1px solid var(--border);
+      padding: 0 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      position: sticky;
+      top: 57px;
+      z-index: 95;
+    }
+
+    .page-tablist {
+      display: flex;
+      gap: 4px;
+      overflow-x: auto;
+    }
+
+    .page-tab {
+      appearance: none;
+      background: transparent;
+      color: var(--text-muted);
+      border: none;
+      border-bottom: 3px solid transparent;
+      padding: 12px 18px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+      white-space: nowrap;
+    }
+
+    .page-tab:hover {
+      color: #fff;
+      background: rgba(56, 189, 248, 0.06);
+    }
+
+    .page-tab:focus-visible {
+      outline: 2px solid var(--accent-blue);
+      outline-offset: -2px;
+    }
+
+    .page-tab[aria-selected="true"] {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+      background: rgba(56, 189, 248, 0.09);
+    }
+
+    .page-tab-num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 19px;
+      height: 19px;
+      border-radius: 4px;
+      font-size: 10px;
+      background: rgba(148, 163, 184, 0.16);
+      color: var(--text-main);
+    }
+
+    .page-tab[aria-selected="true"] .page-tab-num {
+      background: var(--accent-blue);
+      color: #06101e;
+    }
+
+    .nav-pnl-summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 6px 0;
+    }
+
+    /* Colour-Coded PnL System (Color + Icon + Sign for Accessibility) */
+    .pnl-pos {
+      color: var(--pnl-pos-fg) !important;
+      font-weight: 700;
+    }
+    .pnl-neg {
+      color: var(--pnl-neg-fg) !important;
+      font-weight: 700;
+    }
+    .pnl-flat {
+      color: var(--pnl-flat-fg) !important;
+    }
+
+    .pnl-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.3;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .pnl-pill.pnl-pos {
+      background: var(--pnl-pos-bg);
+      color: var(--pnl-pos-fg);
+      border-color: var(--pnl-pos-border);
+    }
+    .pnl-pill.pnl-neg {
+      background: var(--pnl-neg-bg);
+      color: var(--pnl-neg-fg);
+      border-color: var(--pnl-neg-border);
+    }
+    .pnl-pill.pnl-flat {
+      background: var(--pnl-flat-bg);
+      color: var(--pnl-flat-fg);
+      border-color: var(--pnl-flat-border);
+    }
+
+    .badge {
+      padding: 3px 9px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+    }
+
+    .badge-bull { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.4); }
+    .badge-bear { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.4); }
+    .badge-chop { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.4); }
+    .badge-info { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4); }
+    .badge-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border-color: rgba(168, 85, 247, 0.4); }
+
+    button {
+      background: var(--bg-card);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-family: var(--font-mono);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    button:hover {
+      background: var(--bg-hover);
+      border-color: var(--accent-blue);
+    }
+
+    button.primary {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: var(--accent-blue);
+      color: var(--accent-blue);
+      font-weight: 600;
+    }
+
+    button.success {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: var(--accent-green);
+      color: #34d399;
+      font-weight: 600;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    main {
+      padding: 16px 22px 32px;
+      max-width: 1820px;
+      margin: 0 auto;
+    }
+
+    .page-view[hidden] {
+      display: none !important;
+    }
+
+    .page-view {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Top KPI Strip */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+
+    .kpi-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 12px 15px;
+      transition: border-color 0.2s;
+    }
+
+    .kpi-card.kpi-pnl-pos {
+      border-left: 3px solid var(--accent-green);
+    }
+    .kpi-card.kpi-pnl-neg {
+      border-left: 3px solid var(--accent-red);
+    }
+
+    .kpi-label {
+      color: var(--text-muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .kpi-value {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 20px;
+      font-weight: 700;
+      margin-top: 4px;
+      color: #fff;
+    }
+
+    .kpi-sub {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #1a2436;
+      border-radius: 3px;
+      margin-top: 6px;
+      overflow: hidden;
+      display: flex;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--accent-blue);
+      transition: width 0.3s ease;
+    }
+
+    /* Layout Grid */
+    .grid-2col {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 16px;
+    }
+
+    .grid-equal-2col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 1280px) {
+      .grid-2col, .grid-equal-2col { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel-header {
+      background: var(--bg-secondary);
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .panel-title {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #f8fafc;
+    }
+
+    .panel-body {
+      padding: 12px 14px;
+      overflow-x: auto;
+    }
+
+    .table-wrapper {
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--accent-blue);
+      outline-offset: -2px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 11.5px;
+    }
+
+    th, td {
+      padding: 7px 9px;
+      text-align: left;
+      border-bottom: 1px solid rgba(30, 45, 68, 0.6);
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 10.5px;
+      text-transform: uppercase;
+      background: rgba(13, 19, 31, 0.92);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+
+    tr:hover td {
+      background: rgba(24, 35, 54, 0.5);
+    }
+
+    .text-green { color: #34d399; }
+    .text-red { color: #f87171; }
+    .text-amber { color: #fbbf24; }
+    .text-blue { color: #38bdf8; }
+    .text-muted { color: var(--text-muted); }
+
+    .config-input {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      color: #fff;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      padding: 4px 7px;
+      border-radius: 4px;
+      width: 115px;
+    }
+
+    .config-input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    .log-stream {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      max-height: 240px;
+      overflow-y: auto;
+      padding: 8px 12px;
+      background: #06090f;
+    }
+
+    .log-entry {
+      padding: 3px 0;
+      border-bottom: 1px dashed rgba(30, 45, 68, 0.4);
+    }
+
+    .report-box {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      white-space: pre-wrap;
+      background: #05080d;
+      padding: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      color: #34d399;
+      max-height: 360px;
+      overflow-y: auto;
+    }
+
+    .book-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+    }
+
+    .metric-tile {
+      background: rgba(7, 10, 16, 0.65);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+    }
+
+    .metric-tile-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    .metric-tile-val {
+      font-size: 15px;
+      font-weight: 700;
+      font-family: var(--font-mono);
+      margin-top: 3px;
+    }
+
+    .filter-pill-bar {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .filter-pill {
+      padding: 3px 9px;
+      font-size: 11px;
+      border-radius: 4px;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+
+    .filter-pill.active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--accent-blue);
+      color: var(--accent-blue);
+      font-weight: 700;
     }
   </style>
 </head>
 <body>
+
   <header>
     <div class="brand">
-      <h1>AEGIS QUANT <span class="badge" id="ver-badge">v0.2.0-rc2</span></h1>
-      <p>Self-Custodial Hyperliquid L1 Web3 DEX Engine • 3-State HMM • MACE + SNR • SQLite WAL + Fernet AES-128</p>
+      <div class="brand-logo" id="conn-dot"></div>
+      <div>
+        <div class="brand-title">AEGIS-QUANT // v0.3.0-rc1 PP-50 TWO-BOOK PLATFORM</div>
+        <div class="brand-sub">Book A: The Pit (MACE+SNR+HMM) | Book B: The Pond (NPS-01 Naked-Option Perp Scanner) | Daily <span id="header-settle-time">00:05 Local</span> Settling</div>
+      </div>
     </div>
-    <div>
-      <span class="badge BULL" id="runtime-badge">ENGINE: RUST NATIVE</span>
-      <span class="badge" id="routing-badge">ROUTING: PAPER</span>
-      <span class="badge CHOP" id="telegram-badge">TELEGRAM: STANDBY</span>
-      <span class="badge" id="wal-badge">SQLite: WAL (v4)</span>
-      <span class="badge CHOP" id="regime-badge">HMM: CHOP</span>
+    <div class="header-actions">
+      <span class="badge badge-info" id="routing-mode-badge">MODE: PAPER_SIMULATION</span>
+      <span class="badge" id="alert-status-badge" style="color:var(--text-muted)">TELEGRAM: UNCONFIGURED</span>
+      <span class="badge badge-info" id="sse-status">SSE: CONNECTING</span>
+      <button class="primary" id="btn-cycle" onclick="triggerCycle()">Run Platform Cycle</button>
+      <button id="btn-pond-scan" onclick="triggerPondScan()">Run Pond Scan</button>
+      <button id="btn-settle-dry" onclick="triggerSettleRun(true)">Dry-Run Settle</button>
+      <button id="btn-calibrate" onclick="triggerCalibration()">Calibrate MACE</button>
+      <button id="btn-backtest" onclick="triggerBacktest()">Run 365d Tear Sheet</button>
     </div>
   </header>
 
-  <section class="metrics-grid">
-    <div class="card">
-      <div class="card-label">Total Equity (USDC)</div>
-      <div class="card-value" id="val-equity">$10,000.00</div>
-      <div class="card-sub" id="val-initial-equity">Initial Baseline: $10,000.00</div>
-    </div>
-    <div class="card">
-      <div class="card-label" id="lbl-heat-cap">Portfolio Heat Cap ($400 / 4%)</div>
-      <div class="card-value" id="val-heat">$0.00 (0.00%)</div>
-      <div class="card-sub" id="val-risk-range">Conviction Risk: $50 – $150 / trade</div>
-    </div>
-    <div class="card">
-      <div class="card-label" id="lbl-leverage-cap">Gross Leverage (Max 1.5x)</div>
-      <div class="card-value" id="val-leverage">0.00x</div>
-      <div class="card-sub" id="val-notional">Deployed: $0.00 / $15,000</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Idle Basis / HLP Harvest</div>
-      <div class="card-value" id="val-basis">$0.00</div>
-      <div class="card-sub" id="val-yield">Accrued Yield: $0.0000</div>
-    </div>
-    <div class="card">
-      <div class="card-label">3-State HMM (540-Bar 4H)</div>
-      <div class="card-value" id="val-hmm-probs">B:33% | S:33% | C:34%</div>
-      <div class="card-sub">Diagonal-Covariance Gaussian</div>
-    </div>
-  </section>
-
-  <section class="section-grid">
-    <div class="card">
-      <h2>MACE (35%) + Continuous SNR (65%) Cross-Pair Signal Matrix (15 ALT/BTC:SYNTH Pairs)</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Rank</th>
-            <th>Asset</th>
-            <th>Exec Contract</th>
-            <th>Synth Pair</th>
-            <th>SNR (65%)</th>
-            <th>MACE (35%)</th>
-            <th>Conviction</th>
-            <th>1H Funding</th>
-            <th>Gate Action</th>
-          </tr>
-        </thead>
-        <tbody id="signals-tbody">
-          <tr><td colspan="9">Loading live telemetry...</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h2>Active Positions & Chandelier Trailing Stops</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Notional</th>
-            <th>Risk ($)</th>
-            <th>Chandelier Stop</th>
-          </tr>
-        </thead>
-        <tbody id="trades-tbody">
-          <tr><td colspan="5">No open directional positions</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="card cred-panel">
-    <h2>Hyperliquid L1 Web3 DEX Credentials & Routing Mode (Mainnet / Testnet / Paper)</h2>
-
-    <div class="state-strip" aria-live="polite">
-      <div class="state-box">
-        <div class="state-box-label">1. Configured Setting (SQLite)</div>
-        <div class="state-box-value text-accent" id="st-configured-mode">Loading...</div>
-        <div class="state-box-sub" id="st-configured-sub">system_config target</div>
-      </div>
-      <div class="state-box">
-        <div class="state-box-label">2. Effective Active Routing</div>
-        <div class="state-box-value" id="st-active-routing">Loading...</div>
-        <div class="state-box-sub" id="st-active-routing-sub">Current order execution path</div>
-      </div>
-      <div class="state-box">
-        <div class="state-box-label">3. Target DEX Network & API</div>
-        <div class="state-box-value" id="st-network-target">Loading...</div>
-        <div class="state-box-sub" id="st-network-endpoint">https://api.hyperliquid-testnet.xyz</div>
-      </div>
-      <div class="state-box">
-        <div class="state-box-label">4. L1 Signing Credentials</div>
-        <div class="state-box-value" id="st-creds-ready">Loading...</div>
-        <div class="state-box-sub" id="st-creds-detail">Wallet &amp; Agent Private Key status</div>
-      </div>
+  <!-- 4-Page Accessible Navigation Bar -->
+  <nav class="page-nav-bar" aria-label="Dashboard Sections">
+    <div class="page-tablist" role="tablist" aria-label="PP-50 Platform Views">
+      <button
+        type="button"
+        role="tab"
+        class="page-tab"
+        id="tab-btn-overall"
+        aria-selected="true"
+        aria-controls="page-overall"
+        tabindex="0"
+        onclick="switchDashboardPage('overall')"
+      >
+        <span class="page-tab-num">1</span>
+        <span>Overall Status</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="page-tab"
+        id="tab-btn-pit"
+        aria-selected="false"
+        aria-controls="page-pit"
+        tabindex="-1"
+        onclick="switchDashboardPage('pit')"
+      >
+        <span class="page-tab-num">2</span>
+        <span>Pit (Book A)</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="page-tab"
+        id="tab-btn-pond"
+        aria-selected="false"
+        aria-controls="page-pond"
+        tabindex="-1"
+        onclick="switchDashboardPage('pond')"
+      >
+        <span class="page-tab-num">3</span>
+        <span>Pond (Book B)</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        class="page-tab"
+        id="tab-btn-settings"
+        aria-selected="false"
+        aria-controls="page-settings"
+        tabindex="-1"
+        onclick="switchDashboardPage('settings')"
+      >
+        <span class="page-tab-num">4</span>
+        <span>Settings</span>
+      </button>
     </div>
 
-    <form class="cred-form" id="cred-form">
-      <div class="form-group">
-        <label for="inp-mode">Configured Execution Mode</label>
-        <select id="inp-mode">
-          <option value="PAPER">PAPER — Local Simulated Fills (No DEX Orders)</option>
-          <option value="TESTNET">TESTNET — Hyperliquid Testnet CLOB Routing</option>
-          <option value="LIVE">LIVE MAINNET — Hyperliquid Mainnet L1 Routing</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label for="inp-network">Hyperliquid Network Target (Market Data &amp; CLOB)</label>
-        <select id="inp-network">
-          <option value="true">Testnet (api.hyperliquid-testnet.xyz)</option>
-          <option value="false">Mainnet (api.hyperliquid.xyz)</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label for="inp-wallet">Main Arbitrum Wallet Address (USDC Collateral)</label>
-        <input type="text" id="inp-wallet" placeholder="0x..." autocomplete="off" />
-      </div>
-      <div class="form-group">
-        <label for="inp-privkey">Trade-Only Agent Private Key (64 Hex Chars / 32 Bytes)</label>
-        <input type="password" id="inp-privkey" placeholder="0x... (64 hex chars, NOT 40-hex address)" autocomplete="off" />
-      </div>
-      <div class="form-group">
-        <label for="inp-vault">Optional Vault / Sub-Account Address</label>
-        <input type="text" id="inp-vault" placeholder="0x... (optional)" autocomplete="off" />
-      </div>
-      <div class="form-group">
-        <button type="submit" class="btn-save">Save DEX Credentials</button>
-      </div>
-    </form>
-    <div id="cred-banner" class="state-banner" role="status"></div>
-    <div class="cred-status-msg" id="cred-status-msg">Endpoint: https://api.hyperliquid-testnet.xyz • Credentials: Not Configured</div>
-  </section>
-
-  <section class="card cred-panel">
-    <h2>Telegram Bot Alerting & Drawdown Guard (Primary Operational Alerting Channel)</h2>
-    <form class="cred-form" id="telegram-form">
-      <div class="form-group">
-        <label for="inp-tg-token">Telegram Bot Token (Fernet AES-128 Encrypted at Rest)</label>
-        <input type="password" id="inp-tg-token" placeholder="123456789:AAH... (@BotFather)" autocomplete="off" />
-      </div>
-      <div class="form-group">
-        <label for="inp-tg-chat">Telegram Target Chat ID</label>
-        <input type="text" id="inp-tg-chat" placeholder="-1001234567890" autocomplete="off" />
-      </div>
-      <div class="form-group">
-        <label for="inp-dd-pct">Daily Drawdown Alert Threshold (%)</label>
-        <input type="number" id="inp-dd-pct" step="0.1" min="0.5" max="50.0" value="3.0" />
-      </div>
-      <div class="form-group btn-row">
-        <button type="submit" class="btn-save">Save Telegram Config</button>
-        <button type="button" class="btn-secondary" id="btn-test-telegram">Send Test Alert</button>
-      </div>
-    </form>
-    <div class="cred-status-msg" id="telegram-status-msg">
-      Channel: TELEGRAM Bot API • Status: Standby • Triggers: CRITICAL Logs, HMM Regime Flips, Position Drift, Daily Drawdown &ge; 3.0%
+    <div class="nav-pnl-summary" aria-live="polite">
+      <span class="text-muted">Platform PnL:</span>
+      <span id="nav-total-pnl-pill" class="pnl-pill pnl-flat">• $0.00 (0.00%)</span>
+      <span class="text-muted">| Pit:</span>
+      <span id="nav-pit-pnl-pill" class="pnl-pill pnl-flat">• $0.00</span>
+      <span class="text-muted">| Pond:</span>
+      <span id="nav-pond-pnl-pill" class="pnl-pill pnl-flat">• $0.00</span>
     </div>
-  </section>
+  </nav>
 
-  <section class="card cred-panel" id="system-settings-panel">
-    <h2>System Settings &amp; Quantitative Engine Parameters (SQLite <code>system_config</code> — <span id="cfg-total-count">100</span> Keys)</h2>
-
-    <form id="equity-scale-form" action="/api/v1/config" method="POST">
-      <fieldset class="settings-fieldset">
-        <legend>Capital Baseline &amp; Proportional Risk Scaling</legend>
-        <div class="equity-bar">
-          <div class="form-group" style="min-width: 240px; flex: 1;">
-            <label for="inp-initial-equity">Initial Portfolio Equity Baseline (USDC)</label>
-            <span id="equity-hint" class="hint">Updates initial_equity_usdc and recalculates portfolio total equity</span>
-            <input
-              type="number"
-              id="inp-initial-equity"
-              name="initial_equity_usdc"
-              step="0.01"
-              min="100"
-              required
-              value="10000"
-              aria-describedby="equity-hint"
-              aria-errormessage="equity-error"
-            />
-            <div id="equity-error" class="error-msg">
-              <span aria-hidden="true">❌</span> Enter a valid initial equity (&ge; $100 USDC).
-            </div>
+  <main>
+    <!-- ===================================================================== -->
+    <!-- PAGE 1: OVERALL STATUS                                                -->
+    <!-- ===================================================================== -->
+    <section
+      id="page-overall"
+      class="page-view"
+      role="tabpanel"
+      aria-labelledby="tab-btn-overall"
+    >
+      <!-- Composite PP-50 KPI Strip -->
+      <div class="kpi-grid">
+        <div class="kpi-card" id="pp50-card-equity">
+          <div class="kpi-label">
+            <span>PP-50 Platform Equity</span>
+            <span class="text-blue">PIT + POND</span>
           </div>
-
-          <div class="form-group" style="flex: 2; min-width: 280px;">
-            <label class="checkbox-inline" for="chk-scale-risk">
-              <input type="checkbox" id="chk-scale-risk" name="scale_risk_caps" checked />
-              <span>Auto-scale dollar risk caps (1% baseline risk, 0.5%–1.5% trade risk, 4% heat, 25% single-asset, 1.5x gross notional)</span>
-            </label>
-            <div class="preset-pills" role="group" aria-label="Equity Presets">
-              <button type="button" class="pill-btn eq-preset-btn" data-eq="1000">$1,000</button>
-              <button type="button" class="pill-btn eq-preset-btn" data-eq="5000">$5,000</button>
-              <button type="button" class="pill-btn eq-preset-btn active" data-eq="10000">$10,000</button>
-              <button type="button" class="pill-btn eq-preset-btn" data-eq="25000">$25,000</button>
-              <button type="button" class="pill-btn eq-preset-btn" data-eq="50000">$50,000</button>
-              <button type="button" class="pill-btn eq-preset-btn" data-eq="100000">$100,000</button>
-            </div>
-          </div>
-
-          <div class="form-group btn-row">
-            <button type="submit" class="btn-save" id="btn-save-equity">Apply Equity &amp; Risk Baseline</button>
-            <button type="button" class="btn-secondary" id="btn-sync-wallet">Sync from Hyperliquid Wallet</button>
+          <div class="kpi-value" id="pp50-total-equity">$10,000.00</div>
+          <div class="kpi-sub">
+            <span>Baseline: <strong id="pp50-initial-equity">$10,000.00</strong></span>
+            <span>| 50/50 Target: <strong id="pp50-target-each">$5,000.00</strong></span>
           </div>
         </div>
-      </fieldset>
-    </form>
 
-    <form id="sys-config-form" action="/api/v1/config/batch" method="POST">
-      <fieldset class="settings-fieldset" style="margin-bottom: 0;">
-        <legend>All System Configuration Keys (Risk, Execution, Stops, HMM, MACE, Signals, Orchestrator)</legend>
+        <div class="kpi-card" id="pp50-card-total-pnl">
+          <div class="kpi-label">
+            <span>Total Platform Net PnL</span>
+            <span id="pp50-total-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pp50-total-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>Combined Realized + Unrealized + Funding</span>
+          </div>
+        </div>
 
-        <div class="cfg-toolbar">
-          <div class="form-group" style="min-width: 280px; flex: 1;">
-            <label for="inp-cfg-search">Search Settings by Key, Category, or Description</label>
+        <div class="kpi-card" id="pp50-card-pit-pnl">
+          <div class="kpi-label">
+            <span>Book A (The Pit) PnL</span>
+            <span id="pp50-pit-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pp50-pit-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>Equity: <strong id="pp50-pit-equity">$5,000.00</strong></span>
+            <span>| Share: <strong id="pp50-pit-share">50.0%</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card" id="pp50-card-pond-pnl">
+          <div class="kpi-label">
+            <span>Book B (The Pond) PnL</span>
+            <span id="pp50-pond-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pp50-pond-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>Equity: <strong id="pp50-pond-equity">$5,000.00</strong></span>
+            <span>| Share: <strong id="pp50-pond-share">50.0%</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>50/50 Allocation Drift</span>
+            <span id="pp50-settle-time-badge" class="badge badge-info">00:05 Local</span>
+          </div>
+          <div class="kpi-value" id="pp50-drift-bps">0.0 bps</div>
+          <div class="kpi-sub">
+            <span>Dead-band: <strong id="pp50-deadband-bps">50.0 bps</strong></span>
+            <span>| Status: <strong id="pp50-settle-status-label">BALANCED</strong></span>
+          </div>
+          <div class="progress-bar" title="Book A (Pit) vs Book B (Pond) Capital Share">
+            <div class="progress-fill" id="pp50-split-bar-pit" style="width:50%; background: var(--accent-blue);"></div>
+            <div class="progress-fill" id="pp50-split-bar-pond" style="width:50%; background: var(--accent-purple);"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Two-Book Side-by-Side Comparison -->
+      <div class="grid-equal-2col">
+        <!-- Book A Summary Card -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Book A — The Pit (Directional MACE + SNR + 3-State HMM)</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="badge badge-chop" id="overall-pit-regime-badge">CHOP</span>
+              <button onclick="switchDashboardPage('pit')">Open Pit Page →</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="book-summary-grid">
+              <div class="metric-tile">
+                <div class="metric-tile-label">Pit Equity / Baseline</div>
+                <div class="metric-tile-val" id="overall-pit-equity">$5,000.00 <span class="text-muted" style="font-size:11px;">/ $5,000</span></div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Pit Total Net PnL</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pit-total-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Realized PnL</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pit-realized-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Unrealized + Funding PnL</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pit-unrealized-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Open Positions & Heat</div>
+                <div class="metric-tile-val" id="overall-pit-positions">0 pos | $0.00 heat</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Deployed & Gross Leverage</div>
+                <div class="metric-tile-val" id="overall-pit-leverage">$0.00 (0.00x)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Book B Summary Card -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Book B — The Pond (Champion NPS-01 Naked-Option Perp Scanner)</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span class="badge badge-purple" id="overall-pond-policy-badge">POLICY: BOTH</span>
+              <button onclick="switchDashboardPage('pond')">Open Pond Page →</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="book-summary-grid">
+              <div class="metric-tile">
+                <div class="metric-tile-label">Pond Equity / Baseline</div>
+                <div class="metric-tile-val" id="overall-pond-equity">$5,000.00 <span class="text-muted" style="font-size:11px;">/ $5,000</span></div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Pond Total Net PnL</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pond-total-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Realized PnL</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pond-realized-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Unrealized + Funding Harvested</div>
+                <div class="metric-tile-val pnl-flat" id="overall-pond-unrealized-pnl">• $0.00</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Active Cells & Heat Cap</div>
+                <div class="metric-tile-val" id="overall-pond-cells">0 / 8 cells | $0.00 / $200 heat</div>
+              </div>
+              <div class="metric-tile">
+                <div class="metric-tile-label">Deployed & Gross Leverage</div>
+                <div class="metric-tile-val" id="overall-pond-leverage">$0.00 (0.00x)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Daily 50/50 Settling Transfers & Formatted Report Line -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title" id="settle-table-heading">Daily 50/50 Settling Ledger (`book_transfers` — Invariant F5 Idle-Only Transfer)</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <button class="primary" onclick="triggerSettleRun(true)">Simulate Dry-Run Settle</button>
+            <button class="success" onclick="triggerSettleRun(false)">Execute Live Settle</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="pp50-report-line" style="font-family:var(--font-mono); font-size:11.5px; padding:8px 10px; margin-bottom:10px; background:#06090f; border:1px solid var(--border); border-radius:5px; color:var(--accent-blue);">
+            PP-50 D+01 | platform $10000.00 (+0.00%) | PIT $5000.00 | POND $5000.00 | drift 0.0 bps | settle: $0.00 (READY) | cells: 0/8 (heat $0) | champion NPS-01
+          </div>
+          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="settle-table-heading">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">ID</th>
+                  <th scope="col" id="settle-ts-col-header">Timestamp (Local)</th>
+                  <th scope="col">Direction</th>
+                  <th scope="col">Pit Before</th>
+                  <th scope="col">Pond Before</th>
+                  <th scope="col">Platform Total</th>
+                  <th scope="col">Drift (bps)</th>
+                  <th scope="col">Required</th>
+                  <th scope="col">Rich Idle</th>
+                  <th scope="col">Executed</th>
+                  <th scope="col">Blocked (F5)</th>
+                  <th scope="col">Status</th>
+                </tr>
+              </thead>
+              <tbody id="settle-transfers-tbody">
+                <tr><td colspan="12" class="text-muted">No settling transfers recorded yet. Click "Simulate Dry-Run Settle" to test the 5-phase protocol.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Backtest Tear Sheet Modal / Output Box -->
+      <div class="panel" id="report-panel" style="display: none;">
+        <div class="panel-header">
+          <span class="panel-title" id="report-title">Institutional Walk-Forward Tear Sheet</span>
+          <button onclick="document.getElementById('report-panel').style.display='none'">Close</button>
+        </div>
+        <div class="panel-body">
+          <div class="report-box" id="report-content"></div>
+        </div>
+      </div>
+
+      <!-- System Telemetry Logs -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">System Audit & Telemetry Stream (SQLite WAL)</span>
+          <span class="text-muted" id="schema-runtime-badge" style="font-family:var(--font-mono); font-size:11px;">Schema v6 // RUST_NATIVE (Axum / Tokio)</span>
+        </div>
+        <div class="log-stream" id="logs-box"></div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- PAGE 2: PIT (BOOK A)                                                  -->
+    <!-- ===================================================================== -->
+    <section
+      id="page-pit"
+      class="page-view"
+      role="tabpanel"
+      aria-labelledby="tab-btn-pit"
+      hidden
+    >
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Book A (Pit) Equity</span>
+            <span class="text-blue" id="kpi-equity-delta">$5,000.00 Base</span>
+          </div>
+          <div class="kpi-value" id="kpi-equity">$5,000.00</div>
+          <div class="kpi-sub" id="kpi-cash">Available Cash: $5,000.00</div>
+        </div>
+
+        <div class="kpi-card" id="pit-card-total-pnl">
+          <div class="kpi-label">
+            <span>Pit Total Net PnL</span>
+            <span id="pit-kpi-pnl-pct-badge" class="pnl-pill pnl-flat">• 0.00%</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pit-kpi-total-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>Realized: <strong id="pit-kpi-realized-pnl" class="pnl-flat">$0.00</strong></span>
+            <span>| uPnL: <strong id="pit-kpi-unrealized-pnl" class="pnl-flat">$0.00</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Portfolio Heat (Cap: 4.0%)</span>
+            <span id="kpi-heat-pct">0.00%</span>
+          </div>
+          <div class="kpi-value" id="kpi-heat">$0.00 <span style="font-size:13px; color:var(--text-muted)">/ $400</span></div>
+          <div class="progress-bar"><div class="progress-fill" id="bar-heat" style="width: 0%"></div></div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Gross Leverage (Cap: 1.50x)</span>
+            <span id="kpi-notional">$0.00</span>
+          </div>
+          <div class="kpi-value" id="kpi-leverage">0.00x</div>
+          <div class="progress-bar"><div class="progress-fill" id="bar-leverage" style="width: 0%"></div></div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Idle Basis / HLP Harvest</span>
+            <span class="text-green" id="kpi-yield">+$0.00 Yield</span>
+          </div>
+          <div class="kpi-value" id="kpi-basis">$0.00</div>
+          <div class="kpi-sub">35% Max Idle Cash Floor</div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>3-State Gaussian HMM Regime</span>
+            <span class="badge badge-chop" id="kpi-regime">CHOP</span>
+          </div>
+          <div class="kpi-sub" style="margin-top:8px; line-height:1.6;">
+            <div>BULL: <strong class="text-green" id="prob-bull">33.3%</strong> | BEAR: <strong class="text-red" id="prob-bear">33.3%</strong> | CHOP: <strong class="text-amber" id="prob-chop">33.4%</strong></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Cross-Pair Signal Matrix -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title" id="pit-signals-heading">Cross-Pair Signal Matrix (`ALT/BTC:SYNTH` 35% MACE + 65% Continuous SNR → `ALT/USDC` Execution)</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="text-muted" id="signals-count">15 Pairs</span>
+            <button class="primary" onclick="triggerCycle()">Evaluate Signals</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-signals-heading">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Exec Symbol</th>
+                  <th scope="col">Synth Ratio</th>
+                  <th scope="col">TF</th>
+                  <th scope="col">MACE (35%)</th>
+                  <th scope="col">Cont. SNR (65%)</th>
+                  <th scope="col">Ensemble</th>
+                  <th scope="col">Threshold</th>
+                  <th scope="col">Vol Tier</th>
+                  <th scope="col">1H Funding</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="signals-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-equal-2col">
+        <!-- Active Pit Positions -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title" id="pit-open-heading">Active Perpetual Positions & Chandelier Stops</span>
+            <span class="badge badge-info" id="open-trades-count">0 OPEN</span>
+          </div>
+          <div class="panel-body">
+            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-open-heading">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Symbol</th>
+                    <th scope="col">Side</th>
+                    <th scope="col">Notional</th>
+                    <th scope="col">Entry Px</th>
+                    <th scope="col">Mark Px</th>
+                    <th scope="col">Chandelier Stop</th>
+                    <th scope="col">Risk ($)</th>
+                    <th scope="col">uPnL + Funding</th>
+                    <th scope="col" id="pit-open-ts-col-header">Opened (Local)</th>
+                  </tr>
+                </thead>
+                <tbody id="open-trades-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Recent Closed Pit Trades -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title" id="pit-closed-heading">Recent Closed Pit Trades & Realized PnL</span>
+            <span class="text-muted">Colour-Coded PnL</span>
+          </div>
+          <div class="panel-body">
+            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-closed-heading">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">ID</th>
+                    <th scope="col" id="pit-closed-ts-col-header">Timestamp (Local)</th>
+                    <th scope="col">Symbol</th>
+                    <th scope="col">Side</th>
+                    <th scope="col">State / Reason</th>
+                    <th scope="col">Entry</th>
+                    <th scope="col">Exit</th>
+                    <th scope="col">Notional</th>
+                    <th scope="col">Funding</th>
+                    <th scope="col">Realized PnL</th>
+                  </tr>
+                </thead>
+                <tbody id="recent-trades-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- PAGE 3: POND (BOOK B)                                                 -->
+    <!-- ===================================================================== -->
+    <section
+      id="page-pond"
+      class="page-view"
+      role="tabpanel"
+      aria-labelledby="tab-btn-pond"
+      hidden
+    >
+      <!-- Book B KPI Strip -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Book B (Pond) Equity</span>
+            <span class="badge badge-purple" id="pond-champion-badge">NPS-01</span>
+          </div>
+          <div class="kpi-value" id="pond-kpi-equity">$5,000.00</div>
+          <div class="kpi-sub">
+            <span>Idle USDC: <strong id="pond-kpi-idle">$5,000.00</strong></span>
+            <span>| Baseline: <strong id="pond-kpi-baseline">$5,000.00</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card" id="pond-card-total-pnl">
+          <div class="kpi-label">
+            <span>Pond Total Net PnL</span>
+            <span id="pond-kpi-pnl-pct-badge" class="pnl-pill pnl-flat">• 0.00%</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pond-kpi-total-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>Realized: <strong id="pond-kpi-realized-pnl" class="pnl-flat">$0.00</strong></span>
+            <span>| uPnL: <strong id="pond-kpi-unrealized-pnl" class="pnl-flat">$0.00</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card" id="pond-card-funding-pnl">
+          <div class="kpi-label">
+            <span>Option-Analogue Funding Harvest</span>
+            <span class="text-blue">168h Z-Score Fade</span>
+          </div>
+          <div class="kpi-value pnl-flat" id="pond-kpi-funding-pnl">• $0.00</div>
+          <div class="kpi-sub">
+            <span>SHORT_CALL: <strong id="pond-kpi-short-calls">0</strong></span>
+            <span>| SHORT_PUT: <strong id="pond-kpi-short-puts">0</strong></span>
+          </div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Open Pond Cells & Heat</span>
+            <span id="pond-kpi-cells">0 / 8 Cells</span>
+          </div>
+          <div class="kpi-value" id="pond-kpi-heat">$0.00 <span style="font-size:13px; color:var(--text-muted)">/ $200</span></div>
+          <div class="progress-bar"><div class="progress-fill" id="pond-bar-heat" style="width: 0%; background: var(--accent-purple);"></div></div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Pond Gross Leverage (Cap: 1.50x)</span>
+            <span id="pond-kpi-notional">$0.00</span>
+          </div>
+          <div class="kpi-value" id="pond-kpi-leverage">0.00x</div>
+          <div class="progress-bar"><div class="progress-fill" id="pond-bar-leverage" style="width: 0%; background: var(--accent-purple);"></div></div>
+        </div>
+
+        <div class="kpi-card">
+          <div class="kpi-label">
+            <span>Direction Policy (`pond_direction_policy`)</span>
+            <span class="badge badge-info" id="pond-kpi-policy-badge">both</span>
+          </div>
+          <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
+            <select id="pond-policy-select" class="config-input" style="width:125px" onchange="updatePondDirectionPolicy(this.value)" aria-label="Pond Direction Policy">
+              <option value="both">both (Call+Put)</option>
+              <option value="short_only">short_only (Call)</option>
+              <option value="long_only">long_only (Put)</option>
+            </select>
+            <button class="primary" onclick="triggerPondScan()">Scan Now</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Active & Recent Pond Cells Table -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title" id="pond-cells-heading">Pond Cells (`pond_cells` — 10-State FSM & 6-Tier Exit Priority Engine)</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="badge badge-purple" id="pond-open-cells-badge">0 OPEN</span>
+            <button class="primary" onclick="triggerPondScan()">Run Hourly S-Cycle Scan</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-cells-heading">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Cell ID</th>
+                  <th scope="col" id="pond-cells-ts-col-header">Timestamp (Local)</th>
+                  <th scope="col">Symbol</th>
+                  <th scope="col">FSM State</th>
+                  <th scope="col">Side / Analogue</th>
+                  <th scope="col">Notional</th>
+                  <th scope="col">Risk ($)</th>
+                  <th scope="col">Entry Px</th>
+                  <th scope="col">Mark Px</th>
+                  <th scope="col">Init Stop</th>
+                  <th scope="col">4H Chandelier</th>
+                  <th scope="col">Entry Z / Cur Z</th>
+                  <th scope="col">Premium</th>
+                  <th scope="col">Funding ($)</th>
+                  <th scope="col">uPnL ($)</th>
+                  <th scope="col">Net / Realized PnL</th>
+                  <th scope="col">Exit Tier / Reason</th>
+                </tr>
+              </thead>
+              <tbody id="pond-cells-tbody">
+                <tr><td colspan="17" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2col">
+        <!-- 80-Coin Dynamic Pond Universe -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title" id="pond-univ-heading">80-Coin Dynamic Pond Universe (`pond_universe` — $50k Volume Floor & Rank 95 Hysteresis)</span>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <input
+                type="text"
+                id="pond-universe-filter"
+                class="config-input"
+                style="width:150px"
+                placeholder="Filter symbol..."
+                aria-label="Filter Pond Universe Symbol"
+                oninput="renderPondUniverseTable()"
+              />
+              <span class="badge badge-info" id="pond-universe-count-badge">80 ACTIVE</span>
+            </div>
+          </div>
+          <div class="panel-body" style="max-height: 420px; overflow-y: auto;">
+            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-univ-heading">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Rank</th>
+                    <th scope="col">Symbol</th>
+                    <th scope="col">Base</th>
+                    <th scope="col">7d Median Daily Vol</th>
+                    <th scope="col">Status</th>
+                    <th scope="col" id="pond-warmup-ts-col-header">Warmup Ready (168h Local)</th>
+                    <th scope="col">Below-Rank Streak</th>
+                  </tr>
+                </thead>
+                <tbody id="pond-universe-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Hourly S-Cycle Scan History -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title" id="pond-cycles-heading">Hourly S-Cycle Scan Telemetry (`pond_scan_cycles`)</span>
+            <span class="text-muted">Champion NPS-01</span>
+          </div>
+          <div class="panel-body" style="max-height: 420px; overflow-y: auto;">
+            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-cycles-heading">
+              <table>
+                <thead>
+                  <tr>
+                    <th scope="col">Cycle</th>
+                    <th scope="col" id="pond-cycles-ts-col-header">Timestamp (Local)</th>
+                    <th scope="col">Active</th>
+                    <th scope="col">Passed</th>
+                    <th scope="col">Opened</th>
+                    <th scope="col">Exits</th>
+                    <th scope="col">Cells</th>
+                    <th scope="col">Heat</th>
+                    <th scope="col">Equity</th>
+                  </tr>
+                </thead>
+                <tbody id="pond-cycles-tbody">
+                  <tr><td colspan="9" class="text-muted">No S-Cycle scans recorded yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- PAGE 4: SETTINGS                                                      -->
+    <!-- ===================================================================== -->
+    <section
+      id="page-settings"
+      class="page-view"
+      role="tabpanel"
+      aria-labelledby="tab-btn-settings"
+      hidden
+    >
+      <div class="grid-equal-2col">
+        <!-- Hyperliquid L1 Credentials & Routing -->
+        <div class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Hyperliquid L1 Web3 DEX Credentials & Routing</span>
+            <span class="badge" id="cred-status-pill" style="color:var(--accent-amber)">PAPER MODE</span>
+          </div>
+          <div class="panel-body">
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
+              <div>
+                <label class="text-muted" for="cred-mode" style="font-size:11px; display:block; margin-bottom:4px;">Execution Routing Mode</label>
+                <select id="cred-mode" class="config-input" style="width:100%" onchange="onRoutingModeChange()">
+                  <option value="PAPER">PAPER_SIMULATION — Simulated Fill + Slippage (PAPER)</option>
+                  <option value="TESTNET">LIVE_TESTNET — Hyperliquid Testnet (api.hyperliquid-testnet.xyz)</option>
+                  <option value="LIVE">LIVE_MAINNET — Hyperliquid Mainnet (api.hyperliquid.xyz)</option>
+                </select>
+              </div>
+              <div>
+                <label class="text-muted" for="cred-wallet" style="font-size:11px; display:block; margin-bottom:4px;">L1 Wallet Address (0x... 42-char EVM)</label>
+                <input type="text" id="cred-wallet" class="config-input" style="width:100%" placeholder="0xYourHyperliquidWalletAddress" oninput="markFormFieldDirty(this.id)" />
+              </div>
+            </div>
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
+              <div>
+                <label class="text-muted" for="cred-pk" style="font-size:11px; display:block; margin-bottom:4px;">API Agent / Wallet Private Key (`0x` + 64 hex)</label>
+                <input type="password" id="cred-pk" class="config-input" style="width:100%" placeholder="Leave blank to keep existing key" />
+              </div>
+              <div>
+                <label class="text-muted" for="cred-vault" style="font-size:11px; display:block; margin-bottom:4px;">HLP Vault Address (auto-switches Mainnet/Testnet)</label>
+                <input type="text" id="cred-vault" class="config-input" style="width:100%" placeholder="0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0" oninput="markFormFieldDirty(this.id)" />
+              </div>
+            </div>
+            <div style="margin-bottom:10px;">
+              <label class="text-muted" for="cred-gemini" style="font-size:11px; display:block; margin-bottom:4px;">Gemini API Key (Optional AI Macro Overlay)</label>
+              <input type="password" id="cred-gemini" class="config-input" style="width:100%" placeholder="Leave blank to keep existing key" />
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span class="text-muted" id="cred-endpoint-label" style="font-size:11px; font-family:var(--font-mono)">Endpoint: Simulated Fill + Slippage</span>
+              <button class="primary" onclick="saveCredentials()">Save L1 Credentials & Routing</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Telegram Bot Alerting & Capital Scaling -->
+        <div style="display:flex; flex-direction:column; gap:16px;">
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">Telegram Bot Alerting & Daily Drawdown Guard</span>
+              <span class="badge" id="tg-status-pill" style="color:var(--text-muted)">NOT CONFIGURED</span>
+            </div>
+            <div class="panel-body">
+              <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
+                <div>
+                  <label class="text-muted" for="tg-token" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Bot Token (`@BotFather`)</label>
+                  <input type="password" id="tg-token" class="config-input" style="width:100%" placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+                </div>
+                <div>
+                  <label class="text-muted" for="tg-chat-id" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Chat ID / Channel ID</label>
+                  <input type="text" id="tg-chat-id" class="config-input" style="width:100%" placeholder="-1001234567890 or 123456789" oninput="markFormFieldDirty(this.id)" />
+                </div>
+              </div>
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <label class="text-muted" for="tg-dd-pct" style="font-size:11px;">Daily Drawdown Alert (%):</label>
+                  <input type="number" step="0.5" id="tg-dd-pct" class="config-input" style="width:70px" value="3.0" oninput="markFormFieldDirty(this.id)" />
+                </div>
+                <div style="display:flex; gap:6px;">
+                  <button onclick="sendTestAlert()">Send Test Alert</button>
+                  <button class="primary" onclick="saveTelegramAlerts()">Save Telegram Config</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">Capital Baseline & Proportional Risk Scaling</span>
+              <span class="badge badge-info" id="capital-scale-badge">1.00x Baseline</span>
+            </div>
+            <div class="panel-body">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div>
+                  <label class="text-muted" for="capital-baseline-input" style="font-size:11px; display:block; margin-bottom:4px;">Initial / Baseline Equity (USDC)</label>
+                  <input type="number" step="100" min="100" id="capital-baseline-input" class="config-input" style="width:160px; font-size:13px; font-weight:700;" value="10000" oninput="markFormFieldDirty(this.id)" />
+                </div>
+                <div style="display:flex; gap:8px; margin-top:14px;">
+                  <button class="primary" onclick="applyCapitalBaseline()">Scale All Risk Caps</button>
+                  <button id="btn-sync-wallet" onclick="syncWalletEquity()">Sync From Hyperliquid L1 Wallet</button>
+                </div>
+              </div>
+              <div class="text-muted" id="capital-scale-summary" style="font-size:11px; margin-top:8px; font-family:var(--font-mono);">
+                Heat Cap: $400.00 (4.0%) | Base Risk/Trade: $100.00 [$50–$150] | Single Asset Cap: $2,500.00 | Max Notional: $15,000.00
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Tunable System Config Table (All 333 Keys) -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title" id="settings-config-heading">Live Tunable `system_config` Parameters (333 Keys — SQLite Single Source of Truth)</span>
+          <div class="filter-pill-bar">
+            <button type="button" class="filter-pill active" data-cat="all" onclick="setConfigCategoryFilter('all', this)">All</button>
+            <button type="button" class="filter-pill" data-cat="platform" onclick="setConfigCategoryFilter('platform', this)">Platform</button>
+            <button type="button" class="filter-pill" data-cat="pond" onclick="setConfigCategoryFilter('pond', this)">Pond (Book B)</button>
+            <button type="button" class="filter-pill" data-cat="settling" onclick="setConfigCategoryFilter('settling', this)">Settling</button>
+            <button type="button" class="filter-pill" data-cat="risk" onclick="setConfigCategoryFilter('risk', this)">Risk</button>
+            <button type="button" class="filter-pill" data-cat="signals" onclick="setConfigCategoryFilter('signals', this)">Pit / Signals</button>
+            <button type="button" class="filter-pill" data-cat="execution" onclick="setConfigCategoryFilter('execution', this)">Execution</button>
             <input
               type="text"
-              id="inp-cfg-search"
-              name="cfg_search"
-              placeholder="Filter (e.g. initial_equity, chandelier, hmm, snr, leverage, polling)..."
-              autocomplete="off"
-              autocorrect="off"
-              autocapitalize="off"
-              spellcheck="false"
+              id="config-search-input"
+              class="config-input"
+              style="width:165px"
+              placeholder="Search key..."
+              aria-label="Search system_config keys"
+              oninput="renderConfigTable()"
             />
           </div>
-          <div class="btn-row">
-            <button type="submit" class="btn-save" id="btn-save-all-cfg">
-              Save Modified Settings (<span id="cfg-dirty-count">0</span>)
-            </button>
-            <button type="button" class="btn-secondary" id="btn-reload-cfg">Reload Settings</button>
+        </div>
+        <div class="panel-body">
+          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="settings-config-heading">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Category</th>
+                  <th scope="col">Parameter Key</th>
+                  <th scope="col">Value</th>
+                  <th scope="col">Description</th>
+                  <th scope="col" id="config-updated-ts-col-header">Updated (Local)</th>
+                  <th scope="col">Action</th>
+                </tr>
+              </thead>
+              <tbody id="config-tbody"></tbody>
+            </table>
           </div>
         </div>
-
-        <div class="cat-pills" id="cfg-category-pills" role="group" aria-label="Filter by configuration category"></div>
-
-        <div id="sys-config-banner" class="state-banner" role="status" aria-live="polite"></div>
-
-        <div class="cfg-table-wrap">
-          <table class="cfg-table">
-            <thead>
-              <tr>
-                <th>Category</th>
-                <th>Config Key</th>
-                <th>Type</th>
-                <th>Value</th>
-                <th>Description</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody id="sys-config-tbody">
-              <tr><td colspan="6">Loading system_config parameters...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </fieldset>
-    </form>
-  </section>
+      </div>
+    </section>
+  </main>
 
   <script>
-    function shortAddr(addr) {
-      if (!addr || addr.length < 12) return addr || 'Not Set';
-      return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-    }
+    const fmtUsd = (n) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtNum = (n, d = 4) => Number(n || 0).toFixed(d);
+    const pad2 = (n) => String(n).padStart(2, '0');
 
-    function resolveUiExecutionMode(c) {
-      const rawMode = String(c.execution_mode || 'PAPER').toUpperCase();
-      const isTestnet = Boolean(c.hyperliquid_testnet) || rawMode === 'TESTNET';
-      if (rawMode === 'PAPER') return 'PAPER';
-      if (isTestnet) return 'TESTNET';
-      return 'LIVE';
-    }
-
-    function renderPortfolio(p) {
-      if (!p) return;
-      const eq = Number(p.total_equity_usdc ?? 10000).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-      document.getElementById('val-equity').textContent = `$${eq}`;
-      if (p.initial_equity_usdc !== undefined) {
-        const initEq = Number(p.initial_equity_usdc).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        document.getElementById('val-initial-equity').textContent = `Initial Baseline: $${initEq}`;
-      }
-      const heat = Number(p.portfolio_heat_usdc ?? 0).toFixed(2);
-      const heatPct = (Number(p.portfolio_heat_pct ?? 0) * 100).toFixed(2);
-      document.getElementById('val-heat').textContent = `$${heat} (${heatPct}%)`;
-      if (p.max_portfolio_heat_usdc !== undefined) {
-        const maxHeat = Number(p.max_portfolio_heat_usdc).toLocaleString(undefined, {maximumFractionDigits: 0});
-        const maxHeatPct = Math.round(Number(p.max_portfolio_heat_pct ?? 0.04) * 100);
-        document.getElementById('lbl-heat-cap').textContent = `Portfolio Heat Cap ($${maxHeat} / ${maxHeatPct}%)`;
-      }
-      if (p.min_risk_per_trade_usdc !== undefined && p.max_risk_per_trade_usdc !== undefined) {
-        const minR = Number(p.min_risk_per_trade_usdc).toLocaleString(undefined, {maximumFractionDigits: 2});
-        const maxR = Number(p.max_risk_per_trade_usdc).toLocaleString(undefined, {maximumFractionDigits: 2});
-        document.getElementById('val-risk-range').textContent = `Conviction Risk: $${minR} – $${maxR} / trade`;
-      }
-      if (p.max_gross_leverage !== undefined) {
-        document.getElementById('lbl-leverage-cap').textContent = `Gross Leverage (Max ${Number(p.max_gross_leverage).toFixed(1)}x)`;
-      }
-      document.getElementById('val-leverage').textContent = `${Number(p.gross_leverage ?? 0).toFixed(2)}x`;
-      const maxGrossNotional = Number(p.max_gross_leverage_notional_usdc ?? 15000).toLocaleString(undefined, {maximumFractionDigits: 0});
-      document.getElementById('val-notional').textContent = `Deployed: $${Number(p.deployed_notional_usdc ?? 0).toFixed(2)} / $${maxGrossNotional}`;
-      document.getElementById('val-basis').textContent = `$${Number(p.basis_harvest_notional_usdc ?? 0).toFixed(2)}`;
-      document.getElementById('val-yield').textContent = `Accrued Yield: $${Number(p.accrued_yield_usdc ?? 0).toFixed(4)}`;
-
-      const regime = p.hmm_regime || 'CHOP';
-      const badge = document.getElementById('regime-badge');
-      badge.textContent = `HMM: ${regime}`;
-      badge.className = `badge ${regime}`;
-
-      const bullP = Math.round(Number(p.prob_bull ?? p.regime_probabilities?.bull ?? 0.33) * 100);
-      const bearP = Math.round(Number(p.prob_bear ?? p.regime_probabilities?.bear ?? 0.33) * 100);
-      const chopP = Math.round(Number(p.prob_chop ?? p.regime_probabilities?.chop ?? 0.34) * 100);
-      document.getElementById('val-hmm-probs').textContent = `Bull:${bullP}% | Bear:${bearP}% | Chop:${chopP}%`;
-    }
-
-    function renderSignals(signals) {
-      const tbody = document.getElementById('signals-tbody');
-      if (!signals || !signals.length) return;
-      tbody.innerHTML = signals.map(s => `
-        <tr>
-          <td>#${s.rs_rank}</td>
-          <td><strong>${s.base_asset}</strong></td>
-          <td>${s.exec_symbol}</td>
-          <td>${s.synth_symbol}</td>
-          <td>${Number(s.snr_score).toFixed(3)}</td>
-          <td>${Number(s.mace_score).toFixed(3)}</td>
-          <td><strong>${Number(s.blended_conviction).toFixed(3)}</strong></td>
-          <td>${(Number(s.funding_rate_hourly) * 100).toFixed(4)}%/h</td>
-          <td class="pos-${s.signal_action}">${s.signal_action}</td>
-        </tr>
-      `).join('');
-    }
-
-    function renderTrades(trades) {
-      const tbody = document.getElementById('trades-tbody');
-      if (!trades || !trades.length) {
-        tbody.innerHTML = '<tr><td colspan="5">No open directional positions (Idle Cash in Basis/HLP)</td></tr>';
-        return;
-      }
-      tbody.innerHTML = trades.map(t => `
-        <tr>
-          <td>${t.symbol}</td>
-          <td class="pos-${t.side}">${t.side}</td>
-          <td>$${Number(t.notional_usdc).toFixed(2)}</td>
-          <td>$${Number(t.risk_budget_usdc).toFixed(2)}</td>
-          <td>$${Number(t.chandelier_stop_price).toFixed(4)}</td>
-        </tr>
-      `).join('');
-    }
-
-    function renderTelegramAlerts(c) {
-      if (!c) return;
-      const tgBadge = document.getElementById('telegram-badge');
-      const ready = Boolean(c.telegram_alerts_ready);
-      tgBadge.textContent = ready ? 'TELEGRAM: ACTIVE' : 'TELEGRAM: STANDBY';
-      tgBadge.className = `badge ${ready ? 'BULL' : 'CHOP'}`;
-
-      const tokInput = document.getElementById('inp-tg-token');
-      tokInput.value = '';
-      tokInput.placeholder = c.telegram_bot_token_configured
-        ? `Encrypted (${c.telegram_bot_token_masked})`
-        : '123456789:AAH... (@BotFather)';
-      document.getElementById('inp-tg-chat').value = c.telegram_chat_id || '';
-      const ddPct = Number(c.max_daily_drawdown_alert_pct ?? 0.03) * 100;
-      document.getElementById('inp-dd-pct').value = ddPct.toFixed(1);
-
-      document.getElementById('telegram-status-msg').textContent =
-        `Channel: TELEGRAM Bot API • Status: ${ready ? 'ACTIVE' : 'STANDBY'} • Bot Token: ${c.telegram_bot_token_configured ? c.telegram_bot_token_masked : 'Not Set'} • Chat ID: ${c.telegram_chat_id || 'Not Set'} • Daily DD Guard: ${ddPct.toFixed(1)}%`;
-    }
-
-    function renderCredentials(c) {
-      if (!c) return;
-      const uiMode = resolveUiExecutionMode(c);
-      const isTestnet = Boolean(c.hyperliquid_testnet);
-      const activeRouting = c.active_routing || 'PAPER_SIMULATION';
-      const credsReady = Boolean(c.credentials_ready);
-      const walletOk = Boolean(c.wallet_configured);
-      const privOk = Boolean(c.private_key_configured);
-
-      // 1. Update Header Routing Badge
-      const rBadge = document.getElementById('routing-badge');
-      if (activeRouting === 'LIVE_TESTNET') {
-        rBadge.textContent = 'ROUTING: LIVE TESTNET';
-        rBadge.className = 'badge BULL';
-      } else if (activeRouting === 'LIVE_MAINNET') {
-        rBadge.textContent = 'ROUTING: LIVE MAINNET';
-        rBadge.className = 'badge BULL';
-      } else if (uiMode !== 'PAPER' && !credsReady) {
-        rBadge.textContent = `ROUTING: PAPER FALLBACK (${uiMode} KEY MISSING)`;
-        rBadge.className = 'badge CHOP';
-      } else {
-        rBadge.textContent = 'ROUTING: PAPER SIMULATION';
-        rBadge.className = 'badge';
-      }
-
-      // 2. Update 4-Box State Strip
-      const stModeEl = document.getElementById('st-configured-mode');
-      const stModeSubEl = document.getElementById('st-configured-sub');
-      if (uiMode === 'TESTNET') {
-        stModeEl.textContent = 'TESTNET (Hyperliquid Testnet CLOB)';
-        stModeEl.className = 'state-box-value text-accent';
-        stModeSubEl.textContent = 'SQLite: execution_mode=LIVE, hyperliquid_testnet=true';
-      } else if (uiMode === 'LIVE') {
-        stModeEl.textContent = 'LIVE MAINNET (Hyperliquid L1 CLOB)';
-        stModeEl.className = 'state-box-value text-ok';
-        stModeSubEl.textContent = 'SQLite: execution_mode=LIVE, hyperliquid_testnet=false';
-      } else {
-        stModeEl.textContent = 'PAPER (Simulated Local Fills)';
-        stModeEl.className = 'state-box-value';
-        stModeSubEl.textContent = `SQLite: execution_mode=PAPER, market_data=${isTestnet ? 'Testnet' : 'Mainnet'}`;
-      }
-
-      const stRouteEl = document.getElementById('st-active-routing');
-      const stRouteSubEl = document.getElementById('st-active-routing-sub');
-      if (activeRouting === 'LIVE_TESTNET') {
-        stRouteEl.textContent = 'LIVE_TESTNET (Active)';
-        stRouteEl.className = 'state-box-value text-ok';
-        stRouteSubEl.textContent = 'Orders signed & routed to Hyperliquid Testnet';
-      } else if (activeRouting === 'LIVE_MAINNET') {
-        stRouteEl.textContent = 'LIVE_MAINNET (Active)';
-        stRouteEl.className = 'state-box-value text-ok';
-        stRouteSubEl.textContent = 'Orders signed & routed to Hyperliquid Mainnet';
-      } else if (uiMode !== 'PAPER' && !credsReady) {
-        stRouteEl.textContent = 'PAPER_SIMULATION (Safety Fallback)';
-        stRouteEl.className = 'state-box-value text-warn';
-        stRouteSubEl.textContent = `Paused ${uiMode} CLOB routing until Agent Key is set`;
-      } else {
-        stRouteEl.textContent = 'PAPER_SIMULATION';
-        stRouteEl.className = 'state-box-value';
-        stRouteSubEl.textContent = 'Simulated Maker/Taker fills (no on-chain orders)';
-      }
-
-      const stNetEl = document.getElementById('st-network-target');
-      const stNetSubEl = document.getElementById('st-network-endpoint');
-      stNetEl.textContent = isTestnet ? 'TESTNET (Sandbox L1)' : 'MAINNET (Production L1)';
-      stNetEl.className = `state-box-value ${isTestnet ? 'text-accent' : 'text-ok'}`;
-      stNetSubEl.textContent = c.api_endpoint || (isTestnet ? 'https://api.hyperliquid-testnet.xyz' : 'https://api.hyperliquid.xyz');
-
-      const stCredEl = document.getElementById('st-creds-ready');
-      const stCredSubEl = document.getElementById('st-creds-detail');
-      if (credsReady) {
-        stCredEl.textContent = 'READY (Wallet + Agent Key Verified)';
-        stCredEl.className = 'state-box-value text-ok';
-      } else if (walletOk && !privOk) {
-        stCredEl.textContent = 'INCOMPLETE (Agent Private Key Missing)';
-        stCredEl.className = 'state-box-value text-warn';
-      } else {
-        stCredEl.textContent = 'NOT CONFIGURED';
-        stCredEl.className = 'state-box-value text-warn';
-      }
-      stCredSubEl.textContent = `Wallet: ${walletOk ? shortAddr(c.wallet_address) : 'Not Set'} • Agent Key: ${privOk ? c.private_key_masked : 'Not Set'}`;
-
-      // 3. Synchronize Form Controls Without Conflicting Labels
-      document.getElementById('inp-mode').value = uiMode;
-      document.getElementById('inp-network').value = isTestnet ? 'true' : 'false';
-      document.getElementById('inp-wallet').value = c.wallet_address || '';
-      document.getElementById('inp-vault').value = c.hyperliquid_vault_address || '';
-      const privInput = document.getElementById('inp-privkey');
-      privInput.value = '';
-      privInput.placeholder = privOk
-        ? `Encrypted & Verified (${c.private_key_masked})`
-        : 'Not Set — Enter 0x... (64 hex chars) to enable CLOB signing';
-
-      // 4. Contextual Banner & Status Line
-      const bannerEl = document.getElementById('cred-banner');
-      if (uiMode !== 'PAPER' && !credsReady) {
-        bannerEl.className = 'state-banner warn';
-        bannerEl.textContent =
-          `Notice: System is configured for ${uiMode} (${c.api_endpoint}), but Effective Active Routing is currently PAPER_SIMULATION because ${!walletOk ? 'the Wallet Address and ' : ''}the Trade-Only Agent Private Key is not set (or could not be decrypted with the active master key). Enter your 64-character hex Agent Private Key above and click "Save DEX Credentials" to activate ${uiMode === 'TESTNET' ? 'LIVE_TESTNET' : 'LIVE_MAINNET'} routing.`;
-      } else if (activeRouting === 'LIVE_TESTNET' || activeRouting === 'LIVE_MAINNET') {
-        bannerEl.className = 'state-banner ok';
-        bannerEl.textContent =
-          `Active: ${activeRouting} order routing is live on ${(c.network || '').toUpperCase()} (${c.api_endpoint}) with wallet ${shortAddr(c.wallet_address)} and encrypted agent key ${c.private_key_masked}.`;
-      } else {
-        bannerEl.className = 'state-banner';
-        bannerEl.textContent = '';
-      }
-
-      document.getElementById('cred-status-msg').textContent =
-        `Configured Mode: ${uiMode} • Effective Routing: ${activeRouting} • Network: ${(c.network || '').toUpperCase()} (${c.api_endpoint}) • Agent Key: ${privOk ? c.private_key_masked : 'Not Set'}`;
-
-      renderTelegramAlerts(c);
-    }
-
-    document.getElementById('inp-mode').addEventListener('change', (ev) => {
-      const modeVal = ev.target.value;
-      if (modeVal === 'TESTNET') {
-        document.getElementById('inp-network').value = 'true';
-      } else if (modeVal === 'LIVE') {
-        document.getElementById('inp-network').value = 'false';
-      }
-    });
-
-    document.getElementById('inp-network').addEventListener('change', (ev) => {
-      const isTestnetSelected = ev.target.value === 'true';
-      const currentMode = document.getElementById('inp-mode').value;
-      if (isTestnetSelected && currentMode === 'LIVE') {
-        document.getElementById('inp-mode').value = 'TESTNET';
-      } else if (!isTestnetSelected && currentMode === 'TESTNET') {
-        document.getElementById('inp-mode').value = 'LIVE';
-      }
-    });
-
-    document.getElementById('inp-privkey').addEventListener('input', (ev) => {
-      const bannerEl = document.getElementById('cred-banner');
-      const raw = ev.target.value.trim().replace(/^['"]|['"]$/g, '');
-      if (!raw) return;
-      const hexPart = raw.toLowerCase().startsWith('0x') ? raw.slice(2) : raw;
-      if (/^[0-9a-fA-F]{40}$/.test(hexPart)) {
-        bannerEl.className = 'state-banner err';
-        bannerEl.textContent =
-          'Input Warning: You pasted a 42-character Wallet Address (40 hex chars). Hyperliquid Agent Private Keys are 64 hex characters (66 chars with 0x). In Hyperliquid (More -> API), copy the "Private Key" generated when creating the API wallet, not the API wallet address.';
-      } else if (/^[0-9a-fA-F]{64}$/.test(hexPart)) {
-        bannerEl.className = 'state-banner ok';
-        bannerEl.textContent =
-          'Valid 64-hex-character (32-byte) Agent Private Key format detected. Click "Save DEX Credentials" to encrypt and activate routing.';
-      } else {
-        bannerEl.className = 'state-banner warn';
-        bannerEl.textContent =
-          `Agent Private Key must be 64 hexadecimal characters (currently ${hexPart.length} chars after 0x prefix).`;
-      }
-    });
-
-    document.getElementById('cred-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const msgEl = document.getElementById('cred-status-msg');
-      const bannerEl = document.getElementById('cred-banner');
-      const selectedMode = document.getElementById('inp-mode').value;
-      if (selectedMode === 'TESTNET') {
-        document.getElementById('inp-network').value = 'true';
-      } else if (selectedMode === 'LIVE') {
-        document.getElementById('inp-network').value = 'false';
-      }
-      const payload = {
-        execution_mode: selectedMode,
-        hyperliquid_testnet: document.getElementById('inp-network').value === 'true',
-        wallet_address: document.getElementById('inp-wallet').value.trim(),
-        hyperliquid_vault_address: document.getElementById('inp-vault').value.trim(),
-      };
-      const privVal = document.getElementById('inp-privkey').value.trim();
-      if (privVal) {
-        payload.private_key = privVal;
-      }
-      try {
-        const res = await fetch('/api/v1/credentials', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          bannerEl.className = 'state-banner err';
-          bannerEl.textContent = `Configuration rejected: ${data.detail || res.statusText}`;
-          msgEl.textContent = `Configuration error: ${data.detail || res.statusText}`;
-          return;
-        }
-        renderCredentials(data.credentials);
-      } catch (err) {
-        bannerEl.className = 'state-banner err';
-        bannerEl.textContent = `Request failed: ${err}`;
-        msgEl.textContent = `Request failed: ${err}`;
-      }
-    });
-
-    document.getElementById('telegram-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const msgEl = document.getElementById('telegram-status-msg');
-      const ddPctInput = Number(document.getElementById('inp-dd-pct').value || 3.0);
-      const payload = {
-        telegram_chat_id: document.getElementById('inp-tg-chat').value.trim(),
-        max_daily_drawdown_alert_pct: ddPctInput / 100.0,
-      };
-      const tokVal = document.getElementById('inp-tg-token').value.trim();
-      if (tokVal) {
-        payload.telegram_bot_token = tokVal;
-      }
-      try {
-        const res = await fetch('/api/v1/alerts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          msgEl.textContent = `Telegram configuration error: ${data.detail || res.statusText}`;
-          return;
-        }
-        renderTelegramAlerts(data.alerts);
-      } catch (err) {
-        msgEl.textContent = `Telegram config request failed: ${err}`;
-      }
-    });
-
-    document.getElementById('btn-test-telegram').addEventListener('click', async () => {
-      const msgEl = document.getElementById('telegram-status-msg');
-      msgEl.textContent = 'Dispatching Telegram test alert...';
-      try {
-        const res = await fetch('/api/v1/alerts/test', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: 'v0.2.0-rc2 Dashboard Telegram Test Alert', level: 'INFO' }),
-        });
-        const data = await res.json();
-        msgEl.textContent = `Telegram Test Result: ${data.status} (telegram_sent=${data.telegram_sent}, verified=${Boolean(data.webhook_payload_verified)})`;
-      } catch (err) {
-        msgEl.textContent = `Telegram test alert failed: ${err}`;
-      }
-    });
-
-    // --- System Settings & Configuration Manager ---
-    const SECRET_CFG_KEYS = new Set(['private_key', 'gemini_api_key', 'telegram_bot_token']);
-    let allConfigRows = [];
-    let activeCfgCategory = 'ALL';
-    const dirtyConfigValues = new Map();
-
-    function escapeHtml(str) {
-      return String(str ?? '')
+    function escapeHtml(raw) {
+      if (raw === null || raw === undefined) return '';
+      return String(raw)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -959,618 +1378,1317 @@
         .replace(/'/g, '&#39;');
     }
 
-    function updateDirtyCount() {
-      const el = document.getElementById('cfg-dirty-count');
-      if (el) el.textContent = String(dirtyConfigValues.size);
+    function resolveApiAuthToken() {
+      const urlParams = new URLSearchParams(window.location.search || '');
+      const urlTok = urlParams.get('token');
+      if (urlTok) {
+        try { window.localStorage.setItem('aegis_api_token', urlTok); } catch (_) {}
+        return urlTok;
+      }
+      const meta = document.querySelector('meta[name="aegis-session-token"]');
+      const metaTok = meta ? (meta.getAttribute('content') || '').trim() : '';
+      if (metaTok) {
+        try { window.localStorage.setItem('aegis_api_token', metaTok); } catch (_) {}
+        return metaTok;
+      }
+      try {
+        const stored = window.localStorage.getItem('aegis_api_token');
+        if (stored) return stored;
+      } catch (_) {}
+      return '';
     }
 
-    function castControlValue(rawVal, valueType) {
-      const vt = String(valueType || 'string').toLowerCase();
-      if (vt === 'bool') {
-        return String(rawVal).toLowerCase() === 'true';
+    function apiFetch(url, options = {}) {
+      const headers = new Headers(options.headers || {});
+      const token = resolveApiAuthToken();
+      if (token && !headers.has('X-Aegis-Token') && !headers.has('Authorization')) {
+        headers.set('X-Aegis-Token', token);
+        headers.set('Authorization', `Bearer ${token}`);
       }
-      if (vt === 'int') {
-        const n = Number(rawVal);
-        return Number.isFinite(n) ? Math.trunc(n) : rawVal;
-      }
-      if (vt === 'float') {
-        const n = Number(rawVal);
-        return Number.isFinite(n) ? n : rawVal;
-      }
-      return String(rawVal);
+      return fetch(url, { cache: 'no-store', ...options, credentials: 'same-origin', headers });
     }
 
-    function renderCategoryPills() {
-      const container = document.getElementById('cfg-category-pills');
-      if (!container) return;
-      const counts = new Map();
-      for (const r of allConfigRows) {
-        const cat = r.category || 'general';
-        counts.set(cat, (counts.get(cat) || 0) + 1);
-      }
-      const categories = ['ALL', ...Array.from(counts.keys())];
-      container.innerHTML = categories.map(cat => {
-        const cnt = cat === 'ALL' ? allConfigRows.length : counts.get(cat);
-        const isActive = activeCfgCategory === cat ? 'active' : '';
-        return `<button type="button" class="pill-btn ${isActive}" data-cat="${escapeHtml(cat)}">${escapeHtml(cat)} (${cnt})</button>`;
-      }).join('');
+    let activePage = 'overall';
+    let cachedConfigRows = [];
+    let activeConfigCategory = 'all';
+    let cachedPondUniverse = [];
+    let latestSettlingTimeUtc = '00:05';
 
-      container.querySelectorAll('.pill-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          activeCfgCategory = btn.getAttribute('data-cat') || 'ALL';
-          renderCategoryPills();
-          renderSystemConfigTable();
-        });
-      });
+    // Browser Local Timezone Parsing & Formatting Utilities
+    function parseUtcToDate(raw) {
+      if (raw === null || raw === undefined) return null;
+      if (raw instanceof Date) {
+        return Number.isNaN(raw.getTime()) ? null : raw;
+      }
+      if (typeof raw === 'number') {
+        if (!Number.isFinite(raw) || raw < 1e9) return null;
+        const ms = raw < 1e11 ? raw * 1000 : raw;
+        const dt = new Date(ms);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      const str = String(raw).trim();
+      if (!str) return null;
+      if (/^\d{10,13}$/.test(str)) {
+        const num = Number(str);
+        if (!Number.isFinite(num) || num < 1e9) return null;
+        const ms = str.length === 10 ? num * 1000 : num;
+        const dt = new Date(ms);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      const cleaned = str.replace(/(\d{2}:\d{2}:\d{2})\.\d+/, '$1');
+      const norm = cleaned.replace(/^(\d{4})\/(\d{2})\/(\d{2})(?=[ T]|$)/, '$1-$2-$3');
+      // SQLite / Rust UTC timestamps without timezone suffix ("YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS")
+      if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(norm)) {
+        const withSec = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}$/.test(norm) ? `${norm}:00` : norm;
+        const isoUtc = withSec.replace(' ', 'T') + 'Z';
+        const dt = new Date(isoUtc);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      // Timestamps with explicit Z or numeric offset ("YYYY-MM-DDTHH:MM:SSZ" or "+00:00" or "+0000")
+      if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})$/i.test(norm)) {
+        const normalizedOffset = norm
+          .replace(' ', 'T')
+          .replace(/([+-]\d{2})(\d{2})$/, '$1:$2')
+          .replace(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$/i, '$1:00$2');
+        const dt = new Date(normalizedOffset);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      // Date-only strings ("YYYY-MM-DD")
+      if (/^\d{4}-\d{2}-\d{2}$/.test(norm)) {
+        const dt = new Date(`${norm}T00:00:00Z`);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+      }
+      return null;
     }
 
-    function renderSystemConfigTable() {
-      const tbody = document.getElementById('sys-config-tbody');
-      if (!tbody) return;
-      const searchQ = (document.getElementById('inp-cfg-search')?.value || '').trim().toLowerCase();
+    function formatLocalTimestamp(raw, fallback = '-') {
+      if (raw === null || raw === undefined) return fallback;
+      const str = String(raw).trim();
+      if (!str) return fallback;
+      const dt = parseUtcToDate(raw);
+      if (!dt) return str.replace(/(\d{2}:\d{2}:\d{2})\.\d+/, '$1');
+      const yyyy = dt.getFullYear();
+      const mm = pad2(dt.getMonth() + 1);
+      const dd = pad2(dt.getDate());
+      const hh = pad2(dt.getHours());
+      const mi = pad2(dt.getMinutes());
+      const ss = pad2(dt.getSeconds());
+      return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+    }
 
-      const filtered = allConfigRows.filter(r => {
-        if (activeCfgCategory !== 'ALL' && r.category !== activeCfgCategory) return false;
-        if (!searchQ) return true;
-        return (
-          String(r.config_key || '').toLowerCase().includes(searchQ) ||
-          String(r.category || '').toLowerCase().includes(searchQ) ||
-          String(r.description || '').toLowerCase().includes(searchQ)
+    function formatUtcTimeOfDayToLocal(utcHhMm) {
+      const raw = String(utcHhMm || '00:05').trim();
+      const m = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+      if (!m) return raw;
+      const hhUtc = Number(m[1]);
+      const mmUtc = Number(m[2]);
+      const ssUtc = Number(m[3] || 0);
+      if (hhUtc < 0 || hhUtc > 23 || mmUtc < 0 || mmUtc > 59 || ssUtc < 0 || ssUtc > 59) {
+        return raw;
+      }
+      const now = new Date();
+      const dt = new Date(Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        hhUtc,
+        mmUtc,
+        ssUtc
+      ));
+      if (Number.isNaN(dt.getTime())) return raw;
+      const hh = pad2(dt.getHours());
+      const mi = pad2(dt.getMinutes());
+      if (m[3] !== undefined && ssUtc > 0) {
+        return `${hh}:${mi}:${pad2(dt.getSeconds())}`;
+      }
+      return `${hh}:${mi}`;
+    }
+
+    function replaceUtcTimestampsInText(text) {
+      if (typeof text !== 'string') return String(text ?? '');
+      return text
+        .replace(
+          /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/g,
+          (match) => formatLocalTimestamp(match, match)
+        )
+        .replace(
+          /\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*UTC\b/gi,
+          (full, hStr, mStr, sStr) => {
+            const hh = Number(hStr), mm = Number(mStr), ss = Number(sStr || 0);
+            if (hh > 23 || mm > 59 || ss > 59) return full;
+            const hhmm = sStr !== undefined ? `${hStr}:${mStr}:${sStr}` : `${hStr}:${mStr}`;
+            return `${formatUtcTimeOfDayToLocal(hhmm)} Local`;
+          }
         );
-      });
+    }
 
-      if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="6">No matching configuration parameters found.</td></tr>';
-        return;
+    function formatConfigDescriptionWithLocalTime(c, overrideVal) {
+      const baseDesc = c.description || '';
+      const key = c.config_key || '';
+      const rawVal = overrideVal !== undefined
+        ? overrideVal
+        : (Object.prototype.hasOwnProperty.call(dirtyConfigInputs, key) ? dirtyConfigInputs[key] : (c.config_value ?? ''));
+      const val = String(rawVal).trim();
+      if (!val) return baseDesc;
+      if (['settling_time_utc', 'settling_window_open_utc', 'settling_window_close_utc'].includes(key)) {
+        const m = val.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+        if (!m) return baseDesc;
+        const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3] || 0);
+        if (hh > 23 || mm > 59 || ss > 59) return baseDesc;
+        return `${baseDesc} (Local: ${formatUtcTimeOfDayToLocal(val)})`;
+      }
+      if (key === 'equity_baseline_reset_at' || key.endsWith('_at')) {
+        const dt = parseUtcToDate(val);
+        if (!dt) return baseDesc;
+        return `${baseDesc} (Local: ${formatLocalTimestamp(dt)})`;
+      }
+      return baseDesc;
+    }
+
+    function updateTimezoneIndicators(utcHhMm = latestSettlingTimeUtc) {
+      latestSettlingTimeUtc = utcHhMm || '00:05';
+      const localSettleStr = formatUtcTimeOfDayToLocal(latestSettlingTimeUtc);
+
+      const headerSettleEl = document.getElementById('header-settle-time');
+      if (headerSettleEl) headerSettleEl.textContent = `${localSettleStr} Local`;
+
+      const settleBadgeEl = document.getElementById('pp50-settle-time-badge');
+      if (settleBadgeEl) settleBadgeEl.textContent = `${localSettleStr} Local`;
+
+      const settleHeadingEl = document.getElementById('settle-table-heading');
+      if (settleHeadingEl) {
+        settleHeadingEl.textContent = `Daily ${localSettleStr} Local 50/50 Settling Ledger (\`book_transfers\` — Invariant F5 Idle-Only Transfer)`;
       }
 
-      tbody.innerHTML = filtered.map(r => {
-        const key = String(r.config_key);
-        const vtype = String(r.value_type || 'string').toLowerCase();
-        const isSecret = SECRET_CFG_KEYS.has(key);
-        const isDirty = dirtyConfigValues.has(key);
-        const currentVal = isDirty ? dirtyConfigValues.get(key) : String(r.config_value ?? '');
-        const inputId = `cfg-inp-${key}`;
-        const descId = `cfg-desc-${key}`;
+      const dryBtn = document.getElementById('btn-settle-dry');
+      if (dryBtn && !dryBtn.disabled) {
+        dryBtn.textContent = `Dry-Run ${localSettleStr} Settle`;
+      }
+    }
 
-        let controlHtml = '';
-        if (vtype === 'bool') {
-          const isTrue = String(currentVal).toLowerCase() === 'true';
-          controlHtml = `
-            <select id="${escapeHtml(inputId)}" name="${escapeHtml(key)}" class="cfg-input" data-key="${escapeHtml(key)}" data-type="bool" aria-describedby="${escapeHtml(descId)}">
-              <option value="true" ${isTrue ? 'selected' : ''}>true</option>
-              <option value="false" ${!isTrue ? 'selected' : ''}>false</option>
-            </select>
-          `;
-        } else if (isSecret) {
-          const maskedPlaceholder = r.config_value ? `Encrypted (${r.config_value})` : 'Not Set (enter new secret)';
-          controlHtml = `
-            <input
-              type="password"
-              id="${escapeHtml(inputId)}"
-              name="${escapeHtml(key)}"
-              class="cfg-input"
-              data-key="${escapeHtml(key)}"
-              data-type="string"
-              value="${isDirty ? escapeHtml(currentVal) : ''}"
-              placeholder="${escapeHtml(maskedPlaceholder)}"
-              autocomplete="off"
-              aria-describedby="${escapeHtml(descId)}"
-            />
-          `;
-        } else if (vtype === 'int') {
-          controlHtml = `
-            <input
-              type="number"
-              step="1"
-              id="${escapeHtml(inputId)}"
-              name="${escapeHtml(key)}"
-              class="cfg-input"
-              data-key="${escapeHtml(key)}"
-              data-type="int"
-              value="${escapeHtml(currentVal)}"
-              required
-              aria-describedby="${escapeHtml(descId)}"
-            />
-          `;
-        } else if (vtype === 'float') {
-          controlHtml = `
-            <input
-              type="number"
-              step="any"
-              id="${escapeHtml(inputId)}"
-              name="${escapeHtml(key)}"
-              class="cfg-input"
-              data-key="${escapeHtml(key)}"
-              data-type="float"
-              value="${escapeHtml(currentVal)}"
-              required
-              aria-describedby="${escapeHtml(descId)}"
-            />
-          `;
-        } else {
-          controlHtml = `
-            <input
-              type="text"
-              id="${escapeHtml(inputId)}"
-              name="${escapeHtml(key)}"
-              class="cfg-input"
-              data-key="${escapeHtml(key)}"
-              data-type="string"
-              value="${escapeHtml(currentVal)}"
-              autocomplete="off"
-              autocorrect="off"
-              autocapitalize="off"
-              spellcheck="false"
-              aria-describedby="${escapeHtml(descId)}"
-            />
-          `;
+    // Accessible 4-Page Tab Switcher with Keyboard Navigation & URL Hash Sync
+    function switchDashboardPage(pageId) {
+      const validPages = ['overall', 'pit', 'pond', 'settings'];
+      if (!validPages.includes(pageId)) pageId = 'overall';
+      activePage = pageId;
+
+      validPages.forEach((id) => {
+        const btn = document.getElementById(`tab-btn-${id}`);
+        const panel = document.getElementById(`page-${id}`);
+        const isSelected = id === pageId;
+        if (btn) {
+          btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+          btn.setAttribute('tabindex', isSelected ? '0' : '-1');
         }
+        if (panel) {
+          if (isSelected) {
+            panel.removeAttribute('hidden');
+          } else {
+            panel.setAttribute('hidden', '');
+          }
+        }
+      });
+
+      if (history.replaceState) {
+        history.replaceState(null, '', `#${pageId}`);
+      }
+    }
+
+    // Keyboard Left/Right/Home/End navigation for ARIA tablist
+    document.addEventListener('DOMContentLoaded', () => {
+      updateTimezoneIndicators('00:05');
+      const tabIds = ['overall', 'pit', 'pond', 'settings'];
+      const tablist = document.querySelector('[role="tablist"]');
+      if (tablist) {
+        tablist.addEventListener('keydown', (e) => {
+          const curIdx = tabIds.indexOf(activePage);
+          let nextIdx = curIdx;
+          if (e.key === 'ArrowRight') nextIdx = (curIdx + 1) % tabIds.length;
+          else if (e.key === 'ArrowLeft') nextIdx = (curIdx - 1 + tabIds.length) % tabIds.length;
+          else if (e.key === 'Home') nextIdx = 0;
+          else if (e.key === 'End') nextIdx = tabIds.length - 1;
+          else return;
+          e.preventDefault();
+          const nextId = tabIds[nextIdx];
+          switchDashboardPage(nextId);
+          const btn = document.getElementById(`tab-btn-${nextId}`);
+          if (btn) btn.focus();
+        });
+      }
+
+      const hash = (window.location.hash || '').replace('#', '').toLowerCase();
+      if (['overall', 'pit', 'pond', 'settings'].includes(hash)) {
+        switchDashboardPage(hash);
+      }
+    });
+
+    // Colour-Coded PnL Helpers (Color + Directional Icon + Sign)
+    function getPnlClass(val) {
+      const num = Number(val || 0);
+      if (num > 0.0001) return 'pnl-pos';
+      if (num < -0.0001) return 'pnl-neg';
+      return 'pnl-flat';
+    }
+
+    function formatPnlText(val, pctOpt = null) {
+      const num = Number(val || 0);
+      const absStr = fmtUsd(Math.abs(num));
+      let prefix = '• ';
+      let sign = '';
+      if (num > 0.0001) { prefix = '▲ '; sign = '+'; }
+      else if (num < -0.0001) { prefix = '▼ '; sign = '-'; }
+      const pctSuffix = pctOpt !== null && pctOpt !== undefined
+        ? ` (${num > 0.0001 ? '+' : ''}${Number(pctOpt).toFixed(2)}%)`
+        : '';
+      return `${prefix}${sign}${absStr}${pctSuffix}`;
+    }
+
+    function formatPnlPillHtml(val, pctOpt = null) {
+      const cls = getPnlClass(val);
+      return `<span class="pnl-pill ${cls}">${formatPnlText(val, pctOpt)}</span>`;
+    }
+
+    function applyPnlElement(el, val, pctOpt = null, isPill = false) {
+      if (!el) return;
+      const cls = getPnlClass(val);
+      el.classList.remove('pnl-pos', 'pnl-neg', 'pnl-flat');
+      el.classList.add(cls);
+      if (isPill) el.classList.add('pnl-pill');
+      el.textContent = formatPnlText(val, pctOpt);
+    }
+
+    function applyKpiCardPnlBorder(cardEl, val) {
+      if (!cardEl) return;
+      cardEl.classList.remove('kpi-pnl-pos', 'kpi-pnl-neg');
+      const num = Number(val || 0);
+      if (num > 0.0001) cardEl.classList.add('kpi-pnl-pos');
+      else if (num < -0.0001) cardEl.classList.add('kpi-pnl-neg');
+    }
+
+    function regimeBadgeClass(regime) {
+      if (regime === 'BULL') return 'badge badge-bull';
+      if (regime === 'BEAR') return 'badge badge-bear';
+      return 'badge badge-chop';
+    }
+
+    function renderDashboard(data) {
+      if (!data) return;
+      const p = data.portfolio || {};
+      const pond = data.pond || {};
+      const pp50 = data.pp50 || {};
+
+      // ===================================================================
+      // 1. OVERALL STATUS & NAV BAR PNL PILLS
+      // ===================================================================
+      const totalEq = pp50.total_platform_equity_usdc ?? ((p.pit_equity_usdc || 5000) + (pond.pond_equity_usdc || 5000));
+      const initEq = pp50.platform_initial_equity_usdc ?? 10000;
+      const totalPnl = pp50.total_platform_pnl_usdc ?? ((p.total_pnl_usdc || 0) + (pond.total_pnl_usdc || 0));
+      const totalPnlPct = pp50.total_platform_pnl_pct ?? ((totalPnl / Math.max(initEq, 1)) * 100);
+
+      const pitInfo = pp50.pit || {};
+      const pondInfo = pp50.pond || {};
+      const pitEq = pitInfo.equity_usdc ?? p.pit_equity_usdc ?? 5000;
+      const pitPnl = pitInfo.total_pnl_usdc ?? p.total_pnl_usdc ?? 0;
+      const pitPnlPct = pitInfo.total_pnl_pct ?? p.total_pnl_pct ?? 0;
+      const pitRealized = pitInfo.realized_pnl_usdc ?? p.realized_pnl_usdc ?? 0;
+      const pitUnrealized = (pitInfo.unrealized_pnl_usdc ?? p.unrealized_pnl_usdc ?? 0) + (pitInfo.funding_accrued_usdc ?? p.funding_accrued_usdc ?? 0);
+
+      const pondEq = pondInfo.equity_usdc ?? pond.pond_equity_usdc ?? 5000;
+      const pondPnl = pondInfo.total_pnl_usdc ?? pond.total_pnl_usdc ?? 0;
+      const pondPnlPct = pondInfo.total_pnl_pct ?? pond.total_pnl_pct ?? 0;
+      const pondRealized = pondInfo.realized_pnl_usdc ?? pond.realized_pnl_usdc ?? 0;
+      const pondUnrealized = (pondInfo.unrealized_pnl_usdc ?? pond.unrealized_pnl_usdc ?? 0) + (pondInfo.funding_accrued_usdc ?? pond.funding_accrued_usdc ?? 0);
+
+      // Nav bar PnL pills
+      applyPnlElement(document.getElementById('nav-total-pnl-pill'), totalPnl, totalPnlPct, true);
+      applyPnlElement(document.getElementById('nav-pit-pnl-pill'), pitPnl, null, true);
+      applyPnlElement(document.getElementById('nav-pond-pnl-pill'), pondPnl, null, true);
+
+      // Page 1 KPIs
+      document.getElementById('pp50-total-equity').textContent = fmtUsd(totalEq);
+      document.getElementById('pp50-initial-equity').textContent = fmtUsd(initEq);
+      document.getElementById('pp50-target-each').textContent = fmtUsd(totalEq * 0.5);
+
+      applyPnlElement(document.getElementById('pp50-total-pnl'), totalPnl);
+      applyPnlElement(document.getElementById('pp50-total-pnl-badge'), totalPnl, totalPnlPct, true);
+      applyKpiCardPnlBorder(document.getElementById('pp50-card-total-pnl'), totalPnl);
+
+      applyPnlElement(document.getElementById('pp50-pit-pnl'), pitPnl);
+      applyPnlElement(document.getElementById('pp50-pit-pnl-badge'), pitPnl, pitPnlPct, true);
+      applyKpiCardPnlBorder(document.getElementById('pp50-card-pit-pnl'), pitPnl);
+      document.getElementById('pp50-pit-equity').textContent = fmtUsd(pitEq);
+      const pitShare = pp50.pit_share_pct ?? 50.0;
+      const pondShare = pp50.pond_share_pct ?? 50.0;
+      document.getElementById('pp50-pit-share').textContent = `${Number(pitShare).toFixed(1)}%`;
+
+      applyPnlElement(document.getElementById('pp50-pond-pnl'), pondPnl);
+      applyPnlElement(document.getElementById('pp50-pond-pnl-badge'), pondPnl, pondPnlPct, true);
+      applyKpiCardPnlBorder(document.getElementById('pp50-card-pond-pnl'), pondPnl);
+      document.getElementById('pp50-pond-equity').textContent = fmtUsd(pondEq);
+      document.getElementById('pp50-pond-share').textContent = `${Number(pondShare).toFixed(1)}%`;
+
+      const driftBps = Number(pp50.drift_bps || 0);
+      const deadbandBps = Number(pp50.deadband_bps || 50);
+      document.getElementById('pp50-drift-bps').textContent = `${driftBps.toFixed(1)} bps`;
+      document.getElementById('pp50-deadband-bps').textContent = `${deadbandBps.toFixed(1)} bps`;
+      updateTimezoneIndicators(pp50.settling_time_utc || '00:05');
+      const settleStatusEl = document.getElementById('pp50-settle-status-label');
+      if (pp50.platform_pp50_halt) {
+        settleStatusEl.textContent = 'HALTED';
+        settleStatusEl.className = 'text-red';
+      } else if (pp50.settling_in_progress) {
+        settleStatusEl.textContent = 'SETTLING';
+        settleStatusEl.className = 'text-amber';
+      } else if (driftBps > deadbandBps) {
+        settleStatusEl.textContent = 'REBALANCE DUE';
+        settleStatusEl.className = 'text-amber';
+      } else {
+        settleStatusEl.textContent = 'WITHIN DEAD-BAND';
+        settleStatusEl.className = 'text-green';
+      }
+      document.getElementById('pp50-split-bar-pit').style.width = `${Math.max(5, Math.min(95, pitShare))}%`;
+      document.getElementById('pp50-split-bar-pond').style.width = `${Math.max(5, Math.min(95, pondShare))}%`;
+
+      // Page 1 Side-by-Side Book Cards
+      const pitRegime = pitInfo.hmm_regime || p.hmm_regime || 'CHOP';
+      const ovPitRegime = document.getElementById('overall-pit-regime-badge');
+      ovPitRegime.textContent = pitRegime;
+      ovPitRegime.className = regimeBadgeClass(pitRegime);
+      document.getElementById('overall-pit-equity').innerHTML = `${fmtUsd(pitEq)} <span class="text-muted" style="font-size:11px;">/ ${fmtUsd(pitInfo.initial_capital_usdc || 5000)}</span>`;
+      applyPnlElement(document.getElementById('overall-pit-total-pnl'), pitPnl, pitPnlPct);
+      applyPnlElement(document.getElementById('overall-pit-realized-pnl'), pitRealized);
+      applyPnlElement(document.getElementById('overall-pit-unrealized-pnl'), pitUnrealized);
+      document.getElementById('overall-pit-positions').textContent = `${pitInfo.open_positions || 0} pos | ${fmtUsd(pitInfo.heat_usdc || 0)} heat`;
+      document.getElementById('overall-pit-leverage').textContent = `${fmtUsd(pitInfo.deployed_notional_usdc || 0)} (${fmtNum(pitInfo.gross_leverage || 0, 2)}x)`;
+
+      const pondPolicy = pondInfo.direction_policy || pond.direction_policy || 'both';
+      document.getElementById('overall-pond-policy-badge').textContent = `POLICY: ${pondPolicy.toUpperCase()}`;
+      document.getElementById('overall-pond-equity').innerHTML = `${fmtUsd(pondEq)} <span class="text-muted" style="font-size:11px;">/ ${fmtUsd(pondInfo.initial_capital_usdc || 5000)}</span>`;
+      applyPnlElement(document.getElementById('overall-pond-total-pnl'), pondPnl, pondPnlPct);
+      applyPnlElement(document.getElementById('overall-pond-realized-pnl'), pondRealized);
+      applyPnlElement(document.getElementById('overall-pond-unrealized-pnl'), pondUnrealized);
+      document.getElementById('overall-pond-cells').textContent = `${pond.open_cells_count || 0} / ${pond.max_concurrent_cells || 8} cells | ${fmtUsd(pond.open_heat_usdc || 0)} / ${fmtUsd(pond.max_open_heat_usdc || 200)} heat`;
+      document.getElementById('overall-pond-leverage').textContent = `${fmtUsd(pond.deployed_notional_usdc || 0)} (${fmtNum(pond.gross_leverage || 0, 2)}x)`;
+
+      if (pp50.latest_snapshot) {
+        const snap = pp50.latest_snapshot;
+        const snapTs = formatLocalTimestamp(snap.timestamp_ms || snap.created_at, '');
+        if (snap.report_line) {
+          const localizedLine = replaceUtcTimestampsInText(snap.report_line);
+          document.getElementById('pp50-report-line').textContent =
+            (snapTs && !localizedLine.includes(snapTs)) ? `[${snapTs}] ${localizedLine}` : localizedLine;
+        } else {
+          const prefix = snapTs ? `[${snapTs}] ` : '';
+          document.getElementById('pp50-report-line').textContent =
+            `${prefix}PP-50 D+${pad2(snap.snapshot_id || 1)} | platform ${fmtUsd(snap.platform_equity_usdc ?? totalEq)} (${totalPnlPct >= 0 ? '+' : ''}${Number(totalPnlPct).toFixed(2)}%) | PIT ${fmtUsd(snap.pit_equity_usdc ?? pitEq)} | POND ${fmtUsd(snap.pond_equity_usdc ?? pondEq)} | drift ${fmtNum(snap.drift_bps ?? driftBps, 1)} bps | settle: ${replaceUtcTimestampsInText(snap.settling_status || 'READY')} | cells: ${snap.pond_open_cells ?? (pond.open_cells_count || 0)}/${pond.max_concurrent_cells || 8} (heat ${fmtUsd(pond.open_heat_usdc || 0)}) | champion ${pond.active_champion_id || 'NPS-01'}`;
+        }
+      }
+
+      // Page 1 Settling Transfers Table
+      const transfers = pp50.recent_transfers || [];
+      const settleTbody = document.getElementById('settle-transfers-tbody');
+      if (transfers.length === 0) {
+        settleTbody.innerHTML = '<tr><td colspan="12" class="text-muted">No settling transfers recorded yet. Click "Simulate Dry-Run Settle" to test the 5-phase protocol.</td></tr>';
+      } else {
+        settleTbody.innerHTML = transfers.map((tr) => {
+          const stClass = (tr.status === 'COMPLETED' || tr.status === 'NO_ACTION_WITHIN_DEADBAND') ? 'text-green' : (tr.status === 'PARTIAL_IDLE_CAPPED' ? 'text-amber' : 'text-blue');
+          const prePit = tr.from_book === 'PIT' ? tr.pre_from_usdc : (tr.to_book === 'PIT' ? tr.pre_to_usdc : tr.pre_from_usdc);
+          const prePond = tr.from_book === 'POND' ? tr.pre_from_usdc : (tr.to_book === 'POND' ? tr.pre_to_usdc : tr.pre_to_usdc);
+          const preTotal = (Number(prePit || 0) + Number(prePond || 0));
+          const execAmt = tr.amount_usdc ?? tr.executed_transfer_usdc ?? 0;
+          const reqAmt = tr.required_transfer_usdc ?? execAmt;
+          const driftVal = tr.drift_bps_before ?? tr.drift_bps ?? 0;
+          const rawTs = (tr.created_at && (!tr.settle_date || String(tr.settle_date).length <= 10))
+            ? tr.created_at
+            : (tr.settle_date || tr.created_at);
+          return `
+            <tr>
+              <td>#${escapeHtml(tr.transfer_id)}</td>
+              <td>${escapeHtml(formatLocalTimestamp(rawTs))}</td>
+              <td><strong>${escapeHtml(tr.from_book)} → ${escapeHtml(tr.to_book)}</strong></td>
+              <td>${fmtUsd(prePit)}</td>
+              <td>${fmtUsd(prePond)}</td>
+              <td>${fmtUsd(preTotal)}</td>
+              <td>${fmtNum(driftVal, 1)} bps</td>
+              <td>${fmtUsd(reqAmt)}</td>
+              <td>${fmtUsd(tr.available_idle_usdc ?? execAmt)}</td>
+              <td class="text-green"><strong>${fmtUsd(execAmt)}</strong></td>
+              <td class="${(tr.blocked_remainder_usdc || 0) > 0 ? 'text-amber' : 'text-muted'}">${fmtUsd(tr.blocked_remainder_usdc || 0)}</td>
+              <td class="${stClass}"><strong>${escapeHtml(tr.status)}</strong></td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // ===================================================================
+      // 2. PIT (BOOK A) PAGE
+      // ===================================================================
+      const pitInitCap = p.pit_initial_capital_usdc || 5000;
+      document.getElementById('kpi-equity').textContent = fmtUsd(pitEq);
+      const deltaEl = document.getElementById('kpi-equity-delta');
+      applyPnlElement(deltaEl, pitPnl, pitPnlPct);
+      document.getElementById('kpi-cash').textContent = `Idle USDC: ${fmtUsd(p.pit_idle_usdc ?? p.available_cash_usdc)} | Baseline: ${fmtUsd(pitInitCap)}`;
+
+      applyPnlElement(document.getElementById('pit-kpi-total-pnl'), pitPnl);
+      applyPnlElement(document.getElementById('pit-kpi-pnl-pct-badge'), pitPnl, pitPnlPct, true);
+      applyPnlElement(document.getElementById('pit-kpi-realized-pnl'), pitRealized);
+      applyPnlElement(document.getElementById('pit-kpi-unrealized-pnl'), pitUnrealized);
+      applyKpiCardPnlBorder(document.getElementById('pit-card-total-pnl'), pitPnl);
+
+      const maxHeat = p.max_portfolio_heat_usdc || (pitInitCap * 0.04);
+      const heatPct = (p.portfolio_heat_pct || 0) * 100;
+      document.getElementById('kpi-heat').innerHTML = `${fmtUsd(p.portfolio_heat_usdc)} <span style="font-size:13px; color:var(--text-muted)">/ ${fmtUsd(maxHeat)}</span>`;
+      document.getElementById('kpi-heat-pct').textContent = fmtNum(heatPct, 2) + '%';
+      document.getElementById('bar-heat').style.width = Math.min(100, (heatPct / 4.0) * 100) + '%';
+
+      const lev = p.gross_leverage || 0;
+      document.getElementById('kpi-leverage').textContent = fmtNum(lev, 2) + 'x';
+      document.getElementById('kpi-notional').textContent = fmtUsd(p.deployed_notional_usdc);
+      document.getElementById('bar-leverage').style.width = Math.min(100, (lev / 1.5) * 100) + '%';
+
+      document.getElementById('kpi-basis').textContent = fmtUsd(p.basis_harvest_notional_usdc);
+      applyPnlElement(document.getElementById('kpi-yield'), p.accrued_yield_usdc || 0);
+
+      const regime = p.hmm_regime || 'CHOP';
+      const regBadge = document.getElementById('kpi-regime');
+      regBadge.textContent = regime;
+      regBadge.className = regimeBadgeClass(regime);
+      document.getElementById('prob-bull').textContent = fmtNum((p.prob_bull || 0) * 100, 1) + '%';
+      document.getElementById('prob-bear').textContent = fmtNum((p.prob_bear || 0) * 100, 1) + '%';
+      document.getElementById('prob-chop').textContent = fmtNum((p.prob_chop || 0) * 100, 1) + '%';
+
+      // Pit Signals Table
+      const sigs = data.signals || [];
+      const latestSigTs = sigs.length > 0 ? (sigs[0].timestamp_ms || sigs[0].created_at) : null;
+      document.getElementById('signals-count').textContent = latestSigTs
+        ? `${sigs.length} Pairs | Eval: ${formatLocalTimestamp(latestSigTs)}`
+        : `${sigs.length} Pairs`;
+      const sigTbody = document.getElementById('signals-tbody');
+      sigTbody.innerHTML = sigs.map(s => {
+        const execSym = s.symbol || s.exec_symbol || '-';
+        const tf = s.timeframe || '4h';
+        const ensScore = s.ensemble_score ?? s.blended_conviction ?? 0;
+        const entryThresh = s.entry_threshold ?? 0.65;
+        const volTier = s.volatility_tier || `RANK_${s.rs_rank || 1}`;
+        const ensClass = ensScore >= entryThresh ? 'text-green' : (ensScore <= -entryThresh ? 'text-red' : 'text-muted');
+        let actionBadge = `<span class="text-muted">${escapeHtml(s.signal_action)}</span>`;
+        if (s.signal_action === 'LONG_ENTRY') actionBadge = `<span class="badge badge-bull">LONG_ENTRY</span>`;
+        else if (s.signal_action === 'SHORT_ENTRY') actionBadge = `<span class="badge badge-bear">SHORT_ENTRY</span>`;
+        else if (s.signal_action === 'BASIS_HARVEST') actionBadge = `<span class="badge badge-info">BASIS_HARVEST</span>`;
 
         return `
-          <tr id="cfg-row-${escapeHtml(key)}" class="${isDirty ? 'cfg-row-dirty' : ''}">
-            <td><span class="type-pill">${escapeHtml(r.category)}</span></td>
-            <td><label for="${escapeHtml(inputId)}"><code>${escapeHtml(key)}</code></label></td>
-            <td><span class="type-pill">${escapeHtml(vtype)}</span></td>
-            <td>${controlHtml}</td>
-            <td id="${escapeHtml(descId)}" style="color: var(--text-muted); font-size: 0.76rem;">${escapeHtml(r.description || '—')}</td>
-            <td>
-              <button type="button" class="btn-secondary btn-row-save" data-key="${escapeHtml(key)}" style="padding: 0.3rem 0.65rem; font-size: 0.75rem;">
-                Save
-              </button>
-            </td>
+          <tr>
+            <td><strong>${escapeHtml(execSym)}</strong></td>
+            <td class="text-muted">${escapeHtml(s.synth_symbol || '-')}</td>
+            <td>${escapeHtml(tf)}</td>
+            <td class="${s.mace_score >= 0 ? 'text-green' : 'text-red'}">${s.mace_score >= 0 ? '+' : ''}${fmtNum(s.mace_score, 3)}</td>
+            <td class="${s.snr_score >= 0 ? 'text-green' : 'text-red'}">${s.snr_score >= 0 ? '+' : ''}${fmtNum(s.snr_score, 3)}</td>
+            <td class="${ensClass}"><strong>${ensScore >= 0 ? '+' : ''}${fmtNum(ensScore, 3)}</strong></td>
+            <td>±${fmtNum(entryThresh, 2)}</td>
+            <td>${escapeHtml(volTier)}</td>
+            <td>${fmtNum((s.funding_rate_hourly || 0) * 100, 4)}%</td>
+            <td>${actionBadge}</td>
           </tr>
         `;
       }).join('');
 
-      tbody.querySelectorAll('.cfg-input').forEach(inp => {
-        const handler = () => {
-          const key = inp.getAttribute('data-key');
-          const origRow = allConfigRows.find(r => r.config_key === key);
-          if (!key || !origRow) return;
-          const val = inp.value;
-          const isSecret = SECRET_CFG_KEYS.has(key);
-          const changed = isSecret ? val.trim().length > 0 : String(val) !== String(origRow.config_value ?? '');
-          const tr = document.getElementById(`cfg-row-${key}`);
-          if (changed) {
-            dirtyConfigValues.set(key, val);
-            if (tr) tr.classList.add('cfg-row-dirty');
-          } else {
-            dirtyConfigValues.delete(key);
-            if (tr) tr.classList.remove('cfg-row-dirty');
+      // Pit Open Positions Table (Colour-Coded uPnL + Local Opened Timestamp)
+      const openTrades = data.open_trades || [];
+      document.getElementById('open-trades-count').textContent = `${openTrades.length} OPEN`;
+      const openTbody = document.getElementById('open-trades-tbody');
+      if (openTrades.length === 0) {
+        openTbody.innerHTML = `<tr><td colspan="9" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
+      } else {
+        openTbody.innerHTML = openTrades.map(t => {
+          const upnl = (t.unrealized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0);
+          return `
+            <tr>
+              <td><strong>${escapeHtml(t.symbol)}</strong></td>
+              <td><span class="badge ${t.side === 'LONG' ? 'badge-bull' : 'badge-bear'}">${escapeHtml(t.side)}</span></td>
+              <td>${fmtUsd(t.notional_usdc)}</td>
+              <td>${fmtNum(t.entry_price, 4)}</td>
+              <td>${fmtNum(t.current_price, 4)}</td>
+              <td class="text-amber">${fmtNum(t.chandelier_stop_price, 4)}</td>
+              <td>${fmtUsd(t.risk_budget_usdc)}</td>
+              <td>${formatPnlPillHtml(upnl)}</td>
+              <td class="text-muted">${escapeHtml(formatLocalTimestamp(t.opened_at))}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // Pit Recent Closed Trades Table (Colour-Coded Realized PnL + Local Timestamp)
+      const recentTrades = data.recent_trades || [];
+      const recTbody = document.getElementById('recent-trades-tbody');
+      recTbody.innerHTML = recentTrades.slice(0, 20).map(t => {
+        const tradeState = t.status || t.state || 'CLOSED';
+        const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0)) : (t.realized_pnl_usdc || 0);
+        const fPnl = t.funding_accrued_usdc || 0;
+        const tradeTs = tradeState === 'OPEN' ? t.opened_at : (t.closed_at || t.opened_at);
+        return `
+          <tr>
+            <td>#${escapeHtml(t.trade_id)}</td>
+            <td class="text-muted">${escapeHtml(formatLocalTimestamp(tradeTs))}</td>
+            <td><strong>${escapeHtml(t.symbol)}</strong></td>
+            <td><span class="${t.side === 'LONG' ? 'text-green' : 'text-red'}">${escapeHtml(t.side)}</span></td>
+            <td>${escapeHtml(replaceUtcTimestampsInText(t.exit_reason || tradeState))}</td>
+            <td>${fmtNum(t.entry_price, 4)}</td>
+            <td>${t.exit_price ? fmtNum(t.exit_price, 4) : fmtNum(t.current_price, 4)}</td>
+            <td>${fmtUsd(t.notional_usdc)}</td>
+            <td class="${getPnlClass(fPnl)}">${formatPnlText(fPnl)}</td>
+            <td>${formatPnlPillHtml(pnl)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      // ===================================================================
+      // 3. POND (BOOK B) PAGE
+      // ===================================================================
+      const pondInitCap = pondInfo.initial_capital_usdc ?? pond.initial_capital_usdc ?? (initEq * 0.5);
+      document.getElementById('pond-kpi-equity').textContent = fmtUsd(pondEq);
+      document.getElementById('pond-kpi-idle').textContent = fmtUsd(pond.idle_usdc ?? pondEq);
+      const pondBaselineEl = document.getElementById('pond-kpi-baseline');
+      if (pondBaselineEl) pondBaselineEl.textContent = fmtUsd(pondInitCap);
+      document.getElementById('pond-champion-badge').textContent = pond.active_champion_id || 'NPS-01';
+
+      applyPnlElement(document.getElementById('pond-kpi-total-pnl'), pondPnl);
+      applyPnlElement(document.getElementById('pond-kpi-pnl-pct-badge'), pondPnl, pondPnlPct, true);
+      applyPnlElement(document.getElementById('pond-kpi-realized-pnl'), pondRealized);
+      applyPnlElement(document.getElementById('pond-kpi-unrealized-pnl'), pond.unrealized_pnl_usdc || 0);
+      applyKpiCardPnlBorder(document.getElementById('pond-card-total-pnl'), pondPnl);
+
+      const pondFunding = pond.funding_accrued_usdc || 0;
+      applyPnlElement(document.getElementById('pond-kpi-funding-pnl'), pondFunding);
+      applyKpiCardPnlBorder(document.getElementById('pond-card-funding-pnl'), pondFunding);
+      document.getElementById('pond-kpi-short-calls').textContent = pond.short_call_count ?? 0;
+      document.getElementById('pond-kpi-short-puts').textContent = pond.short_put_count ?? 0;
+
+      const pondOpenCount = pond.open_cells_count ?? 0;
+      const pondMaxCells = pond.max_concurrent_cells ?? 8;
+      const pondHeat = pond.open_heat_usdc ?? 0;
+      const pondMaxHeat = pond.max_open_heat_usdc ?? 200;
+      document.getElementById('pond-kpi-cells').textContent = `${pondOpenCount} / ${pondMaxCells} Cells`;
+      document.getElementById('pond-open-cells-badge').textContent = `${pondOpenCount} OPEN`;
+      document.getElementById('pond-kpi-heat').innerHTML = `${fmtUsd(pondHeat)} <span style="font-size:13px; color:var(--text-muted)">/ ${fmtUsd(pondMaxHeat)}</span>`;
+      document.getElementById('pond-bar-heat').style.width = `${Math.min(100, (pondHeat / Math.max(pondMaxHeat, 1)) * 100)}%`;
+
+      const pondLev = pond.gross_leverage ?? 0;
+      const pondMaxLev = pond.max_gross_leverage ?? 1.5;
+      document.getElementById('pond-kpi-leverage').textContent = `${fmtNum(pondLev, 2)}x`;
+      document.getElementById('pond-kpi-notional').textContent = fmtUsd(pond.deployed_notional_usdc || 0);
+      document.getElementById('pond-bar-leverage').style.width = `${Math.min(100, (pondLev / Math.max(pondMaxLev, 0.1)) * 100)}%`;
+
+      document.getElementById('pond-kpi-policy-badge').textContent = pondPolicy;
+      const policySelect = document.getElementById('pond-policy-select');
+      if (policySelect && document.activeElement !== policySelect) {
+        policySelect.value = pondPolicy;
+      }
+
+      // Pond Cells Table (Colour-Coded Funding, uPnL, Total/Realized PnL, and Local Timestamp)
+      const recentCells = pond.recent_cells || [];
+      const pondCellsTbody = document.getElementById('pond-cells-tbody');
+      if (recentCells.length === 0) {
+        pondCellsTbody.innerHTML = '<tr><td colspan="17" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>';
+      } else {
+        pondCellsTbody.innerHTML = recentCells.map((c) => {
+          const isOpen = ['OPEN', 'TRAILED', 'ARMED'].includes(c.state);
+          const netPnl = isOpen
+            ? ((c.unrealized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))
+            : (c.realized_pnl_usdc || 0);
+          const sideBadge = c.option_analogue === 'SHORT_CALL'
+            ? '<span class="badge badge-bear">SHORT / SHORT_CALL</span>'
+            : '<span class="badge badge-bull">LONG / SHORT_PUT</span>';
+          const stateBadge = isOpen
+            ? `<span class="badge badge-info">${escapeHtml(c.state)}</span>`
+            : `<span class="badge">${escapeHtml(c.state)}</span>`;
+          const cellTs = isOpen ? (c.opened_at || c.updated_at) : (c.closed_at || c.updated_at || c.opened_at);
+          const exitFallback = isOpen
+            ? 'HOLDING'
+            : (c.cooldown_until ? `COOLDOWN (${formatLocalTimestamp(c.cooldown_until)})` : '-');
+          const reasonText = c.exit_reason ? replaceUtcTimestampsInText(c.exit_reason) : exitFallback;
+          const exitLabel = escapeHtml(`${c.exit_tier ? `T${c.exit_tier}: ` : ''}${reasonText}`);
+          return `
+            <tr>
+              <td>#${escapeHtml(c.cell_id)}</td>
+              <td class="text-muted">${escapeHtml(formatLocalTimestamp(cellTs))}</td>
+              <td><strong>${escapeHtml(c.symbol)}</strong></td>
+              <td>${stateBadge}</td>
+              <td>${sideBadge}</td>
+              <td>${fmtUsd(c.notional_usdc)}</td>
+              <td>${fmtUsd(c.risk_budget_usdc)}</td>
+              <td>${c.entry_price ? fmtNum(c.entry_price, 4) : '-'}</td>
+              <td>${fmtNum(c.current_price, 4)}</td>
+              <td class="text-amber">${fmtNum(c.initial_stop ?? c.initial_stop_price, 4)}</td>
+              <td class="text-blue">${fmtNum(c.chandelier_stop ?? c.chandelier_stop_price, 4)}</td>
+              <td>${fmtNum(c.funding_z_entry ?? c.entry_funding_z, 2)}σ → <strong>${fmtNum(c.current_funding_z, 2)}σ</strong></td>
+              <td>${fmtNum(c.premium_score, 2)}</td>
+              <td class="${getPnlClass(c.funding_accrued_usdc)}">${formatPnlText(c.funding_accrued_usdc)}</td>
+              <td class="${getPnlClass(c.unrealized_pnl_usdc)}">${formatPnlText(c.unrealized_pnl_usdc)}</td>
+              <td>${formatPnlPillHtml(netPnl)}</td>
+              <td class="text-muted">${exitLabel}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // Pond Universe Table
+      cachedPondUniverse = pond.universe || [];
+      document.getElementById('pond-universe-count-badge').textContent = `${pond.universe_active_count ?? cachedPondUniverse.length} ACTIVE / ${cachedPondUniverse.length} TOTAL`;
+      renderPondUniverseTable();
+
+      // Pond Scan Cycles Table
+      const cycles = pond.scan_cycles || [];
+      const cyclesTbody = document.getElementById('pond-cycles-tbody');
+      if (cycles.length === 0) {
+        cyclesTbody.innerHTML = '<tr><td colspan="9" class="text-muted">No S-Cycle scans recorded yet.</td></tr>';
+      } else {
+        cyclesTbody.innerHTML = cycles.map((cy) => `
+          <tr>
+            <td>#${escapeHtml(cy.cycle_id)}</td>
+            <td>${escapeHtml(formatLocalTimestamp(cy.started_at || cy.completed_at))}</td>
+            <td>${escapeHtml(cy.coins_scanned ?? cy.universe_active_count)}</td>
+            <td class="text-blue">${escapeHtml(cy.candidates ?? cy.candidates_passed_gates)}</td>
+            <td class="text-green"><strong>+${escapeHtml(cy.opened ?? cy.entries_opened)}</strong></td>
+            <td class="text-amber">${escapeHtml(cy.exits_evaluated ?? cy.exits_triggered)}</td>
+            <td>${escapeHtml(cy.open_cells_after ?? pondOpenCount)}</td>
+            <td>${fmtUsd(cy.open_heat_usdc ?? pondHeat)}</td>
+            <td>${fmtUsd(cy.pond_equity_usdc ?? pondEq)}</td>
+          </tr>
+        `).join('');
+      }
+
+      // ===================================================================
+      // 4. SETTINGS PAGE & SYSTEM CONFIG
+      // ===================================================================
+      const initCap = p.initial_equity_usdc || 10000;
+      const scaleMult = initCap / 10000.0;
+      const capInput = document.getElementById('capital-baseline-input');
+      if (capInput && !dirtyFormFields.has('capital-baseline-input') && document.activeElement !== capInput) {
+        capInput.value = Math.round(initCap);
+      }
+      const capBadge = document.getElementById('capital-scale-badge');
+      if (capBadge) capBadge.textContent = `${fmtNum(scaleMult, 2)}x Baseline`;
+      const capSummary = document.getElementById('capital-scale-summary');
+      if (capSummary) {
+        capSummary.textContent = `Heat Cap: ${fmtUsd(p.max_portfolio_heat_usdc || (initCap * 0.04))} (4.0%) | Base Risk/Trade: ${fmtUsd(p.baseline_risk_per_trade_usdc || (initCap * 0.01))} [${fmtUsd(p.min_risk_per_trade_usdc || (initCap * 0.005))}–${fmtUsd(p.max_risk_per_trade_usdc || (initCap * 0.015))}] | Single Asset Cap: ${fmtUsd(p.single_asset_cap_usdc || (initCap * 0.25))}`;
+      }
+
+      if (data.credentials) {
+        renderCredentials(data.credentials);
+      }
+
+      const schemaRuntimeEl = document.getElementById('schema-runtime-badge');
+      if (schemaRuntimeEl) {
+        const sv = data.schema_version ?? 6;
+        const rt = data.engine_runtime_detail || data.engine_runtime || 'RUST_NATIVE (Axum / Tokio)';
+        schemaRuntimeEl.textContent = `Schema v${sv} // ${rt}`;
+      }
+
+      cachedConfigRows = data.config || [];
+      const cfgHeadingEl = document.getElementById('settings-config-heading');
+      if (cfgHeadingEl && cachedConfigRows.length > 0) {
+        cfgHeadingEl.textContent = `Live Tunable \`system_config\` Parameters (${cachedConfigRows.length} Keys — SQLite Single Source of Truth)`;
+      }
+      renderConfigTable();
+
+      // Logs
+      const logs = data.logs || [];
+      const logsBox = document.getElementById('logs-box');
+      logsBox.innerHTML = logs.map(l => `
+        <div class="log-entry">
+          <span class="text-muted">[${escapeHtml(formatLocalTimestamp(l.timestamp_ms || l.created_at))}]</span>
+          <span class="${l.level === 'ERROR' ? 'text-red' : (l.level === 'WARN' ? 'text-amber' : 'text-blue')}">[${escapeHtml(l.level)}]</span>
+          <span class="text-muted">${escapeHtml(l.component)}:</span>
+          <span>${escapeHtml(replaceUtcTimestampsInText(l.message))}</span>
+        </div>
+      `).join('');
+    }
+
+    function renderPondUniverseTable() {
+      const tbody = document.getElementById('pond-universe-tbody');
+      if (!tbody) return;
+      const q = (document.getElementById('pond-universe-filter')?.value || '').trim().toUpperCase();
+      const filtered = cachedPondUniverse.filter((u) => {
+        const sym = (u.symbol || '').toUpperCase();
+        const base = (u.base_asset || sym.split('/')[0] || '').toUpperCase();
+        return !q || sym.includes(q) || base.includes(q);
+      });
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="text-muted">No matching Pond universe coins.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = filtered.map((u) => {
+        const baseAsset = u.base_asset || (u.symbol || '').split('/')[0] || '-';
+        let stBadge = `<span class="badge badge-bull">${escapeHtml(u.status)}</span>`;
+        if (u.status === 'WARMUP') stBadge = `<span class="badge badge-chop">WARMUP</span>`;
+        else if (u.status === 'DELISTING' || u.status === 'RETIRED') stBadge = `<span class="badge badge-bear">${escapeHtml(u.status)}</span>`;
+        const streak = u.below_rank95_streak ?? u.delist_streak ?? u.consecutive_below_rank_count ?? 0;
+        const rank = u.volume_rank_30d ?? u.rank ?? u.rank_by_volume ?? '-';
+        const rawWarmup = u.warmup_until || u.warmup_ready_at;
+        const warmupDisplay = rawWarmup ? formatLocalTimestamp(rawWarmup) : 'READY';
+        return `
+          <tr>
+            <td>#${escapeHtml(rank)}</td>
+            <td><strong>${escapeHtml(u.symbol)}</strong></td>
+            <td><span class="text-blue">${escapeHtml(baseAsset)}</span></td>
+            <td>${fmtUsd(u.median_daily_volume_usdc ?? u.median_daily_vol_usdc)}</td>
+            <td>${stBadge}</td>
+            <td class="text-muted">${escapeHtml(warmupDisplay)}</td>
+            <td class="${streak > 0 ? 'text-amber' : 'text-muted'}">${escapeHtml(streak)} / 2</td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function setConfigCategoryFilter(cat, btnEl) {
+      activeConfigCategory = cat;
+      document.querySelectorAll('.filter-pill').forEach((el) => el.classList.remove('active'));
+      if (btnEl) btnEl.classList.add('active');
+      renderConfigTable();
+    }
+
+    let credModeDirty = false;
+    let lastCredState = null;
+    const dirtyConfigInputs = {};
+    const dirtyFormFields = new Set();
+    const ROUTING_CONFIG_KEYS = ['execution_mode', 'pond_execution_mode', 'hyperliquid_testnet', 'environment'];
+
+    function markFormFieldDirty(fieldId) {
+      if (fieldId) dirtyFormFields.add(fieldId);
+    }
+
+    function clearRoutingDirtyInputs() {
+      credModeDirty = false;
+      ROUTING_CONFIG_KEYS.forEach((k) => {
+        delete dirtyConfigInputs[k];
+      });
+    }
+
+    function onConfigInputEdit(key, val) {
+      dirtyConfigInputs[key] = val;
+      const cfgRow = cachedConfigRows.find((r) => r.config_key === key);
+      if (cfgRow) {
+        const cfgTbody = document.getElementById('config-tbody');
+        const tr = cfgTbody ? Array.from(cfgTbody.querySelectorAll('tr[data-config-key]')).find((el) => el.getAttribute('data-config-key') === key) : null;
+        const descCell = tr ? tr.querySelector('.cfg-desc-cell') : null;
+        if (descCell) {
+          descCell.textContent = formatConfigDescriptionWithLocalTime(cfgRow, val);
+        }
+      }
+      if (key === 'settling_time_utc' && /^\d{1,2}:\d{2}(?::\d{2})?$/.test(String(val).trim())) {
+        updateTimezoneIndicators(String(val).trim());
+      }
+    }
+
+    function renderConfigTable() {
+      const cfgTbody = document.getElementById('config-tbody');
+      if (!cfgTbody) return;
+      const q = (document.getElementById('config-search-input')?.value || '').trim().toLowerCase();
+      const filtered = cachedConfigRows.filter((c) => {
+        if (c.category === 'credentials') return false;
+        if (activeConfigCategory !== 'all') {
+          if (activeConfigCategory === 'signals') {
+            if (!['hmm', 'mace', 'stops', 'basis'].includes(c.category)) return false;
+          } else if (c.category !== activeConfigCategory) {
+            return false;
           }
-          updateDirtyCount();
-        };
-        inp.addEventListener('input', handler);
-        inp.addEventListener('change', handler);
+        }
+        if (q && !c.config_key.toLowerCase().includes(q) && !(c.description || '').toLowerCase().includes(q)) {
+          return false;
+        }
+        return true;
       });
 
-      tbody.querySelectorAll('.btn-row-save').forEach(btn => {
-        btn.addEventListener('click', async () => {
-          const key = btn.getAttribute('data-key');
-          const inp = document.getElementById(`cfg-inp-${key}`);
-          if (!key || !inp) return;
-          await saveSingleConfigKey(key, inp.value, inp.getAttribute('data-type') || 'string', btn);
+      const existingRows = Array.from(cfgTbody.querySelectorAll('tr[data-config-key]'));
+      const sameRowOrder = existingRows.length === filtered.length &&
+        existingRows.every((tr, idx) => tr.getAttribute('data-config-key') === filtered[idx].config_key);
+
+      if (sameRowOrder) {
+        filtered.forEach((c, idx) => {
+          const row = existingRows[idx];
+          const inputEl = document.getElementById(`cfg-${c.config_key}`);
+          const targetVal = String(
+            Object.prototype.hasOwnProperty.call(dirtyConfigInputs, c.config_key)
+              ? dirtyConfigInputs[c.config_key]
+              : (c.config_value ?? '')
+          );
+          if (inputEl && document.activeElement !== inputEl && inputEl.value !== targetVal) {
+            inputEl.value = targetVal;
+          }
+          const descText = formatConfigDescriptionWithLocalTime(c);
+          const descCell = row.querySelector('.cfg-desc-cell');
+          if (descCell && descCell.textContent !== descText) {
+            descCell.textContent = descText;
+          }
+          const updatedText = formatLocalTimestamp(c.updated_at);
+          const updatedCell = row.querySelector('.cfg-updated-cell');
+          if (updatedCell && updatedCell.textContent !== updatedText) {
+            updatedCell.textContent = updatedText;
+          }
+          const catBadge = row.querySelector('.cfg-cat-badge');
+          if (catBadge && catBadge.textContent !== (c.category || '')) {
+            catBadge.textContent = c.category || '';
+          }
         });
+        return;
+      }
+
+      const activeId = document.activeElement ? document.activeElement.id : null;
+      cfgTbody.innerHTML = filtered.map((c) => {
+        const safeKey = escapeHtml(c.config_key);
+        const encodedKey = encodeURIComponent(c.config_key);
+        return `
+        <tr data-config-key="${safeKey}">
+          <td><span class="badge cfg-cat-badge">${escapeHtml(c.category)}</span></td>
+          <td><strong>${safeKey}</strong></td>
+          <td><input class="config-input" id="cfg-${safeKey}" aria-label="${safeKey}" oninput="onConfigInputEdit(decodeURIComponent('${encodedKey}'), this.value)" /></td>
+          <td class="text-muted cfg-desc-cell" style="white-space:normal; max-width:360px;"></td>
+          <td class="text-muted cfg-updated-cell">${escapeHtml(formatLocalTimestamp(c.updated_at))}</td>
+          <td><button type="button" onclick="saveConfig(decodeURIComponent('${encodedKey}'))">Save</button></td>
+        </tr>
+      `;
+      }).join('');
+
+      filtered.forEach((c) => {
+        const inputEl = document.getElementById(`cfg-${c.config_key}`);
+        if (inputEl) {
+          inputEl.value = String(
+            Object.prototype.hasOwnProperty.call(dirtyConfigInputs, c.config_key)
+              ? dirtyConfigInputs[c.config_key]
+              : (c.config_value ?? '')
+          );
+        }
+        const row = Array.from(cfgTbody.querySelectorAll('tr[data-config-key]')).find((el) => el.getAttribute('data-config-key') === c.config_key);
+        const descCell = row ? row.querySelector('.cfg-desc-cell') : null;
+        if (descCell) {
+          descCell.textContent = formatConfigDescriptionWithLocalTime(c);
+        }
       });
+
+      if (activeId && activeId.startsWith('cfg-')) {
+        const el = document.getElementById(activeId);
+        if (el) el.focus();
+      }
     }
 
-    async function refreshTelemetryState() {
-      const [pRes, cRes] = await Promise.all([
-        fetch('/api/v1/portfolio'),
-        fetch('/api/v1/credentials')
-      ]);
-      if (pRes.ok) renderPortfolio(await pRes.json());
-      if (cRes.ok) renderCredentials(await cRes.json());
+    function resolveCredMode(cred) {
+      if (!cred) return 'PAPER';
+      const raw = String(cred.execution_mode || 'PAPER').toUpperCase();
+      if (raw === 'TESTNET' || (raw === 'LIVE' && cred.hyperliquid_testnet) || cred.active_routing === 'LIVE_TESTNET') {
+        return 'TESTNET';
+      }
+      if (raw === 'LIVE' || cred.active_routing === 'LIVE_MAINNET') {
+        return 'LIVE';
+      }
+      return 'PAPER';
     }
 
-    async function loadSystemConfig() {
+    function modeToRoutingLabel(mode) {
+      const m = String(mode || 'PAPER').toUpperCase();
+      if (m === 'TESTNET') return 'LIVE_TESTNET';
+      if (m === 'LIVE') return 'LIVE_MAINNET';
+      return 'PAPER_SIMULATION';
+    }
+
+    function updateRoutingStatusPill(selectedMode, cred) {
+      const pill = document.getElementById('cred-status-pill');
+      if (!pill || !cred) return;
+      const resolvedMode = resolveCredMode(cred);
+      const savedRouting = cred.active_routing || modeToRoutingLabel(resolvedMode);
+      const isLiveRouting = savedRouting === 'LIVE_TESTNET' || savedRouting === 'LIVE_MAINNET';
+      if (credModeDirty && selectedMode && selectedMode !== resolvedMode) {
+        pill.textContent = `${savedRouting} → ${modeToRoutingLabel(selectedMode)} (UNSAVED)`;
+        pill.style.color = '#fbbf24';
+      } else {
+        pill.textContent = savedRouting;
+        pill.style.color = isLiveRouting ? '#34d399' : '#fbbf24';
+      }
+    }
+
+    function updateRoutingEndpointPreview(selectedMode, cred) {
+      const endpointLabel = document.getElementById('cred-endpoint-label');
+      const vaultInput = document.getElementById('cred-vault');
+      if (vaultInput) {
+        vaultInput.placeholder = selectedMode === 'TESTNET'
+          ? '0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0'
+          : '0xdfc24b077bc1425ad1dea75bcb6f8158e10df303';
+      }
+      if (!endpointLabel) return;
+      const pkLabel = cred && cred.private_key_configured ? cred.private_key_masked : 'Not Set';
+      const geminiLabel = cred && cred.gemini_api_key_configured ? cred.gemini_api_key_masked : 'Not Set';
+      let epText = 'Simulated Fill + Slippage';
+      if (selectedMode === 'TESTNET') {
+        epText = 'https://api.hyperliquid-testnet.xyz';
+      } else if (selectedMode === 'LIVE') {
+        epText = 'https://api.hyperliquid.xyz';
+      } else if (cred && cred.api_endpoint) {
+        epText = `Simulated Fill + Slippage (Data: ${cred.api_endpoint})`;
+      }
+      endpointLabel.textContent = `Endpoint: ${epText} | PK: ${pkLabel} | Gemini: ${geminiLabel}`;
+    }
+
+    function onRoutingModeChange() {
+      const modeSelect = document.getElementById('cred-mode');
+      if (!modeSelect) return;
+      const resolvedMode = resolveCredMode(lastCredState);
+      credModeDirty = modeSelect.value !== resolvedMode;
+      updateRoutingStatusPill(modeSelect.value, lastCredState);
+      updateRoutingEndpointPreview(modeSelect.value, lastCredState);
+    }
+
+    function renderCredentials(cred) {
+      if (!cred) return;
+      lastCredState = cred;
+      const modeBadge = document.getElementById('routing-mode-badge');
+      const modeSelect = document.getElementById('cred-mode');
+      const walletInput = document.getElementById('cred-wallet');
+      const vaultInput = document.getElementById('cred-vault');
+
+      const resolvedMode = resolveCredMode(cred);
+      const isLiveRouting = cred.active_routing === 'LIVE_TESTNET' || cred.active_routing === 'LIVE_MAINNET';
+
+      if (modeBadge) {
+        modeBadge.textContent = `MODE: ${cred.active_routing || resolvedMode}`;
+        modeBadge.className = isLiveRouting ? 'badge badge-bull' : 'badge badge-info';
+      }
+      if (modeSelect && credModeDirty && modeSelect.value === resolvedMode) {
+        credModeDirty = false;
+      }
+      if (modeSelect && !credModeDirty && document.activeElement !== modeSelect) {
+        modeSelect.value = resolvedMode;
+      }
+      const currentSelectedMode = modeSelect ? modeSelect.value : resolvedMode;
+      updateRoutingStatusPill(currentSelectedMode, cred);
+      updateRoutingEndpointPreview(currentSelectedMode, cred);
+
+      if (walletInput && !dirtyFormFields.has('cred-wallet') && document.activeElement !== walletInput && cred.wallet_address !== undefined) {
+        walletInput.value = cred.wallet_address;
+      }
+      if (vaultInput && !dirtyFormFields.has('cred-vault') && document.activeElement !== vaultInput && cred.hyperliquid_vault_address !== undefined) {
+        vaultInput.value = cred.hyperliquid_vault_address;
+      }
+
+      const alertBadge = document.getElementById('alert-status-badge');
+      const tgPill = document.getElementById('tg-status-pill');
+      const tgChatInput = document.getElementById('tg-chat-id');
+      const tgDdInput = document.getElementById('tg-dd-pct');
+
+      if (alertBadge) {
+        alertBadge.textContent = cred.telegram_alerts_ready ? 'TELEGRAM: READY' : 'TELEGRAM: UNCONFIGURED';
+        alertBadge.className = cred.telegram_alerts_ready ? 'badge badge-bull' : 'badge';
+      }
+      if (tgPill) {
+        tgPill.textContent = cred.telegram_alerts_ready ? `READY (${cred.telegram_bot_token_masked})` : 'NOT CONFIGURED';
+        tgPill.style.color = cred.telegram_alerts_ready ? '#34d399' : 'var(--text-muted)';
+      }
+      if (tgChatInput && !dirtyFormFields.has('tg-chat-id') && document.activeElement !== tgChatInput && cred.telegram_chat_id !== undefined) {
+        tgChatInput.value = cred.telegram_chat_id;
+      }
+      if (tgDdInput && !dirtyFormFields.has('tg-dd-pct') && document.activeElement !== tgDdInput && cred.max_daily_drawdown_alert_pct !== undefined) {
+        tgDdInput.value = Number(cred.max_daily_drawdown_alert_pct * 100).toFixed(1);
+      }
+    }
+
+    async function fetchInitialDashboard() {
       try {
-        const res = await fetch('/api/v1/config');
+        const res = await apiFetch('/api/v1/dashboard');
         if (!res.ok) return;
         const data = await res.json();
-        allConfigRows = data.config || [];
-        dirtyConfigValues.clear();
-        updateDirtyCount();
-
-        const countEl = document.getElementById('cfg-total-count');
-        if (countEl) countEl.textContent = String(allConfigRows.length);
-
-        const eqRow = allConfigRows.find(r => r.config_key === 'initial_equity_usdc');
-        if (eqRow) {
-          const eqVal = Number(eqRow.config_value || 10000);
-          const eqInput = document.getElementById('inp-initial-equity');
-          if (eqInput) eqInput.value = String(eqVal);
-          document.querySelectorAll('.eq-preset-btn').forEach(b => {
-            b.classList.toggle('active', Number(b.getAttribute('data-eq')) === eqVal);
-          });
+        if (data && !data.error) {
+          renderDashboard(data);
         }
-
-        renderCategoryPills();
-        renderSystemConfigTable();
       } catch (err) {
-        console.error('Failed to load system_config:', err);
+        console.error('Initial dashboard load error:', err);
       }
     }
 
-    async function applyProportionalRiskCapsViaSingleEndpoint(eqVal) {
-      const eq = Number(eqVal);
-      if (!Number.isFinite(eq) || eq <= 0) return;
-      const getRowNum = (k, defVal) => {
-        const r = allConfigRows.find(x => x.config_key === k);
-        const n = r ? Number(r.config_value) : defVal;
-        return Number.isFinite(n) && n > 0 ? n : defVal;
+    let activeEventSource = null;
+    let sseReconnectTimer = null;
+
+    function connectSSE() {
+      if (sseReconnectTimer) {
+        clearTimeout(sseReconnectTimer);
+        sseReconnectTimer = null;
+      }
+      if (activeEventSource) {
+        try { activeEventSource.close(); } catch (_) {}
+        activeEventSource = null;
+      }
+      const sseBadge = document.getElementById('sse-status');
+      const sseToken = resolveApiAuthToken();
+      const sseUrl = sseToken ? `/api/v1/stream?token=${encodeURIComponent(sseToken)}` : '/api/v1/stream';
+      const evtSource = new EventSource(sseUrl);
+      activeEventSource = evtSource;
+      evtSource.onopen = () => {
+        sseBadge.textContent = 'SSE: LIVE (3s)';
+        sseBadge.className = 'badge badge-bull';
       };
-      const heatPct = getRowNum('max_portfolio_heat_pct', 0.04);
-      const singlePct = getRowNum('max_single_asset_pct', 0.25);
-      const grossLev = getRowNum('max_gross_leverage', 1.5);
-      const scaleMin = getRowNum('conviction_scale_min', 0.5);
-      const scaleMax = getRowNum('conviction_scale_max', 1.5);
-      const baseRisk = Math.round(eq * 0.01 * 100) / 100;
-      const capUpdates = [
-        ['baseline_risk_per_trade_usdc', baseRisk],
-        ['min_risk_per_trade_usdc', Math.round(baseRisk * scaleMin * 100) / 100],
-        ['max_risk_per_trade_usdc', Math.round(baseRisk * scaleMax * 100) / 100],
-        ['max_portfolio_heat_usdc', Math.round(eq * heatPct * 100) / 100],
-        ['max_single_asset_notional_usdc', Math.round(eq * singlePct * 100) / 100],
-        ['max_gross_leverage_notional_usdc', Math.round(eq * grossLev * 100) / 100],
-      ];
-      for (const [k, v] of capUpdates) {
-        await fetch('/api/v1/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ config_key: k, config_value: v }),
-        });
-      }
-    }
-
-    async function saveSingleConfigKey(key, rawValue, valueType, triggerBtn) {
-      const bannerEl = document.getElementById('sys-config-banner');
-      if (SECRET_CFG_KEYS.has(key) && !String(rawValue).trim()) {
-        bannerEl.className = 'state-banner warn';
-        bannerEl.textContent = `Enter a new value for secret key '${key}' before saving.`;
-        return;
-      }
-      const scaleCaps = key === 'initial_equity_usdc' && Boolean(document.getElementById('chk-scale-risk')?.checked);
-      if (triggerBtn) triggerBtn.disabled = true;
-      try {
-        const res = await fetch('/api/v1/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            config_key: key,
-            config_value: castControlValue(rawValue, valueType),
-            scale_risk_caps: scaleCaps,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          bannerEl.className = 'state-banner err';
-          bannerEl.textContent = `Failed to update '${key}': ${data.detail || res.statusText}`;
-          return;
-        }
-        if (scaleCaps && !data.scaled_risk_caps) {
-          await applyProportionalRiskCapsViaSingleEndpoint(rawValue);
-        }
-        bannerEl.className = 'state-banner ok';
-        bannerEl.textContent = scaleCaps
-          ? `Updated '${key}' to $${Number(rawValue).toLocaleString()} and scaled all dollar risk caps proportionally.`
-          : `Updated system_config parameter '${key}' = ${SECRET_CFG_KEYS.has(key) ? '***' : rawValue}.`;
-        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
-      } catch (err) {
-        bannerEl.className = 'state-banner err';
-        bannerEl.textContent = `Request failed saving '${key}': ${err}`;
-      } finally {
-        if (triggerBtn) triggerBtn.disabled = false;
-      }
-    }
-
-    document.querySelectorAll('.eq-preset-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const eqVal = btn.getAttribute('data-eq');
-        const eqInput = document.getElementById('inp-initial-equity');
-        if (eqInput && eqVal) {
-          eqInput.value = eqVal;
-          document.querySelectorAll('.eq-preset-btn').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-        }
-      });
-    });
-
-    document.getElementById('equity-scale-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const eqInput = document.getElementById('inp-initial-equity');
-      const saveBtn = document.getElementById('btn-save-equity');
-      if (!eqInput || !eqInput.checkValidity()) return;
-      await saveSingleConfigKey('initial_equity_usdc', eqInput.value, 'float', saveBtn);
-    });
-
-    async function fallbackSyncWalletFromBrowser(scaleCaps) {
-      const credRes = await fetch('/api/v1/credentials');
-      if (!credRes.ok) {
-        throw new Error('Could not read wallet_address from /api/v1/credentials');
-      }
-      const cred = await credRes.json();
-      const targetUser = (cred.hyperliquid_vault_address || cred.wallet_address || '').trim();
-      if (!targetUser) {
-        throw new Error('Configure your Main Arbitrum Wallet Address (wallet_address) first.');
-      }
-      const isTestnet = Boolean(cred.hyperliquid_testnet);
-      const apiBase = (cred.api_endpoint || (isTestnet ? 'https://api.hyperliquid-testnet.xyz' : 'https://api.hyperliquid.xyz')).replace(/\/+$/, '');
-      const networkLabel = isTestnet ? 'TESTNET' : 'MAINNET';
-
-      let totalUsdc = 0;
-      let accountType = 'perps';
-
-      const perpsRes = await fetch(`${apiBase}/info`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'clearinghouseState', user: targetUser }),
-      });
-      if (perpsRes.ok) {
-        const perpsData = await perpsRes.json();
-        const marginSum = perpsData?.marginSummary || perpsData?.crossMarginSummary || {};
-        totalUsdc = Number(marginSum.accountValue || 0);
-      }
-
-      if (!(totalUsdc > 0)) {
-        const spotRes = await fetch(`${apiBase}/info`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'spotClearinghouseState', user: targetUser }),
-        });
-        if (spotRes.ok) {
-          const spotData = await spotRes.json();
-          const balances = Array.isArray(spotData?.balances) ? spotData.balances : [];
-          const usdcObj = balances.find(b => String(b?.coin || '').toUpperCase().startsWith('USDC'));
-          const spTot = Number(usdcObj?.total || 0);
-          if (spTot > 0) {
-            totalUsdc = spTot;
-            accountType = 'spot';
-          }
-        }
-      }
-
-      const roundedEq = Math.round(totalUsdc * 100) / 100;
-      if (!(roundedEq > 0)) {
-        throw new Error(`Hyperliquid ${networkLabel} wallet ${targetUser} returned $0.00 USDC balance.`);
-      }
-
-      const saveRes = await fetch('/api/v1/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config_key: 'initial_equity_usdc', config_value: roundedEq, scale_risk_caps: scaleCaps }),
-      });
-      if (!saveRes.ok) {
-        const errBody = await saveRes.json().catch(() => ({}));
-        throw new Error(errBody.detail || saveRes.statusText);
-      }
-      if (scaleCaps) {
-        await applyProportionalRiskCapsViaSingleEndpoint(roundedEq);
-      }
-      return {
-        wallet_balance_usdc: roundedEq,
-        network: networkLabel,
-        account_type: accountType,
-        wallet_address: targetUser,
-      };
-    }
-
-    document.getElementById('btn-sync-wallet').addEventListener('click', async () => {
-      const bannerEl = document.getElementById('sys-config-banner');
-      const syncBtn = document.getElementById('btn-sync-wallet');
-      const scaleCaps = Boolean(document.getElementById('chk-scale-risk')?.checked);
-      if (syncBtn) syncBtn.disabled = true;
-      bannerEl.className = 'state-banner warn';
-      bannerEl.textContent = 'Querying live Hyperliquid wallet USDC balance...';
-      try {
-        const res = await fetch('/api/v1/config/sync-wallet', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scale_risk_caps: scaleCaps }),
-        });
-        let data = null;
-        if (res.status === 404) {
-          data = await fallbackSyncWalletFromBrowser(scaleCaps);
-        } else {
-          data = await res.json();
-          if (!res.ok) {
-            bannerEl.className = 'state-banner err';
-            bannerEl.textContent = `Wallet sync failed: ${data.detail || res.statusText}`;
-            return;
-          }
-        }
-        const eqFormatted = Number(data.wallet_balance_usdc).toLocaleString(undefined, {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2,
-        });
-        bannerEl.className = 'state-banner ok';
-        bannerEl.textContent = `Synced initial_equity_usdc = $${eqFormatted} USDC from Hyperliquid ${String(data.network || '').toUpperCase()} (${data.account_type || 'perps'} account, wallet ${shortAddr(data.wallet_address)})${scaleCaps ? ' and scaled all dollar risk caps proportionally.' : '.'}`;
-        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
-      } catch (err) {
-        bannerEl.className = 'state-banner err';
-        bannerEl.textContent = `Wallet sync failed: ${err.message || err}`;
-      } finally {
-        if (syncBtn) syncBtn.disabled = false;
-      }
-    });
-
-    document.getElementById('inp-cfg-search').addEventListener('input', () => {
-      renderSystemConfigTable();
-    });
-
-    document.getElementById('btn-reload-cfg').addEventListener('click', async () => {
-      const bannerEl = document.getElementById('sys-config-banner');
-      await loadSystemConfig();
-      bannerEl.className = 'state-banner ok';
-      bannerEl.textContent = 'Reloaded all system_config parameters from SQLite.';
-    });
-
-    document.getElementById('sys-config-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const bannerEl = document.getElementById('sys-config-banner');
-      const saveAllBtn = document.getElementById('btn-save-all-cfg');
-      if (dirtyConfigValues.size === 0) {
-        bannerEl.className = 'state-banner warn';
-        bannerEl.textContent = 'No modified settings to save. Edit one or more values in the table below first.';
-        return;
-      }
-      const updates = {};
-      for (const [k, rawV] of dirtyConfigValues.entries()) {
-        const row = allConfigRows.find(r => r.config_key === k);
-        updates[k] = castControlValue(rawV, row ? row.value_type : 'string');
-      }
-      const scaleCaps = updates.initial_equity_usdc !== undefined && Boolean(document.getElementById('chk-scale-risk')?.checked);
-      if (saveAllBtn) saveAllBtn.disabled = true;
-      try {
-        const res = await fetch('/api/v1/config/batch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ updates, scale_risk_caps: scaleCaps }),
-        });
-        if (res.status === 404) {
-          const savedKeys = [];
-          for (const [k, v] of Object.entries(updates)) {
-            const singleRes = await fetch('/api/v1/config', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ config_key: k, config_value: v }),
-            });
-            const singleData = await singleRes.json();
-            if (!singleRes.ok) {
-              bannerEl.className = 'state-banner err';
-              bannerEl.textContent = `Update rejected on '${k}': ${singleData.detail || singleRes.statusText}`;
-              return;
-            }
-            savedKeys.push(k);
-          }
-          if (scaleCaps) {
-            await applyProportionalRiskCapsViaSingleEndpoint(updates.initial_equity_usdc);
-          }
-          bannerEl.className = 'state-banner ok';
-          bannerEl.textContent = `Saved ${savedKeys.length} configuration parameter(s): ${savedKeys.join(', ')}`;
-          await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
-          return;
-        }
-        const data = await res.json();
-        if (!res.ok) {
-          bannerEl.className = 'state-banner err';
-          bannerEl.textContent = `Batch update rejected: ${data.detail || res.statusText}`;
-          return;
-        }
-        bannerEl.className = 'state-banner ok';
-        bannerEl.textContent = `Saved ${data.count} configuration parameter(s): ${(data.updated_keys || []).join(', ')}`;
-        await Promise.all([loadSystemConfig(), refreshTelemetryState()]);
-      } catch (err) {
-        bannerEl.className = 'state-banner err';
-        bannerEl.textContent = `Batch update failed: ${err}`;
-      } finally {
-        if (saveAllBtn) saveAllBtn.disabled = false;
-      }
-    });
-
-    // Interaction-deferred validation & ARIA synchronization
-    const UserInvalidFallback = (() => {
-      const dirtyState = new WeakMap();
-      const updateState = (input) => {
-        const isValid = input.checkValidity();
-        input.classList.toggle('user-invalid-fallback', !isValid);
-        input.classList.toggle('user-valid-fallback', isValid);
-        if (!isValid) {
-          input.setAttribute('aria-invalid', 'true');
-        } else {
-          input.removeAttribute('aria-invalid');
-        }
-      };
-      const handleEvent = (event) => {
-        const input = event.target;
-        if (!input || !input.checkValidity) return;
-        if (event.type === 'input' || event.type === 'change') {
-          const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
-          state.hasInteracted = true;
-          dirtyState.set(input, state);
-          if (state.hasBlurred) updateState(input);
-        } else if (event.type === 'blur') {
-          const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
-          state.hasBlurred = true;
-          dirtyState.set(input, state);
-          if (state.hasInteracted) updateState(input);
-        }
-      };
-      const init = (root = document) => {
-        if (typeof CSS !== 'undefined' && CSS.supports && CSS.supports('selector(:user-invalid)')) return;
-        root.addEventListener('blur', handleEvent, true);
-        root.addEventListener('input', handleEvent);
-        root.addEventListener('change', handleEvent);
-      };
-      return { init };
-    })();
-    UserInvalidFallback.init(document);
-
-    const syncAria = (el) => {
-      if (el && el.matches && el.setAttribute) {
-        try {
-          el.setAttribute('aria-invalid', el.matches(':user-invalid') ? 'true' : 'false');
-        } catch (err) {}
-      }
-    };
-    document.addEventListener('blur', (e) => syncAria(e.target), true);
-    document.addEventListener('input', (e) => {
-      if (e.target && e.target.hasAttribute && e.target.hasAttribute('aria-invalid')) syncAria(e.target);
-    });
-
-    async function bootstrapLoad() {
-      try {
-        const [stRes, pRes, sRes, cRes] = await Promise.all([
-          fetch('/api/v1/status'),
-          fetch('/api/v1/portfolio'),
-          fetch('/api/v1/signals'),
-          fetch('/api/v1/credentials'),
-          loadSystemConfig()
-        ]);
-        const stData = await stRes.json();
-        const pData = await pRes.json();
-        const sData = await sRes.json();
-        const cData = await cRes.json();
-        if (stData.version) {
-          document.getElementById('ver-badge').textContent = stData.version;
-        }
-        const rtBadge = document.getElementById('runtime-badge');
-        if (rtBadge) {
-          const isRust = String(stData.runtime || '').toUpperCase().includes('RUST');
-          rtBadge.textContent = isRust ? 'ENGINE: RUST NATIVE' : 'ENGINE: PYTHON';
-          rtBadge.className = `badge ${isRust ? 'BULL' : 'CHOP'}`;
-        }
-        if (stData.journal_mode) {
-          const sVer = stData.schema_version ?? 4;
-          document.getElementById('wal-badge').textContent = `SQLite: ${String(stData.journal_mode).toUpperCase()} (v${sVer})`;
-        }
-        renderPortfolio(pData);
-        renderSignals(sData.signals || []);
-        renderTrades(pData.open_positions || []);
-        renderCredentials(cData);
-      } catch (err) {
-        console.error('Initial telemetry fetch error:', err);
-      }
-
-      const evt = new EventSource('/api/v1/stream');
-      evt.onmessage = (e) => {
+      evtSource.onmessage = (e) => {
         try {
           const data = JSON.parse(e.data);
-          const rtBadge = document.getElementById('runtime-badge');
-          if (rtBadge && data.runtime) {
-            const isRust = String(data.runtime).toUpperCase().includes('RUST');
-            rtBadge.textContent = isRust ? 'ENGINE: RUST NATIVE' : 'ENGINE: PYTHON';
-            rtBadge.className = `badge ${isRust ? 'BULL' : 'CHOP'}`;
+          if (data && !data.error) {
+            sseBadge.textContent = 'SSE: LIVE (3s)';
+            sseBadge.className = 'badge badge-bull';
+            renderDashboard(data);
           }
-          renderPortfolio(data.portfolio);
-          renderSignals(data.signals);
-          renderTrades(data.open_trades);
-        } catch (err) {}
+        } catch (err) {
+          console.error('SSE parse error:', err);
+        }
+      };
+      evtSource.onerror = () => {
+        sseBadge.textContent = 'SSE: RECONNECTING';
+        sseBadge.className = 'badge badge-chop';
+        try { evtSource.close(); } catch (_) {}
+        if (activeEventSource === evtSource) {
+          activeEventSource = null;
+        }
+        fetchInitialDashboard();
+        if (!sseReconnectTimer) {
+          sseReconnectTimer = setTimeout(connectSSE, 3000);
+        }
       };
     }
 
-    bootstrapLoad();
+    setInterval(() => {
+      if (!activeEventSource || activeEventSource.readyState !== 1) {
+        fetchInitialDashboard();
+      }
+    }, 5000);
+
+    async function saveConfig(key) {
+      const val = document.getElementById(`cfg-${key}`).value;
+      const res = await apiFetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_key: key, config_value: val })
+      });
+      if (res.ok) {
+        delete dirtyConfigInputs[key];
+        if (ROUTING_CONFIG_KEYS.includes(key)) {
+          clearRoutingDirtyInputs();
+        }
+        if (key === 'initial_equity_usdc') {
+          dirtyFormFields.delete('capital-baseline-input');
+        }
+        await fetchInitialDashboard();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert('Error updating config: ' + (err.detail || res.statusText));
+      }
+    }
+
+    async function updatePondDirectionPolicy(policyVal) {
+      const res = await apiFetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_key: 'pond_direction_policy', config_value: policyVal })
+      });
+      if (res.ok) {
+        await fetchInitialDashboard();
+      }
+    }
+
+    async function triggerPondScan() {
+      const btn = document.getElementById('btn-pond-scan');
+      if (btn) { btn.disabled = true; btn.textContent = 'Scanning 80 Coins...'; }
+      try {
+        const res = await apiFetch('/api/v1/pond/scan', { method: 'POST' });
+        const data = await res.json();
+        if (data.dashboard) renderDashboard(data.dashboard);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Run Pond Scan'; }
+      }
+    }
+
+    async function triggerSettleRun(dryRun) {
+      const btn = document.getElementById('btn-settle-dry');
+      if (btn) { btn.disabled = true; btn.textContent = 'Settling...'; }
+      try {
+        const res = await apiFetch('/api/v1/settle/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dry_run: Boolean(dryRun) })
+        });
+        const data = await res.json();
+        if (data.dashboard) renderDashboard(data.dashboard);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = `Dry-Run ${formatUtcTimeOfDayToLocal(latestSettlingTimeUtc)} Settle`;
+        }
+      }
+    }
+
+    async function applyCapitalBaseline() {
+      const val = parseFloat(document.getElementById('capital-baseline-input').value);
+      if (!val || val < 100) {
+        alert('Initial equity must be at least $100 USDC.');
+        return;
+      }
+      const res = await apiFetch('/api/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config_key: 'initial_equity_usdc', config_value: val, scale_risk_caps: true })
+      });
+      if (res.ok) {
+        dirtyFormFields.delete('capital-baseline-input');
+        delete dirtyConfigInputs['initial_equity_usdc'];
+        await fetchInitialDashboard();
+      }
+    }
+
+    async function syncWalletEquity() {
+      const btn = document.getElementById('btn-sync-wallet');
+      btn.disabled = true;
+      btn.textContent = 'Querying Hyperliquid L1...';
+      try {
+        const res = await apiFetch('/api/v1/wallet/sync', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          alert('Wallet sync failed: ' + (data.detail || 'Unknown error'));
+          return;
+        }
+        dirtyFormFields.delete('capital-baseline-input');
+        await fetchInitialDashboard();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync From Hyperliquid L1 Wallet';
+      }
+    }
+
+    async function saveCredentials() {
+      const mode = document.getElementById('cred-mode').value;
+      const wallet = document.getElementById('cred-wallet').value.trim();
+      const pk = document.getElementById('cred-pk').value.trim();
+      const vault = document.getElementById('cred-vault').value.trim();
+      const gemini = document.getElementById('cred-gemini').value.trim();
+
+      const payload = {
+        execution_mode: mode,
+        hyperliquid_testnet: mode !== 'LIVE',
+        wallet_address: wallet,
+        hyperliquid_vault_address: vault
+      };
+      if (pk.length > 0) payload.private_key = pk;
+      if (gemini.length > 0) payload.gemini_api_key = gemini;
+
+      const res = await apiFetch('/api/v1/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert('Credential validation error: ' + (data.detail || 'Invalid format'));
+        return;
+      }
+      clearRoutingDirtyInputs();
+      dirtyFormFields.delete('cred-wallet');
+      dirtyFormFields.delete('cred-vault');
+      document.getElementById('cred-pk').value = '';
+      document.getElementById('cred-gemini').value = '';
+      renderCredentials(data.credentials);
+      await fetchInitialDashboard();
+    }
+
+    async function saveTelegramAlerts() {
+      const token = document.getElementById('tg-token').value.trim();
+      const chatId = document.getElementById('tg-chat-id').value.trim();
+      const ddPct = parseFloat(document.getElementById('tg-dd-pct').value || '3.0') / 100.0;
+
+      const payload = {
+        telegram_chat_id: chatId,
+        max_daily_drawdown_alert_pct: ddPct
+      };
+      if (token.length > 0) payload.telegram_bot_token = token;
+
+      const res = await apiFetch('/api/v1/alerts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert('Telegram config error: ' + (data.detail || 'Invalid parameter'));
+        return;
+      }
+      dirtyFormFields.delete('tg-chat-id');
+      dirtyFormFields.delete('tg-dd-pct');
+      document.getElementById('tg-token').value = '';
+      renderCredentials(data.alerts);
+      await fetchInitialDashboard();
+    }
+
+    async function sendTestAlert() {
+      const res = await apiFetch('/api/v1/alerts/test', { method: 'POST' });
+      const data = await res.json();
+      dirtyFormFields.delete('tg-chat-id');
+      if (data.status === 'DELIVERED') {
+        const cid = data.chat_id ? ` (Chat ID: ${data.chat_id})` : '';
+        alert(`Telegram Alert Dispatch Status: DELIVERED${cid}`);
+      } else {
+        const detail = data.error_detail || (data.channels && data.channels[0] && data.channels[0].error) || data.reason || '';
+        alert(`Telegram Alert Dispatch Status: ${data.status}${detail ? '\n\n' + detail : ''}`);
+      }
+      await fetchInitialDashboard();
+    }
+
+    async function triggerCycle() {
+      const btn = document.getElementById('btn-cycle');
+      btn.disabled = true;
+      btn.textContent = 'Running Cycle...';
+      try {
+        const res = await apiFetch('/api/v1/engine/cycle', { method: 'POST' });
+        const data = await res.json();
+        if (data.dashboard) renderDashboard(data.dashboard);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Run Platform Cycle';
+      }
+    }
+
+    async function triggerCalibration() {
+      const btn = document.getElementById('btn-calibrate');
+      btn.disabled = true;
+      btn.textContent = 'Calibrating...';
+      try {
+        const res = await apiFetch('/api/v1/engine/calibrate', { method: 'POST' });
+        const data = await res.json();
+        document.getElementById('report-panel').style.display = 'flex';
+        document.getElementById('report-title').textContent = 'Walk-Forward MACE Calibration Report';
+        document.getElementById('report-content').textContent = replaceUtcTimestampsInText(JSON.stringify(data.calibration_report, null, 2));
+        switchDashboardPage('overall');
+        await fetchInitialDashboard();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Calibrate MACE';
+      }
+    }
+
+    async function triggerBacktest() {
+      const btn = document.getElementById('btn-backtest');
+      btn.disabled = true;
+      btn.textContent = 'Simulating 365d...';
+      try {
+        const res = await apiFetch('/api/v1/engine/backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ days: 365, use_real_history: true })
+        });
+        const data = await res.json();
+        document.getElementById('report-panel').style.display = 'flex';
+        document.getElementById('report-title').textContent = '365-Day Walk-Forward Tear Sheet (0.35% Slippage + 1H Funding)';
+        document.getElementById('report-content').textContent = replaceUtcTimestampsInText(data.formatted_report);
+        switchDashboardPage('overall');
+        await fetchInitialDashboard();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Run 365d Tear Sheet';
+      }
+    }
+
+    fetchInitialDashboard();
+    connectSSE();
   </script>
 </body>
 </html>

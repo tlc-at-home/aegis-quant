@@ -4,11 +4,10 @@ version = 4
 
 [[package]]
 name = "aegis-alerts"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aegis-db",
- "anyhow",
  "chrono",
  "parking_lot",
  "reqwest",
@@ -19,14 +18,13 @@ dependencies = [
 
 [[package]]
 name = "aegis-backtest"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aegis-db",
  "aegis-execution",
  "aegis-risk",
  "aegis-signals",
- "anyhow",
  "chrono",
  "rayon",
  "serde",
@@ -37,31 +35,32 @@ dependencies = [
 
 [[package]]
 name = "aegis-cli"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-alerts",
  "aegis-backtest",
  "aegis-core",
  "aegis-db",
  "aegis-execution",
+ "aegis-pit",
+ "aegis-pond",
  "aegis-risk",
+ "aegis-settle",
  "aegis-signals",
+ "aegis-telemetry",
  "aegis-web",
  "anyhow",
- "chrono",
  "clap",
- "serde",
+ "futures-util",
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "aegis-core"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
- "anyhow",
  "chrono",
  "hex",
  "k256",
@@ -74,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-db"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aes",
@@ -82,6 +81,7 @@ dependencies = [
  "base64 0.22.1",
  "cbc",
  "chrono",
+ "clap",
  "hmac",
  "parking_lot",
  "rand 0.8.8",
@@ -97,13 +97,12 @@ dependencies = [
 
 [[package]]
 name = "aegis-execution"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-alerts",
  "aegis-core",
  "aegis-db",
  "aegis-risk",
- "anyhow",
  "chrono",
  "hex",
  "k256",
@@ -117,27 +116,74 @@ dependencies = [
  "sha3",
  "tracing",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "aegis-pit"
+version = "0.3.0-rc1"
+dependencies = [
+ "aegis-core",
+ "aegis-db",
+ "aegis-execution",
+ "aegis-risk",
+ "aegis-signals",
+ "aegis-telemetry",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aegis-pond"
+version = "0.3.0-rc1"
+dependencies = [
+ "aegis-core",
+ "aegis-db",
+ "aegis-execution",
+ "aegis-risk",
+ "aegis-telemetry",
+ "chrono",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "aegis-risk"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aegis-db",
- "anyhow",
  "serde",
  "serde_json",
  "tracing",
 ]
 
 [[package]]
-name = "aegis-signals"
-version = "0.2.0-rc2"
+name = "aegis-settle"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aegis-db",
- "anyhow",
+ "aegis-execution",
+ "aegis-telemetry",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aegis-signals"
+version = "0.3.0-rc1"
+dependencies = [
+ "aegis-core",
+ "aegis-db",
  "parking_lot",
  "rand 0.8.8",
  "rayon",
@@ -147,19 +193,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegis-telemetry"
+version = "0.3.0-rc1"
+dependencies = [
+ "aegis-alerts",
+ "aegis-core",
+ "aegis-db",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aegis-web"
-version = "0.2.0-rc2"
+version = "0.3.0-rc1"
 dependencies = [
  "aegis-alerts",
  "aegis-backtest",
  "aegis-core",
  "aegis-db",
  "aegis-execution",
- "aegis-risk",
+ "aegis-pond",
+ "aegis-settle",
  "aegis-signals",
  "anyhow",
  "axum",
- "futures-util",
+ "rand 0.8.8",
  "serde",
  "serde_json",
  "tokio",

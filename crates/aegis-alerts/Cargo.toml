@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 aegis-core = { workspace = true }
 aegis-db = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
