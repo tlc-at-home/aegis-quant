@@ -147,11 +147,21 @@ impl ExecutionEngine {
                 "https://api.hyperliquid-testnet.xyz",
             );
             let fallback = format!("{}/info", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_testnet_info_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_testnet_info_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         } else {
             let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
             let fallback = format!("{}/info", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_info_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_info_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         }
     }
 
@@ -162,11 +172,21 @@ impl ExecutionEngine {
                 "https://api.hyperliquid-testnet.xyz",
             );
             let fallback = format!("{}/exchange", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_testnet_exchange_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_testnet_exchange_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         } else {
             let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
             let fallback = format!("{}/exchange", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_exchange_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_exchange_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         }
     }
 
@@ -3215,13 +3235,21 @@ mod tests {
         let db = DatabaseManager::memory();
         db.initialize_schema(false).unwrap();
         // Force offline endpoint so test never depends on external network reachability
-        db.set_config_value("hyperliquid_info_url", &json!("http://127.0.0.1:1/info"))
-            .unwrap();
-        db.set_config_value(
-            "hyperliquid_testnet_info_url",
-            &json!("http://127.0.0.1:1/info"),
-        )
-        .unwrap();
+        assert!(db
+            .set_config_value("hyperliquid_mainnet_url", &json!("http://127.0.0.1:1"))
+            .unwrap());
+        assert!(db
+            .set_config_value("hyperliquid_testnet_url", &json!("http://127.0.0.1:1"))
+            .unwrap());
+        assert!(db
+            .set_config_value("hyperliquid_info_url", &json!("http://127.0.0.1:1/info"))
+            .unwrap());
+        assert!(db
+            .set_config_value(
+                "hyperliquid_testnet_info_url",
+                &json!("http://127.0.0.1:1/info"),
+            )
+            .unwrap());
         let mut exec = ExecutionEngine::new(db.clone());
         exec.timeout_sec = 1;
 
@@ -3248,8 +3276,9 @@ mod tests {
 
         // S6: Verify fallback indices are NEVER cached and LIVE/TESTNET mode refuses fallback indices
         assert!(exec.asset_index_cache.lock().is_empty());
-        db.set_config_value("execution_mode", &json!("LIVE"))
-            .unwrap();
+        assert!(db
+            .set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap());
         assert_eq!(
             exec.fetch_hyperliquid_universe_asset_index("ADA", false),
             None

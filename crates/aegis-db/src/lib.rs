@@ -164,6 +164,69 @@ fn alert_config_defaults(
                 "Daily portfolio drawdown threshold (3.0%) triggering critical Telegram alert",
             ),
         ),
+        (
+            "hyperliquid_info_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Mainnet /info endpoint URL",
+            ),
+        ),
+        (
+            "hyperliquid_testnet_info_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Testnet /info endpoint URL",
+            ),
+        ),
+        (
+            "hyperliquid_exchange_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Mainnet /exchange endpoint URL",
+            ),
+        ),
+        (
+            "hyperliquid_testnet_exchange_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Testnet /exchange endpoint URL",
+            ),
+        ),
+        (
+            "hyperliquid_mainnet_api_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Mainnet API base URL",
+            ),
+        ),
+        (
+            "hyperliquid_testnet_api_url",
+            (
+                "",
+                "string",
+                "execution",
+                "Optional override for Hyperliquid Testnet API base URL",
+            ),
+        ),
+        (
+            "equity_baseline_reset_at",
+            (
+                "",
+                "string",
+                "risk",
+                "ISO-8601 timestamp of last manual equity baseline reset",
+            ),
+        ),
     ])
 }
 
@@ -1719,10 +1782,20 @@ impl DatabaseManager {
                 "hyperliquid_testnet_url",
                 "https://api.hyperliquid-testnet.xyz",
             );
-            cfg.get_str("hyperliquid_testnet_api_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_testnet_api_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         } else {
             let fallback = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
-            cfg.get_str("hyperliquid_mainnet_api_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_mainnet_api_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         };
         let active_routing =
             if (effective_mode == "LIVE" || effective_mode == "TESTNET") && credentials_ready {

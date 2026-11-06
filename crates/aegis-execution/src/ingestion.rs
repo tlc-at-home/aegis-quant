@@ -69,11 +69,21 @@ impl MarketIngestionEngine {
                 "https://api.hyperliquid-testnet.xyz",
             );
             let fallback = format!("{}/info", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_testnet_info_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_testnet_info_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         } else {
             let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
             let fallback = format!("{}/info", base.trim_end_matches('/'));
-            cfg.get_str("hyperliquid_info_url", &fallback)
+            let custom = cfg.get_str("hyperliquid_info_url", "");
+            if custom.trim().is_empty() {
+                fallback
+            } else {
+                custom.trim().to_string()
+            }
         }
     }
 
