@@ -1,13 +1,15 @@
 //! Market Data Ingestion & `ALT/BTC:SYNTH` Synthesis Engine (`aegis-execution::ingestion`).
 
-use aegis_core::{base_prices_usdc, round_dp, timeframe_seconds, OhlcvBar, PondUniverseRow, Result};
+use crate::http_client::{http_post_json, resolve_info_url, shared_blocking_client};
+use aegis_core::{
+    now_iso8601_utc, round_dp, timeframe_seconds, OhlcvBar, PondUniverseRow, Result,
+};
 use aegis_db::{ConfigMap, DatabaseManager};
 use chrono::Utc;
 use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 /// Market Data Ingestion & `ALT/BTC:SYNTH` Synthesis Engine (`engine/ingestion.py`).
 #[derive(Clone)]
@@ -31,10 +33,7 @@ impl MarketIngestionEngine {
                 .clamp(1, 60) as u64
             })
             .unwrap_or(8);
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(timeout_sec))
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let http_client = shared_blocking_client(timeout_sec);
         Self {
             db,
             timeout_sec,
@@ -44,87 +43,30 @@ impl MarketIngestionEngine {
     }
 
     fn load_config_logged(&self, caller: &str) -> ConfigMap {
-        match self.db.load_config() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                tracing::error!(
-                    caller = caller,
-                    error = %e,
-                    "MarketIngestionEngine failed to load system_config from SQLite; falling back to empty ConfigMap"
-                );
-                ConfigMap::default()
-            }
-        }
+        self.db.load_config_logged(caller)
     }
 
     fn info_url(&self) -> String {
-        let cfg = self.load_config_logged("info_url");
-        let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
-            || cfg
-                .get_str("execution_mode", "PAPER")
-                .eq_ignore_ascii_case("TESTNET");
-        if is_testnet {
-            let base = cfg.get_str(
-                "hyperliquid_testnet_url",
-                "https://api.hyperliquid-testnet.xyz",
-            );
-            let fallback = format!("{}/info", base.trim_end_matches('/'));
-            let custom = cfg.get_str("hyperliquid_testnet_info_url", "");
-            if custom.trim().is_empty() {
-                fallback
-            } else {
-                custom.trim().to_string()
-            }
-        } else {
-            let base = cfg.get_str("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz");
-            let fallback = format!("{}/info", base.trim_end_matches('/'));
-            let custom = cfg.get_str("hyperliquid_info_url", "");
-            if custom.trim().is_empty() {
-                fallback
-            } else {
-                custom.trim().to_string()
-            }
-        }
+        let cfg = self.load_config_logged("engine.ingestion.info_url");
+        resolve_info_url(&cfg)
     }
 
     fn http_post_json(&self, url: &str, payload: &Value) -> Option<Value> {
-        let owned_client;
-        let client_ref = if self.timeout_sec == self.client_timeout_sec {
-            &self.http_client
-        } else {
-            owned_client = Client::builder()
-                .timeout(Duration::from_secs(self.timeout_sec.max(1)))
-                .build()
-                .ok()?;
-            &owned_client
-        };
-        let resp = match client_ref.post(url).json(payload).send() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(url = url, error = %e, "Hyperliquid /info request failed");
-                return None;
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::warn!(
-                url = url,
-                status = %resp.status(),
-                "Hyperliquid /info returned non-2xx HTTP status"
-            );
-            return None;
-        }
-        match resp.json::<Value>() {
-            Ok(val) => Some(val),
-            Err(e) => {
-                tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid /info");
-                None
-            }
-        }
+        let cfg = self.load_config_logged("engine.ingestion.http_post_json");
+        http_post_json(
+            &self.http_client,
+            self.timeout_sec,
+            self.client_timeout_sec,
+            url,
+            payload,
+            &cfg,
+        )
     }
 
     pub fn fetch_hyperliquid_funding_map(&self) -> HashMap<String, f64> {
         let mut out = HashMap::new();
-        let Some(resp) = self.http_post_json(&self.info_url(), &json!({"type": "metaAndAssetCtxs"}))
+        let Some(resp) =
+            self.http_post_json(&self.info_url(), &json!({"type": "metaAndAssetCtxs"}))
         else {
             return out;
         };
@@ -155,13 +97,13 @@ impl MarketIngestionEngine {
         out
     }
 
-    pub fn fetch_hyperliquid_candles(
+    pub fn fetch_hyperliquid_candles_result(
         &self,
         coin: &str,
         interval: &str,
         lookback_bars: usize,
         funding_hourly: f64,
-    ) -> Option<Vec<OhlcvBar>> {
+    ) -> Result<Vec<OhlcvBar>> {
         let tf_sec = timeframe_seconds(interval);
         let now_ms = Utc::now().timestamp_millis();
         let start_ms = now_ms - ((lookback_bars as i64 + 2) * tf_sec * 1000);
@@ -174,10 +116,18 @@ impl MarketIngestionEngine {
                 "endTime": now_ms,
             }
         });
-        let raw = self.http_post_json(&self.info_url(), &payload)?;
-        let list = raw.as_array()?;
+        let raw = self.http_post_json(&self.info_url(), &payload).ok_or_else(|| {
+            aegis_core::AegisError::Execution(format!(
+                "Hyperliquid candleSnapshot HTTP request failed for {coin} ({interval})"
+            ))
+        })?;
+        let list = raw.as_array().ok_or_else(|| {
+            aegis_core::AegisError::Execution(format!(
+                "Hyperliquid candleSnapshot response is not an array for {coin} ({interval})"
+            ))
+        })?;
         if list.is_empty() {
-            return None;
+            return Ok(Vec::new());
         }
 
         let symbol = format!("{coin}/USDC:USDC");
@@ -212,7 +162,20 @@ impl MarketIngestionEngine {
         if bars.len() > lookback_bars {
             bars = bars[bars.len() - lookback_bars..].to_vec();
         }
-        Some(bars)
+        Ok(bars)
+    }
+
+    pub fn fetch_hyperliquid_candles(
+        &self,
+        coin: &str,
+        interval: &str,
+        lookback_bars: usize,
+        funding_hourly: f64,
+    ) -> Option<Vec<OhlcvBar>> {
+        match self.fetch_hyperliquid_candles_result(coin, interval, lookback_bars, funding_hourly) {
+            Ok(bars) if !bars.is_empty() => Some(bars),
+            _ => None,
+        }
     }
 
     /// Generates realistic multi-regime OHLCV bars (`BEAR`, `CHOP`, `BULL`) for offline / sandbox testing.
@@ -372,7 +335,6 @@ impl MarketIngestionEngine {
     ) -> Result<HashMap<String, usize>> {
         let usdc_assets = self.db.get_usdc_perp_universe()?;
         let alt_pairs = self.db.get_alt_pairs_universe()?;
-        let base_prices = base_prices_usdc();
 
         let mut timeframes: HashSet<String> = HashSet::from(["4h".to_string(), "1h".to_string()]);
         for a in &usdc_assets {
@@ -380,7 +342,7 @@ impl MarketIngestionEngine {
             timeframes.insert(a.rs_timeframe.clone());
         }
 
-        let cfg = self.load_config_logged("ingest_universe");
+        let cfg = self.load_config_logged("engine.ingestion.ingest_universe");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_live_or_testnet =
             mode == "LIVE" || mode == "TESTNET" || cfg.get_bool("hyperliquid_testnet", false);
@@ -397,18 +359,35 @@ impl MarketIngestionEngine {
         let mut live_api_used = false;
         let mut api_unreachable = false;
 
+        let max_consecutive_failures =
+            cfg.get_i64("max_consecutive_api_failures", 5).max(1) as usize;
+        let mut consecutive_failures = 0usize;
+
         let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
         sorted_tfs.sort();
+
+        let btc_ref_px = self.db.resolve_reference_price("BTC/USDC:USDC");
 
         for tf in &sorted_tfs {
             let mut bars_opt = None;
             if !force_synthetic && !api_unreachable {
                 let f_rate = funding_map.get("BTC").copied().unwrap_or(0.0001);
-                bars_opt = self.fetch_hyperliquid_candles("BTC", tf, lookback_bars, f_rate);
-                if bars_opt.is_some() {
-                    live_api_used = true;
-                } else if funding_map.is_empty() {
-                    api_unreachable = true;
+                match self.fetch_hyperliquid_candles_result("BTC", tf, lookback_bars, f_rate) {
+                    Ok(b) => {
+                        consecutive_failures = 0;
+                        if !b.is_empty() {
+                            live_api_used = true;
+                            bars_opt = Some(b);
+                        }
+                    }
+                    Err(_) => {
+                        consecutive_failures += 1;
+                        if funding_map.is_empty()
+                            || consecutive_failures >= max_consecutive_failures
+                        {
+                            api_unreachable = true;
+                        }
+                    }
                 }
             }
             let bars = match bars_opt {
@@ -436,7 +415,7 @@ impl MarketIngestionEngine {
                             "BTC/USDC:USDC",
                             tf,
                             lookback_bars,
-                            *base_prices.get("BTC/USDC:USDC").unwrap_or(&68500.0),
+                            btc_ref_px,
                             None,
                             1,
                             None,
@@ -461,19 +440,38 @@ impl MarketIngestionEngine {
                 .get(&asset.base_asset)
                 .copied()
                 .unwrap_or(0.00012);
-            let ref_px = *base_prices.get(asset.symbol.as_str()).unwrap_or(&10.0);
+            let ref_px = if asset.reference_price > 0.0 {
+                asset.reference_price
+            } else {
+                self.db.resolve_reference_price(&asset.symbol)
+            };
 
             for tf in req_tfs {
                 let mut bars_opt = None;
                 if !force_synthetic && !api_unreachable {
-                    bars_opt = self.fetch_hyperliquid_candles(
+                    match self.fetch_hyperliquid_candles_result(
                         &asset.base_asset,
                         &tf,
                         lookback_bars,
                         f_rate,
-                    );
-                    if bars_opt.is_some() {
-                        live_api_used = true;
+                    ) {
+                        Ok(b) => {
+                            consecutive_failures = 0;
+                            if !b.is_empty() {
+                                live_api_used = true;
+                                bars_opt = Some(b);
+                            }
+                        }
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            if consecutive_failures >= max_consecutive_failures {
+                                tracing::warn!(
+                                    consecutive_failures = consecutive_failures,
+                                    "Hyperliquid candleSnapshot reached max_consecutive_api_failures in altcoin loop; tripping api_unreachable circuit breaker (NM-12)"
+                                );
+                                api_unreachable = true;
+                            }
+                        }
                     }
                 }
                 match bars_opt {
@@ -555,31 +553,52 @@ impl MarketIngestionEngine {
     }
 
     /// Discovers top-N Hyperliquid USDC perpetual candidates ranked by 7-day median daily volume,
-    /// falling back to a deterministic 80-coin Hyperliquid universe when offline.
+    /// falling back to a deterministic 85-coin Hyperliquid universe when offline (`NH-9`, `NM-13`, `HP`).
     pub fn discover_pond_universe_candidates(
         &self,
         target_size: usize,
         min_daily_vol_usdc: f64,
     ) -> Vec<PondUniverseRow> {
-        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
         let warmup_ready = (Utc::now() - chrono::Duration::hours(200))
-            .format("%Y-%m-%d %H:%M:%S")
+            .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
 
-        // Try live Hyperliquid metaAndAssetCtxs first
-        if let Some(resp) = self.http_post_json(&self.info_url(), &json!({"type": "metaAndAssetCtxs"})) {
-            if let Some(arr) = resp.as_array() {
-                if arr.len() >= 2 {
+        let cfg = self.load_config_logged("discover_pond_universe_candidates");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let has_custom_info_url = !cfg.get_str("hyperliquid_info_url", "").trim().is_empty()
+            || !cfg
+                .get_str("hyperliquid_testnet_info_url", "")
+                .trim()
+                .is_empty();
+        let should_query_live = exec_mode == "LIVE"
+            || exec_mode == "TESTNET"
+            || pond_mode == "LIVE"
+            || pond_mode == "TESTNET"
+            || has_custom_info_url;
+
+        // Try live Hyperliquid metaAndAssetCtxs when in LIVE/TESTNET mode or custom info endpoint is set
+        if should_query_live {
+            if let Some(resp) =
+                self.http_post_json(&self.info_url(), &json!({"type": "metaAndAssetCtxs"}))
+            {
+                if let Some(arr) = resp.as_array() {
+                    if arr.len() >= 2 {
                     let universe = arr[0]
                         .get("universe")
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
                     let ctxs = arr[1].as_array().cloned().unwrap_or_default();
-                    let mut live_items: Vec<(String, f64)> = Vec::new();
+                    let mut live_items: Vec<(String, f64, u32, f64, f64)> = Vec::new();
                     for (u, c) in universe.iter().zip(ctxs.iter()) {
-                        let is_delisted =
-                            u.get("isDelisted").and_then(Value::as_bool).unwrap_or(false);
+                        let is_delisted = u
+                            .get("isDelisted")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         if is_delisted {
                             continue;
                         }
@@ -592,7 +611,36 @@ impl MarketIngestionEngine {
                                 })
                                 .unwrap_or(0.0);
                             if day_vlm >= min_daily_vol_usdc {
-                                live_items.push((name.to_uppercase(), day_vlm));
+                                let sz_decimals = u
+                                    .get("szDecimals")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(3)
+                                    .min(6) as u32;
+                                let max_lev = u
+                                    .get("maxLeverage")
+                                    .and_then(|v| {
+                                        v.as_f64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                        })
+                                    })
+                                    .unwrap_or(3.0)
+                                    .clamp(1.0, 50.0);
+                                let mark_px = c
+                                    .get("markPx")
+                                    .or_else(|| c.get("midPx"))
+                                    .and_then(|v| {
+                                        v.as_f64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                        })
+                                    })
+                                    .unwrap_or(0.0);
+                                live_items.push((
+                                    name.to_uppercase(),
+                                    day_vlm,
+                                    sz_decimals,
+                                    max_lev,
+                                    mark_px,
+                                ));
                             }
                         }
                     }
@@ -603,24 +651,44 @@ impl MarketIngestionEngine {
                             .into_iter()
                             .take(target_size)
                             .enumerate()
-                            .map(|(idx, (coin, vol))| PondUniverseRow {
-                                symbol: format!("{coin}/USDC:USDC"),
-                                rank: (idx + 1) as i64,
-                                median_daily_volume_usdc: round_dp(vol, 2),
-                                tick_size: 0.0001,
-                                lot_step_size: 0.001,
-                                min_notional_usdc: 10.0,
-                                max_leverage: 3.0,
-                                status: "ACTIVE".to_string(),
-                                warmup_until: Some(warmup_ready.clone()),
-                                delist_streak: 0,
-                                added_at: now_str.clone(),
-                                delisted_at: None,
+                            .map(|(idx, (coin, vol, sz_dec, max_lev, mark_px))| {
+                                let symbol = format!("{coin}/USDC:USDC");
+                                let ref_px = if mark_px > 0.0 {
+                                    mark_px
+                                } else {
+                                    self.db.resolve_reference_price(&symbol)
+                                };
+                                let lot_step = round_dp(10f64.powi(-(sz_dec as i32)), 8).max(1e-6);
+                                let max_dec = (6 - sz_dec as i32).max(0);
+                                let mag = if ref_px > 0.0 {
+                                    ref_px.log10().floor() as i32
+                                } else {
+                                    0
+                                };
+                                let dec = (4 - mag).max(0).min(max_dec);
+                                let tick_size = round_dp(10f64.powi(-dec), 8).max(1e-6);
+                                PondUniverseRow {
+                                    symbol,
+                                    rank: (idx + 1) as i64,
+                                    median_daily_volume_usdc: round_dp(vol, 2),
+                                    tick_size,
+                                    lot_step_size: lot_step,
+                                    min_notional_usdc: 10.0,
+                                    max_leverage: max_lev,
+                                    status: "ACTIVE".to_string(),
+                                    warmup_until: Some(warmup_ready.clone()),
+                                    delist_streak: 0,
+                                    added_at: now_str.clone(),
+                                    delisted_at: None,
+                                    is_synthetic_volume: 0,
+                                    reference_price: ref_px,
+                                }
                             })
                             .collect();
                     }
                 }
             }
+        }
         }
 
         // Deterministic 85-coin Hyperliquid universe fallback (sorted by realistic daily volume >= $50k)
@@ -642,10 +710,12 @@ impl MarketIngestionEngine {
             .enumerate()
             .map(|(idx, coin)| {
                 let rank = (idx + 1) as i64;
+                let symbol = format!("{coin}/USDC:USDC");
                 let vol = (850_000_000.0 * (-0.112 * (idx as f64)).exp())
                     .max(min_daily_vol_usdc + 25_000.0);
+                let ref_px = self.db.resolve_reference_price(&symbol);
                 PondUniverseRow {
-                    symbol: format!("{coin}/USDC:USDC"),
+                    symbol,
                     rank,
                     median_daily_volume_usdc: round_dp(vol, 2),
                     tick_size: 0.0001,
@@ -657,6 +727,8 @@ impl MarketIngestionEngine {
                     delist_streak: 0,
                     added_at: now_str.clone(),
                     delisted_at: None,
+                    is_synthetic_volume: 1,
+                    reference_price: ref_px,
                 }
             })
             .collect()
@@ -669,10 +741,19 @@ impl MarketIngestionEngine {
         rank: usize,
         hours: usize,
     ) -> (Vec<f64>, Vec<OhlcvBar>, Vec<OhlcvBar>) {
-        let base_map = base_prices_usdc();
-        let base_px = *base_map
-            .get(symbol)
-            .unwrap_or(&(10.0 + (rank as f64) * 0.75));
+        let cfg = self.load_config_logged("engine.ingestion.generate_pond_funding_and_bars");
+        let fallback_base = cfg.get_f64("pond_fallback_base_price_usdc", 10.0);
+        let fallback_slope = cfg.get_f64("pond_fallback_rank_slope_usdc", 0.75);
+        let resolved_px = self.db.resolve_reference_price(symbol);
+        let base_px = if (resolved_px - fallback_base).abs() > 1e-6
+            || symbol.starts_with("APT")
+            || symbol.starts_with("UNI")
+            || symbol.starts_with("ATOM")
+        {
+            resolved_px
+        } else {
+            fallback_base + (rank as f64) * fallback_slope
+        };
         let bars_1h = self.generate_synthetic_bars(
             symbol,
             "1h",
@@ -712,8 +793,12 @@ impl MarketIngestionEngine {
         (funding_series, bars_1h, bars_4h)
     }
 
-    /// Queries Hyperliquid `/info` (`fundingHistory`) for up to `hours` of historical 1H funding rates.
-    pub fn fetch_hyperliquid_funding_history(&self, coin: &str, hours: usize) -> Option<Vec<f64>> {
+    /// Queries Hyperliquid `/info` (`fundingHistory`) for up to `hours` of historical 1H funding rates with timestamps (`NL-8`).
+    pub fn fetch_hyperliquid_funding_history_timestamped(
+        &self,
+        coin: &str,
+        hours: usize,
+    ) -> Option<Vec<(i64, f64)>> {
         let now_ms = Utc::now().timestamp_millis();
         let start_ms = now_ms - ((hours as i64 + 4) * 3_600_000);
         let payload = json!({
@@ -725,6 +810,7 @@ impl MarketIngestionEngine {
         let raw = self.http_post_json(&self.info_url(), &payload)?;
         let list = raw.as_array()?;
         if list.is_empty() {
+            tracing::warn!(coin = coin, "Hyperliquid fundingHistory returned empty array (NL-8)");
             return None;
         }
         let mut out = Vec::with_capacity(list.len());
@@ -734,17 +820,38 @@ impl MarketIngestionEngine {
                     .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
             }) {
                 if f.is_finite() {
-                    out.push(round_dp(f, 8));
+                    let ts_ms = item
+                        .get("time")
+                        .and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        })
+                        .unwrap_or(0);
+                    out.push((ts_ms, round_dp(f, 8)));
                 }
             }
         }
         if out.is_empty() {
+            tracing::warn!(coin = coin, "Hyperliquid fundingHistory contained no finite fundingRate values (NL-8)");
             return None;
+        }
+        if out.len() < 24 {
+            tracing::warn!(
+                coin = coin,
+                samples = out.len(),
+                "Hyperliquid fundingHistory returned fewer than 24 hourly samples (NL-8)"
+            );
         }
         if out.len() > hours {
             out = out[out.len() - hours..].to_vec();
         }
         Some(out)
+    }
+
+    /// Queries Hyperliquid `/info` (`fundingHistory`) for up to `hours` of historical 1H funding rates.
+    pub fn fetch_hyperliquid_funding_history(&self, coin: &str, hours: usize) -> Option<Vec<f64>> {
+        self.fetch_hyperliquid_funding_history_timestamped(coin, hours)
+            .map(|v| v.into_iter().map(|(_, r)| r).collect())
     }
 
     /// Loads or fetches 1H funding history + 1H/4H OHLCV bars for a Pond asset.
@@ -756,7 +863,7 @@ impl MarketIngestionEngine {
         live_funding_map: Option<&HashMap<String, f64>>,
         allow_network_fetch: bool,
     ) -> (Vec<f64>, Vec<OhlcvBar>, Vec<OhlcvBar>) {
-        let cfg = self.load_config_logged("load_or_fetch_pond_funding_and_bars");
+        let cfg = self.load_config_logged("engine.ingestion.load_or_fetch_pond_funding_and_bars");
         let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let pond_mode = cfg
             .get_str("pond_execution_mode", &exec_mode)
@@ -778,6 +885,8 @@ impl MarketIngestionEngine {
             .to_uppercase();
         let live_f = live_funding_map.and_then(|m| m.get(&coin).copied());
         let min_fund_floor = cfg.get_f64("pond_funding_floor_hourly", 0.000015);
+        let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+        let now_ms = Utc::now().timestamp_millis();
 
         let mut bars_1h: Vec<OhlcvBar> = self
             .db
@@ -800,7 +909,6 @@ impl MarketIngestionEngine {
         };
 
         if allow_network_fetch && passes_floor_or_single {
-            let now_ms = Utc::now().timestamp_millis();
             let f_rate = live_f.unwrap_or_else(|| {
                 bars_1h
                     .last()
@@ -847,32 +955,84 @@ impl MarketIngestionEngine {
             };
 
             if need_1h || !has_funding_variance {
-                if let Some(mut f_hist) =
-                    self.fetch_hyperliquid_funding_history(&coin, hours.max(180))
+                if let Some(f_hist_ts) =
+                    self.fetch_hyperliquid_funding_history_timestamped(&coin, hours.max(180))
                 {
+                    let mut f_hist: Vec<f64> = f_hist_ts.iter().map(|(_, r)| *r).collect();
                     if let Some(lf) = live_f {
                         if let Some(last) = f_hist.last_mut() {
                             *last = lf;
                         }
                     }
-                    if !bars_1h.is_empty() && !f_hist.is_empty() {
-                        let b_len = bars_1h.len();
-                        let f_len = f_hist.len();
-                        let overlap = b_len.min(f_len);
-                        for i in 0..overlap {
-                            bars_1h[b_len - overlap + i].funding_rate_hourly =
-                                f_hist[f_len - overlap + i];
+                    if !bars_1h.is_empty() && !f_hist_ts.is_empty() {
+                        let mut bucket_map: HashMap<i64, f64> = HashMap::new();
+                        for &(ts_ms, rate) in &f_hist_ts {
+                            if ts_ms > 0 {
+                                bucket_map.insert(ts_ms / 3_600_000, rate);
+                            }
+                        }
+                        if !bucket_map.is_empty() {
+                            for bar in &mut bars_1h {
+                                let bar_bucket = bar.timestamp_ms / 3_600_000;
+                                if let Some(&rate) = bucket_map.get(&bar_bucket) {
+                                    bar.funding_rate_hourly = rate;
+                                }
+                            }
+                            if let Some(lf) = live_f {
+                                if let Some(last_bar) = bars_1h.last_mut() {
+                                    last_bar.funding_rate_hourly = lf;
+                                }
+                            }
+                        } else {
+                            let b_len = bars_1h.len();
+                            let f_len = f_hist.len();
+                            let overlap = b_len.min(f_len);
+                            for i in 0..overlap {
+                                bars_1h[b_len - overlap + i].funding_rate_hourly =
+                                    f_hist[f_len - overlap + i];
+                            }
                         }
                         if let Err(e) = self.db.upsert_ohlcv_batch(&bars_1h) {
                             tracing::error!(symbol = symbol, error = %e, "Failed to upsert 1h pond bars");
                         }
                     }
                     return (f_hist, bars_1h, bars_4h);
-                } else if need_1h && !bars_1h.is_empty() {
-                    if let Err(e) = self.db.upsert_ohlcv_batch(&bars_1h) {
-                        tracing::error!(symbol = symbol, error = %e, "Failed to upsert 1h pond bars");
+                } else {
+                    tracing::warn!(
+                        symbol = symbol,
+                        coin = %coin,
+                        "Live fundingHistory unavailable for Pond asset; falling back to bar funding series (NL-8)"
+                    );
+                    if need_1h && !bars_1h.is_empty() {
+                        if let Err(e) = self.db.upsert_ohlcv_batch(&bars_1h) {
+                            tracing::error!(symbol = symbol, error = %e, "Failed to upsert 1h pond bars");
+                        }
                     }
                 }
+            }
+        }
+
+        // Enforce live bar staleness guard (NM-8)
+        if let Some(last_1h) = bars_1h.last() {
+            if now_ms - last_1h.timestamp_ms > max_staleness_ms {
+                tracing::warn!(
+                    symbol = symbol,
+                    age_ms = now_ms - last_1h.timestamp_ms,
+                    max_staleness_ms = max_staleness_ms,
+                    "Discarding stale 1h Pond bars in live/testnet mode (NM-8)"
+                );
+                bars_1h.clear();
+            }
+        }
+        if let Some(last_4h) = bars_4h.last() {
+            if now_ms - last_4h.timestamp_ms > max_staleness_ms {
+                tracing::warn!(
+                    symbol = symbol,
+                    age_ms = now_ms - last_4h.timestamp_ms,
+                    max_staleness_ms = max_staleness_ms,
+                    "Discarding stale 4h Pond bars in live/testnet mode (NM-8)"
+                );
+                bars_4h.clear();
             }
         }
 

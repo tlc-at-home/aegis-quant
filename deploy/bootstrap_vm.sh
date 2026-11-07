@@ -46,7 +46,7 @@ chcon -t bin_t "${BIN_DIR}/aegis-quant" 2>/dev/null || true
 
 echo "[5/6] Provisioning CSPRNG Fernet master key & SQLite WAL database (${DB_PATH})..."
 if [ ! -s "${KEY_PATH}" ]; then
-    "${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --generate-key > "${KEY_PATH}"
+    (umask 0077; "${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --generate-key > "${KEY_PATH}")
 fi
 chmod 600 "${KEY_PATH}"
 "${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --init --migrate

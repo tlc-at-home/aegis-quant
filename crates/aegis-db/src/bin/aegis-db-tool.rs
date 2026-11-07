@@ -1,47 +1,48 @@
-//! Standalone SQLite WAL Schema v6 Migration & Verification CLI (`aegis-db-tool`).
+//! Standalone SQLite WAL Schema v7 Migration & Verification CLI (`aegis-db-tool`).
 //!
 //! Usage:
-//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/006_v030_review_remediation.sql`
+//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/007_v030_round2_remediation.sql`
 
 use aegis_db::DatabaseManager;
-use clap::Parser;
 use serde_json::json;
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "aegis-db-tool",
-    version,
-    about = "Aegis Quant SQLite WAL Schema Migration & Integrity Verification Tool"
-)]
+#[derive(Debug, Default)]
 struct Args {
-    /// Path to SQLite WAL database (defaults to data/aegis_quant.db)
-    #[arg(long)]
     db: Option<PathBuf>,
-
-    /// Apply a specific SQL migration file (e.g. sql/migrations/005_v030_pp50_two_book.sql)
-    #[arg(long = "apply-migration")]
     apply_migration: Option<PathBuf>,
-
-    /// Initialize full schema and all migrations (001..006)
-    #[arg(long)]
     init: bool,
-
-    /// Force reset mutable tables and vacuum database when used with --init
-    #[arg(long)]
     force: bool,
-
-    /// Generate a fresh 32-byte URL-safe Base64 Fernet master key
-    #[arg(long = "generate-key")]
     generate_key: bool,
-
-    /// Verify schema integrity and print JSON report
-    #[arg(long)]
-    verify: bool,
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+fn parse_args() -> Args {
+    let mut args = Args::default();
+    let mut iter = std::env::args().skip(1);
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--db" => {
+                if let Some(val) = iter.next() {
+                    args.db = Some(PathBuf::from(val));
+                }
+            }
+            "--apply-migration" => {
+                if let Some(val) = iter.next() {
+                    args.apply_migration = Some(PathBuf::from(val));
+                }
+            }
+            "--init" | "--migrate" => args.init = true,
+            "--force" => args.force = true,
+            "--generate-key" => args.generate_key = true,
+            "--verify" => {}
+            _ => {}
+        }
+    }
+    args
+}
+
+fn main() -> aegis_core::Result<()> {
+    let args = parse_args();
     if args.generate_key {
         println!("{}", aegis_db::fernet::generate_fernet_key());
         return Ok(());
@@ -66,7 +67,7 @@ fn main() -> anyhow::Result<()> {
             "status": "APPLIED",
             "migration": mig_path.display().to_string(),
             "db_path": db.db_path.display().to_string(),
-            "schema_version": rep.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(6),
+            "schema_version": rep.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(7),
             "system_config_count": rep.get("system_config_count").and_then(|v| v.as_i64()).unwrap_or(0),
             "pond_config_count": rep.get("pond_config_count").and_then(|v| v.as_i64()).unwrap_or(0),
             "books_count": books.len(),
@@ -83,3 +84,4 @@ fn main() -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&rep)?);
     Ok(())
 }
+

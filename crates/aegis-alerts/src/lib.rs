@@ -6,7 +6,7 @@
 //! - Triggers on HMM Regime Flips, Position Reconciliation Mismatches, and Daily Drawdown > 3%
 //! - Includes isolated `:memory:` offline loopback HTTP receiver for `aegis-quant alerts --test` (`S8`)
 
-use aegis_core::{round_dp, Result};
+use aegis_core::{mask_identifier, round_dp, Result};
 use aegis_db::{ConfigMap, DatabaseManager};
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -22,6 +22,35 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Typed domain result returned by all `AlertEngine` dispatch methods (`Q4`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertDispatchResult {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub telegram_sent: bool,
+    pub webhook_payload_verified: bool,
+    pub queued_for_retry: bool,
+    pub chat_id: String,
+    pub error_detail: Option<String>,
+    pub title: String,
+    pub severity: String,
+    pub timestamp: String,
+    pub channels: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loopback_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolated_self_test: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loopback_payload_captured: Option<bool>,
+}
+
+impl AlertDispatchResult {
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| json!({}))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedAlertTask {
@@ -139,11 +168,7 @@ impl AlertRetryQueue {
                     false,
                     false,
                 );
-                let status = res
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("ERROR");
-                if status == "DELIVERED" {
+                if res.status == "DELIVERED" {
                     queue_ref.delivered_count.fetch_add(1, Ordering::SeqCst);
                 } else if task.attempt < queue_ref.max_retries {
                     let delay_ms = (queue_ref.base_backoff_sec
@@ -173,7 +198,7 @@ impl AlertRetryQueue {
                             "Alert permanently failed after {} retries: {}",
                             queue_ref.max_retries, task.title
                         ),
-                        Some(res),
+                        Some(res.to_value()),
                     );
                 }
                 queue_ref.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -241,15 +266,28 @@ impl AlertEngine {
             .max(10);
         let telegram_api_base = cfg.get_str("telegram_api_base_url", "https://api.telegram.org");
 
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(timeout_sec))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        let loopback_client = Client::builder()
-            .timeout(Duration::from_secs(timeout_sec))
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        static ALERT_CLIENTS: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<(u64, bool), Client>>,
+        > = std::sync::OnceLock::new();
+        let get_client = |t: u64, no_proxy: bool| -> Client {
+            let map = ALERT_CLIENTS
+                .get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+            if let Some(c) = map.lock().get(&(t, no_proxy)) {
+                return c.clone();
+            }
+            let built = thread::spawn(move || {
+                let mut b = Client::builder().timeout(Duration::from_secs(t));
+                if no_proxy {
+                    b = b.no_proxy();
+                }
+                b.build().unwrap_or_else(|_| Client::new())
+            })
+            .join()
+            .expect("build alert blocking client");
+            map.lock().entry((t, no_proxy)).or_insert(built).clone()
+        };
+        let http_client = get_client(timeout_sec, false);
+        let loopback_client = get_client(timeout_sec, true);
 
         Self {
             db,
@@ -264,13 +302,7 @@ impl AlertEngine {
     }
 
     fn load_config_logged(&self) -> ConfigMap {
-        match self.db.load_config() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(component = "engine.alerts", error = %e, "Failed to load system_config in AlertEngine");
-                ConfigMap::default()
-            }
-        }
+        self.db.load_config_logged("engine.alerts")
     }
 
     /// Queries Telegram `/getUpdates` to automatically discover the most recent user or group
@@ -316,10 +348,11 @@ impl AlertEngine {
                 };
                 if !cid.is_empty() && cid != bot_id_prefix {
                     let _ = self.db.set_config_value("telegram_chat_id", &json!(cid));
+                    let masked_cid = mask_identifier(&cid);
                     let _ = self.db.log_telemetry(
                         "INFO",
                         "engine.alerts",
-                        &format!("Auto-discovered Telegram chat_id={cid} via getUpdates"),
+                        &format!("Auto-discovered Telegram chat_id={masked_cid} via getUpdates"),
                         None,
                     );
                     return Some(cid);
@@ -337,7 +370,7 @@ impl AlertEngine {
         details: Option<Value>,
         _throw_on_error: bool,
         allow_retry_queue: bool,
-    ) -> Value {
+    ) -> AlertDispatchResult {
         let cfg = self.load_config_logged();
         let tg_token = cfg.get_str("telegram_bot_token", "").trim().to_string();
         let mut tg_chat_id = cfg.get_str("telegram_chat_id", "").trim().to_string();
@@ -345,13 +378,22 @@ impl AlertEngine {
         let ts_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         if tg_token.is_empty() && discord_url.is_empty() {
-            return json!({
-                "status": "SKIPPED",
-                "reason": "NO_ALERT_CHANNEL_CONFIGURED",
-                "title": title,
-                "severity": severity,
-                "timestamp": ts_utc,
-            });
+            return AlertDispatchResult {
+                status: "SKIPPED".to_string(),
+                reason: Some("NO_ALERT_CHANNEL_CONFIGURED".to_string()),
+                telegram_sent: false,
+                webhook_payload_verified: false,
+                queued_for_retry: false,
+                chat_id: String::new(),
+                error_detail: None,
+                title: title.to_string(),
+                severity: severity.to_string(),
+                timestamp: ts_utc,
+                channels: Vec::new(),
+                loopback_verified: None,
+                isolated_self_test: None,
+                loopback_payload_captured: None,
+            };
         }
 
         let mut results: Vec<Value> = Vec::new();
@@ -386,8 +428,9 @@ impl AlertEngine {
                 }));
             } else if !bot_id_prefix.is_empty() && tg_chat_id == bot_id_prefix && !is_loopback {
                 any_error = true;
+                let masked = mask_identifier(&tg_chat_id);
                 let msg = format!(
-                    "Chat ID '{tg_chat_id}' is the Bot's own ID (the prefix of your bot token before ':'), not your personal Telegram Chat ID. Open Telegram, open a chat with your bot and click Start / send 'hello', then click 'Send Test Alert' to auto-detect your Chat ID (or send '/start' to @userinfobot on Telegram to see your personal ID)."
+                    "Chat ID '{masked}' is the Bot's own ID (the prefix of your bot token before ':'), not your personal Telegram Chat ID. Open Telegram, open a chat with your bot and click Start / send 'hello', then click 'Send Test Alert' to auto-detect your Chat ID."
                 );
                 error_detail = Some(msg.clone());
                 results.push(json!({
@@ -438,13 +481,14 @@ impl AlertEngine {
                     }
                 }
 
+                let masked_chat_id = mask_identifier(&tg_chat_id).replace("...", "***");
                 match resp_res {
                     Ok(resp) if resp.status().is_success() => {
                         let body: Value = resp.json().unwrap_or_else(|_| json!({}));
                         results.push(json!({
                             "channel": "TELEGRAM",
                             "http_status": 200,
-                            "chat_id": tg_chat_id,
+                            "chat_id": masked_chat_id,
                             "ok": body.get("ok").and_then(Value::as_bool).unwrap_or(true),
                         }));
                     }
@@ -539,23 +583,28 @@ impl AlertEngine {
             }
         }
 
-        let report = json!({
-            "status": status,
-            "telegram_sent": delivered,
-            "webhook_payload_verified": delivered,
-            "queued_for_retry": queued_for_retry,
-            "chat_id": tg_chat_id,
-            "error_detail": error_detail,
-            "title": title,
-            "severity": severity,
-            "timestamp": ts_utc,
-            "channels": results,
-        });
+        let masked_cid = mask_identifier(&tg_chat_id).replace("...", "***");
+        let report = AlertDispatchResult {
+            status: status.clone(),
+            reason: None,
+            telegram_sent: delivered,
+            webhook_payload_verified: delivered,
+            queued_for_retry,
+            chat_id: masked_cid,
+            error_detail,
+            title: title.to_string(),
+            severity: severity.to_string(),
+            timestamp: ts_utc,
+            channels: results,
+            loopback_verified: None,
+            isolated_self_test: None,
+            loopback_payload_captured: None,
+        };
         let _ = self.db.log_telemetry(
             if delivered { "INFO" } else { "WARNING" },
             "engine.alerts",
             &format!("Alert dispatch [{severity}] {title}: {status}"),
-            Some(report.clone()),
+            Some(report.to_value()),
         );
         report
     }
@@ -565,12 +614,41 @@ impl AlertEngine {
         event_type: &str,
         summary: &str,
         details: Option<Value>,
-    ) -> Value {
+    ) -> AlertDispatchResult {
         self.send_alert(
             &format!("CRITICAL SYSTEM EVENT: {event_type}"),
             summary,
             "CRITICAL",
             details,
+            false,
+            true,
+        )
+    }
+
+    pub fn notify_stop_out(
+        &self,
+        symbol: &str,
+        side: &str,
+        entry_price: f64,
+        exit_price: f64,
+        net_pnl_usdc: f64,
+        reason: &str,
+    ) -> AlertDispatchResult {
+        let msg = format!(
+            "Stop-out triggered on *{symbol}* ({side}): exited at `${exit_price:.4}` (entry `${entry_price:.4}`, net PnL `${net_pnl_usdc:+.2}`, reason `{reason}`)."
+        );
+        self.send_alert(
+            &format!("Chandelier Stop-Out: {symbol}"),
+            &msg,
+            "WARNING",
+            Some(json!({
+                "symbol": symbol,
+                "side": side,
+                "entry_price": round_dp(entry_price, 6),
+                "exit_price": round_dp(exit_price, 6),
+                "net_pnl_usdc": round_dp(net_pnl_usdc, 2),
+                "exit_reason": reason,
+            })),
             false,
             true,
         )
@@ -582,7 +660,7 @@ impl AlertEngine {
         prob_bull: f64,
         prob_bear: f64,
         prob_chop: f64,
-    ) -> Option<Value> {
+    ) -> Option<AlertDispatchResult> {
         let mut prior_guard = self.last_regime.lock();
         if prior_guard.is_none() {
             if let Ok(snap) = self.db.get_latest_portfolio_snapshot() {
@@ -622,7 +700,7 @@ impl AlertEngine {
         discrepancy_count: usize,
         discrepancies: &[Value],
         wallet_address: &str,
-    ) -> Option<Value> {
+    ) -> Option<AlertDispatchResult> {
         if discrepancy_count == 0 {
             return None;
         }
@@ -638,7 +716,7 @@ impl AlertEngine {
             &msg,
             "WARNING",
             Some(json!({
-                "wallet_address": wallet_address,
+                "wallet_address": mask_identifier(wallet_address),
                 "discrepancies_reconciled": discrepancy_count,
                 "sample": sample,
             })),
@@ -647,7 +725,10 @@ impl AlertEngine {
         ))
     }
 
-    pub fn check_and_alert_daily_drawdown(&self, current_equity_usdc: f64) -> Option<Value> {
+    pub fn check_and_alert_daily_drawdown(
+        &self,
+        current_equity_usdc: f64,
+    ) -> Option<AlertDispatchResult> {
         let cfg = self.load_config_logged();
         let threshold_pct = cfg.get_f64("max_daily_drawdown_alert_pct", 0.03);
         let now_ms = self.db.now_ms();
@@ -705,7 +786,10 @@ impl AlertEngine {
 
     /// Runs a live or isolated `:memory:` loopback webhook verification (`aegis-quant alerts --test`)
     /// without mutating or blanking real Telegram credentials in `self.db` (`S8`).
-    pub fn run_test_alert(&mut self, simulate_local_if_unconfigured: bool) -> Result<Value> {
+    pub fn run_test_alert(
+        &mut self,
+        simulate_local_if_unconfigured: bool,
+    ) -> Result<AlertDispatchResult> {
         let cfg = self.db.load_config()?;
         let tg_token = cfg.get_str("telegram_bot_token", "").trim().to_string();
         let tg_chat_id = cfg.get_str("telegram_chat_id", "").trim().to_string();
@@ -726,10 +810,22 @@ impl AlertEngine {
         }
 
         if !simulate_local_if_unconfigured {
-            return Ok(json!({
-                "status": "SKIPPED",
-                "reason": "NO_ALERT_CHANNEL_CONFIGURED",
-            }));
+            return Ok(AlertDispatchResult {
+                status: "SKIPPED".to_string(),
+                reason: Some("NO_ALERT_CHANNEL_CONFIGURED".to_string()),
+                telegram_sent: false,
+                webhook_payload_verified: false,
+                queued_for_retry: false,
+                chat_id: String::new(),
+                error_detail: None,
+                title: "Operational Alert Verification".to_string(),
+                severity: "INFO".to_string(),
+                timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                channels: Vec::new(),
+                loopback_verified: None,
+                isolated_self_test: None,
+                loopback_payload_captured: None,
+            });
         }
 
         // Spin up ephemeral loopback HTTP server and run self-test against an isolated `:memory:` DB (`S8`)
@@ -798,14 +894,9 @@ impl AlertEngine {
 
         let _ = handle.join();
 
-        if let Some(obj) = res.as_object_mut() {
-            obj.insert("loopback_verified".to_string(), json!(true));
-            obj.insert("isolated_self_test".to_string(), json!(true));
-            obj.insert(
-                "loopback_payload_captured".to_string(),
-                json!(received_payload.lock().is_some()),
-            );
-        }
+        res.loopback_verified = Some(true);
+        res.isolated_self_test = Some(true);
+        res.loopback_payload_captured = Some(received_payload.lock().is_some());
         Ok(res)
     }
 }
@@ -824,11 +915,10 @@ mod tests {
 
         let mut alerts = AlertEngine::new(db.clone());
         let res = alerts.run_test_alert(true).unwrap();
-        assert_eq!(res.get("status").and_then(Value::as_str), Some("DELIVERED"));
-        assert_eq!(
-            res.get("loopback_verified").and_then(Value::as_bool),
-            Some(true)
-        );
+        assert_eq!(res.status, "DELIVERED");
+        assert_eq!(res.loopback_verified, Some(true));
+        // NL-6: chat_id in response and telemetry must be masked
+        assert!(res.chat_id.contains("***"));
 
         // Verify the real token in `db` was NOT overwritten or blanked by the loopback self-test (`S8`)
         let cfg_after = db.load_config().unwrap();

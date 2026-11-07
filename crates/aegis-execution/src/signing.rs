@@ -1,6 +1,9 @@
 //! Hyperliquid L1 EIP-712 / MessagePack / secp256k1 action signing (`aegis-execution::signing`).
 
-use aegis_core::{validate_private_key, AegisError, Result};
+pub use aegis_core::{
+    derive_evm_address_from_private_key, validate_private_key, verify_signer_matches_wallet,
+};
+use aegis_core::{round_dp, AegisError, Result};
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,6 +22,55 @@ pub fn float_to_wire(x: f64) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Infers Hyperliquid `szDecimals` (`0..=6`) from `lot_step_size` (`10^-szDecimals`).
+pub fn infer_sz_decimals_from_lot_step(lot_step_size: f64) -> u32 {
+    if !lot_step_size.is_finite() || lot_step_size <= 0.0 {
+        return 3;
+    }
+    (-lot_step_size.log10()).round().clamp(0.0, 6.0) as u32
+}
+
+/// Formats a perpetual limit price for Hyperliquid L1 wire transmission (`NH-9`):
+/// - Snaps to `tick_size` if `tick_size > 0`
+/// - Enforces at most 5 significant figures (with integer prices allowed for `>= 100_000`)
+/// - Enforces at most `6 - sz_decimals` decimal places for perpetuals
+pub fn format_hl_wire_price(price: f64, tick_size: f64, sz_decimals: u32) -> String {
+    if !price.is_finite() || price <= 0.0 {
+        return "0".to_string();
+    }
+    let max_perp_decimals = 6usize.saturating_sub(sz_decimals as usize);
+    let mag = price.log10().floor() as i32;
+    let sig_fig_decimals = (4 - mag).max(0) as usize;
+    let allowed_decimals = sig_fig_decimals.min(max_perp_decimals);
+    let min_wire_step = 10_f64.powi(-(allowed_decimals as i32));
+    let effective_tick = if tick_size.is_finite() && tick_size > 0.0 {
+        tick_size.max(min_wire_step)
+    } else {
+        min_wire_step
+    };
+    let mut p = (price / effective_tick).round() * effective_tick;
+    if p <= 0.0 {
+        p = price;
+    }
+    float_to_wire(round_dp(p, allowed_decimals as i32))
+}
+
+/// Formats a perpetual order size (`s`) for Hyperliquid L1 wire transmission (`NH-9`):
+/// - Snaps to `lot_step_size` if `lot_step_size > 0`
+/// - Rounds to `sz_decimals` decimal places
+pub fn format_hl_wire_size(size: f64, lot_step_size: f64, sz_decimals: u32) -> String {
+    if !size.is_finite() || size <= 0.0 {
+        return "0".to_string();
+    }
+    let s = if lot_step_size.is_finite() && lot_step_size > 0.0 {
+        (size / lot_step_size).round() * lot_step_size
+    } else {
+        size
+    };
+    let dec = (sz_decimals as usize).min(8);
+    float_to_wire(round_dp(s, dec as i32))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,7 +184,7 @@ pub fn compute_l1_action_hash<T: Serialize>(
 }
 
 /// Signs an L1 action payload using MessagePack binary serialization, action_hash, and EIP-712 structured data signing.
-/// Zeroizes intermediate normalized key strings and raw secret key bytes on drop (`S10`).
+/// Zeroizes intermediate normalized key strings and raw secret key bytes on drop (`S10`, `NM-11`).
 pub fn sign_l1_action<T: Serialize>(
     private_key_hex: &str,
     action: &T,
@@ -141,9 +193,24 @@ pub fn sign_l1_action<T: Serialize>(
     expires_after: Option<u64>,
     is_mainnet: bool,
 ) -> Result<Value> {
+    if private_key_hex.trim().is_empty() {
+        return Err(AegisError::Crypto(
+            "Private key cannot be empty for L1 action signing".to_string(),
+        ));
+    }
     let normalized_pk = Zeroizing::new(validate_private_key(private_key_hex)?);
+    let hex_body = normalized_pk
+        .strip_prefix("0x")
+        .or_else(|| normalized_pk.strip_prefix("0X"))
+        .unwrap_or(normalized_pk.as_str());
+    if hex_body.len() != 64 {
+        return Err(AegisError::Crypto(format!(
+            "Normalized private key must contain 64 hex chars, got {}",
+            hex_body.len()
+        )));
+    }
     let raw_bytes = Zeroizing::new(
-        hex::decode(&normalized_pk[2..])
+        hex::decode(hex_body)
             .map_err(|e| AegisError::Crypto(format!("Invalid private_key hex: {e}")))?,
     );
     let signing_key = SigningKey::from_slice(&raw_bytes)

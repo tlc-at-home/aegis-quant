@@ -50,8 +50,8 @@ impl DatabaseManager {
                         "INSERT INTO pond_universe (
                             symbol, rank, median_daily_volume_usdc, tick_size, lot_step_size,
                             min_notional_usdc, max_leverage, status, warmup_until,
-                            delist_streak, added_at, delisted_at
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                            delist_streak, added_at, delisted_at, reference_price, is_synthetic_volume
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                         ON CONFLICT(symbol) DO UPDATE SET
                             rank = excluded.rank,
                             median_daily_volume_usdc = excluded.median_daily_volume_usdc,
@@ -62,14 +62,21 @@ impl DatabaseManager {
                             status = excluded.status,
                             warmup_until = excluded.warmup_until,
                             delist_streak = excluded.delist_streak,
-                            delisted_at = excluded.delisted_at;",
+                            delisted_at = excluded.delisted_at,
+                            reference_price = CASE WHEN excluded.reference_price > 0.0 THEN excluded.reference_price ELSE pond_universe.reference_price END,
+                            is_synthetic_volume = excluded.is_synthetic_volume;",
                     )
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 for r in rows {
                     let added_at = if r.added_at.trim().is_empty() {
-                        Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                        aegis_core::now_iso8601_utc()
                     } else {
-                        r.added_at.clone()
+                        aegis_core::normalize_timestamp_iso8601_utc(&r.added_at)
+                    };
+                    let ref_px = if r.reference_price > 0.0 {
+                        r.reference_price
+                    } else {
+                        10.0
                     };
                     stmt.execute(params![
                         r.symbol,
@@ -80,10 +87,12 @@ impl DatabaseManager {
                         r.min_notional_usdc,
                         r.max_leverage,
                         r.status,
-                        r.warmup_until,
+                        r.warmup_until.as_deref().map(aegis_core::normalize_timestamp_iso8601_utc),
                         r.delist_streak,
                         added_at,
-                        r.delisted_at,
+                        r.delisted_at.as_deref().map(aegis_core::normalize_timestamp_iso8601_utc),
+                        ref_px,
+                        r.is_synthetic_volume,
                     ])
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 }
@@ -98,12 +107,14 @@ impl DatabaseManager {
         let sql = if active_only {
             "SELECT symbol, rank, median_daily_volume_usdc, tick_size, lot_step_size,
                     min_notional_usdc, max_leverage, status, warmup_until, delist_streak,
-                    added_at, delisted_at
-             FROM v_pond_universe_active;"
+                    added_at, delisted_at, reference_price, is_synthetic_volume
+             FROM pond_universe
+             WHERE status = 'ACTIVE'
+             ORDER BY rank ASC;"
         } else {
             "SELECT symbol, rank, median_daily_volume_usdc, tick_size, lot_step_size,
                     min_notional_usdc, max_leverage, status, warmup_until, delist_streak,
-                    added_at, delisted_at
+                    added_at, delisted_at, reference_price, is_synthetic_volume
              FROM pond_universe
              ORDER BY rank ASC, symbol ASC;"
         };
@@ -126,6 +137,8 @@ impl DatabaseManager {
                         delist_streak: r.get(9)?,
                         added_at: r.get(10)?,
                         delisted_at: r.get(11)?,
+                        reference_price: r.get::<_, Option<f64>>(12).ok().flatten().unwrap_or(10.0),
+                        is_synthetic_volume: r.get::<_, Option<i64>>(13).ok().flatten().unwrap_or(0),
                     })
                 })
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -457,7 +470,7 @@ impl DatabaseManager {
             let reset_trimmed = reset_at.trim().trim_matches('"');
             let pnl: f64 = if !reset_trimmed.is_empty() {
                 conn.query_row(
-                    "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM pond_cells WHERE state IN ('CLOSED', 'COOLDOWN', 'DORMANT') AND (closed_at IS NULL OR closed_at > ?1);",
+                    "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM pond_cells WHERE state IN ('CLOSED', 'COOLDOWN', 'DORMANT') AND (closed_at IS NULL OR datetime(closed_at) > datetime(?1));",
                     params![reset_trimmed],
                     |r| r.get(0),
                 )
@@ -477,7 +490,11 @@ impl DatabaseManager {
     pub fn get_open_pit_symbols(&self) -> Result<HashSet<String>> {
         self.with_conn(|conn| {
             let mut stmt = conn
-                .prepare("SELECT DISTINCT symbol FROM trades WHERE status = 'OPEN';")
+                .prepare(
+                    "SELECT DISTINCT symbol FROM trades
+                     WHERE status = 'OPEN'
+                       AND NOT (COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, quantity) <= 0.0);",
+                )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             let iter = stmt
                 .query_map([], |r| r.get::<_, String>(0))
@@ -533,7 +550,10 @@ impl DatabaseManager {
         let total_deployed = self.with_conn(|conn| {
             let pit_dep: f64 = conn
                 .query_row(
-                    "SELECT COALESCE(SUM(ABS(quantity) * current_price), 0.0) FROM trades WHERE status = 'OPEN';",
+                    "SELECT COALESCE(SUM(ABS(quantity) * current_price), 0.0)
+                     FROM trades
+                     WHERE status = 'OPEN'
+                       AND NOT (COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, quantity) <= 0.0);",
                     [],
                     |r| r.get(0),
                 )
@@ -614,15 +634,39 @@ impl DatabaseManager {
         })
     }
 
+    pub fn update_pond_cell_funding(
+        &self,
+        cell_id: i64,
+        funding_accrued_usdc: f64,
+    ) -> Result<()> {
+        let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE pond_cells
+                 SET funding_accrued_usdc = ?1,
+                     updated_at = ?2
+                 WHERE cell_id = ?3;",
+                params![round_dp(funding_accrued_usdc, 4), now_iso, cell_id],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     pub fn insert_book_transfer(&self, transfer: &BookTransfer) -> Result<i64> {
+        let created_iso = if transfer.created_at.trim().is_empty() {
+            aegis_core::now_iso8601_utc()
+        } else {
+            aegis_core::normalize_timestamp_iso8601_utc(&transfer.created_at)
+        };
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO book_transfers (
                     settle_date, from_book, to_book, amount_usdc,
                     pre_from_usdc, pre_to_usdc, post_from_usdc, post_to_usdc,
                     drift_bps_before, drift_bps_after, blocked_remainder_usdc,
-                    status, attempts, tx_ref
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
+                    status, attempts, tx_ref, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15);",
                 params![
                     transfer.settle_date,
                     transfer.from_book,
@@ -638,6 +682,7 @@ impl DatabaseManager {
                     transfer.status,
                     transfer.attempts,
                     transfer.tx_ref,
+                    created_iso,
                 ],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -650,11 +695,12 @@ impl DatabaseManager {
         &self,
         transfer_id: i64,
         status: &str,
+        tx_ref: Option<&str>,
         attempts: i64,
         post_from_usdc: Option<f64>,
         post_to_usdc: Option<f64>,
         drift_bps_after: Option<f64>,
-        tx_ref: Option<&str>,
+        blocked_remainder_usdc: f64,
     ) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -664,8 +710,9 @@ impl DatabaseManager {
                      post_from_usdc = COALESCE(?3, post_from_usdc),
                      post_to_usdc = COALESCE(?4, post_to_usdc),
                      drift_bps_after = COALESCE(?5, drift_bps_after),
-                     tx_ref = COALESCE(?6, tx_ref)
-                 WHERE transfer_id = ?7;",
+                     tx_ref = COALESCE(?6, tx_ref),
+                     blocked_remainder_usdc = ?7
+                 WHERE transfer_id = ?8;",
                 params![
                     status,
                     attempts,
@@ -673,6 +720,7 @@ impl DatabaseManager {
                     post_to_usdc,
                     drift_bps_after,
                     tx_ref,
+                    blocked_remainder_usdc,
                     transfer_id,
                 ],
             )
@@ -721,7 +769,7 @@ impl DatabaseManager {
     }
 
     /// Returns the cumulative net USDC transferred into `book_code` minus USDC transferred out of
-    /// `book_code` across all `EXECUTED` rows in `book_transfers` (`C1`).
+    /// `book_code` across all `COMPLETED` / `PARTIAL_IDLE_CAPPED` rows in `book_transfers` (`C1`, `NL-10`).
     pub fn get_net_book_transfer_adjustment(&self, book_code: &str) -> Result<f64> {
         let code = book_code.trim().to_ascii_uppercase();
         self.with_conn(|conn| {
@@ -738,8 +786,8 @@ impl DatabaseManager {
                     .query_row(
                         "SELECT COALESCE(SUM(amount_usdc), 0.0)
                          FROM book_transfers
-                         WHERE to_book = ?1 AND status IN ('EXECUTED', 'COMPLETED', 'PARTIAL_IDLE_CAPPED')
-                           AND (created_at IS NULL OR created_at > ?2);",
+                         WHERE to_book = ?1 AND status IN ('COMPLETED', 'PARTIAL_IDLE_CAPPED')
+                           AND (created_at IS NULL OR datetime(created_at) > datetime(?2));",
                         params![code, reset_trimmed],
                         |r| r.get(0),
                     )
@@ -748,8 +796,8 @@ impl DatabaseManager {
                     .query_row(
                         "SELECT COALESCE(SUM(amount_usdc), 0.0)
                          FROM book_transfers
-                         WHERE from_book = ?1 AND status IN ('EXECUTED', 'COMPLETED', 'PARTIAL_IDLE_CAPPED')
-                           AND (created_at IS NULL OR created_at > ?2);",
+                         WHERE from_book = ?1 AND status IN ('COMPLETED', 'PARTIAL_IDLE_CAPPED')
+                           AND (created_at IS NULL OR datetime(created_at) > datetime(?2));",
                         params![code, reset_trimmed],
                         |r| r.get(0),
                     )
@@ -760,7 +808,7 @@ impl DatabaseManager {
                     .query_row(
                         "SELECT COALESCE(SUM(amount_usdc), 0.0)
                          FROM book_transfers
-                         WHERE to_book = ?1 AND status IN ('EXECUTED', 'COMPLETED', 'PARTIAL_IDLE_CAPPED');",
+                         WHERE to_book = ?1 AND status IN ('COMPLETED', 'PARTIAL_IDLE_CAPPED');",
                         params![code],
                         |r| r.get(0),
                     )
@@ -769,7 +817,7 @@ impl DatabaseManager {
                     .query_row(
                         "SELECT COALESCE(SUM(amount_usdc), 0.0)
                          FROM book_transfers
-                         WHERE from_book = ?1 AND status IN ('EXECUTED', 'COMPLETED', 'PARTIAL_IDLE_CAPPED');",
+                         WHERE from_book = ?1 AND status IN ('COMPLETED', 'PARTIAL_IDLE_CAPPED');",
                         params![code],
                         |r| r.get(0),
                     )

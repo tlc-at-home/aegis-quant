@@ -16,8 +16,8 @@ use crate::cell::{
 use crate::scanner::{run_nps01_scan, PondAssetScanInput, PondScannerParams};
 use crate::universe::{parse_utc_timestamp, PondUniverseManager};
 use aegis_core::{
-    compute_atr_from_bars, compute_trailing_z_score, round_dp, BookType, PondCell, PondCellState,
-    PondScanCycle, PondUniverseRow, Result,
+    compute_atr_from_bars, compute_trailing_z_score, now_iso8601_utc, round_dp, BookType,
+    PondCell, PondCellState, PondScanCycle, PondUniverseRow, Result,
 };
 use aegis_db::{BookScopedDb, DatabaseManager, PondConfig};
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine, RestingOrderStatus};
@@ -26,7 +26,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,6 +61,7 @@ pub struct PondOrchestrator {
     pub universe_mgr: PondUniverseManager,
     pub telemetry: Option<TelemetryBus>,
     pub last_universe_refresh_ms: Arc<Mutex<Option<i64>>>,
+    pub exit_attempt_count: Arc<Mutex<HashMap<i64, u32>>>,
 }
 
 impl PondOrchestrator {
@@ -76,6 +77,7 @@ impl PondOrchestrator {
             universe_mgr,
             telemetry,
             last_universe_refresh_ms: Arc::new(Mutex::new(None)),
+            exit_attempt_count: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -84,7 +86,7 @@ impl PondOrchestrator {
         self.scoped_db.load_pond_config()
     }
 
-    /// Returns true if the platform-wide emergency halt, Pond kill switch, or daily 00:05 UTC settling freeze is active.
+    /// Returns true if the platform-wide emergency halt, Pond kill switch, or daily 00:05 UTC settling freeze is active (`NH-10`, `NM-3`).
     pub fn is_entry_frozen(&self) -> Result<(bool, String)> {
         let cfg = self.load_pond_config()?;
         if cfg.platform_pp50_halt {
@@ -93,7 +95,7 @@ impl PondOrchestrator {
         if cfg.pond_kill_switch {
             return Ok((true, "POND_KILL_SWITCH".to_string()));
         }
-        if cfg.platform_settle_gate_enabled {
+        if cfg.platform_settle_gate_enabled || self.scoped_db.inner().is_entry_frozen() {
             return Ok((true, "SETTLING_IN_PROGRESS".to_string()));
         }
         Ok((false, "ACTIVE".to_string()))
@@ -158,7 +160,7 @@ impl PondOrchestrator {
 
     /// Reconciles resting `ARMED` orders (`B8`) before evaluating open cells.
     /// - Confirmed fills (`filled_units > 0.0`) transition `ARMED -> OPEN`.
-    /// - Cancelled/expired resting orders transition `ARMED -> CANCELLED -> COOLDOWN` without market exit orders.
+    /// - Cancelled/expired resting orders transition `ARMED -> REJECTED` without market exit orders.
     /// - Stale resting orders at a new 1H boundary are cancelled on the exchange first.
     pub fn reconcile_armed_cells(&self, is_1h_boundary: bool) -> Result<usize> {
         let armed_cells = self.scoped_db.get_armed_pond_cells()?;
@@ -167,7 +169,7 @@ impl PondOrchestrator {
         }
         let cfg = self.load_pond_config()?;
         let now = Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
         let mut promoted = 0usize;
 
         for mut cell in armed_cells {
@@ -195,15 +197,15 @@ impl PondOrchestrator {
                     self.scoped_db.upsert_pond_cell(&cell)?;
                     promoted += 1;
                 }
-                "CANCELLED_OR_GONE" | "FILLED" => {
+                "GONE" | "CANCELLED_OR_GONE" => {
                     cell.exit_reason = Some("RESTING_ENTRY_CANCELLED_OR_EXPIRED".to_string());
                     cell.closed_at = Some(now_str.clone());
                     cell.cooldown_until = Some(
                         (now + ChronoDuration::hours(cfg.pond_cooldown_hours.max(1)))
-                            .format("%Y-%m-%d %H:%M:%S")
+                            .format("%Y-%m-%dT%H:%M:%SZ")
                             .to_string(),
                     );
-                    let _ = transition_cell_state(&mut cell, PondCellState::Rejected);
+                    transition_cell_state(&mut cell, PondCellState::Rejected)?;
                     self.scoped_db.upsert_pond_cell(&cell)?;
                 }
                 _ => {
@@ -215,10 +217,10 @@ impl PondOrchestrator {
                         cell.closed_at = Some(now_str.clone());
                         cell.cooldown_until = Some(
                             (now + ChronoDuration::hours(cfg.pond_cooldown_hours.max(1)))
-                                .format("%Y-%m-%d %H:%M:%S")
+                                .format("%Y-%m-%dT%H:%M:%SZ")
                                 .to_string(),
                         );
-                        let _ = transition_cell_state(&mut cell, PondCellState::Rejected);
+                        transition_cell_state(&mut cell, PondCellState::Rejected)?;
                         self.scoped_db.upsert_pond_cell(&cell)?;
                     }
                 }
@@ -242,6 +244,13 @@ impl PondOrchestrator {
         let cfg = self.load_pond_config()?;
         let is_live_or_testnet =
             cfg.pond_execution_mode == "LIVE" || cfg.pond_execution_mode == "TESTNET";
+        let max_staleness_ms = self
+            .scoped_db
+            .inner()
+            .load_config()
+            .map(|m| m.get_i64("max_bar_staleness_ms", 28_800_000))
+            .unwrap_or(28_800_000);
+        let now_ms = self.scoped_db.now_ms();
         let wick_mult = cfg.pond_wick_buffer_atr_mult;
         let chand_mult = cfg.pond_chandelier_atr_mult;
         let z_exit = cfg.pond_funding_z_exit;
@@ -257,7 +266,7 @@ impl PondOrchestrator {
 
         let universe = self.scoped_db.get_pond_universe(false)?;
         let now = Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
         let mut exits_triggered = 0usize;
 
         for mut cell in open_cells {
@@ -274,6 +283,25 @@ impl PondOrchestrator {
             let atr_4h = compute_atr_from_bars(&bars_4h, cfg.pond_atr_period.max(1))
                 .max(atr_1h * cfg.pond_gate6_atr_4h_floor_mult);
             let last_1h = bars_1h.last();
+            let bars_1h_fresh = !is_live_or_testnet
+                || last_1h
+                    .map(|b| now_ms.saturating_sub(b.timestamp_ms) <= max_staleness_ms)
+                    .unwrap_or(false);
+            let bars_4h_fresh = !is_live_or_testnet
+                || bars_4h
+                    .last()
+                    .map(|b| now_ms.saturating_sub(b.timestamp_ms) <= max_staleness_ms)
+                    .unwrap_or(false);
+            if is_live_or_testnet && !bars_1h_fresh {
+                tracing::warn!(
+                    symbol = %cell.symbol,
+                    cell_id = cell.cell_id,
+                    "Book B (POND) 1H bar is stale or missing in LIVE/TESTNET mode; skipping hourly funding accrual and non-emergency bar exits"
+                );
+            }
+            let effective_1h_boundary = is_1h_boundary && bars_1h_fresh;
+            let effective_4h_close = is_4h_bar_close && bars_4h_fresh;
+
             let entry_px = cell.entry_price.unwrap_or(100.0);
             let mark_px = last_1h
                 .map(|b| b.close)
@@ -291,7 +319,7 @@ impl PondOrchestrator {
                 cfg.pond_funding_z_window_hours.max(1),
             );
 
-            if is_1h_boundary {
+            if effective_1h_boundary {
                 accrue_cell_hourly_funding(&mut cell, mark_px, cur_funding);
             }
             let _price_pnl = update_cell_mark_and_chandelier(
@@ -301,7 +329,7 @@ impl PondOrchestrator {
                 low_px,
                 atr_4h,
                 chand_mult,
-                is_4h_bar_close,
+                effective_4h_close,
             );
 
             let hold_hours = cell
@@ -319,8 +347,8 @@ impl PondOrchestrator {
                 atr_14_1h: atr_1h,
                 bar_4h_close,
                 atr_14_4h: atr_4h,
-                is_4h_bar_close,
-                is_1h_boundary,
+                is_4h_bar_close: effective_4h_close,
+                is_1h_boundary: effective_1h_boundary,
                 current_funding_hourly: cur_funding,
                 current_funding_z: cur_z,
                 hold_hours,
@@ -340,6 +368,18 @@ impl PondOrchestrator {
                 let close_side = if cell.side == "LONG" { "SELL" } else { "BUY" };
                 let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
                 let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
+
+                // Escalate maker exit to market/IOC on retry or overdue max-hold timeout (NM-7)
+                let prev_attempts = self
+                    .exit_attempt_count
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(&cell.cell_id).copied())
+                    .unwrap_or(0);
+                let effective_prefer_maker = decision.prefer_maker
+                    && prev_attempts == 0
+                    && !(decision.tier == Some(5) && hold_hours >= max_hold + 1.0);
+
                 let fill = self.execution.execute_pond_order(
                     &cell.symbol,
                     close_side,
@@ -350,19 +390,50 @@ impl PondOrchestrator {
                     high_px,
                     low_px,
                     last_1h.map(|b| b.volume).unwrap_or(50_000.0),
-                    decision.tier == Some(1),
-                    decision.prefer_maker,
+                    decision.tier == Some(1) || prev_attempts > 0,
+                    effective_prefer_maker,
                     true,
                     None,
                 );
                 if is_live_or_testnet && fill.fsm_state != "FILLED" {
+                    if let Ok(mut guard) = self.exit_attempt_count.lock() {
+                        *guard.entry(cell.cell_id).or_insert(0) += 1;
+                    }
                     tracing::warn!(
-                        "Book B (POND) live exit order for {} (cell #{}) did not fill (state={}); keeping cell OPEN for retry",
+                        "Book B (POND) live exit order for {} (cell #{}, attempt {}) did not fill (state={}); keeping cell OPEN for retry",
                         cell.symbol,
                         cell.cell_id,
+                        prev_attempts + 1,
                         fill.fsm_state
                     );
+                } else if is_live_or_testnet
+                    && fill.filled_units > 0.0
+                    && fill.filled_units + 1e-8 < qty
+                {
+                    // Partial live exit fill (NH-8): reduce cell quantity & notional, keep remaining units open
+                    let exit_px = if fill.avg_fill_price > 0.0 {
+                        fill.avg_fill_price
+                    } else {
+                        mark_px
+                    };
+                    let partial_gross = if cell.side == "LONG" {
+                        (exit_px - entry_px) * fill.filled_units
+                    } else {
+                        (entry_px - exit_px) * fill.filled_units
+                    };
+                    let rem_qty = (qty - fill.filled_units).max(0.0);
+                    cell.quantity = Some(round_dp(rem_qty, 6));
+                    cell.notional_usdc = Some(round_dp(rem_qty * entry_px, 2));
+                    cell.fees_paid_usdc = round_dp(cell.fees_paid_usdc + fill.fees_paid_usdc, 4);
+                    cell.realized_pnl_usdc =
+                        round_dp(cell.realized_pnl_usdc + partial_gross, 4);
+                    if let Ok(mut guard) = self.exit_attempt_count.lock() {
+                        *guard.entry(cell.cell_id).or_insert(0) += 1;
+                    }
                 } else {
+                    if let Ok(mut guard) = self.exit_attempt_count.lock() {
+                        guard.remove(&cell.cell_id);
+                    }
                     let exit_px = if fill.avg_fill_price > 0.0 {
                         fill.avg_fill_price
                     } else {
@@ -376,18 +447,20 @@ impl PondOrchestrator {
                     cell.exit_price = Some(exit_px);
                     cell.fees_paid_usdc = round_dp(cell.fees_paid_usdc + fill.fees_paid_usdc, 4);
                     cell.realized_pnl_usdc = round_dp(
-                        gross_pnl + cell.funding_accrued_usdc - cell.fees_paid_usdc,
+                        cell.realized_pnl_usdc + gross_pnl + cell.funding_accrued_usdc
+                            - cell.fees_paid_usdc,
                         4,
                     );
                     cell.exit_reason = decision.exit_reason;
                     cell.closed_at = Some(now_str.clone());
                     cell.cooldown_until = Some(
                         (now + ChronoDuration::hours(decision.cooldown_hours))
-                            .format("%Y-%m-%d %H:%M:%S")
+                            .format("%Y-%m-%dT%H:%M:%SZ")
                             .to_string(),
                     );
-                    let _ = transition_cell_state(&mut cell, PondCellState::Closed);
-                    let _ = transition_cell_state(&mut cell, PondCellState::Cooldown);
+                    transition_cell_state(&mut cell, PondCellState::Closed)?;
+                    self.scoped_db.upsert_pond_cell(&cell)?;
+                    transition_cell_state(&mut cell, PondCellState::Cooldown)?;
                     exits_triggered += 1;
                 }
             }
@@ -444,7 +517,7 @@ impl PondOrchestrator {
         let armed_cells = self.scoped_db.get_armed_pond_cells()?;
         let recent_cells = self.scoped_db.get_pond_cells(200)?;
         let now = Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
 
         let mut open_or_cooldown_symbols: HashSet<String> = open_cells
             .iter()
@@ -456,13 +529,23 @@ impl PondOrchestrator {
         }
         for c in &recent_cells {
             if c.state == "COOLDOWN" {
-                if let Some(until) = &c.cooldown_until {
-                    let active_cd = parse_utc_timestamp(until)
-                        .map(|dt| dt > now.naive_utc())
-                        .unwrap_or_else(|| until.as_str() > now_str.as_str());
-                    if active_cd {
-                        open_or_cooldown_symbols.insert(c.symbol.clone());
-                    }
+                let active_cd = c
+                    .cooldown_until
+                    .as_deref()
+                    .map(|until| {
+                        parse_utc_timestamp(until)
+                            .map(|dt| dt > now.naive_utc())
+                            .unwrap_or_else(|| until > now_str.as_str())
+                    })
+                    .unwrap_or(false);
+                if active_cd {
+                    open_or_cooldown_symbols.insert(c.symbol.clone());
+                } else {
+                    // NM-14: Persist COOLDOWN -> DORMANT transition when cooldown_until has expired
+                    let mut expired_cell = c.clone();
+                    expired_cell.updated_at = now_str.clone();
+                    transition_cell_state(&mut expired_cell, PondCellState::Dormant)?;
+                    self.scoped_db.upsert_pond_cell(&expired_cell)?;
                 }
             }
         }
@@ -530,6 +613,7 @@ impl PondOrchestrator {
             conviction_z_span: cfg.pond_conviction_z_span,
             conviction_scale_min: cfg.pond_conviction_scale_min,
             conviction_scale_max: cfg.pond_conviction_scale_max,
+            reject_synthetic_volume: is_live_or_testnet,
         };
 
         // 4. Build scan inputs across all universe coins
@@ -648,7 +732,10 @@ impl PondOrchestrator {
                 continue;
             }
             if fill.fsm_state != "FILLED" || fill.filled_units <= 0.0 {
-                let _ = transition_cell_state(&mut new_cell, PondCellState::Rejected);
+                new_cell.exit_reason = Some(format!("ENTRY_NOT_FILLED:{}", fill.fsm_state));
+                new_cell.closed_at = Some(now_str.clone());
+                transition_cell_state(&mut new_cell, PondCellState::Rejected)?;
+                self.scoped_db.upsert_pond_cell(&new_cell)?;
                 tracing::warn!(
                     "Book B (POND) entry order for {} not filled (state={}); skipping cell open",
                     cand.symbol,
@@ -734,18 +821,21 @@ pub fn spawn_pond_task(
     tokio::spawn(async move {
         let mut ticks = 0u64;
         let mut last_scan_hour_bucket: Option<i64> = None;
+        let mut last_4h_close_bucket: Option<i64> = None;
         loop {
             if *shutdown_rx.borrow() {
                 break;
             }
             let orch = orchestrator.clone();
-            let now_hour_bucket = Utc::now().timestamp_millis() / 3_600_000;
+            let now_ms = Utc::now().timestamp_millis();
+            let now_hour_bucket = now_ms / 3_600_000;
+            let now_4h_bucket = now_ms / 14_400_000;
             let is_hourly_scan = last_scan_hour_bucket != Some(now_hour_bucket);
-            let is_4h_close = is_hourly_scan && (now_hour_bucket % 4 == 0);
+            let is_4h_close = last_4h_close_bucket != Some(now_4h_bucket);
 
             let step_fut = AssertUnwindSafe(async move {
                 tokio::task::spawn_blocking(move || {
-                    if is_hourly_scan {
+                    if is_hourly_scan || is_4h_close {
                         orch.run_scan_cycle(is_4h_close).map(|_| ())
                     } else {
                         orch.run_tick_15s().map(|_| ())
@@ -758,8 +848,11 @@ pub fn spawn_pond_task(
             match step_fut.await {
                 Ok(Ok(Ok(()))) => {
                     ticks += 1;
-                    if is_hourly_scan {
+                    if is_hourly_scan || is_4h_close {
                         last_scan_hour_bucket = Some(now_hour_bucket);
+                    }
+                    if is_4h_close {
+                        last_4h_close_bucket = Some(now_4h_bucket);
                     }
                 }
                 Ok(Ok(Err(e))) => {
@@ -963,11 +1056,13 @@ mod tests {
                 lot_step_size: 0.01,
                 min_notional_usdc: 10.0,
                 max_leverage: 3.0,
+                reference_price: 180.0,
                 status: "ACTIVE".to_string(),
-                warmup_until: Some("2026-01-08 00:00:00".to_string()),
+                warmup_until: Some("2026-01-08T00:00:00Z".to_string()),
                 delist_streak: 0,
-                added_at: "2026-01-01 00:00:00".to_string(),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
                 delisted_at: None,
+                is_synthetic_volume: 0,
             },
             funding_series_168h: f_pos,
             bars_1h: make_test_bars("SOL/USDC:USDC", "1h", 180, 180.0),
@@ -985,11 +1080,13 @@ mod tests {
                 lot_step_size: 0.1,
                 min_notional_usdc: 10.0,
                 max_leverage: 3.0,
+                reference_price: 3.2,
                 status: "ACTIVE".to_string(),
-                warmup_until: Some("2026-01-08 00:00:00".to_string()),
+                warmup_until: Some("2026-01-08T00:00:00Z".to_string()),
                 delist_streak: 0,
-                added_at: "2026-01-01 00:00:00".to_string(),
+                added_at: "2026-01-01T00:00:00Z".to_string(),
                 delisted_at: None,
+                is_synthetic_volume: 0,
             },
             funding_series_168h: f_neg,
             bars_1h: make_test_bars("SUI/USDC:USDC", "1h", 180, 3.2),
@@ -1101,11 +1198,9 @@ mod tests {
         // 2. Ratchet Chandelier stop into TRAILED state, then test Tier 1 wick stop on 15s tick
         update_cell_mark_and_chandelier(&mut cell, 1.25, 1.28, 1.20, 0.04, 2.8, true);
         assert_eq!(cell.state, "TRAILED");
-        // Chandelier stop ratcheted down to 1.20 + 2.8 * 0.04 = 1.312 (< initial_stop 1.75)
         let active_stop = cell.chandelier_stop.unwrap();
         assert!((active_stop - 1.312).abs() < 1e-6);
 
-        // Wick above ratcheted chandelier stop + 0.85 * atr_14_1h (1.312 + 0.85 * 0.04 = 1.346) -> 1.36 triggers Tier 1!
         let dec_t1 = evaluate_exit_priority(
             &cell,
             &CellExitEvalInput {
@@ -1147,11 +1242,13 @@ mod tests {
             lot_step_size: 1.0,
             min_notional_usdc: 10.0,
             max_leverage: 3.0,
+            reference_price: 0.25,
             status: "ACTIVE".to_string(),
             warmup_until: Some("2025-01-01T00:00:00Z".to_string()),
             delist_streak: 0,
             added_at: "2025-01-01T00:00:00Z".to_string(),
             delisted_at: None,
+            is_synthetic_volume: 0,
         };
 
         // 1. Only 120 hours of 1H bars (< 168h requirement) -> Vetoed by Gate 5
@@ -1203,11 +1300,9 @@ mod tests {
         assert!(parse_utc_timestamp("2020-01-01T00:00:00Z").is_some());
         assert!(parse_utc_timestamp("2026-01-01 00:00:00").is_some());
 
-        // Multi-week rank-95 delisting hysteresis when coin has an open PondCell:
         let mut rows = orch.initialize_or_refresh_universe().unwrap();
         let target_sym = rows[79].symbol.clone();
 
-        // Open an active PondCell on `target_sym`
         let mut open_cell = PondCell {
             cell_id: 0,
             symbol: target_sym.clone(),
@@ -1241,7 +1336,6 @@ mod tests {
         let stored_cells = orch.scoped_db.get_open_pond_cells().unwrap();
         open_cell.cell_id = stored_cells[0].cell_id;
 
-        // Week 1: Drops to rank 102 (> 95) -> streak = 1, remains ACTIVE
         rows[79].rank = 102;
         let w1 = orch
             .universe_mgr
@@ -1251,7 +1345,6 @@ mod tests {
         assert_eq!(r_w1.delist_streak, 1);
         assert_eq!(r_w1.status, "ACTIVE");
 
-        // Week 2: Still at rank 102 (> 95) for 2nd consecutive week WITH open cell -> DELISTING
         let w2 = orch
             .universe_mgr
             .refresh_universe(Some(rows.clone()))
@@ -1260,7 +1353,6 @@ mod tests {
         assert_eq!(r_w2.delist_streak, 2);
         assert_eq!(r_w2.status, "DELISTING");
 
-        // Close the open cell (simulating Tier 6 exit on DELISTING), then Week 3 -> RETIRED
         open_cell.state = "CLOSED".to_string();
         open_cell.exit_reason = Some("TIER6_UNIVERSE_DELISTING_EXIT".to_string());
         orch.scoped_db.upsert_pond_cell(&open_cell).unwrap();
@@ -1277,7 +1369,6 @@ mod tests {
         db.initialize_schema(true).unwrap();
         let orch = PondOrchestrator::new(db.clone(), None);
 
-        // 1. Insert an ARMED cell representing a resting entry order on the book (B8)
         let armed_cell = PondCell {
             cell_id: 0,
             symbol: "SOL/USDC:USDC".to_string(),
@@ -1311,13 +1402,11 @@ mod tests {
         assert_eq!(orch.scoped_db.get_open_pond_cells().unwrap().len(), 0);
         assert_eq!(orch.scoped_db.get_armed_pond_cells().unwrap().len(), 1);
 
-        // On a 15s tick while order is still resting on book, cell stays ARMED (not phantom OPEN)
         let promoted = orch.reconcile_armed_cells(false).unwrap();
         assert_eq!(promoted, 0);
         assert_eq!(orch.scoped_db.get_open_pond_cells().unwrap().len(), 0);
         assert_eq!(orch.scoped_db.get_armed_pond_cells().unwrap().len(), 1);
 
-        // At 1H boundary, stale unfilled resting order is cancelled and transitioned ARMED -> REJECTED
         let _ = orch.reconcile_armed_cells(true).unwrap();
         assert_eq!(orch.scoped_db.get_armed_pond_cells().unwrap().len(), 0);
         assert_eq!(orch.scoped_db.get_open_pond_cells().unwrap().len(), 0);
@@ -1325,7 +1414,6 @@ mod tests {
         assert_eq!(all_cells[0].state, "REJECTED");
         assert_eq!(all_cells[0].funding_accrued_usdc, 0.0);
 
-        // 2. Verify C1 & C3: Confirmed OPEN cell equity includes MTM price PnL minus fees and net settled transfers
         let mut cell = armed_cell;
         cell.state = "OPEN".to_string();
         cell.opened_at = Some("2026-01-01T00:00:00Z".to_string());
@@ -1334,7 +1422,6 @@ mod tests {
         cell.fees_paid_usdc = 2.0;
         orch.scoped_db.upsert_pond_cell(&cell).unwrap();
 
-        // Insert a 1h bar with close = 90.0 (SHORT 5 units @ 100.0 -> +$50 MTM price PnL)
         db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
@@ -1349,7 +1436,6 @@ mod tests {
         }])
         .unwrap();
 
-        // Insert a COMPLETED book transfer of +$200 from PIT to POND
         db.insert_book_transfer(&aegis_core::BookTransfer {
             transfer_id: 0,
             settle_date: "2026-01-01".to_string(),
@@ -1371,7 +1457,136 @@ mod tests {
         .unwrap();
 
         let (pond_eq, _idle) = orch.compute_pond_equity_and_idle_usdc().unwrap();
-        // base ($5000) + net_transfer (+$200) + MTM price_pnl (+$50) + funding (+$12) - fees ($2) = $5260.0
         assert!((pond_eq - 5260.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_live_synthetic_volume_rejected_in_gate1_nm13() {
+        let mut f_pos = vec![0.000005; 167];
+        f_pos.push(0.000095);
+
+        let synth_input = PondAssetScanInput {
+            universe_row: PondUniverseRow {
+                symbol: "SOL/USDC:USDC".to_string(),
+                rank: 3,
+                median_daily_volume_usdc: 500_000.0,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                min_notional_usdc: 10.0,
+                max_leverage: 3.0,
+                reference_price: 180.0,
+                status: "ACTIVE".to_string(),
+                warmup_until: Some("2026-01-08T00:00:00Z".to_string()),
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 1,
+            },
+            funding_series_168h: f_pos,
+            bars_1h: make_test_bars("SOL/USDC:USDC", "1h", 180, 180.0),
+            bars_4h: make_test_bars("SOL/USDC:USDC", "4h", 50, 180.0),
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+        };
+
+        let live_params = PondScannerParams {
+            reject_synthetic_volume: true,
+            ..Default::default()
+        };
+        let out = run_nps01_scan(&[synth_input], &live_params, &HashSet::new());
+        assert_eq!(out.selected_entries.len(), 0);
+        assert!(out
+            .rejections_by_gate
+            .iter()
+            .any(|(_, r)| r == "GATE1_SYNTHETIC_VOLUME_REJECTED_IN_LIVE"));
+    }
+
+    #[test]
+    fn test_nm7_nm8_nm10_nm14_nm15_pond_boundary_staleness_reconcile_fsm_and_risk_scope() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+
+        // 1. NM-14: Expired COOLDOWN cell transitions to DORMANT and is persisted in SQLite during run_scan_cycle
+        let cd_cell = PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "COOLDOWN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(150.0),
+            quantity: Some(2.0),
+            notional_usdc: Some(300.0),
+            risk_budget_usdc: Some(30.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.2),
+            funding_rate_entry: Some(0.0005),
+            initial_stop: Some(165.0),
+            chandelier_stop: Some(165.0),
+            highest_price_seen: Some(150.0),
+            lowest_price_seen: Some(150.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 5.0,
+            fees_paid_usdc: 0.2,
+            exit_price: Some(147.0),
+            exit_reason: Some("FUNDING_DECAY".to_string()),
+            opened_at: Some("2026-01-01T00:00:00Z".to_string()),
+            closed_at: Some("2026-01-01T04:00:00Z".to_string()),
+            cooldown_until: Some("2026-01-01T08:00:00Z".to_string()),
+            updated_at: "2026-01-01T04:00:00Z".to_string(),
+        };
+        let cd_id = orch.scoped_db.upsert_pond_cell(&cd_cell).unwrap();
+        let _ = orch.run_scan_cycle(false).unwrap();
+        let cells_after = orch.scoped_db.get_pond_cells(50).unwrap();
+        let updated_cd = cells_after.iter().find(|c| c.cell_id == cd_id).unwrap();
+        assert_eq!(updated_cd.state, "DORMANT");
+
+        // 2. NM-10: Exchange reconciliation detects direction flip on an open Pond cell
+        let open_cell = PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(3000.0),
+            quantity: Some(1.0),
+            notional_usdc: Some(3000.0),
+            risk_budget_usdc: Some(50.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.5),
+            funding_rate_entry: Some(0.0004),
+            initial_stop: Some(3150.0),
+            chandelier_stop: Some(3150.0),
+            highest_price_seen: Some(3000.0),
+            lowest_price_seen: Some(3000.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            opened_at: Some("2026-01-02T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+        let open_id = orch.scoped_db.upsert_pond_cell(&open_cell).unwrap();
+        let mut sim_pos = HashMap::new();
+        // Positive szi (+1.5) means LONG on exchange, whereas local cell is SHORT!
+        sim_pos.insert(
+            "ETH".to_string(),
+            json!({"szi": "1.5", "entryPx": "3010.0", "markPx": "3020.0", "unrealizedPnl": "15.0"}),
+        );
+        let rec = orch
+            .execution
+            .reconcile_exchange_state(Some(&sim_pos), Some(&[]));
+        assert!(rec["discrepancies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["type"] == "DIRECTION_FLIP_POND_CELL_RECONCILED" && d["cell_id"] == open_id));
     }
 }

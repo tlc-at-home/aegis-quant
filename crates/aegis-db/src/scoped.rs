@@ -284,14 +284,25 @@ impl BookScopedDb {
         self.check_table_access("trades")?;
         self.check_config_key_access("hmm_window_bars")?;
         let cfg = self.pool.load_config()?;
-        Ok(PitConfig::from_config_map(&cfg))
+        let mut pit_cfg = PitConfig::from_config_map(&cfg);
+        pit_cfg.platform_settle_gate_enabled = self.pool.is_settle_gate_active()?;
+        Ok(pit_cfg)
     }
 
     pub fn load_pond_config(&self) -> Result<PondConfig> {
         self.check_table_access("pond_cells")?;
         self.check_config_key_access("pond_direction_policy")?;
         let cfg = self.pool.load_config()?;
-        Ok(PondConfig::from_config_map(&cfg))
+        let mut pond_cfg = PondConfig::from_config_map(&cfg);
+        let active_gate = self.pool.is_settle_gate_active()?;
+        pond_cfg.platform_settle_gate_enabled = active_gate;
+        pond_cfg.platform_settle_gate_enabled_raw = active_gate;
+        Ok(pond_cfg)
+    }
+
+    /// Returns true if the daily settling gate is currently active and has not exceeded its TTL (`NH-10`).
+    pub fn is_settle_gate_active(&self) -> Result<bool> {
+        self.pool.is_settle_gate_active()
     }
 
     // --- Shared Read-Only / Telemetry Operations ---

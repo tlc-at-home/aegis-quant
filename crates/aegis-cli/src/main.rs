@@ -24,6 +24,7 @@ use aegis_pond::PondOrchestrator;
 use aegis_risk::RiskEngine;
 use aegis_settle::{SettleController, SettleOverrideInput};
 use aegis_signals::{SignalEngine, WalkForwardCalibrator};
+use aegis_telemetry::TelemetryBus;
 use aegis_web::serve_web;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -130,7 +131,7 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..006_*.sql`)
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..007_*.sql`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -192,7 +193,7 @@ pub fn validate_bind_host(
     host: &str,
     allow_remote_bind_flag: bool,
 ) -> Result<String> {
-    let cfg = db.load_config().unwrap_or_default();
+    let cfg = db.load_config_or_log_default("aegis-cli.bind_host");
     let effective_host = if host.trim().is_empty() {
         cfg.get_str("web_bind_host", "127.0.0.1")
     } else {
@@ -226,6 +227,7 @@ pub fn validate_bind_host(
 /// Top-level orchestrator coordinating SQLite WAL, Book A (`PIT`), Book B (`POND`), and WebUI.
 pub struct AegisOrchestrator {
     pub db: DatabaseManager,
+    pub telemetry: TelemetryBus,
     pub ingestion: MarketIngestionEngine,
     pub signals: SignalEngine,
     pub risk: RiskEngine,
@@ -239,15 +241,17 @@ pub struct AegisOrchestrator {
 
 impl AegisOrchestrator {
     pub fn new(db: DatabaseManager) -> Self {
+        let telemetry = TelemetryBus::new(db.clone());
         let ingestion = MarketIngestionEngine::new(db.clone());
         let signals = SignalEngine::new(db.clone());
         let risk = RiskEngine::new(db.clone());
         let execution = ExecutionEngine::new(db.clone());
         let calibrator = WalkForwardCalibrator::new(db.clone());
-        let pit = PitOrchestrator::new(db.clone(), None);
-        let pond = PondOrchestrator::new(db.clone(), None);
+        let pit = PitOrchestrator::new(db.clone(), Some(telemetry.clone()));
+        let pond = PondOrchestrator::new(db.clone(), Some(telemetry.clone()));
         Self {
             db,
+            telemetry,
             ingestion,
             signals,
             risk,
@@ -260,17 +264,48 @@ impl AegisOrchestrator {
         }
     }
 
+    /// Spawns Book A (`PitOrchestrator`) and Book B (`PondOrchestrator`) background Tokio tasks (`NQ-3`).
+    pub fn spawn_async_book_tasks(
+        &self,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> (tokio::task::JoinHandle<Value>, tokio::task::JoinHandle<Value>) {
+        let pit_handle = aegis_pit::spawn_pit_task(self.pit.clone(), 900, shutdown_rx.clone());
+        let pond_handle = aegis_pond::spawn_pond_task(self.pond.clone(), 15, shutdown_rx);
+        (pit_handle, pond_handle)
+    }
+
     pub fn initialize(&self, run_calibration: bool) -> Result<()> {
         self.db.initialize_schema(false)?;
         if let Err(e) = self.db.prune_retention_data() {
             tracing::warn!("Startup retention pruning warning: {e}");
         }
         let cfg = self.db.load_config()?;
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        if exec_mode == "LIVE"
+            || exec_mode == "TESTNET"
+            || pond_mode == "LIVE"
+            || pond_mode == "TESTNET"
+        {
+            if let Err(e) = self.db.validate_signer_binding() {
+                tracing::warn!(
+                    "Startup signer binding check warning in mode {exec_mode}: {e} (WebUI remains available to update credentials)"
+                );
+            }
+        }
         let recon = self.execution.reconcile_exchange_state(None, None);
+        let recon_status = recon
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        let recon_disc = recon
+            .get("discrepancies_found")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         tracing::info!(
-            "Startup exchange reconciliation: status={} discrepancies={}",
-            recon["status"].as_str().unwrap_or("UNKNOWN"),
-            recon["discrepancies_found"].as_u64().unwrap_or(0)
+            "Startup exchange reconciliation: status={recon_status} discrepancies={recon_disc}"
         );
         if let Err(e) = self.pond.initialize_or_refresh_universe() {
             tracing::error!("Startup Pond universe initialization failed: {e}");
@@ -303,9 +338,12 @@ impl AegisOrchestrator {
             }
         }
 
+        let (frozen, _) = self.pit.is_entry_frozen()?;
         let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
         let evaluations = self.signals.evaluate_universe(true)?;
-        let snapshot = self.execution.reconcile_cycle(&evaluations, false)?;
+        let snapshot =
+            self.execution
+                .reconcile_cycle_with_options(&evaluations, false, frozen)?;
         let now_hour_bucket = self.db.now_ms() / 3_600_000;
         let pond_summary = if self.last_pond_scan_hour_bucket != Some(now_hour_bucket) {
             match self.pond.run_scan_cycle(now_hour_bucket % 4 == 0) {
@@ -360,29 +398,29 @@ impl AegisOrchestrator {
             *actions_summary.entry(ev.signal_action.clone()).or_insert(0) += 1;
         }
 
-        self.db.log_telemetry(
-            "INFO",
-            "engine.orchestrator",
-            &format!(
-                "Cycle #{} complete in {:.0}ms | Regime={} (B:{:.0}%/Be:{:.0}%/C:{:.0}%) | PitEq=${:.2} | PondEq=${:.2} | WalletEq=${:.2}",
-                self.cycle_count,
-                elapsed_ms,
-                snapshot.hmm_regime,
-                snapshot.prob_bull * 100.0,
-                snapshot.prob_bear * 100.0,
-                snapshot.prob_chop * 100.0,
-                pit_eq_now,
-                pond_eq_now,
-                snapshot.total_equity_usdc,
-            ),
-            Some(json!({
-                "cycle": self.cycle_count,
-                "elapsed_ms": round_dp(elapsed_ms, 1),
-                "ingest": ingest_stats,
-                "actions": actions_summary,
-                "pond": pond_summary,
-            })),
-        )?;
+        let details = json!({
+            "cycle": self.cycle_count,
+            "elapsed_ms": round_dp(elapsed_ms, 1),
+            "ingest": ingest_stats,
+            "actions": actions_summary,
+            "pond": pond_summary,
+        });
+        let msg = format!(
+            "Cycle #{} complete in {:.0}ms | Regime={} (B:{:.0}%/Be:{:.0}%/C:{:.0}%) | PitEq=${:.2} | PondEq=${:.2} | WalletEq=${:.2}",
+            self.cycle_count,
+            elapsed_ms,
+            snapshot.hmm_regime,
+            snapshot.prob_bull * 100.0,
+            snapshot.prob_bear * 100.0,
+            snapshot.prob_chop * 100.0,
+            pit_eq_now,
+            pond_eq_now,
+            snapshot.total_equity_usdc,
+        );
+        self.db
+            .log_telemetry("INFO", "engine.orchestrator", &msg, Some(details.clone()))?;
+        self.telemetry
+            .publish_event("INFO", "engine.orchestrator", &msg, Some(details));
 
         println!(
             "\n------------------------------------------------------------------------------"
@@ -474,13 +512,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 6 {
+        status: if schema_ver >= 7 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 6 (migrations 001..006 applied)".to_string(),
+        requirement: "schema_version >= 7 (migrations 001..007 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -583,14 +621,20 @@ pub fn run_readiness_suite(
     });
 
     let wallet_addr = cfg.get_str("wallet_address", "");
+    let agent_addr = cfg.get_str("hyperliquid_agent_address", "");
     let priv_key = db.get_signing_private_key().unwrap_or_default();
     let wallet_ok =
         !wallet_addr.is_empty() && validate_evm_address(&wallet_addr, "wallet_address").is_ok();
     let priv_ok = !priv_key.is_empty() && validate_private_key(&priv_key).is_ok();
-    let creds_ready = wallet_ok && priv_ok;
+    let binding_ok = if wallet_ok && priv_ok && !agent_addr.trim().is_empty() {
+        db.validate_signer_binding().is_ok()
+    } else {
+        true
+    };
+    let creds_ready = wallet_ok && priv_ok && binding_ok;
     let sec03_status = if creds_ready {
         "PASS"
-    } else if !is_live_or_testnet {
+    } else if !is_live_or_testnet && binding_ok {
         "WARN"
     } else {
         "FAIL"
@@ -601,7 +645,7 @@ pub fn run_readiness_suite(
         name: "Trade-Only Agent Wallet & Key".to_string(),
         status: sec03_status.to_string(),
         observed: format!(
-            "wallet_valid={wallet_ok}, private_key_valid={priv_ok} (mode={target_mode})"
+            "wallet_valid={wallet_ok}, private_key_valid={priv_ok}, signer_binding_ok={binding_ok} (mode={target_mode})"
         ),
         requirement: "Valid 42-char 0x wallet_address + 64-hex secp256k1 Agent private_key"
             .to_string(),
@@ -783,7 +827,7 @@ pub fn run_readiness_suite(
 
     let mut test_alert_engine = AlertEngine::new(mem_db.clone());
     let alert_res = test_alert_engine.run_test_alert(true)?;
-    let loopback_ok = alert_res.get("status").and_then(Value::as_str) == Some("DELIVERED");
+    let loopback_ok = alert_res.status == "DELIVERED";
     let ops01_status = if live_alerts_configured && loopback_ok {
         "PASS"
     } else if loopback_ok && !is_live_or_testnet {
@@ -846,8 +890,16 @@ pub fn run_readiness_suite(
         json!({"szi": 2.5, "entryPx": 180.0, "markPx": 182.0, "unrealizedPnl": 5.0}),
     );
     let recon_res = exec_self.reconcile_exchange_state(Some(&sim_ex), Some(&[]));
-    let recon_ok = recon_res.get("status").and_then(Value::as_str) == Some("RECONCILED")
-        && recon_res.get("discrepancies_found").and_then(Value::as_u64).unwrap_or(0) >= 1;
+    let recon_status = recon_res
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("UNKNOWN")
+        .to_string();
+    let recon_disc = recon_res
+        .get("discrepancies_found")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let recon_ok = recon_status == "RECONCILED" && recon_disc >= 1;
 
     checks.push(CheckResult {
         gate: "Gate 4: Operational Readiness".to_string(),
@@ -855,9 +907,7 @@ pub fn run_readiness_suite(
         name: "Exchange Position Drift Reconciliation".to_string(),
         status: if recon_ok { "PASS" } else { "FAIL" }.to_string(),
         observed: format!(
-            "status={}, discrepancies_reconciled={}",
-            recon_res["status"].as_str().unwrap_or("ERROR"),
-            recon_res["discrepancies_found"].as_u64().unwrap_or(0)
+            "status={recon_status}, discrepancies_reconciled={recon_disc}",
         ),
         requirement: "Automatically detects and reconciles orphan/phantom/size-drift positions"
             .to_string(),
@@ -1081,7 +1131,8 @@ fn main() -> anyhow::Result<()> {
             refresh_universe,
         }) => {
             db.initialize_schema(false)?;
-            let pond = PondOrchestrator::new(db, None);
+            let bus = TelemetryBus::new(db.clone());
+            let pond = PondOrchestrator::new(db, Some(bus));
             if refresh_universe || !scan {
                 let rows = pond.initialize_or_refresh_universe()?;
                 println!("Refreshed Pond universe: {} coins tracked", rows.len());
@@ -1112,7 +1163,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 None => (None, None),
             };
-            let ctrl = SettleController::new(db, None);
+            let bus = TelemetryBus::new(db.clone());
+            let ctrl = SettleController::new(db, Some(bus));
             let res = ctrl.run_settling(SettleOverrideInput {
                 pit_equity_usdc: pit_override,
                 pond_equity_usdc: pond_override,

@@ -10,9 +10,9 @@
 //!   post-stop cooldowns, dynamic slippage, and DB-configured institutional acceptance gates
 
 use aegis_core::{
-    base_prices_usdc, resolve_project_root, round_dp, verify_data_provenance, AegisError,
-    AltPairMetadata, BacktestTearSheet, OhlcvBar, PortfolioSnapshot, RegimeState, Result,
-    SignalEvaluation, TradeRecord, UniverseAsset,
+    resolve_project_root, round_dp, verify_data_provenance, AegisError, AltPairMetadata,
+    BacktestTearSheet, OhlcvBar, PortfolioSnapshot, RegimeState, Result, SignalEvaluation,
+    TradeRecord, UniverseAsset,
 };
 use aegis_db::DatabaseManager;
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine};
@@ -267,7 +267,6 @@ impl BacktestEngine {
         let ingestion = MarketIngestionEngine::new(bt_db.clone());
         let usdc_assets = bt_db.get_usdc_perp_universe()?;
         let alt_pairs = bt_db.get_alt_pairs_universe()?;
-        let base_prices = base_prices_usdc();
 
         let backfill_file = Self::backfill_path();
         let mut loaded_real: HashMap<String, Vec<OhlcvBar>> = HashMap::new();
@@ -312,7 +311,7 @@ impl BacktestEngine {
                 btc_sym,
                 "4h",
                 total_needed,
-                *base_prices.get(btc_sym).unwrap_or(&68500.0),
+                bt_db.resolve_reference_price(btc_sym),
                 None,
                 1,
                 None,
@@ -352,7 +351,9 @@ impl BacktestEngine {
                     &asset.symbol,
                     "4h",
                     total_needed,
-                    *base_prices.get(asset.symbol.as_str()).unwrap_or(&10.0),
+                    asset
+                        .reference_price
+                        .max(bt_db.resolve_reference_price(&asset.symbol)),
                     Some(&btc_bars),
                     (idx + 2) as u64,
                     btc_bars.last().map(|b| b.timestamp_ms),

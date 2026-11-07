@@ -46,8 +46,6 @@ VALUES ('enforce_master_key', 'true', 'bool', 'security', 'Require external or k
 INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description) VALUES
 ('hyperliquid_mainnet_url',          'https://api.hyperliquid.xyz',         'string', 'execution', 'Hyperliquid L1 Mainnet REST API base URL'),
 ('hyperliquid_testnet_url',          'https://api.hyperliquid-testnet.xyz', 'string', 'execution', 'Hyperliquid L1 Testnet REST API base URL'),
-('hyperliquid_default_vault_mainnet','0xdfc24b077bc1425ad1dea75bcb6f8158e10df303', 'string', 'execution', 'Default HLP Mainnet Vault address'),
-('hyperliquid_default_vault_testnet','0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0', 'string', 'execution', 'Default HLP Testnet Vault address'),
 ('pit_subaccount_address',           '',                                    'string', 'execution', 'Optional dedicated Hyperliquid sub-account EVM address for Book A (PIT)'),
 ('pond_subaccount_address',          '',                                    'string', 'execution', 'Optional dedicated Hyperliquid sub-account EVM address for Book B (POND)'),
 ('maker_fill_poll_interval_ms',      '250',                                 'int',    'execution', 'Polling sleep interval in ms between live Maker Limit Chaser reprices'),

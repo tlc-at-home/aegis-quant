@@ -10,7 +10,7 @@ aegis-core = { workspace = true }
 aegis-db = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
-rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+

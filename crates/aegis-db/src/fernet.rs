@@ -125,7 +125,7 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
         if !cred_dir.is_empty() {
             let dir_path = Path::new(cred_dir);
             if dir_path.is_dir() {
-                for name in ["aegis_master_key", "master_key", "fernet_key"] {
+                for name in ["aegis_master_key", ".aegis_master_key"] {
                     let cand = dir_path.join(name);
                     if cand.is_file() {
                         if let Ok(bytes) = fs::read(&cand) {
@@ -133,22 +133,6 @@ pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path
                                 let norm = normalize_fernet_key(&bytes);
                                 if !is_legacy_public_fallback_key(&norm) {
                                     return (norm, true);
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Ok(entries) = fs::read_dir(dir_path) {
-                    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-                    paths.sort();
-                    for child in paths {
-                        if child.is_file() {
-                            if let Ok(bytes) = fs::read(&child) {
-                                if !trim_ascii(&bytes).is_empty() {
-                                    let norm = normalize_fernet_key(&bytes);
-                                    if !is_legacy_public_fallback_key(&norm) {
-                                        return (norm, true);
-                                    }
                                 }
                             }
                         }
@@ -268,6 +252,11 @@ impl FernetCipher {
 
     /// Decrypt a URL-safe base64 Fernet token (`gAAAAAB...`) and verify its HMAC-SHA256 tag.
     pub fn decrypt(&self, token_str: &str) -> Result<String> {
+        self.decrypt_str_with_ttl(token_str, None)
+    }
+
+    /// Decrypt a URL-safe base64 Fernet token (`gAAAAAB...`), verifying HMAC-SHA256 and optional TTL (`NL-5`).
+    pub fn decrypt_str_with_ttl(&self, token_str: &str, max_age_secs: Option<u64>) -> Result<String> {
         let clean = token_str.trim();
         let raw_token = clean.strip_prefix("ENC:").unwrap_or(clean);
         let data = URL_SAFE
@@ -290,6 +279,26 @@ impl FernetCipher {
                 "Failed to decrypt Fernet-encrypted configuration value: invalid master key or corrupted token.".to_string(),
             )
         })?;
+
+        if let Some(ttl) = max_age_secs {
+            let mut ts_bytes = [0u8; 8];
+            ts_bytes.copy_from_slice(&data[1..9]);
+            let token_ts = u64::from_be_bytes(ts_bytes);
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if token_ts > now_secs.saturating_add(60) {
+                return Err(AegisError::Crypto(
+                    "Fernet token timestamp is in the future beyond clock skew tolerance".to_string(),
+                ));
+            }
+            if now_secs.saturating_sub(token_ts) > ttl {
+                return Err(AegisError::Crypto(
+                    "Fernet token has expired beyond allowed TTL".to_string(),
+                ));
+            }
+        }
 
         let iv = &data[9..25];
         let ciphertext = &data[25..body_end];

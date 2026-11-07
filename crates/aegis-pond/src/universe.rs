@@ -6,23 +6,14 @@
 //! - Delisting hysteresis: rank > 95 for 2 consecutive refreshes transitions to `DELISTING`,
 //!   and once no open cells remain, transitions to `RETIRED`.
 
-use aegis_core::{PondUniverseRow, Result};
+use aegis_core::{now_iso8601_utc, PondUniverseRow, Result};
 use aegis_db::BookScopedDb;
 use aegis_execution::MarketIngestionEngine;
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) fn parse_utc_timestamp(s: &str) -> Option<NaiveDateTime> {
-    let trimmed = s.trim();
-    NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
-        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ"))
-        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S"))
-        .ok()
-        .or_else(|| {
-            DateTime::parse_from_rfc3339(trimmed)
-                .ok()
-                .map(|dt| dt.naive_utc())
-        })
+    aegis_core::parse_utc_timestamp(s)
 }
 
 /// Dynamic 80-coin Pond universe manager.
@@ -72,7 +63,7 @@ impl PondUniverseManager {
         };
 
         let now = Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
         let mut updated_symbols = HashSet::new();
         let mut final_rows = Vec::new();
 
@@ -92,14 +83,14 @@ impl PondUniverseManager {
                         (
                             now_str.clone(),
                             (now - Duration::hours(warmup_hours + 12))
-                                .format("%Y-%m-%d %H:%M:%S")
+                                .format("%Y-%m-%dT%H:%M:%SZ")
                                 .to_string(),
                         )
                     } else {
                         (
                             now_str.clone(),
                             (now + Duration::hours(warmup_hours))
-                                .format("%Y-%m-%d %H:%M:%S")
+                                .format("%Y-%m-%dT%H:%M:%SZ")
                                 .to_string(),
                         )
                     }
@@ -137,11 +128,13 @@ impl PondUniverseManager {
                 lot_step_size: cand.lot_step_size,
                 min_notional_usdc: cand.min_notional_usdc,
                 max_leverage: cand.max_leverage,
+                reference_price: cand.reference_price,
                 status,
                 warmup_until: Some(warmup_until_str),
                 delist_streak,
                 added_at,
                 delisted_at,
+                is_synthetic_volume: cand.is_synthetic_volume,
             });
         }
 
@@ -168,11 +161,13 @@ impl PondUniverseManager {
                 lot_step_size: prev.lot_step_size,
                 min_notional_usdc: prev.min_notional_usdc,
                 max_leverage: prev.max_leverage,
+                reference_price: prev.reference_price,
                 status,
                 warmup_until: prev.warmup_until,
                 delist_streak,
                 added_at: prev.added_at,
                 delisted_at,
+                is_synthetic_volume: prev.is_synthetic_volume,
             });
         }
 
@@ -195,7 +190,7 @@ impl PondUniverseManager {
         }
         let open_cells = self.scoped_db.get_open_pond_cells()?;
         let open_syms: HashSet<String> = open_cells.into_iter().map(|c| c.symbol).collect();
-        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now_str = now_iso8601_utc();
         let mut to_update = Vec::new();
         for mut row in delisting {
             if !open_syms.contains(&row.symbol) {

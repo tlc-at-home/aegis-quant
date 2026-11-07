@@ -32,7 +32,7 @@ impl TelemetryBus {
     pub fn new(db: DatabaseManager) -> Self {
         let (event_tx, mut event_rx) = mpsc::channel::<TelemetryEvent>(256);
         let (snapshot_tx, _) = broadcast::channel::<Value>(64);
-        let initial_cfg = db.load_config().unwrap_or_default();
+        let initial_cfg = db.load_config_logged("aegis-telemetry.bus");
         let (config_tx, config_rx) = watch::channel(initial_cfg);
         let (settling_tx, settling_rx) = watch::channel(false);
 
@@ -102,4 +102,47 @@ pub fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_telemetry_bus_settling_watch_and_config_reload() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let bus = TelemetryBus::new(db.clone());
+
+        assert!(!bus.is_settling_in_progress());
+        bus.set_settling_in_progress(true);
+        assert!(bus.is_settling_in_progress());
+        bus.set_settling_in_progress(false);
+        assert!(!bus.is_settling_in_progress());
+
+        db.set_config_value("polling_interval_seconds", &json!(30))
+            .unwrap();
+        bus.reload_config(&db);
+        let cfg = bus.config_rx.borrow().clone();
+        assert_eq!(cfg.get_i64("polling_interval_seconds", 15), 30);
+    }
+
+    #[test]
+    fn test_telemetry_bus_publish_event_and_snapshot_broadcast() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let bus = TelemetryBus::new(db);
+        let mut rx = bus.snapshot_tx.subscribe();
+
+        bus.publish_event(
+            "INFO",
+            "test.component",
+            "unit test event",
+            Some(json!({"equity": 10250.5})),
+        );
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received["equity"], json!(10250.5));
+    }
 }

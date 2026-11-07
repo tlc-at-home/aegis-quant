@@ -1,28 +1,31 @@
 //! Multi-Layer Quantitative Signal & Regime Engine (`aegis-signals`).
 //!
 //! 1:1 port of `engine/signals.py` and `engine/calibration.py`:
-//! - **Layer 1:** 3-State Diagonal Gaussian HMM (`BULL`, `BEAR`, `CHOP`) with MAP directional priors,
+//! - **Layer 1 (`hmm`):** 3-State Diagonal Gaussian HMM (`BULL`, `BEAR`, `CHOP`) with MAP directional priors,
 //!   sticky transition priors, causal rolling-window decoding (`states.len() == bars.len()`),
-//!   4H bar-close cache + 15s single-step forward filtering (`alpha_{T-1} -> alpha_T`),
+//!   4H bar-close `Arc<[RegimeState]>` cache + 15s single-step forward filtering (`alpha_{T-1} -> alpha_T`),
 //!   causal cross-sectional `alt_pc1_ret` via rolling covariance power-iteration, and hysteresis transition gates.
 //! - **Layer 2:** Continuous Signal-to-Noise Ratio (`SNR` in `[-1, +1]`) blending `60%` `ALT/BTC:SYNTH`
 //!   and `40%` `ALT/USDC:USDC` causal EMA trend/volatility ratio (`16`/`64` spans).
-//! - **Layer 3:** Out-of-Sample Purged MACE (`6` base features causally standardized -> `18` nonlinear features,
+//! - **Layer 3 (`mace`):** Out-of-Sample Purged MACE (`6` base features causally standardized -> `18` nonlinear features,
 //!   purged `k=4` bars, timestamp-keyed refit every `36` bars with L2 Ridge + Random Forest Regressor ensemble)
 //!   and causal Spearman Rank IC.
 //! - **Layer 4:** Calibration 2 Cross-Sectional Ranking, BTC Macro Confirmation, and Walk-Forward Calibrator.
 
 #![allow(clippy::needless_range_loop, clippy::manual_memcpy)]
 
-use aegis_core::{round_dp, AegisError, OhlcvBar, RegimeState, Result, SignalEvaluation};
+pub mod hmm;
+pub mod mace;
+
+pub use hmm::*;
+pub use mace::*;
+
+use aegis_core::{round_dp, AegisError, OhlcvBar, Result, SignalEvaluation};
 use aegis_db::{ConfigMap, DatabaseManager};
 use parking_lot::Mutex;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::f64::consts::PI;
 use std::sync::Arc;
 
 /// Database-backed quantitative signal engine configuration (`system_config`).
@@ -301,536 +304,6 @@ impl SignalConfig {
     }
 }
 
-/// 3-State Diagonal-Covariance Gaussian Hidden Markov Model (`BULL`, `BEAR`, `CHOP`).
-#[derive(Debug, Clone)]
-pub struct DiagonalGaussianHMM {
-    pub n_states: usize,
-    pub max_iter: usize,
-    pub tol: f64,
-    pub pi: [f64; 3],
-    pub trans: [[f64; 3]; 3],
-    pub means: [[f64; 3]; 3],
-    pub vars: [[f64; 3]; 3],
-    pub last_alpha: Option<[f64; 3]>,
-}
-
-impl Default for DiagonalGaussianHMM {
-    fn default() -> Self {
-        Self::new(3, 18, 1e-4)
-    }
-}
-
-impl DiagonalGaussianHMM {
-    pub fn new(_n_states: usize, max_iter: usize, tol: f64) -> Self {
-        Self {
-            n_states: 3,
-            max_iter,
-            tol,
-            pi: [1.0 / 3.0; 3],
-            trans: [
-                [0.90, 0.08, 0.02],
-                [0.08, 0.84, 0.08],
-                [0.02, 0.08, 0.90],
-            ],
-            means: [
-                [-0.55, 0.0, -0.35],
-                [0.0, 0.0, 0.0],
-                [0.55, 0.0, 0.35],
-            ],
-            vars: [[1.0; 3]; 3],
-            last_alpha: None,
-        }
-    }
-
-    #[inline]
-    fn log_emission_single(&self, obs: &[f64; 3]) -> [f64; 3] {
-        let mut log_b = [0.0; 3];
-        for k in 0..3 {
-            let mut sum = 0.0;
-            for d in 0..3 {
-                let v = self.vars[k][d].max(1e-4);
-                let diff = obs[d] - self.means[k][d];
-                sum += -0.5 * ((2.0 * PI * v).ln() + (diff * diff) / v);
-            }
-            log_b[k] = sum;
-        }
-        log_b
-    }
-
-    fn log_emission(&self, x: &[[f64; 3]]) -> Vec<[f64; 3]> {
-        x.iter().map(|obs| self.log_emission_single(obs)).collect()
-    }
-
-    #[inline]
-    fn logsumexp(arr: &[f64; 3]) -> f64 {
-        let m = arr[0].max(arr[1]).max(arr[2]);
-        if !m.is_finite() {
-            return -1e30;
-        }
-        m + ((arr[0] - m).exp() + (arr[1] - m).exp() + (arr[2] - m).exp()).ln()
-    }
-
-    fn forward(&self, log_b: &[[f64; 3]]) -> (Vec<[f64; 3]>, f64) {
-        let t_len = log_b.len();
-        let mut log_alpha = vec![[0.0; 3]; t_len];
-        let mut log_pi = [0.0; 3];
-        let mut log_a = [[0.0; 3]; 3];
-        for i in 0..3 {
-            log_pi[i] = self.pi[i].max(1e-12).ln();
-            for j in 0..3 {
-                log_a[i][j] = self.trans[i][j].max(1e-12).ln();
-            }
-        }
-
-        for k in 0..3 {
-            log_alpha[0][k] = log_pi[k] + log_b[0][k];
-        }
-
-        for t in 1..t_len {
-            for j in 0..3 {
-                let candidates = [
-                    log_alpha[t - 1][0] + log_a[0][j],
-                    log_alpha[t - 1][1] + log_a[1][j],
-                    log_alpha[t - 1][2] + log_a[2][j],
-                ];
-                log_alpha[t][j] = log_b[t][j] + Self::logsumexp(&candidates);
-            }
-        }
-
-        let log_lik = Self::logsumexp(&log_alpha[t_len - 1]);
-        (log_alpha, log_lik)
-    }
-
-    fn backward(&self, log_b: &[[f64; 3]]) -> Vec<[f64; 3]> {
-        let t_len = log_b.len();
-        let mut log_beta = vec![[0.0; 3]; t_len];
-        let mut log_a = [[0.0; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                log_a[i][j] = self.trans[i][j].max(1e-12).ln();
-            }
-        }
-
-        for t in (0..(t_len - 1)).rev() {
-            for i in 0..3 {
-                let candidates = [
-                    log_a[i][0] + log_b[t + 1][0] + log_beta[t + 1][0],
-                    log_a[i][1] + log_b[t + 1][1] + log_beta[t + 1][1],
-                    log_a[i][2] + log_b[t + 1][2] + log_beta[t + 1][2],
-                ];
-                log_beta[t][i] = Self::logsumexp(&candidates);
-            }
-        }
-        log_beta
-    }
-
-    /// Fits the 3-State Gaussian HMM via MAP Baum-Welch EM and caches `last_alpha`.
-    pub fn fit(&mut self, x: &[[f64; 3]]) {
-        let t_len = x.len();
-        if t_len < 6 {
-            return;
-        }
-
-        let mut sorted_r: Vec<f64> = x.iter().map(|row| row[0]).collect();
-        sorted_r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let q1 = sorted_r[t_len / 3];
-        let q2 = sorted_r[(2 * t_len) / 3];
-
-        for state_idx in 0..3 {
-            let mut subset: Vec<&[f64; 3]> = x
-                .iter()
-                .filter(|row| match state_idx {
-                    0 => row[0] <= q1,
-                    1 => row[0] > q1 && row[0] <= q2,
-                    _ => row[0] > q2,
-                })
-                .collect();
-            if subset.len() < 2 {
-                subset = x.iter().collect();
-            }
-            let n = subset.len() as f64;
-            for d in 0..3 {
-                let mean = subset.iter().map(|r| r[d]).sum::<f64>() / n;
-                let var = subset
-                    .iter()
-                    .map(|r| (r[d] - mean).powi(2))
-                    .sum::<f64>()
-                    / n
-                    + 1e-2;
-                self.means[state_idx][d] = mean;
-                self.vars[state_idx][d] = var.max(0.08);
-            }
-        }
-
-        let prior_means_col0 = [-0.55, 0.0, 0.55];
-        let prior_weight = 18.0;
-        let trans_prior = [
-            [48.0, 1.2, 0.05],
-            [1.0, 40.0, 1.0],
-            [0.05, 1.2, 48.0],
-        ];
-
-        let mut prev_ll = f64::NEG_INFINITY;
-        for _ in 0..self.max_iter {
-            let log_b = self.log_emission(x);
-            let (log_alpha, ll) = self.forward(&log_b);
-            let log_beta = self.backward(&log_b);
-
-            let mut gamma = vec![[1.0 / 3.0; 3]; t_len];
-            for t in 0..t_len {
-                let raw = [
-                    log_alpha[t][0] + log_beta[t][0],
-                    log_alpha[t][1] + log_beta[t][1],
-                    log_alpha[t][2] + log_beta[t][2],
-                ];
-                let norm = Self::logsumexp(&raw);
-                let mut row = [
-                    (raw[0] - norm).exp(),
-                    (raw[1] - norm).exp(),
-                    (raw[2] - norm).exp(),
-                ];
-                let s = (row[0] + row[1] + row[2]).max(1e-12);
-                row[0] /= s;
-                row[1] /= s;
-                row[2] /= s;
-                gamma[t] = row;
-            }
-
-            let mut log_a = [[0.0; 3]; 3];
-            for i in 0..3 {
-                for j in 0..3 {
-                    log_a[i][j] = self.trans[i][j].max(1e-12).ln();
-                }
-            }
-
-            let mut xi_sum = [[0.0; 3]; 3];
-            for t in 0..(t_len - 1) {
-                let mut log_xi_t = [[0.0; 3]; 3];
-                let mut max_v = f64::NEG_INFINITY;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        let v =
-                            log_alpha[t][i] + log_a[i][j] + log_b[t + 1][j] + log_beta[t + 1][j];
-                        log_xi_t[i][j] = v;
-                        if v > max_v {
-                            max_v = v;
-                        }
-                    }
-                }
-                let mut sum_exp = 0.0;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        sum_exp += (log_xi_t[i][j] - max_v).exp();
-                    }
-                }
-                let log_norm = max_v + sum_exp.max(1e-12).ln();
-                for i in 0..3 {
-                    for j in 0..3 {
-                        xi_sum[i][j] += (log_xi_t[i][j] - log_norm).exp();
-                    }
-                }
-            }
-
-            let pi_sum = (gamma[0][0] + gamma[0][1] + gamma[0][2]).max(1e-12);
-            for k in 0..3 {
-                self.pi[k] = (gamma[0][k] / pi_sum).max(1e-6);
-            }
-            let pi_norm = self.pi[0] + self.pi[1] + self.pi[2];
-            for k in 0..3 {
-                self.pi[k] /= pi_norm;
-            }
-
-            for i in 0..3 {
-                let mut row_sum = 0.0;
-                for j in 0..3 {
-                    self.trans[i][j] = (xi_sum[i][j] + trans_prior[i][j]).max(1e-6);
-                    row_sum += self.trans[i][j];
-                }
-                for j in 0..3 {
-                    self.trans[i][j] /= row_sum.max(1e-12);
-                }
-            }
-
-            for k in 0..3 {
-                let denom = gamma.iter().map(|g| g[k]).sum::<f64>().max(1e-6);
-                for d in 0..3 {
-                    let weighted_sum = gamma
-                        .iter()
-                        .zip(x.iter())
-                        .map(|(g, row)| g[k] * row[d])
-                        .sum::<f64>();
-                    let raw_mean = weighted_sum / denom;
-                    if d == 0 {
-                        self.means[k][0] = (weighted_sum + prior_weight * prior_means_col0[k])
-                            / (denom + prior_weight);
-                    } else {
-                        self.means[k][d] = raw_mean;
-                    }
-                }
-                for d in 0..3 {
-                    let var_num = gamma
-                        .iter()
-                        .zip(x.iter())
-                        .map(|(g, row)| g[k] * (row[d] - self.means[k][d]).powi(2))
-                        .sum::<f64>();
-                    self.vars[k][d] = (var_num / denom + 0.05).max(0.08);
-                }
-            }
-
-            if (ll - prev_ll).abs() < self.tol {
-                break;
-            }
-            prev_ll = ll;
-        }
-
-        // Cache forward posterior at final bar
-        let log_b = self.log_emission(x);
-        let (log_alpha, _) = self.forward(&log_b);
-        let last = &log_alpha[t_len - 1];
-        let norm = Self::logsumexp(last);
-        let mut alpha = [
-            (last[0] - norm).exp(),
-            (last[1] - norm).exp(),
-            (last[2] - norm).exp(),
-        ];
-        let s = (alpha[0] + alpha[1] + alpha[2]).max(1e-12);
-        alpha[0] /= s;
-        alpha[1] /= s;
-        alpha[2] /= s;
-        self.last_alpha = Some(alpha);
-    }
-
-    /// Returns causal filtered posterior probabilities `P(S_t | X_{1:t})` for each bar `t`.
-    pub fn predict_proba(&mut self, x: &[[f64; 3]]) -> Vec<[f64; 3]> {
-        let log_b = self.log_emission(x);
-        let (log_alpha, _) = self.forward(&log_b);
-        let mut gamma = Vec::with_capacity(x.len());
-        for row in &log_alpha {
-            let norm = Self::logsumexp(row);
-            let mut g = [
-                (row[0] - norm).exp(),
-                (row[1] - norm).exp(),
-                (row[2] - norm).exp(),
-            ];
-            let s = (g[0] + g[1] + g[2]).max(1e-12);
-            g[0] /= s;
-            g[1] /= s;
-            g[2] /= s;
-            gamma.push(g);
-        }
-        if let Some(last) = gamma.last() {
-            self.last_alpha = Some(*last);
-        }
-        gamma
-    }
-
-    /// Performs a single-step forward Bayesian update from `base_alpha` (or `self.last_alpha`)
-    /// without mutating stored HMM parameters (`alpha_{T+1} \propto (alpha_T A) \odot B(x_{T+1})`).
-    pub fn step_forward(&self, obs: &[f64; 3], base_alpha: Option<&[f64; 3]>) -> [f64; 3] {
-        let alpha_prev = base_alpha
-            .copied()
-            .or(self.last_alpha)
-            .unwrap_or(self.pi);
-        let mut prior_next = [0.0; 3];
-        for j in 0..3 {
-            let mut acc = 0.0;
-            for i in 0..3 {
-                acc += alpha_prev[i] * self.trans[i][j];
-            }
-            prior_next[j] = acc.max(1e-12);
-        }
-        let log_b = self.log_emission_single(obs);
-        let log_post = [
-            prior_next[0].ln() + log_b[0],
-            prior_next[1].ln() + log_b[1],
-            prior_next[2].ln() + log_b[2],
-        ];
-        let norm = Self::logsumexp(&log_post);
-        let mut post = [
-            (log_post[0] - norm).exp(),
-            (log_post[1] - norm).exp(),
-            (log_post[2] - norm).exp(),
-        ];
-        let s = (post[0] + post[1] + post[2]).max(1e-12);
-        post[0] /= s;
-        post[1] /= s;
-        post[2] /= s;
-        post
-    }
-}
-
-/// Simple deterministic Axis-Aligned Regression Tree (`max_depth=4`, `min_samples_leaf=10`)
-/// used inside the bagged Random Forest Regressor for Layer 3 MACE.
-#[derive(Debug, Clone)]
-pub enum RegressionTreeNode {
-    Leaf(f64),
-    Split {
-        feature_idx: usize,
-        threshold: f64,
-        left: Box<RegressionTreeNode>,
-        right: Box<RegressionTreeNode>,
-    },
-}
-
-impl RegressionTreeNode {
-    fn fit(
-        x: &[[f64; 18]],
-        y: &[f64],
-        indices: &[usize],
-        feature_subset: &[usize],
-        depth: usize,
-        max_depth: usize,
-        min_samples_leaf: usize,
-    ) -> Self {
-        if indices.is_empty() {
-            return Self::Leaf(0.0);
-        }
-        let mean_y = indices.iter().map(|&i| y[i]).sum::<f64>() / (indices.len() as f64);
-        if depth >= max_depth || indices.len() < 2 * min_samples_leaf {
-            return Self::Leaf(mean_y);
-        }
-
-        let mut best_gain = 0.0;
-        let mut best_feat = 0;
-        let mut best_thresh = 0.0;
-        let mut best_left = Vec::new();
-        let mut best_right = Vec::new();
-
-        let total_var: f64 = indices.iter().map(|&i| (y[i] - mean_y).powi(2)).sum();
-        if total_var <= 1e-12 {
-            return Self::Leaf(mean_y);
-        }
-
-        for &f_idx in feature_subset {
-            let mut vals: Vec<f64> = indices.iter().map(|&i| x[i][f_idx]).collect();
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let n = vals.len();
-            for q_num in [1, 2, 3, 4, 5, 6] {
-                let thresh = vals[(n * q_num) / 8];
-                let mut left_idx = Vec::new();
-                let mut right_idx = Vec::new();
-                let mut left_sum = 0.0;
-                let mut right_sum = 0.0;
-                for &idx in indices {
-                    if x[idx][f_idx] <= thresh {
-                        left_idx.push(idx);
-                        left_sum += y[idx];
-                    } else {
-                        right_idx.push(idx);
-                        right_sum += y[idx];
-                    }
-                }
-                if left_idx.len() < min_samples_leaf || right_idx.len() < min_samples_leaf {
-                    continue;
-                }
-                let l_mean = left_sum / (left_idx.len() as f64);
-                let r_mean = right_sum / (right_idx.len() as f64);
-                let l_var: f64 = left_idx.iter().map(|&i| (y[i] - l_mean).powi(2)).sum();
-                let r_var: f64 = right_idx.iter().map(|&i| (y[i] - r_mean).powi(2)).sum();
-                let gain = total_var - (l_var + r_var);
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_feat = f_idx;
-                    best_thresh = thresh;
-                    best_left = left_idx;
-                    best_right = right_idx;
-                }
-            }
-        }
-
-        if best_gain <= 1e-12 {
-            return Self::Leaf(mean_y);
-        }
-
-        let left_node = Self::fit(
-            x,
-            y,
-            &best_left,
-            feature_subset,
-            depth + 1,
-            max_depth,
-            min_samples_leaf,
-        );
-        let right_node = Self::fit(
-            x,
-            y,
-            &best_right,
-            feature_subset,
-            depth + 1,
-            max_depth,
-            min_samples_leaf,
-        );
-
-        Self::Split {
-            feature_idx: best_feat,
-            threshold: best_thresh,
-            left: Box::new(left_node),
-            right: Box::new(right_node),
-        }
-    }
-
-    #[inline]
-    fn predict(&self, row: &[f64; 18]) -> f64 {
-        match self {
-            Self::Leaf(v) => *v,
-            Self::Split {
-                feature_idx,
-                threshold,
-                left,
-                right,
-            } => {
-                if row[*feature_idx] <= *threshold {
-                    left.predict(row)
-                } else {
-                    right.predict(row)
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedMaceModel {
-    pub last_fit_len: usize,
-    pub last_fit_bar_ts: i64,
-    pub last_seen_bar_ts: i64,
-    pub bars_advanced_since_fit: usize,
-    pub ridge_weights: [f64; 18],
-    pub ridge_intercept: f64,
-    pub trees: Vec<RegressionTreeNode>,
-    pub scale: f64,
-    pub last_mace: f64,
-    pub last_ic: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct HmmCacheState {
-    pub bar_ts: Option<i64>,
-    pub bar_len: usize,
-    pub window: usize,
-    pub hmm: Option<DiagonalGaussianHMM>,
-    pub alpha: Option<[f64; 3]>,
-    pub alpha_prev: Option<[f64; 3]>,
-    pub states: Vec<RegimeState>,
-    pub mapping: (usize, usize, usize), // (bear_idx, chop_idx, bull_idx)
-    pub r_mean: f64,
-    pub r_std: f64,
-    pub v_mean: f64,
-    pub v_std: f64,
-    pub a_mean: f64,
-    pub a_std: f64,
-    pub prev_close: f64,
-    pub last_bar_close: f64,
-    pub last_alt_pc1_raw: f64,
-    pub last_vol_raw: f64,
-    pub prev_ema_r_fast: f64,
-    pub prev_ema_r_slow: f64,
-    pub last_ema_r_fast: f64,
-    pub last_ema_r_slow: f64,
-    pub last_ema_v: f64,
-    pub last_ema_a: f64,
-}
-
 /// Validated Relative-Strength and USDC momentum lookback helper (`C6`).
 /// Returns `(rs_fast, rs_mid, rs_slow, r_usdc_mom)` and requires `s_closes.len() > lb_slow`
 /// so short series never silently clamp to index `0` via `saturating_sub`.
@@ -864,8 +337,8 @@ pub fn compute_rs_lookbacks(
 #[derive(Clone)]
 pub struct SignalEngine {
     pub db: DatabaseManager,
-    hmm_cache: Arc<Mutex<HmmCacheState>>,
-    mace_cache: Arc<Mutex<HashMap<String, CachedMaceModel>>>,
+    pub(crate) hmm_cache: Arc<Mutex<HmmCacheState>>,
+    pub(crate) mace_cache: Arc<Mutex<HashMap<String, CachedMaceModel>>>,
 }
 
 impl SignalEngine {
@@ -895,484 +368,6 @@ impl SignalEngine {
             out.push(alpha * series[i] + (1.0 - alpha) * prev);
         }
         out
-    }
-
-    /// Computes a strictly causal first Principal Component (`alt_pc1_ret`) of standardized
-    /// cross-sectional altcoin log returns aligned to `timestamps` using a rolling trailing
-    /// window of up to `window` bars ending at each bar `t` (`B6`).
-    pub fn compute_alt_pc1_series(
-        alt_bars_map: &HashMap<String, Vec<OhlcvBar>>,
-        timestamps: &[i64],
-        window: usize,
-    ) -> Vec<f64> {
-        let t_total = timestamps.len();
-        if t_total < 10 || alt_bars_map.is_empty() {
-            return vec![0.0; t_total];
-        }
-
-        let mut aligned_returns: Vec<Vec<f64>> = Vec::new();
-        let mut keys: Vec<&String> = alt_bars_map.keys().collect();
-        keys.sort();
-
-        for sym in keys {
-            let bars = &alt_bars_map[sym];
-            if bars.len() < 10 {
-                continue;
-            }
-            let ts_to_close: HashMap<i64, f64> = bars
-                .iter()
-                .map(|b| (b.timestamp_ms, b.close.max(1e-8)))
-                .collect();
-            let mut closes = Vec::with_capacity(t_total);
-            let mut last_c = bars[0].close.max(1e-8);
-            for &ts in timestamps {
-                if let Some(&c) = ts_to_close.get(&ts) {
-                    last_c = c;
-                }
-                closes.push(last_c);
-            }
-            let mut rets = vec![0.0; t_total];
-            for i in 1..t_total {
-                rets[i] = (closes[i] / closes[i - 1]).ln();
-            }
-            aligned_returns.push(rets);
-        }
-
-        let m_assets = aligned_returns.len();
-        if m_assets == 0 {
-            return vec![0.0; t_total];
-        }
-
-        let eff_win = window.max(10);
-        let refit_step = 12usize;
-        let mut out = vec![0.0; t_total];
-        let mut active_v = vec![1.0 / (m_assets as f64).sqrt(); m_assets];
-        let mut active_mu = vec![0.0; m_assets];
-        let mut active_sd = vec![1.0; m_assets];
-        let mut active_scale = (m_assets as f64).sqrt();
-
-        for t in 10..t_total {
-            let w_start = (t + 1).saturating_sub(eff_win);
-            let w_len = t + 1 - w_start;
-
-            // Refit causal trailing standardization and M x M covariance eigenvector every `refit_step` bars
-            // (and on the final bar if `t_total <= eff_win + 5`)
-            if t == 10 || (t - 10) % refit_step == 0 {
-                for m in 0..m_assets {
-                    let slice = &aligned_returns[m][w_start..=t];
-                    active_mu[m] = sample_mean(slice);
-                    active_sd[m] = sample_std(slice, 0) + 1e-8;
-                }
-
-                let mut cov = vec![vec![0.0; m_assets]; m_assets];
-                let mut cs_dot = vec![0.0; m_assets];
-                let inv_w = 1.0 / (w_len as f64);
-
-                for tau in w_start..=t {
-                    let mut z_row = vec![0.0; m_assets];
-                    let mut cs_ret = 0.0;
-                    for m in 0..m_assets {
-                        let r = aligned_returns[m][tau];
-                        cs_ret += r;
-                        z_row[m] = (r - active_mu[m]) / active_sd[m];
-                    }
-                    cs_ret /= m_assets as f64;
-                    for a in 0..m_assets {
-                        cs_dot[a] += z_row[a] * cs_ret;
-                        for b in a..m_assets {
-                            cov[a][b] += z_row[a] * z_row[b] * inv_w;
-                        }
-                    }
-                }
-                for a in 0..m_assets {
-                    for b in 0..a {
-                        cov[a][b] = cov[b][a];
-                    }
-                }
-
-                let mut v = vec![1.0 / (m_assets as f64).sqrt(); m_assets];
-                for _ in 0..16 {
-                    let mut v_next = vec![0.0; m_assets];
-                    for a in 0..m_assets {
-                        let mut acc = 0.0;
-                        for b in 0..m_assets {
-                            acc += cov[a][b] * v[b];
-                        }
-                        v_next[a] = acc;
-                    }
-                    let norm = v_next.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
-                    for a in 0..m_assets {
-                        v[a] = v_next[a] / norm;
-                    }
-                }
-
-                let orient: f64 = (0..m_assets).map(|a| v[a] * cs_dot[a]).sum();
-                if orient < 0.0 {
-                    for val in &mut v {
-                        *val = -*val;
-                    }
-                }
-
-                // Variance of projected score u = Z * v over [w_start..=t] is v^T * cov * v
-                let mut lambda1 = 0.0;
-                for a in 0..m_assets {
-                    for b in 0..m_assets {
-                        lambda1 += v[a] * cov[a][b] * v[b];
-                    }
-                }
-                active_scale = lambda1.max(1e-8).sqrt();
-                active_v = v;
-            }
-
-            let mut proj_t = 0.0;
-            for m in 0..m_assets {
-                let z_tm = (aligned_returns[m][t] - active_mu[m]) / active_sd[m];
-                proj_t += z_tm * active_v[m];
-            }
-            out[t] = (proj_t / active_scale).clamp(-4.0, 4.0);
-        }
-
-        out
-    }
-
-    /// Decodes the full causal sequence of `RegimeState` across `btc_bars` (`states.len() == btc_bars.len()`).
-    /// Each bar `t` uses only trailing observations `<= t` (zero lookahead, no full-history CHOP padding) (`B6`),
-    /// caches the fitted 4H HMM on `last_bar_ts`, and supports 15s single-step forward filtering (`C5`).
-    pub fn decode_hmm_regime_states(
-        &self,
-        btc_bars: &[OhlcvBar],
-        window: usize,
-        alt_pc1_series: Option<&[f64]>,
-        live_tick_close: Option<f64>,
-    ) -> Vec<RegimeState> {
-        let n_bars = btc_bars.len();
-        if n_bars < 15 {
-            return vec![
-                RegimeState {
-                    regime: "CHOP".to_string(),
-                    prob_bull: 0.3333,
-                    prob_bear: 0.3333,
-                    prob_chop: 0.3334,
-                    window_bars: n_bars,
-                };
-                n_bars.max(1)
-            ];
-        }
-
-        let cfg = self.db.load_config_opts(false).unwrap_or_default();
-        let scfg = SignalConfig::from_config_map(&cfg);
-        let em_iters = cfg.get_usize("hmm_em_iterations", 18).max(5);
-        let em_tol = cfg.get_f64("hmm_em_tolerance", 1e-4).max(1e-7);
-        let span_r_fast = cfg.get_f64("hmm_ema_fast_span", 36.0).max(2.0);
-        let span_r_slow = cfg.get_f64("hmm_ema_slow_span", 96.0).max(4.0);
-        let span_vol = cfg.get_f64("hmm_ema_vol_span", 14.0).max(2.0);
-        let span_alt = cfg.get_f64("hmm_ema_alt_span", 14.0).max(2.0);
-        let enter_gate = cfg
-            .get_f64(
-                "hmm_enter_gate_prob",
-                cfg.get_f64("hmm_enter_prob_gate", 0.55),
-            )
-            .clamp(0.45, 0.80);
-        let exit_gate = cfg
-            .get_f64(
-                "hmm_exit_gate_prob",
-                cfg.get_f64("hmm_exit_prob_gate", 0.45),
-            )
-            .clamp(0.25, 0.65);
-
-        let last_bar_ts = btc_bars.last().map(|b| b.timestamp_ms).unwrap_or(0);
-        let last_bar_close = btc_bars.last().map(|b| b.close).unwrap_or(0.0);
-        {
-            let cache = self.hmm_cache.lock();
-            if cache.bar_ts == Some(last_bar_ts)
-                && cache.bar_len == n_bars
-                && cache.window == window
-                && cache.states.len() == n_bars
-                && cache.hmm.is_some()
-            {
-                let mut states = cache.states.clone();
-                let eff_tick = live_tick_close
-                    .filter(|&p| p > 0.0 && (p - cache.last_bar_close).abs() > 1e-9)
-                    .or_else(|| {
-                        if (last_bar_close - cache.last_bar_close).abs() > 1e-9 {
-                            Some(last_bar_close)
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(tick_px) = eff_tick {
-                    if let Some(hmm) = &cache.hmm {
-                        let base_alpha = cache.alpha_prev.as_ref().or(cache.alpha.as_ref());
-                        let prev_close = cache.prev_close.max(1e-8);
-                        let raw_r = (tick_px.max(1e-8) / prev_close).ln();
-                        let alpha_f = 2.0 / (span_r_fast + 1.0);
-                        let alpha_s = 2.0 / (span_r_slow + 1.0);
-                        let ema_r_f = alpha_f * raw_r + (1.0 - alpha_f) * cache.prev_ema_r_fast;
-                        let ema_r_s = alpha_s * raw_r + (1.0 - alpha_s) * cache.prev_ema_r_slow;
-                        let smooth_r = scfg.hmm_ret_fast_weight * ema_r_f
-                            + scfg.hmm_ret_slow_weight * ema_r_s;
-                        let r_z = ((smooth_r - cache.r_mean) / cache.r_std).clamp(-3.5, 3.5);
-                        let v_z = ((cache.last_ema_v - cache.v_mean) / cache.v_std).clamp(-3.5, 3.5);
-                        let a_z = ((cache.last_ema_a - cache.a_mean) / cache.a_std).clamp(-3.5, 3.5);
-                        let obs = [r_z, v_z, a_z];
-                        let post = hmm.step_forward(&obs, base_alpha);
-                        let (bear_idx, chop_idx, bull_idx) = cache.mapping;
-                        let p_bull = post[bull_idx];
-                        let p_bear = post[bear_idx];
-                        let p_chop = post[chop_idx];
-                        let prev_regime = if states.len() >= 2 {
-                            states[states.len() - 2].regime.as_str()
-                        } else {
-                            "CHOP"
-                        };
-                        let next_regime = apply_hysteresis_with_gates(
-                            prev_regime,
-                            p_bull,
-                            p_bear,
-                            p_chop,
-                            enter_gate,
-                            exit_gate,
-                        );
-                        if let Some(last_state) = states.last_mut() {
-                            *last_state = RegimeState {
-                                regime: next_regime.to_string(),
-                                prob_bull: round_dp(p_bull, 4),
-                                prob_bear: round_dp(p_bear, 4),
-                                prob_chop: round_dp(p_chop, 4),
-                                window_bars: last_state.window_bars,
-                            };
-                        }
-                    }
-                }
-                return states;
-            }
-        }
-
-        let w_total = n_bars - 1;
-        let mut log_ret = Vec::with_capacity(w_total);
-        let mut vol_raw = Vec::with_capacity(w_total);
-        for i in 1..n_bars {
-            let c_prev = btc_bars[i - 1].close.max(1e-8);
-            let c_curr = btc_bars[i].close.max(1e-8);
-            log_ret.push((c_curr / c_prev).ln());
-            vol_raw.push((btc_bars[i].high - btc_bars[i].low) / c_curr);
-        }
-
-        let alt_pc1_raw: Vec<f64> = if let Some(series) = alt_pc1_series {
-            if series.len() == n_bars {
-                series[1..].to_vec()
-            } else if series.len() >= w_total {
-                series[series.len() - w_total..].to_vec()
-            } else {
-                let mut padded = vec![0.0; w_total - series.len()];
-                padded.extend_from_slice(series);
-                padded
-            }
-        } else {
-            let mut alt_map: HashMap<String, Vec<OhlcvBar>> = HashMap::new();
-            if let Ok(usdc_assets) = self.db.get_usdc_perp_universe() {
-                for a in usdc_assets {
-                    if a.base_asset != "BTC" {
-                        if let Ok(abars) = self.db.get_ohlcv_bars(
-                            &a.symbol,
-                            &a.exec_timeframe,
-                            n_bars + 5,
-                            None,
-                        ) {
-                            alt_map.insert(a.symbol, abars);
-                        }
-                    }
-                }
-            }
-            let ts_slice: Vec<i64> = btc_bars[1..].iter().map(|b| b.timestamp_ms).collect();
-            Self::compute_alt_pc1_series(&alt_map, &ts_slice, window)
-        };
-
-        let ema_r_fast = Self::causal_ema(&log_ret, span_r_fast);
-        let ema_r_slow = Self::causal_ema(&log_ret, span_r_slow);
-        let mut smooth_ret = Vec::with_capacity(w_total);
-        for i in 0..w_total {
-            smooth_ret.push(
-                scfg.hmm_ret_fast_weight * ema_r_fast[i]
-                    + scfg.hmm_ret_slow_weight * ema_r_slow[i],
-            );
-        }
-        let smooth_vol = Self::causal_ema(&vol_raw, span_vol);
-        let smooth_alt = Self::causal_ema(&alt_pc1_raw, span_alt);
-
-        let eff_window = window.max(15);
-        let hmm_refit_step = scfg.hmm_refit_step_bars.max(1);
-        let min_fit_obs = scfg.hmm_min_fit_obs_bars.max(4); // corresponds to bar index 14 (15th bar)
-
-        let mut states = Vec::with_capacity(n_bars);
-        states.push(RegimeState {
-            regime: "CHOP".to_string(),
-            prob_bull: 0.3333,
-            prob_bear: 0.3333,
-            prob_chop: 0.3334,
-            window_bars: 1,
-        });
-
-        let mut active_hmm = DiagonalGaussianHMM::new(3, em_iters, em_tol);
-        let mut active_mapping = (0usize, 1usize, 2usize);
-        let mut active_alpha = [1.0 / 3.0; 3];
-        let mut prev_alpha = [1.0 / 3.0; 3];
-        let mut r_mean = 0.0;
-        let mut r_std = 1.0;
-        let mut v_mean = 0.0;
-        let mut v_std = 1.0;
-        let mut a_mean = 0.0;
-        let mut a_std = 1.0;
-        let mut current_regime = "CHOP";
-
-        for idx in 0..w_total {
-            let w_start = (idx + 1).saturating_sub(eff_window);
-            let w_len = idx + 1 - w_start;
-            prev_alpha = active_alpha;
-
-            if idx < min_fit_obs {
-                states.push(RegimeState {
-                    regime: "CHOP".to_string(),
-                    prob_bull: 0.3333,
-                    prob_bear: 0.3333,
-                    prob_chop: 0.3334,
-                    window_bars: w_len,
-                });
-                continue;
-            }
-
-            // Refit HMM parameters causally on trailing window [w_start..=idx] on deterministic schedule
-            if idx == min_fit_obs || (idx - min_fit_obs).is_multiple_of(hmm_refit_step) {
-                let sr_slice = &smooth_ret[w_start..=idx];
-                let sv_slice = &smooth_vol[w_start..=idx];
-                let sa_slice = &smooth_alt[w_start..=idx];
-
-                r_mean = sample_mean(sr_slice);
-                r_std = sample_std(sr_slice, 0) + 1e-8;
-                v_mean = sample_mean(sv_slice);
-                v_std = sample_std(sv_slice, 0) + 1e-8;
-                a_mean = sample_mean(sa_slice);
-                a_std = sample_std(sa_slice, 0) + 1e-8;
-
-                let mut x_obs = Vec::with_capacity(w_len);
-                for k in w_start..=idx {
-                    let rz = ((smooth_ret[k] - r_mean) / r_std).clamp(-3.5, 3.5);
-                    let vz = ((smooth_vol[k] - v_mean) / v_std).clamp(-3.5, 3.5);
-                    let az = ((smooth_alt[k] - a_mean) / a_std).clamp(-3.5, 3.5);
-                    x_obs.push([rz, vz, az]);
-                }
-
-                let mut hmm = DiagonalGaussianHMM::new(3, em_iters, em_tol);
-                hmm.fit(&x_obs);
-                let gamma = hmm.predict_proba(&x_obs);
-                if gamma.len() >= 2 {
-                    prev_alpha = gamma[gamma.len() - 2];
-                }
-                active_alpha = *gamma.last().unwrap_or(&[1.0 / 3.0; 3]);
-
-                let mut order = [0usize, 1, 2];
-                order.sort_by(|&i, &j| {
-                    hmm.means[i][0]
-                        .partial_cmp(&hmm.means[j][0])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                active_mapping = (order[0], order[1], order[2]);
-                active_hmm = hmm;
-            } else {
-                let rz = ((smooth_ret[idx] - r_mean) / r_std).clamp(-3.5, 3.5);
-                let vz = ((smooth_vol[idx] - v_mean) / v_std).clamp(-3.5, 3.5);
-                let az = ((smooth_alt[idx] - a_mean) / a_std).clamp(-3.5, 3.5);
-                let obs = [rz, vz, az];
-                active_alpha = active_hmm.step_forward(&obs, Some(&prev_alpha));
-            }
-
-            let (bear_idx, chop_idx, bull_idx) = active_mapping;
-            let p_bull = active_alpha[bull_idx];
-            let p_bear = active_alpha[bear_idx];
-            let p_chop = active_alpha[chop_idx];
-            current_regime = apply_hysteresis_with_gates(
-                current_regime,
-                p_bull,
-                p_bear,
-                p_chop,
-                enter_gate,
-                exit_gate,
-            );
-            let p_b_round = round_dp(p_bull, 4);
-            let p_r_round = round_dp(p_bear, 4);
-            let p_c_round = round_dp((1.0 - p_b_round - p_r_round).max(0.0), 4);
-            states.push(RegimeState {
-                regime: current_regime.to_string(),
-                prob_bull: p_b_round,
-                prob_bear: p_r_round,
-                prob_chop: p_c_round,
-                window_bars: w_len,
-            });
-        }
-
-        debug_assert_eq!(states.len(), n_bars);
-
-        {
-            let mut cache = self.hmm_cache.lock();
-            cache.bar_ts = Some(last_bar_ts);
-            cache.bar_len = n_bars;
-            cache.window = window;
-            cache.alpha = Some(active_alpha);
-            cache.alpha_prev = Some(prev_alpha);
-            cache.hmm = Some(active_hmm);
-            cache.states = states.clone();
-            cache.mapping = active_mapping;
-            cache.r_mean = r_mean;
-            cache.r_std = r_std;
-            cache.v_mean = v_mean;
-            cache.v_std = v_std;
-            cache.a_mean = a_mean;
-            cache.a_std = a_std;
-            cache.prev_close = if n_bars >= 2 {
-                btc_bars[n_bars - 2].close
-            } else {
-                btc_bars[n_bars - 1].close
-            };
-            cache.last_bar_close = last_bar_close;
-            cache.last_alt_pc1_raw = *alt_pc1_raw.last().unwrap_or(&0.0);
-            cache.last_vol_raw = *vol_raw.last().unwrap_or(&0.0);
-            cache.prev_ema_r_fast = if ema_r_fast.len() >= 2 {
-                ema_r_fast[ema_r_fast.len() - 2]
-            } else {
-                *ema_r_fast.first().unwrap_or(&0.0)
-            };
-            cache.prev_ema_r_slow = if ema_r_slow.len() >= 2 {
-                ema_r_slow[ema_r_slow.len() - 2]
-            } else {
-                *ema_r_slow.first().unwrap_or(&0.0)
-            };
-            cache.last_ema_r_fast = *ema_r_fast.last().unwrap_or(&0.0);
-            cache.last_ema_r_slow = *ema_r_slow.last().unwrap_or(&0.0);
-            cache.last_ema_v = *smooth_vol.last().unwrap_or(&0.0);
-            cache.last_ema_a = *smooth_alt.last().unwrap_or(&0.0);
-        }
-
-        if let Some(tick_px) = live_tick_close.filter(|&p| p > 0.0 && (p - last_bar_close).abs() > 1e-9) {
-            return self.decode_hmm_regime_states(
-                btc_bars,
-                window,
-                alt_pc1_series,
-                Some(tick_px),
-            );
-        }
-        states
-    }
-
-    pub fn decode_hmm_regime(
-        &self,
-        btc_bars: &[OhlcvBar],
-        window: usize,
-        alt_pc1_series: Option<&[f64]>,
-        live_tick_close: Option<f64>,
-    ) -> RegimeState {
-        let states =
-            self.decode_hmm_regime_states(btc_bars, window, alt_pc1_series, live_tick_close);
-        states.into_iter().last().unwrap_or_default()
     }
 
     /// Computes causal continuous SNR series (`[-1.0, +1.0]`) blending `snr_synth_weight` `ALT/BTC:SYNTH`
@@ -1454,373 +449,6 @@ impl SignalEngine {
             comp.last().copied().unwrap_or(0.0),
             synth.last().copied().unwrap_or(0.0),
         )
-    }
-
-    /// Builds 18 nonlinear feature columns `[X_norm, tanh(X_norm), X_norm^2 - 1]` and forward `k=4` target `y`
-    /// using strictly causal trailing standardization (`B6`).
-    pub fn build_mace_features_and_target(
-        synth_bars: &[OhlcvBar],
-        usdc_bars: &[OhlcvBar],
-    ) -> Option<(Vec<[f64; 18]>, Vec<f64>, usize)> {
-        Self::build_mace_features_and_target_with_config(
-            synth_bars,
-            usdc_bars,
-            &SignalConfig::default(),
-        )
-    }
-
-    pub fn build_mace_features_and_target_with_config(
-        synth_bars: &[OhlcvBar],
-        usdc_bars: &[OhlcvBar],
-        scfg: &SignalConfig,
-    ) -> Option<(Vec<[f64; 18]>, Vec<f64>, usize)> {
-        let n = synth_bars.len().min(usdc_bars.len());
-        if n < scfg.mace_min_bars.max(40) {
-            return None;
-        }
-        let s_bars = &synth_bars[synth_bars.len() - n..];
-        let u_bars = &usdc_bars[usdc_bars.len() - n..];
-
-        let s_close: Vec<f64> = s_bars.iter().map(|b| b.close.max(1e-12)).collect();
-        let u_close: Vec<f64> = u_bars.iter().map(|b| b.close.max(1e-12)).collect();
-        let u_vol: Vec<f64> = u_bars.iter().map(|b| b.volume.max(0.0)).collect();
-
-        let lag_ret = |arr: &[f64], lag: usize| -> Vec<f64> {
-            let mut out = vec![0.0; arr.len()];
-            for i in lag..arr.len() {
-                out[i] = (arr[i] / arr[i - lag]).ln();
-            }
-            out
-        };
-
-        let r_s4 = lag_ret(&s_close, 4);
-        let r_s16 = lag_ret(&s_close, 16);
-        let r_s32 = lag_ret(&s_close, 32);
-        let r_u8 = lag_ret(&u_close, 8);
-        let r_u24 = lag_ret(&u_close, 24);
-        let vol_ema = Self::causal_ema(&u_vol, scfg.mace_vol_ema_span.max(2.0));
-
-        let mut base_cols = vec![vec![0.0; n]; 6];
-        for i in 0..n {
-            let vol_z = (u_vol[i] - vol_ema[i]) / (vol_ema[i] + 1.0);
-            base_cols[0][i] = r_s4[i];
-            base_cols[1][i] = r_s16[i];
-            base_cols[2][i] = r_s32[i];
-            base_cols[3][i] = r_u8[i];
-            base_cols[4][i] = r_u24[i];
-            base_cols[5][i] = vol_z;
-        }
-
-        // Causally standardize base 6 features over trailing window [w_start..=i] (zero future lookahead)
-        let mut x_raw = vec![[0.0; 18]; n];
-        let z_win = scfg.mace_z_window_bars.max(16);
-        for d in 0..6 {
-            let col = &base_cols[d];
-            for i in 0..n {
-                let w_start = if i >= 32 {
-                    (i + 1).saturating_sub(z_win).max(32)
-                } else {
-                    0
-                };
-                let slice = &col[w_start..=i];
-                let mu = sample_mean(slice);
-                let sd = sample_std(slice, 0) + 1e-8;
-                let z = if slice.len() >= 2 {
-                    ((col[i] - mu) / sd).clamp(-3.5, 3.5)
-                } else {
-                    0.0
-                };
-                x_raw[i][d] = z;
-                x_raw[i][d + 6] = z.tanh();
-                x_raw[i][d + 12] = z * z - 1.0;
-            }
-        }
-
-        let k = scfg.mace_target_horizon_bars.max(1).min(n.saturating_sub(1));
-        let mut y_target = vec![0.0; n];
-        for i in 0..(n - k) {
-            y_target[i] = scfg.snr_synth_weight * (s_close[i + k] / s_close[i]).ln()
-                + scfg.snr_usdc_weight * (u_close[i + k] / u_close[i]).ln();
-        }
-        Some((x_raw, y_target, k))
-    }
-
-    /// Fits L2 Ridge + Random Forest Regressor on purged rolling slice `[train_start : t - k]`
-    /// and caches fitted models across `mace_refit_interval_bars` (36) bars using bar timestamps (`B7`).
-    pub fn fit_predict_mace_series_from_xy(
-        &self,
-        x_raw: &[[f64; 18]],
-        y_target: &[f64],
-        k_horizon: usize,
-        symbol_key: Option<&str>,
-    ) -> (Vec<f64>, Vec<f64>) {
-        self.fit_predict_mace_series_with_timestamps(x_raw, y_target, k_horizon, symbol_key, None)
-    }
-
-    pub fn fit_predict_mace_series_with_timestamps(
-        &self,
-        x_raw: &[[f64; 18]],
-        y_target: &[f64],
-        k_horizon: usize,
-        symbol_key: Option<&str>,
-        bar_timestamps: Option<&[i64]>,
-    ) -> (Vec<f64>, Vec<f64>) {
-        let n = x_raw.len();
-        if n == 0 {
-            return (Vec::new(), Vec::new());
-        }
-        let cfg = self.db.load_config_opts(false).unwrap_or_default();
-        let scfg = SignalConfig::from_config_map(&cfg);
-        let warmup = cfg.get_usize("mace_warmup_bars", 32).max(8);
-        let min_train_rows = cfg.get_usize("mace_min_train_rows", 16).max(8);
-        let train_window = scfg.mace_train_window_bars.max(min_train_rows);
-        let refit_interval = cfg.get_usize("mace_refit_interval_bars", 36).max(1);
-        let ridge_alpha = cfg.get_f64("mace_ridge_alpha", 1.0).max(1e-4);
-        let rf_trees = cfg.get_usize("mace_rf_trees", 30).max(5);
-        let rf_max_depth = cfg.get_usize("mace_rf_max_depth", 4).max(2);
-        let rf_min_leaf = cfg.get_usize("mace_rf_min_samples_leaf", 10).max(2);
-        let rf_seed = cfg.get_i64("mace_rng_seed", 42) as u64;
-        let ic_win = scfg.mace_ic_window_bars.max(8);
-
-        let mut mace_series = vec![0.0; n];
-        let mut ic_series = vec![0.0; n];
-
-        let last_bar_ts = bar_timestamps
-            .and_then(|ts| ts.last().copied())
-            .unwrap_or(0);
-
-        // Fast path for live single-bar evaluation when cached model has advanced fewer than `refit_interval` bars (`B7`)
-        if let Some(sym) = symbol_key {
-            let mut cache = self.mace_cache.lock();
-            if let Some(cached) = cache.get_mut(sym) {
-                let can_use_cache = if let Some(ts_slice) = bar_timestamps {
-                    if cached.last_fit_bar_ts > 0 && last_bar_ts >= cached.last_fit_bar_ts {
-                        let bars_elapsed = ts_slice
-                            .iter()
-                            .filter(|&&ts| ts > cached.last_fit_bar_ts)
-                            .count();
-                        let has_anchor = ts_slice.iter().any(|&ts| ts <= cached.last_fit_bar_ts);
-                        has_anchor && bars_elapsed < refit_interval
-                    } else {
-                        false
-                    }
-                } else {
-                    if n > cached.last_fit_len {
-                        cached.bars_advanced_since_fit += n - cached.last_fit_len;
-                        cached.last_fit_len = n;
-                    } else {
-                        cached.bars_advanced_since_fit += 1;
-                    }
-                    cached.bars_advanced_since_fit < refit_interval
-                };
-
-                if can_use_cache {
-                    let x_cur = &x_raw[n - 1];
-                    let pred_ridge =
-                        predict_ridge(&cached.ridge_weights, cached.ridge_intercept, x_cur);
-                    let pred_rf = predict_forest(&cached.trees, x_cur);
-                    let raw_pred = 0.50 * pred_ridge + 0.50 * pred_rf;
-                    let mace_t = (raw_pred / cached.scale).tanh().clamp(-1.0, 1.0);
-                    mace_series[n - 1] = round_dp(mace_t, 4);
-                    cached.last_mace = mace_series[n - 1];
-                    cached.last_seen_bar_ts = last_bar_ts;
-                    return (mace_series, vec![cached.last_ic; n]);
-                }
-            }
-        }
-
-        let start_t = warmup + min_train_rows + k_horizon;
-        if start_t >= n {
-            return (mace_series, ic_series);
-        }
-
-        let eval_indices: Vec<usize> = if symbol_key.is_some() {
-            let mut v: Vec<usize> = (start_t..n).step_by(refit_interval).collect();
-            if v.last().copied() != Some(n - 1) {
-                v.push(n - 1);
-            }
-            v
-        } else {
-            (start_t..n).collect()
-        };
-
-        let mut active_ridge_w = [0.0; 18];
-        let mut active_ridge_b = 0.0;
-        let mut active_trees: Vec<RegressionTreeNode> = Vec::new();
-        let mut active_scale = 0.015;
-        let mut last_fit_t: Option<usize> = None;
-
-        let mut raw_preds = vec![0.0; n];
-        let mut oos_preds = Vec::new();
-        let mut oos_reals = Vec::new();
-        let mut current_ic = 0.0;
-
-        for t in start_t..n {
-            let train_end = t - k_horizon;
-            if train_end <= warmup + min_train_rows {
-                continue;
-            }
-            let need_refit = active_trees.is_empty()
-                || last_fit_t
-                    .map(|lt| (t - lt) >= refit_interval)
-                    .unwrap_or(true);
-
-            if need_refit && (symbol_key.is_none() || eval_indices.contains(&t)) {
-                let train_start = train_end.saturating_sub(train_window).max(warmup);
-                let x_train = &x_raw[train_start..train_end];
-                let y_train = &y_target[train_start..train_end];
-                let (rw, rb) = fit_ridge_l2(x_train, y_train, ridge_alpha);
-                let trees =
-                    fit_random_forest(x_train, y_train, rf_trees, rf_max_depth, rf_min_leaf, rf_seed);
-                let y_sd = sample_std(y_train, 0);
-                active_ridge_w = rw;
-                active_ridge_b = rb;
-                active_trees = trees;
-                active_scale = 1.5 * y_sd + 1e-6;
-                last_fit_t = Some(t);
-            }
-
-            if !active_trees.is_empty() {
-                // Only add a prediction to the OOS IC evaluation buffer once its k_horizon forward return
-                // has causally completed at or before bar `t` (`tau + k_horizon == t`) (`B6`).
-                if t >= start_t + k_horizon {
-                    let tau = t - k_horizon;
-                    oos_preds.push(raw_preds[tau]);
-                    oos_reals.push(y_target[tau]);
-                    if oos_preds.len() >= 8 {
-                        let tail = oos_preds.len().min(ic_win);
-                        current_ic = Self::safe_spearman_ic(
-                            &oos_preds[oos_preds.len() - tail..],
-                            &oos_reals[oos_reals.len() - tail..],
-                        );
-                    }
-                }
-
-                let x_cur = &x_raw[t];
-                let pred_ridge = predict_ridge(&active_ridge_w, active_ridge_b, x_cur);
-                let pred_rf = predict_forest(&active_trees, x_cur);
-                let raw_pred = 0.50 * pred_ridge + 0.50 * pred_rf;
-                raw_preds[t] = raw_pred;
-                let mace_t = (raw_pred / active_scale).tanh().clamp(-1.0, 1.0);
-                mace_series[t] = round_dp(mace_t, 4);
-                ic_series[t] = current_ic;
-            }
-        }
-
-        if let Some(sym) = symbol_key {
-            if !active_trees.is_empty() {
-                self.mace_cache.lock().insert(
-                    sym.to_string(),
-                    CachedMaceModel {
-                        last_fit_len: n,
-                        last_fit_bar_ts: last_bar_ts,
-                        last_seen_bar_ts: last_bar_ts,
-                        bars_advanced_since_fit: 0,
-                        ridge_weights: active_ridge_w,
-                        ridge_intercept: active_ridge_b,
-                        trees: active_trees,
-                        scale: active_scale,
-                        last_mace: mace_series[n - 1],
-                        last_ic: current_ic,
-                    },
-                );
-            }
-        }
-
-        (mace_series, ic_series)
-    }
-
-    /// Computes Spearman Rank Information Coefficient (`IC` in `[-1.0, +1.0]`) with zero-variance guard.
-    pub fn safe_spearman_ic(preds: &[f64], reals: &[f64]) -> f64 {
-        let n = preds.len().min(reals.len());
-        if n < 5 {
-            return 0.0;
-        }
-        let p = &preds[..n];
-        let r = &reals[..n];
-        if sample_std(p, 0) < 1e-10 || sample_std(r, 0) < 1e-10 {
-            return 0.0;
-        }
-        let rank_p = rank_slice(p);
-        let rank_r = rank_slice(r);
-        let mp = sample_mean(&rank_p);
-        let mr = sample_mean(&rank_r);
-        let mut cov = 0.0;
-        let mut vp = 0.0;
-        let mut vr = 0.0;
-        for i in 0..n {
-            let dp = rank_p[i] - mp;
-            let dr = rank_r[i] - mr;
-            cov += dp * dr;
-            vp += dp * dp;
-            vr += dr * dr;
-        }
-        let denom = (vp * vr).sqrt();
-        if denom < 1e-12 {
-            return 0.0;
-        }
-        let corr = cov / denom;
-        if corr.is_finite() {
-            round_dp(corr.clamp(-1.0, 1.0), 4)
-        } else {
-            0.0
-        }
-    }
-
-    /// Computes dynamic MACE conviction weight bounded in `[mace_dynamic_weight_min, mace_dynamic_weight_max]` based on rolling OOS Spearman IC.
-    pub fn compute_dynamic_mace_weight(rolling_ic: f64, base_weight: f64) -> f64 {
-        Self::compute_dynamic_mace_weight_with_config(
-            rolling_ic,
-            base_weight,
-            &SignalConfig::default(),
-        )
-    }
-
-    pub fn compute_dynamic_mace_weight_with_config(
-        rolling_ic: f64,
-        base_weight: f64,
-        scfg: &SignalConfig,
-    ) -> f64 {
-        let w = if rolling_ic <= 0.0 {
-            base_weight + rolling_ic * scfg.mace_ic_neg_slope
-        } else {
-            base_weight + rolling_ic * scfg.mace_ic_pos_slope
-        };
-        round_dp(
-            w.clamp(scfg.mace_dynamic_weight_min, scfg.mace_dynamic_weight_max),
-            4,
-        )
-    }
-
-    pub fn compute_mace_and_ic(
-        &self,
-        synth_bars: &[OhlcvBar],
-        usdc_bars: &[OhlcvBar],
-        base_mace_weight: f64,
-        symbol_key: Option<&str>,
-    ) -> (f64, f64, f64) {
-        let cfg = self.db.load_config_opts(false).unwrap_or_default();
-        let scfg = SignalConfig::from_config_map(&cfg);
-        let Some((x_raw, y_target, k)) =
-            Self::build_mace_features_and_target_with_config(synth_bars, usdc_bars, &scfg)
-        else {
-            return (0.0, 0.0, base_mace_weight);
-        };
-        let n = x_raw.len();
-        let s_tail = &synth_bars[synth_bars.len() - n..];
-        let ts_vec: Vec<i64> = s_tail.iter().map(|b| b.timestamp_ms).collect();
-        let cache_key = symbol_key.or_else(|| synth_bars.last().map(|b| b.symbol.as_str()));
-        let (mace_series, ic_series) = self.fit_predict_mace_series_with_timestamps(
-            &x_raw,
-            &y_target,
-            k,
-            cache_key,
-            Some(&ts_vec),
-        );
-        let mace = mace_series.last().copied().unwrap_or(0.0);
-        let ic = ic_series.last().copied().unwrap_or(0.0);
-        let dyn_w = Self::compute_dynamic_mace_weight_with_config(ic, base_mace_weight, &scfg);
-        (mace, ic, dyn_w)
     }
 
     /// Computes BTC macro trend confirmation (`trend_pct`, `r_btc_24`, `r_btc_8`).
@@ -1983,6 +611,8 @@ impl SignalEngine {
         let scfg = SignalConfig::from_config_map(&cfg);
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_live_mode = mode == "LIVE" || mode == "TESTNET";
+        let is_wall_clock = self.db.get_pit_timestamp_ms().is_none();
+        let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(60_000);
         // Read `hmm_lookback_bars` (seeded at 540), falling back to legacy `hmm_lookback_candles` (`C4`)
         let hmm_window = cfg.get_usize(
             "hmm_lookback_bars",
@@ -2027,6 +657,20 @@ impl SignalEngine {
 
         let alt_pairs = self.db.get_alt_pairs_universe()?;
         let now_ms = self.db.now_ms();
+        let btc_stale_live = is_live_mode
+            && is_wall_clock
+            && btc_bars
+                .last()
+                .map(|b| (now_ms - b.timestamp_ms) > max_staleness_ms)
+                .unwrap_or(true);
+        if btc_stale_live {
+            let _ = self.db.log_telemetry(
+                "WARNING",
+                "engine.signals",
+                "Stale BTC/USDC:USDC candles detected in live mode; forcing FLAT signal actions",
+                Some(json!({ "max_bar_staleness_ms": max_staleness_ms })),
+            );
+        }
 
         struct RawMetrics {
             base_asset: String,
@@ -2045,9 +689,14 @@ impl SignalEngine {
 
         let mut raw_metrics = Vec::with_capacity(alt_pairs.len());
         for pair in &alt_pairs {
-            let usdc_bars =
+            let mut usdc_bars =
                 self.db
                     .get_ohlcv_bars(&pair.exec_symbol, &pair.exec_timeframe, 260, None)?;
+            if usdc_bars.len() < 20 && pair.exec_timeframe != "4h" {
+                usdc_bars = self
+                    .db
+                    .get_ohlcv_bars(&pair.exec_symbol, "4h", 260, None)?;
+            }
             let synth_bars =
                 self.db
                     .get_ohlcv_bars(&pair.synth_symbol, &pair.rs_timeframe, 260, None)?;
@@ -2055,11 +704,27 @@ impl SignalEngine {
                 continue;
             }
 
-            let is_unsupported_live = is_live_mode
-                && usdc_bars
-                    .last()
-                    .map(|b| b.is_synthetic == 1)
-                    .unwrap_or(false);
+            let usdc_stale = usdc_bars
+                .last()
+                .map(|b| (now_ms - b.timestamp_ms) > max_staleness_ms)
+                .unwrap_or(true);
+            let synth_stale = synth_bars
+                .last()
+                .map(|b| (now_ms - b.timestamp_ms) > max_staleness_ms)
+                .unwrap_or(true);
+            let bars_misaligned = match (usdc_bars.last(), synth_bars.last()) {
+                (Some(u), Some(s)) => (u.timestamp_ms - s.timestamp_ms).abs() > max_staleness_ms,
+                _ => true,
+            };
+            let is_stale_live = is_live_mode
+                && is_wall_clock
+                && (btc_stale_live || usdc_stale || synth_stale || bars_misaligned);
+            let is_unsupported_live = is_stale_live
+                || (is_live_mode
+                    && usdc_bars
+                        .last()
+                        .map(|b| b.is_synthetic == 1)
+                        .unwrap_or(false));
 
             let (snr_series, snr_synth_series) =
                 Self::compute_continuous_snr_series_with_config(
@@ -2108,7 +773,7 @@ impl SignalEngine {
             });
         }
 
-        // Rank tradable live assets ahead of unsupported synthetic assets
+        // Rank tradable live assets ahead of unsupported/stale assets
         raw_metrics.sort_by(|a, b| match (a.is_unsupported_live, b.is_unsupported_live) {
             (false, true) => std::cmp::Ordering::Less,
             (true, false) => std::cmp::Ordering::Greater,
@@ -2375,47 +1040,8 @@ impl WalkForwardCalibrator {
     }
 }
 
-fn apply_hysteresis_with_gates(
-    current_regime: &str,
-    p_bull: f64,
-    p_bear: f64,
-    p_chop: f64,
-    enter_gate: f64,
-    exit_gate: f64,
-) -> &'static str {
-    match current_regime {
-        "BULL" => {
-            if p_bull >= exit_gate && p_bull >= p_bear {
-                "BULL"
-            } else if p_bear >= enter_gate {
-                "BEAR"
-            } else {
-                "CHOP"
-            }
-        }
-        "BEAR" => {
-            if p_bear >= exit_gate && p_bear >= p_bull {
-                "BEAR"
-            } else if p_bull >= enter_gate {
-                "BULL"
-            } else {
-                "CHOP"
-            }
-        }
-        _ => {
-            if p_bull >= enter_gate && p_bull > p_bear && p_bull > p_chop {
-                "BULL"
-            } else if p_bear >= enter_gate && p_bear > p_bull && p_bear > p_chop {
-                "BEAR"
-            } else {
-                "CHOP"
-            }
-        }
-    }
-}
-
 #[inline]
-fn sample_mean(slice: &[f64]) -> f64 {
+pub(crate) fn sample_mean(slice: &[f64]) -> f64 {
     if slice.is_empty() {
         return 0.0;
     }
@@ -2423,158 +1049,13 @@ fn sample_mean(slice: &[f64]) -> f64 {
 }
 
 #[inline]
-fn sample_std(slice: &[f64], ddof: usize) -> f64 {
+pub(crate) fn sample_std(slice: &[f64], ddof: usize) -> f64 {
     if slice.len() <= ddof {
         return 0.0;
     }
     let mu = sample_mean(slice);
     let var = slice.iter().map(|x| (x - mu).powi(2)).sum::<f64>() / ((slice.len() - ddof) as f64);
     var.max(0.0).sqrt()
-}
-
-fn rank_slice(slice: &[f64]) -> Vec<f64> {
-    let mut indexed: Vec<(usize, f64)> = slice.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut ranks = vec![0.0; slice.len()];
-    for (rank, (orig_idx, _)) in indexed.into_iter().enumerate() {
-        ranks[orig_idx] = rank as f64;
-    }
-    ranks
-}
-
-fn fit_ridge_l2(x: &[[f64; 18]], y: &[f64], alpha: f64) -> ([f64; 18], f64) {
-    let n = x.len().min(y.len());
-    if n == 0 {
-        return ([0.0; 18], 0.0);
-    }
-    let y_mean = sample_mean(&y[..n]);
-    let mut x_mean = [0.0; 18];
-    for row in &x[..n] {
-        for j in 0..18 {
-            x_mean[j] += row[j] / (n as f64);
-        }
-    }
-
-    let mut a_mat = [[0.0f64; 18]; 18];
-    let mut b_vec = [0.0f64; 18];
-
-    for i in 0..n {
-        let dy = y[i] - y_mean;
-        for r in 0..18 {
-            let xr = x[i][r] - x_mean[r];
-            b_vec[r] += xr * dy;
-            for c in r..18 {
-                let xc = x[i][c] - x_mean[c];
-                a_mat[r][c] += xr * xc;
-            }
-        }
-    }
-    for r in 0..18 {
-        a_mat[r][r] += alpha.max(1e-6);
-        for c in 0..r {
-            a_mat[r][c] = a_mat[c][r];
-        }
-    }
-
-    // Solve 18x18 SPD system (A * w = b) via Gaussian elimination with partial pivoting
-    let mut weights = [0.0f64; 18];
-    for k in 0..18 {
-        let mut pivot_row = k;
-        let mut max_val = a_mat[k][k].abs();
-        for i in (k + 1)..18 {
-            if a_mat[i][k].abs() > max_val {
-                max_val = a_mat[i][k].abs();
-                pivot_row = i;
-            }
-        }
-        if max_val < 1e-12 {
-            continue;
-        }
-        if pivot_row != k {
-            a_mat.swap(k, pivot_row);
-            b_vec.swap(k, pivot_row);
-        }
-        let pivot = a_mat[k][k];
-        for i in (k + 1)..18 {
-            let factor = a_mat[i][k] / pivot;
-            b_vec[i] -= factor * b_vec[k];
-            for j in k..18 {
-                a_mat[i][j] -= factor * a_mat[k][j];
-            }
-        }
-    }
-    for i in (0..18).rev() {
-        let mut sum = b_vec[i];
-        for j in (i + 1)..18 {
-            sum -= a_mat[i][j] * weights[j];
-        }
-        let diag = a_mat[i][i];
-        weights[i] = if diag.abs() > 1e-12 { sum / diag } else { 0.0 };
-    }
-
-    let mut dot_mean = 0.0;
-    for j in 0..18 {
-        dot_mean += weights[j] * x_mean[j];
-    }
-    let intercept = y_mean - dot_mean;
-    (weights, intercept)
-}
-
-#[inline]
-fn predict_ridge(weights: &[f64; 18], intercept: f64, row: &[f64; 18]) -> f64 {
-    let mut acc = intercept;
-    for j in 0..18 {
-        acc += weights[j] * row[j];
-    }
-    acc
-}
-
-fn fit_random_forest(
-    x: &[[f64; 18]],
-    y: &[f64],
-    n_trees: usize,
-    max_depth: usize,
-    min_samples_leaf: usize,
-    seed: u64,
-) -> Vec<RegressionTreeNode> {
-    let n = x.len().min(y.len());
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut trees = Vec::with_capacity(n_trees);
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    for _ in 0..n_trees {
-        let mut sample_indices = Vec::with_capacity(n);
-        for _ in 0..n {
-            sample_indices.push(rng.gen_range(0..n));
-        }
-        let mut feat_subset = Vec::with_capacity(8);
-        for k in 0..8 {
-            feat_subset.push((rng.gen_range(0..18) + k * 3) % 18);
-        }
-        feat_subset.sort_unstable();
-        feat_subset.dedup();
-        trees.push(RegressionTreeNode::fit(
-            x,
-            y,
-            &sample_indices,
-            &feat_subset,
-            0,
-            max_depth,
-            min_samples_leaf,
-        ));
-    }
-    trees
-}
-
-#[inline]
-fn predict_forest(trees: &[RegressionTreeNode], row: &[f64; 18]) -> f64 {
-    if trees.is_empty() {
-        return 0.0;
-    }
-    let sum: f64 = trees.iter().map(|t| t.predict(row)).sum();
-    sum / (trees.len() as f64)
 }
 
 #[cfg(test)]
@@ -2627,7 +1108,10 @@ mod tests {
         let engine = SignalEngine::new(db);
 
         let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 120, 50_000.0, 0.002);
-        let states = engine.decode_hmm_regime_states(&btc_bars, 80, None, None);
+        let states = engine.decode_hmm_regime_states_shared(&btc_bars, 80, None, None);
+        let states_cached = engine.decode_hmm_regime_states_shared(&btc_bars, 80, None, None);
+        // NL-11: Cache hit returns shared Arc pointer without cloning underlying slice
+        assert!(Arc::ptr_eq(&states, &states_cached));
         assert_eq!(states.len(), btc_bars.len());
 
         for (idx, st) in states.iter().enumerate() {
@@ -2757,5 +1241,28 @@ mod tests {
         let (rs24, rs72, rs96, ru8) = compute_rs_lookbacks(&short_s, &short_u, 24, 72, 96, 8);
         assert_eq!((rs24, rs72, rs96), (0.0, 0.0, 0.0));
         assert_eq!(ru8, 0.0);
+    }
+
+    #[test]
+    fn test_live_stale_candles_forced_flat_nm8() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+
+        // Insert ancient candles from year 2023 (far older than max_bar_staleness_ms)
+        let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 120, 68_000.0, 0.005);
+        let sol_u = make_synthetic_bars("SOL/USDC:USDC", 120, 180.0, 0.008);
+        let sol_s = make_synthetic_bars("SOL/BTC:SYNTH", 120, 0.0026, 0.003);
+        db.upsert_ohlcv_batch(&btc_bars).unwrap();
+        db.upsert_ohlcv_batch(&sol_u).unwrap();
+        db.upsert_ohlcv_batch(&sol_s).unwrap();
+
+        let engine = SignalEngine::new(db);
+        let evals = engine.evaluate_universe(false).unwrap();
+        assert!(!evals.is_empty());
+        assert!(
+            evals.iter().all(|e| e.signal_action == "FLAT"),
+            "Stale live candles must force FLAT signal actions"
+        );
     }
 }

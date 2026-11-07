@@ -60,6 +60,7 @@ pub struct PondScannerParams {
     pub conviction_z_span: f64,
     pub conviction_scale_min: f64,
     pub conviction_scale_max: f64,
+    pub reject_synthetic_volume: bool,
 }
 
 impl Default for PondScannerParams {
@@ -98,6 +99,7 @@ impl Default for PondScannerParams {
             conviction_z_span: 2.0,
             conviction_scale_min: 0.5,
             conviction_scale_max: 1.5,
+            reject_synthetic_volume: false,
         }
     }
 }
@@ -155,9 +157,21 @@ pub fn evaluate_asset_gates_1_to_6(
     params: &PondScannerParams,
     open_or_cooldown_symbols: &HashSet<String>,
 ) -> std::result::Result<GateEvaluationOutcome, &'static str> {
-    // Gate 1: Universe Eligibility & Liquidity Floor
+    // Gate 1: Universe Eligibility & Liquidity Floor (and live synthetic volume guard NM-13)
     if !input.universe_row.status.eq_ignore_ascii_case("ACTIVE") {
         return Err("GATE1_UNIVERSE_NOT_ACTIVE");
+    }
+    if params.reject_synthetic_volume && input.universe_row.is_synthetic_volume != 0 {
+        return Err("GATE1_SYNTHETIC_VOLUME_REJECTED_IN_LIVE");
+    }
+    if params.reject_synthetic_volume
+        && input
+            .bars_1h
+            .last()
+            .map(|b| b.is_synthetic != 0)
+            .unwrap_or(false)
+    {
+        return Err("GATE1_SYNTHETIC_BARS_REJECTED_IN_LIVE");
     }
     if input.universe_row.median_daily_volume_usdc < params.min_daily_vol_usdc {
         return Err("GATE1_VOLUME_BELOW_FLOOR");
@@ -411,6 +425,13 @@ pub fn run_nps01_scan(
             continue;
         }
         let actual_risk = round_dp(qty * stop_distance, 2);
+        if actual_risk < params.min_cell_risk_usdc * 0.5 {
+            rejections.push((
+                item.universe_row.symbol.clone(),
+                "GATE7_BELOW_MIN_CELL_RISK".to_string(),
+            ));
+            continue;
+        }
         let chandelier_dist = params.chandelier_atr_mult * atr_4h;
 
         let (initial_stop, chandelier_stop) = match side {

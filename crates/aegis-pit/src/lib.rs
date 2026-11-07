@@ -65,19 +65,23 @@ impl PitOrchestrator {
         self.scoped_db.load_pit_config()
     }
 
-    /// Returns true if the platform-wide emergency halt or daily 00:05 UTC settling gate is active.
+    /// Returns true if the platform-wide emergency halt or daily 00:05 UTC settling gate is active (`NH-10`, `NM-3`).
     pub fn is_entry_frozen(&self) -> Result<(bool, String)> {
         let cfg = self.load_pit_config()?;
         if cfg.platform_pp50_halt {
             return Ok((true, "PLATFORM_PP50_HALT".to_string()));
         }
-        if cfg.platform_settle_gate_enabled {
+        if cfg.platform_settle_gate_enabled || self.scoped_db.inner().is_entry_frozen() {
             return Ok((true, "SETTLING_IN_PROGRESS".to_string()));
         }
         Ok((false, "ACTIVE".to_string()))
     }
 
     /// Executes a single Book A (`PIT`) 4H/1H signal & execution reconciliation cycle.
+    ///
+    /// Even when `frozen` is true (`PLATFORM_PP50_HALT` or `SETTLING_IN_PROGRESS`), protective
+    /// Chandelier trailing stops and regime exits continue to execute (`NH-10`), while new
+    /// directional entries are suppressed.
     pub fn run_cycle(&self, ingest_first: bool, force_synthetic: bool) -> Result<PitCycleSummary> {
         self.scoped_db.check_table_access("trades")?;
         self.scoped_db.check_table_access("portfolio_snapshots")?;
@@ -93,11 +97,9 @@ impl PitOrchestrator {
         }
 
         let evals = self.signals.evaluate_universe(true)?;
-        let snap: PortfolioSnapshot = if frozen {
-            self.scoped_db.get_pit_latest_portfolio_snapshot()?
-        } else {
-            self.execution.reconcile_cycle(&evals, false)?
-        };
+        let snap: PortfolioSnapshot = self
+            .execution
+            .reconcile_cycle_with_options(&evals, false, frozen)?;
 
         let summary = PitCycleSummary {
             book_id: "PIT".to_string(),
@@ -137,11 +139,15 @@ impl PitOrchestrator {
         let raw_db = self.scoped_db.inner();
         let realized = raw_db.get_total_realized_pnl().unwrap_or(0.0);
         let open_trades = self.scoped_db.get_pit_open_trades().unwrap_or_default();
+        let resting_trades = raw_db.get_resting_pit_trades().unwrap_or_default();
         let mut deployed = 0.0;
         let mut upnl = 0.0;
         for t in &open_trades {
             deployed += t.quantity.abs() * t.current_price;
             upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc;
+        }
+        for rt in &resting_trades {
+            deployed += rt.notional_usdc.max(rt.quantity.abs() * rt.entry_price);
         }
         let latest_snap = self.scoped_db.get_pit_latest_portfolio_snapshot()?;
         let has_baseline_reset = !raw_db
@@ -226,6 +232,7 @@ pub fn spawn_pit_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_core::TradeRecord;
 
     #[test]
     fn test_pit_orchestrator_scoped_cycle() {
@@ -239,5 +246,117 @@ mod tests {
         assert_eq!(summary.book_id, "PIT");
         assert!(summary.total_equity_usdc > 0.0);
         assert_eq!(summary.evaluations_count, 15);
+    }
+
+    #[test]
+    fn test_pit_frozen_cycle_still_evaluates_chandelier_stops_nh10() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PitOrchestrator::new(db.clone(), None);
+
+        // Seed synthetic bars first so SOL/USDC:USDC has valid OHLCV bars
+        let _ = orch.ingestion.ingest_universe(60, true).unwrap();
+        let bars = db
+            .get_ohlcv_bars("SOL/USDC:USDC", "4h", 5, None)
+            .unwrap();
+        let last_bar = bars.last().unwrap();
+
+        // Insert an open LONG trade whose Chandelier stop is above current bar low so it must trigger a stop exit
+        let stop_px = last_bar.high + 50.0;
+        let entry_px = stop_px + 20.0;
+        let trade = TradeRecord {
+            trade_id: 0,
+            client_order_id: "nh10-stop-test".to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: entry_px,
+            current_price: entry_px,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 1.0,
+            avg_fill_price: Some(entry_px),
+            notional_usdc: entry_px,
+            risk_budget_usdc: 20.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: stop_px,
+            chandelier_stop_price: stop_px,
+            current_stop_price: stop_px,
+            highest_price_seen: entry_px,
+            lowest_price_seen: entry_px,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.1,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("paper-nh10".to_string()),
+            opened_at: String::new(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        db.insert_trade(&trade).unwrap();
+        assert_eq!(db.get_open_trades().unwrap().len(), 1);
+
+        // Freeze entries via both platform_settle_gate_enabled and DB settle lock
+        db.set_config_value("platform_settle_gate_enabled", &json!(true))
+            .unwrap();
+        db.try_acquire_settle_lock("test").unwrap();
+
+        let summary = orch.run_cycle(false, false).unwrap();
+        assert_eq!(summary.status, "SETTLING_IN_PROGRESS");
+        // The stop-out MUST have executed despite the entry freeze, and no new entries opened
+        assert_eq!(db.get_open_trades().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_nh4_nh6_resting_order_confirmation_and_pit_pending_state() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PitOrchestrator::new(db.clone(), None);
+
+        // Insert a resting order in OPEN_ON_BOOK / PENDING_RESTING state (NH-4, NH-6)
+        let resting = TradeRecord {
+            trade_id: 0,
+            client_order_id: "nh4-resting-coid".to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "LONG".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 180.0,
+            current_price: 180.0,
+            exit_price: None,
+            quantity: 2.0,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 360.0,
+            risk_budget_usdc: 20.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 170.0,
+            chandelier_stop_price: 170.0,
+            current_stop_price: 170.0,
+            highest_price_seen: 180.0,
+            lowest_price_seen: 180.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-resting-999".to_string()),
+            opened_at: String::new(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        db.insert_trade(&resting).unwrap();
+
+        // Unfilled resting order must NOT appear in get_open_trades() (NH-4)
+        assert_eq!(db.get_open_trades().unwrap().len(), 0);
+        assert_eq!(db.get_resting_pit_trades().unwrap().len(), 1);
+        // Resting notional must still reserve idle margin in compute_pit_equity_and_idle_usdc
+        let (pit_eq, pit_idle) = orch.compute_pit_equity_and_idle_usdc().unwrap();
+        assert!((pit_eq - 5000.0).abs() < 1e-6);
+        assert!((pit_idle - 4640.0).abs() < 1e-6);
     }
 }

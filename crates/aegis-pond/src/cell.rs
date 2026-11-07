@@ -139,9 +139,14 @@ pub fn update_cell_mark_and_chandelier(
     round_dp(price_pnl, 4)
 }
 
-/// Accrues 1H funding on an active Pond cell.
+/// Accrues 1H funding on an active Pond cell using mark-to-market notional (`NL-13`).
 pub fn accrue_cell_hourly_funding(cell: &mut PondCell, mark_price: f64, funding_rate_hourly: f64) {
-    let notional = cell.quantity.unwrap_or(0.0).abs() * mark_price.max(cell.entry_price.unwrap_or(0.0));
+    let eff_px = if mark_price > 0.0 {
+        mark_price
+    } else {
+        cell.entry_price.unwrap_or(0.0).max(0.0)
+    };
+    let notional = cell.quantity.unwrap_or(0.0).abs() * eff_px;
     // SHORT receives positive funding; LONG receives negative funding (pays positive funding)
     let delta = if cell.side == "SHORT" {
         notional * funding_rate_hourly

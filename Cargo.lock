@@ -67,8 +67,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sha3",
  "thiserror 1.0.69",
- "zeroize",
 ]
 
 [[package]]
@@ -77,11 +77,9 @@ version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aes",
- "anyhow",
  "base64 0.22.1",
  "cbc",
  "chrono",
- "clap",
  "hmac",
  "parking_lot",
  "rand 0.8.8",
@@ -89,7 +87,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
  "tracing",
  "uuid",
  "zeroize",
@@ -107,7 +104,6 @@ dependencies = [
  "hex",
  "k256",
  "parking_lot",
- "rand 0.8.8",
  "reqwest",
  "rmp-serde",
  "serde",
@@ -159,8 +155,6 @@ version = "0.3.0-rc1"
 dependencies = [
  "aegis-core",
  "aegis-db",
- "serde",
- "serde_json",
  "tracing",
 ]
 
@@ -186,7 +180,6 @@ dependencies = [
  "aegis-db",
  "parking_lot",
  "rand 0.8.8",
- "rayon",
  "serde",
  "serde_json",
  "tracing",
@@ -215,9 +208,12 @@ dependencies = [
  "aegis-core",
  "aegis-db",
  "aegis-execution",
+ "aegis-pit",
  "aegis-pond",
+ "aegis-risk",
  "aegis-settle",
  "aegis-signals",
+ "aegis-telemetry",
  "anyhow",
  "axum",
  "rand 0.8.8",
@@ -225,6 +221,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
 ]

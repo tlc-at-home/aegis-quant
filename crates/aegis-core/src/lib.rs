@@ -22,8 +22,41 @@ pub const SENSITIVE_CONFIG_KEYS: &[&str] = &[
     "web_api_token",
 ];
 
+/// Canonical Hyperliquid Mainnet HLP Vault EVM address.
+pub const DEFAULT_MAINNET_HLP_VAULT_ADDRESS: &str = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+
+/// Canonical Hyperliquid Testnet HLP Vault EVM address.
+pub const DEFAULT_TESTNET_HLP_VAULT_ADDRESS: &str = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+
 /// Security-critical config keys that cannot be weakened or mutated via the Web API.
-pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &["enforce_master_key"];
+pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
+    "enforce_master_key",
+    "web_auth_enabled",
+    "web_allow_remote_bind",
+    "web_bind_host",
+    "web_csp_policy",
+    "web_cors_allowed_origins",
+    "web_allowed_hosts",
+    "web_api_token",
+    "telegram_api_base_url",
+    "hyperliquid_mainnet_url",
+    "hyperliquid_testnet_url",
+    "hyperliquid_info_url",
+    "hyperliquid_testnet_info_url",
+    "hyperliquid_exchange_url",
+    "hyperliquid_testnet_exchange_url",
+    "hyperliquid_mainnet_api_url",
+    "hyperliquid_testnet_api_url",
+    "hyperliquid_info_url_override",
+    "hyperliquid_exchange_url_override",
+    "pit_subaccount_address",
+    "pond_subaccount_address",
+    "hyperliquid_vault_address",
+    "hyperliquid_default_vault_mainnet",
+    "hyperliquid_default_vault_testnet",
+    "hyperliquid_mainnet_vault_address",
+    "hyperliquid_testnet_vault_address",
+];
 
 /// Returns true if `key` is an immutable security policy key that cannot be modified via the Web API.
 pub fn is_immutable_security_config_key(key: &str) -> bool {
@@ -42,6 +75,311 @@ pub fn is_sensitive_config_key(key: &str) -> bool {
         || k.ends_with("_bot_token")
         || k.ends_with("_webhook_url")
         || k.ends_with("_secret")
+}
+
+/// Canonical UTC timestamp formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn now_iso8601_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Format a millisecond epoch timestamp as canonical ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn format_ms_iso8601_utc(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms)
+        .unwrap_or_else(chrono::Utc::now)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+/// Normalize a legacy SQLite (`YYYY-MM-DD HH:MM:SS`) or RFC3339 timestamp string into canonical ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn normalize_timestamp_iso8601_utc(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return ndt.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return ndt.and_utc().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Parse an RFC3339 or legacy SQLite UTC timestamp string into a `NaiveDateTime`.
+pub fn parse_utc_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.naive_utc());
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%SZ") {
+        return Some(ndt);
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return Some(ndt);
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return Some(ndt);
+    }
+    None
+}
+
+/// Typed USDC amount newtype (`NM-15`) preventing unit confusion in risk sizing and equity accounting.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Usdc(pub f64);
+
+impl Usdc {
+    #[inline]
+    pub const fn new(val: f64) -> Self {
+        Self(val)
+    }
+
+    #[inline]
+    pub fn new_clamped(val: f64) -> Self {
+        if val.is_finite() && val > 0.0 {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
+    }
+
+    #[inline]
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        Self((self.0 - rhs.0).max(0.0))
+    }
+
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+
+    #[inline]
+    pub fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    #[inline]
+    pub fn clamp(self, min: Self, max: Self) -> Self {
+        Self(self.0.clamp(min.0, max.0))
+    }
+
+    #[inline]
+    pub fn round_dp(self, decimals: i32) -> Self {
+        Self(round_dp(self.0, decimals))
+    }
+}
+
+impl From<f64> for Usdc {
+    fn from(v: f64) -> Self {
+        Self(v)
+    }
+}
+
+impl fmt::Display for Usdc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.2}", self.0)
+    }
+}
+
+/// Typed instrument price newtype (`NM-15`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Price(pub f64);
+
+impl Price {
+    #[inline]
+    pub const fn new(val: f64) -> Self {
+        Self(val)
+    }
+
+    #[inline]
+    pub fn new_clamped(val: f64) -> Self {
+        if val.is_finite() && val > 0.0 {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
+    }
+
+    #[inline]
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub fn abs_diff(self, other: Self) -> f64 {
+        (self.0 - other.0).abs()
+    }
+
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+
+    #[inline]
+    pub fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    #[inline]
+    pub fn round_step(self, step: f64, round_down: bool) -> Self {
+        Self(round_step(self.0, step, round_down))
+    }
+}
+
+impl From<f64> for Price {
+    fn from(v: f64) -> Self {
+        Self(v)
+    }
+}
+
+impl fmt::Display for Price {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Typed contract quantity newtype (`NM-15`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Quantity(pub f64);
+
+impl Quantity {
+    #[inline]
+    pub const fn new(val: f64) -> Self {
+        Self(val)
+    }
+
+    #[inline]
+    pub fn new_clamped(val: f64) -> Self {
+        if val.is_finite() && val > 0.0 {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
+    }
+
+    #[inline]
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub fn from_notional_rounded_down(notional: Usdc, price: Price, step: f64) -> Self {
+        if price.0 <= 0.0 || !price.0.is_finite() {
+            return Self(0.0);
+        }
+        let raw_qty = notional.0 / price.0;
+        Self(round_step(raw_qty, step, true).max(0.0))
+    }
+
+    #[inline]
+    pub fn notional_at(self, price: Price) -> Usdc {
+        Usdc::new_clamped(self.0 * price.0)
+    }
+
+    #[inline]
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
+    }
+
+    #[inline]
+    pub fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    #[inline]
+    pub fn round_step(self, step: f64, round_down: bool) -> Self {
+        Self(round_step(self.0, step, round_down))
+    }
+}
+
+impl From<f64> for Quantity {
+    fn from(v: f64) -> Self {
+        Self(v)
+    }
+}
+
+impl fmt::Display for Quantity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Typed leverage multiplier newtype (`NM-15`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Leverage(pub f64);
+
+impl Leverage {
+    #[inline]
+    pub fn new_clamped(val: f64) -> Self {
+        if val.is_finite() && val >= 0.0 {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
+    }
+
+    #[inline]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+}
+
+/// Typed basis-points (`1 bps = 0.01%`) newtype (`NM-15`).
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Bps(pub f64);
+
+impl Bps {
+    #[inline]
+    pub const fn as_f64(self) -> f64 {
+        self.0
+    }
+
+    #[inline]
+    pub fn from_fraction(frac: f64) -> Self {
+        if frac.is_finite() {
+            Self(frac * 10_000.0)
+        } else {
+            Self(0.0)
+        }
+    }
+
+    #[inline]
+    pub fn to_fraction(self) -> f64 {
+        self.0 / 10_000.0
+    }
 }
 
 /// Computes the absolute drift in basis points (`bps`) between Book A's equity and its target split of total platform equity.
@@ -63,26 +401,10 @@ pub const VALID_FSM_STATES: &[&str] = &[
     "EXPIRED",
 ];
 
-/// Baseline reference prices (USDC) for deterministic sandbox / synthetic fallback series.
+/// Deprecated stub: all reference prices are stored in SQLite (`universe_assets.reference_price`
+/// and `pond_universe.reference_price`) and queried via `DatabaseManager::resolve_reference_price` (`HP`).
 pub fn base_prices_usdc() -> HashMap<&'static str, f64> {
-    HashMap::from([
-        ("BTC/USDC:USDC", 68500.0),
-        ("ETH/USDC:USDC", 2650.0),
-        ("SOL/USDC:USDC", 175.0),
-        ("HYPE/USDC:USDC", 24.5),
-        ("XRP/USDC:USDC", 0.56),
-        ("DOGE/USDC:USDC", 0.145),
-        ("ADA/USDC:USDC", 0.38),
-        ("AVAX/USDC:USDC", 28.5),
-        ("LINK/USDC:USDC", 12.4),
-        ("SUI/USDC:USDC", 2.15),
-        ("DOT/USDC:USDC", 4.35),
-        ("NEAR/USDC:USDC", 4.85),
-        ("APT/USDC:USDC", 9.80),
-        ("ARB/USDC:USDC", 0.58),
-        ("OP/USDC:USDC", 1.65),
-        ("INJ/USDC:USDC", 21.2),
-    ])
+    HashMap::new()
 }
 
 /// Timeframe duration in seconds.
@@ -114,6 +436,8 @@ pub enum FirewallError {
 pub enum AegisError {
     #[error("Validation error: {0}")]
     Validation(String),
+    #[error("Configuration error: {0}")]
+    Config(String),
     #[error("Security violation: {0}")]
     SecurityViolation(String),
     #[error("Firewall violation: {0}")]
@@ -128,6 +452,8 @@ pub enum AegisError {
     Execution(String),
     #[error("Not found: {0}")]
     NotFound(String),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -451,6 +777,10 @@ pub struct BookRow {
     pub created_at: String,
 }
 
+fn default_reference_price() -> f64 {
+    10.0
+}
+
 /// Dynamic 80-coin Pond universe row (`pond_universe` table).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PondUniverseRow {
@@ -466,6 +796,10 @@ pub struct PondUniverseRow {
     pub delist_streak: i64,
     pub added_at: String,
     pub delisted_at: Option<String>,
+    #[serde(default = "default_reference_price")]
+    pub reference_price: f64,
+    #[serde(default)]
+    pub is_synthetic_volume: i64,
 }
 
 /// Pond Champion version record (`pond_champions` table).
@@ -648,6 +982,9 @@ pub enum OrderFsmState {
     Expired,
 }
 
+/// Alias for `OrderFsmState` (`NM-14`).
+pub type OrderLifecycleState = OrderFsmState;
+
 impl OrderFsmState {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -674,6 +1011,37 @@ impl OrderFsmState {
                 "Invalid fsm_state '{other}': must be one of {VALID_FSM_STATES:?}"
             ))),
         }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Rejected | Self::Expired
+        )
+    }
+
+    pub fn can_transition_to(&self, next: OrderFsmState) -> bool {
+        use OrderFsmState::*;
+        matches!(
+            (*self, next),
+            (Pending, Pending)
+                | (Pending, OpenOnBook)
+                | (Pending, PartiallyFilled)
+                | (Pending, Filled)
+                | (Pending, Cancelled)
+                | (Pending, Rejected)
+                | (Pending, Expired)
+                | (OpenOnBook, OpenOnBook)
+                | (OpenOnBook, PartiallyFilled)
+                | (OpenOnBook, Filled)
+                | (OpenOnBook, Cancelled)
+                | (OpenOnBook, Rejected)
+                | (OpenOnBook, Expired)
+                | (PartiallyFilled, PartiallyFilled)
+                | (PartiallyFilled, Filled)
+                | (PartiallyFilled, Cancelled)
+                | (PartiallyFilled, Expired)
+        )
     }
 }
 
@@ -738,6 +1106,8 @@ pub struct UniverseAsset {
     pub max_leverage: f64,
     pub is_active: i64,
     pub updated_at: String,
+    #[serde(default = "default_reference_price")]
+    pub reference_price: f64,
 }
 
 /// Paired execution (`USDC_PERP`) & relative-strength (`BTC_SYNTH`) row (`v_universe_alt_pairs`).
@@ -832,6 +1202,169 @@ pub struct OrderExecutionResult {
     pub is_maker: bool,
     pub fill_type: String,
     pub state_history: Vec<String>,
+}
+
+impl OrderExecutionResult {
+    /// Construct a rejected `OrderExecutionResult` (`Q1` / `NQ-1`).
+    pub fn rejected(
+        client_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+    ) -> Self {
+        Self::rejected_with_type(client_order_id, symbol, side, requested_units, "REJECTED")
+    }
+
+    /// Construct a rejected `OrderExecutionResult` with custom fill type (`Q1`).
+    pub fn rejected_with_type(
+        client_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+        fill_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+            exchange_order_id: String::new(),
+            symbol: symbol.into(),
+            side: side.into(),
+            fsm_state: "REJECTED".to_string(),
+            requested_units: round_dp(requested_units, 6),
+            filled_units: 0.0,
+            avg_fill_price: 0.0,
+            slippage_paid_usd: 0.0,
+            effective_slippage_bps: 0.0,
+            fees_paid_usdc: 0.0,
+            is_maker: false,
+            fill_type: fill_type.into(),
+            state_history: vec!["CREATED".to_string(), "REJECTED".to_string()],
+        }
+    }
+
+    /// Construct a cancelled `OrderExecutionResult`.
+    pub fn cancelled(
+        client_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+            exchange_order_id: String::new(),
+            symbol: symbol.into(),
+            side: side.into(),
+            fsm_state: "CANCELLED".to_string(),
+            requested_units: round_dp(requested_units, 6),
+            filled_units: 0.0,
+            avg_fill_price: 0.0,
+            slippage_paid_usd: 0.0,
+            effective_slippage_bps: 0.0,
+            fees_paid_usdc: 0.0,
+            is_maker: false,
+            fill_type: "CANCELLED".to_string(),
+            state_history: vec![
+                "CREATED".to_string(),
+                "SUBMITTED".to_string(),
+                "OPEN_ON_BOOK".to_string(),
+                "CANCELLED".to_string(),
+            ],
+        }
+    }
+
+    /// Construct an expired `OrderExecutionResult`.
+    pub fn expired(
+        client_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+            exchange_order_id: String::new(),
+            symbol: symbol.into(),
+            side: side.into(),
+            fsm_state: "EXPIRED".to_string(),
+            requested_units: round_dp(requested_units, 6),
+            filled_units: 0.0,
+            avg_fill_price: 0.0,
+            slippage_paid_usd: 0.0,
+            effective_slippage_bps: 0.0,
+            fees_paid_usdc: 0.0,
+            is_maker: false,
+            fill_type: "EXPIRED".to_string(),
+            state_history: vec![
+                "CREATED".to_string(),
+                "SUBMITTED".to_string(),
+                "OPEN_ON_BOOK".to_string(),
+                "EXPIRED".to_string(),
+            ],
+        }
+    }
+
+    /// Construct an `OPEN_ON_BOOK` resting order result (`NH-4` / `NH-7`).
+    pub fn open_on_book(
+        client_order_id: impl Into<String>,
+        exchange_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+            exchange_order_id: exchange_order_id.into(),
+            symbol: symbol.into(),
+            side: side.into(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            requested_units: round_dp(requested_units, 6),
+            filled_units: 0.0,
+            avg_fill_price: 0.0,
+            slippage_paid_usd: 0.0,
+            effective_slippage_bps: 0.0,
+            fees_paid_usdc: 0.0,
+            is_maker: true,
+            fill_type: "HL_RESTING_ALO".to_string(),
+            state_history: vec![
+                "CREATED".to_string(),
+                "SUBMITTED".to_string(),
+                "OPEN_ON_BOOK".to_string(),
+            ],
+        }
+    }
+
+    /// Construct a `FILLED` order execution result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn filled(
+        client_order_id: impl Into<String>,
+        exchange_order_id: impl Into<String>,
+        symbol: impl Into<String>,
+        side: impl Into<String>,
+        requested_units: f64,
+        filled_units: f64,
+        avg_fill_price: f64,
+        slippage_paid_usd: f64,
+        effective_slippage_bps: f64,
+        fees_paid_usdc: f64,
+        is_maker: bool,
+        fill_type: impl Into<String>,
+        state_history: Vec<String>,
+    ) -> Self {
+        Self {
+            client_order_id: client_order_id.into(),
+            exchange_order_id: exchange_order_id.into(),
+            symbol: symbol.into(),
+            side: side.into(),
+            fsm_state: "FILLED".to_string(),
+            requested_units: round_dp(requested_units, 6),
+            filled_units: round_dp(filled_units, 6),
+            avg_fill_price: round_dp(avg_fill_price, 6),
+            slippage_paid_usd: round_dp(slippage_paid_usd, 4),
+            effective_slippage_bps: round_dp(effective_slippage_bps, 4),
+            fees_paid_usdc: round_dp(fees_paid_usdc, 4),
+            is_maker,
+            fill_type: fill_type.into(),
+            state_history,
+        }
+    }
 }
 
 /// Normalized trade record (`trades` table).
@@ -1009,7 +1542,7 @@ pub fn validate_private_key(value: &str) -> Result<String> {
     let raw_hex = if has_prefix { &cleaned[2..] } else { cleaned };
     if raw_hex.len() != 64 || !raw_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(AegisError::Validation(format!(
-            "Invalid private_key: must be a 64-hex-character (32-byte) private key (received {} characters after 0x prefix).",
+            "Invalid private_key: must be a 64-hex-character (64 hex characters / 32-byte) private key (received {} characters after 0x prefix).",
             raw_hex.len()
         )));
     }
@@ -1025,6 +1558,64 @@ pub fn validate_private_key(value: &str) -> Result<String> {
     Ok(format!("0x{}", raw_hex.to_ascii_lowercase()))
 }
 
+/// Derive the 42-character lowercase `0x` Ethereum address from a secp256k1 private key (`NH-12`).
+pub fn derive_evm_address_from_private_key(private_key: &str) -> Result<String> {
+    let norm_pk = validate_private_key(private_key)?;
+    if norm_pk.is_empty() || norm_pk.len() < 66 {
+        return Err(AegisError::Validation(
+            "Cannot derive EVM address from empty private_key.".to_string(),
+        ));
+    }
+    let pk_bytes = hex::decode(&norm_pk[2..]).map_err(|e| {
+        AegisError::Validation(format!("Invalid private_key hex encoding: {e}"))
+    })?;
+    let signing_key = k256::ecdsa::SigningKey::from_slice(&pk_bytes).map_err(|e| {
+        AegisError::Validation(format!("Invalid secp256k1 signing key: {e}"))
+    })?;
+    let verifying_key = signing_key.verifying_key();
+    let encoded_pt = verifying_key.to_encoded_point(false);
+    let pub_bytes = encoded_pt.as_bytes();
+    if pub_bytes.len() != 65 || pub_bytes[0] != 0x04 {
+        return Err(AegisError::Crypto(
+            "Unexpected uncompressed secp256k1 public key length".to_string(),
+        ));
+    }
+    use sha3::Keccak256;
+    let hash = Keccak256::digest(&pub_bytes[1..]);
+    Ok(format!("0x{}", hex::encode(&hash[12..])))
+}
+
+/// Verify that the Ethereum address derived from `private_key` matches `wallet_address`
+/// or an explicitly configured `agent_address` (`NH-12`).
+pub fn verify_signer_matches_wallet(
+    private_key: &str,
+    wallet_address: &str,
+    agent_address: Option<&str>,
+) -> Result<String> {
+    let derived = derive_evm_address_from_private_key(private_key)?;
+    let norm_wallet = validate_evm_address(wallet_address, "wallet_address")?;
+    if norm_wallet.is_empty() {
+        return Err(AegisError::Validation(
+            "wallet_address cannot be empty when verifying signer binding.".to_string(),
+        ));
+    }
+    if derived.eq_ignore_ascii_case(&norm_wallet) {
+        return Ok(derived);
+    }
+    if let Some(agent_raw) = agent_address.map(str::trim).filter(|s| !s.is_empty()) {
+        let norm_agent = validate_evm_address(agent_raw, "hyperliquid_agent_address")?;
+        if derived.eq_ignore_ascii_case(&norm_agent) {
+            return Ok(derived);
+        }
+        return Err(AegisError::Validation(format!(
+            "Private key signer address '{derived}' matches neither wallet_address '{norm_wallet}' nor hyperliquid_agent_address '{norm_agent}'."
+        )));
+    }
+    Err(AegisError::Validation(format!(
+        "Private key signer address '{derived}' does not match wallet_address '{norm_wallet}' (and no hyperliquid_agent_address is configured)."
+    )))
+}
+
 /// Mask sensitive private keys and API keys for safe telemetry output.
 pub fn mask_secret(raw_val: &str) -> String {
     let val = raw_val.trim();
@@ -1035,6 +1626,21 @@ pub fn mask_secret(raw_val: &str) -> String {
         format!("{}...{}", &val[..6], &val[val.len() - 4..])
     } else {
         "********".to_string()
+    }
+}
+
+/// Mask semi-sensitive identifiers such as `telegram_chat_id` for API responses (`NL-6`).
+pub fn mask_identifier(raw_val: &str) -> String {
+    let val = raw_val.trim();
+    if val.is_empty() {
+        return String::new();
+    }
+    if val.len() <= 4 {
+        "****".to_string()
+    } else if val.len() <= 6 {
+        format!("{}***{}", &val[..2], &val[val.len() - 2..])
+    } else {
+        format!("{}...{}", &val[..3], &val[val.len() - 3..])
     }
 }
 
@@ -1191,17 +1797,22 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_secret() {
+    fn test_mask_secret_and_identifier() {
         assert_eq!(
             mask_secret("0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"),
             "0x4c08...2318"
         );
         assert_eq!(mask_secret("short"), "********");
         assert_eq!(mask_secret(""), "");
+
+        assert_eq!(mask_identifier("-100123456789"), "-10...789");
+        assert_eq!(mask_identifier("123456"), "12***56");
+        assert_eq!(mask_identifier("1234"), "****");
+        assert_eq!(mask_identifier(""), "");
     }
 
     #[test]
-    fn test_pond_cell_fsm_and_math_helpers() {
+    fn test_pond_cell_fsm_and_order_fsm_transitions() {
         use PondCellState::*;
         assert!(Dormant.can_transition_to(Screened));
         assert!(Screened.can_transition_to(Candidate));
@@ -1213,12 +1824,39 @@ mod tests {
         assert!(Cooldown.can_transition_to(Dormant));
         assert!(!Dormant.can_transition_to(Open));
 
+        use OrderFsmState::*;
+        assert!(Pending.can_transition_to(OpenOnBook));
+        assert!(Pending.can_transition_to(Filled));
+        assert!(OpenOnBook.can_transition_to(PartiallyFilled));
+        assert!(OpenOnBook.can_transition_to(Filled));
+        assert!(OpenOnBook.can_transition_to(Cancelled));
+        assert!(!Filled.can_transition_to(OpenOnBook));
+        assert!(!Cancelled.can_transition_to(Filled));
+        assert!(!OrderFsmState::Rejected.can_transition_to(Filled));
+        assert!(Filled.is_terminal());
+
         let mut series = vec![0.0001; 167];
         series.push(0.0005);
         let (z, mean, std) = compute_trailing_z_score(&series, 168);
         assert!(z > 2.0);
         assert!(mean > 0.0);
         assert!(std > 0.0);
+    }
+
+    #[test]
+    fn test_iso8601_utc_and_immutable_keys() {
+        assert_eq!(
+            normalize_timestamp_iso8601_utc("2026-11-06 14:30:00"),
+            "2026-11-06T14:30:00Z"
+        );
+        assert_eq!(
+            normalize_timestamp_iso8601_utc("2026-11-06T14:30:00Z"),
+            "2026-11-06T14:30:00Z"
+        );
+        assert!(is_immutable_security_config_key("web_auth_enabled"));
+        assert!(is_immutable_security_config_key("telegram_api_base_url"));
+        assert!(is_immutable_security_config_key("hyperliquid_info_url_override"));
+        assert!(is_immutable_security_config_key("pit_subaccount_address"));
     }
 }
 

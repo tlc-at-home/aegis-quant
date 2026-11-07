@@ -32,25 +32,25 @@ struct SettleToolArgs {
     db: Option<String>,
 }
 
-fn parse_split(s: &str) -> Result<(f64, f64), String> {
+fn parse_split(s: &str) -> aegis_core::Result<(f64, f64)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
-        return Err(format!(
+        return Err(aegis_core::AegisError::Validation(format!(
             "Invalid --initial-split '{s}': expected '<PIT_USDC>:<POND_USDC>' (e.g. 5000:5000)"
-        ));
+        )));
     }
     let pit = parts[0]
         .trim()
         .parse::<f64>()
-        .map_err(|e| format!("Invalid PIT equity in --initial-split: {e}"))?;
+        .map_err(|e| aegis_core::AegisError::Validation(format!("Invalid PIT equity in --initial-split: {e}")))?;
     let pond = parts[1]
         .trim()
         .parse::<f64>()
-        .map_err(|e| format!("Invalid POND equity in --initial-split: {e}"))?;
+        .map_err(|e| aegis_core::AegisError::Validation(format!("Invalid POND equity in --initial-split: {e}")))?;
     Ok((pit, pond))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> aegis_core::Result<()> {
     let args = SettleToolArgs::parse();
     let db = match args.db.as_deref() {
         Some(path) => DatabaseManager::new(path),

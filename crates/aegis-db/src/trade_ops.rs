@@ -108,11 +108,75 @@ impl DatabaseManager {
                         max_leverage: r.get("max_leverage")?,
                         is_active: r.get("is_active")?,
                         updated_at: r.get("updated_at")?,
+                        reference_price: r
+                            .get::<_, Option<f64>>("reference_price")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(10.0),
                     })
                 })
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(iter.flatten().collect())
         })
+    }
+
+    /// Resolve the reference price for `symbol` from `universe_assets`, `pond_universe`,
+    /// latest `market_ohlcv` close, or `system_config` (`HP`).
+    pub fn resolve_reference_price(&self, symbol: &str) -> f64 {
+        let sym = symbol.trim();
+        let db_val: Option<f64> = self
+            .with_conn(|conn| {
+                let ua_px: Option<f64> = conn
+                    .query_row(
+                        "SELECT reference_price FROM universe_assets WHERE symbol = ?1 LIMIT 1;",
+                        params![sym],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                if let Some(px) = ua_px.filter(|&p| p > 0.0) {
+                    return Ok(Some(px));
+                }
+                let pond_px: Option<f64> = conn
+                    .query_row(
+                        "SELECT reference_price FROM pond_universe WHERE symbol = ?1 LIMIT 1;",
+                        params![sym],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                if let Some(px) = pond_px.filter(|&p| p > 0.0) {
+                    return Ok(Some(px));
+                }
+                let ohlcv_px: Option<f64> = conn
+                    .query_row(
+                        "SELECT close FROM market_ohlcv WHERE symbol = ?1 ORDER BY timestamp_ms DESC LIMIT 1;",
+                        params![sym],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                if let Some(px) = ohlcv_px.filter(|&p| p > 0.0) {
+                    return Ok(Some(px));
+                }
+                let fallback_px: Option<f64> = conn
+                    .query_row(
+                        "SELECT CAST(config_value AS REAL) FROM system_config WHERE config_key = 'default_fallback_reference_price_usdc' LIMIT 1;",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                Ok(fallback_px.filter(|&p| p > 0.0))
+            })
+            .ok()
+            .flatten();
+
+        db_val.unwrap_or(100.0)
     }
 
     pub fn get_alt_pairs_universe(&self) -> Result<Vec<AltPairMetadata>> {
@@ -298,9 +362,10 @@ impl DatabaseManager {
                         "INSERT INTO signal_evaluations (
                             timestamp_ms, base_asset, exec_symbol, synth_symbol,
                             hmm_regime, prob_bull, prob_bear, prob_chop,
-                            snr_score, mace_score, blended_conviction,
+                            snr_score, snr_synth, rs_96, r_usdc_8,
+                            mace_score, blended_conviction,
                             rs_rank, signal_action, funding_rate_hourly
-                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14);",
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17);",
                     )
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 for ev in evaluations {
@@ -317,6 +382,9 @@ impl DatabaseManager {
                         ev.prob_bear,
                         ev.prob_chop,
                         ev.snr_score,
+                        ev.snr_synth,
+                        ev.rs_96,
+                        ev.r_usdc_8,
                         ev.mace_score,
                         ev.blended_conviction,
                         ev.rs_rank,
@@ -350,7 +418,8 @@ impl DatabaseManager {
                 .prepare(
                     "SELECT eval_id, timestamp_ms, base_asset, exec_symbol, synth_symbol,
                             hmm_regime, prob_bull, prob_bear, prob_chop,
-                            snr_score, mace_score, blended_conviction,
+                            snr_score, snr_synth, rs_96, r_usdc_8,
+                            mace_score, blended_conviction,
                             rs_rank, signal_action, funding_rate_hourly, created_at
                      FROM signal_evaluations
                      WHERE eval_id IN (
@@ -365,6 +434,10 @@ impl DatabaseManager {
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             let iter = stmt
                 .query_map(params![ts, limit as i64], |r| {
+                    let snr_score: f64 = r.get(9)?;
+                    let snr_synth: f64 = r.get::<_, Option<f64>>(10).ok().flatten().unwrap_or(snr_score);
+                    let rs_96: f64 = r.get::<_, Option<f64>>(11).ok().flatten().unwrap_or(0.0);
+                    let r_usdc_8: f64 = r.get::<_, Option<f64>>(12).ok().flatten().unwrap_or(0.0);
                     Ok(SignalEvaluation {
                         eval_id: Some(r.get(0)?),
                         timestamp_ms: r.get(1)?,
@@ -375,16 +448,16 @@ impl DatabaseManager {
                         prob_bull: r.get(6)?,
                         prob_bear: r.get(7)?,
                         prob_chop: r.get(8)?,
-                        snr_score: r.get(9)?,
-                        snr_synth: r.get(9)?,
-                        rs_96: 0.0,
-                        r_usdc_8: 0.0,
-                        mace_score: r.get(10)?,
-                        blended_conviction: r.get(11)?,
-                        rs_rank: r.get(12)?,
-                        signal_action: r.get(13)?,
-                        funding_rate_hourly: r.get(14)?,
-                        created_at: r.get(15)?,
+                        snr_score,
+                        snr_synth,
+                        rs_96,
+                        r_usdc_8,
+                        mace_score: r.get(13)?,
+                        blended_conviction: r.get(14)?,
+                        rs_rank: r.get(15)?,
+                        signal_action: r.get(16)?,
+                        funding_rate_hourly: r.get(17)?,
+                        created_at: r.get(18)?,
                     })
                 })
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -458,15 +531,136 @@ impl DatabaseManager {
         })
     }
 
+    /// Returns all active filled open PIT positions, excluding unfilled resting `OPEN_ON_BOOK` orders (`NH-4`).
     pub fn get_open_trades(&self) -> Result<Vec<TradeRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn
-                .prepare("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at ASC;")
+                .prepare(
+                    "SELECT * FROM trades
+                     WHERE status = 'OPEN'
+                       AND NOT (COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, quantity) <= 0.0)
+                     ORDER BY opened_at ASC;",
+                )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             let iter = stmt
                 .query_map([], Self::map_trade_row)
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(iter.flatten().collect())
+        })
+    }
+
+    /// Returns unfilled resting `OPEN_ON_BOOK` PIT orders awaiting exchange fill/cancel reconciliation (`NH-4`).
+    pub fn get_resting_pit_trades(&self) -> Result<Vec<TradeRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT * FROM trades
+                     WHERE status = 'PENDING'
+                        OR (status = 'OPEN' AND COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, 0.0) <= 0.0)
+                     ORDER BY opened_at ASC;",
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            let iter = stmt
+                .query_map([], Self::map_trade_row)
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(iter.flatten().collect())
+        })
+    }
+
+    /// Promote a resting `OPEN_ON_BOOK` order to an active `OPEN` / `FILLED` position once filled on exchange (`NH-4`).
+    pub fn promote_resting_trade_to_open(
+        &self,
+        trade_id: i64,
+        filled_units: f64,
+        avg_fill_price: f64,
+        fees_paid_usdc: f64,
+        slippage_paid_usd: f64,
+    ) -> Result<()> {
+        let notional = round_dp(filled_units * avg_fill_price, 4);
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE trades
+                 SET status = 'OPEN',
+                     fsm_state = 'FILLED',
+                     quantity = ?1,
+                     filled_units = ?1,
+                     entry_price = ?2,
+                     current_price = ?2,
+                     avg_fill_price = ?2,
+                     notional_usdc = ?3,
+                     highest_price_seen = MAX(highest_price_seen, ?2),
+                     lowest_price_seen = CASE WHEN lowest_price_seen > 0.0 THEN MIN(lowest_price_seen, ?2) ELSE ?2 END,
+                     fees_paid_usdc = ?4,
+                     slippage_paid_usd = ?5
+                 WHERE trade_id = ?6;",
+                params![
+                    filled_units,
+                    avg_fill_price,
+                    notional,
+                    fees_paid_usdc,
+                    slippage_paid_usd,
+                    trade_id
+                ],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Cancel an unfilled resting `OPEN_ON_BOOK` trade row (`NH-4`).
+    pub fn cancel_resting_trade(&self, trade_id: i64, reason: &str) -> Result<()> {
+        let closed_iso = aegis_core::format_ms_iso8601_utc(self.now_ms());
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE trades
+                 SET status = 'CANCELLED',
+                     fsm_state = 'CANCELLED',
+                     closed_at = ?1,
+                     exit_reason = ?2
+                 WHERE trade_id = ?3;",
+                params![closed_iso, reason, trade_id],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Reduce an open trade's quantity, notional, and risk budget on a partial live exit fill (`NH-8`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_open_trade_partial_exit(
+        &self,
+        trade_id: i64,
+        remaining_qty: f64,
+        remaining_notional: f64,
+        realized_pnl_delta: f64,
+        fees_delta: f64,
+        slippage_delta: f64,
+        mark_price: f64,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE trades
+                 SET quantity = ?1,
+                     filled_units = ?1,
+                     notional_usdc = ?2,
+                     risk_budget_usdc = ABS(entry_price - initial_stop_price) * ?1,
+                     realized_pnl_usdc = realized_pnl_usdc + ?3,
+                     fees_paid_usdc = fees_paid_usdc + ?4,
+                     slippage_paid_usd = COALESCE(slippage_paid_usd, 0.0) + ?5,
+                     current_price = CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END
+                 WHERE trade_id = ?7 AND status = 'OPEN';",
+                params![
+                    round_dp(remaining_qty, 8),
+                    round_dp(remaining_notional, 4),
+                    round_dp(realized_pnl_delta, 4),
+                    round_dp(fees_delta, 4),
+                    round_dp(slippage_delta, 4),
+                    mark_price,
+                    trade_id,
+                ],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
         })
     }
 
@@ -487,10 +681,32 @@ impl DatabaseManager {
         let cli_id = if trade.client_order_id.trim().is_empty() {
             format!("cli-{}", &Uuid::new_v4().simple().to_string()[..12])
         } else {
-            trade.client_order_id.clone()
+            trade.client_order_id.trim().to_string()
+        };
+        let opened_iso = if trade.opened_at.trim().is_empty() {
+            aegis_core::format_ms_iso8601_utc(self.now_ms())
+        } else {
+            aegis_core::normalize_timestamp_iso8601_utc(&trade.opened_at)
         };
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            if let Some(existing_id) = tx
+                .query_row(
+                    "SELECT trade_id FROM trades WHERE client_order_id = ?1 LIMIT 1;",
+                    params![cli_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+            {
+                tx.commit()
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+                return Ok(existing_id);
+            }
+
+            tx.execute(
                 "INSERT INTO trades (
                     client_order_id, symbol, base_asset, side, status, fsm_state,
                     entry_price, current_price, quantity, notional_usdc,
@@ -498,7 +714,8 @@ impl DatabaseManager {
                     initial_stop_price, chandelier_stop_price,
                     highest_price_seen, lowest_price_seen,
                     fees_paid_usdc, funding_accrued_usdc, unrealized_pnl_usdc,
-                    exchange_order_id, avg_fill_price, filled_units, slippage_paid_usd
+                    exchange_order_id, avg_fill_price, filled_units, slippage_paid_usd,
+                    opened_at
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10,
@@ -506,7 +723,8 @@ impl DatabaseManager {
                     ?13, ?14,
                     ?15, ?16,
                     ?17, ?18, ?19,
-                    ?20, ?21, ?22, ?23
+                    ?20, ?21, ?22, ?23,
+                    ?24
                 );",
                 params![
                     cli_id,
@@ -532,10 +750,14 @@ impl DatabaseManager {
                     trade.avg_fill_price,
                     trade.filled_units,
                     trade.slippage_paid_usd,
+                    opened_iso,
                 ],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(conn.last_insert_rowid())
+            let row_id = tx.last_insert_rowid();
+            tx.commit()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(row_id)
         })
     }
 
@@ -575,57 +797,92 @@ impl DatabaseManager {
         let target_fsm = OrderFsmState::parse(to_state)?;
         let ts = self.now_ms();
         self.with_conn(|conn| {
-            let existing: Option<(i64, String)> = conn
-                .query_row(
-                    "SELECT trade_id, COALESCE(fsm_state, 'PENDING')
-                     FROM trades
-                     WHERE client_order_id = ?1 OR exchange_order_id = ?1
-                     ORDER BY trade_id DESC LIMIT 1;",
-                    params![client_order_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
+            conn.execute_batch("BEGIN IMMEDIATE;")
                 .map_err(|e| AegisError::Database(e.to_string()))?;
+            let result = (|| -> Result<()> {
+                let existing: Option<(i64, String)> = conn
+                    .query_row(
+                        "SELECT trade_id, COALESCE(fsm_state, 'PENDING')
+                         FROM trades
+                         WHERE client_order_id = ?1 OR exchange_order_id = ?1
+                         ORDER BY trade_id DESC LIMIT 1;",
+                        params![client_order_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            let prior_state = from_state
-                .map(str::to_string)
-                .or_else(|| existing.as_ref().map(|(_, s)| s.clone()))
-                .unwrap_or_else(|| "PENDING".to_string());
+                let last_audit_state: Option<String> = conn
+                    .query_row(
+                        "SELECT to_state FROM order_state_audit
+                         WHERE client_order_id = ?1
+                         ORDER BY id DESC LIMIT 1;",
+                        params![client_order_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            if let Some((trade_id, _)) = existing {
+                let prior_state = from_state
+                    .map(str::to_string)
+                    .or_else(|| existing.as_ref().map(|(_, s)| s.clone()))
+                    .or(last_audit_state)
+                    .unwrap_or_else(|| "PENDING".to_string());
+
+                let prior_fsm = OrderFsmState::parse(&prior_state)?;
+                if !prior_fsm.can_transition_to(target_fsm) {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid OrderFsmState transition for '{client_order_id}': {prior_fsm} -> {target_fsm}"
+                    )));
+                }
+
+                if let Some((trade_id, _)) = existing {
+                    conn.execute(
+                        "UPDATE trades
+                         SET fsm_state = ?1,
+                             exchange_order_id = COALESCE(?2, exchange_order_id),
+                             avg_fill_price = COALESCE(?3, avg_fill_price),
+                             entry_price = COALESCE(?3, entry_price),
+                             current_price = COALESCE(?3, current_price),
+                             filled_units = COALESCE(?4, filled_units),
+                             slippage_paid_usd = COALESCE(?5, slippage_paid_usd),
+                             fees_paid_usdc = COALESCE(?6, fees_paid_usdc),
+                             status = COALESCE(?7, status)
+                         WHERE trade_id = ?8;",
+                        params![
+                            target_fsm.as_str(),
+                            exchange_order_id,
+                            avg_fill_price,
+                            filled_units,
+                            slippage_paid_usd,
+                            fees_paid_usdc,
+                            status,
+                            trade_id,
+                        ],
+                    )
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+                }
+
                 conn.execute(
-                    "UPDATE trades
-                     SET fsm_state = ?1,
-                         exchange_order_id = COALESCE(?2, exchange_order_id),
-                         avg_fill_price = COALESCE(?3, avg_fill_price),
-                         entry_price = COALESCE(?3, entry_price),
-                         current_price = COALESCE(?3, current_price),
-                         filled_units = COALESCE(?4, filled_units),
-                         slippage_paid_usd = COALESCE(?5, slippage_paid_usd),
-                         fees_paid_usdc = COALESCE(?6, fees_paid_usdc),
-                         status = COALESCE(?7, status)
-                     WHERE trade_id = ?8;",
-                    params![
-                        target_fsm.as_str(),
-                        exchange_order_id,
-                        avg_fill_price,
-                        filled_units,
-                        slippage_paid_usd,
-                        fees_paid_usdc,
-                        status,
-                        trade_id,
-                    ],
+                    "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5);",
+                    params![client_order_id, prior_fsm.as_str(), target_fsm.as_str(), ts, reason],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
-            }
+                Ok(())
+            })();
 
-            conn.execute(
-                "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5);",
-                params![client_order_id, prior_state, target_fsm.as_str(), ts, reason],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT;")
+                        .map_err(|e| AegisError::Database(e.to_string()))?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -716,7 +973,7 @@ impl DatabaseManager {
             let reset_trimmed = reset_at.trim().trim_matches('"');
             let pnl: f64 = if !reset_trimmed.is_empty() {
                 conn.query_row(
-                    "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM trades WHERE status = 'CLOSED' AND (closed_at IS NULL OR closed_at > ?1);",
+                    "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM trades WHERE status = 'CLOSED' AND (closed_at IS NULL OR datetime(closed_at) > datetime(?1));",
                     params![reset_trimmed],
                     |r| r.get(0),
                 )
@@ -895,9 +1152,9 @@ impl DatabaseManager {
     }
 
     /// Prune unbounded `telemetry_logs` and synthetic/Pond `market_ohlcv` rows according to
-    /// DB-configured retention settings (`R6`).
+    /// DB-configured retention settings (`R6`, `NL-10`).
     pub fn prune_retention_data(&self) -> Result<Value> {
-        let cfg = self.load_config_opts(false).unwrap_or_default();
+        let cfg = self.load_config_opts(false)?;
         let ohlcv_retention_days = cfg.get_i64("pond_ohlcv_retention_days", 90).max(7);
         let telemetry_retention_days = cfg.get_i64("telemetry_retention_days", 30).max(1);
         let telemetry_max_rows = cfg.get_i64("telemetry_max_rows", 100_000).max(1_000);
@@ -907,24 +1164,27 @@ impl DatabaseManager {
         let telemetry_cutoff_ms = now_ms - telemetry_retention_days * 86_400_000;
 
         self.with_conn(|conn| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
             // Preserve the core 7-asset Pit universe bars for full backtest history; prune old non-Pit Pond/synthetic bars
-            let ohlcv_deleted = conn
+            let ohlcv_deleted = tx
                 .execute(
                     "DELETE FROM market_ohlcv
                      WHERE timestamp_ms < ?1
                        AND symbol NOT IN (SELECT symbol FROM universe_assets WHERE is_active = 1);",
                     params![ohlcv_cutoff_ms],
                 )
-                .unwrap_or(0);
+                .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            let telemetry_age_deleted = conn
+            let telemetry_age_deleted = tx
                 .execute(
                     "DELETE FROM telemetry_logs WHERE timestamp_ms < ?1;",
                     params![telemetry_cutoff_ms],
                 )
-                .unwrap_or(0);
+                .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            let telemetry_cap_deleted = conn
+            let telemetry_cap_deleted = tx
                 .execute(
                     "DELETE FROM telemetry_logs
                      WHERE log_id NOT IN (
@@ -934,7 +1194,10 @@ impl DatabaseManager {
                      );",
                     params![telemetry_max_rows],
                 )
-                .unwrap_or(0);
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+
+            tx.commit()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
 
             Ok(json!({
                 "ohlcv_deleted": ohlcv_deleted,

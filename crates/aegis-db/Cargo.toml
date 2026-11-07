@@ -8,15 +8,13 @@ description = "Thread-safe SQLite WAL & :memory: manager with Fernet AES-128-CBC
 
 [dependencies]
 aegis-core.workspace = true
-anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-sha2.workspace = true
 hmac.workspace = true
+sha2.workspace = true
 aes.workspace = true
 cbc.workspace = true
 base64.workspace = true
@@ -24,7 +22,7 @@ rand.workspace = true
 zeroize.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
-clap.workspace = true
+
 
 [[bin]]
 name = "aegis-db-tool"

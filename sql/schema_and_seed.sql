@@ -269,7 +269,7 @@ CREATE TABLE IF NOT EXISTS trades (
     symbol TEXT NOT NULL,
     base_asset TEXT NOT NULL,
     side TEXT NOT NULL CHECK (side IN ('LONG', 'SHORT', 'BASIS_HARVEST')),
-    status TEXT NOT NULL CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED')) DEFAULT 'OPEN',
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'OPEN', 'CLOSED', 'CANCELLED')) DEFAULT 'OPEN',
     entry_price REAL NOT NULL,
     current_price REAL NOT NULL,
     exit_price REAL,
