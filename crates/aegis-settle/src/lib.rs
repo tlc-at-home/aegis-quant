@@ -302,6 +302,9 @@ impl SettleController {
                             } else {
                                 Some(res.tx_hash)
                             };
+                            if !overrides.dry_run && !res.transfer_mode.trim().is_empty() {
+                                transfer_mode_used = res.transfer_mode.trim().to_string();
+                            }
                             transfer_ok = true;
                             break;
                         }
@@ -434,6 +437,9 @@ impl SettleController {
                 Some(drift_bps_after.0),
                 blocked_remainder.0,
             )?;
+            if !transfer_mode_used.is_empty() {
+                let _ = self.db.update_book_transfer_mode(tid, &transfer_mode_used);
+            }
             tid
         } else {
             let transfer_row = BookTransfer {

@@ -120,7 +120,7 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..009_*.sql`)
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..010_*.sql`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -142,6 +142,9 @@ enum Commands {
         /// Read-only decrypt and print the existing `web_api_token` from `system_config` to stdout (WARNING: prints bearer secret in plaintext)
         #[arg(long)]
         show_web_token: bool,
+        /// Audit `book_transfers` for any ledger-counted `PARTIAL_IDLE_CAPPED` rows lacking a `DRY_RUN` marker (`R5-M2`)
+        #[arg(long)]
+        audit_dry_run_residue: bool,
     },
     /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
     Backtest {
@@ -243,7 +246,9 @@ pub struct AegisOrchestrator {
     pub pit: PitOrchestrator,
     pub pond: PondOrchestrator,
     pub cycle_count: usize,
+    pub last_pit_cycle_ms: Option<i64>,
     pub last_pond_scan_hour_bucket: Option<i64>,
+    pub last_pond_4h_bucket: Option<i64>,
 }
 
 impl AegisOrchestrator {
@@ -265,7 +270,9 @@ impl AegisOrchestrator {
             pit,
             pond,
             cycle_count: 0,
+            last_pit_cycle_ms: None,
             last_pond_scan_hour_bucket: None,
+            last_pond_4h_bucket: None,
         }
     }
 
@@ -385,36 +392,8 @@ impl AegisOrchestrator {
         let snapshot =
             self.execution
                 .reconcile_cycle_with_options(&evaluations, false, frozen)?;
-        let now_hour_bucket = self.db.now_ms() / 3_600_000;
-        let pond_summary = if self.last_pond_scan_hour_bucket != Some(now_hour_bucket) {
-            match self.pond.run_scan_cycle(now_hour_bucket % 4 == 0) {
-                Ok(summary) => {
-                    self.last_pond_scan_hour_bucket = Some(now_hour_bucket);
-                    Some(summary)
-                }
-                Err(e) => {
-                    tracing::error!("Hourly Pond scan cycle failed: {e}");
-                    let _ = self.db.log_telemetry(
-                        "ERROR",
-                        "pond.orchestrator",
-                        &format!("Hourly Pond scan cycle failed: {e}"),
-                        None,
-                    );
-                    None
-                }
-            }
-        } else {
-            if let Err(e) = self.pond.run_tick_15s() {
-                tracing::error!("Pond 15s tick failed: {e}");
-                let _ = self.db.log_telemetry(
-                    "ERROR",
-                    "pond.orchestrator",
-                    &format!("Pond 15s tick failed: {e}"),
-                    None,
-                );
-            }
-            None
-        };
+        self.last_pit_cycle_ms = Some(self.db.now_ms());
+        let pond_summary = self.run_pond_scheduled_step().ok().flatten();
         let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
         let pit_eq_now = self
             .pit
@@ -500,6 +479,136 @@ impl AegisOrchestrator {
 
         Ok(snapshot)
     }
+
+    /// Executes Book B (`POND`) scheduled step: hourly S-Cycle scan (with 4H close boundary flag)
+    /// when a new UTC hour or 4H bucket is entered, or `run_tick_15s()` otherwise (`R5-M3`, `R5-QB`).
+    pub fn run_pond_scheduled_step(&mut self) -> Result<Option<aegis_pond::PondCycleSummary>> {
+        let now_ms = self.db.now_ms();
+        let now_hour_bucket = now_ms / 3_600_000;
+        let now_4h_bucket = now_ms / 14_400_000;
+        let is_hourly_scan = self.last_pond_scan_hour_bucket != Some(now_hour_bucket);
+        let is_4h_close = self.last_pond_4h_bucket != Some(now_4h_bucket);
+        if is_hourly_scan || is_4h_close {
+            match self.pond.run_scan_cycle(is_4h_close) {
+                Ok(summary) => {
+                    self.last_pond_scan_hour_bucket = Some(now_hour_bucket);
+                    if is_4h_close {
+                        self.last_pond_4h_bucket = Some(now_4h_bucket);
+                    }
+                    Ok(Some(summary))
+                }
+                Err(e) => {
+                    tracing::error!("Hourly Pond scan cycle failed: {e}");
+                    let _ = self.db.log_telemetry(
+                        "ERROR",
+                        "pond.orchestrator",
+                        &format!("Hourly Pond scan cycle failed: {e}"),
+                        None,
+                    );
+                    Err(e)
+                }
+            }
+        } else {
+            if let Err(e) = self.pond.run_tick_15s() {
+                tracing::error!("Pond 15s tick failed: {e}");
+                let _ = self.db.log_telemetry(
+                    "ERROR",
+                    "pond.orchestrator",
+                    &format!("Pond 15s tick failed: {e}"),
+                    None,
+                );
+                return Err(e);
+            }
+            Ok(None)
+        }
+    }
+
+    /// Executes one scheduled daemon iteration for `book_mode` (`"pit"`, `"pond"`, or `"both"`)
+    /// inside a `std::panic::catch_unwind` fault-isolation boundary (`Invariant F6`) and returns
+    /// `(step_result, sleep_seconds)` dynamically resolved from `system_config` (`R5-M3`, `R5-QB`, `R5-N3`).
+    pub fn run_scheduled_daemon_step(
+        &mut self,
+        book_mode: &str,
+        fallback_lookback_bars: usize,
+    ) -> (Result<()>, u64) {
+        let cfg = self
+            .db
+            .load_config_or_log_default("aegis-cli.run_scheduled_daemon_step");
+        let cycle_bars = cfg
+            .get_i64("ingest_lookback_bars", fallback_lookback_bars as i64)
+            .clamp(60, 1500) as usize;
+        let pit_interval_sec = self
+            .pit
+            .load_pit_config()
+            .map(|c| c.pit_tick_interval_seconds)
+            .unwrap_or_else(|_| cfg.get_i64("pit_tick_interval_seconds", 900).max(1) as u64)
+            .max(1);
+        let pond_interval_sec = cfg.get_i64("pond_tick_interval_seconds", 15).max(1) as u64;
+        let poll_interval_sec = cfg.get_i64("polling_interval_seconds", 15).max(1) as u64;
+
+        let mode_norm = book_mode.trim().to_ascii_lowercase();
+        match mode_norm.as_str() {
+            "pit" => {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let r = self.pit.run_cycle(true, false).map(|_| ());
+                    if r.is_ok() {
+                        self.last_pit_cycle_ms = Some(self.db.now_ms());
+                    }
+                    r
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        "CRITICAL: Book A (PIT) cycle caught a panic via catch_unwind; isolating fault"
+                    );
+                    Err(AegisError::Execution(
+                        "Book A (PIT) cycle panicked; fault isolated".to_string(),
+                    ))
+                });
+                (res, pit_interval_sec)
+            }
+            "pond" => {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.run_pond_scheduled_step().map(|_| ())
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        "CRITICAL: Book B (POND) step caught a panic via catch_unwind; isolating fault"
+                    );
+                    Err(AegisError::Execution(
+                        "Book B (POND) step panicked; fault isolated".to_string(),
+                    ))
+                });
+                (res, pond_interval_sec)
+            }
+            _ => {
+                let now_ms = self.db.now_ms();
+                let pit_due = self
+                    .last_pit_cycle_ms
+                    .map(|last_ms| (now_ms - last_ms) >= (pit_interval_sec as i64) * 1000)
+                    .unwrap_or(true);
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if pit_due {
+                        self.run_single_cycle(cycle_bars).map(|_| ())
+                    } else {
+                        self.run_pond_scheduled_step().map(|_| ())
+                    }
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        "CRITICAL: Combined orchestrator step caught a panic via catch_unwind; isolating fault"
+                    );
+                    Err(AegisError::Execution(
+                        "Combined orchestrator step panicked; fault isolated".to_string(),
+                    ))
+                });
+                let sleep_sec = pond_interval_sec
+                    .min(poll_interval_sec)
+                    .min(pit_interval_sec)
+                    .max(1);
+                (res, sleep_sec)
+            }
+        }
+    }
 }
 
 /// 5-Gate Institutional Mainnet Go/No-Go Readiness Verifier (`scripts/check_mainnet_readiness.py`).
@@ -552,13 +661,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 9 {
+        status: if schema_ver >= 10 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 9 (migrations 001..009 applied)".to_string(),
+        requirement: "schema_version >= 10 (migrations 001..010 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -1095,7 +1204,32 @@ fn main() -> anyhow::Result<()> {
             new_key_file,
             generate_key,
             show_web_token,
+            audit_dry_run_residue,
         }) => {
+            if audit_dry_run_residue {
+                let rows = db.audit_suspect_dry_run_book_transfers()?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "suspect_partial_idle_capped_count": rows.len(),
+                            "rows": rows,
+                        }))?
+                    );
+                } else if rows.is_empty() {
+                    println!(
+                        "No suspect PARTIAL_IDLE_CAPPED dry-run residue rows found in book_transfers."
+                    );
+                } else {
+                    println!(
+                        "Found {} ledger-counted PARTIAL_IDLE_CAPPED row(s) without DRY_RUN marker:",
+                        rows.len()
+                    );
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                return Ok(());
+            }
             if show_web_token {
                 let token = db.get_existing_web_api_token()?.ok_or_else(|| {
                     AegisError::Validation(
@@ -1446,53 +1580,12 @@ fn run_orchestrator(
     }
 
     while running.load(Ordering::SeqCst) {
-        let cycle_bars = db
-            .load_config()
-            .map(|c| c.get_i64("ingest_lookback_bars", 140).clamp(60, 1500) as usize)
-            .unwrap_or(lookback_bars);
-        let res = match book_mode.as_str() {
-            "pit" => orchestrator.pit.run_cycle(true, false).map(|_| ()),
-            "pond" => {
-                let now_hour_bucket = db.now_ms() / 3_600_000;
-                if orchestrator.last_pond_scan_hour_bucket != Some(now_hour_bucket) {
-                    match orchestrator.pond.run_scan_cycle(now_hour_bucket % 4 == 0) {
-                        Ok(_) => {
-                            orchestrator.last_pond_scan_hour_bucket = Some(now_hour_bucket);
-                            Ok(())
-                        }
-                        Err(e) => {
-                            let _ = db.log_telemetry(
-                                "ERROR",
-                                "pond.orchestrator",
-                                &format!("Hourly Pond scan cycle failed: {e}"),
-                                None,
-                            );
-                            Err(e)
-                        }
-                    }
-                } else if let Err(e) = orchestrator.pond.run_tick_15s() {
-                    let _ = db.log_telemetry(
-                        "ERROR",
-                        "pond.orchestrator",
-                        &format!("Pond 15s tick failed: {e}"),
-                        None,
-                    );
-                    Err(e)
-                } else {
-                    Ok(())
-                }
-            }
-            _ => orchestrator.run_single_cycle(cycle_bars).map(|_| ()),
-        };
+        let (res, sleep_sec) = orchestrator.run_scheduled_daemon_step(&book_mode, lookback_bars);
         if let Err(e) = res {
             tracing::error!("Orchestrator cycle error ({book_mode}): {e}");
         }
-        let poll_sec = db
-            .load_config()
-            .map(|c| c.get_i64("polling_interval_seconds", 15).max(1) as u64)
-            .unwrap_or(15);
 
-        for _ in 0..poll_sec {
+        for _ in 0..sleep_sec {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
@@ -1659,7 +1752,7 @@ mod tests {
     async fn test_nq3_spawn_async_book_tasks_supervision() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        let orch = AegisOrchestrator::new(db);
+        let orch = AegisOrchestrator::new(db.clone());
         let (_tx, rx) = tokio::sync::watch::channel(true);
         let (pit_h, pond_h) = orch.spawn_async_book_tasks(rx);
         let pit_res = pit_h.await.unwrap();
@@ -1668,5 +1761,47 @@ mod tests {
         assert_eq!(pit_res["status"], "STOPPED");
         assert_eq!(pond_res["book_id"], "POND");
         assert_eq!(pond_res["status"], "STOPPED");
+
+        // R5-M3, R5-N3, R5-QB: Verify `run_scheduled_daemon_step` honours `pit_tick_interval_seconds`
+        // and `pond_tick_interval_seconds` across all three book modes and dynamically reloads config.
+        let mut daemon_orch = AegisOrchestrator::new(db.clone());
+        let (_r_pit, pit_sleep) = daemon_orch.run_scheduled_daemon_step("pit", 60);
+        assert_eq!(pit_sleep, 900);
+        let (_r_pond, pond_sleep) = daemon_orch.run_scheduled_daemon_step("pond", 60);
+        assert_eq!(pond_sleep, 15);
+
+        // Update pit_tick_interval_seconds to 300 and pond_tick_interval_seconds to 10 in DB
+        db.set_config_value("pit_tick_interval_seconds", &json!(300))
+            .unwrap();
+        db.set_config_value("pond_tick_interval_seconds", &json!(10))
+            .unwrap();
+        let (_r_pit2, pit_sleep2) = daemon_orch.run_scheduled_daemon_step("pit", 60);
+        assert_eq!(pit_sleep2, 300);
+        let (_r_pond2, pond_sleep2) = daemon_orch.run_scheduled_daemon_step("pond", 60);
+        assert_eq!(pond_sleep2, 10);
+
+        // In `--book both` mode, PIT runs on the first step (`cycle_count == 1`), is skipped on an
+        // immediate subsequent 10s tick before `pit_tick_interval_seconds` elapses (`cycle_count == 1`),
+        // and runs again once `last_pit_cycle_ms` is older than `pit_tick_interval_seconds` (`cycle_count == 2`).
+        daemon_orch.last_pit_cycle_ms = None;
+        let (r_both1, both_sleep1) = daemon_orch.run_scheduled_daemon_step("both", 60);
+        assert!(r_both1.is_ok());
+        assert_eq!(both_sleep1, 10);
+        assert_eq!(daemon_orch.cycle_count, 1);
+
+        let (r_both2, _both_sleep2) = daemon_orch.run_scheduled_daemon_step("both", 60);
+        assert!(r_both2.is_ok());
+        assert_eq!(
+            daemon_orch.cycle_count, 1,
+            "Immediate tick before pit_tick_interval_seconds must only run Pond 15s step (R5-M3)"
+        );
+
+        daemon_orch.last_pit_cycle_ms = Some(db.now_ms() - 301_000);
+        let (r_both3, _both_sleep3) = daemon_orch.run_scheduled_daemon_step("both", 60);
+        assert!(r_both3.is_ok());
+        assert_eq!(
+            daemon_orch.cycle_count, 2,
+            "Tick after pit_tick_interval_seconds elapsed must run full PIT cycle (R5-M3)"
+        );
     }
 }

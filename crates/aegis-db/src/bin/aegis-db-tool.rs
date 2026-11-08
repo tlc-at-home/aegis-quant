@@ -1,8 +1,9 @@
-//! Standalone SQLite WAL Schema v7 Migration & Verification CLI (`aegis-db-tool`).
+//! Standalone SQLite WAL Schema v10 Migration & Verification CLI (`aegis-db-tool`).
 //!
 //! Usage:
-//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/007_v030_round2_remediation.sql`
+//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/010_v030_round5_remediation.sql`
 
+use aegis_core::AegisError;
 use aegis_db::DatabaseManager;
 use serde_json::json;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ struct Args {
     force: bool,
     generate_key: bool,
     show_web_token: bool,
+    audit_dry_run_residue: bool,
 }
 
 fn parse_args() -> Args {
@@ -22,7 +24,7 @@ fn parse_args() -> Args {
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--db" => {
+            "--db" | "--db-path" => {
                 if let Some(val) = iter.next() {
                     args.db = Some(PathBuf::from(val));
                 }
@@ -36,6 +38,7 @@ fn parse_args() -> Args {
             "--force" => args.force = true,
             "--generate-key" => args.generate_key = true,
             "--show-web-token" => args.show_web_token = true,
+            "--audit-dry-run-residue" => args.audit_dry_run_residue = true,
             "--verify" => {}
             _ => {}
         }
@@ -55,8 +58,28 @@ fn main() -> aegis_core::Result<()> {
     };
 
     if args.show_web_token {
-        let token = db.get_or_create_web_api_token()?;
-        println!("{token}");
+        match db.get_existing_web_api_token()? {
+            Some(token) => {
+                println!("{token}");
+                return Ok(());
+            }
+            None => {
+                return Err(AegisError::NotFound(
+                    "No web_api_token configured in system_config.".to_string(),
+                ));
+            }
+        }
+    }
+
+    if args.audit_dry_run_residue {
+        let rows = db.audit_suspect_dry_run_book_transfers()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "suspect_partial_idle_capped_count": rows.len(),
+                "rows": rows,
+            }))?
+        );
         return Ok(());
     }
 

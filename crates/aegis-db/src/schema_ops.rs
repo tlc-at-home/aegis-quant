@@ -1,4 +1,4 @@
-//! SQLite schema initialization, idempotent migration runner (001..007),
+//! SQLite schema initialization, transactional idempotent migration runner (001..010),
 //! routing mode reconciliation, and database integrity verification.
 
 use crate::fernet::ensure_master_key_for_db;
@@ -9,6 +9,14 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
+/// Ordered list of SQLite schema migration files (`001..010`).
+///
+/// Invariant (`R5-M1`):
+/// 1. Each migration file is executed atomically inside a SQLite transaction
+///    (`execute_sql_transactional`), so migration scripts must not include
+///    non-transactional statements such as `VACUUM` or `PRAGMA journal_mode`.
+/// 2. Numbered migration files are treated as frozen once shipped; follow-up
+///    schema or data repairs must be placed in a new numbered migration file.
 pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/001_v020_config_expansion.sql",
     "sql/migrations/002_v020_order_fsm.sql",
@@ -19,9 +27,83 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/007_v030_round2_remediation.sql",
     "sql/migrations/008_v030_round3_remediation.sql",
     "sql/migrations/009_v030_round4_remediation.sql",
+    "sql/migrations/010_v030_round5_remediation.sql",
 ];
 
 impl DatabaseManager {
+    /// Repairs any half-completed table rebuilds left behind if a prior non-transactional
+    /// migration crashed mid-rebuild (`R5-M1`).
+    ///
+    /// Specifically handles the two crash windows of the v9 `book_transfers` table rebuild:
+    /// - Crash Window A (after `CREATE`/`INSERT INTO book_transfers_v9`, before `DROP TABLE book_transfers`):
+    ///   both `book_transfers` and `book_transfers_v9` exist -> drops the partial staging table `book_transfers_v9`.
+    /// - Crash Window B (after `DROP TABLE book_transfers`, before `ALTER TABLE book_transfers_v9 RENAME TO book_transfers`):
+    ///   only `book_transfers_v9` exists -> completes the rename to `book_transfers` and recreates `v_book_transfers_recent`.
+    pub(crate) fn repair_interrupted_table_rebuilds(conn: &Connection) -> Result<()> {
+        let has_main: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='book_transfers';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or(false);
+        let has_v9: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='book_transfers_v9';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+        if has_v9 && !has_main {
+            conn.execute_batch(
+                "ALTER TABLE book_transfers_v9 RENAME TO book_transfers;
+                 CREATE VIEW IF NOT EXISTS v_book_transfers_recent AS
+                 SELECT * FROM book_transfers ORDER BY transfer_id DESC LIMIT 30;",
+            )
+            .map_err(|e| AegisError::Database(format!("Failed to recover book_transfers_v9: {e}")))?;
+        } else if has_v9 && has_main {
+            conn.execute_batch("DROP TABLE IF EXISTS book_transfers_v9;")
+                .map_err(|e| {
+                    AegisError::Database(format!("Failed to drop stale book_transfers_v9: {e}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Execute a multi-statement migration script atomically inside a single SQLite transaction (`R5-M1`).
+    /// If any statement fails (other than idempotent `duplicate column name` on `ALTER TABLE ADD COLUMN`),
+    /// the entire migration script rolls back cleanly.
+    pub(crate) fn execute_sql_transactional(conn: &Connection, sql_script: &str) -> Result<()> {
+        Self::repair_interrupted_table_rebuilds(conn)?;
+        let began_tx = conn.is_autocommit();
+        if began_tx {
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .map_err(|e| AegisError::Database(format!("Failed to begin migration tx: {e}")))?;
+        }
+        match Self::execute_sql_idempotent(conn, sql_script) {
+            Ok(()) => {
+                if began_tx {
+                    conn.execute_batch("COMMIT;").map_err(|e| {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        AegisError::Database(format!("Failed to commit migration tx: {e}"))
+                    })?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if began_tx {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Execute multi-statement SQL idempotently, ignoring duplicate column errors on `ALTER TABLE`.
     pub(crate) fn execute_sql_idempotent(conn: &Connection, sql_script: &str) -> Result<()> {
         let mut buffer = Vec::new();
@@ -413,13 +495,13 @@ impl DatabaseManager {
                         let p = root.join(prereq);
                         if p.exists() {
                             if let Ok(s) = fs::read_to_string(&p) {
-                                Self::execute_sql_idempotent(conn, &s)?;
+                                Self::execute_sql_transactional(conn, &s)?;
                             }
                         }
                     }
                 }
             }
-            Self::execute_sql_idempotent(conn, &sql_script)?;
+            Self::execute_sql_transactional(conn, &sql_script)?;
 
             let has_mig_table: Option<String> = conn
                 .query_row(

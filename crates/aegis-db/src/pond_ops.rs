@@ -1000,7 +1000,7 @@ impl DatabaseManager {
                      drift_bps_after = COALESCE(?5, drift_bps_after),
                      tx_ref = COALESCE(?6, tx_ref),
                      blocked_remainder_usdc = ?7,
-                     transfer_mode = COALESCE(NULLIF(transfer_mode, ''), ?8, 'LIVE')
+                     transfer_mode = COALESCE(?8, NULLIF(transfer_mode, ''), 'LIVE')
                  WHERE transfer_id = ?9;",
                 params![
                     target_status.as_str(),
@@ -1013,6 +1013,22 @@ impl DatabaseManager {
                     mode_override,
                     transfer_id,
                 ],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Updates `transfer_mode` on an existing `book_transfers` row (`R5-M2`).
+    pub fn update_book_transfer_mode(&self, transfer_id: i64, transfer_mode: &str) -> Result<()> {
+        let trimmed = transfer_mode.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE book_transfers SET transfer_mode = ?1 WHERE transfer_id = ?2;",
+                params![trimmed, transfer_id],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(())
@@ -1292,6 +1308,50 @@ impl DatabaseManager {
             None,
         );
         Ok(stranded)
+    }
+
+    /// Audits `book_transfers` for any `PARTIAL_IDLE_CAPPED` rows that lack a `DRY_RUN%`
+    /// `transfer_mode` or `dryrun-` `tx_ref` prefix (`R5-M2`) so operators can inspect
+    /// ledger-counted partial rows before the first live settle.
+    pub fn audit_suspect_dry_run_book_transfers(&self) -> Result<Vec<BookTransfer>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT transfer_id, settle_date, from_book, to_book, amount_usdc,
+                            pre_from_usdc, pre_to_usdc, post_from_usdc, post_to_usdc,
+                            drift_bps_before, drift_bps_after, blocked_remainder_usdc,
+                            status, attempts, tx_ref, created_at
+                     FROM book_transfers
+                     WHERE status = 'PARTIAL_IDLE_CAPPED'
+                       AND UPPER(COALESCE(transfer_mode, '')) NOT LIKE 'DRY_RUN%'
+                       AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%'
+                     ORDER BY transfer_id DESC;",
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            let iter = stmt
+                .query_map([], |r| {
+                    Ok(BookTransfer {
+                        transfer_id: r.get(0)?,
+                        settle_date: r.get(1)?,
+                        from_book: r.get(2)?,
+                        to_book: r.get(3)?,
+                        amount_usdc: r.get(4)?,
+                        pre_from_usdc: r.get(5)?,
+                        pre_to_usdc: r.get(6)?,
+                        post_from_usdc: r.get(7)?,
+                        post_to_usdc: r.get(8)?,
+                        drift_bps_before: r.get(9)?,
+                        drift_bps_after: r.get(10)?,
+                        blocked_remainder_usdc: r.get(11)?,
+                        status: r.get(12)?,
+                        attempts: r.get(13)?,
+                        tx_ref: r.get(14)?,
+                        created_at: r.get(15)?,
+                    })
+                })
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(iter.flatten().collect())
+        })
     }
 
     pub fn get_recent_book_transfers(&self, limit: usize) -> Result<Vec<BookTransfer>> {

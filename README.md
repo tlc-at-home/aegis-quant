@@ -8,7 +8,7 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
 
 1. **Workspace Layout (`crates/*`)**:
    - `aegis-core`: Shared domain types (`BookId`, `Side`, `HmmRegime`, `SignalAction`, `PondCellState`, `BookTransferStatus`, `OhlcvBar`, `Usdc`, `Price`, `Quantity`, `Leverage`, `Bps`), telemetry secret redaction (`sanitize_telemetry_message`, `sanitize_telemetry_details`), timeframe validators, and financial math (`calculate_sharpe_sortino_calmar`, `compute_chandelier_stop`, `round_step`, `accrue_chop_basis_harvest_4h`).
-   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), schema version v9 auto-migration (`001..009`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
+   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), transactional schema version v10 auto-migration (`001..010`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
    - `aegis-signals`: 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, and Continuous Signal-to-Noise Ratio (SNR) ensemble.
    - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and correlation cluster limits.
    - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `reconcile`), live mark-to-market synchronization, and config validator.
@@ -25,25 +25,29 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
 
 ## Quick Start
 
-### 1. Build Release Binaries
+### 1. Build & Test Workspace
 
 ```bash
 cargo build --release --workspace
+cargo test --workspace
 ```
 
-### 2. Initialize / Migrate SQLite Database (Schema v9)
+> **Note on Test Suite Execution Counts (`R5-N1`)**: The workspace defines and executes `95` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 4 unit + 5 `test_firewall_ast` integration, `aegis-core`: 8, `aegis-db`: 16, `aegis-execution`: 14, `aegis-pit`: 3, `aegis-pond`: 10, `aegis-risk`: 3, `aegis-settle`: 10, `aegis-signals`: 7, `aegis-telemetry`: 2, `aegis-web`: 8).
+
+### 2. Initialize / Migrate SQLite Database (Schema v10)
 
 Both `--db <PATH>` and `--db-path <PATH>` are accepted globally across all subcommands (built binaries are output to `./target/release/aegis-quant` and installed to `./bin/aegis-quant`):
 
 ```bash
 ./target/release/aegis-quant --db data/aegis_quant.db db --init
 ./target/release/aegis-quant --db data/aegis_quant.db db --migrate
+./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
 ./target/release/aegis-quant --db data/aegis_quant.db db --show-web-token
 ```
 
 > **Security Note (`--show-web-token`)**: `db --show-web-token` is strictly read-only (`R4-N8`)—it never creates or mutates database rows or keys, and prints the decrypted `web_api_token` bearer secret to `stdout`. Do not run it in shared terminals or unredacted CI logs.
 
-Incremental SQL migrations are stored under `sql/migrations/`:
+Incremental SQL migrations are stored under `sql/migrations/` and are executed atomically inside a SQLite transaction (`R5-M1`):
 - `sql/migrations/001_v020_config_expansion.sql`
 - `sql/migrations/002_v020_order_fsm.sql`
 - `sql/migrations/003_v020_schema_versioning.sql`
@@ -53,6 +57,7 @@ Incremental SQL migrations are stored under `sql/migrations/`:
 - `sql/migrations/007_v030_round2_remediation.sql`
 - `sql/migrations/008_v030_round3_remediation.sql`
 - `sql/migrations/009_v030_round4_remediation.sql`
+- `sql/migrations/010_v030_round5_remediation.sql`
 
 ### 3. Run the 4-Page Web Dashboard & Dual-Book Background Daemons
 
@@ -86,12 +91,32 @@ Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashb
 
 ### 5. Operational Cadence & Cross-Book Settling Runbook
 
-- **Loop Cadence Keys (`system_config`)**:
-  - `polling_interval_seconds` (default `15`): Top-level synchronous orchestrator loop sleep cadence.
-  - `pit_tick_interval_seconds` (default `900`): Background Tokio task interval for Book A (`PitOrchestrator`).
-  - `pond_tick_interval_seconds` (default `15`): Background Tokio task interval for Book B (`PondOrchestrator` 15s Tier 1 wick-stop evaluation).
+- **Loop Cadence Keys (`system_config`, `R5-M3`, `R5-QB`)**:
+  - `pit_tick_interval_seconds` (default `900`): Book A (`PitOrchestrator`) evaluation cadence. In `--book pit` mode (`aegis-pit.service`), the daemon sleeps for `pit_tick_interval_seconds` between cycles and reloads the key from `system_config` on every tick (`R5-N3`). In `--book both` mode (`aegis-quant.service`), full Book A cycles (`ingest_universe` + `evaluate_universe` + `reconcile_cycle_with_options`) execute on Cycle #1 and whenever `pit_tick_interval_seconds` has elapsed since `last_pit_cycle_ms`.
+  - `pond_tick_interval_seconds` (default `15`): Book B (`PondOrchestrator`) 15s Tier 1 wick-stop and resting-order evaluation cadence (with hourly S-Cycle scans on UTC hour boundaries and 4H close ratchets on 4H boundaries). Reloaded dynamically on every tick.
+  - `polling_interval_seconds` (default `15`): Top-level wake cadence ceiling in `--book both` mode (`sleep_sec = min(pond_tick_interval_seconds, polling_interval_seconds, pit_tick_interval_seconds)`).
 - **Cross-Book Transfer Quarantine (`PARTIAL` / `AMBIGUOUS`)**:
   - Only `COMPLETED`, `CONFIRMED`, and live `PARTIAL_IDLE_CAPPED` rows in `book_transfers` are credited in virtual book equity (`BookTransferStatus::is_ledger_counted()`).
   - If a 2-leg subaccount transfer fails after Leg 1 (`attempts = 1`), it transitions to `PARTIAL` (USDC stranded in master wallet). If an L1 transfer times out post-broadcast (`POST_SEND_UNCERTAIN`), it transitions to `AMBIGUOUS`. Both states emit a throttled critical alert (`STRANDED_BOOK_TRANSFER`) until reconciled by an operator.
-  - To reset book equity baselines after a deposit/withdrawal or manual L1 reconciliation, update `equity_baseline_reset_at` in `system_config` to the current ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
-
+- **Pre-Live Dry-Run Residue Audit & Remediation (`R5-M2`)**:
+  - Before executing the first live settle on a database upgraded from pre-v8 builds, audit `book_transfers` for any historical `PARTIAL_IDLE_CAPPED` rows that lack a `DRY_RUN` marker:
+    ```bash
+    ./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
+    ```
+    Or run the SQL detection query directly:
+    ```sql
+    SELECT transfer_id, settle_date, amount_usdc, tx_ref, transfer_mode, created_at
+    FROM book_transfers
+    WHERE status = 'PARTIAL_IDLE_CAPPED'
+      AND UPPER(COALESCE(transfer_mode, '')) NOT LIKE 'DRY_RUN%'
+      AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%';
+    ```
+  - If any historical dry-run rows remain from pre-v8 test windows, remediate using either:
+    1. **Timestamp-Window Reclassification**: Set `dry_run_reclassify_before_utc` in `system_config` to the ISO-8601 UTC cutoff timestamp before running `db --migrate`, or reclassify the known dry-run window directly:
+       ```sql
+       UPDATE book_transfers
+       SET status = 'DRY_RUN', transfer_mode = 'DRY_RUN_RECLASSIFIED'
+       WHERE status = 'PARTIAL_IDLE_CAPPED'
+         AND datetime(created_at) <= datetime('2026-11-08T00:00:00Z');
+       ```
+    2. **One-Step Ledger Baseline Reset**: Set `equity_baseline_reset_at` in `system_config` to the current ISO-8601 UTC upgrade timestamp (`YYYY-MM-DDTHH:MM:SSZ`), which rebases both books' ledgers and zeroes any prior historical transfer or PnL distortion in a single step.

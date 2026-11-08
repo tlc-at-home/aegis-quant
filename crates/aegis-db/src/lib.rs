@@ -1250,7 +1250,7 @@ mod tests {
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 9);
+        assert_eq!(db.get_schema_version().unwrap(), 10);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1481,6 +1481,164 @@ mod tests {
             .unwrap();
         assert_eq!(rec_hist.status, "DRY_RUN");
         assert!((db.get_net_book_transfer_adjustment("PIT").unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_r5_m1_m2_n2_transactional_migration_crash_recovery_and_paper_dry_run_reclassification() {
+        use rusqlite::OptionalExtension;
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 10);
+
+        // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
+        db.with_conn(|conn| {
+            let failing_script = "
+                CREATE TABLE r5_temp_test (id INTEGER PRIMARY KEY);
+                INSERT INTO r5_temp_test (id) VALUES (1);
+                SELECT * FROM non_existent_table_that_forces_rollback;
+            ";
+            assert!(DatabaseManager::execute_sql_transactional(conn, failing_script).is_err());
+            let table_exists: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='r5_temp_test';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert!(
+                table_exists.is_none(),
+                "Transactional migration runner must roll back all DDL/DML on error (R5-M1)"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // 2. R5-M1: Pre-migration crash recovery for both v9 table-rebuild crash windows
+        db.with_conn(|conn| {
+            // Crash Window A: both `book_transfers` and `book_transfers_v9` exist
+            conn.execute_batch("CREATE TABLE book_transfers_v9 (transfer_id INTEGER PRIMARY KEY);")
+                .unwrap();
+            DatabaseManager::repair_interrupted_table_rebuilds(conn).unwrap();
+            let v9_after_a: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='book_transfers_v9';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert!(v9_after_a.is_none());
+
+            // Crash Window B: `book_transfers` was dropped before `book_transfers_v9` was renamed
+            conn.execute_batch(
+                "DROP VIEW IF EXISTS v_book_transfers_recent;
+                 ALTER TABLE book_transfers RENAME TO book_transfers_v9;",
+            )
+            .unwrap();
+            DatabaseManager::repair_interrupted_table_rebuilds(conn).unwrap();
+            let main_after_b: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='book_transfers';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(main_after_b.as_deref(), Some("book_transfers"));
+            Ok(())
+        })
+        .unwrap();
+
+        // 3. R5-M2 & R5-N2: Round-2-era PAPER-mode `PARTIAL_IDLE_CAPPED` row with plain `0x...` tx_ref
+        // is detected by `audit_suspect_dry_run_book_transfers` and reclassified to `DRY_RUN` by migration 010,
+        // and open trades with `last_funding_hour_bucket = 0` are backfilled to the current UTC hour bucket.
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        let paper_hist_id = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-06T00:05:00Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 325.0,
+                    pre_from_usdc: Some(5500.0),
+                    pre_to_usdc: Some(4500.0),
+                    post_from_usdc: Some(5175.0),
+                    post_to_usdc: Some(4825.0),
+                    drift_bps_before: Some(500.0),
+                    drift_bps_after: Some(175.0),
+                    blocked_remainder_usdc: 175.0,
+                    status: "PARTIAL_IDLE_CAPPED".to_string(),
+                    attempts: 1,
+                    tx_ref: Some(
+                        "0x111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000"
+                            .to_string(),
+                    ),
+                    created_at: "2026-11-06T00:05:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        let suspect_before = db.audit_suspect_dry_run_book_transfers().unwrap();
+        assert_eq!(suspect_before.len(), 1);
+        assert_eq!(suspect_before[0].transfer_id, paper_hist_id);
+
+        // Also insert an OPEN trade whose `last_funding_hour_bucket` is 0 (simulating a pre-v10 open trade)
+        let trade = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "r5-n2-open-trade".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 90_000.0,
+            current_price: 90_100.0,
+            exit_price: None,
+            quantity: 0.1,
+            filled_units: 0.1,
+            avg_fill_price: Some(90_000.0),
+            notional_usdc: 9_000.0,
+            risk_budget_usdc: 50.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 88_000.0,
+            chandelier_stop_price: 88_500.0,
+            current_stop_price: 88_500.0,
+            highest_price_seen: 90_100.0,
+            lowest_price_seen: 90_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 10.0,
+            fees_paid_usdc: 1.0,
+            funding_accrued_usdc: 2.5,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("sim-r5-n2".to_string()),
+            opened_at: "2026-11-06T00:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let tid = db.insert_trade(&trade).unwrap();
+
+        // Apply migration 010 transactionally
+        db.apply_migration("sql/migrations/010_v030_round5_remediation.sql")
+            .unwrap();
+
+        let suspect_after = db.audit_suspect_dry_run_book_transfers().unwrap();
+        assert!(
+            suspect_after.is_empty(),
+            "Migration 010 must reclassify Round-2-era PAPER-mode PARTIAL_IDLE_CAPPED dry-run rows (R5-M2)"
+        );
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap()).abs() < 1e-9);
+
+        // R5-N2: Because migration 010 backfilled `last_funding_hour_bucket` to the current UTC hour bucket,
+        // attempting to accrue the current UTC hour again must be a no-op!
+        let cur_hour_bucket = db.now_ms() / 3_600_000;
+        assert!(
+            !db.accrue_trade_funding_for_hour(tid, cur_hour_bucket, 90_100.0, 10.0, -1.0)
+                .unwrap(),
+            "Open trade backfilled by migration 010 must not double-accrue the current hour bucket (R5-N2)"
+        );
     }
 }
 

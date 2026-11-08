@@ -172,15 +172,13 @@ pub fn spawn_pit_task(
                 }
             }
 
-            let sleep_sec = if interval_sec == 0 || interval_sec >= 60 {
-                orchestrator
-                    .load_pit_config()
-                    .map(|c| c.pit_tick_interval_seconds)
-                    .unwrap_or_else(|_| interval_sec.max(1))
-                    .max(1)
-            } else {
-                interval_sec.max(1)
-            };
+            // R5-N3: Always reload `pit_tick_interval_seconds` from `system_config` on every tick,
+            // falling back to `interval_sec.max(1)` only if the DB config read fails.
+            let sleep_sec = orchestrator
+                .load_pit_config()
+                .map(|c| c.pit_tick_interval_seconds)
+                .unwrap_or_else(|_| interval_sec.max(1))
+                .max(1);
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(sleep_sec)) => {}

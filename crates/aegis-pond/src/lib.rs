@@ -974,8 +974,14 @@ pub fn spawn_pond_task(
                 }
             }
 
+            let sleep_sec = orchestrator
+                .load_pond_config()
+                .map(|c| c.pond_tick_interval_seconds)
+                .unwrap_or_else(|_| tick_interval_sec.max(1))
+                .max(1);
+
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(tick_interval_sec.max(1))) => {}
+                _ = tokio::time::sleep(Duration::from_secs(sleep_sec)) => {}
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;

@@ -143,14 +143,18 @@ impl Usdc {
     pub const ZERO: Self = Self(0.0);
 
     #[inline]
-    pub const fn new(val: f64) -> Self {
-        Self(val)
+    pub fn new(val: f64) -> Self {
+        if val.is_finite() {
+            Self(round_dp(val, 4))
+        } else {
+            Self(0.0)
+        }
     }
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
         if val.is_finite() && val > 0.0 {
-            Self(val)
+            Self(round_dp(val, 4))
         } else {
             Self(0.0)
         }
@@ -211,7 +215,7 @@ impl std::ops::Add for Usdc {
     type Output = Self;
     #[inline]
     fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0 + rhs.0)
+        Self::new(self.0 + rhs.0)
     }
 }
 
@@ -219,21 +223,21 @@ impl std::ops::Sub for Usdc {
     type Output = Self;
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0 - rhs.0)
+        Self::new(self.0 - rhs.0)
     }
 }
 
 impl std::ops::AddAssign for Usdc {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
+        *self = Self::new(self.0 + rhs.0);
     }
 }
 
 impl std::ops::SubAssign for Usdc {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
+        *self = Self::new(self.0 - rhs.0);
     }
 }
 
@@ -241,7 +245,7 @@ impl std::ops::Mul<f64> for Usdc {
     type Output = Self;
     #[inline]
     fn mul(self, rhs: f64) -> Self::Output {
-        Self(self.0 * rhs)
+        Self::new(self.0 * rhs)
     }
 }
 
@@ -249,19 +253,23 @@ impl std::ops::Div<f64> for Usdc {
     type Output = Self;
     #[inline]
     fn div(self, rhs: f64) -> Self::Output {
-        Self(self.0 / rhs)
+        if rhs.is_finite() && rhs.abs() > 0.0 {
+            Self::new(self.0 / rhs)
+        } else {
+            Self::ZERO
+        }
     }
 }
 
 impl std::iter::Sum for Usdc {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        Self(iter.map(|u| u.0).sum())
+        Self::new(iter.map(|u| u.0).sum())
     }
 }
 
 impl From<f64> for Usdc {
     fn from(v: f64) -> Self {
-        Self(v)
+        Self::new(v)
     }
 }
 
@@ -280,8 +288,12 @@ impl Price {
     pub const ZERO: Self = Self(0.0);
 
     #[inline]
-    pub const fn new(val: f64) -> Self {
-        Self(val)
+    pub fn new(val: f64) -> Self {
+        if val.is_finite() {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
     }
 
     #[inline]
@@ -326,7 +338,7 @@ impl Price {
 
 impl From<f64> for Price {
     fn from(v: f64) -> Self {
-        Self(v)
+        Self::new(v)
     }
 }
 
@@ -361,8 +373,12 @@ impl Quantity {
     pub const ZERO: Self = Self(0.0);
 
     #[inline]
-    pub const fn new(val: f64) -> Self {
-        Self(val)
+    pub fn new(val: f64) -> Self {
+        if val.is_finite() {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
     }
 
     #[inline]
@@ -421,7 +437,7 @@ impl Quantity {
 
 impl From<f64> for Quantity {
     fn from(v: f64) -> Self {
-        Self(v)
+        Self::new(v)
     }
 }
 
@@ -440,8 +456,12 @@ impl Leverage {
     pub const ZERO: Self = Self(0.0);
 
     #[inline]
-    pub const fn new(val: f64) -> Self {
-        Self(val)
+    pub fn new(val: f64) -> Self {
+        if val.is_finite() {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
     }
 
     #[inline]
@@ -468,8 +488,12 @@ impl Bps {
     pub const ZERO: Self = Self(0.0);
 
     #[inline]
-    pub const fn new(val: f64) -> Self {
-        Self(val)
+    pub fn new(val: f64) -> Self {
+        if val.is_finite() {
+            Self(val)
+        } else {
+            Self(0.0)
+        }
     }
 
     #[inline]
@@ -2598,6 +2622,35 @@ mod tests {
         assert!(parse_timeframe_seconds("7h").is_err());
         assert_eq!(validate_timeframe_csv("1h, 2h, 4H").unwrap(), "1h,2h,4h");
         assert!(validate_timeframe_csv("1h,invalid").is_err());
+    }
+
+    #[test]
+    fn test_r5_qa_usdc_price_quantity_finiteness_and_rounding() {
+        // Finiteness guards on Usdc::new, Price::new, Quantity::new
+        assert_eq!(Usdc::new(f64::NAN), Usdc::ZERO);
+        assert_eq!(Usdc::new(f64::INFINITY), Usdc::ZERO);
+        assert_eq!(Usdc::new(f64::NEG_INFINITY), Usdc::ZERO);
+        assert_eq!(Price::new(f64::NAN), Price::ZERO);
+        assert_eq!(Price::new(f64::INFINITY), Price::ZERO);
+        assert_eq!(Quantity::new(f64::NAN), Quantity::ZERO);
+        assert_eq!(Quantity::new(f64::NEG_INFINITY), Quantity::ZERO);
+
+        // 4-decimal rounding in Usdc::new, Add, Sub, AddAssign, SubAssign, Mul, Div
+        let a = Usdc::new(0.1);
+        let b = Usdc::new(0.2);
+        let sum = a + b;
+        assert_eq!(sum.as_f64(), 0.3);
+        let diff = sum - Usdc::new(0.1);
+        assert_eq!(diff.as_f64(), 0.2);
+
+        let mut acc = Usdc::new(100.123456);
+        assert_eq!(acc.as_f64(), 100.1235);
+        acc += Usdc::new(0.000049);
+        assert_eq!(acc.as_f64(), 100.1235);
+        acc -= Usdc::new(0.1235);
+        assert_eq!(acc.as_f64(), 100.0);
+        assert_eq!((acc / 0.0).as_f64(), 0.0);
+        assert_eq!((acc / f64::NAN).as_f64(), 0.0);
     }
 }
 

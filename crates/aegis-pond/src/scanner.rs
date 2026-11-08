@@ -7,8 +7,8 @@
 //! - Ranks qualifying candidates by `premium_score` and sizes up to 3 new cells per cycle.
 
 use aegis_core::{
-    compute_atr_from_bars, compute_ema, compute_trailing_z_score, round_dp, round_step, OhlcvBar,
-    OptionAnalogue, PondDirectionPolicy, PondSide, PondUniverseRow,
+    compute_atr_from_bars, compute_ema, compute_trailing_z_score, round_dp, Leverage, OhlcvBar,
+    OptionAnalogue, PondDirectionPolicy, PondSide, PondUniverseRow, Price, Quantity, Usdc,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -341,9 +341,15 @@ pub fn run_nps01_scan(
     let candidates_passed_gates = raw_candidates.len();
     let mut selected_entries = Vec::new();
     let mut open_cells = params.current_open_cells;
-    let mut open_heat = params.current_open_heat_usdc;
-    let mut deployed_notional = params.current_deployed_notional_usdc;
-    let max_total_notional = params.pond_equity_usdc.max(1.0) * params.max_gross_leverage;
+    let mut open_heat = Usdc::new_clamped(params.current_open_heat_usdc);
+    let mut deployed_notional = Usdc::new_clamped(params.current_deployed_notional_usdc);
+    let pond_equity = Usdc::new_clamped(params.pond_equity_usdc.max(1.0));
+    let max_gross_lev = Leverage::new_clamped(params.max_gross_leverage);
+    let max_total_notional = pond_equity * max_gross_lev.as_f64();
+    let max_open_heat = Usdc::new_clamped(params.max_open_heat_usdc);
+    let min_cell_risk = Usdc::new_clamped(params.min_cell_risk_usdc);
+    let max_cell_risk = Usdc::new_clamped(params.max_cell_risk_usdc);
+    let max_cell_notional = Usdc::new_clamped(params.max_cell_notional_usdc);
 
     for (item, eval) in raw_candidates {
         let GateEvaluationOutcome {
@@ -358,7 +364,7 @@ pub fn run_nps01_scan(
         if selected_entries.len() >= params.max_entries_per_cycle {
             break;
         }
-        // Gate 7: Book B Portfolio Risk Gate
+        // Gate 7: Book B Portfolio Risk Gate (`R5-QA` typed Usdc/Price/Quantity sizing boundary)
         if open_cells >= params.max_concurrent_cells {
             rejections.push((
                 item.universe_row.symbol.clone(),
@@ -366,16 +372,16 @@ pub fn run_nps01_scan(
             ));
             continue;
         }
-        let remaining_heat = params.max_open_heat_usdc - open_heat;
-        if remaining_heat < params.min_cell_risk_usdc {
+        let remaining_heat = max_open_heat.saturating_sub(open_heat);
+        if remaining_heat < min_cell_risk {
             rejections.push((
                 item.universe_row.symbol.clone(),
                 "GATE7_MAX_OPEN_HEAT".to_string(),
             ));
             continue;
         }
-        let min_notional = item.universe_row.min_notional_usdc.max(10.0);
-        let remaining_notional_cap = (max_total_notional - deployed_notional).max(0.0);
+        let min_notional = Usdc::new_clamped(item.universe_row.min_notional_usdc.max(10.0));
+        let remaining_notional_cap = max_total_notional.saturating_sub(deployed_notional);
         if remaining_notional_cap < min_notional {
             rejections.push((
                 item.universe_row.symbol.clone(),
@@ -387,9 +393,11 @@ pub fn run_nps01_scan(
         let Some(last_1h) = item.bars_1h.last() else {
             continue;
         };
-        let ref_px = last_1h.close;
-        let stop_distance = (params.initial_stop_atr_mult * atr_1h)
-            .max(ref_px * params.min_stop_pct_floor.max(0.0001));
+        let ref_px = Price::new_clamped(last_1h.close);
+        let stop_distance = Price::new_clamped(
+            (params.initial_stop_atr_mult * atr_1h)
+                .max(ref_px.as_f64() * params.min_stop_pct_floor.max(0.0001)),
+        );
 
         // Conviction-scaled cell risk budget [conviction_scale_min, conviction_scale_max] of baseline risk
         let conviction_scale = ((z_t.abs() - params.z_entry_threshold)
@@ -400,15 +408,17 @@ pub fn run_nps01_scan(
                 + conviction_scale * (params.conviction_scale_max - params.conviction_scale_min),
             4,
         );
-        let desired_risk = params.min_cell_risk_usdc
-            + (params.max_cell_risk_usdc - params.min_cell_risk_usdc) * conviction_scale;
-        let risk_budget = round_dp(desired_risk.min(remaining_heat), 2);
+        let desired_risk =
+            min_cell_risk + (max_cell_risk.saturating_sub(min_cell_risk)) * conviction_scale;
+        let risk_budget = desired_risk.min(remaining_heat).round_cents();
 
-        let raw_units = risk_budget / stop_distance;
-        let max_notional_for_cell = params.max_cell_notional_usdc.min(remaining_notional_cap);
-        let capped_units = raw_units.min(max_notional_for_cell / ref_px.max(1e-8));
-        let qty = round_step(capped_units, item.lot_step_size.max(1e-6), true);
-        if qty <= 0.0 {
+        let raw_units = Quantity::new_clamped(risk_budget.as_f64() / stop_distance.as_f64().max(1e-8));
+        let max_notional_for_cell = max_cell_notional.min(remaining_notional_cap);
+        let max_units_by_notional =
+            Quantity::new_clamped(max_notional_for_cell.as_f64() / ref_px.as_f64().max(1e-8));
+        let capped_units = raw_units.min(max_units_by_notional);
+        let qty = capped_units.round_step(item.lot_step_size.max(1e-6), true);
+        if qty.as_f64() <= 0.0 {
             rejections.push((
                 item.universe_row.symbol.clone(),
                 "GATE7_ZERO_ROUNDED_UNITS".to_string(),
@@ -416,7 +426,7 @@ pub fn run_nps01_scan(
             continue;
         }
 
-        let notional = round_dp(qty * ref_px, 2);
+        let notional = qty.notional_at(ref_px).round_cents();
         if notional < min_notional {
             rejections.push((
                 item.universe_row.symbol.clone(),
@@ -424,8 +434,8 @@ pub fn run_nps01_scan(
             ));
             continue;
         }
-        let actual_risk = round_dp(qty * stop_distance, 2);
-        if actual_risk < params.min_cell_risk_usdc * 0.5 {
+        let actual_risk = qty.notional_at(stop_distance).round_cents();
+        if actual_risk < min_cell_risk * 0.5 {
             rejections.push((
                 item.universe_row.symbol.clone(),
                 "GATE7_BELOW_MIN_CELL_RISK".to_string(),
@@ -436,18 +446,18 @@ pub fn run_nps01_scan(
 
         let (initial_stop, chandelier_stop) = match side {
             PondSide::Long => (
-                round_dp((ref_px - stop_distance).max(1e-8), 8),
+                round_dp((ref_px.as_f64() - stop_distance.as_f64()).max(1e-8), 8),
                 round_dp((last_1h.high - chandelier_dist).max(1e-8), 8),
             ),
             PondSide::Short => (
-                round_dp(ref_px + stop_distance, 8),
+                round_dp(ref_px.as_f64() + stop_distance.as_f64(), 8),
                 round_dp(last_1h.low + chandelier_dist, 8),
             ),
         };
 
         open_cells += 1;
-        open_heat += actual_risk;
-        deployed_notional += notional;
+        open_heat = (open_heat + actual_risk).round_cents();
+        deployed_notional = (deployed_notional + notional).round_cents();
 
         let base_asset = item
             .universe_row
@@ -462,15 +472,15 @@ pub fn run_nps01_scan(
             base_asset,
             side,
             option_analogue: analogue,
-            reference_price: ref_px,
+            reference_price: ref_px.as_f64(),
             funding_rate_hourly: r_hourly,
             funding_z_score: z_t,
             premium_score,
             atr_14_1h: atr_1h,
             atr_14_4h: atr_4h,
-            quantity: qty,
-            notional_usdc: notional,
-            risk_budget_usdc: actual_risk,
+            quantity: qty.as_f64(),
+            notional_usdc: notional.as_f64(),
+            risk_budget_usdc: actual_risk.as_f64(),
             conviction_multiplier,
             initial_stop_price: initial_stop,
             chandelier_stop_price: chandelier_stop,
