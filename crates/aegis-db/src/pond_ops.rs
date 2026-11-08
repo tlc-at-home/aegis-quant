@@ -3,8 +3,8 @@
 
 use crate::DatabaseManager;
 use aegis_core::{
-    round_dp, AegisError, BookRow, BookTransfer, PondCell, PondCellState, PondChampion,
-    PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, Result,
+    round_dp, AegisError, BookRow, BookTransfer, BookTransferStatus, PondCell, PondCellState,
+    PondChampion, PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, Result,
 };
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
@@ -301,6 +301,7 @@ impl DatabaseManager {
             closed_at: r.get("closed_at")?,
             cooldown_until: r.get("cooldown_until")?,
             updated_at: r.get("updated_at")?,
+            resting_order_id: r.get::<_, Option<String>>("resting_order_id").ok().flatten(),
         })
     }
 
@@ -337,8 +338,9 @@ impl DatabaseManager {
                          opened_at = ?23,
                          closed_at = ?24,
                          cooldown_until = ?25,
-                         updated_at = ?26
-                     WHERE cell_id = ?27
+                         updated_at = ?26,
+                         resting_order_id = ?27
+                     WHERE cell_id = ?28
                        AND state NOT IN ('CLOSED', 'COOLDOWN', 'REJECTED');"
                 } else {
                     "UPDATE pond_cells
@@ -367,8 +369,9 @@ impl DatabaseManager {
                          opened_at = ?23,
                          closed_at = ?24,
                          cooldown_until = ?25,
-                         updated_at = ?26
-                     WHERE cell_id = ?27;"
+                         updated_at = ?26,
+                         resting_order_id = ?27
+                     WHERE cell_id = ?28;"
                 };
                 conn.execute(
                     sql,
@@ -399,6 +402,7 @@ impl DatabaseManager {
                         cell.closed_at,
                         cell.cooldown_until,
                         now_iso,
+                        cell.resting_order_id,
                         cell.cell_id,
                     ],
                 )
@@ -412,14 +416,14 @@ impl DatabaseManager {
                         funding_z_entry, funding_rate_entry, initial_stop, chandelier_stop,
                         highest_price_seen, lowest_price_seen, funding_accrued_usdc,
                         realized_pnl_usdc, fees_paid_usdc, exit_price, exit_reason,
-                        opened_at, closed_at, cooldown_until, updated_at
+                        opened_at, closed_at, cooldown_until, updated_at, resting_order_id
                     ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6,
                         ?7, ?8, ?9, ?10, ?11,
                         ?12, ?13, ?14, ?15,
                         ?16, ?17, ?18,
                         ?19, ?20, ?21, ?22,
-                        ?23, ?24, ?25, ?26
+                        ?23, ?24, ?25, ?26, ?27
                     );",
                     params![
                         cell.symbol,
@@ -448,6 +452,7 @@ impl DatabaseManager {
                         cell.closed_at,
                         cell.cooldown_until,
                         now_iso,
+                        cell.resting_order_id,
                     ],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -481,7 +486,10 @@ impl DatabaseManager {
         })
     }
 
-    /// Targeted atomic update of open/trailed Pond cell watermarks and Chandelier stop (`R3-H1`).
+    /// Targeted atomic update of open/trailed Pond cell watermarks and Chandelier stop (`R3-H1`, `R4-N10`).
+    ///
+    /// Note: `state` is strictly restricted to `"OPEN"` or `"TRAILED"`. Callers must use
+    /// [`Self::close_open_pond_cell`] to transition a cell to `"CLOSED"` or `"COOLDOWN"`.
     pub fn update_open_pond_cell_watermarks(
         &self,
         cell_id: i64,
@@ -490,7 +498,13 @@ impl DatabaseManager {
         highest_price_seen: Option<f64>,
         lowest_price_seen: Option<f64>,
     ) -> Result<bool> {
-        let _ = PondCellState::parse(state)?;
+        let parsed_state = PondCellState::parse(state)?;
+        if !parsed_state.is_open_or_trailed() {
+            return Err(AegisError::Validation(format!(
+                "update_open_pond_cell_watermarks only accepts 'OPEN' or 'TRAILED' state (received '{state}'); use close_open_pond_cell to close a cell."
+            )));
+        }
+        debug_assert!(parsed_state.is_open_or_trailed());
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         self.with_conn(|conn| {
             let rows = conn
@@ -503,7 +517,7 @@ impl DatabaseManager {
                          updated_at = ?5
                      WHERE cell_id = ?6 AND state IN ('OPEN', 'TRAILED');",
                     params![
-                        state,
+                        parsed_state.as_str(),
                         chandelier_stop,
                         highest_price_seen,
                         lowest_price_seen,
@@ -516,7 +530,10 @@ impl DatabaseManager {
         })
     }
 
-    /// Targeted atomic update for partial live exit fill on an open/trailed Pond cell (`R3-H1`, `R3-H17`).
+    /// Targeted atomic update for partial live exit fill on an open/trailed Pond cell (`R3-H1`, `R3-H17`, `R4-N10`).
+    ///
+    /// Note: `state` is strictly restricted to `"OPEN"` or `"TRAILED"`. Callers must use
+    /// [`Self::close_open_pond_cell`] to transition a cell to `"CLOSED"` or `"COOLDOWN"`.
     #[allow(clippy::too_many_arguments)]
     pub fn reduce_open_pond_cell_partial_exit(
         &self,
@@ -530,7 +547,13 @@ impl DatabaseManager {
         realized_pnl_delta: f64,
         fees_delta: f64,
     ) -> Result<bool> {
-        let _ = PondCellState::parse(state)?;
+        let parsed_state = PondCellState::parse(state)?;
+        if !parsed_state.is_open_or_trailed() {
+            return Err(AegisError::Validation(format!(
+                "reduce_open_pond_cell_partial_exit only accepts 'OPEN' or 'TRAILED' state (received '{state}'); use close_open_pond_cell to close a cell."
+            )));
+        }
+        debug_assert!(parsed_state.is_open_or_trailed());
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         self.with_conn(|conn| {
             let rows = conn
@@ -547,7 +570,7 @@ impl DatabaseManager {
                          updated_at = ?9
                      WHERE cell_id = ?10 AND state IN ('OPEN', 'TRAILED');",
                     params![
-                        state,
+                        parsed_state.as_str(),
                         chandelier_stop,
                         highest_price_seen,
                         lowest_price_seen,
@@ -596,7 +619,8 @@ impl DatabaseManager {
                          exit_reason = ?8,
                          closed_at = ?9,
                          cooldown_until = ?10,
-                         updated_at = ?11
+                         updated_at = ?11,
+                         resting_order_id = NULL
                      WHERE cell_id = ?12 AND state IN ('OPEN', 'TRAILED');",
                     params![
                         target_state,
@@ -779,7 +803,8 @@ impl DatabaseManager {
                      exit_price = ?1,
                      exit_reason = ?2,
                      closed_at = ?3,
-                     updated_at = ?3
+                     updated_at = ?3,
+                     resting_order_id = NULL
                  WHERE cell_id = ?4 AND state IN ('OPEN', 'TRAILED', 'ARMED');",
                 params![exit_price, exit_reason, now_iso, cell_id],
             )
@@ -849,6 +874,12 @@ impl DatabaseManager {
                 .tx_ref
                 .as_deref()
                 .unwrap_or("")
+                .to_ascii_lowercase()
+                .starts_with("dryrun-")
+            || transfer
+                .tx_ref
+                .as_deref()
+                .unwrap_or("")
                 .to_ascii_uppercase()
                 .contains("DRY_RUN");
         let transfer_mode = if is_dry_run { "DRY_RUN" } else { "LIVE" };
@@ -860,13 +891,20 @@ impl DatabaseManager {
         transfer: &BookTransfer,
         transfer_mode: &str,
     ) -> Result<i64> {
+        let parsed_status = BookTransferStatus::parse(&transfer.status)?;
         let created_iso = if transfer.created_at.trim().is_empty() {
             aegis_core::now_iso8601_utc()
         } else {
             aegis_core::normalize_timestamp_iso8601_utc(&transfer.created_at)
         };
         let eff_mode = if transfer_mode.trim().is_empty() {
-            if transfer.status.to_ascii_uppercase().starts_with("DRY_RUN")
+            if parsed_status == BookTransferStatus::DryRun
+                || transfer
+                    .tx_ref
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .starts_with("dryrun-")
                 || transfer
                     .tx_ref
                     .as_deref()
@@ -901,7 +939,7 @@ impl DatabaseManager {
                     transfer.drift_bps_before,
                     transfer.drift_bps_after,
                     transfer.blocked_remainder_usdc,
-                    transfer.status,
+                    parsed_status.as_str(),
                     transfer.attempts,
                     transfer.tx_ref,
                     eff_mode,
@@ -925,13 +963,34 @@ impl DatabaseManager {
         drift_bps_after: Option<f64>,
         blocked_remainder_usdc: f64,
     ) -> Result<()> {
-        let is_dry_run = status.to_ascii_uppercase().starts_with("DRY_RUN")
+        let target_status = BookTransferStatus::parse(status)?;
+        let is_dry_run = target_status == BookTransferStatus::DryRun
+            || tx_ref
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .starts_with("dryrun-")
             || tx_ref
                 .unwrap_or("")
                 .to_ascii_uppercase()
                 .contains("DRY_RUN");
         let mode_override = if is_dry_run { Some("DRY_RUN") } else { None };
         self.with_conn(|conn| {
+            if let Ok(Some(prior_str)) = conn
+                .query_row(
+                    "SELECT status FROM book_transfers WHERE transfer_id = ?1;",
+                    params![transfer_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            {
+                if let Ok(prior_status) = BookTransferStatus::parse(&prior_str) {
+                    if !prior_status.can_transition_to(target_status) {
+                        return Err(AegisError::Validation(format!(
+                            "Invalid BookTransferStatus transition for transfer_id #{transfer_id}: {prior_status} -> {target_status}"
+                        )));
+                    }
+                }
+            }
             conn.execute(
                 "UPDATE book_transfers
                  SET status = ?1,
@@ -944,7 +1003,7 @@ impl DatabaseManager {
                      transfer_mode = COALESCE(NULLIF(transfer_mode, ''), ?8, 'LIVE')
                  WHERE transfer_id = ?9;",
                 params![
-                    status,
+                    target_status.as_str(),
                     attempts,
                     post_from_usdc,
                     post_to_usdc,
@@ -1003,7 +1062,13 @@ impl DatabaseManager {
     }
 
     /// Startup and pre-settle recovery sweep that inspects stale `PENDING` rows in `book_transfers`
-    /// and resolves or flags them before allowing a new settle cycle (`R3-B3`, `R3-QE`).
+    /// and resolves or quarantines them before allowing a new settle cycle (`R3-B3`, `R3-QE`, `R4-H1`, `R4-QA`).
+    ///
+    /// - Rows with both legs completed (`legs_completed >= 2` or `leg2_tx_ref` present) transition to `CONFIRMED`.
+    /// - Rows with `legs_completed == 1` (or `leg1_tx_ref` present without leg 2) transition to `PARTIAL`
+    ///   (requiring manual operator reconciliation because funds are stranded on the master wallet).
+    /// - Rows whose `tx_ref` / leg refs indicate `AMBIGUOUS_POST_SEND` transition to `AMBIGUOUS`.
+    /// - Rows with 0 legs completed transition to `FAILED` (`RECONCILED_STALE_PENDING`).
     #[allow(clippy::type_complexity)]
     pub fn reconcile_pending_book_transfers(&self) -> Result<usize> {
         let pending_rows: Vec<(
@@ -1050,6 +1115,18 @@ impl DatabaseManager {
                 .as_deref()
                 .map(|s| !s.trim().is_empty())
                 .unwrap_or(false);
+            let is_ambiguous = tx_ref
+                .as_deref()
+                .map(|s| s.to_ascii_uppercase().contains("AMBIGUOUS"))
+                .unwrap_or(false)
+                || leg1_ref
+                    .as_deref()
+                    .map(|s| s.to_ascii_uppercase().contains("AMBIGUOUS"))
+                    .unwrap_or(false)
+                || leg2_ref
+                    .as_deref()
+                    .map(|s| s.to_ascii_uppercase().contains("AMBIGUOUS"))
+                    .unwrap_or(false);
             let has_confirmed_tx = tx_ref
                 .as_deref()
                 .map(|s| {
@@ -1057,6 +1134,7 @@ impl DatabaseManager {
                     !u.is_empty()
                         && !u.contains("PENDING")
                         && !u.contains("PARTIAL")
+                        && !u.contains("AMBIGUOUS")
                         && !u.contains("FAILED")
                         && !u.contains("RECONCILED")
                 })
@@ -1064,41 +1142,51 @@ impl DatabaseManager {
 
             let (new_status, new_tx_ref) = if legs_completed >= 2 || has_leg2 || has_confirmed_tx {
                 (
-                    "CONFIRMED",
+                    BookTransferStatus::Confirmed,
                     tx_ref
                         .or(leg2_ref)
                         .unwrap_or_else(|| format!("0xreconciled_confirmed_{tid}")),
                 )
             } else if legs_completed == 1 || leg1_ref.is_some() {
+                let l1 = leg1_ref.unwrap_or_else(|| format!("leg1_{tid}"));
                 (
-                    "FAILED",
-                    tx_ref
-                        .or(leg1_ref)
-                        .unwrap_or_else(|| format!("RECONCILED_PARTIAL_LEG1_{tid}")),
+                    BookTransferStatus::Partial,
+                    tx_ref.unwrap_or_else(|| format!("PARTIAL_LEG1_ONLY:{l1}")),
+                )
+            } else if is_ambiguous {
+                (
+                    BookTransferStatus::Ambiguous,
+                    tx_ref.unwrap_or_else(|| format!("AMBIGUOUS_POST_SEND_{tid}")),
                 )
             } else {
                 (
-                    "FAILED",
+                    BookTransferStatus::Failed,
                     tx_ref.unwrap_or_else(|| format!("RECONCILED_STALE_PENDING_{tid}")),
                 )
             };
 
+            let reset_post_eq = !new_status.is_ledger_counted();
             self.with_conn(|conn| {
                 conn.execute(
                     "UPDATE book_transfers
                      SET status = ?1,
                          tx_ref = ?2,
-                         post_from_usdc = CASE WHEN ?1 = 'FAILED' THEN pre_from_usdc ELSE post_from_usdc END,
-                         post_to_usdc = CASE WHEN ?1 = 'FAILED' THEN pre_to_usdc ELSE post_to_usdc END
-                     WHERE transfer_id = ?3 AND status = 'PENDING';",
-                    params![new_status, new_tx_ref, tid],
+                         post_from_usdc = CASE WHEN ?3 THEN pre_from_usdc ELSE post_from_usdc END,
+                         post_to_usdc = CASE WHEN ?3 THEN pre_to_usdc ELSE post_to_usdc END
+                     WHERE transfer_id = ?4 AND status = 'PENDING';",
+                    params![new_status.as_str(), new_tx_ref, reset_post_eq, tid],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
                 Ok(())
             })?;
 
+            let log_level = if new_status.needs_manual_reconciliation() {
+                "ERROR"
+            } else {
+                "WARN"
+            };
             let _ = self.log_telemetry(
-                "WARN",
+                log_level,
                 "aegis-settle.reconcile_pending",
                 &format!(
                     "Reconciled stale PENDING book_transfer #{tid} (${amount_usdc:.2} {from_book}->{to_book}, legs={legs_completed}) -> {new_status} ({new_tx_ref})"
@@ -1108,6 +1196,102 @@ impl DatabaseManager {
             reconciled += 1;
         }
         Ok(reconciled)
+    }
+
+    /// Query `book_transfers` for any unresolved `PARTIAL` or `AMBIGUOUS` rows, `FAILED` rows with
+    /// `legs_completed > 0`, or stale `PENDING` rows exceeding `pending_transfer_stale_ttl_ms` (`R4-H1`, `R4-QB`).
+    pub fn get_stranded_or_unresolved_book_transfers(&self) -> Result<Vec<BookTransfer>> {
+        let cfg = self.load_config_opts(false).unwrap_or_default();
+        let stale_ttl_ms = cfg.get_i64("pending_transfer_stale_ttl_ms", 120_000).max(1_000);
+        let cutoff_iso = chrono::DateTime::from_timestamp_millis(self.now_ms() - stale_ttl_ms)
+            .unwrap_or_else(Utc::now)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT transfer_id, settle_date, from_book, to_book, amount_usdc,
+                            pre_from_usdc, pre_to_usdc, post_from_usdc, post_to_usdc,
+                            drift_bps_before, drift_bps_after, blocked_remainder_usdc,
+                            status, attempts, tx_ref, created_at
+                     FROM book_transfers
+                     WHERE status IN ('PARTIAL', 'AMBIGUOUS')
+                        OR (status = 'FAILED' AND COALESCE(legs_completed, 0) > 0)
+                        OR (status = 'PENDING' AND datetime(created_at) <= datetime(?1))
+                     ORDER BY transfer_id DESC;",
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            let iter = stmt
+                .query_map(params![cutoff_iso], |r| {
+                    Ok(BookTransfer {
+                        transfer_id: r.get(0)?,
+                        settle_date: r.get(1)?,
+                        from_book: r.get(2)?,
+                        to_book: r.get(3)?,
+                        amount_usdc: r.get(4)?,
+                        pre_from_usdc: r.get(5)?,
+                        pre_to_usdc: r.get(6)?,
+                        post_from_usdc: r.get(7)?,
+                        post_to_usdc: r.get(8)?,
+                        drift_bps_before: r.get(9)?,
+                        drift_bps_after: r.get(10)?,
+                        blocked_remainder_usdc: r.get(11)?,
+                        status: r.get(12)?,
+                        attempts: r.get(13)?,
+                        tx_ref: r.get(14)?,
+                        created_at: r.get(15)?,
+                    })
+                })
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(iter.flatten().collect())
+        })
+    }
+
+    /// Rate-limited check for unresolved `PARTIAL`/`AMBIGUOUS` or stale `PENDING` book transfers (`R4-QB`).
+    /// Returns the unresolved transfers if at least one exists and `stranded_transfer_alert_cooldown_ms`
+    /// has elapsed since the last alert, updating `stranded_transfer_last_alert_ms` in `system_config`.
+    pub fn check_and_record_stranded_transfer_alert(&self) -> Result<Vec<BookTransfer>> {
+        let stranded = self.get_stranded_or_unresolved_book_transfers()?;
+        if stranded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cfg = self.load_config_opts(false).unwrap_or_default();
+        let cooldown_ms = cfg
+            .get_i64("stranded_transfer_alert_cooldown_ms", 300_000)
+            .max(1_000);
+        let last_alert_ms = cfg.get_i64("stranded_transfer_last_alert_ms", 0);
+        let now_ms = self.now_ms();
+        if last_alert_ms > 0 && (now_ms - last_alert_ms) < cooldown_ms {
+            return Ok(Vec::new());
+        }
+        let _ = self.with_conn(|conn| {
+            let _ = conn.execute(
+                "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('stranded_transfer_last_alert_ms', ?1, 'int', 'settling', 'Epoch timestamp (ms) of last stranded book transfer alert', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 ON CONFLICT(config_key) DO UPDATE SET
+                    config_value = excluded.config_value,
+                    updated_at = excluded.updated_at;",
+                params![now_ms.to_string()],
+            );
+            Ok(())
+        });
+        let ids: Vec<i64> = stranded.iter().map(|t| t.transfer_id).collect();
+        tracing::warn!(
+            unresolved_count = stranded.len(),
+            transfer_ids = ?ids,
+            "Unresolved PARTIAL/AMBIGUOUS or stale PENDING book_transfers detected; manual reconciliation required"
+        );
+        let _ = self.log_telemetry(
+            "WARNING",
+            "aegis-settle.stranded_watcher",
+            &format!(
+                "Unresolved PARTIAL/AMBIGUOUS or stale PENDING book_transfers detected (count={}, ids={ids:?}); manual reconciliation required",
+                stranded.len()
+            ),
+            None,
+        );
+        Ok(stranded)
     }
 
     pub fn get_recent_book_transfers(&self, limit: usize) -> Result<Vec<BookTransfer>> {
@@ -1150,7 +1334,7 @@ impl DatabaseManager {
     }
 
     /// Returns the cumulative net USDC transferred into `book_code` minus USDC transferred out of
-    /// `book_code` across all non-dry-run `COMPLETED` / `CONFIRMED` / `PARTIAL_IDLE_CAPPED` rows in `book_transfers` (`C1`, `NL-10`, `R3-H5`).
+    /// `book_code` across all non-dry-run `COMPLETED` / `CONFIRMED` / `PARTIAL_IDLE_CAPPED` rows in `book_transfers` (`C1`, `NL-10`, `R3-H5`, `R4-H2`).
     pub fn get_net_book_transfer_adjustment(&self, book_code: &str) -> Result<f64> {
         let code = book_code.trim().to_ascii_uppercase();
         self.with_conn(|conn| {
@@ -1164,6 +1348,7 @@ impl DatabaseManager {
                            AND status IN ('COMPLETED', 'CONFIRMED', 'PARTIAL_IDLE_CAPPED')
                            AND COALESCE(transfer_mode, '') NOT LIKE 'DRY_RUN%'
                            AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%'
+                           AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%'
                            AND (created_at IS NULL OR datetime(created_at) > datetime(?2));",
                         params![code, reset_trimmed],
                         |r| r.get(0),
@@ -1177,6 +1362,7 @@ impl DatabaseManager {
                            AND status IN ('COMPLETED', 'CONFIRMED', 'PARTIAL_IDLE_CAPPED')
                            AND COALESCE(transfer_mode, '') NOT LIKE 'DRY_RUN%'
                            AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%'
+                           AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%'
                            AND (created_at IS NULL OR datetime(created_at) > datetime(?2));",
                         params![code, reset_trimmed],
                         |r| r.get(0),
@@ -1191,7 +1377,8 @@ impl DatabaseManager {
                          WHERE to_book = ?1
                            AND status IN ('COMPLETED', 'CONFIRMED', 'PARTIAL_IDLE_CAPPED')
                            AND COALESCE(transfer_mode, '') NOT LIKE 'DRY_RUN%'
-                           AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%';",
+                           AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%'
+                           AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%';",
                         params![code],
                         |r| r.get(0),
                     )
@@ -1203,7 +1390,8 @@ impl DatabaseManager {
                          WHERE from_book = ?1
                            AND status IN ('COMPLETED', 'CONFIRMED', 'PARTIAL_IDLE_CAPPED')
                            AND COALESCE(transfer_mode, '') NOT LIKE 'DRY_RUN%'
-                           AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%';",
+                           AND COALESCE(tx_ref, '') NOT LIKE '%DRY_RUN%'
+                           AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%';",
                         params![code],
                         |r| r.get(0),
                     )
@@ -1214,7 +1402,7 @@ impl DatabaseManager {
         })
     }
 
-    /// Single source of truth for Book A (`PIT`) equity and unlocked idle USDC (`R3-H18`, `R3-QC`).
+    /// Single source of truth for Book A (`PIT`) equity and unlocked idle USDC (`R3-H18`, `R3-QC`, `R3-N8`).
     pub fn compute_pit_equity_and_idle_usdc(&self) -> Result<(f64, f64)> {
         let cfg = crate::scoped::PitConfig::from_config_map(&self.load_config()?);
         let base_cap = cfg.book_baseline_equity_usdc.max(1.0);
@@ -1226,7 +1414,8 @@ impl DatabaseManager {
         let mut upnl = 0.0;
         for t in &open_trades {
             deployed += t.quantity.abs() * t.current_price;
-            upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc;
+            // R3-N8: Subtract entry/partial-fill fees_paid_usdc on open PIT trades symmetrically with Pond cells
+            upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc - t.fees_paid_usdc;
         }
         for rt in &resting_trades {
             deployed += rt.notional_usdc.max(rt.quantity.abs() * rt.entry_price);

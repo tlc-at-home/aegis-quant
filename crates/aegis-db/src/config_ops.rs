@@ -230,6 +230,42 @@ fn alert_config_defaults(
                 "Enforce Secure flag on session cookies",
             ),
         ),
+        (
+            "calibration_timeframes_csv",
+            (
+                "1h,4h",
+                "string",
+                "calibration",
+                "Comma-separated list of candidate timeframes evaluated during walk-forward calibration",
+            ),
+        ),
+        (
+            "default_timeframe",
+            (
+                "1h",
+                "string",
+                "execution",
+                "Default execution bar timeframe",
+            ),
+        ),
+        (
+            "exec_timeframe",
+            (
+                "1h",
+                "string",
+                "execution",
+                "Default per-asset execution timeframe",
+            ),
+        ),
+        (
+            "rs_timeframe",
+            (
+                "4h",
+                "string",
+                "signals",
+                "Default relative-strength timeframe",
+            ),
+        ),
     ])
 }
 
@@ -552,12 +588,29 @@ const MIN_MAX_FLOAT_PAIRS: &[(&str, &str)] = &[
     ("pond_conviction_scale_min", "pond_conviction_scale_max"),
 ];
 
+/// Returns `true` only when `s` matches one of the exact mask shapes emitted by
+/// [`mask_secret`] (`<6 chars>...<4 chars>` or `"********"`), [`mask_identifier`]
+/// (`<3 chars>...<3 chars>`, `<2 chars>***<2 chars>`, or `"****"`), or `"[REDACTED]"` (`R3-H21`, `R4-N3`).
 pub fn is_masked_secret_echo(s: &str) -> bool {
     let trimmed = s.trim();
-    trimmed.contains("...")
-        || trimmed.contains("***")
-        || trimmed.contains("****")
-        || trimmed.eq_ignore_ascii_case("[REDACTED]")
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.eq_ignore_ascii_case("[REDACTED]") || trimmed == "********" || trimmed == "****"
+    {
+        return true;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() == 7 && chars[2..5] == ['*', '*', '*'] {
+        return true;
+    }
+    if chars.len() == 9 && chars[3..6] == ['.', '.', '.'] {
+        return true;
+    }
+    if chars.len() == 13 && chars[6..9] == ['.', '.', '.'] {
+        return true;
+    }
+    false
 }
 
 impl DatabaseManager {
@@ -639,10 +692,14 @@ impl DatabaseManager {
             other => other.to_string(),
         };
 
-        // R3-H21: Reject/ignore masked echo values so UI round-trips never overwrite real secrets.
+        // R3-H21 / R4-N3: Reject/ignore masked echo values so UI round-trips never overwrite real secrets.
         if (SENSITIVE_CONFIG_KEYS.contains(&key) || key == "telegram_chat_id")
             && is_masked_secret_echo(&val_str)
         {
+            tracing::debug!(
+                config_key = key,
+                "Skipping system_config write for masked secret echo value"
+            );
             return Ok(true);
         }
 
@@ -850,10 +907,16 @@ impl DatabaseManager {
                     )));
                 }
                 let int_val = f as i64;
-                if key == "polling_interval_seconds" && int_val < 1 {
-                    return Err(AegisError::Validation(
-                        "Invalid polling_interval_seconds: must be >= 1 second.".to_string(),
-                    ));
+                if matches!(
+                    key,
+                    "polling_interval_seconds"
+                        | "pit_tick_interval_seconds"
+                        | "pond_tick_interval_seconds"
+                ) && int_val < 1
+                {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid {key}: must be >= 1 second."
+                    )));
                 }
                 int_val.to_string()
             }
@@ -934,6 +997,14 @@ impl DatabaseManager {
                     s.to_ascii_lowercase()
                 } else if key == "hyperliquid_agent_address" {
                     validate_evm_address(&s, "hyperliquid_agent_address")?
+                } else if matches!(
+                    key,
+                    "hmm_timeframe" | "default_timeframe" | "exec_timeframe" | "rs_timeframe"
+                ) {
+                    aegis_core::parse_timeframe_seconds(&s)?;
+                    s.to_ascii_lowercase()
+                } else if key == "calibration_timeframes_csv" {
+                    aegis_core::validate_timeframe_csv(&s)?
                 } else {
                     s
                 }
@@ -1622,21 +1693,30 @@ impl DatabaseManager {
         self.get_credentials_status()
     }
 
-    /// Retrieves and decrypts the active `web_api_token` (or `dashboard_api_token`) from `system_config`,
-    /// or generates and persists a new 32-byte CSPRNG hex token if none is configured.
-    pub fn get_or_create_web_api_token(&self) -> Result<String> {
+    /// Read-only inspection of the configured `web_api_token` (or `dashboard_api_token`) without
+    /// generating or writing a new token when none is configured (`R4-N8`).
+    pub fn get_existing_web_api_token(&self) -> Result<Option<String>> {
         if let Ok(tok) = std::env::var("AEGIS_WEB_TOKEN") {
             let trimmed = tok.trim().to_string();
             if !trimmed.is_empty() {
-                return Ok(trimmed);
+                return Ok(Some(trimmed));
             }
         }
         let cfg = self.load_config()?;
         for key in ["web_api_token", "dashboard_api_token"] {
             let tok = cfg.get_str(key, "");
             if !tok.trim().is_empty() {
-                return Ok(tok.trim().to_string());
+                return Ok(Some(tok.trim().to_string()));
             }
+        }
+        Ok(None)
+    }
+
+    /// Retrieves and decrypts the active `web_api_token` (or `dashboard_api_token`) from `system_config`,
+    /// or generates and persists a new 32-byte CSPRNG hex token if none is configured.
+    pub fn get_or_create_web_api_token(&self) -> Result<String> {
+        if let Some(existing) = self.get_existing_web_api_token()? {
+            return Ok(existing);
         }
         use rand::RngCore;
         let mut bytes = [0u8; 32];

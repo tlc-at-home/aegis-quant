@@ -143,10 +143,14 @@ impl PondOrchestrator {
 
         for mut cell in armed_cells {
             let resting_oid = cell
-                .exit_reason
-                .as_deref()
-                .and_then(|r| r.strip_prefix("RESTING_OID:"))
-                .map(|s| s.to_string());
+                .resting_order_id
+                .clone()
+                .or_else(|| {
+                    cell.exit_reason
+                        .as_deref()
+                        .and_then(|r| r.strip_prefix("RESTING_OID:"))
+                        .map(|s| s.to_string())
+                });
             let status: RestingOrderStatus = self
                 .execution
                 .check_resting_order_status(&cell.symbol, resting_oid.as_deref());
@@ -168,12 +172,14 @@ impl PondOrchestrator {
                     cell.fees_paid_usdc = round_dp(cell.fees_paid_usdc + entry_fee, 4);
                     cell.opened_at = Some(now_str.clone());
                     cell.exit_reason = None;
+                    cell.resting_order_id = None;
                     transition_cell_state(&mut cell, PondCellState::Open)?;
                     self.scoped_db.upsert_pond_cell(&cell)?;
                     promoted += 1;
                 }
                 "GONE" | "CANCELLED_OR_GONE" => {
                     cell.exit_reason = Some("RESTING_ENTRY_CANCELLED_OR_EXPIRED".to_string());
+                    cell.resting_order_id = None;
                     cell.closed_at = Some(now_str.clone());
                     cell.cooldown_until = Some(
                         (now + ChronoDuration::hours(cfg.pond_cooldown_hours.max(1)))
@@ -195,6 +201,7 @@ impl PondOrchestrator {
                         };
                         if cancel_confirmed {
                             cell.exit_reason = Some("RESTING_ENTRY_UNFILLED_EXPIRED".to_string());
+                            cell.resting_order_id = None;
                             cell.closed_at = Some(now_str.clone());
                             cell.cooldown_until = Some(
                                 (now + ChronoDuration::hours(cfg.pond_cooldown_hours.max(1)))
@@ -223,6 +230,7 @@ impl PondOrchestrator {
                         };
                         if cancel_confirmed {
                             cell.exit_reason = Some("RESTING_ENTRY_UNFILLED_EXPIRED".to_string());
+                            cell.resting_order_id = None;
                             cell.closed_at = Some(now_str.clone());
                             cell.cooldown_until = Some(
                                 (now + ChronoDuration::hours(cfg.pond_cooldown_hours.max(1)))
@@ -547,6 +555,20 @@ impl PondOrchestrator {
 
     /// Executes the 15-second tick loop step for open Pond cells (Tier 1 Catastrophic Wick Stop).
     pub fn run_tick_15s(&self) -> Result<usize> {
+        if let Ok(stranded) = self.scoped_db.check_and_record_stranded_transfer_alert() {
+            if !stranded.is_empty() {
+                let ids: Vec<i64> = stranded.iter().map(|r| r.transfer_id).collect();
+                let _ = self.execution.alerts.notify_critical_event(
+                    "STRANDED_BOOK_TRANSFER",
+                    &format!(
+                        "{} book_transfers row(s) require operator reconciliation or have been PENDING past TTL: {:?}",
+                        stranded.len(),
+                        ids
+                    ),
+                    Some(json!({ "transfer_ids": ids })),
+                );
+            }
+        }
         self.evaluate_open_cells(false, false)
     }
 
@@ -770,6 +792,7 @@ impl PondOrchestrator {
                 fees_paid_usdc: 0.0,
                 exit_price: None,
                 exit_reason: None,
+                resting_order_id: None,
                 opened_at: None,
                 closed_at: None,
                 cooldown_until: None,
@@ -796,14 +819,14 @@ impl PondOrchestrator {
                 None,
             );
             if fill.fsm_state == "OPEN_ON_BOOK" || (is_live_or_testnet && fill.filled_units <= 0.0 && fill.fsm_state == "FILLED") {
-                // B8: Resting order is NOT an open position. Keep cell in ARMED state and track resting OID.
+                // B8 + R4-N11: Resting order is NOT an open position. Keep cell in ARMED state and track resting OID in resting_order_id.
                 let resting_oid = if !fill.exchange_order_id.trim().is_empty() {
                     fill.exchange_order_id.as_str()
                 } else {
                     fill.client_order_id.as_str()
                 };
                 new_cell.entry_price = Some(cand.reference_price);
-                new_cell.exit_reason = Some(format!("RESTING_OID:{resting_oid}"));
+                new_cell.resting_order_id = Some(resting_oid.to_string());
                 self.scoped_db.upsert_pond_cell(&new_cell)?;
                 open_heat = round_dp(open_heat + cand.risk_budget_usdc, 2);
                 deployed_notional = round_dp(deployed_notional + cand.notional_usdc, 2);
@@ -1047,6 +1070,7 @@ mod tests {
             fees_paid_usdc: 0.0,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: None,
             closed_at: None,
             cooldown_until: None,
@@ -1248,6 +1272,7 @@ mod tests {
             fees_paid_usdc: 0.0,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: Some("2026-01-01T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1411,6 +1436,7 @@ mod tests {
             fees_paid_usdc: 0.0,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: Some("2026-01-01T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1476,7 +1502,8 @@ mod tests {
             realized_pnl_usdc: 0.0,
             fees_paid_usdc: 0.0,
             exit_price: None,
-            exit_reason: Some("RESTING_OID:HL-RESTING-123".to_string()),
+            exit_reason: None,
+            resting_order_id: Some("HL-RESTING-123".to_string()),
             opened_at: None,
             closed_at: None,
             cooldown_until: None,
@@ -1497,11 +1524,13 @@ mod tests {
         let all_cells = orch.scoped_db.get_pond_cells(10).unwrap();
         assert_eq!(all_cells[0].state, "REJECTED");
         assert_eq!(all_cells[0].funding_accrued_usdc, 0.0);
+        assert!(all_cells[0].resting_order_id.is_none());
 
         let mut cell = armed_cell;
         cell.state = "OPEN".to_string();
         cell.opened_at = Some("2026-01-01T00:00:00Z".to_string());
         cell.exit_reason = None;
+        cell.resting_order_id = None;
         cell.funding_accrued_usdc = 12.0;
         cell.fees_paid_usdc = 2.0;
         orch.scoped_db.upsert_pond_cell(&cell).unwrap();
@@ -1616,6 +1645,7 @@ mod tests {
             fees_paid_usdc: 0.2,
             exit_price: Some(147.0),
             exit_reason: Some("FUNDING_DECAY".to_string()),
+            resting_order_id: None,
             opened_at: Some("2026-01-01T00:00:00Z".to_string()),
             closed_at: Some("2026-01-01T04:00:00Z".to_string()),
             cooldown_until: Some("2026-01-01T08:00:00Z".to_string()),
@@ -1652,6 +1682,7 @@ mod tests {
             fees_paid_usdc: 0.0,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: Some("2026-01-02T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1667,9 +1698,8 @@ mod tests {
         let rec = orch
             .execution
             .reconcile_exchange_state(Some(&sim_pos), Some(&[]));
-        assert!(rec["discrepancies"]
-            .as_array()
-            .unwrap()
+        assert!(rec
+            .discrepancies
             .iter()
             .any(|d| d["type"] == "DIRECTION_FLIP_POND_CELL_RECONCILED" && d["cell_id"] == open_id));
     }

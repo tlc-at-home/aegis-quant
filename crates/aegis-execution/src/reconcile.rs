@@ -6,10 +6,12 @@ use aegis_core::{
 use aegis_risk::RiskEngine;
 use serde_json::{json, Value};
 
-use crate::{ExecutionEngine, FundingSyncReport, ReconcileReport};
+use crate::{
+    ExecutionEngine, FundingSyncReport, FundingSyncStatus, ReconcileReport, ReconcileStatus,
+};
 
 impl ExecutionEngine {
-    /// Accrues or reconciles hourly funding payments across open Book A (`PIT`) perpetual positions (`NM-4`, `R3-B1`).
+    /// Accrues or reconciles hourly funding payments across open Book A (`PIT`) perpetual positions (`NM-4`, `R3-B1`, `R4-N4`).
     ///
     /// Note (`R3-B1`): Book B (`POND`) cells accrue hourly funding exclusively inside
     /// `PondOrchestrator::evaluate_open_cells` via `accrue_pond_cell_funding_for_hour`
@@ -21,34 +23,40 @@ impl ExecutionEngine {
     ) -> FundingSyncReport {
         let now_ms = current_ts_ms.unwrap_or_else(|| self.db.now_ms());
         let hour_bucket = (now_ms / 3_600_000) * 3_600_000;
+        let hour_bucket_idx = now_ms.div_euclid(3_600_000);
         if *self.last_funding_sync_hour_ts.lock() == Some(hour_bucket) {
-            return FundingSyncReport::from_raw(json!({
-                "status": "ALREADY_SYNCED_THIS_HOUR",
-                "hour_bucket_ms": hour_bucket,
-                "positions_updated": 0,
-            }));
+            return FundingSyncReport {
+                status: FundingSyncStatus::AlreadySyncedThisHour,
+                reason: None,
+                hour_bucket_ms: hour_bucket,
+                positions_updated: 0,
+                net_funding_delta_usdc: 0.0,
+            };
         }
 
         let open_trades = match self.db.get_open_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to query open trades during sync_funding_payments");
-                return FundingSyncReport::from_raw(json!({
-                    "status": "ERROR",
-                    "reason": e.to_string(),
-                    "hour_bucket_ms": hour_bucket,
-                    "positions_updated": 0,
-                }));
+                return FundingSyncReport {
+                    status: FundingSyncStatus::Error,
+                    reason: Some(e.to_string()),
+                    hour_bucket_ms: hour_bucket,
+                    positions_updated: 0,
+                    net_funding_delta_usdc: 0.0,
+                };
             }
         };
 
         if open_trades.is_empty() {
             *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
-            return FundingSyncReport::from_raw(json!({
-                "status": "NO_OPEN_POSITIONS",
-                "hour_bucket_ms": hour_bucket,
-                "positions_updated": 0,
-            }));
+            return FundingSyncReport {
+                status: FundingSyncStatus::NoOpenPositions,
+                reason: None,
+                hour_bucket_ms: hour_bucket,
+                positions_updated: 0,
+                net_funding_delta_usdc: 0.0,
+            };
         }
 
         let mut onchain_rate_by_coin: HashMap<String, f64> = HashMap::new();
@@ -123,29 +131,34 @@ impl ExecutionEngine {
                 .map(|b| b.close)
                 .unwrap_or(trade.current_price);
             let notional = trade.quantity.abs() * mark_px;
-            let delta = if trade.side == "LONG" {
-                -notional * funding_rate
-            } else {
-                notional * funding_rate
-            };
-            let new_funding = round_dp(trade.funding_accrued_usdc + delta, 4);
-            if let Err(e) = self.db.update_open_trade(
+            let delta = round_dp(
+                if trade.side == "LONG" {
+                    -notional * funding_rate
+                } else {
+                    notional * funding_rate
+                },
+                4,
+            );
+            match self.db.accrue_trade_funding_for_hour(
                 trade.trade_id,
+                hour_bucket_idx,
                 mark_px,
-                trade.chandelier_stop_price,
-                trade.highest_price_seen,
-                trade.lowest_price_seen,
                 trade.unrealized_pnl_usdc,
-                new_funding,
+                delta,
             ) {
-                tracing::error!(
-                    trade_id = trade.trade_id,
-                    error = %e,
-                    "Failed to update open trade funding"
-                );
+                Ok(true) => {
+                    net_funding_delta += delta;
+                    updated += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        trade_id = trade.trade_id,
+                        error = %e,
+                        "Failed to accrue open trade funding (R4-N4)"
+                    );
+                }
             }
-            net_funding_delta += delta;
-            updated += 1;
         }
 
         *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
@@ -161,16 +174,17 @@ impl ExecutionEngine {
             );
         }
 
-        FundingSyncReport::from_raw(json!({
-            "status": "SYNCED",
-            "hour_bucket_ms": hour_bucket,
-            "positions_updated": updated,
-            "net_funding_delta_usdc": round_dp(net_funding_delta, 4),
-        }))
+        FundingSyncReport {
+            status: FundingSyncStatus::Synced,
+            reason: None,
+            hour_bucket_ms: hour_bucket,
+            positions_updated: updated,
+            net_funding_delta_usdc: round_dp(net_funding_delta, 4),
+        }
     }
 
     /// Reconciles local SQLite `OPEN` trades and Pond cells against Hyperliquid L1
-    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`).
+    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`, `R4-N11`).
     pub fn reconcile_exchange_state(
         &self,
         simulated_exchange_positions: Option<&HashMap<String, Value>>,
@@ -186,13 +200,14 @@ impl ExecutionEngine {
             && simulated_open_orders.is_none()
         {
             let open_trades = self.db.get_open_trades().unwrap_or_default();
-            return ReconcileReport::from_raw(json!({
-                "status": "VERIFIED_PAPER",
-                "mode": "PAPER",
-                "local_open_trades": open_trades.len(),
-                "discrepancies_found": 0,
-                "discrepancies": [],
-            }));
+            return ReconcileReport {
+                status: ReconcileStatus::VerifiedPaper,
+                mode: Some("PAPER".to_string()),
+                reason: None,
+                local_open_trades: Some(open_trades.len()),
+                discrepancies_found: 0,
+                discrepancies: Vec::new(),
+            };
         }
 
         let mut ex_positions: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
@@ -265,18 +280,24 @@ impl ExecutionEngine {
                     }
                 }
             } else {
-                return ReconcileReport::from_raw(json!({
-                    "status": "SKIPPED_OFFLINE",
-                    "reason": "CLEARINGHOUSE_STATE_UNAVAILABLE",
-                    "discrepancies_found": 0,
-                }));
+                return ReconcileReport {
+                    status: ReconcileStatus::SkippedOffline,
+                    mode: None,
+                    reason: Some("CLEARINGHOUSE_STATE_UNAVAILABLE".to_string()),
+                    local_open_trades: None,
+                    discrepancies_found: 0,
+                    discrepancies: Vec::new(),
+                };
             }
         } else {
-            return ReconcileReport::from_raw(json!({
-                "status": "SKIPPED_OFFLINE",
-                "reason": "CLEARINGHOUSE_API_UNREACHABLE",
-                "discrepancies_found": 0,
-            }));
+            return ReconcileReport {
+                status: ReconcileStatus::SkippedOffline,
+                mode: None,
+                reason: Some("CLEARINGHOUSE_API_UNREACHABLE".to_string()),
+                local_open_trades: None,
+                discrepancies_found: 0,
+                discrepancies: Vec::new(),
+            };
         }
 
         let live_open_orders: Vec<Value>;
@@ -301,33 +322,42 @@ impl ExecutionEngine {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open trades");
-                return ReconcileReport::from_raw(json!({
-                    "status": "ERROR_DB_UNAVAILABLE",
-                    "reason": e.to_string(),
-                    "discrepancies_found": 0,
-                }));
+                return ReconcileReport {
+                    status: ReconcileStatus::ErrorDbUnavailable,
+                    mode: None,
+                    reason: Some(e.to_string()),
+                    local_open_trades: None,
+                    discrepancies_found: 0,
+                    discrepancies: Vec::new(),
+                };
             }
         };
         let resting_trades = match self.db.get_resting_pit_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load resting trades");
-                return ReconcileReport::from_raw(json!({
-                    "status": "ERROR_DB_UNAVAILABLE",
-                    "reason": e.to_string(),
-                    "discrepancies_found": 0,
-                }));
+                return ReconcileReport {
+                    status: ReconcileStatus::ErrorDbUnavailable,
+                    mode: None,
+                    reason: Some(e.to_string()),
+                    local_open_trades: None,
+                    discrepancies_found: 0,
+                    discrepancies: Vec::new(),
+                };
             }
         };
         let local_pond_cells = match self.db.get_open_pond_cells() {
             Ok(cells) => cells,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open pond cells");
-                return ReconcileReport::from_raw(json!({
-                    "status": "ERROR_DB_UNAVAILABLE",
-                    "reason": e.to_string(),
-                    "discrepancies_found": 0,
-                }));
+                return ReconcileReport {
+                    status: ReconcileStatus::ErrorDbUnavailable,
+                    mode: None,
+                    reason: Some(e.to_string()),
+                    local_open_trades: None,
+                    discrepancies_found: 0,
+                    discrepancies: Vec::new(),
+                };
             }
         };
         let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
@@ -366,14 +396,14 @@ impl ExecutionEngine {
                 known_resting_oids.insert(oid);
             }
         }
-        // R3-B4: Protect resting Pond ARMED cells and their RESTING_OID orders from dangling-order cancellation
+        // R3-B4 & R4-N11: Protect resting Pond ARMED cells and their resting_order_id orders from dangling-order cancellation
         for c in armed_pond_cells.iter().chain(all_pond_cells.iter()) {
-            let has_resting_oid = c
-                .exit_reason
-                .as_deref()
-                .map(|r| r.starts_with("RESTING_OID:"))
-                .unwrap_or(false);
-            if c.state.eq_ignore_ascii_case("ARMED") || has_resting_oid {
+            let resting_oid_raw = c.resting_order_id.as_deref().or_else(|| {
+                c.exit_reason
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("RESTING_OID:"))
+            });
+            if c.state.eq_ignore_ascii_case("ARMED") || resting_oid_raw.is_some() {
                 let coin = c
                     .symbol
                     .split('/')
@@ -382,10 +412,7 @@ impl ExecutionEngine {
                     .trim()
                     .to_uppercase();
                 seen_coins.insert(coin);
-                if let Some(oid) = c
-                    .exit_reason
-                    .as_deref()
-                    .and_then(|r| r.strip_prefix("RESTING_OID:"))
+                if let Some(oid) = resting_oid_raw
                     .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
                     .and_then(|s| s.parse::<u64>().ok())
                     .filter(|&id| id > 0)
@@ -652,12 +679,14 @@ impl ExecutionEngine {
             );
         }
 
-        ReconcileReport::from_raw(json!({
-            "status": "RECONCILED",
-            "mode": mode,
-            "discrepancies_found": discrepancies.len(),
-            "discrepancies": discrepancies,
-        }))
+        ReconcileReport {
+            status: ReconcileStatus::Reconciled,
+            mode: Some(mode),
+            reason: None,
+            local_open_trades: None,
+            discrepancies_found: discrepancies.len(),
+            discrepancies,
+        }
     }
 
     /// Runs a complete execution & portfolio management cycle (`engine/execution.py::reconcile_cycle`).

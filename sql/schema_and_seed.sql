@@ -91,6 +91,12 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('chandelier_atr_multiplier_long', '3.0', 'float', 'stops', 'Chandelier trailing stop ATR multiplier for Long positions'),
     ('chandelier_atr_multiplier_short', '3.8', 'float', 'stops', 'Inverted Chandelier trailing stop ATR multiplier for Short positions'),
     ('polling_interval_seconds', '15', 'int', 'orchestrator', 'Main engine ingestion and signal evaluation loop interval in seconds'),
+    ('pit_tick_interval_seconds', '900', 'int', 'orchestrator', 'Async daemon Book A (Pit) evaluation cadence in seconds (R4-M1)'),
+    ('pond_tick_interval_seconds', '15', 'int', 'pond', 'Async daemon Book B (Pond) fast intrabar stop/scan tick cadence in seconds (R4-M1)'),
+    ('btc_fallback_base_price_usdc', '95000.0', 'float', 'execution', 'Configured fallback BTC/USDC base price when no prior BTC market bars exist in PAPER/TESTNET mode (R4-N1)'),
+    ('pond_volume_min_bars_per_day', '12', 'int', 'pond', 'Minimum 1H bars required within a UTC calendar day bucket for daily volume aggregation (R4-N6)'),
+    ('stranded_transfer_alert_cooldown_ms', '300000', 'int', 'settling', 'Minimum cooldown in milliseconds between repeated alerts for stranded PARTIAL/AMBIGUOUS book transfers (R4-QB)'),
+    ('pending_transfer_stale_ttl_ms', '120000', 'int', 'settling', 'Age threshold in milliseconds after which an in-flight PENDING book transfer is flagged as stale (R4-QB)'),
     ('ohlcv_fetch_limit', '600', 'int', 'orchestrator', 'Number of historical candles fetched per symbol (>= 540 HMM bars)'),
     ('calibration_walk_forward_days', '90', 'int', 'calibration', 'Walk-forward window in days for per-asset timeframe calibration'),
     ('web_server_port', '8000', 'int', 'web', 'FastAPI REST + SSE telemetry server listening port');

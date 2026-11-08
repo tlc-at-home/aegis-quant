@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
     about = "Aegis Quant PP-50 Two-Book Crypto Quantitative Trading & Portfolio Management Platform (Hyperliquid L1)"
 )]
 struct Cli {
-    /// Path to SQLite WAL database (`data/aegis.db`)
-    #[arg(long, global = true)]
+    /// Path to SQLite WAL database (`data/aegis.db`; accepts `--db` or `--db-path`)
+    #[arg(long = "db", visible_alias = "db-path", global = true)]
     db: Option<PathBuf>,
 
     /// Which book(s) to run (`pit`, `pond`, or `both`)
@@ -120,7 +120,7 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..008_*.sql`)
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..009_*.sql`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -139,7 +139,7 @@ enum Commands {
         /// Generate a fresh 32-byte URL-safe base64 Fernet master key
         #[arg(long)]
         generate_key: bool,
-        /// Decrypt and display the active `web_api_token` from `system_config` (or generate one if empty)
+        /// Read-only decrypt and print the existing `web_api_token` from `system_config` to stdout (WARNING: prints bearer secret in plaintext)
         #[arg(long)]
         show_web_token: bool,
     },
@@ -269,7 +269,7 @@ impl AegisOrchestrator {
         }
     }
 
-    /// Spawns Book A (`PitOrchestrator`) and Book B (`PondOrchestrator`) background Tokio tasks (`NQ-3`).
+    /// Spawns Book A (`PitOrchestrator`) and Book B (`PondOrchestrator`) background Tokio tasks (`NQ-3`, `R4-M1`).
     pub fn spawn_async_book_tasks(
         &self,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -277,7 +277,7 @@ impl AegisOrchestrator {
         let cfg = self
             .db
             .load_config_or_log_default("aegis-cli.spawn_async_book_tasks");
-        let pit_sec = cfg.get_i64("polling_interval_seconds", 15).max(1) as u64;
+        let pit_sec = cfg.get_i64("pit_tick_interval_seconds", 900).max(1) as u64;
         let pond_sec = cfg.get_i64("pond_tick_interval_seconds", 15).max(1) as u64;
         let pit_handle =
             aegis_pit::spawn_pit_task(self.pit.clone(), pit_sec, shutdown_rx.clone());
@@ -314,15 +314,23 @@ impl AegisOrchestrator {
                 );
             }
         }
+        if let Ok(stranded) = self.db.check_and_record_stranded_transfer_alert() {
+            if !stranded.is_empty() {
+                let ids: Vec<i64> = stranded.iter().map(|r| r.transfer_id).collect();
+                let _ = self.execution.alerts.notify_critical_event(
+                    "STRANDED_BOOK_TRANSFER",
+                    &format!(
+                        "{} book_transfers row(s) require operator reconciliation or have been PENDING past TTL: {:?}",
+                        stranded.len(),
+                        ids
+                    ),
+                    Some(json!({ "transfer_ids": ids })),
+                );
+            }
+        }
         let recon = self.execution.reconcile_exchange_state(None, None);
-        let recon_status = recon
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("UNKNOWN");
-        let recon_disc = recon
-            .get("discrepancies_found")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let recon_status = recon.status.as_str();
+        let recon_disc = recon.discrepancies_found;
         tracing::info!(
             "Startup exchange reconciliation: status={recon_status} discrepancies={recon_disc}"
         );
@@ -350,6 +358,20 @@ impl AegisOrchestrator {
 
         if is_live_mode || (self.cycle_count > 1 && self.cycle_count.is_multiple_of(20)) {
             let _ = self.execution.reconcile_exchange_state(None, None);
+        }
+        if let Ok(stranded) = self.db.check_and_record_stranded_transfer_alert() {
+            if !stranded.is_empty() {
+                let ids: Vec<i64> = stranded.iter().map(|r| r.transfer_id).collect();
+                let _ = self.execution.alerts.notify_critical_event(
+                    "STRANDED_BOOK_TRANSFER",
+                    &format!(
+                        "{} book_transfers row(s) require operator reconciliation or have been PENDING past TTL: {:?}",
+                        stranded.len(),
+                        ids
+                    ),
+                    Some(json!({ "transfer_ids": ids })),
+                );
+            }
         }
         if self.cycle_count.is_multiple_of(240) {
             if let Err(e) = self.db.prune_retention_data() {
@@ -505,7 +527,7 @@ pub fn run_readiness_suite(
         let fk_on: i64 = conn
             .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
             .unwrap_or(0);
-        let sv = db.get_schema_version().unwrap_or(0);
+        let sv = db.get_schema_version().unwrap_or(-1);
         let uc = db.get_usdc_perp_universe().map(|v| v.len()).unwrap_or(0);
         let sc = db.get_btc_synth_universe().map(|v| v.len()).unwrap_or(0);
         let pc = db.get_alt_pairs_universe().map(|v| v.len()).unwrap_or(0);
@@ -530,13 +552,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 8 {
+        status: if schema_ver >= 9 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 8 (migrations 001..008 applied)".to_string(),
+        requirement: "schema_version >= 9 (migrations 001..009 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -908,15 +930,8 @@ pub fn run_readiness_suite(
         json!({"szi": 2.5, "entryPx": 180.0, "markPx": 182.0, "unrealizedPnl": 5.0}),
     );
     let recon_res = exec_self.reconcile_exchange_state(Some(&sim_ex), Some(&[]));
-    let recon_status = recon_res
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("UNKNOWN")
-        .to_string();
-    let recon_disc = recon_res
-        .get("discrepancies_found")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let recon_status = recon_res.status.as_str().to_string();
+    let recon_disc = recon_res.discrepancies_found as u64;
     let recon_ok = recon_status == "RECONCILED" && recon_disc >= 1;
 
     checks.push(CheckResult {
@@ -1082,7 +1097,11 @@ fn main() -> anyhow::Result<()> {
             show_web_token,
         }) => {
             if show_web_token {
-                let token = db.get_or_create_web_api_token()?;
+                let token = db.get_existing_web_api_token()?.ok_or_else(|| {
+                    AegisError::Validation(
+                        "web_api_token is not initialized in system_config (run `aegis-quant db --init` or start the WebUI first)".to_string(),
+                    )
+                })?;
                 if json_out {
                     println!(
                         "{}",
@@ -1601,6 +1620,28 @@ mod tests {
                 ..
             })
         ));
+
+        // R4-N2: Both --db and --db-path are accepted globally
+        let cli_db = Cli::try_parse_from(["aegis-quant", "--db", "data/aegis_quant.db", "db"])
+            .expect("parse --db");
+        let cli_db_path =
+            Cli::try_parse_from(["aegis-quant", "--db-path", "data/aegis_quant.db", "db"])
+                .expect("parse --db-path");
+        assert_eq!(cli_db.db, cli_db_path.db);
+
+        // R4-N8: get_existing_web_api_token is strictly read-only when empty
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        assert_eq!(
+            db.get_existing_web_api_token().unwrap(),
+            None,
+            "get_existing_web_api_token must not create or mutate an empty web_api_token (R4-N8)"
+        );
+        let generated = db.get_or_create_web_api_token().unwrap();
+        assert_eq!(
+            db.get_existing_web_api_token().unwrap(),
+            Some(generated)
+        );
 
         // --initial-split validation (R3-H22: both halves must be finite and > 0.0)
         assert_eq!(

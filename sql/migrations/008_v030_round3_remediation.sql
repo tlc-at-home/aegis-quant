@@ -18,12 +18,18 @@ ALTER TABLE book_transfers ADD COLUMN leg1_tx_ref TEXT;
 ALTER TABLE book_transfers ADD COLUMN leg2_tx_ref TEXT;
 ALTER TABLE book_transfers ADD COLUMN legs_completed INTEGER NOT NULL DEFAULT 0;
 
--- Clean up any historical dry-run rows that recorded status = 'PARTIAL_IDLE_CAPPED' (R3-H5)
+-- Clean up any rows explicitly tagged with DRY_RUN in tx_ref / transfer_mode (R3-H5).
+-- Note (R4-H2): Pre-v8 dry-run rows whose virtual tx_ref was plain '0x...' are reclassified
+-- via telemetry correlation in 009_v030_round4_remediation.sql (or excluded via equity_baseline_reset_at).
 UPDATE book_transfers
 SET status = 'DRY_RUN',
     transfer_mode = 'DRY_RUN'
 WHERE status = 'PARTIAL_IDLE_CAPPED'
-  AND (COALESCE(tx_ref, '') LIKE '%DRY_RUN%' OR COALESCE(transfer_mode, '') LIKE 'DRY_RUN%');
+  AND (
+      COALESCE(tx_ref, '') LIKE '%DRY_RUN%'
+      OR LOWER(COALESCE(tx_ref, '')) LIKE 'dryrun-%'
+      OR COALESCE(transfer_mode, '') LIKE 'DRY_RUN%'
+  );
 
 UPDATE book_transfers
 SET transfer_mode = 'DRY_RUN'

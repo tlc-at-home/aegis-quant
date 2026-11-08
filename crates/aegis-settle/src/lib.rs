@@ -5,8 +5,8 @@
 //! Zero Forced Liquidation) and Invariant F1 (Zero dependency on book strategy crates).
 
 use aegis_core::{
-    compute_drift_bps, now_iso8601_utc, round_dp, AegisError, BookTransfer, Pp50PlatformSnapshot,
-    Result,
+    compute_drift_bps, now_iso8601_utc, round_dp, AegisError, BookTransfer, BookTransferStatus,
+    Bps, Pp50PlatformSnapshot, Result, Usdc,
 };
 use aegis_db::DatabaseManager;
 use aegis_execution::ExecutionEngine;
@@ -120,7 +120,7 @@ impl SettleController {
         Ok((pit_eq, pit_idle, pond_eq, pond_idle))
     }
 
-    /// Executes the 5-Phase 00:05 UTC Settling Protocol.
+    /// Executes the 5-Phase 00:05 UTC Settling Protocol (`R3-QA`, `R4-H1`, `R4-QA`, `R4-QB`).
     pub fn run_settling(&self, overrides: SettleOverrideInput) -> Result<SettleRunResult> {
         let cfg = self.db.load_config()?;
         let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
@@ -146,39 +146,56 @@ impl SettleController {
         }
 
         let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
-        let deadband_bps = DatabaseManager::resolve_settling_deadband_bps(&cfg);
+        let deadband_bps = Bps(DatabaseManager::resolve_settling_deadband_bps(&cfg));
         let settling_enabled = cfg.get_bool("settling_enabled", true);
         let settling_kill_switch = cfg.get_bool("settling_kill_switch", false);
         let max_retries = cfg.get_i64("settling_max_retries", 3).max(1) as usize;
-        let initial_platform_eq = cfg.get_f64("initial_equity_usdc", 10000.0).max(1.0);
+        let initial_platform_eq = Usdc(cfg.get_f64("initial_equity_usdc", 10000.0).max(1.0));
         let champion_id = cfg.get_str("pond_champion_active", "NPS-01");
         let max_cells = cfg.get_i64("pond_max_concurrent_cells", 8);
 
         // Phase 1: Pre-Freeze Audit — activate RAII SettleGateGuard with DB mutex lock (C2, NH-10, NM-3)
         let mut gate_guard = SettleGateGuard::activate(&self.db, self.telemetry.as_ref())?;
-        // R3-B3: Reconcile any stale PENDING book_transfers left over from a prior crash before inspecting books
+        // R3-B3 & R4-H1: Reconcile any stale PENDING book_transfers left over from a prior crash before inspecting books
         let _ = self.db.reconcile_pending_book_transfers();
+        // R4-QB: Check for any unresolved PARTIAL or AMBIGUOUS transfers and emit a critical alert
+        if let Ok(stranded) = self.db.check_and_record_stranded_transfer_alert() {
+            if !stranded.is_empty() {
+                let ids: Vec<i64> = stranded.iter().map(|t| t.transfer_id).collect();
+                let _ = self.execution.alerts.notify_critical_event(
+                    "STRANDED_BOOK_TRANSFER",
+                    &format!(
+                        "{} book_transfers row(s) in PARTIAL/AMBIGUOUS state require manual reconciliation (ids={ids:?})",
+                        stranded.len()
+                    ),
+                    Some(json!({"transfer_ids": ids, "count": stranded.len()})),
+                );
+            }
+        }
 
         let (db_pit_eq, db_pit_idle, db_pond_eq, db_pond_idle) = self.inspect_books_state()?;
-        let pit_before = round_dp(overrides.pit_equity_usdc.unwrap_or(db_pit_eq).max(0.0), 2);
-        let pond_before = round_dp(overrides.pond_equity_usdc.unwrap_or(db_pond_eq).max(0.0), 2);
-        let total_equity = round_dp(pit_before + pond_before, 2);
+        let pit_before = Usdc(overrides.pit_equity_usdc.unwrap_or(db_pit_eq).max(0.0)).round_cents();
+        let pond_before = Usdc(overrides.pond_equity_usdc.unwrap_or(db_pond_eq).max(0.0)).round_cents();
+        let total_equity = (pit_before + pond_before).round_cents();
 
-        // Phase 2: Drift & Dead-Band Evaluation (Q3, R3-N15)
-        let target_pit = round_dp(total_equity * split_pct, 2);
+        // Phase 2: Drift & Dead-Band Evaluation (Q3, R3-N15, R3-QA)
+        let target_pit = (total_equity * split_pct).round_cents();
         let target_each = target_pit;
 
         let diff_pit = pit_before - target_pit;
-        let drift_bps = round_dp(compute_drift_bps(pit_before, total_equity, split_pct), 2);
+        let drift_bps = Bps(round_dp(
+            compute_drift_bps(pit_before.0, total_equity.0, split_pct),
+            2,
+        ));
 
-        let (from_book, to_book, pre_from, pre_to, rich_idle_default) = if diff_pit >= 0.0 {
+        let (from_book, to_book, pre_from, pre_to, rich_idle_default) = if diff_pit.0 >= 0.0 {
             (
                 "PIT".to_string(),
                 "POND".to_string(),
                 pit_before,
                 pond_before,
                 if overrides.pit_equity_usdc.is_some() {
-                    pit_before
+                    pit_before.0
                 } else {
                     db_pit_idle
                 },
@@ -190,26 +207,26 @@ impl SettleController {
                 pond_before,
                 pit_before,
                 if overrides.pond_equity_usdc.is_some() {
-                    pond_before
+                    pond_before.0
                 } else {
                     db_pond_idle
                 },
             )
         };
 
-        let available_idle = round_dp(
+        let available_idle = Usdc(
             overrides
                 .rich_idle_usdc
                 .unwrap_or(rich_idle_default)
                 .max(0.0),
-            2,
-        );
-        let required_transfer = round_dp(diff_pit.abs(), 2);
+        )
+        .round_cents();
+        let required_transfer = diff_pit.abs().round_cents();
 
         let now_str = now_iso8601_utc();
-        let status: String;
-        let executed_transfer: f64;
-        let blocked_remainder: f64;
+        let status: BookTransferStatus;
+        let executed_transfer: Usdc;
+        let blocked_remainder: Usdc;
         let mut tx_hash: Option<String> = None;
         let mut transfer_mode_used = if overrides.dry_run {
             "DRY_RUN_SIMULATED".to_string()
@@ -220,26 +237,28 @@ impl SettleController {
         let mut pending_transfer_id: Option<i64> = None;
 
         if !settling_enabled || settling_kill_switch {
-            status = "BLOCKED_ZERO_IDLE".to_string();
-            executed_transfer = 0.0;
+            status = BookTransferStatus::SkippedNoIdle;
+            executed_transfer = Usdc::ZERO;
             blocked_remainder = required_transfer;
-        } else if drift_bps <= deadband_bps || required_transfer <= 0.0 {
-            status = "SKIPPED_DEADBAND".to_string();
-            executed_transfer = 0.0;
-            blocked_remainder = 0.0;
+        } else if drift_bps <= deadband_bps || required_transfer <= Usdc::ZERO {
+            status = BookTransferStatus::SkippedWithinBand;
+            executed_transfer = Usdc::ZERO;
+            blocked_remainder = Usdc::ZERO;
         } else {
             // Phase 3: Idle-Only Transfer Execution (Invariant F5: Never liquidate open positions)
-            executed_transfer = round_dp(required_transfer.min(available_idle), 2);
-            blocked_remainder = round_dp((required_transfer - executed_transfer).max(0.0), 2);
-            if overrides.dry_run && blocked_remainder > 0.0 {
+            executed_transfer = required_transfer.min(available_idle).round_cents();
+            blocked_remainder = (required_transfer - executed_transfer)
+                .max(Usdc::ZERO)
+                .round_cents();
+            if overrides.dry_run && blocked_remainder > Usdc::ZERO {
                 transfer_mode_used = "DRY_RUN_PARTIAL_IDLE_CAPPED".to_string();
             }
 
-            if executed_transfer <= 0.0 {
+            if executed_transfer <= Usdc::ZERO {
                 status = if overrides.dry_run {
-                    "DRY_RUN".to_string()
+                    BookTransferStatus::DryRun
                 } else {
-                    "PARTIAL_IDLE_CAPPED".to_string()
+                    BookTransferStatus::PartialIdleCapped
                 };
             } else {
                 // Q2 & NQ-3: Crash-safe pre-transfer ledger persistence in PENDING state before network call
@@ -248,15 +267,15 @@ impl SettleController {
                     settle_date: now_str.clone(),
                     from_book: from_book.clone(),
                     to_book: to_book.clone(),
-                    amount_usdc: executed_transfer,
-                    pre_from_usdc: Some(pre_from),
-                    pre_to_usdc: Some(pre_to),
-                    post_from_usdc: Some(pre_from),
-                    post_to_usdc: Some(pre_to),
-                    drift_bps_before: Some(drift_bps),
-                    drift_bps_after: Some(drift_bps),
-                    blocked_remainder_usdc: blocked_remainder,
-                    status: "PENDING".to_string(),
+                    amount_usdc: executed_transfer.0,
+                    pre_from_usdc: Some(pre_from.0),
+                    pre_to_usdc: Some(pre_to.0),
+                    post_from_usdc: Some(pre_from.0),
+                    post_to_usdc: Some(pre_to.0),
+                    drift_bps_before: Some(drift_bps.0),
+                    drift_bps_after: Some(drift_bps.0),
+                    blocked_remainder_usdc: blocked_remainder.0,
+                    status: BookTransferStatus::Pending.as_str().to_string(),
                     attempts: 0,
                     tx_ref: None,
                     created_at: now_str.clone(),
@@ -274,14 +293,15 @@ impl SettleController {
                         pending_transfer_id,
                         &from_book,
                         &to_book,
-                        executed_transfer,
+                        executed_transfer.0,
                         overrides.dry_run,
                     ) {
                         Ok(res) => {
-                            tx_hash = res
-                                .get("tx_hash")
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string);
+                            tx_hash = if res.tx_hash.is_empty() {
+                                None
+                            } else {
+                                Some(res.tx_hash)
+                            };
                             transfer_ok = true;
                             break;
                         }
@@ -297,36 +317,90 @@ impl SettleController {
                     }
                 }
                 if !transfer_ok {
-                    status = "FAILED".to_string();
-                    let _ = self.db.log_telemetry(
-                        "ERROR",
-                        "aegis-settle.transfer",
-                        &format!(
-                            "Subaccount transfer ${executed_transfer:.2} {from_book}->{to_book} failed after {attempts_count} attempt(s): {last_err}"
-                        ),
-                        None,
-                    );
-                } else if blocked_remainder > 0.0 {
-                    status = "PARTIAL_IDLE_CAPPED".to_string();
+                    let leg1_persisted = pending_transfer_id
+                        .and_then(|tid| self.db.get_book_transfer_leg_progress(tid).ok())
+                        .and_then(|(legs, l1_ref, _)| {
+                            if legs == 1 || l1_ref.is_some() {
+                                Some(l1_ref.unwrap_or_else(|| "leg1-completed".to_string()))
+                            } else {
+                                None
+                            }
+                        });
+                    if last_err.contains("PARTIAL_LEG1_COMPLETED") || leg1_persisted.is_some() {
+                        status = BookTransferStatus::Partial;
+                        let ref_note = leg1_persisted
+                            .map(|r| format!("PARTIAL_LEG1_ONLY:{r}"))
+                            .unwrap_or_else(|| format!("PARTIAL_LEG1_ONLY:{last_err}"));
+                        tx_hash = Some(ref_note.clone());
+                        let msg = format!(
+                            "CRITICAL: 2-leg subAccountTransfer ${:.2} {from_book}->{to_book} stranded in PARTIAL state (leg 1 succeeded, leg 2 failed): {last_err}",
+                            executed_transfer.0
+                        );
+                        let _ = self.db.log_telemetry(
+                            "ERROR",
+                            "aegis-settle.transfer",
+                            &msg,
+                            Some(json!({"transfer_id": pending_transfer_id, "status": "PARTIAL", "tx_ref": ref_note})),
+                        );
+                        let _ = self.execution.alerts.notify_critical_event(
+                            "SETTLE_PARTIAL_TRANSFER",
+                            &msg,
+                            Some(json!({"transfer_id": pending_transfer_id, "from_book": from_book, "to_book": to_book, "amount_usdc": executed_transfer.0})),
+                        );
+                    } else if last_err.contains("AMBIGUOUS_POST_SEND") {
+                        status = BookTransferStatus::Ambiguous;
+                        let ref_note = format!("AMBIGUOUS_POST_SEND:{last_err}");
+                        tx_hash = Some(ref_note.clone());
+                        let msg = format!(
+                            "CRITICAL: subAccountTransfer ${:.2} {from_book}->{to_book} in AMBIGUOUS state after post-send timeout: {last_err}",
+                            executed_transfer.0
+                        );
+                        let _ = self.db.log_telemetry(
+                            "ERROR",
+                            "aegis-settle.transfer",
+                            &msg,
+                            Some(json!({"transfer_id": pending_transfer_id, "status": "AMBIGUOUS", "tx_ref": ref_note})),
+                        );
+                        let _ = self.execution.alerts.notify_critical_event(
+                            "SETTLE_AMBIGUOUS_TRANSFER",
+                            &msg,
+                            Some(json!({"transfer_id": pending_transfer_id, "from_book": from_book, "to_book": to_book, "amount_usdc": executed_transfer.0})),
+                        );
+                    } else {
+                        status = BookTransferStatus::Failed;
+                        let _ = self.db.log_telemetry(
+                            "ERROR",
+                            "aegis-settle.transfer",
+                            &format!(
+                                "Subaccount transfer ${:.2} {from_book}->{to_book} failed after {attempts_count} attempt(s): {last_err}",
+                                executed_transfer.0
+                            ),
+                            None,
+                        );
+                    }
+                } else if blocked_remainder > Usdc::ZERO {
+                    status = BookTransferStatus::PartialIdleCapped;
                 } else if overrides.dry_run {
-                    status = "DRY_RUN".to_string();
+                    status = BookTransferStatus::DryRun;
                 } else {
-                    status = "COMPLETED".to_string();
+                    status = BookTransferStatus::Completed;
                 }
             }
         }
 
-        // Phase 4: Post-Transfer Verification & Book Equity Update
-        let (pit_after, pond_after) = if executed_transfer > 0.0 && status != "FAILED" {
+        // Phase 4: Post-Transfer Verification & Book Equity Update (R4-H1: Never adjust equities on FAILED, PARTIAL, or AMBIGUOUS)
+        let transfer_effective = executed_transfer > Usdc::ZERO
+            && (status.is_ledger_counted() || status == BookTransferStatus::DryRun);
+        let (pit_after, pond_after) = if transfer_effective {
             if from_book == "PIT" {
                 (
-                    round_dp(pit_before - executed_transfer, 2),
-                    round_dp(pond_before + executed_transfer, 2),
+                    (pit_before - executed_transfer).round_cents(),
+                    (pond_before + executed_transfer).round_cents(),
                 )
             } else {
                 (
-                    round_dp(pit_before + executed_transfer, 2),
-                    round_dp(pond_before - executed_transfer, 2),
+                    (pit_before + executed_transfer).round_cents(),
+                    (pond_before - executed_transfer).round_cents(),
                 )
             }
         } else {
@@ -339,23 +413,26 @@ impl SettleController {
             (pond_after, pit_after)
         };
 
-        let drift_bps_after = round_dp(compute_drift_bps(pit_after, total_equity, split_pct), 2);
-        let db_status = if overrides.dry_run && status == "PARTIAL_IDLE_CAPPED" {
-            "DRY_RUN"
+        let drift_bps_after = Bps(round_dp(
+            compute_drift_bps(pit_after.0, total_equity.0, split_pct),
+            2,
+        ));
+        let db_status = if overrides.dry_run && status == BookTransferStatus::PartialIdleCapped {
+            BookTransferStatus::DryRun
         } else {
-            status.as_str()
+            status
         };
 
         let transfer_id = if let Some(tid) = pending_transfer_id {
             self.db.update_book_transfer_status(
                 tid,
-                db_status,
+                db_status.as_str(),
                 tx_hash.as_deref(),
                 attempts_count,
-                Some(post_from),
-                Some(post_to),
-                Some(drift_bps_after),
-                blocked_remainder,
+                Some(post_from.0),
+                Some(post_to.0),
+                Some(drift_bps_after.0),
+                blocked_remainder.0,
             )?;
             tid
         } else {
@@ -364,15 +441,15 @@ impl SettleController {
                 settle_date: now_str.clone(),
                 from_book: from_book.clone(),
                 to_book: to_book.clone(),
-                amount_usdc: executed_transfer,
-                pre_from_usdc: Some(pre_from),
-                pre_to_usdc: Some(pre_to),
-                post_from_usdc: Some(post_from),
-                post_to_usdc: Some(post_to),
-                drift_bps_before: Some(drift_bps),
-                drift_bps_after: Some(drift_bps_after),
-                blocked_remainder_usdc: blocked_remainder,
-                status: status.clone(),
+                amount_usdc: executed_transfer.0,
+                pre_from_usdc: Some(pre_from.0),
+                pre_to_usdc: Some(pre_to.0),
+                post_from_usdc: Some(post_from.0),
+                post_to_usdc: Some(post_to.0),
+                drift_bps_before: Some(drift_bps.0),
+                drift_bps_after: Some(drift_bps_after.0),
+                blocked_remainder_usdc: blocked_remainder.0,
+                status: db_status.as_str().to_string(),
                 attempts: attempts_count,
                 tx_ref: tx_hash.clone(),
                 created_at: now_str.clone(),
@@ -387,56 +464,61 @@ impl SettleController {
         // Phase 5: Snapshot Persistence & Formatted Daily Report Line
         let open_trades = self.db.get_open_trades().unwrap_or_default();
         let open_cells = self.db.get_open_pond_cells().unwrap_or_default();
-        let pond_heat: f64 = open_cells
-            .iter()
-            .map(|c| c.risk_budget_usdc.unwrap_or(0.0))
-            .sum::<f64>()
-            .max(0.0);
+        let pond_heat = Usdc(
+            open_cells
+                .iter()
+                .map(|c| c.risk_budget_usdc.unwrap_or(0.0))
+                .sum::<f64>()
+                .max(0.0),
+        );
 
-        let settle_desc = if executed_transfer > 0.0 && status != "FAILED" {
-            if blocked_remainder > 0.0 {
+        let status_str = status.as_str().to_string();
+        let settle_desc = if transfer_effective {
+            if blocked_remainder > Usdc::ZERO {
                 format!(
-                    "${executed_transfer:.2} {from_book}->{to_book} (${blocked_remainder:.2} blocked)"
+                    "${:.2} {from_book}->{to_book} (${:.2} blocked)",
+                    executed_transfer.0, blocked_remainder.0
                 )
             } else {
-                format!("${executed_transfer:.2} {from_book}->{to_book}")
+                format!("${:.2} {from_book}->{to_book}", executed_transfer.0)
             }
         } else {
-            format!("$0.00 ({status})")
+            format!("$0.00 ({status_str})")
         };
 
         let day_idx = overrides.day_index.unwrap_or(1);
-        let pct_return = ((total_equity - initial_platform_eq) / initial_platform_eq) * 100.0;
+        let pct_return =
+            ((total_equity.0 - initial_platform_eq.0) / initial_platform_eq.0) * 100.0;
         let report_line = format!(
             "PP-50 D+{:02} | platform ${:.2} ({:+.2}%) | PIT ${:.2} | POND ${:.2} | drift {:.1} bps | settle: {} | cells: {}/{} (heat ${:.0}) | champion {}",
             day_idx,
-            total_equity,
+            total_equity.0,
             pct_return,
-            pit_after,
-            pond_after,
-            drift_bps,
+            pit_after.0,
+            pond_after.0,
+            drift_bps.0,
             settle_desc,
             open_cells.len(),
             max_cells,
-            pond_heat.abs(),
+            pond_heat.0.abs(),
             champion_id
         );
 
         let snap_row = Pp50PlatformSnapshot {
             snapshot_id: None,
             timestamp_ms: self.db.now_ms(),
-            platform_equity_usdc: total_equity,
-            pit_equity_usdc: pit_after,
-            pond_equity_usdc: pond_after,
-            split_pct: if total_equity > 0.0 {
-                round_dp(pit_after / total_equity, 4)
+            platform_equity_usdc: total_equity.0,
+            pit_equity_usdc: pit_after.0,
+            pond_equity_usdc: pond_after.0,
+            split_pct: if total_equity > Usdc::ZERO {
+                round_dp(pit_after.0 / total_equity.0, 4)
             } else {
                 0.5
             },
-            drift_bps: drift_bps_after,
+            drift_bps: drift_bps_after.0,
             pit_open_count: open_trades.len() as i64,
             pond_open_cells: open_cells.len() as i64,
-            settling_status: status.clone(),
+            settling_status: status_str.clone(),
             created_at: Some(now_str),
         };
         let snapshot_id = self.db.save_pp50_platform_snapshot(&snap_row)?;
@@ -449,9 +531,11 @@ impl SettleController {
                 Some(json!({
                     "transfer_id": transfer_id,
                     "snapshot_id": snapshot_id,
-                    "status": status,
-                    "executed_transfer_usdc": executed_transfer,
-                    "blocked_remainder_usdc": blocked_remainder,
+                    "status": status_str,
+                    "dry_run": overrides.dry_run,
+                    "transfer_mode": transfer_mode_used,
+                    "executed_transfer_usdc": executed_transfer.0,
+                    "blocked_remainder_usdc": blocked_remainder.0,
                 })),
             );
         }
@@ -459,21 +543,21 @@ impl SettleController {
         Ok(SettleRunResult {
             transfer_id,
             snapshot_id,
-            status,
+            status: status_str,
             from_book,
             to_book,
-            pit_equity_before: pit_before,
-            pond_equity_before: pond_before,
-            pit_equity_after: pit_after,
-            pond_equity_after: pond_after,
-            total_equity_usdc: total_equity,
-            target_each_usdc: target_each,
-            drift_bps,
-            deadband_bps,
-            required_transfer_usdc: required_transfer,
-            available_idle_usdc: available_idle,
-            executed_transfer_usdc: executed_transfer,
-            blocked_remainder_usdc: blocked_remainder,
+            pit_equity_before: pit_before.0,
+            pond_equity_before: pond_before.0,
+            pit_equity_after: pit_after.0,
+            pond_equity_after: pond_after.0,
+            total_equity_usdc: total_equity.0,
+            target_each_usdc: target_each.0,
+            drift_bps: drift_bps.0,
+            deadband_bps: deadband_bps.0,
+            required_transfer_usdc: required_transfer.0,
+            available_idle_usdc: available_idle.0,
+            executed_transfer_usdc: executed_transfer.0,
+            blocked_remainder_usdc: blocked_remainder.0,
             tx_hash,
             report_line,
         })
@@ -822,5 +906,163 @@ mod tests {
         // CONFIRMED row counts toward net book transfer adjustment, FAILED row does not
         assert!((db.get_net_book_transfer_adjustment("PIT").unwrap() - 150.0).abs() < 1e-6);
         assert!((db.get_net_book_transfer_adjustment("POND").unwrap() - (-150.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_r4_h1_qa_qb_partial_and_ambiguous_transfers_quarantined_and_alerted() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // 1. Seed a virtual ledger profit transfer in PAPER mode so drift exists when we switch to LIVE
+        let ctrl = SettleController::new(db.clone(), None);
+        ctrl.run_settling(SettleOverrideInput {
+            pit_equity_usdc: Some(4400.0),
+            pond_equity_usdc: Some(5600.0),
+            rich_idle_usdc: Some(2000.0),
+            day_index: Some(1),
+            dry_run: false,
+        })
+        .unwrap();
+
+        // 2. Test 2-leg PARTIAL_LEG1_COMPLETED failure injection through SettleController::run_settling:
+        // Spin up a local mock HTTP server where request 1 (leg 1) succeeds and request 2 (leg 2) fails.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = std::thread::spawn(move || {
+            for i in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = if i == 0 {
+                        r#"{"status":"ok","response":{"txHash":"0xleg1_live"}}"#
+                    } else {
+                        r#"{"status":"err","response":"leg 2 rejected by exchange"}"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+
+        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
+        let derived_wallet = aegis_core::derive_evm_address_from_private_key(pk).unwrap();
+        db.set_config_value("wallet_address", &json!(derived_wallet))
+            .unwrap();
+        db.set_config_value("private_key", &json!(pk)).unwrap();
+        db.set_config_value(
+            "pit_subaccount_address",
+            &json!("0x1111111111111111111111111111111111111111"),
+        )
+        .unwrap();
+        db.set_config_value(
+            "pond_subaccount_address",
+            &json!("0x2222222222222222222222222222222222222222"),
+        )
+        .unwrap();
+        db.set_config_value(
+            "hyperliquid_mainnet_url",
+            &json!(format!("http://{addr}")),
+        )
+        .unwrap();
+
+        let res_partial = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: None,
+                pond_equity_usdc: None,
+                rich_idle_usdc: None,
+                day_index: Some(2),
+                dry_run: false,
+            })
+            .unwrap();
+        let _ = server_handle.join();
+        assert_eq!(res_partial.status, "PARTIAL");
+        assert!((res_partial.pit_equity_after - res_partial.pit_equity_before).abs() < 1e-6);
+        assert!((res_partial.pond_equity_after - res_partial.pond_equity_before).abs() < 1e-6);
+
+        let recent_after_partial = db.get_recent_book_transfers(5).unwrap();
+        let partial_live_row = recent_after_partial
+            .iter()
+            .find(|r| r.transfer_id == res_partial.transfer_id)
+            .unwrap();
+        assert_eq!(partial_live_row.status, "PARTIAL");
+        assert_eq!(partial_live_row.attempts, 1);
+
+        // 3. Test AMBIGUOUS_POST_SEND failure injection pointing at an unreachable endpoint (127.0.0.1:1)
+        db.set_config_value("hyperliquid_mainnet_url", &json!("https://127.0.0.1:1"))
+            .unwrap();
+
+        let res_ambig = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: None,
+                pond_equity_usdc: None,
+                rich_idle_usdc: None,
+                day_index: Some(3),
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(res_ambig.status, "AMBIGUOUS");
+        assert!((res_ambig.pit_equity_after - res_ambig.pit_equity_before).abs() < 1e-6);
+        assert!((res_ambig.pond_equity_after - res_ambig.pond_equity_before).abs() < 1e-6);
+
+        let recent = db.get_recent_book_transfers(5).unwrap();
+        let row = recent
+            .iter()
+            .find(|r| r.transfer_id == res_ambig.transfer_id)
+            .unwrap();
+        assert_eq!(row.status, "AMBIGUOUS");
+        assert_eq!(row.attempts, 1);
+
+        // 4. Also insert a 1-leg completed PENDING row and verify reconcile_pending_book_transfers marks it PARTIAL
+        let tid_partial = db
+            .insert_book_transfer_with_mode(
+                &BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-08T00:05:10Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 200.0,
+                    pre_from_usdc: Some(5200.0),
+                    pre_to_usdc: Some(4800.0),
+                    post_from_usdc: Some(5200.0),
+                    post_to_usdc: Some(4800.0),
+                    drift_bps_before: Some(200.0),
+                    drift_bps_after: Some(200.0),
+                    blocked_remainder_usdc: 0.0,
+                    status: "PENDING".to_string(),
+                    attempts: 1,
+                    tx_ref: None,
+                    created_at: "2026-11-08T00:05:10Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.update_book_transfer_leg_progress(tid_partial, 1, Some("0xleg1_done"), None)
+            .unwrap();
+        assert_eq!(db.reconcile_pending_book_transfers().unwrap(), 1);
+        let after_recon = db.get_recent_book_transfers(10).unwrap();
+        let partial_row = after_recon
+            .iter()
+            .find(|r| r.transfer_id == tid_partial)
+            .unwrap();
+        assert_eq!(partial_row.status, "PARTIAL");
+
+        // All three (res_partial, res_ambig, tid_partial) are surfaced as stranded/unresolved
+        let stranded = db.get_stranded_or_unresolved_book_transfers().unwrap();
+        assert!(stranded.iter().any(|r| r.transfer_id == res_partial.transfer_id));
+        assert!(stranded.iter().any(|r| r.transfer_id == res_ambig.transfer_id));
+        assert!(stranded.iter().any(|r| r.transfer_id == tid_partial));
+
+        // Neither AMBIGUOUS nor PARTIAL row counts toward net book transfer adjustment (only the earlier $600 PAPER transfer)
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap() - 600.0).abs() < 1e-6);
+        assert!((db.get_net_book_transfer_adjustment("POND").unwrap() - (-600.0)).abs() < 1e-6);
     }
 }

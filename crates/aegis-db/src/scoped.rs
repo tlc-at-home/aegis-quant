@@ -5,9 +5,9 @@
 
 use crate::{ConfigMap, DatabaseManager};
 use aegis_core::{
-    AltPairMetadata, BookType, FirewallError, OhlcvBar, PondCell, PondChampion, PondDirectionPolicy,
-    PondScanCycle, PondUniverseRow, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord,
-    UniverseAsset,
+    AltPairMetadata, BookTransfer, BookType, FirewallError, OhlcvBar, PondCell, PondChampion,
+    PondDirectionPolicy, PondScanCycle, PondUniverseRow, PortfolioSnapshot, Result,
+    SignalEvaluation, TradeRecord, UniverseAsset,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +30,7 @@ pub struct PitConfig {
     pub max_concurrent_long_positions: usize,
     pub max_concurrent_short_positions: usize,
     pub polling_interval_seconds: u64,
+    pub pit_tick_interval_seconds: u64,
     pub ingest_lookback_bars: usize,
     pub platform_pp50_enabled: bool,
     pub platform_settle_gate_enabled: bool,
@@ -57,6 +58,7 @@ impl PitConfig {
             max_concurrent_long_positions: cfg.get_usize("max_concurrent_long_positions", 2),
             max_concurrent_short_positions: cfg.get_usize("max_concurrent_short_positions", 2),
             polling_interval_seconds: cfg.get_i64("polling_interval_seconds", 15).max(1) as u64,
+            pit_tick_interval_seconds: cfg.get_i64("pit_tick_interval_seconds", 900).max(1) as u64,
             ingest_lookback_bars: cfg.get_usize("ingest_lookback_bars", 120),
             platform_pp50_enabled: pp50_enabled,
             platform_settle_gate_enabled: cfg.get_bool("platform_settle_gate_enabled", false),
@@ -120,6 +122,7 @@ pub struct PondConfig {
     pub pond_blowoff_atr_mult: f64,
     pub pond_blowoff_3h_adverse_atr_mult: f64,
     pub pond_trend_veto_4h_atr_mult: f64,
+    pub pond_tick_interval_seconds: u64,
     pub platform_pp50_enabled: bool,
     pub platform_settle_gate_enabled: bool,
     pub platform_settle_gate_enabled_raw: bool,
@@ -185,6 +188,7 @@ impl PondConfig {
             pond_blowoff_atr_mult: cfg.get_f64("pond_blowoff_atr_mult", 3.0),
             pond_blowoff_3h_adverse_atr_mult: cfg.get_f64("pond_blowoff_3h_adverse_atr_mult", 2.2),
             pond_trend_veto_4h_atr_mult: cfg.get_f64("pond_trend_veto_4h_atr_mult", 2.5),
+            pond_tick_interval_seconds: cfg.get_i64("pond_tick_interval_seconds", 15).max(1) as u64,
             platform_pp50_enabled: cfg.get_bool("platform_pp50_enabled", false),
             platform_settle_gate_enabled: settle_gate,
             platform_settle_gate_enabled_raw: settle_gate,
@@ -303,6 +307,11 @@ impl BookScopedDb {
     /// Returns true if the daily settling gate is currently active and has not exceeded its TTL (`NH-10`).
     pub fn is_settle_gate_active(&self) -> Result<bool> {
         self.pool.is_settle_gate_active()
+    }
+
+    /// Checks whether any `PARTIAL` or `AMBIGUOUS` book transfers exist and records a cooldown-gated alert (`R4-QB`).
+    pub fn check_and_record_stranded_transfer_alert(&self) -> Result<Vec<BookTransfer>> {
+        self.pool.check_and_record_stranded_transfer_alert()
     }
 
     // --- Shared Read-Only / Telemetry Operations ---

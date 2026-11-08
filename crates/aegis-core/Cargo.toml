@@ -15,4 +15,5 @@ sha2.workspace = true
 sha3.workspace = true
 hex.workspace = true
 k256.workspace = true
+tracing.workspace = true
 

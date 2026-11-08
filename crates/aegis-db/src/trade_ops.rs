@@ -3,213 +3,17 @@
 
 use crate::DatabaseManager;
 use aegis_core::{
-    is_sensitive_config_key, round_dp, AegisError, AltPairMetadata, OhlcvBar, OrderFsmState,
-    PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
+    round_dp, AegisError, AltPairMetadata, OhlcvBar, OrderFsmState, PortfolioSnapshot, Result,
+    SignalEvaluation, TradeRecord, UniverseAsset,
+};
+pub use aegis_core::{
+    redact_embedded_url_secrets, sanitize_telemetry_details, sanitize_telemetry_message,
+    sanitize_telemetry_value,
 };
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
-
-/// Scrub any sensitive keys or inline credential literals from a JSON value before logging (`R3-B2`, `R3-B5`).
-fn sanitize_telemetry_value(val: &mut Value) {
-    match val {
-        Value::Object(map) => {
-            for (k, v) in map.iter_mut() {
-                if is_sensitive_config_key(k) {
-                    *v = Value::String("[REDACTED]".to_string());
-                } else {
-                    sanitize_telemetry_value(v);
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr.iter_mut() {
-                sanitize_telemetry_value(item);
-            }
-        }
-        Value::String(s) => {
-            *s = sanitize_telemetry_message(s);
-        }
-        _ => {}
-    }
-}
-
-fn is_url_token_delimiter(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '/' | '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
-}
-
-fn is_webhook_path_delimiter(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
-}
-
-fn redact_embedded_url_secrets(input: &str) -> String {
-    let mut out = input.to_string();
-
-    // 1. Redact Telegram bot URLs: `api.telegram.org/bot<token>` or `/bot<id>:<secret>`
-    let mut search_from = 0;
-    while search_from < out.len() {
-        let lower = out[search_from..].to_ascii_lowercase();
-        let Some(rel_idx) = lower.find("/bot") else {
-            break;
-        };
-        let token_start = search_from + rel_idx + 4;
-        if token_start >= out.len() {
-            break;
-        }
-        let rest = &out[token_start..];
-        let token_len = rest
-            .find(is_url_token_delimiter)
-            .unwrap_or(rest.len());
-        let token_candidate = &rest[..token_len];
-        let looks_like_bot_token = token_candidate != "[REDACTED]"
-            && !token_candidate.is_empty()
-            && (token_candidate.contains(':')
-                || out[..search_from + rel_idx]
-                    .to_ascii_lowercase()
-                    .ends_with("api.telegram.org"));
-        if looks_like_bot_token {
-            out.replace_range(token_start..token_start + token_len, "[REDACTED]");
-            search_from = token_start + "[REDACTED]".len();
-        } else {
-            search_from = token_start;
-        }
-    }
-
-    // 2. Redact Discord webhook URLs: `/api/webhooks/<id>/<token>`
-    let mut wh_from = 0;
-    while wh_from < out.len() {
-        let lower = out[wh_from..].to_ascii_lowercase();
-        let Some(rel_idx) = lower.find("/api/webhooks/") else {
-            break;
-        };
-        let path_start = wh_from + rel_idx + "/api/webhooks/".len();
-        if path_start >= out.len() {
-            break;
-        }
-        let rest = &out[path_start..];
-        let path_len = rest
-            .find(is_webhook_path_delimiter)
-            .unwrap_or(rest.len());
-        let candidate = &rest[..path_len];
-        if candidate != "[REDACTED]" && !candidate.is_empty() {
-            out.replace_range(path_start..path_start + path_len, "[REDACTED]");
-            wh_from = path_start + "[REDACTED]".len();
-        } else {
-            wh_from = path_start;
-        }
-    }
-
-    out
-}
-
-/// Scrub inline secret patterns (`private_key=...`, `private_key: ...`, `telegram_bot_token = ...`,
-/// embedded Telegram/Discord webhook URLs, etc.) from log strings (`R3-B2`, `R3-B5`).
-pub fn sanitize_telemetry_message(message: &str) -> String {
-    let mut sanitized = redact_embedded_url_secrets(message);
-    let lower = sanitized.to_ascii_lowercase();
-
-    const SENSITIVE_KEYS: &[&str] = &[
-        "hyperliquid_private_key",
-        "private_key",
-        "gemini_api_key",
-        "telegram_bot_token",
-        "bot_token",
-        "discord_webhook_url",
-        "webhook_url",
-        "web_api_token",
-        "web_auth_token",
-        "auth_token",
-        "aegis_master_key",
-        "master_key",
-    ];
-
-    let has_sensitive = SENSITIVE_KEYS.iter().any(|k| lower.contains(k));
-    if !has_sensitive {
-        return sanitized;
-    }
-
-    let mut keys_to_redact: Vec<&str> = SENSITIVE_KEYS.to_vec();
-    keys_to_redact.push("value");
-    keys_to_redact.push("val");
-
-    for key in keys_to_redact {
-        let mut search_from = 0;
-        while search_from < sanitized.len() {
-            let lower_slice = sanitized[search_from..].to_ascii_lowercase();
-            let Some(rel_idx) = lower_slice.find(key) else {
-                break;
-            };
-            let abs_idx = search_from + rel_idx;
-            // Ensure word boundary before short keys like `val` or `value`
-            if (key == "val" || key == "value") && abs_idx > 0 {
-                let prev = sanitized[..abs_idx].chars().next_back().unwrap_or(' ');
-                if prev.is_ascii_alphanumeric() || prev == '_' {
-                    search_from = abs_idx + key.len();
-                    continue;
-                }
-            }
-            let after_key = abs_idx + key.len();
-            if after_key >= sanitized.len() {
-                break;
-            }
-            let tail = &sanitized[after_key..];
-            let mut chars = tail.char_indices().peekable();
-            while let Some(&(_, c)) = chars.peek() {
-                if c == ' ' || c == '\t' || c == '"' || c == '\'' {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            let Some((_, sep)) = chars.next() else {
-                search_from = after_key;
-                continue;
-            };
-            if sep != '=' && sep != ':' {
-                search_from = after_key;
-                continue;
-            }
-            while let Some(&(_, c)) = chars.peek() {
-                if c == ' ' || c == '\t' {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            let val_rel_start = chars.peek().map(|&(i, _)| i).unwrap_or(tail.len());
-            let val_start = after_key + val_rel_start;
-            if val_start >= sanitized.len() {
-                break;
-            }
-            let rest = &sanitized[val_start..];
-            let (replace_start, replace_end) =
-                if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
-                    let inner = &rest[quote.len_utf8()..];
-                    let end_rel = inner.find(quote).unwrap_or(inner.len());
-                    (
-                        val_start + quote.len_utf8(),
-                        val_start + quote.len_utf8() + end_rel,
-                    )
-                } else {
-                    let end_rel = rest
-                        .find(|c: char| {
-                            c.is_whitespace() || matches!(c, ',' | ';' | ')' | '}' | ']' | '"' | '\'')
-                        })
-                        .unwrap_or(rest.len());
-                    (val_start, val_start + end_rel)
-                };
-            let current_val = &sanitized[replace_start..replace_end];
-            if current_val != "[REDACTED]" && !current_val.is_empty() {
-                sanitized.replace_range(replace_start..replace_end, "[REDACTED]");
-                search_from = replace_start + "[REDACTED]".len();
-            } else {
-                search_from = replace_end.max(after_key);
-            }
-        }
-    }
-    sanitized
-}
 
 impl DatabaseManager {
     pub fn get_usdc_perp_universe(&self) -> Result<Vec<UniverseAsset>> {
@@ -331,6 +135,10 @@ impl DatabaseManager {
         exec_timeframe: &str,
         rs_timeframe: &str,
     ) -> Result<()> {
+        aegis_core::parse_timeframe_seconds(exec_timeframe)?;
+        aegis_core::parse_timeframe_seconds(rs_timeframe)?;
+        let norm_exec = exec_timeframe.trim().to_ascii_lowercase();
+        let norm_rs = rs_timeframe.trim().to_ascii_lowercase();
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE universe_assets
@@ -338,7 +146,7 @@ impl DatabaseManager {
                      rs_timeframe = ?2,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
                  WHERE base_asset = ?3;",
-                params![exec_timeframe, rs_timeframe, base_asset],
+                params![norm_exec, norm_rs, base_asset],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(())
@@ -1042,6 +850,43 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(())
+        })
+    }
+
+    /// Atomically accrue hourly funding on an open PIT trade at most once per UTC hour bucket (`R4-N4`).
+    /// Returns `Ok(true)` if the funding delta was accrued, or `Ok(false)` if `hour_bucket` was already accrued.
+    pub fn accrue_trade_funding_for_hour(
+        &self,
+        trade_id: i64,
+        hour_bucket: i64,
+        mark_price: f64,
+        unrealized_pnl_usdc: f64,
+        delta_usdc: f64,
+    ) -> Result<bool> {
+        if !delta_usdc.is_finite() {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE trades
+                     SET current_price = ?1,
+                         unrealized_pnl_usdc = ?2,
+                         funding_accrued_usdc = ROUND(COALESCE(funding_accrued_usdc, 0.0) + ?3, 4),
+                         last_funding_hour_bucket = ?4
+                     WHERE trade_id = ?5
+                       AND status = 'OPEN'
+                       AND COALESCE(last_funding_hour_bucket, 0) < ?4;",
+                    params![
+                        mark_price,
+                        unrealized_pnl_usdc,
+                        delta_usdc,
+                        hour_bucket,
+                        trade_id
+                    ],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(updated > 0)
         })
     }
 

@@ -45,10 +45,47 @@ pub struct RestingOrderStatus {
     pub fee_usdc: f64,
 }
 
+/// Typed status for `SubaccountTransferResult` (`R3-QB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubaccountTransferStatus {
+    Executed,
+    Confirmed,
+    DryRunSimulated,
+}
+
+impl SubaccountTransferStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Executed => "EXECUTED",
+            Self::Confirmed => "CONFIRMED",
+            Self::DryRunSimulated => "DRY_RUN_SIMULATED",
+        }
+    }
+}
+
+impl std::fmt::Display for SubaccountTransferStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<&str> for SubaccountTransferStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
+    }
+}
+
+impl PartialEq<String> for SubaccountTransferStatus {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
+    }
+}
+
 /// Typed result of a Hyperliquid L1 or virtual-ledger inter-book transfer (`R3-B3`, `R3-QB`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SubaccountTransferResult {
-    pub status: String,
+    pub status: SubaccountTransferStatus,
     pub transfer_mode: String,
     pub from_book: String,
     pub to_book: String,
@@ -57,336 +94,219 @@ pub struct SubaccountTransferResult {
     pub leg_tx_hashes: Vec<String>,
     pub legs_executed: usize,
     pub dry_run: bool,
-    pub raw: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_response: Option<serde_json::Value>,
 }
 
-impl SubaccountTransferResult {
-    pub fn from_raw(raw: serde_json::Value) -> Self {
-        let status = raw
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let transfer_mode = raw
-            .get("transfer_mode")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let from_book = raw
-            .get("from_book")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let to_book = raw
-            .get("to_book")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let amount_usdc = raw
-            .get("amount_usdc")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        let tx_hash = raw
-            .get("tx_hash")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let leg_tx_hashes = raw
-            .get("leg_tx_hashes")
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                if tx_hash.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![tx_hash.clone()]
-                }
-            });
-        let legs_executed = raw
-            .get("legs_executed")
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(leg_tx_hashes.len());
-        let dry_run = raw
-            .get("dry_run")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        Self {
-            status,
-            transfer_mode,
-            from_book,
-            to_book,
-            amount_usdc,
-            tx_hash,
-            leg_tx_hashes,
-            legs_executed,
-            dry_run,
-            raw,
+/// Typed status for `VaultTransferResult` (`R3-QB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VaultTransferStatus {
+    Simulated,
+    Submitted,
+    Skipped,
+    Error,
+}
+
+impl VaultTransferStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Simulated => "SIMULATED",
+            Self::Submitted => "SUBMITTED",
+            Self::Skipped => "SKIPPED",
+            Self::Error => "ERROR",
         }
     }
 }
 
-impl Serialize for SubaccountTransferResult {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
+impl std::fmt::Display for VaultTransferStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
-impl std::ops::Deref for SubaccountTransferResult {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
+impl PartialEq<&str> for VaultTransferStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
-impl std::ops::Index<&str> for SubaccountTransferResult {
-    type Output = serde_json::Value;
-    fn index(&self, index: &str) -> &Self::Output {
-        &self.raw[index]
+impl PartialEq<String> for VaultTransferStatus {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
 /// Typed result of an HLP Vault deposit or withdrawal (`R3-QB`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VaultTransferResult {
-    pub status: String,
+    pub status: VaultTransferStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub vault_address: String,
     pub is_deposit: bool,
     pub amount_usdc: f64,
     pub usd_micro: i64,
-    pub raw: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_streak: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_response: Option<serde_json::Value>,
 }
 
-impl VaultTransferResult {
-    pub fn from_raw(raw: serde_json::Value) -> Self {
-        Self {
-            status: raw
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            vault_address: raw
-                .get("vault_address")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            is_deposit: raw
-                .get("is_deposit")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            amount_usdc: raw
-                .get("amount_usdc")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            usd_micro: raw
-                .get("usd_micro")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0),
-            raw,
+/// Typed status for `WalletEquitySyncResult` (`R3-QB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WalletEquitySyncStatus {
+    PaperDefault,
+    SyncedOnChain,
+    UnreachableFallback,
+}
+
+impl WalletEquitySyncStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PaperDefault => "PAPER_DEFAULT",
+            Self::SyncedOnChain => "SYNCED_ON_CHAIN",
+            Self::UnreachableFallback => "UNREACHABLE_FALLBACK",
         }
     }
 }
 
-impl Serialize for VaultTransferResult {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
+impl std::fmt::Display for WalletEquitySyncStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
-impl std::ops::Deref for VaultTransferResult {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
+impl PartialEq<&str> for WalletEquitySyncStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
-impl std::ops::Index<&str> for VaultTransferResult {
-    type Output = serde_json::Value;
-    fn index(&self, index: &str) -> &Self::Output {
-        &self.raw[index]
+impl PartialEq<String> for WalletEquitySyncStatus {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
 /// Typed result of on-chain wallet equity synchronization (`R3-QB`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalletEquitySyncResult {
-    pub status: String,
+    pub status: WalletEquitySyncStatus,
     pub wallet_address: String,
     pub network: String,
+    pub account_type: String,
+    pub wallet_balance_usdc: f64,
     pub total_equity_usdc: f64,
     pub perp_account_value_usdc: f64,
+    pub withdrawable_usdc: f64,
     pub vault_equity_usdc: f64,
-    pub raw: serde_json::Value,
 }
 
-impl WalletEquitySyncResult {
-    pub fn from_raw(raw: serde_json::Value) -> Self {
-        Self {
-            status: raw
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            wallet_address: raw
-                .get("wallet_address")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            network: raw
-                .get("network")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            total_equity_usdc: raw
-                .get("total_equity_usdc")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            perp_account_value_usdc: raw
-                .get("perp_account_value_usdc")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            vault_equity_usdc: raw
-                .get("vault_equity_usdc")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            raw,
+/// Typed status for `ReconcileReport` (`R3-QB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReconcileStatus {
+    Reconciled,
+    VerifiedPaper,
+    SkippedOffline,
+    ErrorDbUnavailable,
+}
+
+impl ReconcileStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reconciled => "RECONCILED",
+            Self::VerifiedPaper => "VERIFIED_PAPER",
+            Self::SkippedOffline => "SKIPPED_OFFLINE",
+            Self::ErrorDbUnavailable => "ERROR_DB_UNAVAILABLE",
         }
     }
 }
 
-impl Serialize for WalletEquitySyncResult {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
+impl std::fmt::Display for ReconcileStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
-impl std::ops::Deref for WalletEquitySyncResult {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
+impl PartialEq<&str> for ReconcileStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
-impl std::ops::Index<&str> for WalletEquitySyncResult {
-    type Output = serde_json::Value;
-    fn index(&self, index: &str) -> &Self::Output {
-        &self.raw[index]
+impl PartialEq<String> for ReconcileStatus {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
 /// Typed report of exchange clearinghouse state reconciliation (`R3-QB`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReconcileReport {
-    pub status: String,
+    pub status: ReconcileStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_open_trades: Option<usize>,
     pub discrepancies_found: usize,
     pub discrepancies: Vec<serde_json::Value>,
-    pub raw: serde_json::Value,
 }
 
-impl ReconcileReport {
-    pub fn from_raw(raw: serde_json::Value) -> Self {
-        let status = raw
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let discrepancies = raw
-            .get("discrepancies")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let discrepancies_found = raw
-            .get("discrepancies_found")
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(discrepancies.len());
-        Self {
-            status,
-            discrepancies_found,
-            discrepancies,
-            raw,
+/// Typed status for `FundingSyncReport` (`R3-QB`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FundingSyncStatus {
+    Synced,
+    AlreadySyncedThisHour,
+    NoOpenPositions,
+    Error,
+}
+
+impl FundingSyncStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Synced => "SYNCED",
+            Self::AlreadySyncedThisHour => "ALREADY_SYNCED_THIS_HOUR",
+            Self::NoOpenPositions => "NO_OPEN_POSITIONS",
+            Self::Error => "ERROR",
         }
     }
 }
 
-impl Serialize for ReconcileReport {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
+impl std::fmt::Display for FundingSyncStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
-impl std::ops::Deref for ReconcileReport {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
+impl PartialEq<&str> for FundingSyncStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
-impl std::ops::Index<&str> for ReconcileReport {
-    type Output = serde_json::Value;
-    fn index(&self, index: &str) -> &Self::Output {
-        &self.raw[index]
+impl PartialEq<String> for FundingSyncStatus {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str().eq_ignore_ascii_case(other.trim())
     }
 }
 
 /// Typed report of hourly funding payment synchronization (`R3-QB`).
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FundingSyncReport {
-    pub status: String,
+    pub status: FundingSyncStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub hour_bucket_ms: i64,
     pub positions_updated: usize,
     pub net_funding_delta_usdc: f64,
-    pub raw: serde_json::Value,
-}
-
-impl FundingSyncReport {
-    pub fn from_raw(raw: serde_json::Value) -> Self {
-        Self {
-            status: raw
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            hour_bucket_ms: raw
-                .get("hour_bucket_ms")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0),
-            positions_updated: raw
-                .get("positions_updated")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as usize,
-            net_funding_delta_usdc: raw
-                .get("net_funding_delta_usdc")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            raw,
-        }
-    }
-}
-
-impl Serialize for FundingSyncReport {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        self.raw.serialize(serializer)
-    }
-}
-
-impl std::ops::Deref for FundingSyncReport {
-    type Target = serde_json::Value;
-    fn deref(&self) -> &Self::Target {
-        &self.raw
-    }
-}
-
-impl std::ops::Index<&str> for FundingSyncReport {
-    type Output = serde_json::Value;
-    fn index(&self, index: &str) -> &Self::Output {
-        &self.raw[index]
-    }
 }
 
 pub type AssetIndexCache = Arc<Mutex<HashMap<(bool, String), (u32, i64)>>>;
@@ -1008,14 +928,14 @@ mod tests {
         db.initialize_schema(false).unwrap();
         let exec = ExecutionEngine::new(db);
         let sim_deposit = exec.execute_hlp_vault_transfer(100.0, true, Some(vault_addr));
-        assert_eq!(sim_deposit["status"], "SIMULATED");
-        assert_eq!(sim_deposit["usd_micro"], 100_000_000);
-        assert_eq!(sim_deposit["is_deposit"], true);
+        assert_eq!(sim_deposit.status, "SIMULATED");
+        assert_eq!(sim_deposit.usd_micro, 100_000_000);
+        assert!(sim_deposit.is_deposit);
 
         let sim_withdraw = exec.execute_hlp_vault_transfer(50.0, false, Some(vault_addr));
-        assert_eq!(sim_withdraw["status"], "SIMULATED");
-        assert_eq!(sim_withdraw["usd_micro"], 50_000_000);
-        assert_eq!(sim_withdraw["is_deposit"], false);
+        assert_eq!(sim_withdraw.status, "SIMULATED");
+        assert_eq!(sim_withdraw.usd_micro, 50_000_000);
+        assert!(!sim_withdraw.is_deposit);
     }
 
     #[test]
@@ -1134,6 +1054,7 @@ mod tests {
             fees_paid_usdc: 0.0,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: Some("2026-11-05T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1151,13 +1072,13 @@ mod tests {
         let resting_orders = vec![json!({"coin": "JUP", "oid": 99999})];
         let recon_resting =
             exec.reconcile_exchange_state(Some(&empty_on_chain), Some(&resting_orders));
-        assert_eq!(recon_resting["status"], "RECONCILED");
-        assert_eq!(recon_resting["discrepancies_found"], 0);
+        assert_eq!(recon_resting.status, "RECONCILED");
+        assert_eq!(recon_resting.discrepancies_found, 0);
         assert_eq!(db.get_open_pond_cells().unwrap().len(), 1);
 
         let recon = exec.reconcile_exchange_state(Some(&empty_on_chain), None);
-        assert_eq!(recon["status"], "RECONCILED");
-        assert_eq!(recon["discrepancies_found"], 1);
+        assert_eq!(recon.status, "RECONCILED");
+        assert_eq!(recon.discrepancies_found, 1);
         assert_eq!(db.get_open_pond_cells().unwrap().len(), 0);
         let closed_cells = db.get_pond_cells(10).unwrap();
         assert_eq!(closed_cells[0].state, "CLOSED");
@@ -1452,7 +1373,8 @@ mod tests {
             realized_pnl_usdc: 0.0,
             fees_paid_usdc: 0.0,
             exit_price: None,
-            exit_reason: Some("RESTING_OID:hl-777888".to_string()),
+            exit_reason: None,
+            resting_order_id: Some("hl-777888".to_string()),
             opened_at: Some("2026-11-08T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1469,5 +1391,141 @@ mod tests {
         // Must NOT cancel or flag the ARMED Pond resting order as an orphaned order!
         assert_eq!(recon.discrepancies_found, 0);
         assert!(recon.discrepancies.is_empty());
+    }
+
+    #[test]
+    fn test_r4_n6_n9_h2_utc_day_volume_median_and_subaccount_resume_guard() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // R4-H2: Dry-run virtual-ledger transfer prefixes tx_hash with "dryrun-0x"
+        let dry_res = exec
+            .execute_subaccount_transfer("PIT", "POND", 250.0, true)
+            .unwrap();
+        assert_eq!(dry_res.status, "DRY_RUN_SIMULATED");
+        assert!(dry_res.tx_hash.starts_with("dryrun-0x"));
+        assert!(dry_res.dry_run);
+
+        let real_virt_res = exec
+            .execute_subaccount_transfer("PIT", "POND", 250.0, false)
+            .unwrap();
+        assert_eq!(real_virt_res.status, "EXECUTED");
+        assert!(real_virt_res.tx_hash.starts_with("0x"));
+        assert!(!real_virt_res.dry_run);
+
+        // R4-N9: Calling execute_subaccount_transfer_for_record when already_completed >= legs.len()
+        // returns CONFIRMED immediately without making any HTTP call.
+        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
+        let derived_wallet = aegis_core::derive_evm_address_from_private_key(pk).unwrap();
+        db.set_config_value("wallet_address", &json!(derived_wallet))
+            .unwrap();
+        db.set_config_value("private_key", &json!(pk)).unwrap();
+        db.set_config_value(
+            "pit_subaccount_address",
+            &json!("0x1111111111111111111111111111111111111111"),
+        )
+        .unwrap();
+        db.set_config_value(
+            "pond_subaccount_address",
+            &json!("0x2222222222222222222222222222222222222222"),
+        )
+        .unwrap();
+        db.set_config_value("hyperliquid_mainnet_url", &json!("https://127.0.0.1:1"))
+            .unwrap();
+
+        let tid = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-08T00:05:00Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 200.0,
+                    pre_from_usdc: Some(5200.0),
+                    pre_to_usdc: Some(4800.0),
+                    post_from_usdc: Some(5200.0),
+                    post_to_usdc: Some(4800.0),
+                    drift_bps_before: Some(200.0),
+                    drift_bps_after: Some(200.0),
+                    blocked_remainder_usdc: 0.0,
+                    status: "PENDING".to_string(),
+                    attempts: 1,
+                    tx_ref: None,
+                    created_at: "2026-11-08T00:05:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.update_book_transfer_leg_progress(tid, 2, Some("0xleg1"), Some("0xleg2"))
+            .unwrap();
+
+        let confirmed = exec
+            .execute_subaccount_transfer_for_record(Some(tid), "PIT", "POND", 200.0, false)
+            .unwrap();
+        assert_eq!(confirmed.status, "CONFIRMED");
+        assert_eq!(confirmed.tx_hash, "0xleg2");
+        assert_eq!(confirmed.legs_executed, 2);
+
+        // R4-N6: UTC calendar-day bucketing for median daily volume handles missing hourly bar gaps cleanly
+        // Day 1 (UTC day 20000): 22 bars (2 hours missing due to API outage), each with 10_000 USDC notional => 220_000 USDC
+        // Day 2 (UTC day 20001): 24 bars, each with 20_000 USDC notional => 480_000 USDC
+        // Day 3 (UTC day 20002): 24 bars, each with 30_000 USDC notional => 720_000 USDC
+        // Median of [220_000, 480_000, 720_000] = 480_000 USDC (no cross-day sliding window contamination)
+        let mut bars = Vec::new();
+        let day1_base_ms = 20_000 * 86_400_000i64;
+        for h in 0..24 {
+            if h == 5 || h == 6 {
+                continue; // 2-hour outage gap on Day 1
+            }
+            bars.push(aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: day1_base_ms + h * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 100.0, // 100 * 100 = 10_000 USDC/hr
+                funding_rate_hourly: 0.0001,
+                is_synthetic: 0,
+            });
+        }
+        let day2_base_ms = 20_001 * 86_400_000i64;
+        for h in 0..24 {
+            bars.push(aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: day2_base_ms + h * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 200.0, // 200 * 100 = 20_000 USDC/hr
+                funding_rate_hourly: 0.0001,
+                is_synthetic: 0,
+            });
+        }
+        let day3_base_ms = 20_002 * 86_400_000i64;
+        for h in 0..24 {
+            bars.push(aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: day3_base_ms + h * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 300.0, // 300 * 100 = 30_000 USDC/hr
+                funding_rate_hourly: 0.0001,
+                is_synthetic: 0,
+            });
+        }
+        db.upsert_ohlcv_batch(&bars).unwrap();
+        let ingestion = MarketIngestionEngine::new(db.clone());
+        let median_vol =
+            ingestion.compute_median_daily_volume_from_bars("SOL/USDC:USDC", 50_000.0, 7);
+        assert!((median_vol - 480_000.0).abs() < 1e-6);
     }
 }

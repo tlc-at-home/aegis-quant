@@ -17,7 +17,8 @@ use crate::{
 };
 use aegis_alerts::AlertEngine;
 use aegis_backtest::BacktestEngine;
-use aegis_core::{is_immutable_security_config_key, PLATFORM_VERSION};
+pub use crate::payloads::validate_config_update;
+use aegis_core::PLATFORM_VERSION;
 use aegis_execution::ExecutionEngine;
 use aegis_pit::PitOrchestrator;
 use aegis_pond::PondOrchestrator;
@@ -38,35 +39,6 @@ use tokio_stream::{wrappers::IntervalStream, StreamExt};
 
 pub const EMBEDDED_INDEX_HTML: &str = include_str!("../../../web/static/index.html");
 pub const EMBEDDED_APP_JS: &str = include_str!("../../../web/static/app.js");
-
-pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
-    let trimmed_key = key.trim();
-    if trimmed_key.is_empty() {
-        return Err(aegis_core::AegisError::Validation(
-            "Configuration key must not be empty".to_string(),
-        ));
-    }
-    if is_immutable_security_config_key(trimmed_key) {
-        return Err(aegis_core::AegisError::SecurityViolation(format!(
-            "Security policy key '{trimmed_key}' is immutable and cannot be modified via the Web API"
-        )));
-    }
-    if val_str.trim().is_empty()
-        && !matches!(
-            trimmed_key,
-            "telegram_bot_token"
-                | "telegram_chat_id"
-                | "discord_webhook_url"
-                | "gemini_api_key"
-                | "hyperliquid_agent_address"
-        )
-    {
-        return Err(aegis_core::AegisError::Validation(format!(
-            "Configuration value for '{trimmed_key}' must not be empty"
-        )));
-    }
-    Ok(())
-}
 
 pub async fn serve_index(State(state): State<AppState>) -> Response {
     let index_path = state.static_dir.join("index.html");
@@ -199,7 +171,7 @@ pub async fn api_auth_logout(State(state): State<AppState>) -> Response {
 }
 
 pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
-    let schema_version = state.db.get_schema_version().unwrap_or(0);
+    let schema_version = state.db.get_schema_version().unwrap_or(-1);
     Json(HealthPayload {
         status: "ok",
         service: "aegis-quant-pp50-rust",
@@ -213,7 +185,7 @@ pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn api_status(State(state): State<AppState>) -> Response {
     match run_db_blocking(state.db.clone(), |db| {
         let cfg = db.load_config_logged("aegis-web.api_status");
-        let schema_version = db.get_schema_version().unwrap_or(0);
+        let schema_version = db.get_schema_version()?;
         let settle_gate_active = db.is_settle_gate_active().unwrap_or(false);
         let pp50 = build_pp50_payload(&db)?;
         Ok(StatusPayload {

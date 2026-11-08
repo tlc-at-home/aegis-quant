@@ -368,9 +368,10 @@ impl MarketIngestionEngine {
         let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
         sorted_tfs.sort();
 
+        let fallback_btc_px = cfg.get_f64("btc_fallback_base_price_usdc", 95_000.0).max(1.0);
         let btc_ref_px = self
             .resolve_reference_price_logged("BTC/USDC:USDC")
-            .unwrap_or(95_000.0);
+            .unwrap_or(fallback_btc_px);
 
         for tf in &sorted_tfs {
             let mut bars_opt = None;
@@ -585,31 +586,49 @@ impl MarketIngestionEngine {
         }
     }
 
-    /// Computes multi-day median daily notional volume from stored 1H bars when available (`R3-N21`),
-    /// falling back to `fallback_day_vlm` when fewer than 2 full days of 1H bars exist.
-    fn compute_median_daily_volume_from_bars(
+    /// Computes multi-day median daily notional volume from stored 1H bars grouped by UTC calendar day (`R3-N21`, `R4-N6`),
+    /// falling back to `fallback_day_vlm` when fewer than 2 qualifying UTC calendar days of 1H bars exist.
+    pub(crate) fn compute_median_daily_volume_from_bars(
         &self,
         symbol: &str,
         fallback_day_vlm: f64,
         window_days: usize,
     ) -> f64 {
-        let lookback_hours = window_days.max(1) * 24;
+        let lookback_hours = window_days.max(1) * 24 + 24;
         let Ok(bars) = self.db.get_ohlcv_bars(symbol, "1h", lookback_hours, None) else {
             return fallback_day_vlm;
         };
-        if bars.len() < 48 {
+        let min_bars_per_day = self
+            .db
+            .load_config_opts(false)
+            .map(|c| c.get_usize("pond_volume_min_bars_per_day", 12).clamp(1, 24))
+            .unwrap_or(12);
+        if bars.len() < min_bars_per_day * 2 {
             return fallback_day_vlm;
         }
-        let mut daily_vols: Vec<f64> = bars
-            .chunks(24)
-            .filter(|chunk| chunk.len() == 24)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|b| (b.volume * b.close).max(0.0))
-                    .sum::<f64>()
+        let mut by_utc_day: std::collections::BTreeMap<i64, (f64, usize)> =
+            std::collections::BTreeMap::new();
+        for b in &bars {
+            let utc_day = b.timestamp_ms.div_euclid(86_400_000);
+            let notional = (b.volume * b.close).max(0.0);
+            if notional.is_finite() {
+                let entry = by_utc_day.entry(utc_day).or_insert((0.0, 0));
+                entry.0 += notional;
+                entry.1 += 1;
+            }
+        }
+        let mut daily_vols: Vec<f64> = by_utc_day
+            .values()
+            .rev()
+            .filter(|&&(sum, count)| count >= min_bars_per_day && sum > 0.0 && sum.is_finite())
+            .take(window_days.max(1))
+            .map(|&(sum, count)| {
+                if count < 24 {
+                    sum * (24.0 / count as f64)
+                } else {
+                    sum
+                }
             })
-            .filter(|v| *v > 0.0 && v.is_finite())
             .collect();
         if daily_vols.len() < 2 {
             return fallback_day_vlm;

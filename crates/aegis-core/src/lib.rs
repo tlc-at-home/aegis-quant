@@ -200,6 +200,11 @@ impl Usdc {
     pub fn round_dp(self, decimals: i32) -> Self {
         Self(round_dp(self.0, decimals))
     }
+
+    #[inline]
+    pub fn round_cents(self) -> Self {
+        Self(round_dp(self.0, 2))
+    }
 }
 
 impl std::ops::Add for Usdc {
@@ -496,21 +501,58 @@ pub fn compute_drift_bps(book_a_equity: f64, total_equity: f64, target_split_pct
     round_dp(((book_a_equity - target_a).abs() / total_equity) * 10_000.0, 2)
 }
 
-/// Timeframe duration in seconds.
-pub fn timeframe_seconds(tf: &str) -> i64 {
+/// Strictly parse a timeframe string into its duration in seconds (`R3-N13`).
+pub fn parse_timeframe_seconds(tf: &str) -> Result<i64> {
     match tf.trim().to_ascii_lowercase().as_str() {
-        "1m" => 60,
-        "5m" => 300,
-        "15m" => 900,
-        "30m" => 1800,
-        "1h" => 3600,
-        "2h" => 7200,
-        "4h" => 14400,
-        "6h" => 21600,
-        "8h" => 28800,
-        "12h" => 43200,
-        "1d" | "24h" => 86400,
-        _ => 3600,
+        "1m" => Ok(60),
+        "5m" => Ok(300),
+        "15m" => Ok(900),
+        "30m" => Ok(1800),
+        "1h" => Ok(3600),
+        "2h" => Ok(7200),
+        "4h" => Ok(14400),
+        "6h" => Ok(21600),
+        "8h" => Ok(28800),
+        "12h" => Ok(43200),
+        "1d" | "24h" => Ok(86400),
+        other => Err(AegisError::Validation(format!(
+            "Unsupported timeframe '{other}': must be one of 1m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 24h."
+        ))),
+    }
+}
+
+/// Validate a comma-separated list of timeframes (`calibration_timeframes_csv`) (`R3-N13`).
+pub fn validate_timeframe_csv(csv: &str) -> Result<String> {
+    let mut normalized = Vec::new();
+    for part in csv.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let _ = parse_timeframe_seconds(trimmed)?;
+        normalized.push(trimmed.to_ascii_lowercase());
+    }
+    if normalized.is_empty() {
+        return Err(AegisError::Validation(
+            "Timeframe CSV cannot be empty; provide at least one valid timeframe (e.g. '1h,2h,4h')."
+                .to_string(),
+        ));
+    }
+    Ok(normalized.join(","))
+}
+
+/// Timeframe duration in seconds (warns and falls back to `3600` on unknown timeframe strings, `R3-N13`).
+pub fn timeframe_seconds(tf: &str) -> i64 {
+    match parse_timeframe_seconds(tf) {
+        Ok(secs) => secs,
+        Err(_) => {
+            tracing::warn!(
+                timeframe = %tf,
+                fallback_seconds = 3600,
+                "Unknown timeframe passed to timeframe_seconds(); falling back to 3600s (1h)"
+            );
+            3600
+        }
     }
 }
 
@@ -952,6 +994,167 @@ pub struct PondCell {
     pub closed_at: Option<String>,
     pub cooldown_until: Option<String>,
     pub updated_at: String,
+    #[serde(default)]
+    pub resting_order_id: Option<String>,
+}
+
+/// Typed status enum for PP-50 daily Settling ledger rows (`book_transfers.status`, `R4-QA`, `R4-H1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BookTransferStatus {
+    #[serde(rename = "PENDING")]
+    Pending,
+    #[serde(rename = "COMPLETED")]
+    Completed,
+    #[serde(rename = "CONFIRMED")]
+    Confirmed,
+    #[serde(rename = "PARTIAL_IDLE_CAPPED")]
+    PartialIdleCapped,
+    #[serde(rename = "PARTIAL")]
+    Partial,
+    #[serde(rename = "AMBIGUOUS")]
+    Ambiguous,
+    #[serde(rename = "SKIPPED_DEADBAND", alias = "SKIPPED_WITHIN_BAND", alias = "NO_ACTION_WITHIN_DEADBAND")]
+    SkippedWithinBand,
+    #[serde(rename = "BLOCKED_ZERO_IDLE", alias = "SKIPPED_NO_IDLE")]
+    SkippedNoIdle,
+    #[serde(rename = "HALTED_PP50")]
+    HaltedPp50,
+    #[serde(rename = "DRY_RUN")]
+    DryRun,
+    #[serde(rename = "FAILED")]
+    Failed,
+}
+
+impl BookTransferStatus {
+    pub const ALL: &'static [Self] = &[
+        Self::Pending,
+        Self::Completed,
+        Self::Confirmed,
+        Self::PartialIdleCapped,
+        Self::Partial,
+        Self::Ambiguous,
+        Self::SkippedWithinBand,
+        Self::SkippedNoIdle,
+        Self::HaltedPp50,
+        Self::DryRun,
+        Self::Failed,
+    ];
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Completed => "COMPLETED",
+            Self::Confirmed => "CONFIRMED",
+            Self::PartialIdleCapped => "PARTIAL_IDLE_CAPPED",
+            Self::Partial => "PARTIAL",
+            Self::Ambiguous => "AMBIGUOUS",
+            Self::SkippedWithinBand => "SKIPPED_DEADBAND",
+            Self::SkippedNoIdle => "BLOCKED_ZERO_IDLE",
+            Self::HaltedPp50 => "HALTED_PP50",
+            Self::DryRun => "DRY_RUN",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "PENDING" => Ok(Self::Pending),
+            "COMPLETED" => Ok(Self::Completed),
+            "CONFIRMED" => Ok(Self::Confirmed),
+            "PARTIAL_IDLE_CAPPED" => Ok(Self::PartialIdleCapped),
+            "PARTIAL" => Ok(Self::Partial),
+            "AMBIGUOUS" => Ok(Self::Ambiguous),
+            "SKIPPED_DEADBAND" | "SKIPPED_WITHIN_BAND" | "NO_ACTION_WITHIN_DEADBAND" => {
+                Ok(Self::SkippedWithinBand)
+            }
+            "BLOCKED_ZERO_IDLE" | "SKIPPED_NO_IDLE" => Ok(Self::SkippedNoIdle),
+            "HALTED_PP50" => Ok(Self::HaltedPp50),
+            "DRY_RUN" => Ok(Self::DryRun),
+            "FAILED" => Ok(Self::Failed),
+            other => {
+                let valid: Vec<&'static str> = Self::ALL.iter().map(Self::as_str).collect();
+                Err(AegisError::Validation(format!(
+                    "Invalid BookTransferStatus '{other}': must be one of {valid:?}"
+                )))
+            }
+        }
+    }
+
+    /// Returns `true` if this transfer status counts toward virtual two-book net equity adjustments.
+    pub const fn is_ledger_counted(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Confirmed | Self::PartialIdleCapped
+        )
+    }
+
+    /// Returns `true` if this transfer status indicates an unresolved two-leg live transfer
+    /// requiring manual reconciliation (`PARTIAL` or `AMBIGUOUS`).
+    pub const fn needs_manual_reconciliation(&self) -> bool {
+        matches!(self, Self::Partial | Self::Ambiguous)
+    }
+
+    /// Returns `true` if a state transition from `self` to `next` is valid.
+    pub const fn can_transition_to(&self, next: Self) -> bool {
+        use BookTransferStatus::*;
+        matches!(
+            (*self, next),
+            (Pending, Pending)
+                | (Pending, Completed)
+                | (Pending, Confirmed)
+                | (Pending, PartialIdleCapped)
+                | (Pending, Partial)
+                | (Pending, Ambiguous)
+                | (Pending, Failed)
+                | (Pending, DryRun)
+                | (Partial, Partial)
+                | (Partial, Confirmed)
+                | (Partial, Completed)
+                | (Partial, Failed)
+                | (Ambiguous, Ambiguous)
+                | (Ambiguous, Confirmed)
+                | (Ambiguous, Completed)
+                | (Ambiguous, Partial)
+                | (Ambiguous, Failed)
+                | (Completed, Completed)
+                | (Confirmed, Confirmed)
+                | (PartialIdleCapped, PartialIdleCapped)
+                | (SkippedWithinBand, SkippedWithinBand)
+                | (SkippedNoIdle, SkippedNoIdle)
+                | (HaltedPp50, HaltedPp50)
+                | (DryRun, DryRun)
+                | (Failed, Failed)
+        )
+    }
+}
+
+impl std::str::FromStr for BookTransferStatus {
+    type Err = AegisError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
+impl fmt::Display for BookTransferStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<&str> for BookTransferStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+            || BookTransferStatus::parse(other)
+                .map(|parsed| parsed == *self)
+                .unwrap_or(false)
+    }
+}
+
+impl PartialEq<String> for BookTransferStatus {
+    fn eq(&self, other: &String) -> bool {
+        self == &other.as_str()
+    }
 }
 
 /// Daily 00:05 UTC Settling transfer ledger row (`book_transfers` table).
@@ -1769,6 +1972,242 @@ pub fn mask_identifier(raw_val: &str) -> String {
     }
 }
 
+fn is_url_token_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '/' | '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
+}
+
+fn is_webhook_path_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
+}
+
+/// Redact embedded Telegram bot URLs (`/bot<token>`) and Discord webhook URLs (`/api/webhooks/<id>/<token>`) (`R3-B5`, `R4-QC`).
+pub fn redact_embedded_url_secrets(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // 1. Redact Telegram bot URLs: `api.telegram.org/bot<token>` or `/bot<id>:<secret>`
+    let mut search_from = 0;
+    while search_from < out.len() {
+        let lower = out[search_from..].to_ascii_lowercase();
+        let Some(rel_idx) = lower.find("/bot") else {
+            break;
+        };
+        let token_start = search_from + rel_idx + 4;
+        if token_start >= out.len() {
+            break;
+        }
+        let rest = &out[token_start..];
+        let token_len = rest
+            .find(is_url_token_delimiter)
+            .unwrap_or(rest.len());
+        let token_candidate = &rest[..token_len];
+        let looks_like_bot_token = token_candidate != "[REDACTED]"
+            && !token_candidate.is_empty()
+            && (token_candidate.contains(':')
+                || out[..search_from + rel_idx]
+                    .to_ascii_lowercase()
+                    .ends_with("api.telegram.org"));
+        if looks_like_bot_token {
+            out.replace_range(token_start..token_start + token_len, "[REDACTED]");
+            search_from = token_start + "[REDACTED]".len();
+        } else {
+            search_from = token_start;
+        }
+    }
+
+    // 2. Redact Discord webhook URLs: `/api/webhooks/<id>/<token>`
+    let mut wh_from = 0;
+    while wh_from < out.len() {
+        let lower = out[wh_from..].to_ascii_lowercase();
+        let Some(rel_idx) = lower.find("/api/webhooks/") else {
+            break;
+        };
+        let path_start = wh_from + rel_idx + "/api/webhooks/".len();
+        if path_start >= out.len() {
+            break;
+        }
+        let rest = &out[path_start..];
+        let path_len = rest
+            .find(is_webhook_path_delimiter)
+            .unwrap_or(rest.len());
+        let candidate = &rest[..path_len];
+        if candidate != "[REDACTED]" && !candidate.is_empty() {
+            out.replace_range(path_start..path_start + path_len, "[REDACTED]");
+            wh_from = path_start + "[REDACTED]".len();
+        } else {
+            wh_from = path_start;
+        }
+    }
+
+    out
+}
+
+/// Scrub inline secret patterns (`private_key=...`, `private_key: ...`, `telegram_bot_token = ...`,
+/// embedded Telegram/Discord webhook URLs, etc.) from log strings (`R3-B2`, `R3-B5`, `R4-N5`, `R4-QC`).
+pub fn sanitize_telemetry_message(message: &str) -> String {
+    let mut sanitized = redact_embedded_url_secrets(message);
+    let lower = sanitized.to_ascii_lowercase();
+
+    const SENSITIVE_KEYS: &[&str] = &[
+        "hyperliquid_private_key",
+        "private_key",
+        "gemini_api_key",
+        "telegram_bot_token",
+        "bot_token",
+        "discord_webhook_url",
+        "webhook_url",
+        "web_api_token",
+        "web_auth_token",
+        "auth_token",
+        "aegis_master_key",
+        "master_key",
+    ];
+
+    let has_sensitive = SENSITIVE_KEYS.iter().any(|k| lower.contains(k));
+    if !has_sensitive {
+        return sanitized;
+    }
+
+    // R4-N5: Only redact `config_value`/`value`/`val` when the message explicitly pairs
+    // `config_key` (or `key`) with a sensitive key name (e.g. `config_key=private_key config_value=...`),
+    // NOT merely because a sensitive key name is mentioned in prose alongside an unrelated `value=...`.
+    let has_paired_config_key = SENSITIVE_KEYS.iter().any(|sk| {
+        lower.contains(&format!("config_key={sk}"))
+            || lower.contains(&format!("config_key: {sk}"))
+            || lower.contains(&format!("config_key=\"{sk}\""))
+            || lower.contains(&format!("key={sk}"))
+            || lower.contains(&format!("key: {sk}"))
+            || lower.contains(&format!("key=\"{sk}\""))
+    });
+
+    let mut keys_to_redact: Vec<&str> = SENSITIVE_KEYS.to_vec();
+    if has_paired_config_key {
+        keys_to_redact.push("config_value");
+        keys_to_redact.push("value");
+        keys_to_redact.push("val");
+    }
+
+    for key in keys_to_redact {
+        let mut search_from = 0;
+        while search_from < sanitized.len() {
+            let lower_slice = sanitized[search_from..].to_ascii_lowercase();
+            let Some(rel_idx) = lower_slice.find(key) else {
+                break;
+            };
+            let abs_idx = search_from + rel_idx;
+            if (key == "val" || key == "value" || key == "config_value") && abs_idx > 0 {
+                let prev = sanitized[..abs_idx].chars().next_back().unwrap_or(' ');
+                if prev.is_ascii_alphanumeric() || prev == '_' {
+                    search_from = abs_idx + key.len();
+                    continue;
+                }
+            }
+            let after_key = abs_idx + key.len();
+            if after_key >= sanitized.len() {
+                break;
+            }
+            let tail = &sanitized[after_key..];
+            let mut chars = tail.char_indices().peekable();
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' || c == '\t' || c == '"' || c == '\'' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let Some((_, sep)) = chars.next() else {
+                search_from = after_key;
+                continue;
+            };
+            if sep != '=' && sep != ':' {
+                search_from = after_key;
+                continue;
+            }
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' || c == '\t' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let val_rel_start = chars.peek().map(|&(i, _)| i).unwrap_or(tail.len());
+            let val_start = after_key + val_rel_start;
+            if val_start >= sanitized.len() {
+                break;
+            }
+            let rest = &sanitized[val_start..];
+            let (replace_start, replace_end) =
+                if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    let inner = &rest[quote.len_utf8()..];
+                    let end_rel = inner.find(quote).unwrap_or(inner.len());
+                    (
+                        val_start + quote.len_utf8(),
+                        val_start + quote.len_utf8() + end_rel,
+                    )
+                } else {
+                    let end_rel = rest
+                        .find(|c: char| {
+                            c.is_whitespace()
+                                || matches!(c, ',' | ';' | ')' | '}' | ']' | '"' | '\'')
+                        })
+                        .unwrap_or(rest.len());
+                    (val_start, val_start + end_rel)
+                };
+            let current_val = &sanitized[replace_start..replace_end];
+            if current_val != "[REDACTED]" && !current_val.is_empty() {
+                sanitized.replace_range(replace_start..replace_end, "[REDACTED]");
+                search_from = replace_start + "[REDACTED]".len();
+            } else {
+                search_from = replace_end.max(after_key);
+            }
+        }
+    }
+    sanitized
+}
+
+/// Scrub any sensitive keys or inline credential literals from a JSON value before logging (`R3-B2`, `R3-B5`, `R4-N5`, `R4-QC`).
+pub fn sanitize_telemetry_value(val: &mut Value) {
+    match val {
+        Value::Object(map) => {
+            let paired_sensitive = map
+                .get("config_key")
+                .or_else(|| map.get("key"))
+                .and_then(Value::as_str)
+                .map(is_sensitive_config_key)
+                .unwrap_or(false);
+            for (k, v) in map.iter_mut() {
+                if is_sensitive_config_key(k)
+                    || (paired_sensitive
+                        && matches!(
+                            k.as_str(),
+                            "config_value" | "value" | "val" | "new_value" | "old_value"
+                        ))
+                {
+                    *v = Value::String("[REDACTED]".to_string());
+                } else {
+                    sanitize_telemetry_value(v);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_telemetry_value(item);
+            }
+        }
+        Value::String(s) => {
+            *s = sanitize_telemetry_message(s);
+        }
+        _ => {}
+    }
+}
+
+/// Return a sanitized copy of optional telemetry JSON details (`R4-QC`).
+pub fn sanitize_telemetry_details(details: Option<Value>) -> Option<Value> {
+    details.map(|mut v| {
+        sanitize_telemetry_value(&mut v);
+        v
+    })
+}
+
 /// Verify SHA-256 checksum of the historical backfill dataset (`data/real_4h_backfill.json`) (`R3-H20`).
 pub fn verify_data_provenance(backfill_path: impl AsRef<Path>) -> Result<bool> {
     let file_path = backfill_path.as_ref();
@@ -2110,6 +2549,55 @@ mod tests {
         assert!(is_immutable_security_config_key("telegram_api_base_url"));
         assert!(is_immutable_security_config_key("hyperliquid_info_url_override"));
         assert!(is_immutable_security_config_key("pit_subaccount_address"));
+    }
+
+    #[test]
+    fn test_r4_n5_qc_qa_n13_telemetry_sanitization_book_transfer_status_and_timeframe() {
+        // R4-N5: Unrelated `value=enabled` must NOT be redacted when a sensitive key name appears in prose
+        let prose = sanitize_telemetry_message("telegram_bot_token rotated; value=enabled");
+        assert_eq!(prose, "telegram_bot_token rotated; value=enabled");
+
+        // Paired config_key=private_key config_value=... MUST redact config_value
+        let paired = sanitize_telemetry_message(
+            "Updated config_key=private_key config_value=0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        );
+        assert_eq!(
+            paired,
+            "Updated config_key=private_key config_value=[REDACTED]"
+        );
+
+        // JSON details sanitization
+        let details = sanitize_telemetry_details(Some(serde_json::json!({
+            "config_key": "telegram_bot_token",
+            "config_value": "123456:SECRET",
+            "note": "telegram_bot_token rotated; value=enabled"
+        })))
+        .unwrap();
+        assert_eq!(details["config_value"], "[REDACTED]");
+        assert_eq!(details["note"], "telegram_bot_token rotated; value=enabled");
+
+        // R4-QA: BookTransferStatus parsing, ledger counting, and reconciliation flags
+        assert_eq!(
+            BookTransferStatus::parse("PARTIAL").unwrap(),
+            BookTransferStatus::Partial
+        );
+        assert_eq!(
+            BookTransferStatus::parse("AMBIGUOUS").unwrap(),
+            BookTransferStatus::Ambiguous
+        );
+        assert!(BookTransferStatus::Partial.needs_manual_reconciliation());
+        assert!(BookTransferStatus::Ambiguous.needs_manual_reconciliation());
+        assert!(!BookTransferStatus::Partial.is_ledger_counted());
+        assert!(!BookTransferStatus::Ambiguous.is_ledger_counted());
+        assert!(BookTransferStatus::Confirmed.is_ledger_counted());
+        assert!(BookTransferStatus::Completed.is_ledger_counted());
+        assert!(BookTransferStatus::PartialIdleCapped.is_ledger_counted());
+
+        // R3-N13: Strict timeframe parsing and CSV validation
+        assert_eq!(parse_timeframe_seconds("4h").unwrap(), 14400);
+        assert!(parse_timeframe_seconds("7h").is_err());
+        assert_eq!(validate_timeframe_csv("1h, 2h, 4H").unwrap(), "1h,2h,4h");
+        assert!(validate_timeframe_csv("1h,invalid").is_err());
     }
 }
 

@@ -4,7 +4,7 @@
 //! TRAILED -> CLOSED -> COOLDOWN`) and evaluates the 6-Tier Exit Priority Engine in deterministic
 //! precedence order (Tier 1 Catastrophic Wick Stop down to Tier 6 Delisting Exit).
 
-use aegis_core::{round_dp, AegisError, PondCell, PondCellState, Result};
+use aegis_core::{round_dp, AegisError, PondCell, PondCellState, Price, Quantity, Result, Usdc};
 use serde::{Deserialize, Serialize};
 
 /// Input telemetry for evaluating the 6-Tier Exit Priority Engine on an active Pond cell.
@@ -93,30 +93,30 @@ pub fn update_cell_mark_and_chandelier(
     chandelier_mult: f64,
     is_4h_bar_close: bool,
 ) -> f64 {
-    let px = mark_price.max(1e-8);
-    let cur_high = cell.highest_price_seen.unwrap_or(px);
-    if high_price > cur_high {
+    let px = Price::new(mark_price.max(1e-8));
+    let cur_high = Price::new(cell.highest_price_seen.unwrap_or(px.0));
+    if high_price > cur_high.0 {
         cell.highest_price_seen = Some(high_price);
     }
-    let cur_low = cell.lowest_price_seen.unwrap_or(0.0);
-    if cur_low <= 0.0 || (low_price > 0.0 && low_price < cur_low) {
+    let cur_low = Price::new(cell.lowest_price_seen.unwrap_or(0.0));
+    if cur_low.0 <= 0.0 || (low_price > 0.0 && low_price < cur_low.0) {
         cell.lowest_price_seen = Some(low_price);
     }
 
-    let entry = cell.entry_price.unwrap_or(px);
-    let qty = cell.quantity.unwrap_or(0.0).abs();
-    let price_pnl = if cell.side == "LONG" {
-        (px - entry) * qty
+    let entry = Price::new(cell.entry_price.unwrap_or(px.0));
+    let qty = Quantity::new(cell.quantity.unwrap_or(0.0).abs());
+    let price_pnl = Usdc::new(if cell.side == "LONG" {
+        (px.0 - entry.0) * qty.0
     } else {
-        (entry - px) * qty
-    };
+        (entry.0 - px.0) * qty.0
+    });
 
     // Chandelier trailing stop ratchets monotonically only on 4H bar closes
     if is_4h_bar_close && atr_14_4h > 0.0 {
         let dist = chandelier_mult * atr_14_4h;
         let cur_chand = cell.chandelier_stop.unwrap_or(0.0);
         if cell.side == "LONG" {
-            let high_seen = cell.highest_price_seen.unwrap_or(px);
+            let high_seen = cell.highest_price_seen.unwrap_or(px.0);
             let candidate = round_dp((high_seen - dist).max(1e-8), 8);
             if candidate > cur_chand {
                 cell.chandelier_stop = Some(candidate);
@@ -125,7 +125,7 @@ pub fn update_cell_mark_and_chandelier(
                 }
             }
         } else {
-            let low_seen = cell.lowest_price_seen.unwrap_or(px);
+            let low_seen = cell.lowest_price_seen.unwrap_or(px.0);
             let candidate = round_dp((low_seen + dist).max(1e-8), 8);
             if cur_chand <= 0.0 || candidate < cur_chand {
                 cell.chandelier_stop = Some(candidate);
@@ -136,28 +136,29 @@ pub fn update_cell_mark_and_chandelier(
         }
     }
 
-    round_dp(price_pnl, 4)
+    round_dp(price_pnl.0, 4)
 }
 
-/// Computes the 1H funding delta in USDC on an active Pond cell using mark-to-market notional (`R3-B1`, `R3-H1`, `NL-13`).
+/// Computes the 1H funding delta in USDC on an active Pond cell using mark-to-market notional (`R3-B1`, `R3-H1`, `NL-13`, `R3-QA`).
 pub fn compute_cell_hourly_funding_delta(
     cell: &PondCell,
     mark_price: f64,
     funding_rate_hourly: f64,
 ) -> f64 {
-    let eff_px = if mark_price > 0.0 {
+    let eff_px = Price::new(if mark_price > 0.0 {
         mark_price
     } else {
         cell.entry_price.unwrap_or(0.0).max(0.0)
-    };
-    let notional = cell.quantity.unwrap_or(0.0).abs() * eff_px;
+    });
+    let qty = Quantity::new(cell.quantity.unwrap_or(0.0).abs());
+    let notional = Usdc::new(qty.0 * eff_px.0);
     // SHORT receives positive funding; LONG receives negative funding (pays positive funding)
-    let delta = if cell.side == "SHORT" {
-        notional * funding_rate_hourly
+    let delta = Usdc::new(if cell.side == "SHORT" {
+        notional.0 * funding_rate_hourly
     } else {
-        -notional * funding_rate_hourly
-    };
-    round_dp(delta, 4)
+        -notional.0 * funding_rate_hourly
+    });
+    round_dp(delta.0, 4)
 }
 
 /// Accrues 1H funding on an active Pond cell using mark-to-market notional (`NL-13`).

@@ -1,8 +1,9 @@
 //! Typed JSON DTOs and dashboard payload builders for `aegis-web`.
 
 use aegis_core::{
-    compute_drift_bps, round_dp, BacktestTearSheet, BookTransfer, PondCell, PondScanCycle,
-    PondUniverseRow, Pp50PlatformSnapshot, SignalEvaluation, TradeRecord,
+    compute_drift_bps, is_immutable_security_config_key, parse_timeframe_seconds, round_dp,
+    sanitize_telemetry_message, validate_timeframe_csv, BacktestTearSheet, BookTransfer, PondCell,
+    PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, SignalEvaluation, TradeRecord,
 };
 use aegis_db::DatabaseManager;
 use aegis_pit::PitOrchestrator;
@@ -349,9 +350,51 @@ pub struct CalibrateRunResponse {
     pub calibration_report: Value,
 }
 
+pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
+    let trimmed_key = key.trim();
+    if trimmed_key.is_empty() {
+        return Err(aegis_core::AegisError::Validation(
+            "Configuration key must not be empty".to_string(),
+        ));
+    }
+    if is_immutable_security_config_key(trimmed_key) {
+        return Err(aegis_core::AegisError::SecurityViolation(format!(
+            "Security policy key '{trimmed_key}' is immutable and cannot be modified via the Web API"
+        )));
+    }
+    if val_str.trim().is_empty()
+        && !matches!(
+            trimmed_key,
+            "telegram_bot_token"
+                | "telegram_chat_id"
+                | "discord_webhook_url"
+                | "gemini_api_key"
+                | "hyperliquid_agent_address"
+                | "pit_subaccount_address"
+                | "pond_subaccount_address"
+                | "equity_baseline_reset_at"
+        )
+    {
+        return Err(aegis_core::AegisError::Validation(format!(
+            "Configuration value for '{trimmed_key}' must not be empty"
+        )));
+    }
+    // R3-N13: Validate timeframe config keys at Web API write time
+    match trimmed_key {
+        "default_timeframe" | "hmm_timeframe" | "exec_timeframe" | "rs_timeframe" => {
+            parse_timeframe_seconds(val_str)?;
+        }
+        "calibration_timeframes_csv" => {
+            validate_timeframe_csv(val_str)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn map_err_response(err: anyhow::Error) -> Response {
     if let Some(aegis_err) = err.downcast_ref::<aegis_core::AegisError>() {
-        let msg = aegis_err.to_string();
+        let msg = sanitize_telemetry_message(&aegis_err.to_string());
         let status = match aegis_err {
             aegis_core::AegisError::Validation(_) | aegis_core::AegisError::Config(_) => {
                 StatusCode::BAD_REQUEST
@@ -391,7 +434,7 @@ pub fn map_err_response(err: anyhow::Error) -> Response {
     }
 
     // R3-H25: Classify strictly by typed AegisError variants above; any non-AegisError is an unhandled internal error.
-    let msg = err.to_string();
+    let msg = sanitize_telemetry_message(&err.to_string());
     tracing::error!(error = %msg, "Unhandled internal error in aegis-web handler");
     let body = ApiErrorBody {
         error: "Internal server error".to_string(),
@@ -796,7 +839,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<FullDashboardPayl
     let credentials = db
         .get_credentials_status()
         .unwrap_or_else(|_| serde_json::json!({}));
-    let schema_version = db.get_schema_version().unwrap_or(8);
+    let schema_version = db.get_schema_version()?;
 
     Ok(FullDashboardPayload {
         portfolio,

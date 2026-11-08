@@ -18,6 +18,7 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/006_v030_review_remediation.sql",
     "sql/migrations/007_v030_round2_remediation.sql",
     "sql/migrations/008_v030_round3_remediation.sql",
+    "sql/migrations/009_v030_round4_remediation.sql",
 ];
 
 impl DatabaseManager {

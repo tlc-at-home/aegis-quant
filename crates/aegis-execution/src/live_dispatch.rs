@@ -14,8 +14,8 @@ use crate::signing::{
     SubAccountTransferAction, VaultTransferAction,
 };
 use crate::{
-    ExecutionEngine, RestingOrderStatus, SubaccountTransferResult, VaultTransferResult,
-    WalletEquitySyncResult,
+    ExecutionEngine, RestingOrderStatus, SubaccountTransferResult, SubaccountTransferStatus,
+    VaultTransferResult, VaultTransferStatus, WalletEquitySyncResult, WalletEquitySyncStatus,
 };
 
 static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
@@ -1177,30 +1177,46 @@ impl ExecutionEngine {
 
         if mode == "PAPER" {
             *self.hlp_vault_error_streak.lock() = 0;
-            return VaultTransferResult::from_raw(json!({
-                "status": "SIMULATED",
-                "mode": "PAPER",
-                "vault_address": vault,
-                "is_deposit": is_deposit,
-                "amount_usdc": round_dp(amount_usdc, 2),
-                "usd_micro": usd_micro,
-            }));
+            return VaultTransferResult {
+                status: VaultTransferStatus::Simulated,
+                mode: Some("PAPER".to_string()),
+                vault_address: vault,
+                is_deposit,
+                amount_usdc: round_dp(amount_usdc, 2),
+                usd_micro,
+                reason: None,
+                error_streak: None,
+                exchange_response: None,
+            };
         }
 
         let wallet = cfg.get_str("wallet_address", "");
         let priv_key = self.db.get_signing_private_key().unwrap_or_default();
         if wallet.is_empty() || priv_key.is_empty() {
-            return VaultTransferResult::from_raw(json!({
-                "status": "SKIPPED",
-                "reason": "MISSING_CREDENTIALS",
-                "vault_address": vault,
-            }));
+            return VaultTransferResult {
+                status: VaultTransferStatus::Skipped,
+                mode: None,
+                vault_address: vault,
+                is_deposit,
+                amount_usdc: round_dp(amount_usdc, 2),
+                usd_micro,
+                reason: Some("MISSING_CREDENTIALS".to_string()),
+                error_streak: None,
+                exchange_response: None,
+            };
         }
         if vault.trim().is_empty() {
-            return VaultTransferResult::from_raw(json!({
-                "status": "ERROR",
-                "reason": "MISSING_VAULT_ADDRESS",
-            }));
+            return VaultTransferResult {
+                status: VaultTransferStatus::Error,
+                mode: None,
+                vault_address: String::new(),
+                is_deposit,
+                amount_usdc: round_dp(amount_usdc, 2),
+                usd_micro,
+                reason: Some("MISSING_VAULT_ADDRESS".to_string()),
+                error_streak: None,
+                exchange_response: None,
+            };
         }
 
         let action = VaultTransferAction {
@@ -1221,13 +1237,17 @@ impl ExecutionEngine {
                             != Some("error");
                     if is_ok {
                         *self.hlp_vault_error_streak.lock() = 0;
-                        return VaultTransferResult::from_raw(json!({
-                            "status": "SUBMITTED",
-                            "vault_address": vault,
-                            "is_deposit": is_deposit,
-                            "amount_usdc": round_dp(amount_usdc, 2),
-                            "exchange_response": resp,
-                        }));
+                        return VaultTransferResult {
+                            status: VaultTransferStatus::Submitted,
+                            mode: None,
+                            vault_address: vault,
+                            is_deposit,
+                            amount_usdc: round_dp(amount_usdc, 2),
+                            usd_micro,
+                            reason: None,
+                            error_streak: None,
+                            exchange_response: Some(resp),
+                        };
                     }
                 }
                 let mut streak = self.hlp_vault_error_streak.lock();
@@ -1241,16 +1261,29 @@ impl ExecutionEngine {
                         Some(json!({"vault_address": vault, "amount_usdc": amount_usdc})),
                     );
                 }
-                VaultTransferResult::from_raw(json!({
-                    "status": "ERROR",
-                    "reason": "EXCHANGE_POST_FAILED",
-                    "error_streak": cur_streak,
-                }))
+                VaultTransferResult {
+                    status: VaultTransferStatus::Error,
+                    mode: None,
+                    vault_address: vault,
+                    is_deposit,
+                    amount_usdc: round_dp(amount_usdc, 2),
+                    usd_micro,
+                    reason: Some("EXCHANGE_POST_FAILED".to_string()),
+                    error_streak: Some(cur_streak),
+                    exchange_response: None,
+                }
             }
-            Err(e) => VaultTransferResult::from_raw(json!({
-                "status": "ERROR",
-                "reason": e.to_string(),
-            })),
+            Err(e) => VaultTransferResult {
+                status: VaultTransferStatus::Error,
+                mode: None,
+                vault_address: vault,
+                is_deposit,
+                amount_usdc: round_dp(amount_usdc, 2),
+                usd_micro,
+                reason: Some(e.to_string()),
+                error_streak: None,
+                exchange_response: None,
+            },
         }
     }
 
@@ -1265,16 +1298,21 @@ impl ExecutionEngine {
 
         if wallet.trim().is_empty() {
             let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
-            return WalletEquitySyncResult::from_raw(json!({
-                "status": "PAPER_DEFAULT",
-                "wallet_address": "",
-                "network": if is_testnet { "testnet" } else { "mainnet" },
-                "account_type": "perps",
-                "wallet_balance_usdc": init_eq,
-                "total_equity_usdc": init_eq,
-                "perp_account_value_usdc": init_eq,
-                "vault_equity_usdc": 0.0,
-            }));
+            return WalletEquitySyncResult {
+                status: WalletEquitySyncStatus::PaperDefault,
+                wallet_address: String::new(),
+                network: if is_testnet {
+                    "testnet".to_string()
+                } else {
+                    "mainnet".to_string()
+                },
+                account_type: "perps".to_string(),
+                wallet_balance_usdc: init_eq,
+                total_equity_usdc: init_eq,
+                perp_account_value_usdc: init_eq,
+                withdrawable_usdc: init_eq,
+                vault_equity_usdc: 0.0,
+            };
         }
 
         let mut perp_eq = 0.0;
@@ -1347,17 +1385,29 @@ impl ExecutionEngine {
         } else {
             cfg.get_f64("initial_equity_usdc", 10000.0)
         };
-        WalletEquitySyncResult::from_raw(json!({
-            "status": if live_ok { "SYNCED_ON_CHAIN" } else { "UNREACHABLE_FALLBACK" },
-            "wallet_address": wallet,
-            "network": if is_testnet { "testnet" } else { "mainnet" },
-            "account_type": if vault_eq > 0.0 { "perps+vault" } else { "perps" },
-            "wallet_balance_usdc": eff_total,
-            "perp_account_value_usdc": round_dp(perp_eq, 2),
-            "withdrawable_usdc": round_dp(withdrawable, 2),
-            "vault_equity_usdc": round_dp(vault_eq, 2),
-            "total_equity_usdc": eff_total,
-        }))
+        WalletEquitySyncResult {
+            status: if live_ok {
+                WalletEquitySyncStatus::SyncedOnChain
+            } else {
+                WalletEquitySyncStatus::UnreachableFallback
+            },
+            wallet_address: wallet,
+            network: if is_testnet {
+                "testnet".to_string()
+            } else {
+                "mainnet".to_string()
+            },
+            account_type: if vault_eq > 0.0 {
+                "perps+vault".to_string()
+            } else {
+                "perps".to_string()
+            },
+            wallet_balance_usdc: eff_total,
+            perp_account_value_usdc: round_dp(perp_eq, 2),
+            withdrawable_usdc: round_dp(withdrawable, 2),
+            vault_equity_usdc: round_dp(vault_eq, 2),
+            total_equity_usdc: eff_total,
+        }
     }
 
     fn submit_single_subaccount_leg(
@@ -1456,10 +1506,11 @@ impl ExecutionEngine {
         self.execute_subaccount_transfer_for_record(None, from_book, to_book, amount_usdc, dry_run)
     }
 
-    /// Executes an inter-book USDC transfer with optional `transfer_id` per-leg persistence (`R3-B3`).
+    /// Executes an inter-book USDC transfer with optional `transfer_id` per-leg persistence (`R3-B3`, `R4-N9`, `R4-H2`).
     ///
     /// - Persists `legs_completed`, `leg1_tx_ref`, and `leg2_tx_ref` after each leg so a retry on a
-    ///   2-leg transfer where leg 1 succeeded and leg 2 failed NEVER re-executes leg 1 (`R3-B3`).
+    ///   2-leg transfer where leg 1 succeeded and leg 2 failed NEVER re-executes leg 1 (`R3-B3`),
+    ///   and a transfer where all legs already succeeded returns `CONFIRMED` without re-submitting (`R4-N9`).
     /// - Marks post-send HTTP timeouts with `AMBIGUOUS_POST_SEND:` so callers halt automatic retries (`R3-B3`).
     pub fn execute_subaccount_transfer_for_record(
         &self,
@@ -1547,13 +1598,49 @@ impl ExecutionEngine {
                 ));
             }
 
-            let (already_completed, saved_leg1, _saved_leg2) = match transfer_id {
+            let (already_completed, saved_leg1, saved_leg2) = match transfer_id {
                 Some(tid) if tid > 0 => self
                     .db
                     .get_book_transfer_leg_progress(tid)
                     .unwrap_or((0, None, None)),
                 _ => (0, None, None),
             };
+
+            // R4-N9: If all legs for this transfer_id have already completed on a prior attempt,
+            // return CONFIRMED immediately without re-executing any leg.
+            if already_completed as usize >= legs.len() {
+                let mut saved_hashes = Vec::new();
+                if let Some(l1) = saved_leg1 {
+                    saved_hashes.push(l1);
+                }
+                if legs.len() > 1 {
+                    if let Some(l2) = saved_leg2 {
+                        saved_hashes.push(l2);
+                    }
+                }
+                let primary_tx_hash = saved_hashes
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "already-completed".to_string());
+                tracing::info!(
+                    transfer_id = ?transfer_id,
+                    legs_completed = already_completed,
+                    tx_hash = %primary_tx_hash,
+                    "All subAccountTransfer legs already completed for transfer_id; returning CONFIRMED without re-dispatch (R4-N9)"
+                );
+                return Ok(SubaccountTransferResult {
+                    status: SubaccountTransferStatus::Confirmed,
+                    transfer_mode: "HYPERLIQUID_SUBACCOUNT_L1".to_string(),
+                    from_book: from_norm,
+                    to_book: to_norm,
+                    amount_usdc: amt,
+                    tx_hash: primary_tx_hash,
+                    leg_tx_hashes: saved_hashes,
+                    legs_executed: legs.len(),
+                    dry_run: false,
+                    exchange_response: Some(json!({"status": "already_confirmed_all_legs"})),
+                });
+            }
 
             let mut tx_hashes = Vec::new();
             let mut responses = Vec::new();
@@ -1613,18 +1700,22 @@ impl ExecutionEngine {
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "0x0".to_string());
-            return Ok(SubaccountTransferResult::from_raw(json!({
-                "status": "EXECUTED",
-                "transfer_mode": "HYPERLIQUID_SUBACCOUNT_L1",
-                "from_book": from_norm,
-                "to_book": to_norm,
-                "amount_usdc": amt,
-                "tx_hash": primary_tx_hash,
-                "leg_tx_hashes": tx_hashes,
-                "legs_executed": legs.len(),
-                "dry_run": false,
-                "exchange_response": if responses.len() == 1 { responses[0].clone() } else { json!(responses) },
-            })));
+            return Ok(SubaccountTransferResult {
+                status: SubaccountTransferStatus::Executed,
+                transfer_mode: "HYPERLIQUID_SUBACCOUNT_L1".to_string(),
+                from_book: from_norm,
+                to_book: to_norm,
+                amount_usdc: amt,
+                tx_hash: primary_tx_hash,
+                leg_tx_hashes: tx_hashes,
+                legs_executed: legs.len(),
+                dry_run: false,
+                exchange_response: Some(if responses.len() == 1 {
+                    responses[0].clone()
+                } else {
+                    json!(responses)
+                }),
+            });
         }
 
         let digest_hex = hex::encode(Sha256::digest(
@@ -1634,15 +1725,26 @@ impl ExecutionEngine {
             )
             .as_bytes(),
         ));
-        let tx_hash = format!("0x{}", &digest_hex[..64]);
-        Ok(SubaccountTransferResult::from_raw(json!({
-            "status": if dry_run { "DRY_RUN_SIMULATED" } else { "EXECUTED" },
-            "transfer_mode": "VIRTUAL_SINGLE_WALLET_LEDGER",
-            "from_book": from_norm,
-            "to_book": to_norm,
-            "amount_usdc": amt,
-            "tx_hash": tx_hash,
-            "dry_run": dry_run,
-        })))
+        let tx_hash = if dry_run {
+            format!("dryrun-0x{}", &digest_hex[..64])
+        } else {
+            format!("0x{}", &digest_hex[..64])
+        };
+        Ok(SubaccountTransferResult {
+            status: if dry_run {
+                SubaccountTransferStatus::DryRunSimulated
+            } else {
+                SubaccountTransferStatus::Executed
+            },
+            transfer_mode: "VIRTUAL_SINGLE_WALLET_LEDGER".to_string(),
+            from_book: from_norm,
+            to_book: to_norm,
+            amount_usdc: amt,
+            leg_tx_hashes: vec![tx_hash.clone()],
+            tx_hash,
+            legs_executed: 1,
+            dry_run,
+            exchange_response: None,
+        })
     }
 }

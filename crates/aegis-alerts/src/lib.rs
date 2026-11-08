@@ -6,7 +6,7 @@
 //! - Triggers on HMM Regime Flips, Position Reconciliation Mismatches, and Daily Drawdown > 3%
 //! - Includes isolated `:memory:` offline loopback HTTP receiver for `aegis-quant alerts --test` (`S8`)
 
-use aegis_core::{mask_identifier, round_dp, Result};
+use aegis_core::{mask_identifier, round_dp, sanitize_telemetry_message, Result};
 use aegis_db::{ConfigMap, DatabaseManager};
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -547,7 +547,7 @@ impl AlertEngine {
                         } else {
                             format!("HTTP {http_status}: {tg_desc}")
                         };
-                        let err_str = aegis_db::trade_ops::sanitize_telemetry_message(&raw_err_str);
+                        let err_str = sanitize_telemetry_message(&raw_err_str);
                         error_detail = Some(err_str.clone());
                         results.push(json!({
                             "channel": "TELEGRAM",
@@ -559,7 +559,7 @@ impl AlertEngine {
                         any_error = true;
                         retriable_error = true;
                         // R3-B2: Strip request URL (which embeds /bot<token>) before formatting or persisting.
-                        let err_str = aegis_db::trade_ops::sanitize_telemetry_message(
+                        let err_str = sanitize_telemetry_message(
                             &e.without_url().to_string(),
                         );
                         error_detail = Some(err_str.clone());
@@ -599,7 +599,7 @@ impl AlertEngine {
                     any_error = true;
                     retriable_error = true;
                     // R3-B2: Strip Discord webhook URL before formatting or persisting.
-                    let err_str = aegis_db::trade_ops::sanitize_telemetry_message(
+                    let err_str = sanitize_telemetry_message(
                         &e.without_url().to_string(),
                     );
                     results.push(json!({

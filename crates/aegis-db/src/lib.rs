@@ -1126,6 +1126,7 @@ mod tests {
             fees_paid_usdc: 0.10,
             exit_price: None,
             exit_reason: None,
+            resting_order_id: None,
             opened_at: Some("2026-11-08T00:00:00Z".to_string()),
             closed_at: None,
             cooldown_until: None,
@@ -1243,6 +1244,243 @@ mod tests {
 
         // R3-H15: resolve_reference_price returns Ok(None) when no market data exists
         assert_eq!(db.resolve_reference_price("UNKNOWN/USDC:USDC").unwrap(), None);
+    }
+
+    #[test]
+    fn test_r4_remediation_db_invariants() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 9);
+
+        // R4-N8: get_existing_web_api_token is strictly read-only when unset
+        assert_eq!(db.get_existing_web_api_token().unwrap(), None);
+        let generated = db.get_or_create_web_api_token().unwrap();
+        assert_eq!(db.get_existing_web_api_token().unwrap(), Some(generated));
+
+        // R4-N3: Real secret containing '...' (not matching exact mask shapes) is saved, while exact mask shapes are skipped
+        db.set_config_value("gemini_api_key", &json!("my...custom...secret...key"))
+            .unwrap();
+        assert_eq!(
+            db.load_config().unwrap().get_str("gemini_api_key", ""),
+            "my...custom...secret...key"
+        );
+        // 13-char exact mask shape 6 + "..." + 4 is skipped
+        db.set_config_value("gemini_api_key", &json!("my...c...key1"))
+            .unwrap();
+        assert_eq!(
+            db.load_config().unwrap().get_str("gemini_api_key", ""),
+            "my...custom...secret...key"
+        );
+
+        // R3-N13 & R4-M1: Timeframe and tick interval validation at config write boundary
+        assert!(db.set_config_value("hmm_timeframe", &json!("invalid_tf")).is_err());
+        assert!(db
+            .set_config_value("calibration_timeframes_csv", &json!("1h,badtf"))
+            .is_err());
+        assert!(db
+            .set_config_value("pit_tick_interval_seconds", &json!(0))
+            .is_err());
+        db.set_config_value("pit_tick_interval_seconds", &json!(600))
+            .unwrap();
+
+        // R4-N4 & R3-N8: PIT hourly funding accrual idempotency & open trade fee subtraction in compute_pit_equity_and_idle_usdc
+        let mut trade = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "cli-r4-pit-1".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 90_000.0,
+            current_price: 90_000.0,
+            exit_price: None,
+            quantity: 0.1,
+            filled_units: 0.1,
+            avg_fill_price: Some(90_000.0),
+            notional_usdc: 9_000.0,
+            risk_budget_usdc: 200.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 88_000.0,
+            chandelier_stop_price: 88_000.0,
+            current_stop_price: 88_000.0,
+            highest_price_seen: 90_000.0,
+            lowest_price_seen: 90_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 50.0,
+            fees_paid_usdc: 4.5,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("sim-pit-1".to_string()),
+            opened_at: "2026-11-08T00:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let tid = db.insert_trade(&trade).unwrap();
+        trade.trade_id = tid;
+
+        assert!(db
+            .accrue_trade_funding_for_hour(tid, 500_000, 90_500.0, 50.0, -1.25)
+            .unwrap());
+        // Duplicate hour bucket must be a no-op
+        assert!(!db
+            .accrue_trade_funding_for_hour(tid, 500_000, 90_500.0, 50.0, -1.25)
+            .unwrap());
+        // Next hour bucket accrues
+        assert!(db
+            .accrue_trade_funding_for_hour(tid, 500_001, 90_500.0, 50.0, -0.75)
+            .unwrap());
+        let open_trades = db.get_open_trades().unwrap();
+        assert_eq!(open_trades.len(), 1);
+        assert!((open_trades[0].funding_accrued_usdc - (-2.0)).abs() < 1e-9);
+
+        // Check compute_pit_equity_and_idle_usdc: baseline 5000 + upnl 50 + funding (-2.0) - fees (4.5) = 5043.5
+        let (pit_eq, _pit_idle) = db.compute_pit_equity_and_idle_usdc().unwrap();
+        assert!((pit_eq - 5043.5).abs() < 1e-6);
+
+        // R4-N11: Armed cell resting_order_id persistence and lifecycle cleanup
+        let armed_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(3000.0),
+            quantity: Some(0.5),
+            notional_usdc: Some(1500.0),
+            risk_budget_usdc: Some(40.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.5),
+            funding_rate_entry: Some(0.0002),
+            initial_stop: Some(3100.0),
+            chandelier_stop: Some(3120.0),
+            highest_price_seen: Some(3000.0),
+            lowest_price_seen: Some(3000.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: Some("987654321".to_string()),
+            opened_at: Some("2026-11-08T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-08T00:00:00Z".to_string(),
+        };
+        let armed_id = db.upsert_pond_cell(&armed_cell).unwrap();
+        let armed_list = db.get_armed_pond_cells().unwrap();
+        assert_eq!(armed_list.len(), 1);
+        assert_eq!(
+            armed_list[0].resting_order_id.as_deref(),
+            Some("987654321")
+        );
+        assert_eq!(armed_list[0].exit_reason, None);
+        // R4-N10: update_open_pond_cell_watermarks and reduce_open_pond_cell_partial_exit must return Err without panicking when passed CLOSED
+        assert!(db
+            .update_open_pond_cell_watermarks(armed_id, "CLOSED", None, None, None)
+            .is_err());
+        assert!(db
+            .reduce_open_pond_cell_partial_exit(
+                armed_id, "CLOSED", None, None, None, 0.1, 100.0, 0.0, 0.0
+            )
+            .is_err());
+
+        // R4-H1 & R4-QB: PARTIAL / AMBIGUOUS book transfers excluded from virtual ledger and surfaced by alert check
+        let transfer_id = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-08T00:05:00Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 300.0,
+                    pre_from_usdc: Some(5300.0),
+                    pre_to_usdc: Some(4700.0),
+                    post_from_usdc: Some(5300.0),
+                    post_to_usdc: Some(4700.0),
+                    drift_bps_before: Some(300.0),
+                    drift_bps_after: Some(300.0),
+                    blocked_remainder_usdc: 0.0,
+                    status: "PENDING".to_string(),
+                    attempts: 1,
+                    tx_ref: None,
+                    created_at: "2026-11-08T00:05:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.update_book_transfer_leg_progress(transfer_id, 1, Some("leg1:pit->main:300"), None)
+            .unwrap();
+        let reconciled_count = db.reconcile_pending_book_transfers().unwrap();
+        assert_eq!(reconciled_count, 1);
+
+        // Must NOT be counted in virtual ledger adjustment
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap()).abs() < 1e-9);
+        assert!((db.get_net_book_transfer_adjustment("POND").unwrap()).abs() < 1e-9);
+
+        // Stranded transfer alert fires once and respects cooldown on immediate second check
+        let stranded_first = db.check_and_record_stranded_transfer_alert().unwrap();
+        assert_eq!(stranded_first.len(), 1);
+        assert_eq!(stranded_first[0].status, "PARTIAL");
+        let stranded_second = db.check_and_record_stranded_transfer_alert().unwrap();
+        assert!(stranded_second.is_empty());
+
+        // R4-H2: Pre-v9 historical dry-run PARTIAL_IDLE_CAPPED row with virtual tx_ref = '0x...' and legs_completed = 0
+        // in TESTNET/LIVE mode without subaccount addresses configured is reclassified to DRY_RUN by migration 009
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        let hist_id = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-07T00:05:00Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 250.0,
+                    pre_from_usdc: Some(5500.0),
+                    pre_to_usdc: Some(4500.0),
+                    post_from_usdc: Some(5250.0),
+                    post_to_usdc: Some(4750.0),
+                    drift_bps_before: Some(500.0),
+                    drift_bps_after: Some(250.0),
+                    blocked_remainder_usdc: 250.0,
+                    status: "PARTIAL_IDLE_CAPPED".to_string(),
+                    attempts: 1,
+                    tx_ref: Some(
+                        "0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                            .to_string(),
+                    ),
+                    created_at: "2026-11-07T00:05:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = '8' WHERE config_key = 'schema_version';",
+                [],
+            )
+            .unwrap();
+            let mig_009 = include_str!("../../../sql/migrations/009_v030_round4_remediation.sql");
+            let filtered: String = mig_009
+                .lines()
+                .filter(|l| !l.contains("ADD COLUMN last_funding_hour_bucket") && !l.contains("ADD COLUMN resting_order_id"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            conn.execute_batch(&filtered).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let rec_hist = db
+            .get_recent_book_transfers(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.transfer_id == hist_id)
+            .unwrap();
+        assert_eq!(rec_hist.status, "DRY_RUN");
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap()).abs() < 1e-9);
     }
 }
 

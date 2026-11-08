@@ -172,8 +172,18 @@ pub fn spawn_pit_task(
                 }
             }
 
+            let sleep_sec = if interval_sec == 0 || interval_sec >= 60 {
+                orchestrator
+                    .load_pit_config()
+                    .map(|c| c.pit_tick_interval_seconds)
+                    .unwrap_or_else(|_| interval_sec.max(1))
+                    .max(1)
+            } else {
+                interval_sec.max(1)
+            };
+
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval_sec.max(1))) => {}
+                _ = tokio::time::sleep(Duration::from_secs(sleep_sec)) => {}
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;
@@ -202,6 +212,7 @@ mod tests {
         let orch = PitOrchestrator::new(db.clone(), None);
         let cfg = orch.load_pit_config().unwrap();
         assert!(!cfg.platform_pp50_halt);
+        assert_eq!(cfg.pit_tick_interval_seconds, 900);
 
         let summary = orch.run_cycle(true, true).unwrap();
         assert_eq!(summary.book_id, "PIT");

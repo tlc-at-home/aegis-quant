@@ -75,7 +75,7 @@ fn main() -> aegis_core::Result<()> {
             "status": "APPLIED",
             "migration": mig_path.display().to_string(),
             "db_path": db.db_path.display().to_string(),
-            "schema_version": rep.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(7),
+            "schema_version": rep.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(-1),
             "system_config_count": rep.get("system_config_count").and_then(|v| v.as_i64()).unwrap_or(0),
             "pond_config_count": rep.get("pond_config_count").and_then(|v| v.as_i64()).unwrap_or(0),
             "books_count": books.len(),
