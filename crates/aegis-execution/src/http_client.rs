@@ -13,26 +13,33 @@ pub const HYPERLIQUID_EXCHANGE_URL: &str = "https://api.hyperliquid.xyz/exchange
 pub const HYPERLIQUID_TESTNET_INFO_URL: &str = "https://api.hyperliquid-testnet.xyz/info";
 pub const HYPERLIQUID_TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-testnet.xyz/exchange";
 
-static SHARED_BLOCKING_CLIENTS: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
+static SHARED_BLOCKING_CLIENTS: OnceLock<Mutex<HashMap<(u64, bool), Client>>> = OnceLock::new();
 
 /// Returns a process-wide cached `reqwest::blocking::Client` for `timeout_sec` built on a dedicated OS thread
 /// so dropping `ExecutionEngine` or `MarketIngestionEngine` inside an async runtime (`#[tokio::test]`) never panics.
 pub fn shared_blocking_client(timeout_sec: u64) -> Client {
+    shared_blocking_client_opts(timeout_sec, false)
+}
+
+pub fn shared_blocking_client_opts(timeout_sec: u64, no_proxy: bool) -> Client {
     let t_sec = timeout_sec.max(1);
     let cache = SHARED_BLOCKING_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(existing) = cache.lock().get(&t_sec).cloned() {
+    if let Some(existing) = cache.lock().get(&(t_sec, no_proxy)).cloned() {
         return existing;
     }
     let client = std::thread::spawn(move || {
-        Client::builder()
-            .timeout(Duration::from_secs(t_sec))
-            .build()
-            .unwrap_or_else(|_| Client::new())
+        let mut builder = Client::builder().timeout(Duration::from_secs(t_sec));
+        if no_proxy {
+            builder = builder.no_proxy();
+        }
+        builder.build().unwrap_or_else(|_| Client::new())
     })
     .join()
     .expect("Failed to initialize shared Hyperliquid blocking HTTP client");
     let mut guard = cache.lock();
-    guard.entry(t_sec).or_insert_with(|| client.clone());
+    guard
+        .entry((t_sec, no_proxy))
+        .or_insert_with(|| client.clone());
     client
 }
 
@@ -201,11 +208,13 @@ pub fn http_post_json(
     if !validate_hyperliquid_endpoint_url(url, cfg) {
         return None;
     }
+    let is_loopback =
+        url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]");
     let owned_client;
-    let client_ref = if timeout_sec == client_timeout_sec {
+    let client_ref = if timeout_sec == client_timeout_sec && !is_loopback {
         http_client
     } else {
-        owned_client = shared_blocking_client(timeout_sec);
+        owned_client = shared_blocking_client_opts(timeout_sec, is_loopback);
         &owned_client
     };
     std::thread::scope(|s| {

@@ -6,7 +6,7 @@
 //! strictly scoped Book A database wrapper (`BookScopedDb(BookType::Pit)`) and
 //! panic-isolated async runtime (`AssertUnwindSafe(...).catch_unwind()`).
 
-use aegis_core::{round_dp, BookType, PortfolioSnapshot, Result};
+use aegis_core::{BookType, PortfolioSnapshot, Result};
 use aegis_db::{BookScopedDb, DatabaseManager, PitConfig};
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine};
 use aegis_signals::SignalEngine;
@@ -131,48 +131,9 @@ impl PitOrchestrator {
         Ok(summary)
     }
 
-    /// Computes Book A (`PIT`) equity and unlocked idle USDC for the 00:05 UTC settling protocol (`C1`).
+    /// Computes Book A (`PIT`) equity and unlocked idle USDC for the 00:05 UTC settling protocol (`C1`, `R3-H18`, `R3-QC`).
     pub fn compute_pit_equity_and_idle_usdc(&self) -> Result<(f64, f64)> {
-        let cfg = self.load_pit_config()?;
-        let base_cap = cfg.book_baseline_equity_usdc.max(1.0);
-        let net_transfers = self.scoped_db.get_net_book_transfer_adjustment().unwrap_or(0.0);
-        let raw_db = self.scoped_db.inner();
-        let realized = raw_db.get_total_realized_pnl().unwrap_or(0.0);
-        let open_trades = self.scoped_db.get_pit_open_trades().unwrap_or_default();
-        let resting_trades = raw_db.get_resting_pit_trades().unwrap_or_default();
-        let mut deployed = 0.0;
-        let mut upnl = 0.0;
-        for t in &open_trades {
-            deployed += t.quantity.abs() * t.current_price;
-            upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc;
-        }
-        for rt in &resting_trades {
-            deployed += rt.notional_usdc.max(rt.quantity.abs() * rt.entry_price);
-        }
-        let latest_snap = self.scoped_db.get_pit_latest_portfolio_snapshot()?;
-        let has_baseline_reset = !raw_db
-            .load_config()
-            .unwrap_or_default()
-            .get_str("equity_baseline_reset_at", "")
-            .trim()
-            .is_empty();
-        let yield_usdc = if has_baseline_reset {
-            0.0
-        } else {
-            latest_snap.accrued_yield_usdc
-        };
-        let equity = round_dp(base_cap + net_transfers + realized + upnl + yield_usdc, 2);
-        let mut idle = round_dp((equity - deployed).max(0.0), 2);
-        if let Ok((_, perps_trading_eq, vault_eq, total_wallet_deployed)) =
-            self.scoped_db.get_wallet_perps_margin_state()
-        {
-            if vault_eq > 0.0 || total_wallet_deployed > deployed {
-                let avail_perps_margin =
-                    round_dp((perps_trading_eq - total_wallet_deployed).max(0.0), 2);
-                idle = idle.min(avail_perps_margin);
-            }
-        }
-        Ok((equity, idle))
+        self.scoped_db.compute_pit_equity_and_idle_usdc()
     }
 }
 

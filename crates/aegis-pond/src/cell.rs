@@ -139,8 +139,12 @@ pub fn update_cell_mark_and_chandelier(
     round_dp(price_pnl, 4)
 }
 
-/// Accrues 1H funding on an active Pond cell using mark-to-market notional (`NL-13`).
-pub fn accrue_cell_hourly_funding(cell: &mut PondCell, mark_price: f64, funding_rate_hourly: f64) {
+/// Computes the 1H funding delta in USDC on an active Pond cell using mark-to-market notional (`R3-B1`, `R3-H1`, `NL-13`).
+pub fn compute_cell_hourly_funding_delta(
+    cell: &PondCell,
+    mark_price: f64,
+    funding_rate_hourly: f64,
+) -> f64 {
     let eff_px = if mark_price > 0.0 {
         mark_price
     } else {
@@ -153,6 +157,12 @@ pub fn accrue_cell_hourly_funding(cell: &mut PondCell, mark_price: f64, funding_
     } else {
         -notional * funding_rate_hourly
     };
+    round_dp(delta, 4)
+}
+
+/// Accrues 1H funding on an active Pond cell using mark-to-market notional (`NL-13`).
+pub fn accrue_cell_hourly_funding(cell: &mut PondCell, mark_price: f64, funding_rate_hourly: f64) {
+    let delta = compute_cell_hourly_funding_delta(cell, mark_price, funding_rate_hourly);
     cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
 }
 

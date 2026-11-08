@@ -10,80 +10,11 @@ use aegis_core::{
     SENSITIVE_CONFIG_KEYS,
 };
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use zeroize::Zeroizing;
 
-/// Typed configuration dictionary loaded from `system_config`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ConfigMap {
-    pub values: HashMap<String, Value>,
-}
-
-impl ConfigMap {
-    pub fn new() -> Self {
-        Self {
-            values: HashMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, k: impl Into<String>, v: Value) {
-        self.values.insert(k.into(), v);
-    }
-
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        self.values.get(key)
-    }
-
-    pub fn get_str(&self, key: &str, default: &str) -> String {
-        match self.values.get(key) {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Bool(b)) => b.to_string(),
-            Some(Value::Number(n)) => n.to_string(),
-            _ => default.to_string(),
-        }
-    }
-
-    pub fn get_f64(&self, key: &str, default: f64) -> f64 {
-        match self.values.get(key) {
-            Some(Value::Number(n)) => n.as_f64().unwrap_or(default),
-            Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(default),
-            _ => default,
-        }
-    }
-
-    pub fn get_i64(&self, key: &str, default: i64) -> i64 {
-        match self.values.get(key) {
-            Some(Value::Number(n)) => n
-                .as_i64()
-                .or_else(|| n.as_f64().map(|f| f as i64))
-                .unwrap_or(default),
-            Some(Value::String(s)) => s
-                .trim()
-                .parse::<f64>()
-                .map(|f| f as i64)
-                .unwrap_or(default),
-            _ => default,
-        }
-    }
-
-    pub fn get_usize(&self, key: &str, default: usize) -> usize {
-        self.get_i64(key, default as i64).max(0) as usize
-    }
-
-    pub fn get_bool(&self, key: &str, default: bool) -> bool {
-        match self.values.get(key) {
-            Some(Value::Bool(b)) => *b,
-            Some(Value::String(s)) => matches!(
-                s.trim().to_ascii_lowercase().as_str(),
-                "true" | "1" | "yes" | "on" | "testnet"
-            ),
-            Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
-            _ => default,
-        }
-    }
-}
+pub use aegis_core::ConfigMap;
 
 pub fn cast_config_value(raw_val: &str, value_type: &str) -> Value {
     let vtype = value_type.trim().to_ascii_lowercase();
@@ -198,6 +129,24 @@ fn alert_config_defaults(
                 "string",
                 "execution",
                 "Optional override for Hyperliquid Testnet API base URL",
+            ),
+        ),
+        (
+            "hyperliquid_mainnet_url",
+            (
+                "https://api.hyperliquid.xyz",
+                "string",
+                "execution",
+                "Hyperliquid L1 Mainnet REST API base URL",
+            ),
+        ),
+        (
+            "hyperliquid_testnet_url",
+            (
+                "https://api.hyperliquid-testnet.xyz",
+                "string",
+                "execution",
+                "Hyperliquid L1 Testnet REST API base URL",
             ),
         ),
         (
@@ -594,8 +543,25 @@ impl DatabaseManager {
         }
         Ok(map)
     }
+}
 
-    pub fn get_config_rows(&self, mask_secrets: bool) -> Result<Vec<Value>> {
+const MIN_MAX_FLOAT_PAIRS: &[(&str, &str)] = &[
+    ("min_risk_per_trade_usdc", "max_risk_per_trade_usdc"),
+    ("pond_min_risk_usdc", "pond_max_risk_usdc"),
+    ("conviction_scale_min", "conviction_scale_max"),
+    ("pond_conviction_scale_min", "pond_conviction_scale_max"),
+];
+
+pub fn is_masked_secret_echo(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.contains("...")
+        || trimmed.contains("***")
+        || trimmed.contains("****")
+        || trimmed.eq_ignore_ascii_case("[REDACTED]")
+}
+
+impl DatabaseManager {
+    pub fn get_config_rows(&self, _mask_secrets: bool) -> Result<Vec<Value>> {
         self.reconcile_routing_config();
         let sensitive: HashSet<&str> = SENSITIVE_CONFIG_KEYS.iter().copied().collect();
         let immutable: HashSet<&str> = IMMUTABLE_SECURITY_CONFIG_KEYS.iter().copied().collect();
@@ -625,18 +591,15 @@ impl DatabaseManager {
 
         let mut out = Vec::with_capacity(rows.len());
         for (key, raw_val, vtype, category, description, updated_at) in rows {
+            // R3-H21: Always mask sensitive secrets and identifiers when serializing config rows.
             let display_val = if sensitive.contains(key.as_str()) && !raw_val.is_empty() {
-                let plain = if is_encrypted_value(&raw_val) {
+                let plain = Zeroizing::new(if is_encrypted_value(&raw_val) {
                     self.try_decrypt_or_empty(&raw_val)
                 } else {
                     raw_val
-                };
-                if mask_secrets {
-                    mask_secret(&plain)
-                } else {
-                    plain
-                }
-            } else if key == "telegram_chat_id" && mask_secrets && !raw_val.is_empty() {
+                });
+                mask_secret(&plain)
+            } else if key == "telegram_chat_id" && !raw_val.is_empty() {
                 mask_identifier(&raw_val)
             } else {
                 raw_val
@@ -655,6 +618,15 @@ impl DatabaseManager {
     }
 
     pub fn set_config_value(&self, key: &str, value: &Value) -> Result<bool> {
+        self.set_config_value_with_opts(key, value, true)
+    }
+
+    fn set_config_value_with_opts(
+        &self,
+        key: &str,
+        value: &Value,
+        check_pair_bounds: bool,
+    ) -> Result<bool> {
         let val_str = match value {
             Value::String(s) => s.clone(),
             Value::Bool(b) => b.to_string(),
@@ -666,6 +638,13 @@ impl DatabaseManager {
             }
             other => other.to_string(),
         };
+
+        // R3-H21: Reject/ignore masked echo values so UI round-trips never overwrite real secrets.
+        if (SENSITIVE_CONFIG_KEYS.contains(&key) || key == "telegram_chat_id")
+            && is_masked_secret_echo(&val_str)
+        {
+            return Ok(true);
+        }
 
         // Route credential and routing-mode keys through unified validation & synchronization
         match key {
@@ -796,7 +775,11 @@ impl DatabaseManager {
                 } else {
                     pct * 100.0
                 };
-                return self.set_config_value("settling_deadband_bps", &json!(bps));
+                return self.set_config_value_with_opts(
+                    "settling_deadband_bps",
+                    &json!(bps),
+                    check_pair_bounds,
+                );
             }
             _ => {}
         }
@@ -904,6 +887,37 @@ impl DatabaseManager {
                         "Invalid settling_split_pct: must be in (0.0, 1.0).".to_string(),
                     ));
                 }
+                if check_pair_bounds {
+                    for &(min_key, max_key) in MIN_MAX_FLOAT_PAIRS {
+                        if key == min_key {
+                            if f <= 0.0 {
+                                return Err(AegisError::Validation(format!(
+                                    "Invalid {min_key} ({f}): must be > 0.0."
+                                )));
+                            }
+                            let cur_cfg = self.load_config_opts(false)?;
+                            let max_val = cur_cfg.get_f64(max_key, f64::INFINITY);
+                            if f > max_val {
+                                return Err(AegisError::Validation(format!(
+                                    "Invalid {min_key} ({f}): cannot exceed {max_key} ({max_val})."
+                                )));
+                            }
+                        } else if key == max_key {
+                            if f <= 0.0 {
+                                return Err(AegisError::Validation(format!(
+                                    "Invalid {max_key} ({f}): must be > 0.0."
+                                )));
+                            }
+                            let cur_cfg = self.load_config_opts(false)?;
+                            let min_val = cur_cfg.get_f64(min_key, 0.0);
+                            if f < min_val {
+                                return Err(AegisError::Validation(format!(
+                                    "Invalid {max_key} ({f}): cannot be less than {min_key} ({min_val})."
+                                )));
+                            }
+                        }
+                    }
+                }
                 f.to_string()
             }
             _ => {
@@ -1008,8 +1022,13 @@ impl DatabaseManager {
         let heat_pct = cfg.get_f64("max_portfolio_heat_pct", 0.04);
         let single_pct = cfg.get_f64("max_single_asset_pct", 0.25);
         let gross_lev = cfg.get_f64("max_gross_leverage", 1.5);
-        let scale_min = cfg.get_f64("conviction_scale_min", 0.5);
-        let scale_max = cfg.get_f64("conviction_scale_max", 1.5);
+        let raw_scale_min = cfg.get_f64("conviction_scale_min", 0.5);
+        let raw_scale_max = cfg.get_f64("conviction_scale_max", 1.5);
+        let (scale_min, scale_max) = if raw_scale_min <= raw_scale_max {
+            (raw_scale_min, raw_scale_max)
+        } else {
+            (raw_scale_max, raw_scale_min)
+        };
 
         let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
         let pit_book_eq = round_dp(initial_equity_usdc * split_pct, 2);
@@ -1018,8 +1037,13 @@ impl DatabaseManager {
         let pond_book_eq = round_dp(initial_equity_usdc * (1.0 - split_pct), 2);
         let pond_heat_pct = cfg.get_f64("pond_max_heat_pct", 0.04);
         let pond_cell_pct = cfg.get_f64("pond_max_cell_pct", 0.25);
-        let pond_scale_min = cfg.get_f64("pond_conviction_scale_min", 0.5);
-        let pond_scale_max = cfg.get_f64("pond_conviction_scale_max", 1.5);
+        let raw_pond_scale_min = cfg.get_f64("pond_conviction_scale_min", 0.5);
+        let raw_pond_scale_max = cfg.get_f64("pond_conviction_scale_max", 1.5);
+        let (pond_scale_min, pond_scale_max) = if raw_pond_scale_min <= raw_pond_scale_max {
+            (raw_pond_scale_min, raw_pond_scale_max)
+        } else {
+            (raw_pond_scale_max, raw_pond_scale_min)
+        };
         let pond_baseline_risk = round_dp(pond_book_eq * 0.01, 2);
 
         let pairs = [
@@ -1054,10 +1078,10 @@ impl DatabaseManager {
 
         let mut out = HashMap::new();
         for (k, v) in pairs {
-            self.set_config_value(k, &json!(v))?;
+            self.set_config_value_with_opts(k, &json!(v), false)?;
             out.insert(k.to_string(), v);
         }
-        let _ = self.set_config_value("risk_caps_reference_scope", &json!("BOOK"));
+        let _ = self.set_config_value_with_opts("risk_caps_reference_scope", &json!("BOOK"), false);
         Ok(out)
     }
 
@@ -1066,6 +1090,62 @@ impl DatabaseManager {
         updates: &HashMap<String, Value>,
         scale_risk_caps: bool,
     ) -> Result<Vec<String>> {
+        // R3-H13: Validate min <= max pairs across the combined batch + existing DB config before mutating.
+        let cur_cfg = self.load_config_opts(false)?;
+        let parse_opt_f64 = |val: &Value, key: &str| -> Result<f64> {
+            if val.is_boolean() {
+                return Err(AegisError::Validation(format!(
+                    "Invalid float value for '{key}': {val}"
+                )));
+            }
+            let f = match val {
+                Value::Number(n) => n.as_f64().ok_or_else(|| {
+                    AegisError::Validation(format!("Invalid float value for '{key}': {val}"))
+                })?,
+                Value::String(s) => s.trim().parse::<f64>().map_err(|_| {
+                    AegisError::Validation(format!("Invalid float value for '{key}': {val}"))
+                })?,
+                _ => {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid float value for '{key}': {val}"
+                    )))
+                }
+            };
+            if !f.is_finite() {
+                return Err(AegisError::Validation(format!(
+                    "Invalid float value for '{key}': {val}"
+                )));
+            }
+            Ok(f)
+        };
+        for &(min_key, max_key) in MIN_MAX_FLOAT_PAIRS {
+            if updates.contains_key(min_key) || updates.contains_key(max_key) {
+                let eff_min = match updates.get(min_key) {
+                    Some(v) => parse_opt_f64(v, min_key)?,
+                    None => cur_cfg.get_f64(min_key, 0.0),
+                };
+                let eff_max = match updates.get(max_key) {
+                    Some(v) => parse_opt_f64(v, max_key)?,
+                    None => cur_cfg.get_f64(max_key, f64::INFINITY),
+                };
+                if eff_min <= 0.0 {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid {min_key} ({eff_min}): must be > 0.0."
+                    )));
+                }
+                if eff_max <= 0.0 {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid {max_key} ({eff_max}): must be > 0.0."
+                    )));
+                }
+                if eff_min > eff_max {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid {min_key} ({eff_min}) / {max_key} ({eff_max}): min cannot exceed max."
+                    )));
+                }
+            }
+        }
+
         let mut ordered_keys: Vec<&String> = updates.keys().collect();
         ordered_keys.sort_by(|a, b| {
             let prio = |k: &str| -> u8 {
@@ -1088,7 +1168,7 @@ impl DatabaseManager {
         let mut updated_keys = Vec::new();
         for k in ordered_keys {
             let v = &updates[k];
-            let ok = self.set_config_value(k, v)?;
+            let ok = self.set_config_value_with_opts(k, v, false)?;
             if !ok {
                 return Err(AegisError::NotFound(format!("Unknown config_key: {k}")));
             }
@@ -1327,20 +1407,19 @@ impl DatabaseManager {
         max_daily_drawdown_alert_pct: Option<f64>,
     ) -> Result<Value> {
         if let Some(tok) = telegram_bot_token {
-            let plain = Zeroizing::new(if is_encrypted_value(tok) {
-                self.decrypt_config_value(tok)?
-            } else {
-                tok.trim().to_string()
-            });
-            self.set_config_value("telegram_bot_token", &json!(&*plain))?;
+            let trimmed_tok = tok.trim();
+            if !is_masked_secret_echo(trimmed_tok) {
+                let plain = Zeroizing::new(if is_encrypted_value(trimmed_tok) {
+                    self.decrypt_config_value(trimmed_tok)?
+                } else {
+                    trimmed_tok.to_string()
+                });
+                self.set_config_value("telegram_bot_token", &json!(&*plain))?;
+            }
         }
         if let Some(cid) = telegram_chat_id {
             let trimmed = cid.trim();
-            if !trimmed.is_empty()
-                && !trimmed.contains("...")
-                && !trimmed.contains("***")
-                && !trimmed.contains("****")
-            {
+            if !trimmed.is_empty() && !is_masked_secret_echo(trimmed) {
                 self.set_config_value("telegram_chat_id", &json!(trimmed))?;
             }
         }
@@ -1372,12 +1451,15 @@ impl DatabaseManager {
             updates.insert("wallet_address", validate_evm_address(w, "wallet_address")?);
         }
         if let Some(pk) = private_key {
-            let raw_pk = Zeroizing::new(if is_encrypted_value(pk) {
-                self.decrypt_config_value(pk)?
-            } else {
-                pk.to_string()
-            });
-            updates.insert("private_key", validate_private_key(&raw_pk)?);
+            let trimmed_pk = pk.trim();
+            if !is_masked_secret_echo(trimmed_pk) {
+                let raw_pk = Zeroizing::new(if is_encrypted_value(trimmed_pk) {
+                    self.decrypt_config_value(trimmed_pk)?
+                } else {
+                    trimmed_pk.to_string()
+                });
+                updates.insert("private_key", validate_private_key(&raw_pk)?);
+            }
         }
         if let Some(v) = hyperliquid_vault_address {
             updates.insert(
@@ -1386,12 +1468,15 @@ impl DatabaseManager {
             );
         }
         if let Some(gk) = gemini_api_key {
-            let raw_gk = if is_encrypted_value(gk) {
-                self.decrypt_config_value(gk)?
-            } else {
-                gk.trim().to_string()
-            };
-            updates.insert("gemini_api_key", raw_gk);
+            let trimmed_gk = gk.trim();
+            if !is_masked_secret_echo(trimmed_gk) {
+                let raw_gk = if is_encrypted_value(trimmed_gk) {
+                    self.decrypt_config_value(trimmed_gk)?
+                } else {
+                    trimmed_gk.to_string()
+                };
+                updates.insert("gemini_api_key", raw_gk);
+            }
         }
         if let Some(tn) = hyperliquid_testnet {
             updates.insert(
@@ -1535,5 +1620,29 @@ impl DatabaseManager {
             })?;
         }
         self.get_credentials_status()
+    }
+
+    /// Retrieves and decrypts the active `web_api_token` (or `dashboard_api_token`) from `system_config`,
+    /// or generates and persists a new 32-byte CSPRNG hex token if none is configured.
+    pub fn get_or_create_web_api_token(&self) -> Result<String> {
+        if let Ok(tok) = std::env::var("AEGIS_WEB_TOKEN") {
+            let trimmed = tok.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(trimmed);
+            }
+        }
+        let cfg = self.load_config()?;
+        for key in ["web_api_token", "dashboard_api_token"] {
+            let tok = cfg.get_str(key, "");
+            if !tok.trim().is_empty() {
+                return Ok(tok.trim().to_string());
+            }
+        }
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let generated: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.set_config_value("web_api_token", &json!(generated))?;
+        Ok(generated)
     }
 }

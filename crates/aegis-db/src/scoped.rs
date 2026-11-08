@@ -336,17 +336,27 @@ impl BookScopedDb {
     }
 
     pub fn get_wallet_open_symbols(&self) -> Result<std::collections::HashSet<String>> {
-        self.check_table_access("books")?;
+        match self.book {
+            BookType::Pit => self.check_table_access("trades")?,
+            BookType::Pond => self.check_table_access("pond_cells")?,
+        }
         self.pool.get_all_open_wallet_symbols()
     }
 
     pub fn get_wallet_perps_margin_state(&self) -> Result<(f64, f64, f64, f64)> {
-        self.check_table_access("books")?;
+        match self.book {
+            BookType::Pit => self.check_table_access("trades")?,
+            BookType::Pond => self.check_table_access("pond_cells")?,
+        }
+        self.check_table_access("portfolio_snapshots")?;
         self.pool.get_wallet_perps_margin_state()
     }
 
     pub fn get_net_book_transfer_adjustment(&self) -> Result<f64> {
-        self.check_table_access("books")?;
+        match self.book {
+            BookType::Pit => self.check_table_access("trades")?,
+            BookType::Pond => self.check_table_access("pond_cells")?,
+        }
         self.pool.get_net_book_transfer_adjustment(self.book.as_str())
     }
 
@@ -375,6 +385,12 @@ impl BookScopedDb {
     pub fn get_pit_latest_portfolio_snapshot(&self) -> Result<PortfolioSnapshot> {
         self.check_table_access("portfolio_snapshots")?;
         self.pool.get_latest_portfolio_snapshot()
+    }
+
+    pub fn compute_pit_equity_and_idle_usdc(&self) -> Result<(f64, f64)> {
+        self.check_table_access("trades")?;
+        self.check_table_access("portfolio_snapshots")?;
+        self.pool.compute_pit_equity_and_idle_usdc()
     }
 
     // --- Book B (Pond) Scoped Methods ---
@@ -418,6 +434,93 @@ impl BookScopedDb {
         self.pool.upsert_pond_cell(cell)
     }
 
+    pub fn accrue_pond_cell_funding_for_hour(
+        &self,
+        cell_id: i64,
+        hour_bucket: i64,
+        delta_usdc: f64,
+    ) -> Result<bool> {
+        self.check_table_access("pond_cells")?;
+        self.pool
+            .accrue_pond_cell_funding_for_hour(cell_id, hour_bucket, delta_usdc)
+    }
+
+    pub fn update_open_pond_cell_watermarks(
+        &self,
+        cell_id: i64,
+        state: &str,
+        chandelier_stop: Option<f64>,
+        highest_price_seen: Option<f64>,
+        lowest_price_seen: Option<f64>,
+    ) -> Result<bool> {
+        self.check_table_access("pond_cells")?;
+        self.pool.update_open_pond_cell_watermarks(
+            cell_id,
+            state,
+            chandelier_stop,
+            highest_price_seen,
+            lowest_price_seen,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_open_pond_cell_partial_exit(
+        &self,
+        cell_id: i64,
+        state: &str,
+        chandelier_stop: Option<f64>,
+        highest_price_seen: Option<f64>,
+        lowest_price_seen: Option<f64>,
+        remaining_qty: f64,
+        remaining_notional: f64,
+        realized_pnl_delta: f64,
+        fees_delta: f64,
+    ) -> Result<bool> {
+        self.check_table_access("pond_cells")?;
+        self.pool.reduce_open_pond_cell_partial_exit(
+            cell_id,
+            state,
+            chandelier_stop,
+            highest_price_seen,
+            lowest_price_seen,
+            remaining_qty,
+            remaining_notional,
+            realized_pnl_delta,
+            fees_delta,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn close_open_pond_cell(
+        &self,
+        cell_id: i64,
+        target_state: &str,
+        chandelier_stop: Option<f64>,
+        highest_price_seen: Option<f64>,
+        lowest_price_seen: Option<f64>,
+        exit_price: f64,
+        gross_pnl_delta: f64,
+        fees_delta: f64,
+        exit_reason: Option<&str>,
+        closed_at: &str,
+        cooldown_until: &str,
+    ) -> Result<bool> {
+        self.check_table_access("pond_cells")?;
+        self.pool.close_open_pond_cell(
+            cell_id,
+            target_state,
+            chandelier_stop,
+            highest_price_seen,
+            lowest_price_seen,
+            exit_price,
+            gross_pnl_delta,
+            fees_delta,
+            exit_reason,
+            closed_at,
+            cooldown_until,
+        )
+    }
+
     pub fn get_open_pond_cells(&self) -> Result<Vec<PondCell>> {
         self.check_table_access("v_pond_cells_open")?;
         self.pool.get_open_pond_cells()
@@ -436,5 +539,10 @@ impl BookScopedDb {
     pub fn get_pond_realized_pnl(&self) -> Result<f64> {
         self.check_table_access("pond_cells")?;
         self.pool.get_pond_realized_pnl()
+    }
+
+    pub fn compute_pond_equity_and_idle_usdc(&self) -> Result<(f64, f64)> {
+        self.check_table_access("pond_cells")?;
+        self.pool.compute_pond_equity_and_idle_usdc()
     }
 }

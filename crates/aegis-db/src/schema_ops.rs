@@ -17,6 +17,7 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/005_v030_pp50_two_book.sql",
     "sql/migrations/006_v030_review_remediation.sql",
     "sql/migrations/007_v030_round2_remediation.sql",
+    "sql/migrations/008_v030_round3_remediation.sql",
 ];
 
 impl DatabaseManager {
@@ -117,7 +118,7 @@ impl DatabaseManager {
         }
         if !force {
             if let Ok(ver) = self.get_schema_version() {
-                if ver >= 7 {
+                if ver >= ALL_MIGRATION_FILES.len() as i64 {
                     self.reconcile_routing_config();
                     return self.verify_integrity();
                 }
@@ -133,6 +134,7 @@ impl DatabaseManager {
                     "pond_cells",
                     "pond_scan_cycles",
                     "pond_champions",
+                    "pond_universe",
                     "book_transfers",
                     "pp50_platform_snapshots",
                     "system_config",

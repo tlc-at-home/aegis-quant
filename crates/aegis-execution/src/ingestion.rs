@@ -361,17 +361,30 @@ impl MarketIngestionEngine {
 
         let max_consecutive_failures =
             cfg.get_i64("max_consecutive_api_failures", 5).max(1) as usize;
+        let default_funding = cfg.get_f64("default_funding_rate_hourly", 0.0);
+        let fallback_synth_px = cfg.get_f64("pond_fallback_base_price_usdc", 10.0);
         let mut consecutive_failures = 0usize;
 
         let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
         sorted_tfs.sort();
 
-        let btc_ref_px = self.db.resolve_reference_price("BTC/USDC:USDC");
+        let btc_ref_px = self
+            .resolve_reference_price_logged("BTC/USDC:USDC")
+            .unwrap_or(95_000.0);
 
         for tf in &sorted_tfs {
             let mut bars_opt = None;
             if !force_synthetic && !api_unreachable {
-                let f_rate = funding_map.get("BTC").copied().unwrap_or(0.0001);
+                let f_rate = match funding_map.get("BTC").copied() {
+                    Some(r) => r,
+                    None => {
+                        tracing::warn!(
+                            default_funding = default_funding,
+                            "BTC funding rate missing from Hyperliquid metaAndAssetCtxs; using configured default_funding_rate_hourly (R3-N16)"
+                        );
+                        default_funding
+                    }
+                };
                 match self.fetch_hyperliquid_candles_result("BTC", tf, lookback_bars, f_rate) {
                     Ok(b) => {
                         consecutive_failures = 0;
@@ -436,14 +449,24 @@ impl MarketIngestionEngine {
             if asset.rs_timeframe != asset.exec_timeframe {
                 req_tfs.push(asset.rs_timeframe.clone());
             }
-            let f_rate = funding_map
-                .get(&asset.base_asset)
-                .copied()
-                .unwrap_or(0.00012);
+            let f_rate = match funding_map.get(&asset.base_asset).copied() {
+                Some(r) => r,
+                None => {
+                    if !force_synthetic && !api_unreachable {
+                        tracing::warn!(
+                            coin = %asset.base_asset,
+                            default_funding = default_funding,
+                            "Altcoin funding rate missing from Hyperliquid metaAndAssetCtxs; using configured default_funding_rate_hourly (R3-N16)"
+                        );
+                    }
+                    default_funding
+                }
+            };
             let ref_px = if asset.reference_price > 0.0 {
                 asset.reference_price
             } else {
-                self.db.resolve_reference_price(&asset.symbol)
+                self.resolve_reference_price_logged(&asset.symbol)
+                    .unwrap_or(fallback_synth_px)
             };
 
             for tf in req_tfs {
@@ -552,8 +575,56 @@ impl MarketIngestionEngine {
         ]))
     }
 
+    fn resolve_reference_price_logged(&self, symbol: &str) -> Option<f64> {
+        match self.db.resolve_reference_price(symbol) {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, error = %e, "resolve_reference_price SQL query failed (R3-H15)");
+                None
+            }
+        }
+    }
+
+    /// Computes multi-day median daily notional volume from stored 1H bars when available (`R3-N21`),
+    /// falling back to `fallback_day_vlm` when fewer than 2 full days of 1H bars exist.
+    fn compute_median_daily_volume_from_bars(
+        &self,
+        symbol: &str,
+        fallback_day_vlm: f64,
+        window_days: usize,
+    ) -> f64 {
+        let lookback_hours = window_days.max(1) * 24;
+        let Ok(bars) = self.db.get_ohlcv_bars(symbol, "1h", lookback_hours, None) else {
+            return fallback_day_vlm;
+        };
+        if bars.len() < 48 {
+            return fallback_day_vlm;
+        }
+        let mut daily_vols: Vec<f64> = bars
+            .chunks(24)
+            .filter(|chunk| chunk.len() == 24)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|b| (b.volume * b.close).max(0.0))
+                    .sum::<f64>()
+            })
+            .filter(|v| *v > 0.0 && v.is_finite())
+            .collect();
+        if daily_vols.len() < 2 {
+            return fallback_day_vlm;
+        }
+        daily_vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = daily_vols.len() / 2;
+        if daily_vols.len() % 2 == 1 {
+            daily_vols[mid]
+        } else {
+            (daily_vols[mid - 1] + daily_vols[mid]) / 2.0
+        }
+    }
+
     /// Discovers top-N Hyperliquid USDC perpetual candidates ranked by 7-day median daily volume,
-    /// falling back to a deterministic 85-coin Hyperliquid universe when offline (`NH-9`, `NM-13`, `HP`).
+    /// falling back to a deterministic 85-coin Hyperliquid universe when offline (`NH-9`, `NM-13`, `HP`, `R3-N21`).
     pub fn discover_pond_universe_candidates(
         &self,
         target_size: usize,
@@ -565,6 +636,8 @@ impl MarketIngestionEngine {
             .to_string();
 
         let cfg = self.load_config_logged("discover_pond_universe_candidates");
+        let median_window_days = cfg.get_i64("pond_volume_median_window_days", 7).max(1) as usize;
+        let fallback_synth_px = cfg.get_f64("pond_fallback_base_price_usdc", 10.0);
         let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let pond_mode = cfg
             .get_str("pond_execution_mode", &exec_mode)
@@ -603,6 +676,8 @@ impl MarketIngestionEngine {
                             continue;
                         }
                         if let Some(name) = u.get("name").and_then(Value::as_str) {
+                            let coin_upper = name.to_uppercase();
+                            let symbol_full = format!("{coin_upper}/USDC:USDC");
                             let day_vlm = c
                                 .get("dayNtlVlm")
                                 .and_then(|v| {
@@ -610,7 +685,12 @@ impl MarketIngestionEngine {
                                         .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                                 })
                                 .unwrap_or(0.0);
-                            if day_vlm >= min_daily_vol_usdc {
+                            let median_vlm = self.compute_median_daily_volume_from_bars(
+                                &symbol_full,
+                                day_vlm,
+                                median_window_days,
+                            );
+                            if median_vlm >= min_daily_vol_usdc {
                                 let sz_decimals = u
                                     .get("szDecimals")
                                     .and_then(Value::as_u64)
@@ -635,8 +715,8 @@ impl MarketIngestionEngine {
                                     })
                                     .unwrap_or(0.0);
                                 live_items.push((
-                                    name.to_uppercase(),
-                                    day_vlm,
+                                    coin_upper,
+                                    median_vlm,
                                     sz_decimals,
                                     max_lev,
                                     mark_px,
@@ -656,7 +736,8 @@ impl MarketIngestionEngine {
                                 let ref_px = if mark_px > 0.0 {
                                     mark_px
                                 } else {
-                                    self.db.resolve_reference_price(&symbol)
+                                    self.resolve_reference_price_logged(&symbol)
+                                        .unwrap_or(0.0)
                                 };
                                 let lot_step = round_dp(10f64.powi(-(sz_dec as i32)), 8).max(1e-6);
                                 let max_dec = (6 - sz_dec as i32).max(0);
@@ -713,7 +794,9 @@ impl MarketIngestionEngine {
                 let symbol = format!("{coin}/USDC:USDC");
                 let vol = (850_000_000.0 * (-0.112 * (idx as f64)).exp())
                     .max(min_daily_vol_usdc + 25_000.0);
-                let ref_px = self.db.resolve_reference_price(&symbol);
+                let ref_px = self
+                    .resolve_reference_price_logged(&symbol)
+                    .unwrap_or(fallback_synth_px);
                 PondUniverseRow {
                     symbol,
                     rank,
@@ -744,15 +827,17 @@ impl MarketIngestionEngine {
         let cfg = self.load_config_logged("engine.ingestion.generate_pond_funding_and_bars");
         let fallback_base = cfg.get_f64("pond_fallback_base_price_usdc", 10.0);
         let fallback_slope = cfg.get_f64("pond_fallback_rank_slope_usdc", 0.75);
-        let resolved_px = self.db.resolve_reference_price(symbol);
-        let base_px = if (resolved_px - fallback_base).abs() > 1e-6
-            || symbol.starts_with("APT")
-            || symbol.starts_with("UNI")
-            || symbol.starts_with("ATOM")
-        {
-            resolved_px
-        } else {
-            fallback_base + (rank as f64) * fallback_slope
+        let resolved_px = self.resolve_reference_price_logged(symbol);
+        let base_px = match resolved_px {
+            Some(px)
+                if (px - fallback_base).abs() > 1e-6
+                    || symbol.starts_with("APT")
+                    || symbol.starts_with("UNI")
+                    || symbol.starts_with("ATOM") =>
+            {
+                px
+            }
+            _ => fallback_base + (rank as f64) * fallback_slope,
         };
         let bars_1h = self.generate_synthetic_bars(
             symbol,

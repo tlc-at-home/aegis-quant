@@ -6,12 +6,19 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::signing::{
     format_hl_wire_price, format_hl_wire_size, infer_sz_decimals_from_lot_step, sign_l1_action,
     CancelAction, CancelWire, LimitOrderType, OrderAction, OrderTypeWire, OrderWire,
     SubAccountTransferAction, VaultTransferAction,
 };
-use crate::{ExecutionEngine, RestingOrderStatus};
+use crate::{
+    ExecutionEngine, RestingOrderStatus, SubaccountTransferResult, VaultTransferResult,
+    WalletEquitySyncResult,
+};
+
+static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 /// Parses a Hyperliquid `/exchange` order response into an `OrderExecutionResult` (`NH-7`, `NM-9`, `Q1`).
 ///
@@ -213,6 +220,35 @@ impl ExecutionEngine {
         }
     }
 
+    /// Generates a strictly monotonic nonce using SQLite's atomic counter backed by an
+    /// in-process `AtomicU64` high-water floor (`R3-N17`).
+    pub(crate) fn next_monotonic_nonce(&self) -> u64 {
+        let raw = self.db.next_hyperliquid_nonce().unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "DB nonce increment failed; falling back to in-process monotonic clock floor (R3-N17)"
+            );
+            Utc::now().timestamp_millis() as u64
+        });
+        let mut prev = LAST_NONCE_HIGH_WATER.load(Ordering::SeqCst);
+        loop {
+            let next = if raw > prev {
+                raw
+            } else {
+                prev.saturating_add(1)
+            };
+            match LAST_NONCE_HIGH_WATER.compare_exchange(
+                prev,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
     pub(crate) fn post_signed_l1_action_with_nonce_retry<T: serde::Serialize>(
         &self,
         priv_key: &str,
@@ -223,10 +259,7 @@ impl ExecutionEngine {
         self.verify_live_signer(priv_key, cfg)?;
         let url = self.exchange_url(cfg, is_testnet);
         for attempt in 0..2 {
-            let nonce = self
-                .db
-                .next_hyperliquid_nonce()
-                .unwrap_or_else(|_| Utc::now().timestamp_millis() as u64);
+            let nonce = self.next_monotonic_nonce();
             let sig = sign_l1_action(priv_key, action, None, nonce, None, !is_testnet)?;
             let payload = json!({
                 "action": serde_json::to_value(action).unwrap_or_default(),
@@ -259,7 +292,9 @@ impl ExecutionEngine {
             }
             return Ok((sig, resp_opt));
         }
-        unreachable!()
+        Err(AegisError::Execution(
+            "Hyperliquid L1 nonce retry loop exhausted".to_string(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -406,8 +441,11 @@ impl ExecutionEngine {
             let status =
                 self.check_resting_order_status(&asset.symbol, Some(&ack_res.exchange_order_id));
             if status.state == "FILLED" && status.filled_units > 0.0 && status.entry_price > 0.0 {
-                let fees_paid_usdc =
-                    round_dp(status.filled_units * status.entry_price * (fee_bps / 10_000.0), 4);
+                let fees_paid_usdc = if status.fee_usdc > 0.0 {
+                    round_dp(status.fee_usdc, 4)
+                } else {
+                    round_dp(status.filled_units * status.entry_price * (fee_bps / 10_000.0), 4)
+                };
                 let slip_usd =
                     round_dp((status.entry_price - reference_price).abs() * status.filled_units, 4);
                 let eff_slip_bps = if reference_price > 0.0 {
@@ -443,26 +481,31 @@ impl ExecutionEngine {
         ack_res
     }
 
-    /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`).
-    pub fn fetch_hyperliquid_fills_for_oid(
+    /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`, `R3-H4`, `R3-H16`).
+    /// Returns `(reachable, Option<(filled_sz, avg_px, total_fee)>)`.
+    fn query_hyperliquid_fills_for_oid_with_reachability(
         &self,
         wallet_address: &str,
         target_oid: u64,
         is_testnet: bool,
-    ) -> Option<(f64, f64, f64)> {
+    ) -> (bool, Option<(f64, f64, f64)>) {
         if wallet_address.trim().is_empty() || target_oid == 0 {
-            return None;
+            return (false, None);
         }
         let cfg = self.load_config_logged("fetch_hyperliquid_fills_for_oid");
         let url = self.info_url(&cfg, is_testnet);
-        let val = self.http_post_json(
+        let Some(val) = self.http_post_json(
             &url,
             &json!({
                 "type": "userFills",
                 "user": wallet_address.trim(),
             }),
-        )?;
-        let arr = val.as_array()?;
+        ) else {
+            return (false, None);
+        };
+        let Some(arr) = val.as_array() else {
+            return (true, None);
+        };
         let mut total_sz = 0.0_f64;
         let mut total_notional = 0.0_f64;
         let mut total_fee = 0.0_f64;
@@ -507,20 +550,38 @@ impl ExecutionEngine {
             }
         }
         if total_sz > 0.0 {
-            Some((total_sz, total_notional / total_sz, total_fee))
+            (true, Some((total_sz, total_notional / total_sz, total_fee)))
         } else {
-            None
+            (true, None)
         }
     }
 
+    /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`).
+    pub fn fetch_hyperliquid_fills_for_oid(
+        &self,
+        wallet_address: &str,
+        target_oid: u64,
+        is_testnet: bool,
+    ) -> Option<(f64, f64, f64)> {
+        self.query_hyperliquid_fills_for_oid_with_reachability(
+            wallet_address,
+            target_oid,
+            is_testnet,
+        )
+        .1
+    }
+
     /// Checks whether a resting ALO order (`OPEN_ON_BOOK`) is still resting on `openOrders`,
-    /// has filled (`userFills` / `orderStatus` by `oid`), or was cancelled/expired (`GONE`) (`NH-6`).
+    /// has filled (`userFills` / `orderStatus` by `oid`), was cancelled/expired (`GONE`), or
+    /// could not be verified because all `/info` calls failed (`UNKNOWN`) (`NH-6`, `R3-H4`, `R3-H16`).
     ///
-    /// Never attributes an unrelated pre-existing `clearinghouseState` position `szi` to a
-    /// cancelled/expired resting order (`NH-6`).
+    /// - Never attributes an unrelated pre-existing `clearinghouseState` position `szi` to a
+    ///   cancelled/expired resting order (`NH-6`).
+    /// - Never falls back to coin-level `ord_coin == coin` matching when `oid` is missing (`R3-H4`).
+    /// - Returns `"UNKNOWN"` when all Hyperliquid `/info` lookups fail (`R3-H4`).
     pub fn check_resting_order_status(
         &self,
-        symbol: &str,
+        _symbol: &str,
         exchange_order_id: Option<&str>,
     ) -> RestingOrderStatus {
         let cfg = self.load_config_logged("check_resting_order_status");
@@ -533,6 +594,7 @@ impl ExecutionEngine {
                 state: "FILLED".to_string(),
                 filled_units: 0.0,
                 entry_price: 0.0,
+                fee_usdc: 0.0,
             };
         }
 
@@ -540,111 +602,124 @@ impl ExecutionEngine {
             || mode == "TESTNET"
             || pond_mode == "TESTNET";
         let wallet = cfg.get_str("wallet_address", "");
-        let coin = symbol
-            .split('/')
-            .next()
-            .unwrap_or(symbol)
-            .trim()
-            .to_uppercase();
         let target_oid = exchange_order_id
             .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&id| id > 0);
 
+        let Some(oid) = target_oid else {
+            return RestingOrderStatus {
+                state: "UNKNOWN".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+                fee_usdc: 0.0,
+            };
+        };
+
+        let mut any_info_reachable = false;
+
         if let Some(open_orders) = self.fetch_hyperliquid_open_orders(&wallet, is_testnet) {
+            any_info_reachable = true;
             let still_open = open_orders.iter().any(|ord| {
-                let ord_coin = ord
-                    .get("coin")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_uppercase();
                 let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
                     ord.get("oid")
                         .and_then(Value::as_str)
                         .and_then(|s| s.parse::<u64>().ok())
                 });
-                if let Some(tid) = target_oid {
-                    ord_oid == Some(tid)
-                } else {
-                    ord_coin == coin
-                }
+                ord_oid == Some(oid)
             });
             if still_open {
                 return RestingOrderStatus {
                     state: "OPEN_ON_BOOK".to_string(),
                     filled_units: 0.0,
                     entry_price: 0.0,
+                    fee_usdc: 0.0,
                 };
             }
         }
 
-        if let Some(oid) = target_oid {
-            if let Some((filled_sz, avg_px, _fee)) =
-                self.fetch_hyperliquid_fills_for_oid(&wallet, oid, is_testnet)
-            {
+        let (fills_reachable, fills_opt) =
+            self.query_hyperliquid_fills_for_oid_with_reachability(&wallet, oid, is_testnet);
+        if fills_reachable {
+            any_info_reachable = true;
+        }
+        if let Some((filled_sz, avg_px, fee)) = fills_opt {
+            return RestingOrderStatus {
+                state: "FILLED".to_string(),
+                filled_units: round_dp(filled_sz, 6),
+                entry_price: round_dp(avg_px, 6),
+                fee_usdc: round_dp(fee, 4),
+            };
+        }
+
+        let url = self.info_url(&cfg, is_testnet);
+        if let Some(os_val) = self.http_post_json(
+            &url,
+            &json!({
+                "type": "orderStatus",
+                "user": wallet.trim(),
+                "oid": oid,
+            }),
+        ) {
+            any_info_reachable = true;
+            let ord_status = os_val
+                .get("order")
+                .and_then(|o| o.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if ord_status.eq_ignore_ascii_case("open") {
                 return RestingOrderStatus {
-                    state: "FILLED".to_string(),
-                    filled_units: round_dp(filled_sz, 6),
-                    entry_price: round_dp(avg_px, 6),
+                    state: "OPEN_ON_BOOK".to_string(),
+                    filled_units: 0.0,
+                    entry_price: 0.0,
+                    fee_usdc: 0.0,
                 };
             }
-
-            let url = self.info_url(&cfg, is_testnet);
-            if let Some(os_val) = self.http_post_json(
-                &url,
-                &json!({
-                    "type": "orderStatus",
-                    "user": wallet.trim(),
-                    "oid": oid,
-                }),
-            ) {
-                let ord_status = os_val
-                    .get("order")
-                    .and_then(|o| o.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if ord_status.eq_ignore_ascii_case("open") {
-                    return RestingOrderStatus {
-                        state: "OPEN_ON_BOOK".to_string(),
-                        filled_units: 0.0,
-                        entry_price: 0.0,
-                    };
-                }
-                if ord_status.eq_ignore_ascii_case("filled") {
-                    if let Some(order_inner) =
-                        os_val.get("order").and_then(|o| o.get("order"))
-                    {
-                        let orig_sz = order_inner
-                            .get("origSz")
-                            .or_else(|| order_inner.get("sz"))
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            })
-                            .unwrap_or(0.0);
-                        let limit_px = order_inner
-                            .get("limitPx")
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            })
-                            .unwrap_or(0.0);
-                        if orig_sz > 0.0 && limit_px > 0.0 {
-                            return RestingOrderStatus {
-                                state: "FILLED".to_string(),
-                                filled_units: round_dp(orig_sz, 6),
-                                entry_price: round_dp(limit_px, 6),
-                            };
-                        }
+            if ord_status.eq_ignore_ascii_case("filled") {
+                if let Some(order_inner) = os_val.get("order").and_then(|o| o.get("order")) {
+                    let orig_sz = order_inner
+                        .get("origSz")
+                        .or_else(|| order_inner.get("sz"))
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        })
+                        .unwrap_or(0.0);
+                    let limit_px = order_inner
+                        .get("limitPx")
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        })
+                        .unwrap_or(0.0);
+                    if orig_sz > 0.0 && limit_px > 0.0 {
+                        let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5).max(0.0);
+                        let est_fee = round_dp(orig_sz * limit_px * (maker_fee_bps / 10_000.0), 4);
+                        return RestingOrderStatus {
+                            state: "FILLED".to_string(),
+                            filled_units: round_dp(orig_sz, 6),
+                            entry_price: round_dp(limit_px, 6),
+                            fee_usdc: est_fee,
+                        };
                     }
                 }
             }
+        }
+
+        if !any_info_reachable {
+            return RestingOrderStatus {
+                state: "UNKNOWN".to_string(),
+                filled_units: 0.0,
+                entry_price: 0.0,
+                fee_usdc: 0.0,
+            };
         }
 
         RestingOrderStatus {
             state: "GONE".to_string(),
             filled_units: 0.0,
             entry_price: 0.0,
+            fee_usdc: 0.0,
         }
     }
 
@@ -1091,7 +1166,7 @@ impl ExecutionEngine {
         amount_usdc: f64,
         is_deposit: bool,
         vault_address: Option<&str>,
-    ) -> Value {
+    ) -> VaultTransferResult {
         let cfg = self.load_config_logged("execute_hlp_vault_transfer");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
@@ -1102,30 +1177,30 @@ impl ExecutionEngine {
 
         if mode == "PAPER" {
             *self.hlp_vault_error_streak.lock() = 0;
-            return json!({
+            return VaultTransferResult::from_raw(json!({
                 "status": "SIMULATED",
                 "mode": "PAPER",
                 "vault_address": vault,
                 "is_deposit": is_deposit,
                 "amount_usdc": round_dp(amount_usdc, 2),
                 "usd_micro": usd_micro,
-            });
+            }));
         }
 
         let wallet = cfg.get_str("wallet_address", "");
         let priv_key = self.db.get_signing_private_key().unwrap_or_default();
         if wallet.is_empty() || priv_key.is_empty() {
-            return json!({
+            return VaultTransferResult::from_raw(json!({
                 "status": "SKIPPED",
                 "reason": "MISSING_CREDENTIALS",
                 "vault_address": vault,
-            });
+            }));
         }
         if vault.trim().is_empty() {
-            return json!({
+            return VaultTransferResult::from_raw(json!({
                 "status": "ERROR",
                 "reason": "MISSING_VAULT_ADDRESS",
-            });
+            }));
         }
 
         let action = VaultTransferAction {
@@ -1146,13 +1221,13 @@ impl ExecutionEngine {
                             != Some("error");
                     if is_ok {
                         *self.hlp_vault_error_streak.lock() = 0;
-                        return json!({
+                        return VaultTransferResult::from_raw(json!({
                             "status": "SUBMITTED",
                             "vault_address": vault,
                             "is_deposit": is_deposit,
                             "amount_usdc": round_dp(amount_usdc, 2),
                             "exchange_response": resp,
-                        });
+                        }));
                     }
                 }
                 let mut streak = self.hlp_vault_error_streak.lock();
@@ -1166,21 +1241,21 @@ impl ExecutionEngine {
                         Some(json!({"vault_address": vault, "amount_usdc": amount_usdc})),
                     );
                 }
-                json!({
+                VaultTransferResult::from_raw(json!({
                     "status": "ERROR",
                     "reason": "EXCHANGE_POST_FAILED",
                     "error_streak": cur_streak,
-                })
+                }))
             }
-            Err(e) => json!({
+            Err(e) => VaultTransferResult::from_raw(json!({
                 "status": "ERROR",
                 "reason": e.to_string(),
-            }),
+            })),
         }
     }
 
     /// Queries on-chain Hyperliquid clearinghouse + HLP vault equity and optionally rescales risk caps (`NH-11`).
-    pub fn sync_wallet_equity(&self, update_risk_caps: bool) -> Value {
+    pub fn sync_wallet_equity(&self, update_risk_caps: bool) -> WalletEquitySyncResult {
         let cfg = self.load_config_logged("sync_wallet_equity");
         let wallet = cfg.get_str("wallet_address", "");
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
@@ -1190,7 +1265,7 @@ impl ExecutionEngine {
 
         if wallet.trim().is_empty() {
             let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
-            return json!({
+            return WalletEquitySyncResult::from_raw(json!({
                 "status": "PAPER_DEFAULT",
                 "wallet_address": "",
                 "network": if is_testnet { "testnet" } else { "mainnet" },
@@ -1199,7 +1274,7 @@ impl ExecutionEngine {
                 "total_equity_usdc": init_eq,
                 "perp_account_value_usdc": init_eq,
                 "vault_equity_usdc": 0.0,
-            });
+            }));
         }
 
         let mut perp_eq = 0.0;
@@ -1272,7 +1347,7 @@ impl ExecutionEngine {
         } else {
             cfg.get_f64("initial_equity_usdc", 10000.0)
         };
-        json!({
+        WalletEquitySyncResult::from_raw(json!({
             "status": if live_ok { "SYNCED_ON_CHAIN" } else { "UNREACHABLE_FALLBACK" },
             "wallet_address": wallet,
             "network": if is_testnet { "testnet" } else { "mainnet" },
@@ -1282,7 +1357,7 @@ impl ExecutionEngine {
             "withdrawable_usdc": round_dp(withdrawable, 2),
             "vault_equity_usdc": round_dp(vault_eq, 2),
             "total_equity_usdc": eff_total,
-        })
+        }))
     }
 
     fn submit_single_subaccount_leg(
@@ -1304,12 +1379,12 @@ impl ExecutionEngine {
             .post_signed_l1_action_with_nonce_retry(priv_key, &action, cfg, is_testnet)
             .map_err(|e| {
                 AegisError::Execution(format!(
-                    "Hyperliquid subAccountTransfer signing/signer validation failed for subAccountUser={sub_addr}: {e}"
+                    "PRE_SEND_VALIDATION_FAILED: Hyperliquid subAccountTransfer signing/signer validation failed for subAccountUser={sub_addr}: {e}"
                 ))
             })?;
         let resp = resp_opt.ok_or_else(|| {
             AegisError::Execution(format!(
-                "Hyperliquid subAccountTransfer HTTP POST failed for subAccountUser={sub_addr} (isDeposit={is_deposit})"
+                "AMBIGUOUS_POST_SEND: Hyperliquid subAccountTransfer HTTP POST timed out or failed after dispatch for subAccountUser={sub_addr} (isDeposit={is_deposit}) — manual reconciliation required before retry"
             ))
         })?;
 
@@ -1370,23 +1445,30 @@ impl ExecutionEngine {
         Ok((tx_hash, resp))
     }
 
-    /// Executes an inter-book USDC transfer between Book A (PIT) and Book B (POND) (`NB-1`, `NM-6`, `C1`).
-    ///
-    /// - When separate Hyperliquid sub-accounts (`pit_subaccount_address` / `pond_subaccount_address`)
-    ///   are configured in `LIVE` or `TESTNET` mode, signs and submits a real `subAccountTransfer` L1 action.
-    ///   If both `pit_subaccount_address` and `pond_subaccount_address` are distinct sub-accounts,
-    ///   executes the 2-leg transfer (source sub-account -> master -> destination sub-account) (`NM-6`).
-    ///   If any live L1 signing or exchange call fails, returns `Err(AegisError::Execution(...))`
-    ///   and NEVER silently falls back to `VIRTUAL_SINGLE_WALLET_LEDGER` (`NB-1`).
-    /// - Only when running in single-wallet or `PAPER` mode (or `dry_run = true`) does it record a
-    ///   `VIRTUAL_SINGLE_WALLET_LEDGER` entry.
+    /// Executes an inter-book USDC transfer between Book A (PIT) and Book B (POND) (`NB-1`, `NM-6`, `C1`, `R3-B3`).
     pub fn execute_subaccount_transfer(
         &self,
         from_book: &str,
         to_book: &str,
         amount_usdc: f64,
         dry_run: bool,
-    ) -> Result<Value> {
+    ) -> Result<SubaccountTransferResult> {
+        self.execute_subaccount_transfer_for_record(None, from_book, to_book, amount_usdc, dry_run)
+    }
+
+    /// Executes an inter-book USDC transfer with optional `transfer_id` per-leg persistence (`R3-B3`).
+    ///
+    /// - Persists `legs_completed`, `leg1_tx_ref`, and `leg2_tx_ref` after each leg so a retry on a
+    ///   2-leg transfer where leg 1 succeeded and leg 2 failed NEVER re-executes leg 1 (`R3-B3`).
+    /// - Marks post-send HTTP timeouts with `AMBIGUOUS_POST_SEND:` so callers halt automatic retries (`R3-B3`).
+    pub fn execute_subaccount_transfer_for_record(
+        &self,
+        transfer_id: Option<i64>,
+        from_book: &str,
+        to_book: &str,
+        amount_usdc: f64,
+        dry_run: bool,
+    ) -> Result<SubaccountTransferResult> {
         let from_norm = from_book.trim().to_ascii_uppercase();
         let to_norm = to_book.trim().to_ascii_uppercase();
         if (from_norm != "PIT" && from_norm != "POND")
@@ -1465,26 +1547,73 @@ impl ExecutionEngine {
                 ));
             }
 
+            let (already_completed, saved_leg1, _saved_leg2) = match transfer_id {
+                Some(tid) if tid > 0 => self
+                    .db
+                    .get_book_transfer_leg_progress(tid)
+                    .unwrap_or((0, None, None)),
+                _ => (0, None, None),
+            };
+
             let mut tx_hashes = Vec::new();
             let mut responses = Vec::new();
-            for (sub_addr, is_deposit) in &legs {
-                let (tx_hash, resp) = self.submit_single_subaccount_leg(
+            for (leg_idx, (sub_addr, is_deposit)) in legs.iter().enumerate() {
+                if leg_idx == 0 && already_completed >= 1 {
+                    let prev_hash = saved_leg1
+                        .clone()
+                        .unwrap_or_else(|| "leg1-already-completed".to_string());
+                    tracing::info!(
+                        transfer_id = ?transfer_id,
+                        leg1_tx_ref = %prev_hash,
+                        "Skipping already-completed leg 1 of 2-leg subAccountTransfer on resume (R3-B3)"
+                    );
+                    tx_hashes.push(prev_hash);
+                    responses.push(json!({"status": "already_completed_leg1"}));
+                    continue;
+                }
+
+                match self.submit_single_subaccount_leg(
                     &priv_key,
                     sub_addr,
                     *is_deposit,
                     usd_micro,
                     &cfg,
                     is_testnet,
-                )?;
-                tx_hashes.push(tx_hash);
-                responses.push(resp);
+                ) {
+                    Ok((tx_hash, resp)) => {
+                        tx_hashes.push(tx_hash.clone());
+                        responses.push(resp);
+                        if let Some(tid) = transfer_id.filter(|&id| id > 0) {
+                            let l1 = tx_hashes.first().map(String::as_str);
+                            let l2 = tx_hashes.get(1).map(String::as_str);
+                            let _ = self.db.update_book_transfer_leg_progress(
+                                tid,
+                                (leg_idx + 1) as i64,
+                                l1,
+                                l2,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if leg_idx == 1 {
+                            let leg1_ref = tx_hashes
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            return Err(AegisError::Execution(format!(
+                                "PARTIAL_LEG1_COMPLETED(leg1_tx_ref={leg1_ref}): Leg 2 failed after Leg 1 succeeded: {e}"
+                            )));
+                        }
+                        return Err(e);
+                    }
+                }
             }
 
             let primary_tx_hash = tx_hashes
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "0x0".to_string());
-            return Ok(json!({
+            return Ok(SubaccountTransferResult::from_raw(json!({
                 "status": "EXECUTED",
                 "transfer_mode": "HYPERLIQUID_SUBACCOUNT_L1",
                 "from_book": from_norm,
@@ -1495,7 +1624,7 @@ impl ExecutionEngine {
                 "legs_executed": legs.len(),
                 "dry_run": false,
                 "exchange_response": if responses.len() == 1 { responses[0].clone() } else { json!(responses) },
-            }));
+            })));
         }
 
         let digest_hex = hex::encode(Sha256::digest(
@@ -1506,7 +1635,7 @@ impl ExecutionEngine {
             .as_bytes(),
         ));
         let tx_hash = format!("0x{}", &digest_hex[..64]);
-        Ok(json!({
+        Ok(SubaccountTransferResult::from_raw(json!({
             "status": if dry_run { "DRY_RUN_SIMULATED" } else { "EXECUTED" },
             "transfer_mode": "VIRTUAL_SINGLE_WALLET_LEDGER",
             "from_book": from_norm,
@@ -1514,6 +1643,6 @@ impl ExecutionEngine {
             "amount_usdc": amt,
             "tx_hash": tx_hash,
             "dry_run": dry_run,
-        }))
+        })))
     }
 }

@@ -350,39 +350,54 @@ pub struct CalibrateRunResponse {
 }
 
 pub fn map_err_response(err: anyhow::Error) -> Response {
-    let msg = err.to_string();
-    let status = if msg.starts_with("Validation error:")
-        || msg.starts_with("Invalid ")
-        || msg.starts_with("Wallet sync failed:")
-        || msg.contains("must be")
-        || msg.contains("Unknown configuration key")
-        || msg.contains("Unknown config_key")
-    {
-        StatusCode::BAD_REQUEST
-    } else if msg.starts_with("Not found:") {
-        StatusCode::NOT_FOUND
-    } else if msg.starts_with("Forbidden:") || msg.starts_with("Security violation:") {
-        StatusCode::FORBIDDEN
-    } else if msg.starts_with("Unauthorized") {
-        StatusCode::UNAUTHORIZED
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    };
-
-    if status == StatusCode::INTERNAL_SERVER_ERROR {
-        tracing::error!(error = %msg, "Unhandled internal error in aegis-web handler");
+    if let Some(aegis_err) = err.downcast_ref::<aegis_core::AegisError>() {
+        let msg = aegis_err.to_string();
+        let status = match aegis_err {
+            aegis_core::AegisError::Validation(_) | aegis_core::AegisError::Config(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            aegis_core::AegisError::NotFound(detail) => {
+                if detail.contains("Unknown config_key")
+                    || detail.contains("Unknown configuration key")
+                {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            }
+            aegis_core::AegisError::SecurityViolation(_)
+            | aegis_core::AegisError::Firewall(_) => StatusCode::FORBIDDEN,
+            aegis_core::AegisError::Crypto(_)
+            | aegis_core::AegisError::Database(_)
+            | aegis_core::AegisError::Provenance(_)
+            | aegis_core::AegisError::Execution(_)
+            | aegis_core::AegisError::Serialization(_)
+            | aegis_core::AegisError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %msg, "Unhandled internal AegisError in aegis-web handler");
+            let body = ApiErrorBody {
+                error: "Internal server error".to_string(),
+                detail: "An internal server error occurred; see server logs for details."
+                    .to_string(),
+            };
+            return (status, Json(body)).into_response();
+        }
         let body = ApiErrorBody {
-            error: "Internal server error".to_string(),
-            detail: "An internal server error occurred; see server logs for details.".to_string(),
+            error: msg.clone(),
+            detail: msg,
         };
         return (status, Json(body)).into_response();
     }
 
+    // R3-H25: Classify strictly by typed AegisError variants above; any non-AegisError is an unhandled internal error.
+    let msg = err.to_string();
+    tracing::error!(error = %msg, "Unhandled internal error in aegis-web handler");
     let body = ApiErrorBody {
-        error: msg.clone(),
-        detail: msg,
+        error: "Internal server error".to_string(),
+        detail: "An internal server error occurred; see server logs for details.".to_string(),
     };
-    (status, Json(body)).into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
 }
 
 pub async fn run_db_blocking<T, F>(db: DatabaseManager, f: F) -> Result<T>
@@ -781,7 +796,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<FullDashboardPayl
     let credentials = db
         .get_credentials_status()
         .unwrap_or_else(|_| serde_json::json!({}));
-    let schema_version = db.get_schema_version().unwrap_or(7);
+    let schema_version = db.get_schema_version().unwrap_or(8);
 
     Ok(FullDashboardPayload {
         portfolio,

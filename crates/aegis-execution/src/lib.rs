@@ -41,6 +41,352 @@ pub struct RestingOrderStatus {
     pub state: String,
     pub filled_units: f64,
     pub entry_price: f64,
+    #[serde(default)]
+    pub fee_usdc: f64,
+}
+
+/// Typed result of a Hyperliquid L1 or virtual-ledger inter-book transfer (`R3-B3`, `R3-QB`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct SubaccountTransferResult {
+    pub status: String,
+    pub transfer_mode: String,
+    pub from_book: String,
+    pub to_book: String,
+    pub amount_usdc: f64,
+    pub tx_hash: String,
+    pub leg_tx_hashes: Vec<String>,
+    pub legs_executed: usize,
+    pub dry_run: bool,
+    pub raw: serde_json::Value,
+}
+
+impl SubaccountTransferResult {
+    pub fn from_raw(raw: serde_json::Value) -> Self {
+        let status = raw
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let transfer_mode = raw
+            .get("transfer_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let from_book = raw
+            .get("from_book")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let to_book = raw
+            .get("to_book")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let amount_usdc = raw
+            .get("amount_usdc")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let tx_hash = raw
+            .get("tx_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let leg_tx_hashes = raw
+            .get("leg_tx_hashes")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                if tx_hash.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![tx_hash.clone()]
+                }
+            });
+        let legs_executed = raw
+            .get("legs_executed")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(leg_tx_hashes.len());
+        let dry_run = raw
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        Self {
+            status,
+            transfer_mode,
+            from_book,
+            to_book,
+            amount_usdc,
+            tx_hash,
+            leg_tx_hashes,
+            legs_executed,
+            dry_run,
+            raw,
+        }
+    }
+}
+
+impl Serialize for SubaccountTransferResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for SubaccountTransferResult {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::Index<&str> for SubaccountTransferResult {
+    type Output = serde_json::Value;
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.raw[index]
+    }
+}
+
+/// Typed result of an HLP Vault deposit or withdrawal (`R3-QB`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct VaultTransferResult {
+    pub status: String,
+    pub vault_address: String,
+    pub is_deposit: bool,
+    pub amount_usdc: f64,
+    pub usd_micro: i64,
+    pub raw: serde_json::Value,
+}
+
+impl VaultTransferResult {
+    pub fn from_raw(raw: serde_json::Value) -> Self {
+        Self {
+            status: raw
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            vault_address: raw
+                .get("vault_address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            is_deposit: raw
+                .get("is_deposit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            amount_usdc: raw
+                .get("amount_usdc")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            usd_micro: raw
+                .get("usd_micro")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            raw,
+        }
+    }
+}
+
+impl Serialize for VaultTransferResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for VaultTransferResult {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::Index<&str> for VaultTransferResult {
+    type Output = serde_json::Value;
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.raw[index]
+    }
+}
+
+/// Typed result of on-chain wallet equity synchronization (`R3-QB`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct WalletEquitySyncResult {
+    pub status: String,
+    pub wallet_address: String,
+    pub network: String,
+    pub total_equity_usdc: f64,
+    pub perp_account_value_usdc: f64,
+    pub vault_equity_usdc: f64,
+    pub raw: serde_json::Value,
+}
+
+impl WalletEquitySyncResult {
+    pub fn from_raw(raw: serde_json::Value) -> Self {
+        Self {
+            status: raw
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            wallet_address: raw
+                .get("wallet_address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            network: raw
+                .get("network")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            total_equity_usdc: raw
+                .get("total_equity_usdc")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            perp_account_value_usdc: raw
+                .get("perp_account_value_usdc")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            vault_equity_usdc: raw
+                .get("vault_equity_usdc")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            raw,
+        }
+    }
+}
+
+impl Serialize for WalletEquitySyncResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for WalletEquitySyncResult {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::Index<&str> for WalletEquitySyncResult {
+    type Output = serde_json::Value;
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.raw[index]
+    }
+}
+
+/// Typed report of exchange clearinghouse state reconciliation (`R3-QB`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ReconcileReport {
+    pub status: String,
+    pub discrepancies_found: usize,
+    pub discrepancies: Vec<serde_json::Value>,
+    pub raw: serde_json::Value,
+}
+
+impl ReconcileReport {
+    pub fn from_raw(raw: serde_json::Value) -> Self {
+        let status = raw
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let discrepancies = raw
+            .get("discrepancies")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let discrepancies_found = raw
+            .get("discrepancies_found")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(discrepancies.len());
+        Self {
+            status,
+            discrepancies_found,
+            discrepancies,
+            raw,
+        }
+    }
+}
+
+impl Serialize for ReconcileReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for ReconcileReport {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::Index<&str> for ReconcileReport {
+    type Output = serde_json::Value;
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.raw[index]
+    }
+}
+
+/// Typed report of hourly funding payment synchronization (`R3-QB`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct FundingSyncReport {
+    pub status: String,
+    pub hour_bucket_ms: i64,
+    pub positions_updated: usize,
+    pub net_funding_delta_usdc: f64,
+    pub raw: serde_json::Value,
+}
+
+impl FundingSyncReport {
+    pub fn from_raw(raw: serde_json::Value) -> Self {
+        Self {
+            status: raw
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            hour_bucket_ms: raw
+                .get("hour_bucket_ms")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            positions_updated: raw
+                .get("positions_updated")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize,
+            net_funding_delta_usdc: raw
+                .get("net_funding_delta_usdc")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            raw,
+        }
+    }
+}
+
+impl Serialize for FundingSyncReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl std::ops::Deref for FundingSyncReport {
+    type Target = serde_json::Value;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::Index<&str> for FundingSyncReport {
+    type Output = serde_json::Value;
+    fn index(&self, index: &str) -> &Self::Output {
+        &self.raw[index]
+    }
 }
 
 pub type AssetIndexCache = Arc<Mutex<HashMap<(bool, String), (u32, i64)>>>;
@@ -966,6 +1312,9 @@ mod tests {
 
     #[test]
     fn test_resting_order_status_does_not_misattribute_existing_position_nh6() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
         db.set_config_value("execution_mode", &json!("TESTNET"))
@@ -977,10 +1326,74 @@ mod tests {
         .unwrap();
         db.set_config_value("hyperliquid_testnet_url", &json!("https://127.0.0.1:1"))
             .unwrap();
-        let exec = ExecutionEngine::with_timeout(db, 1);
+        let exec = ExecutionEngine::with_timeout(db.clone(), 1);
 
-        // When order is not on openOrders and has no confirmed fills for its oid, it must report GONE (never FILLED from clearinghouse szi)
+        // R3-H4: When /info endpoint is unreachable, must report UNKNOWN (never GONE)
+        let unreachable_status =
+            exec.check_resting_order_status("SOL/USDC:USDC", Some("hl-123456"));
+        assert_eq!(unreachable_status.state, "UNKNOWN");
+
+        // Spin up a local mock /info server that returns empty openOrders, empty userFills, and empty orderStatus
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut buf = [0u8; 4096];
+                        let mut total = Vec::new();
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            total.extend_from_slice(&buf[..n]);
+                            if let Some(hdr_end) =
+                                total.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                let body_start = hdr_end + 4;
+                                if total.len() > body_start {
+                                    break;
+                                }
+                            }
+                        }
+                        let body = "[]";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        let _ = stream.read(&mut buf);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        db.set_config_value(
+            "hyperliquid_testnet_url",
+            &json!(format!("http://{addr}")),
+        )
+        .unwrap();
+
+        // NH-6 & R3-H4: When /info is reachable and order is absent from both openOrders and userFills, it must report GONE
         let status = exec.check_resting_order_status("SOL/USDC:USDC", Some("hl-123456"));
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
         assert_eq!(status.state, "GONE");
         assert_eq!(status.filled_units, 0.0);
     }
@@ -1009,5 +1422,52 @@ mod tests {
         assert_eq!(format_hl_wire_price(95123.456, 0.1, 4), "95123");
         assert_eq!(format_hl_wire_price(185.1234, 0.01, 2), "185.12");
         assert_eq!(format_hl_wire_size(12.3456, 0.01, 2), "12.35");
+    }
+
+    #[test]
+    fn test_r3_b4_reconcile_exchange_state_preserves_armed_pond_orders() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let armed_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(180.0),
+            quantity: Some(2.0),
+            notional_usdc: Some(360.0),
+            risk_budget_usdc: Some(5.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.0),
+            funding_rate_entry: Some(-0.0002),
+            initial_stop: Some(171.0),
+            chandelier_stop: Some(171.0),
+            highest_price_seen: Some(180.0),
+            lowest_price_seen: Some(180.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: Some("RESTING_OID:hl-777888".to_string()),
+            opened_at: Some("2026-11-08T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-08T00:00:00Z".to_string(),
+        };
+        db.upsert_pond_cell(&armed_cell).unwrap();
+
+        let exec = ExecutionEngine::new(db.clone());
+        let empty_on_chain = HashMap::new();
+        // Resting order is present on Hyperliquid book matching ARMED Pond cell oid 777888
+        let resting_orders = vec![json!({"coin": "SOL", "oid": 777888})];
+        let recon = exec.reconcile_exchange_state(Some(&empty_on_chain), Some(&resting_orders));
+        assert_eq!(recon.status, "RECONCILED");
+        // Must NOT cancel or flag the ARMED Pond resting order as an orphaned order!
+        assert_eq!(recon.discrepancies_found, 0);
+        assert!(recon.discrepancies.is_empty());
     }
 }

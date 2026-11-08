@@ -47,11 +47,28 @@ fn parse_split(s: &str) -> aegis_core::Result<(f64, f64)> {
         .trim()
         .parse::<f64>()
         .map_err(|e| aegis_core::AegisError::Validation(format!("Invalid POND equity in --initial-split: {e}")))?;
+    if !pit.is_finite() || !pond.is_finite() || pit < 0.0 || pond < 0.0 || (pit + pond) <= 0.0 {
+        return Err(aegis_core::AegisError::Validation(format!(
+            "Invalid --initial-split '{s}': values must be finite non-negative numbers with positive sum"
+        )));
+    }
     Ok((pit, pond))
 }
 
 fn main() -> aegis_core::Result<()> {
     let args = SettleToolArgs::parse();
+    if !args.dry_run && (args.initial_split.is_some() || args.rich_idle_usdc.is_some()) {
+        return Err(aegis_core::AegisError::Validation(
+            "Manual equity/idle overrides (--initial-split / --rich-idle-usdc) are only permitted with --dry-run".to_string(),
+        ));
+    }
+    if let Some(idle) = args.rich_idle_usdc {
+        if !idle.is_finite() || idle < 0.0 {
+            return Err(aegis_core::AegisError::Validation(format!(
+                "Invalid --rich-idle-usdc '{idle}': must be finite and >= 0.0"
+            )));
+        }
+    }
     let db = match args.db.as_deref() {
         Some(path) => DatabaseManager::new(path),
         None => DatabaseManager::default_db(),

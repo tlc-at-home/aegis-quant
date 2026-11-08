@@ -72,6 +72,7 @@ pub struct AlertRetryQueue {
     in_flight: Arc<AtomicUsize>,
     delivered_count: Arc<AtomicUsize>,
     failed_permanently_count: Arc<AtomicUsize>,
+    dropped_count: Arc<AtomicUsize>,
 }
 
 impl AlertRetryQueue {
@@ -85,6 +86,7 @@ impl AlertRetryQueue {
             in_flight: Arc::new(AtomicUsize::new(0)),
             delivered_count: Arc::new(AtomicUsize::new(0)),
             failed_permanently_count: Arc::new(AtomicUsize::new(0)),
+            dropped_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -98,6 +100,10 @@ impl AlertRetryQueue {
 
     pub fn failed_permanently_count(&self) -> usize {
         self.failed_permanently_count.load(Ordering::SeqCst)
+    }
+
+    pub fn dropped_count(&self) -> usize {
+        self.dropped_count.load(Ordering::SeqCst)
     }
 
     pub fn enqueue(
@@ -120,6 +126,23 @@ impl AlertRetryQueue {
         {
             let mut q = self.queue.lock();
             if q.len() >= self.max_queue_size {
+                let dropped = self.dropped_count.fetch_add(1, Ordering::SeqCst) + 1;
+                drop(q);
+                tracing::warn!(
+                    capacity = self.max_queue_size,
+                    dropped_total = dropped,
+                    title = %title,
+                    "AlertRetryQueue full; dropping alert"
+                );
+                let _ = engine.db.log_telemetry(
+                    "WARNING",
+                    "engine.alerts",
+                    &format!(
+                        "AlertRetryQueue full (capacity={}); dropped alert '{}' (dropped_total={dropped})",
+                        self.max_queue_size, title
+                    ),
+                    None,
+                );
                 return false;
             }
             q.push_back(QueuedAlertTask {
@@ -186,6 +209,24 @@ impl AlertRetryQueue {
                             attempt: task.attempt + 1,
                             next_attempt_ms: next_ms,
                         });
+                    } else {
+                        let dropped = queue_ref.dropped_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        drop(q);
+                        tracing::warn!(
+                            capacity = queue_ref.max_queue_size,
+                            dropped_total = dropped,
+                            title = %task.title,
+                            "AlertRetryQueue full on retry; dropping alert"
+                        );
+                        let _ = engine.db.log_telemetry(
+                            "WARNING",
+                            "engine.alerts",
+                            &format!(
+                                "AlertRetryQueue full on retry (capacity={}); dropped alert '{}' (dropped_total={dropped})",
+                                queue_ref.max_queue_size, task.title
+                            ),
+                            None,
+                        );
                     }
                 } else {
                     queue_ref
@@ -240,6 +281,7 @@ pub struct AlertEngine {
     loopback_client: Client,
     last_regime: Arc<Mutex<Option<String>>>,
     last_drawdown_alert_date: Arc<Mutex<Option<String>>>,
+    chat_id_discovery_attempted: Arc<AtomicBool>,
 }
 
 impl AlertEngine {
@@ -260,8 +302,11 @@ impl AlertEngine {
             .max(0.05);
         let max_queue_size = cfg
             .get_usize(
-                "alert_max_queue_size",
-                cfg.get_usize("alert_worker_queue_capacity", 200),
+                "alerts_retry_queue_capacity",
+                cfg.get_usize(
+                    "alert_max_queue_size",
+                    cfg.get_usize("alert_worker_queue_capacity", 64),
+                ),
             )
             .max(10);
         let telegram_api_base = cfg.get_str("telegram_api_base_url", "https://api.telegram.org");
@@ -298,6 +343,7 @@ impl AlertEngine {
             loopback_client,
             last_regime: Arc::new(Mutex::new(None)),
             last_drawdown_alert_date: Arc::new(Mutex::new(None)),
+            chat_id_discovery_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -410,11 +456,14 @@ impl AlertEngine {
 
         if !tg_token.is_empty() {
             let bot_id_prefix = tg_token.split(':').next().unwrap_or("").trim().to_string();
-            if tg_chat_id.is_empty()
-                || (!bot_id_prefix.is_empty() && tg_chat_id == bot_id_prefix && !is_loopback)
+            if (tg_chat_id.is_empty()
+                || (!bot_id_prefix.is_empty() && tg_chat_id == bot_id_prefix && !is_loopback))
+                && allow_retry_queue
+                && !self.chat_id_discovery_attempted.swap(true, Ordering::SeqCst)
             {
                 if let Some(discovered) = self.discover_telegram_chat_id(&tg_token) {
                     tg_chat_id = discovered;
+                    self.chat_id_discovery_attempted.store(false, Ordering::SeqCst);
                 }
             }
 
@@ -461,25 +510,15 @@ impl AlertEngine {
                     self.telegram_api_base.trim_end_matches('/'),
                     tg_token
                 );
-                let mut payload = json!({
+                let payload = json!({
                     "chat_id": tg_chat_id,
                     "text": text_joined,
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": true,
                 });
 
-                let mut resp_res = client.post(&url).json(&payload).send();
-                if let Ok(ref r) = resp_res {
-                    if (r.status().as_u16() == 400 || r.status().as_u16() == 403) && !is_loopback {
-                        if let Some(discovered) = self.discover_telegram_chat_id(&tg_token) {
-                            if discovered != tg_chat_id {
-                                tg_chat_id = discovered;
-                                payload["chat_id"] = json!(tg_chat_id);
-                                resp_res = client.post(&url).json(&payload).send();
-                            }
-                        }
-                    }
-                }
+                // R3-N14: Do not overwrite an explicitly configured telegram_chat_id via getUpdates on HTTP 400/403.
+                let resp_res = client.post(&url).json(&payload).send();
 
                 let masked_chat_id = mask_identifier(&tg_chat_id).replace("...", "***");
                 match resp_res {
@@ -503,11 +542,12 @@ impl AlertEngine {
                             .get("description")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let err_str = if tg_desc.is_empty() {
+                        let raw_err_str = if tg_desc.is_empty() {
                             format!("HTTP {http_status}")
                         } else {
                             format!("HTTP {http_status}: {tg_desc}")
                         };
+                        let err_str = aegis_db::trade_ops::sanitize_telemetry_message(&raw_err_str);
                         error_detail = Some(err_str.clone());
                         results.push(json!({
                             "channel": "TELEGRAM",
@@ -518,7 +558,10 @@ impl AlertEngine {
                     Err(e) => {
                         any_error = true;
                         retriable_error = true;
-                        let err_str = e.to_string();
+                        // R3-B2: Strip request URL (which embeds /bot<token>) before formatting or persisting.
+                        let err_str = aegis_db::trade_ops::sanitize_telemetry_message(
+                            &e.without_url().to_string(),
+                        );
                         error_detail = Some(err_str.clone());
                         results.push(json!({
                             "channel": "TELEGRAM",
@@ -555,9 +598,13 @@ impl AlertEngine {
                 Err(e) => {
                     any_error = true;
                     retriable_error = true;
+                    // R3-B2: Strip Discord webhook URL before formatting or persisting.
+                    let err_str = aegis_db::trade_ops::sanitize_telemetry_message(
+                        &e.without_url().to_string(),
+                    );
                     results.push(json!({
                         "channel": "DISCORD",
-                        "error": e.to_string(),
+                        "error": err_str,
                     }));
                 }
             }
@@ -927,4 +974,37 @@ mod tests {
             "real_production_bot_token_secret"
         );
     }
+
+    #[test]
+    fn test_r3_b2_reqwest_error_never_leaks_bot_token_or_webhook_url() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.configure_telegram_alerts(
+            Some("999111222:SUPER_SECRET_BOT_TOKEN_R3_B2"),
+            Some("-100123456789"),
+            Some(0.03),
+        )
+        .unwrap();
+        db.set_config_value(
+            "discord_webhook_url",
+            &json!("http://127.0.0.1:1/api/webhooks/777/SUPER_SECRET_DISCORD_WEBHOOK_R3_B2"),
+        )
+        .unwrap();
+
+        let mut alerts = AlertEngine::new(db.clone());
+        alerts.telegram_api_base = "http://127.0.0.1:1".to_string();
+        let res = alerts.send_alert("Test Error", "Body", "WARNING", None, false, false);
+        assert_eq!(res.status, "ERROR");
+        let serialized = res.to_value().to_string();
+        assert!(!serialized.contains("SUPER_SECRET_BOT_TOKEN_R3_B2"));
+        assert!(!serialized.contains("SUPER_SECRET_DISCORD_WEBHOOK_R3_B2"));
+
+        let logs = db.get_recent_logs(10).unwrap();
+        for row in logs {
+            let row_str = row.to_string();
+            assert!(!row_str.contains("SUPER_SECRET_BOT_TOKEN_R3_B2"));
+            assert!(!row_str.contains("SUPER_SECRET_DISCORD_WEBHOOK_R3_B2"));
+        }
+    }
 }
+

@@ -94,9 +94,20 @@ impl RiskEngine {
             ),
         );
 
+        let (eff_min_risk, eff_max_risk) = if min_risk <= max_risk {
+            (Usdc(min_risk), Usdc(max_risk))
+        } else {
+            (Usdc(max_risk), Usdc(min_risk))
+        };
+        let (eff_scale_min, eff_scale_max) = if scale_min <= scale_max {
+            (scale_min, scale_max)
+        } else {
+            (scale_max, scale_min)
+        };
+
         let mag = blended_conviction.abs().clamp(0.0, 1.0);
-        let mult = scale_min + mag * (scale_max - scale_min);
-        let risk_budget = Usdc((baseline_risk * mult).clamp(min_risk, max_risk));
+        let mult = eff_scale_min + mag * (eff_scale_max - eff_scale_min);
+        let risk_budget = (Usdc(baseline_risk) * mult).clamp(eff_min_risk, eff_max_risk);
         (round_dp(risk_budget.as_f64(), 2), round_dp(mult, 4))
     }
 
@@ -388,9 +399,9 @@ impl RiskEngine {
             }
         };
 
-        let mut current_heat_usdc = Usdc(0.0);
+        let mut current_heat_usdc = Usdc::ZERO;
         let mut current_gross_notional_usdc = Usdc(basis_harvest_notional_usdc.max(0.0));
-        let mut existing_asset_notional_usdc = Usdc(0.0);
+        let mut existing_asset_notional_usdc = Usdc::ZERO;
 
         for t in active_trades {
             // NH-4: Unfilled resting limit orders (`OPEN_ON_BOOK` with zero filled units or `PENDING`)
@@ -408,22 +419,20 @@ impl RiskEngine {
             let t_mark = Price(t.current_price.max(t_entry.as_f64()));
             let t_notional = t_size.notional_at(t_mark);
             let t_risk = if t.side == "LONG" {
-                Usdc(((t_entry.as_f64() - t_stop.as_f64()).max(0.0)) * t_size.as_f64())
+                t_size.notional_at(Price((t_entry - t_stop).as_f64().max(0.0)))
             } else {
-                Usdc(((t_stop.as_f64() - t_entry.as_f64()).max(0.0)) * t_size.as_f64())
+                t_size.notional_at(Price((t_stop - t_entry).as_f64().max(0.0)))
             };
 
-            current_gross_notional_usdc =
-                Usdc(current_gross_notional_usdc.as_f64() + t_notional.as_f64());
-            current_heat_usdc = Usdc(current_heat_usdc.as_f64() + t_risk.as_f64());
+            current_gross_notional_usdc += t_notional;
+            current_heat_usdc += t_risk;
             if t.symbol == asset.symbol || t.base_asset == asset.base_asset {
-                existing_asset_notional_usdc =
-                    Usdc(existing_asset_notional_usdc.as_f64() + t_notional.as_f64());
+                existing_asset_notional_usdc += t_notional;
             }
         }
 
-        let remaining_heat = max_heat.as_f64() - current_heat_usdc.as_f64();
-        if remaining_heat <= 1.0 {
+        let remaining_heat = max_heat - current_heat_usdc;
+        if remaining_heat <= Usdc(1.0) {
             return PositionSizeResult {
                 approved: false,
                 reason: format!(
@@ -443,8 +452,9 @@ impl RiskEngine {
             };
         }
 
-        let remaining_gross = max_gross_notional.as_f64() - current_gross_notional_usdc.as_f64();
-        if remaining_gross < asset.min_notional_usdc {
+        let min_notional = Usdc(asset.min_notional_usdc);
+        let remaining_gross = max_gross_notional - current_gross_notional_usdc;
+        if remaining_gross < min_notional {
             return PositionSizeResult {
                 approved: false,
                 reason: format!(
@@ -464,9 +474,8 @@ impl RiskEngine {
             };
         }
 
-        let remaining_asset_notional =
-            max_single_notional.as_f64() - existing_asset_notional_usdc.as_f64();
-        if remaining_asset_notional < asset.min_notional_usdc {
+        let remaining_asset_notional = max_single_notional - existing_asset_notional_usdc;
+        if remaining_asset_notional < min_notional {
             return PositionSizeResult {
                 approved: false,
                 reason: format!(
@@ -500,18 +509,18 @@ impl RiskEngine {
 
         let stop_distance = entry_px.abs_diff(stop_price).max(asset.tick_size);
 
-        let allowed_risk_usdc = max_risk_per_trade.as_f64().min(remaining_heat);
-        let size_by_risk = allowed_risk_usdc / stop_distance;
+        let allowed_risk_usdc = max_risk_per_trade.min(remaining_heat);
+        let size_by_risk = allowed_risk_usdc.as_f64() / stop_distance;
 
         let allowed_notional_usdc = remaining_asset_notional.min(remaining_gross);
-        let size_by_notional = allowed_notional_usdc / entry_px.as_f64().max(1e-8);
+        let size_by_notional = allowed_notional_usdc.as_f64() / entry_px.as_f64().max(1e-8);
 
         let raw_size = size_by_risk.min(size_by_notional);
         let rounded_qty = Quantity(Self::round_step(raw_size, asset.lot_step_size, true));
         let final_notional = round_dp(rounded_qty.notional_at(entry_px).as_f64(), 2);
         let final_risk = round_dp(rounded_qty.as_f64() * stop_distance, 2);
 
-        if rounded_qty.as_f64() <= 0.0 || final_notional < asset.min_notional_usdc {
+        if rounded_qty.as_f64() <= 0.0 || Usdc(final_notional) < min_notional {
             return PositionSizeResult {
                 approved: false,
                 reason: format!(
@@ -656,4 +665,32 @@ mod tests {
         );
         assert!(sized.approved, "Unfilled resting order should not consume filled heat/notional");
     }
+
+    #[test]
+    fn test_r3_h13_inverted_config_bounds_never_panic() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let risk = RiskEngine::new(db.clone());
+        let mut cfg = db.load_config().unwrap();
+        cfg.insert(
+            "min_risk_per_trade_usdc".to_string(),
+            aegis_db::cast_config_value("250.0", "float"),
+        );
+        cfg.insert(
+            "max_risk_per_trade_usdc".to_string(),
+            aegis_db::cast_config_value("50.0", "float"),
+        );
+        cfg.insert(
+            "conviction_scale_min".to_string(),
+            aegis_db::cast_config_value("2.0", "float"),
+        );
+        cfg.insert(
+            "conviction_scale_max".to_string(),
+            aegis_db::cast_config_value("0.5", "float"),
+        );
+        let (budget, mult) = risk.compute_conviction_risk_budget(0.8, 5000.0, Some(&cfg));
+        assert!((50.0..=250.0).contains(&budget));
+        assert!((0.5..=2.0).contains(&mult));
+    }
 }
+

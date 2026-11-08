@@ -138,6 +138,8 @@ impl RegressionTreeNode {
 #[derive(Debug, Clone)]
 pub struct CachedMaceModel {
     pub last_fit_len: usize,
+    pub last_seen_len: usize,
+    pub last_feature_fp: u64,
     pub last_fit_bar_ts: i64,
     pub last_seen_bar_ts: i64,
     pub bars_advanced_since_fit: usize,
@@ -147,6 +149,15 @@ pub struct CachedMaceModel {
     pub scale: f64,
     pub last_mace: f64,
     pub last_ic: f64,
+}
+
+fn compute_feature_row_fp(row: &[f64; 18]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &v in row {
+        h ^= v.to_bits();
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 impl SignalEngine {
@@ -282,6 +293,7 @@ impl SignalEngine {
         let last_bar_ts = bar_timestamps
             .and_then(|ts| ts.last().copied())
             .unwrap_or(0);
+        let cur_feature_fp = compute_feature_row_fp(&x_raw[n - 1]);
 
         if let Some(sym) = symbol_key {
             let mut cache = self.mace_cache.lock();
@@ -298,13 +310,21 @@ impl SignalEngine {
                         false
                     }
                 } else {
-                    if n > cached.last_fit_len {
-                        cached.bars_advanced_since_fit += n - cached.last_fit_len;
-                        cached.last_fit_len = n;
+                    // R3-N18: Only advance bar counter when series length grows or last feature row changes.
+                    if n > cached.last_seen_len {
+                        cached.bars_advanced_since_fit += n - cached.last_seen_len;
+                        cached.last_seen_len = n;
+                        cached.last_feature_fp = cur_feature_fp;
+                        cached.bars_advanced_since_fit < refit_interval
+                    } else if n == cached.last_seen_len {
+                        if cur_feature_fp != cached.last_feature_fp {
+                            cached.bars_advanced_since_fit += 1;
+                            cached.last_feature_fp = cur_feature_fp;
+                        }
+                        cached.bars_advanced_since_fit < refit_interval
                     } else {
-                        cached.bars_advanced_since_fit += 1;
+                        false
                     }
-                    cached.bars_advanced_since_fit < refit_interval
                 };
 
                 if can_use_cache {
@@ -404,6 +424,8 @@ impl SignalEngine {
                     sym.to_string(),
                     CachedMaceModel {
                         last_fit_len: n,
+                        last_seen_len: n,
+                        last_feature_fp: cur_feature_fp,
                         last_fit_bar_ts: last_bar_ts,
                         last_seen_bar_ts: last_bar_ts,
                         bars_advanced_since_fit: 0,
@@ -515,12 +537,23 @@ impl SignalEngine {
     }
 }
 
+/// Assigns average ranks `(start + end - 1) / 2.0` to tied groups (`R3-N10`).
 fn rank_slice(slice: &[f64]) -> Vec<f64> {
+    let n = slice.len();
     let mut indexed: Vec<(usize, f64)> = slice.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut ranks = vec![0.0; slice.len()];
-    for (rank, (orig_idx, _)) in indexed.into_iter().enumerate() {
-        ranks[orig_idx] = rank as f64;
+    let mut ranks = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && (indexed[j].1 - indexed[i].1).abs() <= 1e-12 {
+            j += 1;
+        }
+        let avg_rank = (i + j - 1) as f64 / 2.0;
+        for item in indexed.iter().take(j).skip(i) {
+            ranks[item.0] = avg_rank;
+        }
+        i = j;
     }
     ranks
 }

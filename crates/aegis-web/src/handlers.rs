@@ -23,7 +23,6 @@ use aegis_pit::PitOrchestrator;
 use aegis_pond::PondOrchestrator;
 use aegis_settle::{SettleController, SettleOverrideInput};
 use aegis_signals::WalkForwardCalibrator;
-use anyhow::anyhow;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderValue, StatusCode},
@@ -40,15 +39,17 @@ use tokio_stream::{wrappers::IntervalStream, StreamExt};
 pub const EMBEDDED_INDEX_HTML: &str = include_str!("../../../web/static/index.html");
 pub const EMBEDDED_APP_JS: &str = include_str!("../../../web/static/app.js");
 
-pub fn validate_config_update(key: &str, val_str: &str) -> Result<(), String> {
+pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
     let trimmed_key = key.trim();
     if trimmed_key.is_empty() {
-        return Err("Validation error: Configuration key must not be empty".to_string());
+        return Err(aegis_core::AegisError::Validation(
+            "Configuration key must not be empty".to_string(),
+        ));
     }
     if is_immutable_security_config_key(trimmed_key) {
-        return Err(format!(
-            "Forbidden: Security policy key '{trimmed_key}' is immutable and cannot be modified via the Web API"
-        ));
+        return Err(aegis_core::AegisError::SecurityViolation(format!(
+            "Security policy key '{trimmed_key}' is immutable and cannot be modified via the Web API"
+        )));
     }
     if val_str.trim().is_empty()
         && !matches!(
@@ -60,9 +61,9 @@ pub fn validate_config_update(key: &str, val_str: &str) -> Result<(), String> {
                 | "hyperliquid_agent_address"
         )
     {
-        return Err(format!(
-            "Validation error: Configuration value for '{trimmed_key}' must not be empty"
-        ));
+        return Err(aegis_core::AegisError::Validation(format!(
+            "Configuration value for '{trimmed_key}' must not be empty"
+        )));
     }
     Ok(())
 }
@@ -328,9 +329,13 @@ pub async fn api_settle_run(
 
     if !dry_run {
         if has_manual_override {
-            return map_err_response(anyhow!(
-                "Validation error: manual equity/idle overrides are forbidden for non-dry-run settling (NH-3)"
-            ));
+            return map_err_response(
+                aegis_core::AegisError::Validation(
+                    "manual equity/idle overrides are forbidden for non-dry-run settling (NH-3)"
+                        .to_string(),
+                )
+                .into(),
+            );
         }
         let cfg = state.db.load_config_logged("aegis-web.api_settle_run");
         let exec_mode = cfg.get_str("execution_mode", "PAPER");
@@ -338,9 +343,13 @@ pub async fn api_settle_run(
         if (!exec_mode.eq_ignore_ascii_case("PAPER") || !pond_mode.eq_ignore_ascii_case("PAPER"))
             && req.confirm_live_settle.as_deref() != Some("CONFIRM_LIVE_SETTLE")
         {
-            return map_err_response(anyhow!(
-                "Validation error: non-dry-run settling in LIVE or TESTNET mode requires confirm_live_settle == 'CONFIRM_LIVE_SETTLE' (NH-3)"
-            ));
+            return map_err_response(
+                aegis_core::AegisError::Validation(
+                    "non-dry-run settling in LIVE or TESTNET mode requires confirm_live_settle == 'CONFIRM_LIVE_SETTLE' (NH-3)"
+                        .to_string(),
+                )
+                .into(),
+            );
         }
     }
 
@@ -438,7 +447,7 @@ pub async fn api_update_config(
     };
 
     if let Err(e) = validate_config_update(&payload.config_key, &val_str) {
-        return map_err_response(anyhow!(e));
+        return map_err_response(e.into());
     }
 
     let key = payload.config_key.clone();
@@ -451,33 +460,42 @@ pub async fn api_update_config(
             db.validate_execution_mode_transition(&val_clone, None, None)?;
         }
         if key == "initial_equity_usdc" && scale_caps {
-            let new_eq = val_clone
-                .parse::<f64>()
-                .map_err(|_| anyhow!("Validation error: Invalid initial_equity_usdc"))?;
+            let new_eq = val_clone.parse::<f64>().map_err(|_| {
+                aegis_core::AegisError::Validation("Invalid initial_equity_usdc".to_string())
+            })?;
             db.scale_risk_caps_for_equity(new_eq)?;
         } else {
             let updated = db.set_config_value(&key, &val_json)?;
             if !updated {
-                return Err(anyhow!(
-                    "Validation error: Unknown configuration key '{key}'"
-                ));
+                return Err(aegis_core::AegisError::Validation(format!(
+                    "Unknown configuration key '{key}'"
+                ))
+                .into());
             }
         }
+        let display_val = if aegis_core::is_sensitive_config_key(&key) {
+            "[REDACTED]".to_string()
+        } else {
+            val_clone.clone()
+        };
         let _ = db.log_telemetry(
             "INFO",
             "WEB_API",
-            &format!("Config updated via REST API: {} = {}", key, val_clone),
+            &format!("Config updated via REST API: {} = {}", key, display_val),
             None,
         );
         Ok(SingleConfigUpdateResponse {
             status: "ok",
             key,
-            value: val_clone,
+            value: display_val,
         })
     })
     .await
     {
-        Ok(res) => Json(res).into_response(),
+        Ok(res) => {
+            state.invalidate_auth_cache();
+            Json(res).into_response()
+        }
         Err(e) => map_err_response(e),
     }
 }
@@ -494,7 +512,7 @@ pub async fn api_update_config_batch(
             other => other.to_string(),
         };
         if let Err(e) = validate_config_update(k, &s) {
-            return map_err_response(anyhow!(e));
+            return map_err_response(e.into());
         }
     }
 
@@ -520,7 +538,10 @@ pub async fn api_update_config_batch(
     })
     .await
     {
-        Ok(res) => Json(res).into_response(),
+        Ok(res) => {
+            state.invalidate_auth_cache();
+            Json(res).into_response()
+        }
         Err(e) => map_err_response(e),
     }
 }
@@ -552,9 +573,11 @@ pub async fn api_update_credentials(
                 .flatten()
                 .unwrap_or_default();
             if !v.eq_ignore_ascii_case(cur_vault.trim()) {
-                return Err(anyhow!(
-                    "Forbidden: Security policy key 'hyperliquid_vault_address' is immutable and cannot be modified via the Web API"
-                ));
+                return Err(aegis_core::AegisError::SecurityViolation(
+                    "Security policy key 'hyperliquid_vault_address' is immutable and cannot be modified via the Web API"
+                        .to_string(),
+                )
+                .into());
             }
         }
         let gemini = payload
@@ -596,7 +619,10 @@ pub async fn api_update_credentials(
     })
     .await
     {
-        Ok(res) => Json(res).into_response(),
+        Ok(res) => {
+            state.invalidate_auth_cache();
+            Json(res).into_response()
+        }
         Err(e) => map_err_response(e),
     }
 }
@@ -620,7 +646,10 @@ pub async fn api_update_alerts(
     })
     .await
     {
-        Ok(res) => Json(res).into_response(),
+        Ok(res) => {
+            state.invalidate_auth_cache();
+            Json(res).into_response()
+        }
         Err(e) => map_err_response(e),
     }
 }
@@ -655,7 +684,7 @@ pub async fn api_update_wallet_sync(
         let cred = db.get_credentials_status()?;
         Ok(WalletSyncResponse {
             status: "ok",
-            sync: sync_res,
+            sync: serde_json::to_value(&sync_res).unwrap_or_else(|_| json!({})),
             credentials: cred,
         })
     })

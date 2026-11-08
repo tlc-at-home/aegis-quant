@@ -1,61 +1,54 @@
 use std::collections::{HashMap, HashSet};
 
-use aegis_core::{round_dp, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset};
+use aegis_core::{
+    round_dp, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
+};
 use aegis_risk::RiskEngine;
 use serde_json::{json, Value};
 
-use crate::ExecutionEngine;
+use crate::{ExecutionEngine, FundingSyncReport, ReconcileReport};
 
 impl ExecutionEngine {
-    /// Accrues or reconciles hourly funding payments across open PIT perpetual positions
-    /// and open Pond cells (`NM-4`).
-    pub fn sync_funding_payments(&self, current_ts_ms: Option<i64>, is_backtest: bool) -> Value {
+    /// Accrues or reconciles hourly funding payments across open Book A (`PIT`) perpetual positions (`NM-4`, `R3-B1`).
+    ///
+    /// Note (`R3-B1`): Book B (`POND`) cells accrue hourly funding exclusively inside
+    /// `PondOrchestrator::evaluate_open_cells` via `accrue_pond_cell_funding_for_hour`
+    /// so Pond cells are never double-credited or double-debited.
+    pub fn sync_funding_payments(
+        &self,
+        current_ts_ms: Option<i64>,
+        is_backtest: bool,
+    ) -> FundingSyncReport {
         let now_ms = current_ts_ms.unwrap_or_else(|| self.db.now_ms());
         let hour_bucket = (now_ms / 3_600_000) * 3_600_000;
         if *self.last_funding_sync_hour_ts.lock() == Some(hour_bucket) {
-            return json!({
+            return FundingSyncReport::from_raw(json!({
                 "status": "ALREADY_SYNCED_THIS_HOUR",
                 "hour_bucket_ms": hour_bucket,
                 "positions_updated": 0,
-            });
+            }));
         }
 
         let open_trades = match self.db.get_open_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to query open trades during sync_funding_payments");
-                return json!({
+                return FundingSyncReport::from_raw(json!({
                     "status": "ERROR",
                     "reason": e.to_string(),
                     "hour_bucket_ms": hour_bucket,
                     "positions_updated": 0,
-                });
-            }
-        };
-        let open_pond_cells = if is_backtest {
-            Vec::new()
-        } else {
-            match self.db.get_open_pond_cells() {
-                Ok(cells) => cells,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to query open pond cells during sync_funding_payments");
-                    return json!({
-                        "status": "ERROR",
-                        "reason": e.to_string(),
-                        "hour_bucket_ms": hour_bucket,
-                        "positions_updated": 0,
-                    });
-                }
+                }));
             }
         };
 
-        if open_trades.is_empty() && open_pond_cells.is_empty() {
+        if open_trades.is_empty() {
             *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
-            return json!({
+            return FundingSyncReport::from_raw(json!({
                 "status": "NO_OPEN_POSITIONS",
                 "hour_bucket_ms": hour_bucket,
                 "positions_updated": 0,
-            });
+            }));
         }
 
         let mut onchain_rate_by_coin: HashMap<String, f64> = HashMap::new();
@@ -155,63 +148,6 @@ impl ExecutionEngine {
             updated += 1;
         }
 
-        for cell in open_pond_cells {
-            let qty = cell.quantity.unwrap_or(0.0).abs();
-            if qty <= 0.0 {
-                continue;
-            }
-            let bars = self
-                .db
-                .get_ohlcv_bars(&cell.symbol, "1h", 2, Some(now_ms))
-                .unwrap_or_default();
-            let coin = cell
-                .symbol
-                .split('/')
-                .next()
-                .unwrap_or(&cell.symbol)
-                .trim()
-                .to_uppercase();
-            let Some(funding_rate) = onchain_rate_by_coin
-                .get(&coin)
-                .copied()
-                .or_else(|| bars.last().map(|b| b.funding_rate_hourly))
-                .or(cell.funding_rate_entry)
-            else {
-                tracing::warn!(
-                    cell_id = cell.cell_id,
-                    symbol = %cell.symbol,
-                    "Skipping pond cell hourly funding accrual: no on-chain or 1h bar funding rate available"
-                );
-                continue;
-            };
-            let mark_px = bars
-                .last()
-                .map(|b| b.close)
-                .or(cell.entry_price)
-                .unwrap_or(0.0);
-            if mark_px <= 0.0 {
-                continue;
-            }
-            let notional = qty * mark_px;
-            let is_long = cell.side.eq_ignore_ascii_case("LONG")
-                || cell.side.eq_ignore_ascii_case("BUY");
-            let delta = if is_long {
-                -notional * funding_rate
-            } else {
-                notional * funding_rate
-            };
-            let new_funding = round_dp(cell.funding_accrued_usdc + delta, 4);
-            if let Err(e) = self.db.update_pond_cell_funding(cell.cell_id, new_funding) {
-                tracing::error!(
-                    cell_id = cell.cell_id,
-                    error = %e,
-                    "Failed to update open pond cell funding"
-                );
-            }
-            net_funding_delta += delta;
-            updated += 1;
-        }
-
         *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
 
         if !is_backtest && updated > 0 {
@@ -225,21 +161,21 @@ impl ExecutionEngine {
             );
         }
 
-        json!({
+        FundingSyncReport::from_raw(json!({
             "status": "SYNCED",
             "hour_bucket_ms": hour_bucket,
             "positions_updated": updated,
             "net_funding_delta_usdc": round_dp(net_funding_delta, 4),
-        })
+        }))
     }
 
     /// Reconciles local SQLite `OPEN` trades and Pond cells against Hyperliquid L1
-    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`).
+    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`).
     pub fn reconcile_exchange_state(
         &self,
         simulated_exchange_positions: Option<&HashMap<String, Value>>,
         simulated_open_orders: Option<&[Value]>,
-    ) -> Value {
+    ) -> ReconcileReport {
         let cfg = self.load_config_logged("reconcile_exchange_state");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
@@ -250,13 +186,13 @@ impl ExecutionEngine {
             && simulated_open_orders.is_none()
         {
             let open_trades = self.db.get_open_trades().unwrap_or_default();
-            return json!({
+            return ReconcileReport::from_raw(json!({
                 "status": "VERIFIED_PAPER",
                 "mode": "PAPER",
                 "local_open_trades": open_trades.len(),
                 "discrepancies_found": 0,
                 "discrepancies": [],
-            });
+            }));
         }
 
         let mut ex_positions: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
@@ -329,18 +265,18 @@ impl ExecutionEngine {
                     }
                 }
             } else {
-                return json!({
+                return ReconcileReport::from_raw(json!({
                     "status": "SKIPPED_OFFLINE",
                     "reason": "CLEARINGHOUSE_STATE_UNAVAILABLE",
                     "discrepancies_found": 0,
-                });
+                }));
             }
         } else {
-            return json!({
+            return ReconcileReport::from_raw(json!({
                 "status": "SKIPPED_OFFLINE",
                 "reason": "CLEARINGHOUSE_API_UNREACHABLE",
                 "discrepancies_found": 0,
-            });
+            }));
         }
 
         let live_open_orders: Vec<Value>;
@@ -365,35 +301,36 @@ impl ExecutionEngine {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open trades");
-                return json!({
+                return ReconcileReport::from_raw(json!({
                     "status": "ERROR_DB_UNAVAILABLE",
                     "reason": e.to_string(),
                     "discrepancies_found": 0,
-                });
+                }));
             }
         };
         let resting_trades = match self.db.get_resting_pit_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load resting trades");
-                return json!({
+                return ReconcileReport::from_raw(json!({
                     "status": "ERROR_DB_UNAVAILABLE",
                     "reason": e.to_string(),
                     "discrepancies_found": 0,
-                });
+                }));
             }
         };
         let local_pond_cells = match self.db.get_open_pond_cells() {
             Ok(cells) => cells,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open pond cells");
-                return json!({
+                return ReconcileReport::from_raw(json!({
                     "status": "ERROR_DB_UNAVAILABLE",
                     "reason": e.to_string(),
                     "discrepancies_found": 0,
-                });
+                }));
             }
         };
+        let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
         let all_pond_cells = self.db.get_pond_cells(200).unwrap_or_default();
 
         // Aggregate local quantities per coin across both books (NM-5, NM-10)
@@ -416,11 +353,27 @@ impl ExecutionEngine {
         }
 
         let mut seen_coins: HashSet<String> = HashSet::new();
+        let mut known_resting_oids: HashSet<u64> = HashSet::new();
         for rt in &resting_trades {
             seen_coins.insert(rt.base_asset.to_uppercase());
+            if let Some(oid) = rt
+                .exchange_order_id
+                .as_deref()
+                .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&id| id > 0)
+            {
+                known_resting_oids.insert(oid);
+            }
         }
-        for c in &all_pond_cells {
-            if c.state == "OPEN_ON_BOOK" {
+        // R3-B4: Protect resting Pond ARMED cells and their RESTING_OID orders from dangling-order cancellation
+        for c in armed_pond_cells.iter().chain(all_pond_cells.iter()) {
+            let has_resting_oid = c
+                .exit_reason
+                .as_deref()
+                .map(|r| r.starts_with("RESTING_OID:"))
+                .unwrap_or(false);
+            if c.state.eq_ignore_ascii_case("ARMED") || has_resting_oid {
                 let coin = c
                     .symbol
                     .split('/')
@@ -429,6 +382,16 @@ impl ExecutionEngine {
                     .trim()
                     .to_uppercase();
                 seen_coins.insert(coin);
+                if let Some(oid) = c
+                    .exit_reason
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("RESTING_OID:"))
+                    .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&id| id > 0)
+                {
+                    known_resting_oids.insert(oid);
+                }
             }
         }
 
@@ -596,24 +559,29 @@ impl ExecutionEngine {
                     let expected_pond_qty = (ex_qty - pit_co_qty).max(0.0);
                     let local_qty = cell.quantity.unwrap_or(0.0).abs();
                     if (expected_pond_qty - local_qty).abs() > 1e-6 && expected_pond_qty > 0.0 {
-                        if let Err(e) = self.db.reconcile_open_pond_cell_size(
+                        match self.db.reconcile_open_pond_cell_size(
                             cell.cell_id,
                             expected_pond_qty,
                             Some(entry_px),
                         ) {
-                            tracing::error!(
-                                cell_id = cell.cell_id,
-                                error = %e,
-                                "Failed to reconcile pond cell size"
-                            );
+                            Ok(true) => {
+                                discrepancies.push(json!({
+                                    "type": "SIZE_DRIFT_POND_CELL_RECONCILED",
+                                    "base_asset": coin,
+                                    "cell_id": cell.cell_id,
+                                    "local_qty": local_qty,
+                                    "exchange_qty": expected_pond_qty,
+                                }));
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    cell_id = cell.cell_id,
+                                    error = %e,
+                                    "Failed to reconcile pond cell size"
+                                );
+                            }
                         }
-                        discrepancies.push(json!({
-                            "type": "SIZE_DRIFT_POND_CELL_RECONCILED",
-                            "base_asset": coin,
-                            "cell_id": cell.cell_id,
-                            "local_qty": local_qty,
-                            "exchange_qty": expected_pond_qty,
-                        }));
                     }
                 }
             }
@@ -650,9 +618,20 @@ impl ExecutionEngine {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_uppercase();
-                if !ex_positions.contains_key(&coin) && !seen_coins.contains(&coin) {
+                let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
+                    ord.get("oid")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse::<u64>().ok())
+                });
+                let is_known_resting_oid = ord_oid
+                    .map(|oid| known_resting_oids.contains(&oid))
+                    .unwrap_or(false);
+                if !ex_positions.contains_key(&coin)
+                    && !seen_coins.contains(&coin)
+                    && !is_known_resting_oid
+                {
                     if simulated_open_orders.is_none() {
-                        if let Some(oid) = ord.get("oid").and_then(Value::as_u64) {
+                        if let Some(oid) = ord_oid {
                             let _ = self.cancel_resting_order(&coin, &format!("hl-{oid}"));
                         }
                     }
@@ -673,12 +652,12 @@ impl ExecutionEngine {
             );
         }
 
-        json!({
+        ReconcileReport::from_raw(json!({
             "status": "RECONCILED",
             "mode": mode,
             "discrepancies_found": discrepancies.len(),
             "discrepancies": discrepancies,
-        })
+        }))
     }
 
     /// Runs a complete execution & portfolio management cycle (`engine/execution.py::reconcile_cycle`).
@@ -728,7 +707,7 @@ impl ExecutionEngine {
 
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
-        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`)
+        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`)
         let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
         for r_trade in resting_trades {
             let r_status = self
@@ -744,18 +723,35 @@ impl ExecutionEngine {
                 } else {
                     r_trade.quantity
                 };
-                let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
-                let _ = self.db.promote_resting_trade_to_open(
+                let fee_usdc = if r_status.fee_usdc > 0.0 {
+                    round_dp(r_status.fee_usdc, 4)
+                } else {
+                    round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
+                };
+                if let Err(e) = self.db.promote_resting_trade_to_open(
                     r_trade.trade_id,
                     fill_qty,
                     fill_px,
                     fee_usdc,
                     0.0,
-                );
+                ) {
+                    tracing::error!(
+                        trade_id = r_trade.trade_id,
+                        error = %e,
+                        "Failed to promote resting PIT trade to OPEN (R3-H2)"
+                    );
+                }
             } else if r_status.state == "GONE" {
-                let _ = self
+                if let Err(e) = self
                     .db
-                    .cancel_resting_trade(r_trade.trade_id, "RESTING_ORDER_CANCELLED_OR_EXPIRED");
+                    .cancel_resting_trade(r_trade.trade_id, "RESTING_ORDER_CANCELLED_OR_EXPIRED")
+                {
+                    tracing::error!(
+                        trade_id = r_trade.trade_id,
+                        error = %e,
+                        "Failed to cancel expired resting PIT trade"
+                    );
+                }
             }
         }
 
@@ -1281,26 +1277,28 @@ impl ExecutionEngine {
             let available_cash = (initial_equity + realized_after + total_upnl + accrued_yield_usdc
                 - deployed_notional)
                 .max(0.0);
-            let basis_candidates = evaluations
+            let basis_rates: Vec<f64> = evaluations
                 .iter()
                 .filter(|e| e.signal_action == "BASIS_HARVEST")
-                .count();
-            if (hmm_regime == "CHOP" || prob_chop >= chop_prob_thresh) && basis_candidates > 0 {
+                .map(|e| e.funding_rate_hourly)
+                .collect();
+            if (hmm_regime == "CHOP" || prob_chop >= chop_prob_thresh) && !basis_rates.is_empty() {
                 let alloc_pct = cfg.get_f64("basis_max_idle_cash_allocation_pct", 0.50);
                 let basis_floor = cfg.get_f64(
                     "basis_harvest_min_funding_hourly",
                     cfg.get_f64("basis_min_hourly_funding_rate", 0.000015),
                 );
-                basis_notional = round_dp(available_cash * alloc_pct, 2);
-                if is_backtest && cfg.get_bool("enable_hlp_floor_backtest", false) {
-                    let avg_funding = evaluations
-                        .iter()
-                        .filter(|e| e.signal_action == "BASIS_HARVEST")
-                        .map(|e| e.funding_rate_hourly.max(basis_floor))
-                        .sum::<f64>()
-                        / (basis_candidates as f64);
-                    accrued_yield_usdc =
-                        round_dp(accrued_yield_usdc + basis_notional * avg_funding * 4.0, 4);
+                let accrue_yield = is_backtest && cfg.get_bool("enable_hlp_floor_backtest", false);
+                let (notional, yield_delta) = aegis_core::compute_basis_harvest_accrual(
+                    available_cash,
+                    alloc_pct,
+                    basis_floor,
+                    &basis_rates,
+                    accrue_yield,
+                );
+                basis_notional = notional;
+                if accrue_yield {
+                    accrued_yield_usdc = round_dp(accrued_yield_usdc + yield_delta, 4);
                 }
             }
             total_equity =

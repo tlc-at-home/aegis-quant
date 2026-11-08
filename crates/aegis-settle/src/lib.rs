@@ -113,67 +113,10 @@ impl SettleController {
     }
 
     /// Reads current Book A (`PIT`) and Book B (`POND`) equities and unlocked idle USDC directly
-    /// from the database when no test override is supplied (`C1`, `C3`).
+    /// from the centralized `DatabaseManager` helpers (`C1`, `C3`, `R3-H17`, `R3-H18`, `R3-QC`).
     pub fn inspect_books_state(&self) -> Result<(f64, f64, f64, f64)> {
-        let cfg = self.db.load_config()?;
-        let initial_eq = cfg.get_f64("initial_equity_usdc", 10000.0).max(1.0);
-        let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
-        let pit_init = round_dp(initial_eq * split_pct, 2);
-        let pond_init = round_dp(initial_eq * (1.0 - split_pct), 2);
-        let pit_net_transfers = self.db.get_net_book_transfer_adjustment("PIT").unwrap_or(0.0);
-        let pond_net_transfers = self.db.get_net_book_transfer_adjustment("POND").unwrap_or(0.0);
-
-        let pit_realized = self.db.get_total_realized_pnl().unwrap_or(0.0);
-        let open_trades = self.db.get_open_trades().unwrap_or_default();
-        let mut pit_deployed = 0.0;
-        let mut pit_upnl = 0.0;
-        for t in &open_trades {
-            pit_deployed += t.quantity.abs() * t.current_price;
-            pit_upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc;
-        }
-        let pit_eq = round_dp(pit_init + pit_net_transfers + pit_realized + pit_upnl, 2);
-        let mut pit_idle = round_dp((pit_eq - pit_deployed).max(0.0), 2);
-
-        let pond_realized = self.db.get_pond_realized_pnl().unwrap_or(0.0);
-        let open_cells = self.db.get_open_pond_cells().unwrap_or_default();
-        let mut pond_deployed = 0.0;
-        let mut pond_upnl = 0.0;
-        for c in &open_cells {
-            let entry_px = c.entry_price.unwrap_or(0.0);
-            let qty = c.quantity.unwrap_or(0.0);
-            let mark_px = self
-                .db
-                .get_ohlcv_bars(&c.symbol, "1h", 1, None)
-                .ok()
-                .and_then(|bars| bars.last().map(|b| b.close))
-                .filter(|&p| p > 0.0)
-                .unwrap_or(entry_px);
-            let price_pnl = if entry_px > 0.0 && qty > 0.0 {
-                if c.side.eq_ignore_ascii_case("LONG") {
-                    (mark_px - entry_px) * qty
-                } else {
-                    (entry_px - mark_px) * qty
-                }
-            } else {
-                0.0
-            };
-            pond_deployed += c.notional_usdc.unwrap_or(0.0);
-            pond_upnl += price_pnl + c.funding_accrued_usdc - c.fees_paid_usdc;
-        }
-        let pond_eq = round_dp(pond_init + pond_net_transfers + pond_realized + pond_upnl, 2);
-        let mut pond_idle = round_dp((pond_eq - pond_deployed).max(0.0), 2);
-
-        if let Ok((_, perps_trading_eq, vault_eq, total_wallet_deployed)) =
-            self.db.get_wallet_perps_margin_state()
-        {
-            if vault_eq > 0.0 {
-                let avail_perps_margin =
-                    round_dp((perps_trading_eq - total_wallet_deployed).max(0.0), 2);
-                pit_idle = pit_idle.min(avail_perps_margin);
-                pond_idle = pond_idle.min(avail_perps_margin);
-            }
-        }
-
+        let (pit_eq, pit_idle) = self.db.compute_pit_equity_and_idle_usdc()?;
+        let (pond_eq, pond_idle) = self.db.compute_pond_equity_and_idle_usdc()?;
         Ok((pit_eq, pit_idle, pond_eq, pond_idle))
     }
 
@@ -213,15 +156,17 @@ impl SettleController {
 
         // Phase 1: Pre-Freeze Audit — activate RAII SettleGateGuard with DB mutex lock (C2, NH-10, NM-3)
         let mut gate_guard = SettleGateGuard::activate(&self.db, self.telemetry.as_ref())?;
+        // R3-B3: Reconcile any stale PENDING book_transfers left over from a prior crash before inspecting books
+        let _ = self.db.reconcile_pending_book_transfers();
 
         let (db_pit_eq, db_pit_idle, db_pond_eq, db_pond_idle) = self.inspect_books_state()?;
         let pit_before = round_dp(overrides.pit_equity_usdc.unwrap_or(db_pit_eq).max(0.0), 2);
         let pond_before = round_dp(overrides.pond_equity_usdc.unwrap_or(db_pond_eq).max(0.0), 2);
         let total_equity = round_dp(pit_before + pond_before, 2);
 
-        // Phase 2: Drift & Dead-Band Evaluation (Q3)
+        // Phase 2: Drift & Dead-Band Evaluation (Q3, R3-N15)
         let target_pit = round_dp(total_equity * split_pct, 2);
-        let target_each = round_dp(total_equity * 0.50, 2);
+        let target_each = target_pit;
 
         let diff_pit = pit_before - target_pit;
         let drift_bps = round_dp(compute_drift_bps(pit_before, total_equity, split_pct), 2);
@@ -266,6 +211,11 @@ impl SettleController {
         let executed_transfer: f64;
         let blocked_remainder: f64;
         let mut tx_hash: Option<String> = None;
+        let mut transfer_mode_used = if overrides.dry_run {
+            "DRY_RUN_SIMULATED".to_string()
+        } else {
+            String::new()
+        };
         let mut attempts_count = 0i64;
         let mut pending_transfer_id: Option<i64> = None;
 
@@ -281,9 +231,16 @@ impl SettleController {
             // Phase 3: Idle-Only Transfer Execution (Invariant F5: Never liquidate open positions)
             executed_transfer = round_dp(required_transfer.min(available_idle), 2);
             blocked_remainder = round_dp((required_transfer - executed_transfer).max(0.0), 2);
+            if overrides.dry_run && blocked_remainder > 0.0 {
+                transfer_mode_used = "DRY_RUN_PARTIAL_IDLE_CAPPED".to_string();
+            }
 
             if executed_transfer <= 0.0 {
-                status = "PARTIAL_IDLE_CAPPED".to_string();
+                status = if overrides.dry_run {
+                    "DRY_RUN".to_string()
+                } else {
+                    "PARTIAL_IDLE_CAPPED".to_string()
+                };
             } else {
                 // Q2 & NQ-3: Crash-safe pre-transfer ledger persistence in PENDING state before network call
                 let pre_row = BookTransfer {
@@ -304,13 +261,17 @@ impl SettleController {
                     tx_ref: None,
                     created_at: now_str.clone(),
                 };
-                pending_transfer_id = Some(self.db.insert_book_transfer(&pre_row)?);
+                pending_transfer_id = Some(
+                    self.db
+                        .insert_book_transfer_with_mode(&pre_row, &transfer_mode_used)?,
+                );
 
                 let mut transfer_ok = false;
                 let mut last_err = String::new();
                 for attempt in 0..max_retries {
                     attempts_count = (attempt + 1) as i64;
-                    match self.execution.execute_subaccount_transfer(
+                    match self.execution.execute_subaccount_transfer_for_record(
+                        pending_transfer_id,
                         &from_book,
                         &to_book,
                         executed_transfer,
@@ -326,6 +287,12 @@ impl SettleController {
                         }
                         Err(e) => {
                             last_err = e.to_string();
+                            // R3-B3: Never blind-retry after an ambiguous post-send error or partial leg-1 completion
+                            if last_err.contains("AMBIGUOUS_POST_SEND")
+                                || last_err.contains("PARTIAL_LEG1_COMPLETED")
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -373,11 +340,16 @@ impl SettleController {
         };
 
         let drift_bps_after = round_dp(compute_drift_bps(pit_after, total_equity, split_pct), 2);
+        let db_status = if overrides.dry_run && status == "PARTIAL_IDLE_CAPPED" {
+            "DRY_RUN"
+        } else {
+            status.as_str()
+        };
 
         let transfer_id = if let Some(tid) = pending_transfer_id {
             self.db.update_book_transfer_status(
                 tid,
-                &status,
+                db_status,
                 tx_hash.as_deref(),
                 attempts_count,
                 Some(post_from),
@@ -405,7 +377,8 @@ impl SettleController {
                 tx_ref: tx_hash.clone(),
                 created_at: now_str.clone(),
             };
-            self.db.insert_book_transfer(&transfer_row)?
+            self.db
+                .insert_book_transfer_with_mode(&transfer_row, &transfer_mode_used)?
         };
 
         // Release freeze guard explicitly (Drop also guarantees release on early return/error)
@@ -720,5 +693,134 @@ mod tests {
     #[test]
     fn test_nh10_nm3_settle_gate_ttl_pit_stops_when_frozen_and_mutex() {
         test_c1_c2_c3_transfer_persistence_and_settle_gate_guard();
+    }
+
+    #[test]
+    fn test_r3_h5_n15_dry_run_partial_idle_never_pollutes_book_equities() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.set_config_value("settling_split_pct", &json!(0.60))
+            .unwrap();
+        let ctrl = SettleController::new(db.clone(), None);
+
+        // With split_pct = 0.60 and total = 10000, target_each_usdc must be 6000 (R3-N15)
+        // Dry-run with partial idle cap (available_idle=100 < required=1000) gets status DRY_RUN (R3-H5)
+        let dry_partial = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: Some(5000.0),
+                pond_equity_usdc: Some(5000.0),
+                rich_idle_usdc: Some(100.0),
+                day_index: Some(1),
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(dry_partial.status, "PARTIAL_IDLE_CAPPED");
+        assert!((dry_partial.target_each_usdc - 6000.0).abs() < 1e-6);
+        assert!((dry_partial.blocked_remainder_usdc - 900.0).abs() < 1e-6);
+        let persisted = db.get_recent_book_transfers(5).unwrap();
+        let rec = persisted
+            .iter()
+            .find(|r| r.transfer_id == dry_partial.transfer_id)
+            .unwrap();
+        assert_eq!(rec.status, "DRY_RUN");
+
+        // Dry-run with available_idle = 0.0 also gets status DRY_RUN without violating CHECK constraint
+        let dry_zero_idle = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: Some(5000.0),
+                pond_equity_usdc: Some(5000.0),
+                rich_idle_usdc: Some(0.0),
+                day_index: Some(2),
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(dry_zero_idle.status, "DRY_RUN");
+        assert!((dry_zero_idle.executed_transfer_usdc - 0.0).abs() < 1e-6);
+        assert!((dry_zero_idle.blocked_remainder_usdc - 1000.0).abs() < 1e-6);
+
+        // Verify net book transfer adjustment remains 0.0 after dry_run partial/zero transfers
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap() - 0.0).abs() < 1e-9);
+        assert!((db.get_net_book_transfer_adjustment("POND").unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_r3_b3_reconcile_pending_book_transfers() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // 1. Insert a stale PENDING row with 0 legs completed (crash before leg 1)
+        let stale_row = BookTransfer {
+            transfer_id: 0,
+            settle_date: "2026-11-08T00:05:00Z".to_string(),
+            from_book: "PIT".to_string(),
+            to_book: "POND".to_string(),
+            amount_usdc: 250.0,
+            pre_from_usdc: Some(5250.0),
+            pre_to_usdc: Some(4750.0),
+            post_from_usdc: Some(5000.0),
+            post_to_usdc: Some(5000.0),
+            drift_bps_before: Some(250.0),
+            drift_bps_after: Some(0.0),
+            blocked_remainder_usdc: 0.0,
+            status: "PENDING".to_string(),
+            attempts: 1,
+            tx_ref: None,
+            created_at: "2026-11-08T00:05:00Z".to_string(),
+        };
+        let tid_stale = db.insert_book_transfer_with_mode(&stale_row, "LIVE").unwrap();
+
+        // 2. Insert a PENDING row with 2 legs completed (crash after leg 2 confirmed on-chain)
+        let confirmed_row = BookTransfer {
+            transfer_id: 0,
+            settle_date: "2026-11-08T00:05:05Z".to_string(),
+            from_book: "POND".to_string(),
+            to_book: "PIT".to_string(),
+            amount_usdc: 150.0,
+            pre_from_usdc: Some(5150.0),
+            pre_to_usdc: Some(4850.0),
+            post_from_usdc: Some(5000.0),
+            post_to_usdc: Some(5000.0),
+            drift_bps_before: Some(150.0),
+            drift_bps_after: Some(0.0),
+            blocked_remainder_usdc: 0.0,
+            status: "PENDING".to_string(),
+            attempts: 1,
+            tx_ref: None,
+            created_at: "2026-11-08T00:05:05Z".to_string(),
+        };
+        let tid_confirmed = db
+            .insert_book_transfer_with_mode(&confirmed_row, "LIVE")
+            .unwrap();
+        db.update_book_transfer_leg_progress(
+            tid_confirmed,
+            2,
+            Some("0xleg1_ok"),
+            Some("0xleg2_ok"),
+        )
+        .unwrap();
+
+        // Sweep stale PENDING transfers
+        let count = db.reconcile_pending_book_transfers().unwrap();
+        assert_eq!(count, 2);
+
+        let recent = db.get_recent_book_transfers(10).unwrap();
+        let rec_stale = recent.iter().find(|r| r.transfer_id == tid_stale).unwrap();
+        assert_eq!(rec_stale.status, "FAILED");
+        assert!(rec_stale
+            .tx_ref
+            .as_deref()
+            .unwrap_or("")
+            .contains("RECONCILED_STALE_PENDING"));
+
+        let rec_conf = recent
+            .iter()
+            .find(|r| r.transfer_id == tid_confirmed)
+            .unwrap();
+        assert_eq!(rec_conf.status, "CONFIRMED");
+        assert_eq!(rec_conf.tx_ref.as_deref(), Some("0xleg2_ok"));
+
+        // CONFIRMED row counts toward net book transfer adjustment, FAILED row does not
+        assert!((db.get_net_book_transfer_adjustment("PIT").unwrap() - 150.0).abs() < 1e-6);
+        assert!((db.get_net_book_transfer_adjustment("POND").unwrap() - (-150.0)).abs() < 1e-6);
     }
 }

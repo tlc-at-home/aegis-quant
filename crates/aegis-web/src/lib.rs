@@ -33,12 +33,73 @@ use tokio::sync::Mutex;
 
 const DEFAULT_CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
 
+#[derive(Debug, Clone)]
+pub struct CachedWebAuthConfig {
+    pub fetched_at_ms: i64,
+    pub ttl_ms: i64,
+    pub web_auth_enabled: bool,
+    pub db_token: Option<String>,
+    pub web_cors_allowed_origins: Option<String>,
+    pub web_allowed_hosts: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseManager,
     pub static_dir: PathBuf,
     pub cycle_lock: Arc<Mutex<()>>,
     pub session_token: String,
+    pub auth_cache: Arc<parking_lot::Mutex<Option<CachedWebAuthConfig>>>,
+}
+
+impl AppState {
+    pub fn get_cached_auth_config(&self) -> CachedWebAuthConfig {
+        let now = self.db.now_ms();
+        {
+            let guard = self.auth_cache.lock();
+            if let Some(cached) = guard.as_ref() {
+                if now.saturating_sub(cached.fetched_at_ms) < cached.ttl_ms {
+                    return cached.clone();
+                }
+            }
+        }
+        let db_cfg = self.db.load_config_logged("aegis-web.auth_cache");
+        let ttl_ms = db_cfg
+            .get_i64("web_auth_cache_ttl_ms", 2000)
+            .clamp(0, 60_000);
+        let web_auth_enabled = db_cfg.get_bool("web_auth_enabled", true);
+        let db_token = ["web_api_token", "dashboard_api_token"]
+            .into_iter()
+            .map(|k| db_cfg.get_str(k, ""))
+            .find(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let cors = db_cfg.get_str("web_cors_allowed_origins", "");
+        let web_cors_allowed_origins = if cors.trim().is_empty() {
+            None
+        } else {
+            Some(cors.trim().to_string())
+        };
+        let hosts = db_cfg.get_str("web_allowed_hosts", "");
+        let web_allowed_hosts = if hosts.trim().is_empty() {
+            "localhost,127.0.0.1,[::1],aegis-quant-sandbox,192.168.122.254".to_string()
+        } else {
+            hosts.trim().to_string()
+        };
+        let fresh = CachedWebAuthConfig {
+            fetched_at_ms: now,
+            ttl_ms,
+            web_auth_enabled,
+            db_token,
+            web_cors_allowed_origins,
+            web_allowed_hosts,
+        };
+        *self.auth_cache.lock() = Some(fresh.clone());
+        fresh
+    }
+
+    pub fn invalidate_auth_cache(&self) {
+        *self.auth_cache.lock() = None;
+    }
 }
 
 pub fn generate_ephemeral_session_token() -> String {
@@ -171,6 +232,15 @@ pub fn is_allowed_host(req: &Request, allowed_hosts_csv: &str) -> bool {
 }
 
 pub fn is_request_authorized(state: &AppState, req: &Request) -> bool {
+    let cached = state.get_cached_auth_config();
+    is_request_authorized_with_config(state, req, &cached)
+}
+
+fn is_request_authorized_with_config(
+    state: &AppState,
+    req: &Request,
+    auth_cfg: &CachedWebAuthConfig,
+) -> bool {
     let path = req.uri().path();
     if req.method() == Method::OPTIONS
         || path == "/"
@@ -188,21 +258,15 @@ pub fn is_request_authorized(state: &AppState, req: &Request) -> bool {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let db_cfg = state.db.load_config_logged("aegis-web.is_request_authorized");
-    if !db_cfg.get_bool("web_auth_enabled", true) {
+    if !auth_cfg.web_auth_enabled {
         return true;
     }
-    let db_token = ["web_api_token", "dashboard_api_token"]
-        .into_iter()
-        .map(|k| db_cfg.get_str(k, ""))
-        .find(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_string());
 
     let mut valid_tokens = vec![state.session_token.clone()];
     if let Some(t) = env_token {
         valid_tokens.push(t);
-    } else if let Some(t) = db_token {
-        valid_tokens.push(t);
+    } else if let Some(ref t) = auth_cfg.db_token {
+        valid_tokens.push(t.clone());
     }
 
     let mut header_candidates: Vec<String> = Vec::new();
@@ -260,13 +324,7 @@ pub fn is_request_authorized(state: &AppState, req: &Request) -> bool {
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
         {
-            let configured_origins = db_cfg.get_str("web_cors_allowed_origins", "");
-            let cfg_opt = if configured_origins.trim().is_empty() {
-                None
-            } else {
-                Some(configured_origins.as_str())
-            };
-            if !is_allowed_cors_origin(origin, cfg_opt) {
+            if !is_allowed_cors_origin(origin, auth_cfg.web_cors_allowed_origins.as_deref()) {
                 return false;
             }
         }
@@ -315,21 +373,9 @@ async fn security_and_auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let configured_origins = state
-        .db
-        .get_raw_config_value("web_cors_allowed_origins")
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty());
-
-    let allowed_hosts = state
-        .db
-        .get_raw_config_value("web_allowed_hosts")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            "localhost,127.0.0.1,[::1],aegis-quant-sandbox,192.168.122.254".to_string()
-        });
+    let auth_cfg = state.get_cached_auth_config();
+    let configured_origins = auth_cfg.web_cors_allowed_origins.clone();
+    let allowed_hosts = auth_cfg.web_allowed_hosts.clone();
 
     if !is_allowed_host(&req, &allowed_hosts) {
         let body = ApiErrorBody {
@@ -355,7 +401,7 @@ async fn security_and_auth_middleware(
         return resp;
     }
 
-    if !is_request_authorized(&state, &req) {
+    if !is_request_authorized_with_config(&state, &req, &auth_cfg) {
         let body = ApiErrorBody {
             error: "Unauthorized".to_string(),
             detail: "Missing or invalid API authentication token or CSRF header".to_string(),
@@ -427,6 +473,7 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         static_dir: static_dir.as_ref().to_path_buf(),
         cycle_lock: Arc::new(Mutex::new(())),
         session_token,
+        auth_cache: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     Router::new()
@@ -563,7 +610,7 @@ mod tests {
         db.initialize_schema(true).expect("seed schema");
 
         let payload = build_dashboard_payload(&db).expect("dashboard payload");
-        assert_eq!(payload.schema_version, 7);
+        assert_eq!(payload.schema_version, 8);
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pond.universe.len(), 80);
 
@@ -583,7 +630,7 @@ mod tests {
         db.initialize_schema(true).expect("init schema");
 
         let payload = build_dashboard_payload(&db).expect("build dashboard payload");
-        assert_eq!(payload.schema_version, 7);
+        assert_eq!(payload.schema_version, 8);
 
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pp50.pit.equity_usdc, 5000.0);
@@ -873,5 +920,79 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(clear_cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn test_r3_b5_h25_sensitive_config_redaction_and_typed_error_mapping() {
+        let root = resolve_project_root();
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).expect("seed schema");
+        db.set_config_value("web_api_token", &json!("test-r3-b5-token"))
+            .expect("set token");
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 1. Update sensitive keys (`private_key`, `telegram_bot_token`) via POST /api/v1/config (R3-B5, R3-QE #5)
+        let secret_pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let pk_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/config")
+            .header(header::AUTHORIZATION, "Bearer test-r3-b5-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"config_key":"private_key","config_value":"{secret_pk}"}}"#
+            )))
+            .unwrap();
+        let pk_resp = app.clone().oneshot(pk_req).await.unwrap();
+        assert_eq!(pk_resp.status(), StatusCode::OK);
+
+        let secret_tg = "123456789:AAH_super_secret_telegram_bot_token_value";
+        let tg_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/config")
+            .header(header::AUTHORIZATION, "Bearer test-r3-b5-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"config_key":"telegram_bot_token","config_value":"{secret_tg}"}}"#
+            )))
+            .unwrap();
+        let tg_resp = app.clone().oneshot(tg_req).await.unwrap();
+        assert_eq!(tg_resp.status(), StatusCode::OK);
+
+        // Verify telemetry_logs records `[REDACTED]` and never contains the plaintext secret values (R3-B5)
+        let logs = db.get_recent_logs(20).unwrap();
+        fn msg_of(l: &serde_json::Value) -> &str {
+            l.get("message").and_then(|v| v.as_str()).unwrap_or("")
+        }
+        assert!(
+            logs.iter()
+                .any(|l| msg_of(l).contains("private_key = [REDACTED]")),
+            "telemetry_logs must record [REDACTED] for private_key update"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| msg_of(l).contains("telegram_bot_token = [REDACTED]")),
+            "telemetry_logs must record [REDACTED] for telegram_bot_token update"
+        );
+        for log in &logs {
+            let m = msg_of(log);
+            assert!(
+                !m.contains(secret_pk) && !m.contains(secret_tg),
+                "telemetry_logs must never contain plaintext sensitive config values"
+            );
+        }
+
+        // 2. Unknown config key returns 400 Bad Request via typed AegisError::Validation (R3-H25)
+        let bad_key_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/config")
+            .header(header::AUTHORIZATION, "Bearer test-r3-b5-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"config_key":"nonexistent_config_key","config_value":"123"}"#,
+            ))
+            .unwrap();
+        let bad_key_resp = app.oneshot(bad_key_req).await.unwrap();
+        assert_eq!(bad_key_resp.status(), StatusCode::BAD_REQUEST);
     }
 }

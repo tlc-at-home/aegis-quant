@@ -364,11 +364,31 @@ impl DiagonalGaussianHMM {
     }
 }
 
+fn compute_alt_pc1_fingerprint(alt_pc1_series: Option<&[f64]>) -> u64 {
+    match alt_pc1_series {
+        None => 0,
+        Some(slice) => {
+            let mut h: u64 = 0xcbf29ce484222325 ^ (slice.len() as u64);
+            let step = (slice.len() / 16).max(1);
+            for &v in slice.iter().step_by(step) {
+                h ^= v.to_bits();
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            if let Some(&last) = slice.last() {
+                h ^= last.to_bits();
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h.max(1)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct HmmCacheState {
     pub bar_ts: Option<i64>,
     pub bar_len: usize,
     pub window: usize,
+    pub alt_pc1_fingerprint: u64,
     pub hmm: Option<DiagonalGaussianHMM>,
     pub alpha: Option<[f64; 3]>,
     pub alpha_prev: Option<[f64; 3]>,
@@ -398,6 +418,7 @@ impl Default for HmmCacheState {
             bar_ts: None,
             bar_len: 0,
             window: 0,
+            alt_pc1_fingerprint: 0,
             hmm: None,
             alpha: None,
             alpha_prev: None,
@@ -644,11 +665,13 @@ impl SignalEngine {
 
         let last_bar_ts = btc_bars.last().map(|b| b.timestamp_ms).unwrap_or(0);
         let last_bar_close = btc_bars.last().map(|b| b.close).unwrap_or(0.0);
+        let alt_fp = compute_alt_pc1_fingerprint(alt_pc1_series);
         {
             let cache = self.hmm_cache.lock();
             if cache.bar_ts == Some(last_bar_ts)
                 && cache.bar_len == n_bars
                 && cache.window == window
+                && cache.alt_pc1_fingerprint == alt_fp
                 && cache.states.len() == n_bars
                 && cache.hmm.is_some()
             {
@@ -881,6 +904,7 @@ impl SignalEngine {
             cache.bar_ts = Some(last_bar_ts);
             cache.bar_len = n_bars;
             cache.window = window;
+            cache.alt_pc1_fingerprint = alt_fp;
             cache.alpha = Some(active_alpha);
             cache.alpha_prev = Some(prev_alpha);
             cache.hmm = Some(active_hmm);

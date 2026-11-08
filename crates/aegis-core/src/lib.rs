@@ -1,6 +1,7 @@
 //! Core domain models, state machine enums, EVM/secp256k1 validation, and SHA-256 dataset provenance.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -11,9 +12,6 @@ use thiserror::Error;
 pub const PLATFORM_NAME: &str = "Aegis Quant";
 pub const PLATFORM_VERSION: &str = "0.3.0-rc1";
 
-pub const MAINNET_HLP_VAULT_ADDRESS: &str = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
-pub const TESTNET_HLP_VAULT_ADDRESS: &str = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
-
 pub const SENSITIVE_CONFIG_KEYS: &[&str] = &[
     "private_key",
     "gemini_api_key",
@@ -21,6 +19,20 @@ pub const SENSITIVE_CONFIG_KEYS: &[&str] = &[
     "discord_webhook_url",
     "web_api_token",
 ];
+
+/// Returns `true` if `key` is a sensitive secret or identifier that must be redacted in logs and REST echoes (`R3-B5`).
+pub fn is_sensitive_config_key(key: &str) -> bool {
+    let k = key.trim().to_ascii_lowercase();
+    SENSITIVE_CONFIG_KEYS.contains(&k.as_str())
+        || k == "telegram_chat_id"
+        || k == "dashboard_api_token"
+        || k.contains("secret")
+        || k.contains("token")
+        || k.contains("password")
+        || k.contains("private_key")
+        || k.contains("api_key")
+        || k.contains("webhook")
+}
 
 /// Canonical Hyperliquid Mainnet HLP Vault EVM address.
 pub const DEFAULT_MAINNET_HLP_VAULT_ADDRESS: &str = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
@@ -64,19 +76,6 @@ pub fn is_immutable_security_config_key(key: &str) -> bool {
     IMMUTABLE_SECURITY_CONFIG_KEYS.contains(&k.as_str())
 }
 
-/// Returns true if `key` is a sensitive secret or credential key that must be encrypted at rest
-/// and redacted in logs and API responses.
-pub fn is_sensitive_config_key(key: &str) -> bool {
-    let k = key.trim().to_ascii_lowercase();
-    SENSITIVE_CONFIG_KEYS.contains(&k.as_str())
-        || k == "web_api_token"
-        || k.ends_with("_private_key")
-        || k.ends_with("_api_key")
-        || k.ends_with("_bot_token")
-        || k.ends_with("_webhook_url")
-        || k.ends_with("_secret")
-}
-
 /// Canonical UTC timestamp formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).
 pub fn now_iso8601_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -84,8 +83,11 @@ pub fn now_iso8601_utc() -> String {
 
 /// Format a millisecond epoch timestamp as canonical ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 pub fn format_ms_iso8601_utc(ts_ms: i64) -> String {
+    if ts_ms < 0 {
+        return "1970-01-01T00:00:00Z".to_string();
+    }
     chrono::DateTime::from_timestamp_millis(ts_ms)
-        .unwrap_or_else(chrono::Utc::now)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string()
 }
@@ -138,6 +140,8 @@ pub fn parse_utc_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
 pub struct Usdc(pub f64);
 
 impl Usdc {
+    pub const ZERO: Self = Self(0.0);
+
     #[inline]
     pub const fn new(val: f64) -> Self {
         Self(val)
@@ -163,6 +167,11 @@ impl Usdc {
     }
 
     #[inline]
+    pub fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
+
+    #[inline]
     pub fn saturating_sub(self, rhs: Self) -> Self {
         Self((self.0 - rhs.0).max(0.0))
     }
@@ -179,12 +188,69 @@ impl Usdc {
 
     #[inline]
     pub fn clamp(self, min: Self, max: Self) -> Self {
-        Self(self.0.clamp(min.0, max.0))
+        let (lo, hi) = if min.0 <= max.0 {
+            (min.0, max.0)
+        } else {
+            (max.0, min.0)
+        };
+        Self(self.0.clamp(lo, hi))
     }
 
     #[inline]
     pub fn round_dp(self, decimals: i32) -> Self {
         Self(round_dp(self.0, decimals))
+    }
+}
+
+impl std::ops::Add for Usdc {
+    type Output = Self;
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for Usdc {
+    type Output = Self;
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::AddAssign for Usdc {
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl std::ops::SubAssign for Usdc {
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
+
+impl std::ops::Mul<f64> for Usdc {
+    type Output = Self;
+    #[inline]
+    fn mul(self, rhs: f64) -> Self::Output {
+        Self(self.0 * rhs)
+    }
+}
+
+impl std::ops::Div<f64> for Usdc {
+    type Output = Self;
+    #[inline]
+    fn div(self, rhs: f64) -> Self::Output {
+        Self(self.0 / rhs)
+    }
+}
+
+impl std::iter::Sum for Usdc {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|u| u.0).sum())
     }
 }
 
@@ -206,6 +272,8 @@ impl fmt::Display for Usdc {
 pub struct Price(pub f64);
 
 impl Price {
+    pub const ZERO: Self = Self(0.0);
+
     #[inline]
     pub const fn new(val: f64) -> Self {
         Self(val)
@@ -257,6 +325,22 @@ impl From<f64> for Price {
     }
 }
 
+impl std::ops::Add for Price {
+    type Output = Self;
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for Price {
+    type Output = Self;
+    #[inline]
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
 impl fmt::Display for Price {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -269,6 +353,8 @@ impl fmt::Display for Price {
 pub struct Quantity(pub f64);
 
 impl Quantity {
+    pub const ZERO: Self = Self(0.0);
+
     #[inline]
     pub const fn new(val: f64) -> Self {
         Self(val)
@@ -294,6 +380,11 @@ impl Quantity {
     }
 
     #[inline]
+    pub fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
+
+    #[inline]
     pub fn from_notional_rounded_down(notional: Usdc, price: Price, step: f64) -> Self {
         if price.0 <= 0.0 || !price.0.is_finite() {
             return Self(0.0);
@@ -304,7 +395,7 @@ impl Quantity {
 
     #[inline]
     pub fn notional_at(self, price: Price) -> Usdc {
-        Usdc::new_clamped(self.0 * price.0)
+        Usdc::new_clamped(self.0.abs() * price.0)
     }
 
     #[inline]
@@ -341,6 +432,13 @@ impl fmt::Display for Quantity {
 pub struct Leverage(pub f64);
 
 impl Leverage {
+    pub const ZERO: Self = Self(0.0);
+
+    #[inline]
+    pub const fn new(val: f64) -> Self {
+        Self(val)
+    }
+
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
         if val.is_finite() && val >= 0.0 {
@@ -362,6 +460,13 @@ impl Leverage {
 pub struct Bps(pub f64);
 
 impl Bps {
+    pub const ZERO: Self = Self(0.0);
+
+    #[inline]
+    pub const fn new(val: f64) -> Self {
+        Self(val)
+    }
+
     #[inline]
     pub const fn as_f64(self) -> f64 {
         self.0
@@ -391,33 +496,20 @@ pub fn compute_drift_bps(book_a_equity: f64, total_equity: f64, target_split_pct
     round_dp(((book_a_equity - target_a).abs() / total_equity) * 10_000.0, 2)
 }
 
-pub const VALID_FSM_STATES: &[&str] = &[
-    "PENDING",
-    "OPEN_ON_BOOK",
-    "PARTIALLY_FILLED",
-    "FILLED",
-    "CANCELLED",
-    "REJECTED",
-    "EXPIRED",
-];
-
-/// Deprecated stub: all reference prices are stored in SQLite (`universe_assets.reference_price`
-/// and `pond_universe.reference_price`) and queried via `DatabaseManager::resolve_reference_price` (`HP`).
-pub fn base_prices_usdc() -> HashMap<&'static str, f64> {
-    HashMap::new()
-}
-
 /// Timeframe duration in seconds.
 pub fn timeframe_seconds(tf: &str) -> i64 {
     match tf.trim().to_ascii_lowercase().as_str() {
+        "1m" => 60,
+        "5m" => 300,
         "15m" => 900,
+        "30m" => 1800,
         "1h" => 3600,
         "2h" => 7200,
         "4h" => 14400,
         "6h" => 21600,
         "8h" => 28800,
         "12h" => 43200,
-        "1d" => 86400,
+        "1d" | "24h" => 86400,
         _ => 3600,
     }
 }
@@ -663,19 +755,6 @@ impl fmt::Display for OptionAnalogue {
     }
 }
 
-pub const VALID_POND_CELL_STATES: &[&str] = &[
-    "DORMANT",
-    "SCREENED",
-    "CANDIDATE",
-    "ARMED",
-    "OPEN",
-    "TRAILED",
-    "CLOSED",
-    "COOLDOWN",
-    "SKIPPED",
-    "REJECTED",
-];
-
 /// 10-state Pond Cell Lifecycle FSM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -693,6 +772,19 @@ pub enum PondCellState {
 }
 
 impl PondCellState {
+    pub const ALL: &'static [Self] = &[
+        Self::Dormant,
+        Self::Screened,
+        Self::Candidate,
+        Self::Armed,
+        Self::Open,
+        Self::Trailed,
+        Self::Closed,
+        Self::Cooldown,
+        Self::Skipped,
+        Self::Rejected,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Dormant => "DORMANT",
@@ -720,9 +812,12 @@ impl PondCellState {
             "COOLDOWN" => Ok(Self::Cooldown),
             "SKIPPED" => Ok(Self::Skipped),
             "REJECTED" => Ok(Self::Rejected),
-            other => Err(AegisError::Validation(format!(
-                "Invalid PondCellState '{other}': must be one of {VALID_POND_CELL_STATES:?}"
-            ))),
+            other => {
+                let valid: Vec<&'static str> = Self::ALL.iter().map(Self::as_str).collect();
+                Err(AegisError::Validation(format!(
+                    "Invalid PondCellState '{other}': must be one of {valid:?}"
+                )))
+            }
         }
     }
 
@@ -778,7 +873,7 @@ pub struct BookRow {
 }
 
 fn default_reference_price() -> f64 {
-    10.0
+    0.0
 }
 
 /// Dynamic 80-coin Pond universe row (`pond_universe` table).
@@ -982,10 +1077,17 @@ pub enum OrderFsmState {
     Expired,
 }
 
-/// Alias for `OrderFsmState` (`NM-14`).
-pub type OrderLifecycleState = OrderFsmState;
-
 impl OrderFsmState {
+    pub const ALL: &'static [Self] = &[
+        Self::Pending,
+        Self::OpenOnBook,
+        Self::PartiallyFilled,
+        Self::Filled,
+        Self::Cancelled,
+        Self::Rejected,
+        Self::Expired,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "PENDING",
@@ -1007,9 +1109,12 @@ impl OrderFsmState {
             "CANCELLED" => Ok(Self::Cancelled),
             "REJECTED" => Ok(Self::Rejected),
             "EXPIRED" => Ok(Self::Expired),
-            other => Err(AegisError::Validation(format!(
-                "Invalid fsm_state '{other}': must be one of {VALID_FSM_STATES:?}"
-            ))),
+            other => {
+                let valid: Vec<&'static str> = Self::ALL.iter().map(Self::as_str).collect();
+                Err(AegisError::Validation(format!(
+                    "Invalid fsm_state '{other}': must be one of {valid:?}"
+                )))
+            }
         }
     }
 
@@ -1490,7 +1595,7 @@ pub struct CheckResult {
     pub remediation: String,
 }
 
-/// Locate the project root containing `sql/schema_and_seed.sql`.
+/// Locate the project root containing `sql/schema_and_seed.sql` (`R3-H19`).
 pub fn resolve_project_root() -> PathBuf {
     if let Ok(env_root) = std::env::var("AEGIS_PROJECT_ROOT") {
         let p = PathBuf::from(env_root);
@@ -1505,11 +1610,23 @@ pub fn resolve_project_root() -> PathBuf {
             }
         }
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            if ancestor.join("sql").join("schema_and_seed.sql").exists() {
+                return ancestor.to_path_buf();
+            }
+        }
+    }
+    if let Some(manifest_root) = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+    {
+        if manifest_root.exists() {
+            return manifest_root;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Validate an EVM/Arbitrum `0x` address (or allow empty string to clear).
@@ -1616,44 +1733,49 @@ pub fn verify_signer_matches_wallet(
     )))
 }
 
-/// Mask sensitive private keys and API keys for safe telemetry output.
+/// Mask sensitive private keys and API keys for safe telemetry output (`R3-H14`).
 pub fn mask_secret(raw_val: &str) -> String {
     let val = raw_val.trim();
     if val.is_empty() {
         return String::new();
     }
-    if val.len() > 10 {
-        format!("{}...{}", &val[..6], &val[val.len() - 4..])
+    let chars: Vec<char> = val.chars().collect();
+    if chars.len() > 10 {
+        let prefix: String = chars[..6].iter().collect();
+        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        format!("{prefix}...{suffix}")
     } else {
         "********".to_string()
     }
 }
 
-/// Mask semi-sensitive identifiers such as `telegram_chat_id` for API responses (`NL-6`).
+/// Mask semi-sensitive identifiers such as `telegram_chat_id` for API responses (`NL-6`, `R3-H14`).
 pub fn mask_identifier(raw_val: &str) -> String {
     let val = raw_val.trim();
     if val.is_empty() {
         return String::new();
     }
-    if val.len() <= 4 {
+    let chars: Vec<char> = val.chars().collect();
+    if chars.len() <= 4 {
         "****".to_string()
-    } else if val.len() <= 6 {
-        format!("{}***{}", &val[..2], &val[val.len() - 2..])
+    } else if chars.len() <= 6 {
+        let prefix: String = chars[..2].iter().collect();
+        let suffix: String = chars[chars.len() - 2..].iter().collect();
+        format!("{prefix}***{suffix}")
     } else {
-        format!("{}...{}", &val[..3], &val[val.len() - 3..])
+        let prefix: String = chars[..3].iter().collect();
+        let suffix: String = chars[chars.len() - 3..].iter().collect();
+        format!("{prefix}...{suffix}")
     }
 }
 
-/// Verify SHA-256 checksum of the historical backfill dataset (`data/real_4h_backfill.json`).
+/// Verify SHA-256 checksum of the historical backfill dataset (`data/real_4h_backfill.json`) (`R3-H20`).
 pub fn verify_data_provenance(backfill_path: impl AsRef<Path>) -> Result<bool> {
     let file_path = backfill_path.as_ref();
     let hash_path = PathBuf::from(format!("{}.sha256", file_path.display()));
 
-    if !file_path.exists() {
+    if !file_path.exists() || !hash_path.exists() {
         return Ok(false);
-    }
-    if !hash_path.exists() {
-        return Ok(true);
     }
 
     let hash_text = fs::read_to_string(&hash_path)?;
@@ -1662,6 +1784,9 @@ pub fn verify_data_provenance(backfill_path: impl AsRef<Path>) -> Result<bool> {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
+    if expected_hash.is_empty() {
+        return Ok(false);
+    }
     let bytes = fs::read(file_path)?;
     let actual_hash = hex::encode(Sha256::digest(&bytes));
 
@@ -1684,19 +1809,120 @@ pub fn round_dp(val: f64, decimals: i32) -> f64 {
     (val * factor).round() / factor
 }
 
-/// Round `value` down (or nearest if `round_down == false`) to exchange lot or tick step size.
+/// Round `value` down (or nearest if `round_down == false`) to exchange lot or tick step size (`R3-H11`).
 #[inline]
 pub fn round_step(value: f64, step: f64, round_down: bool) -> f64 {
-    if step <= 0.0 {
+    if step <= 0.0 || !value.is_finite() || !step.is_finite() {
         return value;
     }
     let ratio = value / step;
     let stepped = if round_down {
-        (ratio + 1e-12).floor() * step
+        let k_floor = ratio.floor();
+        let k_next = k_floor + 1.0;
+        let ulp_tol = 4.0 * f64::EPSILON * k_next.abs().max(1.0);
+        let k = if (k_next - ratio) <= ulp_tol && round_dp(k_next * step, 12) <= value {
+            k_next
+        } else {
+            k_floor
+        };
+        k * step
     } else {
         ratio.round() * step
     };
     round_dp(stepped, 10)
+}
+
+/// Typed configuration dictionary loaded from `system_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConfigMap {
+    pub values: HashMap<String, Value>,
+}
+
+impl ConfigMap {
+    pub fn new() -> Self {
+        Self {
+            values: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, k: impl Into<String>, v: Value) {
+        self.values.insert(k.into(), v);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.values.get(key)
+    }
+
+    pub fn get_str(&self, key: &str, default: &str) -> String {
+        match self.values.get(key) {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => default.to_string(),
+        }
+    }
+
+    pub fn get_f64(&self, key: &str, default: f64) -> f64 {
+        match self.values.get(key) {
+            Some(Value::Number(n)) => n.as_f64().unwrap_or(default),
+            Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(default),
+            _ => default,
+        }
+    }
+
+    pub fn get_i64(&self, key: &str, default: i64) -> i64 {
+        match self.values.get(key) {
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|f| f as i64))
+                .unwrap_or(default),
+            Some(Value::String(s)) => s
+                .trim()
+                .parse::<f64>()
+                .map(|f| f as i64)
+                .unwrap_or(default),
+            _ => default,
+        }
+    }
+
+    pub fn get_usize(&self, key: &str, default: usize) -> usize {
+        self.get_i64(key, default as i64).max(0) as usize
+    }
+
+    pub fn get_bool(&self, key: &str, default: bool) -> bool {
+        match self.values.get(key) {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::String(s)) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on" | "testnet"
+            ),
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+            _ => default,
+        }
+    }
+}
+
+/// Shared basis-harvest allocation and yield accrual helper (`R3-H6`).
+/// Returns `(basis_notional_usdc, yield_delta_usdc)`.
+pub fn compute_basis_harvest_accrual(
+    available_cash_usdc: f64,
+    alloc_pct: f64,
+    basis_floor: f64,
+    basis_rates_hourly: &[f64],
+    accrue_yield: bool,
+) -> (f64, f64) {
+    if available_cash_usdc <= 0.0 || basis_rates_hourly.is_empty() {
+        return (0.0, 0.0);
+    }
+    let eff_alloc = alloc_pct.clamp(0.0, 1.0);
+    let basis_notional = round_dp(available_cash_usdc * eff_alloc, 2);
+    if !accrue_yield {
+        return (basis_notional, 0.0);
+    }
+    let avg_funding =
+        (basis_rates_hourly.iter().sum::<f64>() / (basis_rates_hourly.len() as f64)).max(basis_floor);
+    let yield_delta = round_dp(basis_notional * avg_funding * 4.0, 4);
+    (basis_notional, yield_delta)
 }
 
 /// Pure stateless Exponential Moving Average (EMA) series over `values` with span `span`.
@@ -1716,13 +1942,13 @@ pub fn compute_ema(values: &[f64], span: usize) -> Vec<f64> {
     out
 }
 
-/// Pure stateless Average True Range (ATR) over `period` bars.
+/// Pure stateless Average True Range (ATR) over `period` bars (`R3-N13`).
 pub fn compute_atr_from_bars(bars: &[OhlcvBar], period: usize) -> f64 {
     if bars.len() < 2 {
         if let Some(last) = bars.last() {
-            return (last.high - last.low).max(last.close * 0.015).max(1e-8);
+            return (last.high - last.low).max(last.close * 0.005).max(1e-8);
         }
-        return 1.0;
+        return 0.0;
     }
     let mut tr_list = Vec::with_capacity(bars.len() - 1);
     for i in 1..bars.len() {
@@ -1744,7 +1970,7 @@ pub fn compute_atr_from_bars(bars: &[OhlcvBar], period: usize) -> f64 {
     } else {
         window.iter().sum::<f64>() / (window.len() as f64)
     };
-    let current_close = bars.last().map(|b| b.close).unwrap_or(1.0);
+    let current_close = bars.last().map(|b| b.close).unwrap_or(0.0);
     atr.max(current_close * 0.005).max(1e-8)
 }
 
@@ -1804,11 +2030,36 @@ mod tests {
         );
         assert_eq!(mask_secret("short"), "********");
         assert_eq!(mask_secret(""), "");
+        // Multi-byte UTF-8 character safety (R3-H14)
+        assert_eq!(mask_secret("🔑🔑🔑🔑🔑🔑abcdef🔒🔒🔒🔒"), "🔑🔑🔑🔑🔑🔑...🔒🔒🔒🔒");
+        assert_eq!(mask_identifier("🔑🔑🔑🔑🔑🔑🔑"), "🔑🔑🔑...🔑🔑🔑");
 
         assert_eq!(mask_identifier("-100123456789"), "-10...789");
         assert_eq!(mask_identifier("123456"), "12***56");
         assert_eq!(mask_identifier("1234"), "****");
         assert_eq!(mask_identifier(""), "");
+    }
+
+    #[test]
+    fn test_round_step_ulp_and_floor_precision() {
+        // Exact decimal representation 0.3 / 0.1 = 2.9999999999999996 should stay 0.3
+        assert!((round_step(0.3, 0.1, true) - 0.3).abs() < 1e-12);
+        // Values strictly below a step boundary must never round up on round_down = true (R3-H11)
+        assert!((round_step(49999.99999999999, 1.0, true) - 49999.0).abs() < 1e-12);
+        assert!((round_step(0.29999999999995, 0.1, true) - 0.2).abs() < 1e-12);
+        assert!((round_step(0.29999999999995, 0.1, false) - 0.3).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_newtype_arithmetic_and_inverted_clamp_safety() {
+        let a = Usdc(150.0);
+        let b = Usdc(50.0);
+        assert_eq!(a + b, Usdc(200.0));
+        assert_eq!(a - b, Usdc(100.0));
+        // Inverted clamp bounds should not panic (R3-H13 / R3-QA)
+        let clamped = Usdc(120.0).clamp(Usdc(200.0), Usdc(50.0));
+        assert_eq!(clamped, Usdc(120.0));
+        assert_eq!(default_reference_price(), 0.0);
     }
 
     #[test]
@@ -1823,6 +2074,7 @@ mod tests {
         assert!(Closed.can_transition_to(Cooldown));
         assert!(Cooldown.can_transition_to(Dormant));
         assert!(!Dormant.can_transition_to(Open));
+        assert_eq!(PondCellState::ALL.len(), 10);
 
         use OrderFsmState::*;
         assert!(Pending.can_transition_to(OpenOnBook));
@@ -1834,6 +2086,7 @@ mod tests {
         assert!(!Cancelled.can_transition_to(Filled));
         assert!(!OrderFsmState::Rejected.can_transition_to(Filled));
         assert!(Filled.is_terminal());
+        assert_eq!(OrderFsmState::ALL.len(), 7);
 
         let mut series = vec![0.0001; 167];
         series.push(0.0005);
@@ -1859,4 +2112,5 @@ mod tests {
         assert!(is_immutable_security_config_key("pit_subaccount_address"));
     }
 }
+
 

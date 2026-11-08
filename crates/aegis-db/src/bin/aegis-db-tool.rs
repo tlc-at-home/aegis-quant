@@ -14,6 +14,7 @@ struct Args {
     init: bool,
     force: bool,
     generate_key: bool,
+    show_web_token: bool,
 }
 
 fn parse_args() -> Args {
@@ -34,6 +35,7 @@ fn parse_args() -> Args {
             "--init" | "--migrate" => args.init = true,
             "--force" => args.force = true,
             "--generate-key" => args.generate_key = true,
+            "--show-web-token" => args.show_web_token = true,
             "--verify" => {}
             _ => {}
         }
@@ -51,6 +53,12 @@ fn main() -> aegis_core::Result<()> {
         Some(p) => DatabaseManager::new(p),
         None => DatabaseManager::default_db(),
     };
+
+    if args.show_web_token {
+        let token = db.get_or_create_web_api_token()?;
+        println!("{token}");
+        return Ok(());
+    }
 
     if args.init {
         let rep = db.initialize_schema(args.force)?;

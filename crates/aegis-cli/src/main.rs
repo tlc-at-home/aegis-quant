@@ -52,28 +52,32 @@ struct Cli {
     #[arg(long, global = true, default_value = "both")]
     book: String,
 
+    /// Emit machine-readable JSON output
+    #[arg(long, global = true)]
+    json: bool,
+
     /// Run a single ingestion + signal + execution cycle and exit
-    #[arg(long)]
+    #[arg(long, global = true)]
     once: bool,
 
     /// Run walk-forward timeframe calibration (`1H` vs `4H`) before cycle
-    #[arg(long)]
+    #[arg(long, global = true)]
     calibrate: bool,
 
     /// WebUI bind host (defaults to loopback `127.0.0.1` for security)
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, global = true, default_value = "127.0.0.1")]
     host: String,
 
     /// Explicitly allow binding the WebUI server to a non-loopback network interface
-    #[arg(long)]
+    #[arg(long, global = true)]
     allow_remote_bind: bool,
 
     /// WebUI bind port
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, global = true, default_value_t = 8000)]
     port: u16,
 
     /// Disable embedded Axum WebUI server
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_web: bool,
 
     #[command(subcommand)]
@@ -83,22 +87,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start the AegisOrchestrator daemon & WebUI server (or run `--once`)
-    Run {
-        #[arg(long)]
-        once: bool,
-        #[arg(long)]
-        calibrate: bool,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long)]
-        allow_remote_bind: bool,
-        #[arg(long, default_value_t = 8000)]
-        port: u16,
-        #[arg(long)]
-        no_web: bool,
-        #[arg(long, default_value = "both")]
-        book: String,
-    },
+    Run,
     /// Book B (The Pond) universe management and hourly S-Cycle scanner
     Pond {
         /// Run an hourly S-Cycle scan across the 80-coin Pond universe
@@ -113,10 +102,10 @@ enum Commands {
         /// Run settling in dry-run simulation mode
         #[arg(long)]
         dry_run: bool,
-        /// Optional `<PIT_USDC>:<POND_USDC>` equity override (e.g. `5000:5000`)
+        /// Optional `<PIT_USDC>:<POND_USDC>` equity override (e.g. `5000:5000`, requires `--dry-run`)
         #[arg(long)]
         initial_split: Option<String>,
-        /// Optional unlocked idle USDC override on the rich book
+        /// Optional unlocked idle USDC override on the rich book (requires `--dry-run`)
         #[arg(long)]
         rich_idle_usdc: Option<f64>,
         /// Day index for the formatted daily report line
@@ -131,30 +120,28 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..007_*.sql`)
+        /// Apply pending versioned SQL migrations (`sql/migrations/001..008_*.sql`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
         #[arg(long)]
         test_encryption: bool,
         /// Atomically rotate the Fernet master key across all encrypted `system_config` keys
+        /// (reads prior key from `--old-key-file` or `AEGIS_OLD_MASTER_KEY` env, and new key from `--new-key-file` or `AEGIS_NEW_MASTER_KEY` env)
         #[arg(long)]
         rotate_key: bool,
-        /// Prior Fernet master key for `--rotate-key` (prefer `AEGIS_OLD_MASTER_KEY` env or `--old-key-file`)
-        #[arg(long, env = "AEGIS_OLD_MASTER_KEY")]
-        old_key: Option<String>,
         /// Path to file containing the prior Fernet master key for `--rotate-key`
         #[arg(long)]
         old_key_file: Option<PathBuf>,
-        /// New Fernet master key for `--rotate-key` (prefer `AEGIS_NEW_MASTER_KEY` env or `--new-key-file`)
-        #[arg(long, env = "AEGIS_NEW_MASTER_KEY")]
-        new_key: Option<String>,
         /// Path to file containing the new Fernet master key for `--rotate-key`
         #[arg(long)]
         new_key_file: Option<PathBuf>,
         /// Generate a fresh 32-byte URL-safe base64 Fernet master key
         #[arg(long)]
         generate_key: bool,
+        /// Decrypt and display the active `web_api_token` from `system_config` (or generate one if empty)
+        #[arg(long)]
+        show_web_token: bool,
     },
     /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
     Backtest {
@@ -179,10 +166,31 @@ enum Commands {
         /// Skip full 365-day backtest in Gate 5
         #[arg(long)]
         skip_backtest: bool,
-        /// Emit machine-readable JSON readiness report
-        #[arg(long)]
-        json: bool,
     },
+}
+
+/// Validates `--initial-split` (`<PIT_USDC>:<POND_USDC>`) for `aegis-quant settle`.
+pub fn parse_and_validate_initial_split(raw: &str) -> Result<(f64, f64)> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() != 2 {
+        return Err(AegisError::Validation(format!(
+            "Invalid --initial-split '{raw}': expected '<PIT_USDC>:<POND_USDC>' (e.g. 5000:5000)"
+        )));
+    }
+    let pit = parts[0]
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| AegisError::Validation(format!("Invalid PIT value in --initial-split '{raw}': {e}")))?;
+    let pond = parts[1]
+        .trim()
+        .parse::<f64>()
+        .map_err(|e| AegisError::Validation(format!("Invalid POND value in --initial-split '{raw}': {e}")))?;
+    if !pit.is_finite() || !pond.is_finite() || pit <= 0.0 || pond <= 0.0 {
+        return Err(AegisError::Validation(format!(
+            "Invalid --initial-split '{raw}': PIT and POND values must both be finite positive numbers (> 0.0)"
+        )));
+    }
+    Ok((pit, pond))
 }
 
 /// Validates that the WebUI bind address is loopback (`127.0.0.1`, `::1`, `localhost`) unless
@@ -230,7 +238,6 @@ pub struct AegisOrchestrator {
     pub telemetry: TelemetryBus,
     pub ingestion: MarketIngestionEngine,
     pub signals: SignalEngine,
-    pub risk: RiskEngine,
     pub execution: ExecutionEngine,
     pub calibrator: WalkForwardCalibrator,
     pub pit: PitOrchestrator,
@@ -244,7 +251,6 @@ impl AegisOrchestrator {
         let telemetry = TelemetryBus::new(db.clone());
         let ingestion = MarketIngestionEngine::new(db.clone());
         let signals = SignalEngine::new(db.clone());
-        let risk = RiskEngine::new(db.clone());
         let execution = ExecutionEngine::new(db.clone());
         let calibrator = WalkForwardCalibrator::new(db.clone());
         let pit = PitOrchestrator::new(db.clone(), Some(telemetry.clone()));
@@ -254,7 +260,6 @@ impl AegisOrchestrator {
             telemetry,
             ingestion,
             signals,
-            risk,
             execution,
             calibrator,
             pit,
@@ -269,8 +274,15 @@ impl AegisOrchestrator {
         &self,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> (tokio::task::JoinHandle<Value>, tokio::task::JoinHandle<Value>) {
-        let pit_handle = aegis_pit::spawn_pit_task(self.pit.clone(), 900, shutdown_rx.clone());
-        let pond_handle = aegis_pond::spawn_pond_task(self.pond.clone(), 15, shutdown_rx);
+        let cfg = self
+            .db
+            .load_config_or_log_default("aegis-cli.spawn_async_book_tasks");
+        let pit_sec = cfg.get_i64("polling_interval_seconds", 15).max(1) as u64;
+        let pond_sec = cfg.get_i64("pond_tick_interval_seconds", 15).max(1) as u64;
+        let pit_handle =
+            aegis_pit::spawn_pit_task(self.pit.clone(), pit_sec, shutdown_rx.clone());
+        let pond_handle =
+            aegis_pond::spawn_pond_task(self.pond.clone(), pond_sec, shutdown_rx);
         (pit_handle, pond_handle)
     }
 
@@ -292,6 +304,13 @@ impl AegisOrchestrator {
             if let Err(e) = self.db.validate_signer_binding() {
                 tracing::warn!(
                     "Startup signer binding check warning in mode {exec_mode}: {e} (WebUI remains available to update credentials)"
+                );
+            }
+        }
+        if let Ok(reconciled) = self.db.reconcile_pending_book_transfers() {
+            if reconciled > 0 {
+                tracing::warn!(
+                    "Startup book_transfers recovery sweep reconciled {reconciled} stale PENDING row(s)"
                 );
             }
         }
@@ -419,8 +438,7 @@ impl AegisOrchestrator {
         );
         self.db
             .log_telemetry("INFO", "engine.orchestrator", &msg, Some(details.clone()))?;
-        self.telemetry
-            .publish_event("INFO", "engine.orchestrator", &msg, Some(details));
+        let _ = self.telemetry.snapshot_tx.send(details);
 
         println!(
             "\n------------------------------------------------------------------------------"
@@ -512,13 +530,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 7 {
+        status: if schema_ver >= 8 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 7 (migrations 001..007 applied)".to_string(),
+        requirement: "schema_version >= 8 (migrations 001..008 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -1044,6 +1062,8 @@ fn main() -> anyhow::Result<()> {
     aegis_telemetry::init_tracing();
 
     let cli = Cli::parse();
+    let json_out = cli.json;
+    let book_flag = cli.book.clone();
     let db = match &cli.db {
         Some(p) => DatabaseManager::new(p),
         None => DatabaseManager::default_db(),
@@ -1056,32 +1076,83 @@ fn main() -> anyhow::Result<()> {
             migrate,
             test_encryption,
             rotate_key,
-            old_key,
             old_key_file,
-            new_key,
             new_key_file,
             generate_key,
+            show_web_token,
         }) => {
+            if show_web_token {
+                let token = db.get_or_create_web_api_token()?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "web_api_token": token
+                        }))?
+                    );
+                } else {
+                    println!("{token}");
+                }
+                return Ok(());
+            }
             if generate_key {
-                println!("{}", generate_fernet_key());
+                let key = generate_fernet_key();
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "fernet_key": key
+                        }))?
+                    );
+                } else {
+                    println!("{key}");
+                }
                 return Ok(());
             }
             if init {
                 db.initialize_schema(force)?;
-                println!(
-                    "Initialized SQLite WAL database at {} (schema_version={})",
-                    db.db_path.display(),
-                    db.get_schema_version()?
-                );
+                let sv = db.get_schema_version()?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "action": "init",
+                            "db_path": db.db_path.display().to_string(),
+                            "schema_version": sv,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Initialized SQLite WAL database at {} (schema_version={})",
+                        db.db_path.display(),
+                        sv
+                    );
+                }
             }
             if migrate {
                 let applied = db.run_migrations()?;
-                println!(
-                    "Applied {} migration(s): {:?} (schema_version={})",
-                    applied.len(),
-                    applied,
-                    db.get_schema_version()?
-                );
+                let sv = db.get_schema_version()?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "action": "migrate",
+                            "applied": applied,
+                            "schema_version": sv,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Applied {} migration(s): {:?} (schema_version={})",
+                        applied.len(),
+                        applied,
+                        sv
+                    );
+                }
             }
             if rotate_key {
                 let resolved_old = if let Some(path) = old_key_file {
@@ -1094,7 +1165,10 @@ fn main() -> anyhow::Result<()> {
                             .to_string(),
                     )
                 } else {
-                    old_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+                    std::env::var("AEGIS_OLD_MASTER_KEY")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
                 };
                 let target_new = if let Some(path) = new_key_file {
                     fs::read_to_string(&path)?
@@ -1104,7 +1178,8 @@ fn main() -> anyhow::Result<()> {
                         .trim()
                         .to_string()
                 } else {
-                    new_key
+                    std::env::var("AEGIS_NEW_MASTER_KEY")
+                        .ok()
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(generate_fernet_key)
@@ -1119,11 +1194,23 @@ fn main() -> anyhow::Result<()> {
             }
             if !init && !migrate && !rotate_key && !test_encryption {
                 db.initialize_schema(false)?;
-                println!(
-                    "Database ready at {} (schema_version={})",
-                    db.db_path.display(),
-                    db.get_schema_version()?
-                );
+                let sv = db.get_schema_version()?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "db_path": db.db_path.display().to_string(),
+                            "schema_version": sv,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Database ready at {} (schema_version={})",
+                        db.db_path.display(),
+                        sv
+                    );
+                }
             }
         }
         Some(Commands::Pond {
@@ -1135,7 +1222,18 @@ fn main() -> anyhow::Result<()> {
             let pond = PondOrchestrator::new(db, Some(bus));
             if refresh_universe || !scan {
                 let rows = pond.initialize_or_refresh_universe()?;
-                println!("Refreshed Pond universe: {} coins tracked", rows.len());
+                if json_out && !scan {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "universe_count": rows.len(),
+                            "universe": rows,
+                        }))?
+                    );
+                } else if !json_out {
+                    println!("Refreshed Pond universe: {} coins tracked", rows.len());
+                }
             }
             if scan {
                 let summary = pond.run_scan_cycle(true)?;
@@ -1148,21 +1246,29 @@ fn main() -> anyhow::Result<()> {
             rich_idle_usdc,
             day_index,
         }) => {
-            db.initialize_schema(false)?;
+            if !dry_run && (initial_split.is_some() || rich_idle_usdc.is_some()) {
+                return Err(AegisError::Validation(
+                    "Manual equity/idle overrides (--initial-split / --rich-idle-usdc) are only permitted with --dry-run"
+                        .to_string(),
+                )
+                .into());
+            }
+            if let Some(idle) = rich_idle_usdc {
+                if !idle.is_finite() || idle < 0.0 {
+                    return Err(AegisError::Validation(format!(
+                        "Invalid --rich-idle-usdc '{idle}': must be finite and >= 0.0"
+                    ))
+                    .into());
+                }
+            }
             let (pit_override, pond_override) = match initial_split.as_deref() {
                 Some(raw) => {
-                    let parts: Vec<&str> = raw.split(':').collect();
-                    if parts.len() == 2 {
-                        (
-                            parts[0].trim().parse::<f64>().ok(),
-                            parts[1].trim().parse::<f64>().ok(),
-                        )
-                    } else {
-                        (None, None)
-                    }
+                    let (pit, pond) = parse_and_validate_initial_split(raw)?;
+                    (Some(pit), Some(pond))
                 }
                 None => (None, None),
             };
+            db.initialize_schema(false)?;
             let bus = TelemetryBus::new(db.clone());
             let ctrl = SettleController::new(db, Some(bus));
             let res = ctrl.run_settling(SettleOverrideInput {
@@ -1172,29 +1278,36 @@ fn main() -> anyhow::Result<()> {
                 day_index: Some(day_index),
                 dry_run,
             })?;
-            println!("{}", res.report_line);
+            if !json_out {
+                println!("{}", res.report_line);
+            }
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Some(Commands::Backtest { days, synthetic }) => {
             db.initialize_schema(false)?;
             let bt = BacktestEngine::new(db, days);
             let ts = bt.run_backtest(None, None, !synthetic)?;
-            println!("{}", BacktestEngine::format_tear_sheet(&ts));
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&ts)?);
+            } else {
+                println!("{}", BacktestEngine::format_tear_sheet(&ts));
+            }
             if !ts.all_gates_passed {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Alerts { test: _ }) => {
+        Some(Commands::Alerts { test }) => {
             db.initialize_schema(false)?;
-            let mut alerts = AlertEngine::new(db);
-            let res = alerts.run_test_alert(true)?;
-            println!("{}", serde_json::to_string_pretty(&res)?);
+            if test {
+                let mut alerts = AlertEngine::new(db);
+                let res = alerts.run_test_alert(true)?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                let status = db.get_credentials_status()?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
         }
-        Some(Commands::Readiness {
-            mode,
-            skip_backtest,
-            json: json_out,
-        }) => {
+        Some(Commands::Readiness { mode, skip_backtest }) => {
             let (is_go, verdict, checks) =
                 run_readiness_suite(&db, mode.as_deref(), skip_backtest)?;
             let target_mode = mode.unwrap_or_else(|| {
@@ -1219,27 +1332,7 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Run {
-            once,
-            calibrate,
-            host,
-            allow_remote_bind,
-            port,
-            no_web,
-            book,
-        }) => {
-            run_orchestrator(
-                db,
-                once,
-                calibrate,
-                &host,
-                allow_remote_bind,
-                port,
-                no_web,
-                &book,
-            )?;
-        }
-        None => {
+        Some(Commands::Run) | None => {
             run_orchestrator(
                 db,
                 cli.once,
@@ -1248,7 +1341,7 @@ fn main() -> anyhow::Result<()> {
                 cli.allow_remote_bind,
                 cli.port,
                 cli.no_web,
-                &cli.book,
+                &book_flag,
             )?;
         }
     }
@@ -1449,5 +1542,90 @@ mod tests {
         assert!(sec01.remediation.contains(&expected_keyfile.display().to_string()));
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_r3_h12_h22_h23_cli_flags_and_initial_split_validation() {
+        // Global --json flag works before or after subcommand
+        let c1 = Cli::try_parse_from(["aegis-quant", "--json", "readiness", "--skip-backtest"])
+            .expect("parse global --json before subcommand");
+        assert!(c1.json);
+        let c2 = Cli::try_parse_from(["aegis-quant", "backtest", "--days", "30", "--json"])
+            .expect("parse global --json after subcommand");
+        assert!(c2.json);
+
+        // R3-H12: Global run flags (--port, --once, --host, --no-web) work identically before or after `run`
+        let run_before = Cli::try_parse_from([
+            "aegis-quant",
+            "--port",
+            "9000",
+            "--once",
+            "--host",
+            "0.0.0.0",
+            "--allow-remote-bind",
+            "run",
+        ])
+        .expect("parse run flags before subcommand");
+        let run_after = Cli::try_parse_from([
+            "aegis-quant",
+            "run",
+            "--port",
+            "9000",
+            "--once",
+            "--host",
+            "0.0.0.0",
+            "--allow-remote-bind",
+        ])
+        .expect("parse run flags after subcommand");
+        assert_eq!(run_before.port, 9000);
+        assert_eq!(run_after.port, 9000);
+        assert!(run_before.once && run_after.once);
+        assert_eq!(run_before.host, "0.0.0.0");
+        assert_eq!(run_after.host, "0.0.0.0");
+        assert!(run_before.allow_remote_bind && run_after.allow_remote_bind);
+
+        // Raw --old-key / --new-key CLI flags are rejected (R3-H23)
+        assert!(
+            Cli::try_parse_from(["aegis-quant", "db", "--rotate-key", "--old-key", "secret"])
+                .is_err(),
+            "--old-key CLI flag must not be accepted on command line (R3-H23)"
+        );
+
+        // --show-web-token CLI flag is accepted on `db` subcommand
+        let db_tok = Cli::try_parse_from(["aegis-quant", "db", "--show-web-token"])
+            .expect("parse --show-web-token");
+        assert!(matches!(
+            db_tok.command,
+            Some(Commands::Db {
+                show_web_token: true,
+                ..
+            })
+        ));
+
+        // --initial-split validation (R3-H22: both halves must be finite and > 0.0)
+        assert_eq!(
+            parse_and_validate_initial_split("5000:5000").unwrap(),
+            (5000.0, 5000.0)
+        );
+        assert!(parse_and_validate_initial_split("invalid").is_err());
+        assert!(parse_and_validate_initial_split("-100:5000").is_err());
+        assert!(parse_and_validate_initial_split("0:5000").is_err());
+        assert!(parse_and_validate_initial_split("5000:0").is_err());
+        assert!(parse_and_validate_initial_split("0:0").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_nq3_spawn_async_book_tasks_supervision() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = AegisOrchestrator::new(db);
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let (pit_h, pond_h) = orch.spawn_async_book_tasks(rx);
+        let pit_res = pit_h.await.unwrap();
+        let pond_res = pond_h.await.unwrap();
+        assert_eq!(pit_res["book_id"], "PIT");
+        assert_eq!(pit_res["status"], "STOPPED");
+        assert_eq!(pond_res["book_id"], "POND");
+        assert_eq!(pond_res["status"], "STOPPED");
     }
 }

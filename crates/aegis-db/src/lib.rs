@@ -1096,4 +1096,153 @@ mod tests {
     fn test_nh11_nh12_monotonic_db_nonce_and_signer_validation() {
         test_monotonic_nonce_settle_lock_ttl_and_order_fsm_validation();
     }
+
+    #[test]
+    fn test_r3_b1_h1_h2_h3_atomic_pond_cell_mutations_and_state_guards() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let mut cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(150.0),
+            quantity: Some(2.0),
+            notional_usdc: Some(300.0),
+            risk_budget_usdc: Some(30.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.8),
+            funding_rate_entry: Some(0.0001),
+            initial_stop: Some(160.0),
+            chandelier_stop: Some(162.0),
+            highest_price_seen: Some(150.0),
+            lowest_price_seen: Some(150.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.10,
+            exit_price: None,
+            exit_reason: None,
+            opened_at: Some("2026-11-08T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-08T00:00:00Z".to_string(),
+        };
+        let cid = db.upsert_pond_cell(&cell).unwrap();
+        cell.cell_id = cid;
+
+        // R3-B1: Funding accrual is idempotent within the same UTC hour bucket
+        let first_accrual = db
+            .accrue_pond_cell_funding_for_hour(cid, 498_000, -0.05)
+            .unwrap();
+        assert!(first_accrual);
+        let duplicate_accrual = db
+            .accrue_pond_cell_funding_for_hour(cid, 498_000, -0.05)
+            .unwrap();
+        assert!(!duplicate_accrual);
+        let next_hour_accrual = db
+            .accrue_pond_cell_funding_for_hour(cid, 498_001, -0.05)
+            .unwrap();
+        assert!(next_hour_accrual);
+
+        // R3-H1: Targeted watermark update preserves accrued funding (-0.10)
+        db.update_open_pond_cell_watermarks(
+            cid,
+            "TRAILED",
+            Some(145.0),
+            Some(160.0),
+            Some(150.0),
+        )
+        .unwrap();
+        let active = db.get_open_pond_cells().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!((active[0].funding_accrued_usdc - (-0.10)).abs() < 1e-9);
+        assert_eq!(active[0].state, "TRAILED");
+
+        // R3-H1: Close open pond cell atomically
+        let closed = db
+            .close_open_pond_cell(
+                cid,
+                "COOLDOWN",
+                Some(145.0),
+                Some(160.0),
+                Some(140.0),
+                140.0,
+                20.0,
+                0.05,
+                Some("TIER3_FUNDING_NORMALISATION"),
+                "2026-11-08T02:00:00Z",
+                "2026-11-09T02:00:00Z",
+            )
+            .unwrap();
+        assert!(closed);
+
+        // R3-H1 & R3-H3: Stale upsert or reconcile_open_pond_cell_size cannot reopen a CLOSED/COOLDOWN cell
+        db.upsert_pond_cell(&cell).unwrap();
+        assert!(db.get_open_pond_cells().unwrap().is_empty());
+        let reconciled = db
+            .reconcile_open_pond_cell_size(cid, 2.0, Some(150.0))
+            .unwrap();
+        assert!(!reconciled);
+    }
+
+    #[test]
+    fn test_r3_b2_b5_h13_h15_h21_security_and_validation_guards() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // R3-B2 & R3-B5: Multi-secret telemetry message & embedded Telegram bot URL redaction
+        db.log_telemetry(
+            "ERROR",
+            "alerts",
+            "Failed POST https://api.telegram.org/bot123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11/sendMessage private_key=0x1111 gemini_api_key=AIzaSecret999",
+            Some(json!({
+                "error": "url=https://discord.com/api/webhooks/12345/secretToken999",
+                "telegram_bot_token": "123456:ABC-DEF"
+            })),
+        )
+        .unwrap();
+        let logs = db.get_recent_logs(1).unwrap();
+        let msg = logs[0]["message"].as_str().unwrap();
+        let details = logs[0]["details_json"].as_str().unwrap();
+        assert!(!msg.contains("ABC-DEF1234ghIkl"));
+        assert!(!msg.contains("0x1111"));
+        assert!(!msg.contains("AIzaSecret999"));
+        assert!(!details.contains("secretToken999"));
+        assert!(!details.contains("123456:ABC-DEF"));
+
+        // R3-H13: Reject inverted min > max risk bounds
+        assert!(db
+            .set_config_value("min_risk_per_trade_usdc", &json!(9999.0))
+            .is_err());
+        let mut bad_batch = HashMap::new();
+        bad_batch.insert("pond_min_risk_usdc".to_string(), json!(500.0));
+        bad_batch.insert("pond_max_risk_usdc".to_string(), json!(100.0));
+        assert!(db.set_config_batch(&bad_batch, false).is_err());
+
+        // R3-H21: Unconditional masking in get_config_rows(false) and masked echo protection
+        db.set_config_value("gemini_api_key", &json!("AIzaRealSecretKey123456"))
+            .unwrap();
+        let rows_unmasked_flag = db.get_config_rows(false).unwrap();
+        let gk_row = rows_unmasked_flag
+            .iter()
+            .find(|r| r["config_key"] == "gemini_api_key")
+            .unwrap();
+        let masked_echo = gk_row["config_value"].as_str().unwrap().to_string();
+        assert!(masked_echo.contains("..."));
+        assert!(!masked_echo.contains("RealSecretKey"));
+
+        // Saving masked echo back must preserve the real secret in DB
+        db.set_config_value("gemini_api_key", &json!(masked_echo))
+            .unwrap();
+        let cfg = db.load_config().unwrap();
+        assert_eq!(cfg.get_str("gemini_api_key", ""), "AIzaRealSecretKey123456");
+
+        // R3-H15: resolve_reference_price returns Ok(None) when no market data exists
+        assert_eq!(db.resolve_reference_price("UNKNOWN/USDC:USDC").unwrap(), None);
+    }
 }
+

@@ -6,6 +6,10 @@ pub use aegis_alerts::{AlertEngine, AlertRetryQueue, QueuedAlertTask};
 use aegis_db::{ConfigMap, DatabaseManager};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::sync::{broadcast, mpsc, watch};
 
 /// Structured telemetry event sent over `tokio::sync::mpsc` to the database writer.
@@ -26,13 +30,17 @@ pub struct TelemetryBus {
     pub config_rx: watch::Receiver<ConfigMap>,
     pub settling_tx: watch::Sender<bool>,
     pub settling_rx: watch::Receiver<bool>,
+    pub dropped_events: Arc<AtomicUsize>,
 }
 
 impl TelemetryBus {
     pub fn new(db: DatabaseManager) -> Self {
-        let (event_tx, mut event_rx) = mpsc::channel::<TelemetryEvent>(256);
-        let (snapshot_tx, _) = broadcast::channel::<Value>(64);
         let initial_cfg = db.load_config_logged("aegis-telemetry.bus");
+        let queue_cap = initial_cfg
+            .get_usize("telemetry_queue_capacity", 2048)
+            .max(64);
+        let (event_tx, mut event_rx) = mpsc::channel::<TelemetryEvent>(queue_cap);
+        let (snapshot_tx, _) = broadcast::channel::<Value>(64);
         let (config_tx, config_rx) = watch::channel(initial_cfg);
         let (settling_tx, settling_rx) = watch::channel(false);
 
@@ -48,6 +56,21 @@ impl TelemetryBus {
                     );
                 }
             });
+        } else {
+            // R3-H10: When constructed outside an active Tokio runtime (e.g., synchronous CLI daemon),
+            // drain events on a dedicated background OS thread so the bounded channel never stalls or drops.
+            let _ = std::thread::Builder::new()
+                .name("aegis-telemetry-writer".to_string())
+                .spawn(move || {
+                    while let Some(ev) = event_rx.blocking_recv() {
+                        let _ = writer_db.log_telemetry(
+                            &ev.level,
+                            &ev.component,
+                            &ev.message,
+                            ev.details,
+                        );
+                    }
+                });
         }
 
         Self {
@@ -57,7 +80,12 @@ impl TelemetryBus {
             config_rx,
             settling_tx,
             settling_rx,
+            dropped_events: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn dropped_event_count(&self) -> usize {
+        self.dropped_events.load(Ordering::SeqCst)
     }
 
     pub fn set_settling_in_progress(&self, in_progress: bool) {
@@ -87,7 +115,15 @@ impl TelemetryBus {
             message: message.to_string(),
             details: details.clone(),
         };
-        let _ = self.event_tx.try_send(ev);
+        if let Err(err) = self.event_tx.try_send(ev) {
+            let dropped = self.dropped_events.fetch_add(1, Ordering::SeqCst) + 1;
+            tracing::warn!(
+                component = component,
+                dropped_total = dropped,
+                reason = %err,
+                "TelemetryBus event_tx queue full or closed; telemetry event dropped"
+            );
+        }
         if let Some(d) = details {
             let _ = self.snapshot_tx.send(d);
         }
@@ -132,7 +168,7 @@ mod tests {
     fn test_telemetry_bus_publish_event_and_snapshot_broadcast() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        let bus = TelemetryBus::new(db);
+        let bus = TelemetryBus::new(db.clone());
         let mut rx = bus.snapshot_tx.subscribe();
 
         bus.publish_event(
@@ -144,5 +180,6 @@ mod tests {
 
         let received = rx.try_recv().unwrap();
         assert_eq!(received["equity"], json!(10250.5));
+        assert_eq!(bus.dropped_event_count(), 0);
     }
 }

@@ -67,6 +67,14 @@ impl BacktestEngine {
     /// Parses historical 4H backfill JSON supporting both the nested `{"coins": {"BTC": {"funding_rate_hourly": ..., "candles": [...]}}}`
     /// production schema (`B5`) and flat `{"candles": {"BTC": [...]}}` / `{"BTC": [...]}` schemas.
     pub fn parse_backfill_json(raw_json: &str) -> Result<HashMap<String, Vec<OhlcvBar>>> {
+        Self::parse_backfill_json_with_default_funding(raw_json, 0.0)
+    }
+
+    /// Parses historical 4H backfill JSON using `fallback_funding_hourly` from `system_config` (`R3-N16`).
+    pub fn parse_backfill_json_with_default_funding(
+        raw_json: &str,
+        fallback_funding_hourly: f64,
+    ) -> Result<HashMap<String, Vec<OhlcvBar>>> {
         let root_val: Value = serde_json::from_str(raw_json).map_err(|e| {
             AegisError::Validation(format!("Invalid backfill JSON syntax: {e}"))
         })?;
@@ -135,7 +143,7 @@ impl BacktestEngine {
                             v.as_f64()
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                         })
-                        .unwrap_or(0.0001);
+                        .unwrap_or(fallback_funding_hourly);
                     if let Some(arr) = coin_obj.get("candles").and_then(Value::as_array) {
                         let bars = parse_candle_array(&norm_sym, arr, default_funding);
                         if !bars.is_empty() {
@@ -143,7 +151,7 @@ impl BacktestEngine {
                         }
                     }
                 } else if let Some(arr) = coin_entry.as_array() {
-                    let bars = parse_candle_array(&norm_sym, arr, 0.0001);
+                    let bars = parse_candle_array(&norm_sym, arr, fallback_funding_hourly);
                     if !bars.is_empty() {
                         loaded_real.insert(norm_sym, bars);
                     }
@@ -164,7 +172,7 @@ impl BacktestEngine {
                     format!("{}/USDC:USDC", sym_key.trim().to_uppercase())
                 };
                 if let Some(arr) = entry_val.as_array() {
-                    let bars = parse_candle_array(&norm_sym, arr, 0.0001);
+                    let bars = parse_candle_array(&norm_sym, arr, fallback_funding_hourly);
                     if !bars.is_empty() {
                         loaded_real.insert(norm_sym, bars);
                     }
@@ -176,7 +184,7 @@ impl BacktestEngine {
                     let def_f = entry_val
                         .get("funding_rate_hourly")
                         .and_then(Value::as_f64)
-                        .unwrap_or(0.0001);
+                        .unwrap_or(fallback_funding_hourly);
                     let bars = parse_candle_array(&norm_sym, arr, def_f);
                     if !bars.is_empty() {
                         loaded_real.insert(norm_sym, bars);
@@ -243,7 +251,7 @@ impl BacktestEngine {
                 low: round_dp(low_px, 8),
                 close: round_dp(close_px, 8),
                 volume: first_bar.volume.max(1000.0),
-                funding_rate_hourly: 0.0001,
+                funding_rate_hourly: first_bar.funding_rate_hourly,
                 is_synthetic: 1,
             });
         }
@@ -264,6 +272,8 @@ impl BacktestEngine {
         HashMap<String, Vec<OhlcvBar>>,
         HashMap<String, Vec<OhlcvBar>>,
     )> {
+        let cfg = bt_db.load_config()?;
+        let default_funding_hourly = cfg.get_f64("default_funding_rate_hourly", 0.0);
         let ingestion = MarketIngestionEngine::new(bt_db.clone());
         let usdc_assets = bt_db.get_usdc_perp_universe()?;
         let alt_pairs = bt_db.get_alt_pairs_universe()?;
@@ -280,7 +290,10 @@ impl BacktestEngine {
                 )));
             }
             let raw_json = fs::read_to_string(&backfill_file)?;
-            loaded_real = Self::parse_backfill_json(&raw_json)?;
+            loaded_real = Self::parse_backfill_json_with_default_funding(
+                &raw_json,
+                default_funding_hourly,
+            )?;
             if loaded_real.is_empty() || !loaded_real.contains_key("BTC/USDC:USDC") {
                 return Err(AegisError::Validation(format!(
                     "Real historical dataset {} yielded zero usable BTC/USDC:USDC bars (refusing synthetic fallback when use_real_history=true)",
@@ -307,11 +320,14 @@ impl BacktestEngine {
                 "Missing real historical candles for BTC/USDC:USDC".to_string(),
             ));
         } else {
+            let btc_ref_px = bt_db.resolve_reference_price(btc_sym)?.ok_or_else(|| {
+                AegisError::Validation("Missing BTC reference price in universe_assets".to_string())
+            })?;
             ingestion.generate_synthetic_bars(
                 btc_sym,
                 "4h",
                 total_needed,
-                bt_db.resolve_reference_price(btc_sym),
+                btc_ref_px,
                 None,
                 1,
                 None,
@@ -347,13 +363,14 @@ impl BacktestEngine {
                     asset.symbol
                 )));
             } else {
+                let resolved_ref = bt_db
+                    .resolve_reference_price(&asset.symbol)?
+                    .unwrap_or(asset.reference_price);
                 ingestion.generate_synthetic_bars(
                     &asset.symbol,
                     "4h",
                     total_needed,
-                    asset
-                        .reference_price
-                        .max(bt_db.resolve_reference_price(&asset.symbol)),
+                    asset.reference_price.max(resolved_ref),
                     Some(&btc_bars),
                     (idx + 2) as u64,
                     btc_bars.last().map(|b| b.timestamp_ms),
@@ -424,9 +441,7 @@ impl BacktestEngine {
         let risk = RiskEngine::new(bt_db.clone());
         let exec = ExecutionEngine::new(bt_db.clone());
 
-        let hmm_window = cfg
-            .get_usize("hmm_lookback_bars", 0)
-            .max(cfg.get_usize("hmm_lookback_candles", 540));
+        let hmm_window = SignalEngine::resolve_hmm_window(&cfg);
         let snr_fast = cfg.get_usize("snr_ema_fast_period", cfg.get_usize("snr_fast_span", 16));
         let snr_slow = cfg.get_usize("snr_ema_slow_period", cfg.get_usize("snr_slow_span", 64));
         let rs_fast = cfg.get_usize("rs_lookback_fast_bars", 24);
@@ -868,7 +883,7 @@ impl BacktestEngine {
                 active_trades.push(inserted);
             }
 
-            // 3. Basis Harvest & Snapshot accounting
+            // 3. Basis Harvest & Snapshot accounting (R3-H6, R3-N8)
             let deployed_notional: f64 = active_trades
                 .iter()
                 .map(|tr| tr.quantity * tr.current_price)
@@ -882,14 +897,25 @@ impl BacktestEngine {
                 - deployed_notional)
                 .max(0.0);
 
+            let mut basis_notional_t = 0.0;
             if basis_harvest_enabled {
-                let best_funding = evals_t
+                let basis_rates: Vec<f64> = evals_t
                     .iter()
+                    .filter(|e| e.signal_action == "BASIS_HARVEST")
                     .map(|e| e.funding_rate_hourly)
-                    .fold(0.0_f64, f64::max);
-                if best_funding >= basis_floor {
-                    let basis_notional = avail_cash * basis_alloc_pct;
-                    accrued_yield_usdc += basis_notional * best_funding * 4.0;
+                    .collect();
+                if (regime.regime == "CHOP" || regime.prob_chop >= chop_thresh)
+                    && !basis_rates.is_empty()
+                {
+                    let (notional, yield_delta) = aegis_core::compute_basis_harvest_accrual(
+                        avail_cash,
+                        basis_alloc_pct,
+                        basis_floor,
+                        &basis_rates,
+                        true,
+                    );
+                    basis_notional_t = notional;
+                    accrued_yield_usdc = round_dp(accrued_yield_usdc + yield_delta, 4);
                 }
             }
 
@@ -918,7 +944,7 @@ impl BacktestEngine {
                     gross_leverage: round_dp(deployed_notional / bar_equity.max(1.0), 4),
                     portfolio_heat_usdc: 0.0,
                     portfolio_heat_pct: 0.0,
-                    basis_harvest_notional_usdc: 0.0,
+                    basis_harvest_notional_usdc: round_dp(basis_notional_t, 2),
                     accrued_yield_usdc: round_dp(accrued_yield_usdc, 2),
                     hmm_regime: regime.regime,
                     prob_bull: regime.prob_bull,
@@ -934,20 +960,40 @@ impl BacktestEngine {
             }
         }
 
-        // Force-close remaining open trades at final mark price for complete trade attribution
+        // Force-close remaining open trades at final mark price with exit slippage and taker fee (R3-N7)
+        let base_slip_bps = cfg.get_f64("base_slippage_bps", 2.0).max(0.0);
         let remaining_open = bt_db.get_open_trades()?;
+        let mut final_exit_friction_usdc = 0.0;
         for tr in remaining_open {
-            let final_pnl = round_dp(
-                tr.unrealized_pnl_usdc - tr.fees_paid_usdc + tr.funding_accrued_usdc,
-                4,
-            );
+            let slip_mult = if tr.side == "LONG" {
+                1.0 - base_slip_bps / 10_000.0
+            } else {
+                1.0 + base_slip_bps / 10_000.0
+            };
+            let exit_px = round_dp(tr.current_price * slip_mult, 8);
+            let exit_slip_usdc = (tr.current_price - exit_px).abs() * tr.quantity;
+            let exit_fee_usdc = (tr.quantity * exit_px) * (taker_fee_bps / 10_000.0);
+            let total_fees = round_dp(tr.fees_paid_usdc + exit_fee_usdc, 4);
+            total_slippage_usdc += exit_slip_usdc;
+            final_exit_friction_usdc += exit_slip_usdc + exit_fee_usdc;
+            let gross_pnl = if tr.side == "LONG" {
+                (exit_px - tr.entry_price) * tr.quantity
+            } else {
+                (tr.entry_price - exit_px) * tr.quantity
+            };
+            let final_pnl = round_dp(gross_pnl - total_fees + tr.funding_accrued_usdc, 4);
             bt_db.close_trade(
                 tr.trade_id,
-                tr.current_price,
+                exit_px,
                 final_pnl,
-                tr.fees_paid_usdc,
+                total_fees,
                 "END_OF_BACKTEST_MARK",
             )?;
+        }
+        if final_exit_friction_usdc > 0.0 {
+            if let Some(last_eq) = equity_curve.last_mut() {
+                *last_eq = (*last_eq - final_exit_friction_usdc).max(100.0);
+            }
         }
 
         let all_trades = bt_db.get_recent_trades(10_000)?;
@@ -1032,26 +1078,15 @@ impl BacktestEngine {
             annualized_return_pct
         };
 
+        // R3-H7: Compute trade_profit_factor strictly from closed trade PnLs (without accrued_yield_usdc or .max(bar_pf))
         let trade_pf = if gross_loss > 1e-6 {
-            (gross_profit + accrued_yield_usdc) / gross_loss
+            gross_profit / gross_loss
         } else if gross_profit > 0.0 {
             9.99
         } else {
             1.0
         };
-        let bar_pos: f64 = bar_returns.iter().copied().filter(|&r| r > 0.0).sum();
-        let bar_neg: f64 = bar_returns
-            .iter()
-            .copied()
-            .filter(|&r| r < 0.0)
-            .map(f64::abs)
-            .sum();
-        let bar_pf = if bar_neg > 1e-9 {
-            bar_pos / bar_neg
-        } else {
-            trade_pf
-        };
-        let profit_factor = trade_pf.max(bar_pf);
+        let profit_factor = trade_pf;
         let win_rate_pct = if total_trades > 0 {
             (winning_trades as f64 / total_trades as f64) * 100.0
         } else {
@@ -1082,7 +1117,7 @@ impl BacktestEngine {
 
         let gate_sharpe_pass = annualized_sharpe >= min_sharpe;
         let gate_mdd_pass = max_drawdown_pct <= max_mdd;
-        let gate_profit_factor_pass = profit_factor >= min_pf;
+        let gate_profit_factor_pass = trade_pf >= min_pf;
         let all_gates_passed = gate_sharpe_pass && gate_mdd_pass && gate_profit_factor_pass;
 
         Ok((

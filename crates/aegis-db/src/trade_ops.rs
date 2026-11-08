@@ -11,7 +11,7 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Scrub any sensitive keys or inline credential literals from a JSON value before logging.
+/// Scrub any sensitive keys or inline credential literals from a JSON value before logging (`R3-B2`, `R3-B5`).
 fn sanitize_telemetry_value(val: &mut Value) {
     match val {
         Value::Object(map) => {
@@ -28,48 +28,183 @@ fn sanitize_telemetry_value(val: &mut Value) {
                 sanitize_telemetry_value(item);
             }
         }
+        Value::String(s) => {
+            *s = sanitize_telemetry_message(s);
+        }
         _ => {}
     }
 }
 
-/// Scrub inline secret patterns (`private_key=...`, `telegram_bot_token=...`, etc.) from log strings.
-pub fn sanitize_telemetry_message(message: &str) -> String {
-    let lower = message.to_ascii_lowercase();
-    let has_sensitive = [
-        "private_key",
-        "gemini_api_key",
-        "telegram_bot_token",
-        "discord_webhook_url",
-        "web_api_token",
-        "master_key",
-    ]
-    .iter()
-    .any(|k| lower.contains(k));
-    if !has_sensitive {
-        return message.to_string();
+fn is_url_token_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '/' | '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
+}
+
+fn is_webhook_path_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
+}
+
+fn redact_embedded_url_secrets(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // 1. Redact Telegram bot URLs: `api.telegram.org/bot<token>` or `/bot<id>:<secret>`
+    let mut search_from = 0;
+    while search_from < out.len() {
+        let lower = out[search_from..].to_ascii_lowercase();
+        let Some(rel_idx) = lower.find("/bot") else {
+            break;
+        };
+        let token_start = search_from + rel_idx + 4;
+        if token_start >= out.len() {
+            break;
+        }
+        let rest = &out[token_start..];
+        let token_len = rest
+            .find(is_url_token_delimiter)
+            .unwrap_or(rest.len());
+        let token_candidate = &rest[..token_len];
+        let looks_like_bot_token = token_candidate != "[REDACTED]"
+            && !token_candidate.is_empty()
+            && (token_candidate.contains(':')
+                || out[..search_from + rel_idx]
+                    .to_ascii_lowercase()
+                    .ends_with("api.telegram.org"));
+        if looks_like_bot_token {
+            out.replace_range(token_start..token_start + token_len, "[REDACTED]");
+            search_from = token_start + "[REDACTED]".len();
+        } else {
+            search_from = token_start;
+        }
     }
 
-    // Redact `key=value` or `key: value` segments for sensitive keys
-    let mut sanitized = message.to_string();
-    for key in [
+    // 2. Redact Discord webhook URLs: `/api/webhooks/<id>/<token>`
+    let mut wh_from = 0;
+    while wh_from < out.len() {
+        let lower = out[wh_from..].to_ascii_lowercase();
+        let Some(rel_idx) = lower.find("/api/webhooks/") else {
+            break;
+        };
+        let path_start = wh_from + rel_idx + "/api/webhooks/".len();
+        if path_start >= out.len() {
+            break;
+        }
+        let rest = &out[path_start..];
+        let path_len = rest
+            .find(is_webhook_path_delimiter)
+            .unwrap_or(rest.len());
+        let candidate = &rest[..path_len];
+        if candidate != "[REDACTED]" && !candidate.is_empty() {
+            out.replace_range(path_start..path_start + path_len, "[REDACTED]");
+            wh_from = path_start + "[REDACTED]".len();
+        } else {
+            wh_from = path_start;
+        }
+    }
+
+    out
+}
+
+/// Scrub inline secret patterns (`private_key=...`, `private_key: ...`, `telegram_bot_token = ...`,
+/// embedded Telegram/Discord webhook URLs, etc.) from log strings (`R3-B2`, `R3-B5`).
+pub fn sanitize_telemetry_message(message: &str) -> String {
+    let mut sanitized = redact_embedded_url_secrets(message);
+    let lower = sanitized.to_ascii_lowercase();
+
+    const SENSITIVE_KEYS: &[&str] = &[
+        "hyperliquid_private_key",
         "private_key",
         "gemini_api_key",
         "telegram_bot_token",
+        "bot_token",
         "discord_webhook_url",
+        "webhook_url",
         "web_api_token",
+        "web_auth_token",
+        "auth_token",
         "aegis_master_key",
         "master_key",
-    ] {
-        let eq_pat = format!("{key}=");
-        if let Some(idx) = sanitized.to_ascii_lowercase().find(&eq_pat) {
-            let val_start = idx + eq_pat.len();
+    ];
+
+    let has_sensitive = SENSITIVE_KEYS.iter().any(|k| lower.contains(k));
+    if !has_sensitive {
+        return sanitized;
+    }
+
+    let mut keys_to_redact: Vec<&str> = SENSITIVE_KEYS.to_vec();
+    keys_to_redact.push("value");
+    keys_to_redact.push("val");
+
+    for key in keys_to_redact {
+        let mut search_from = 0;
+        while search_from < sanitized.len() {
+            let lower_slice = sanitized[search_from..].to_ascii_lowercase();
+            let Some(rel_idx) = lower_slice.find(key) else {
+                break;
+            };
+            let abs_idx = search_from + rel_idx;
+            // Ensure word boundary before short keys like `val` or `value`
+            if (key == "val" || key == "value") && abs_idx > 0 {
+                let prev = sanitized[..abs_idx].chars().next_back().unwrap_or(' ');
+                if prev.is_ascii_alphanumeric() || prev == '_' {
+                    search_from = abs_idx + key.len();
+                    continue;
+                }
+            }
+            let after_key = abs_idx + key.len();
+            if after_key >= sanitized.len() {
+                break;
+            }
+            let tail = &sanitized[after_key..];
+            let mut chars = tail.char_indices().peekable();
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' || c == '\t' || c == '"' || c == '\'' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let Some((_, sep)) = chars.next() else {
+                search_from = after_key;
+                continue;
+            };
+            if sep != '=' && sep != ':' {
+                search_from = after_key;
+                continue;
+            }
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' || c == '\t' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let val_rel_start = chars.peek().map(|&(i, _)| i).unwrap_or(tail.len());
+            let val_start = after_key + val_rel_start;
+            if val_start >= sanitized.len() {
+                break;
+            }
             let rest = &sanitized[val_start..];
-            let val_end = rest
-                .find(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')')
-                .unwrap_or(rest.len());
-            let current_val = &rest[..val_end];
+            let (replace_start, replace_end) =
+                if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    let inner = &rest[quote.len_utf8()..];
+                    let end_rel = inner.find(quote).unwrap_or(inner.len());
+                    (
+                        val_start + quote.len_utf8(),
+                        val_start + quote.len_utf8() + end_rel,
+                    )
+                } else {
+                    let end_rel = rest
+                        .find(|c: char| {
+                            c.is_whitespace() || matches!(c, ',' | ';' | ')' | '}' | ']' | '"' | '\'')
+                        })
+                        .unwrap_or(rest.len());
+                    (val_start, val_start + end_rel)
+                };
+            let current_val = &sanitized[replace_start..replace_end];
             if current_val != "[REDACTED]" && !current_val.is_empty() {
-                sanitized.replace_range(val_start..val_start + val_end, "[REDACTED]");
+                sanitized.replace_range(replace_start..replace_end, "[REDACTED]");
+                search_from = replace_start + "[REDACTED]".len();
+            } else {
+                search_from = replace_end.max(after_key);
             }
         }
     }
@@ -112,7 +247,7 @@ impl DatabaseManager {
                             .get::<_, Option<f64>>("reference_price")
                             .ok()
                             .flatten()
-                            .unwrap_or(10.0),
+                            .unwrap_or(0.0),
                     })
                 })
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -121,62 +256,47 @@ impl DatabaseManager {
     }
 
     /// Resolve the reference price for `symbol` from `universe_assets`, `pond_universe`,
-    /// latest `market_ohlcv` close, or `system_config` (`HP`).
-    pub fn resolve_reference_price(&self, symbol: &str) -> f64 {
+    /// latest `market_ohlcv` close, or `system_config` (`HP`, `R3-H15`).
+    /// Propagates database errors via `Result` and returns `Ok(None)` when no positive
+    /// reference price is configured or present in the database (never fabricates a hardcoded price).
+    pub fn resolve_reference_price(&self, symbol: &str) -> Result<Option<f64>> {
         let sym = symbol.trim();
-        let db_val: Option<f64> = self
-            .with_conn(|conn| {
-                let ua_px: Option<f64> = conn
-                    .query_row(
-                        "SELECT reference_price FROM universe_assets WHERE symbol = ?1 LIMIT 1;",
-                        params![sym],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                if let Some(px) = ua_px.filter(|&p| p > 0.0) {
-                    return Ok(Some(px));
-                }
-                let pond_px: Option<f64> = conn
-                    .query_row(
-                        "SELECT reference_price FROM pond_universe WHERE symbol = ?1 LIMIT 1;",
-                        params![sym],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                if let Some(px) = pond_px.filter(|&p| p > 0.0) {
-                    return Ok(Some(px));
-                }
-                let ohlcv_px: Option<f64> = conn
-                    .query_row(
-                        "SELECT close FROM market_ohlcv WHERE symbol = ?1 ORDER BY timestamp_ms DESC LIMIT 1;",
-                        params![sym],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                if let Some(px) = ohlcv_px.filter(|&p| p > 0.0) {
-                    return Ok(Some(px));
-                }
-                let fallback_px: Option<f64> = conn
-                    .query_row(
-                        "SELECT CAST(config_value AS REAL) FROM system_config WHERE config_key = 'default_fallback_reference_price_usdc' LIMIT 1;",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                Ok(fallback_px.filter(|&p| p > 0.0))
-            })
-            .ok()
-            .flatten();
-
-        db_val.unwrap_or(100.0)
+        if sym.is_empty() {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let ua_px: Option<f64> = conn
+                .query_row(
+                    "SELECT reference_price FROM universe_assets WHERE symbol = ?1 LIMIT 1;",
+                    params![sym],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            if let Some(px) = ua_px.filter(|&p| p.is_finite() && p > 0.0) {
+                return Ok(Some(px));
+            }
+            let pond_px: Option<f64> = conn
+                .query_row(
+                    "SELECT reference_price FROM pond_universe WHERE symbol = ?1 LIMIT 1;",
+                    params![sym],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            if let Some(px) = pond_px.filter(|&p| p.is_finite() && p > 0.0) {
+                return Ok(Some(px));
+            }
+            let ohlcv_px: Option<f64> = conn
+                .query_row(
+                    "SELECT close FROM market_ohlcv WHERE symbol = ?1 ORDER BY timestamp_ms DESC LIMIT 1;",
+                    params![sym],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(ohlcv_px.filter(|&p| p.is_finite() && p > 0.0))
+        })
     }
 
     pub fn get_alt_pairs_universe(&self) -> Result<Vec<AltPairMetadata>> {
@@ -567,7 +687,7 @@ impl DatabaseManager {
         })
     }
 
-    /// Promote a resting `OPEN_ON_BOOK` order to an active `OPEN` / `FILLED` position once filled on exchange (`NH-4`).
+    /// Promote a resting `OPEN_ON_BOOK` order to an active `OPEN` / `FILLED` position once filled on exchange (`NH-4`, `R3-H2`).
     pub fn promote_resting_trade_to_open(
         &self,
         trade_id: i64,
@@ -575,35 +695,38 @@ impl DatabaseManager {
         avg_fill_price: f64,
         fees_paid_usdc: f64,
         slippage_paid_usd: f64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let notional = round_dp(filled_units * avg_fill_price, 4);
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE trades
-                 SET status = 'OPEN',
-                     fsm_state = 'FILLED',
-                     quantity = ?1,
-                     filled_units = ?1,
-                     entry_price = ?2,
-                     current_price = ?2,
-                     avg_fill_price = ?2,
-                     notional_usdc = ?3,
-                     highest_price_seen = MAX(highest_price_seen, ?2),
-                     lowest_price_seen = CASE WHEN lowest_price_seen > 0.0 THEN MIN(lowest_price_seen, ?2) ELSE ?2 END,
-                     fees_paid_usdc = ?4,
-                     slippage_paid_usd = ?5
-                 WHERE trade_id = ?6;",
-                params![
-                    filled_units,
-                    avg_fill_price,
-                    notional,
-                    fees_paid_usdc,
-                    slippage_paid_usd,
-                    trade_id
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
+            let rows = conn
+                .execute(
+                    "UPDATE trades
+                     SET status = 'OPEN',
+                         fsm_state = 'FILLED',
+                         quantity = ?1,
+                         filled_units = ?1,
+                         entry_price = ?2,
+                         current_price = ?2,
+                         avg_fill_price = ?2,
+                         notional_usdc = ?3,
+                         highest_price_seen = MAX(highest_price_seen, ?2),
+                         lowest_price_seen = CASE WHEN lowest_price_seen > 0.0 THEN MIN(lowest_price_seen, ?2) ELSE ?2 END,
+                         fees_paid_usdc = ?4,
+                         slippage_paid_usd = ?5
+                     WHERE trade_id = ?6
+                       AND status IN ('PENDING', 'OPEN')
+                       AND COALESCE(fsm_state, '') IN ('OPEN_ON_BOOK', 'PENDING');",
+                    params![
+                        filled_units,
+                        avg_fill_price,
+                        notional,
+                        fees_paid_usdc,
+                        slippage_paid_usd,
+                        trade_id
+                    ],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(rows > 0)
         })
     }
 
@@ -961,30 +1084,43 @@ impl DatabaseManager {
         })
     }
 
+    pub(crate) fn query_equity_baseline_reset_at(
+        conn: &rusqlite::Connection,
+    ) -> Result<Option<String>> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT config_value FROM system_config WHERE config_key = 'equity_baseline_reset_at';",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+        Ok(raw
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    pub fn get_equity_baseline_reset_at(&self) -> Result<Option<String>> {
+        self.with_conn(Self::query_equity_baseline_reset_at)
+    }
+
     pub fn get_total_realized_pnl(&self) -> Result<f64> {
         self.with_conn(|conn| {
-            let reset_at: String = conn
-                .query_row(
-                    "SELECT config_value FROM system_config WHERE config_key = 'equity_baseline_reset_at';",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or_default();
-            let reset_trimmed = reset_at.trim().trim_matches('"');
-            let pnl: f64 = if !reset_trimmed.is_empty() {
+            let reset_at = Self::query_equity_baseline_reset_at(conn)?;
+            let pnl: f64 = if let Some(ref reset_trimmed) = reset_at {
                 conn.query_row(
                     "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM trades WHERE status = 'CLOSED' AND (closed_at IS NULL OR datetime(closed_at) > datetime(?1));",
                     params![reset_trimmed],
                     |r| r.get(0),
                 )
-                .unwrap_or(0.0)
+                .map_err(|e| AegisError::Database(e.to_string()))?
             } else {
                 conn.query_row(
                     "SELECT COALESCE(SUM(realized_pnl_usdc), 0.0) FROM trades WHERE status = 'CLOSED';",
                     [],
                     |r| r.get(0),
                 )
-                .unwrap_or(0.0)
+                .map_err(|e| AegisError::Database(e.to_string()))?
             };
             Ok(pnl)
         })
@@ -1126,7 +1262,7 @@ impl DatabaseManager {
         })
     }
 
-    /// Scrub any historical telemetry log rows that may contain plaintext sensitive config values (`B3`).
+    /// Scrub any historical telemetry log rows that may contain plaintext sensitive config values (`B3`, `R3-B5`).
     pub fn redact_sensitive_telemetry_logs(&self) -> Result<usize> {
         self.with_conn(|conn| {
             let updated = conn
@@ -1134,16 +1270,28 @@ impl DatabaseManager {
                     "UPDATE telemetry_logs
                      SET message = 'Updated system_config [REDACTED SENSITIVE KEYS]',
                          details_json = '{\"redacted\":true}'
-                     WHERE message LIKE '%private_key=%'
-                        OR message LIKE '%gemini_api_key=%'
-                        OR message LIKE '%telegram_bot_token=%'
-                        OR message LIKE '%discord_webhook_url=%'
-                        OR message LIKE '%web_api_token=%'
-                        OR details_json LIKE '%\"private_key\"%'
-                        OR details_json LIKE '%\"gemini_api_key\"%'
-                        OR details_json LIKE '%\"telegram_bot_token\"%'
-                        OR details_json LIKE '%\"discord_webhook_url\"%'
-                        OR details_json LIKE '%\"web_api_token\"%';",
+                     WHERE (LOWER(message) LIKE '%private_key%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%private_key%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%gemini_api_key%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%gemini_api_key%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%bot_token%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%bot_token%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%webhook_url%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%webhook_url%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%web_api_token%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%web_api_token%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%auth_token%=%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%auth_token%:%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%api.telegram.org/bot%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(message) LIKE '%/api/webhooks/%' AND message NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"private_key\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"hyperliquid_private_key\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"gemini_api_key\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"telegram_bot_token\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"discord_webhook_url\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%\"web_api_token\"%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%api.telegram.org/bot%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%')
+                        OR (LOWER(COALESCE(details_json, '')) LIKE '%/api/webhooks/%' AND COALESCE(details_json, '') NOT LIKE '%[REDACTED]%');",
                     [],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;

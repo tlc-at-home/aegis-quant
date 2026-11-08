@@ -355,6 +355,15 @@ impl SignalEngine {
         self.mace_cache.lock().clear();
     }
 
+    /// Resolves the configured HMM lookback window from `system_config` (`R3-H8`).
+    pub fn resolve_hmm_window(cfg: &ConfigMap) -> usize {
+        cfg.get_usize(
+            "hmm_lookback_bars",
+            cfg.get_usize("hmm_lookback_candles", 540),
+        )
+        .max(20)
+    }
+
     /// Computes causal Exponential Moving Average (`alpha = 2 / (span + 1)`).
     pub fn causal_ema(series: &[f64], span: f64) -> Vec<f64> {
         if series.is_empty() {
@@ -401,6 +410,18 @@ impl SignalEngine {
             return (vec![0.0; n], vec![0.0; n]);
         }
 
+        let m = n_s.min(n_u);
+        // R3-H9: Guard against severely misaligned synth vs USDC bar series (> 8 hours apart)
+        let has_timestamps = synth_bars.first().map(|b| b.timestamp_ms).unwrap_or(0) > 0
+            && usdc_bars.first().map(|b| b.timestamp_ms).unwrap_or(0) > 0;
+        if has_timestamps {
+            if let (Some(s_last), Some(u_last)) = (synth_bars.last(), usdc_bars.last()) {
+                if (s_last.timestamp_ms - u_last.timestamp_ms).abs() > 28_800_000 {
+                    return (vec![0.0; m], vec![0.0; m]);
+                }
+            }
+        }
+
         let mad_mult = scfg.snr_mad_multiplier.max(1e-4);
         let tanh_scale = scfg.snr_tanh_scale.max(1e-4);
         let calc_series = |bars: &[OhlcvBar]| -> Vec<f64> {
@@ -408,6 +429,13 @@ impl SignalEngine {
             let ema_fast = Self::causal_ema(&closes, fast_span as f64);
             let ema_slow = Self::causal_ema(&closes, slow_span as f64);
             let mut abs_diff = vec![0.0; closes.len()];
+            // R3-N12: Seed bar 0 volatility from first close-to-close diff (or bar 0 range) so MAD EMA is never 0.0 during warmup
+            abs_diff[0] = if closes.len() > 1 {
+                (closes[1] - closes[0]).abs()
+            } else {
+                (bars[0].high - bars[0].low).abs()
+            }
+            .max(closes[0] * 1e-4);
             for i in 1..closes.len() {
                 abs_diff[i] = (closes[i] - closes[i - 1]).abs();
             }
@@ -422,17 +450,31 @@ impl SignalEngine {
 
         let snr_s = calc_series(synth_bars);
         let snr_u = calc_series(usdc_bars);
-        let m = snr_s.len().min(snr_u.len());
         let s_tail = &snr_s[snr_s.len() - m..];
         let u_tail = &snr_u[snr_u.len() - m..];
+        let u_bars_tail = &usdc_bars[usdc_bars.len() - m..];
 
         let mut composite = Vec::with_capacity(m);
         let mut synth_only = Vec::with_capacity(m);
+        let mut s_cursor = 0usize;
         for i in 0..m {
-            let c =
-                (scfg.snr_synth_weight * s_tail[i] + scfg.snr_usdc_weight * u_tail[i]).clamp(-1.0, 1.0);
+            let s_val = if has_timestamps {
+                let target_ts = u_bars_tail[i].timestamp_ms;
+                while s_cursor + 1 < n_s && synth_bars[s_cursor + 1].timestamp_ms <= target_ts {
+                    s_cursor += 1;
+                }
+                if (synth_bars[s_cursor].timestamp_ms - target_ts).abs() <= 28_800_000 {
+                    snr_s[s_cursor]
+                } else {
+                    s_tail[i]
+                }
+            } else {
+                s_tail[i]
+            };
+            let c = (scfg.snr_synth_weight * s_val + scfg.snr_usdc_weight * u_tail[i])
+                .clamp(-1.0, 1.0);
             composite.push(round_dp(c, 4));
-            synth_only.push(round_dp(s_tail[i].clamp(-1.0, 1.0), 4));
+            synth_only.push(round_dp(s_val.clamp(-1.0, 1.0), 4));
         }
         (composite, synth_only)
     }
@@ -613,11 +655,8 @@ impl SignalEngine {
         let is_live_mode = mode == "LIVE" || mode == "TESTNET";
         let is_wall_clock = self.db.get_pit_timestamp_ms().is_none();
         let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(60_000);
-        // Read `hmm_lookback_bars` (seeded at 540), falling back to legacy `hmm_lookback_candles` (`C4`)
-        let hmm_window = cfg.get_usize(
-            "hmm_lookback_bars",
-            cfg.get_usize("hmm_lookback_candles", 540),
-        );
+        // R3-H8: Unified HMM lookback window resolution
+        let hmm_window = Self::resolve_hmm_window(&cfg);
         let snr_fast = cfg.get_usize(
             "snr_ema_fast_period",
             cfg.get_usize("snr_fast_span", 16),
@@ -716,9 +755,9 @@ impl SignalEngine {
                 (Some(u), Some(s)) => (u.timestamp_ms - s.timestamp_ms).abs() > max_staleness_ms,
                 _ => true,
             };
-            let is_stale_live = is_live_mode
-                && is_wall_clock
-                && (btc_stale_live || usdc_stale || synth_stale || bars_misaligned);
+            // R3-H9: Misaligned synth/USDC bars are invalid in ALL execution modes (PAPER, TESTNET, LIVE).
+            let is_stale_live =
+                bars_misaligned || (is_live_mode && is_wall_clock && (btc_stale_live || usdc_stale || synth_stale));
             let is_unsupported_live = is_stale_live
                 || (is_live_mode
                     && usdc_bars
@@ -940,6 +979,19 @@ impl WalkForwardCalibrator {
         synth_symbol: &str,
         timeframe: &str,
     ) -> (f64, f64, usize) {
+        let cfg = self.db.load_config_opts(false).unwrap_or_default();
+        let scfg = SignalConfig::from_config_map(&cfg);
+        let snr_fast = cfg.get_usize(
+            "snr_ema_fast_period",
+            cfg.get_usize("snr_fast_span", 16),
+        );
+        let snr_slow = cfg.get_usize(
+            "snr_ema_slow_period",
+            cfg.get_usize("snr_slow_span", 64),
+        );
+        let bull_snr_thresh = scfg.action_bull_min_snr;
+        let bear_snr_thresh = scfg.action_bear_max_snr;
+
         let usdc_bars = self
             .db
             .get_ohlcv_bars(exec_symbol, timeframe, 300, None)
@@ -953,23 +1005,31 @@ impl WalkForwardCalibrator {
             return (0.0, 0.0, n);
         }
 
+        let u_tail = &usdc_bars[usdc_bars.len() - n..];
+        let s_tail = &synth_bars[synth_bars.len() - n..];
+        let (snr_series, _) = SignalEngine::compute_continuous_snr_series_with_config(
+            s_tail,
+            u_tail,
+            snr_fast,
+            snr_slow,
+            &scfg,
+        );
+
         let split = (n as f64 * 0.65) as usize;
         let mut positions = Vec::new();
         let mut realized_rets = Vec::new();
 
         for t in split..(n - 1) {
-            let sub_u = &usdc_bars[..=t];
-            let sub_s = &synth_bars[..=t];
-            let (snr, _) = SignalEngine::compute_continuous_snr(sub_s, sub_u, 16, 64);
-            let pos = if snr > 0.25 {
+            let snr = snr_series.get(t).copied().unwrap_or(0.0);
+            let pos = if snr > bull_snr_thresh {
                 1.0
-            } else if snr < -0.25 {
+            } else if snr < bear_snr_thresh {
                 -1.0
             } else {
                 0.0
             };
             let fwd_ret =
-                (usdc_bars[t + 1].close.max(1e-12) / usdc_bars[t].close.max(1e-12)).ln();
+                (u_tail[t + 1].close.max(1e-12) / u_tail[t].close.max(1e-12)).ln();
             positions.push(snr);
             realized_rets.push(pos * fwd_ret);
         }
@@ -1265,4 +1325,42 @@ mod tests {
             "Stale live candles must force FLAT signal actions"
         );
     }
+
+    #[test]
+    fn test_r3_h8_h9_n9_n10_snr_misalignment_and_hmm_alt_pc1_cache_invalidation() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let cfg = db.load_config().unwrap();
+        assert_eq!(SignalEngine::resolve_hmm_window(&cfg), 540);
+
+        // R3-H9: Misaligned synth vs USDC bars (> 8 hours apart) return 0.0 SNR
+        let synth_bars = make_synthetic_bars("SOL/BTC:SYNTH", 60, 0.003, 0.002);
+        let mut usdc_misaligned = make_synthetic_bars("SOL/USDC:USDC", 60, 180.0, 0.002);
+        for b in &mut usdc_misaligned {
+            b.timestamp_ms += 86_400_000 * 5; // 5 days apart
+        }
+        let (comp, synth_snr) =
+            SignalEngine::compute_continuous_snr(&synth_bars, &usdc_misaligned, 16, 64);
+        assert_eq!(comp, 0.0);
+        assert_eq!(synth_snr, 0.0);
+
+        // R3-N9: HMM cache invalidates when alt_pc1_series changes
+        let engine = SignalEngine::new(db);
+        let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 80, 60_000.0, 0.001);
+        let s_none = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, None);
+        let custom_pc1: Vec<f64> = (0..80).map(|i| if i % 2 == 0 { 2.5 } else { -2.5 }).collect();
+        let s_custom =
+            engine.decode_hmm_regime_states_shared(&btc_bars, 60, Some(&custom_pc1), None);
+        assert!(!Arc::ptr_eq(&s_none, &s_custom));
+
+        // R3-N10: Tied Spearman rank correlation symmetry
+        let tied_p = vec![1.0, 1.0, 1.0, 2.0, 3.0, 4.0];
+        let tied_r = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let mut tied_r_perm = tied_r.clone();
+        tied_r_perm.swap(0, 2); // permuting reals within the tied-p group must leave Spearman IC invariant!
+        let ic1 = SignalEngine::safe_spearman_ic(&tied_p, &tied_r);
+        let ic2 = SignalEngine::safe_spearman_ic(&tied_p, &tied_r_perm);
+        assert!((ic1 - ic2).abs() < 1e-9);
+    }
 }
+
