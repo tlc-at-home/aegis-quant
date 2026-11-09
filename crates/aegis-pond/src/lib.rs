@@ -875,7 +875,10 @@ impl PondOrchestrator {
                 };
                 new_cell.entry_price = Some(cand.reference_price);
                 new_cell.resting_order_id = Some(resting_oid.to_string());
-                self.scoped_db.upsert_pond_cell(&new_cell)?;
+                if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
+                    let _ = self.execution.cancel_resting_order(&cand.symbol, resting_oid);
+                    return Err(e);
+                }
                 open_heat = round_dp(open_heat + cand.risk_budget_usdc, 2);
                 deployed_notional = round_dp(deployed_notional + cand.notional_usdc, 2);
                 tracing::info!(

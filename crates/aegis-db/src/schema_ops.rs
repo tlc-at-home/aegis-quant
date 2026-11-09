@@ -74,6 +74,7 @@ impl DatabaseManager {
                     AegisError::Database(format!("Failed to drop stale book_transfers_v9: {e}"))
                 })?;
         }
+        Self::ensure_trades_pending_status_check(conn)?;
         Ok(())
     }
 
@@ -204,6 +205,7 @@ impl DatabaseManager {
         if !force {
             if let Ok(ver) = self.get_schema_version() {
                 if ver >= ALL_MIGRATION_FILES.len() as i64 {
+                    let _ = self.with_conn(Self::repair_interrupted_table_rebuilds);
                     self.reconcile_routing_config();
                     return self.verify_integrity();
                 }

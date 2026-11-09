@@ -343,8 +343,19 @@ impl ExecutionEngine {
             .filter_map(|ord| ord.get("coin").and_then(Value::as_str))
             .map(|s| s.to_uppercase())
             .collect();
+        let open_order_oids: HashSet<u64> = open_orders_slice
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|ord| {
+                ord.get("oid").and_then(Value::as_u64).or_else(|| {
+                    ord.get("oid")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+            })
+            .collect();
 
-        let local_trades = match self.db.get_open_trades() {
+        let mut local_trades = match self.db.get_open_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open trades");
@@ -358,7 +369,7 @@ impl ExecutionEngine {
                 };
             }
         };
-        let resting_trades = match self.db.get_resting_pit_trades() {
+        let mut resting_trades = match self.db.get_resting_pit_trades() {
             Ok(trades) => trades,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load resting trades");
@@ -372,6 +383,67 @@ impl ExecutionEngine {
                 };
             }
         };
+
+        // In live/testnet mode, if a resting PIT order is no longer on the exchange openOrders book,
+        // poll its fill status immediately during the 15s tick so filled orders promote to OPEN without
+        // waiting up to 15 minutes for the next PIT cycle.
+        if simulated_exchange_positions.is_none() && open_orders_slice.is_some() && !resting_trades.is_empty() {
+            let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
+            let mut resting_changed = false;
+            for rt in &resting_trades {
+                let oid_num = rt
+                    .exchange_order_id
+                    .as_deref()
+                    .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&id| id > 0);
+                if oid_num.map(|id| open_order_oids.contains(&id)).unwrap_or(false) {
+                    continue;
+                }
+                let r_status = self
+                    .check_resting_order_status(&rt.symbol, rt.exchange_order_id.as_deref());
+                if r_status.state == "FILLED" {
+                    let fill_px = if r_status.entry_price > 0.0 {
+                        r_status.entry_price
+                    } else {
+                        rt.entry_price
+                    };
+                    let fill_qty = if r_status.filled_units > 0.0 {
+                        r_status.filled_units
+                    } else {
+                        rt.quantity
+                    };
+                    let fee_usdc = if r_status.fee_usdc > 0.0 {
+                        round_dp(r_status.fee_usdc, 4)
+                    } else {
+                        round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
+                    };
+                    if self
+                        .db
+                        .promote_resting_trade_to_open(rt.trade_id, fill_qty, fill_px, fee_usdc, 0.0)
+                        .is_ok()
+                    {
+                        resting_changed = true;
+                    }
+                } else if r_status.state == "GONE"
+                    && self
+                        .db
+                        .cancel_resting_trade(rt.trade_id, "RESTING_ORDER_CANCELLED_OR_EXPIRED")
+                        .is_ok()
+                {
+                    resting_changed = true;
+                }
+            }
+            if resting_changed {
+                if let Ok(updated_open) = self.db.get_open_trades() {
+                    local_trades = updated_open;
+                }
+                if let Ok(updated_resting) = self.db.get_resting_pit_trades() {
+                    resting_trades = updated_resting;
+                }
+            }
+        }
+
         let local_pond_cells = match self.db.get_open_pond_cells() {
             Ok(cells) => cells,
             Err(e) => {
@@ -409,6 +481,7 @@ impl ExecutionEngine {
         }
 
         let mut seen_coins: HashSet<String> = HashSet::new();
+        let mut open_pos_coins: HashSet<String> = HashSet::new();
         let mut known_resting_oids: HashSet<u64> = HashSet::new();
         for rt in &resting_trades {
             seen_coins.insert(rt.base_asset.to_uppercase());
@@ -453,6 +526,7 @@ impl ExecutionEngine {
         for lt in &local_trades {
             let coin = lt.base_asset.to_uppercase();
             seen_coins.insert(coin.clone());
+            open_pos_coins.insert(coin.clone());
             let pond_co_qty = pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
 
             match ex_positions.get(&coin) {
@@ -549,6 +623,7 @@ impl ExecutionEngine {
                 .trim()
                 .to_uppercase();
             seen_coins.insert(coin.clone());
+            open_pos_coins.insert(coin.clone());
             let pit_co_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
 
             match ex_positions.get(&coin) {
@@ -679,9 +754,8 @@ impl ExecutionEngine {
                 let is_known_resting_oid = ord_oid
                     .map(|oid| known_resting_oids.contains(&oid))
                     .unwrap_or(false);
-                if !ex_positions.contains_key(&coin)
-                    && !seen_coins.contains(&coin)
-                    && !is_known_resting_oid
+                if !is_known_resting_oid
+                    && (!open_pos_coins.contains(&coin) || ex_positions.contains_key(&coin))
                 {
                     if simulated_open_orders.is_none() {
                         if let Some(oid) = ord_oid {
@@ -763,10 +837,47 @@ impl ExecutionEngine {
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
         // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`)
+        let is_testnet_cycle = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+        let wallet_cycle = cfg.get_str("wallet_address", "").trim().to_string();
         let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
         for r_trade in resting_trades {
-            let r_status = self
+            let mut r_status = self
                 .check_resting_order_status(&r_trade.symbol, r_trade.exchange_order_id.as_deref());
+            if r_status.state == "OPEN_ON_BOOK" && !freeze_entries && !is_backtest {
+                if let Some(oid_str) = r_trade.exchange_order_id.as_deref() {
+                    let cancel_confirmed = self
+                        .cancel_resting_order(&r_trade.symbol, oid_str)
+                        .unwrap_or(false);
+                    r_status = self.check_resting_order_status(&r_trade.symbol, Some(oid_str));
+                    if cancel_confirmed && r_status.state == "OPEN_ON_BOOK" {
+                        if let Some(target_oid) = oid_str
+                            .strip_prefix("hl-")
+                            .or(Some(oid_str))
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .filter(|&id| id > 0)
+                        {
+                            let (fills_reachable, fill_opt) = self
+                                .query_hyperliquid_fills_for_oid_with_reachability(
+                                    &wallet_cycle,
+                                    target_oid,
+                                    is_testnet_cycle,
+                                );
+                            if let Some((filled_sz, avg_px, total_fee)) = fill_opt {
+                                r_status = crate::RestingOrderStatus {
+                                    state: "FILLED".to_string(),
+                                    filled_units: filled_sz,
+                                    entry_price: avg_px,
+                                    fee_usdc: total_fee,
+                                };
+                            } else if fills_reachable {
+                                r_status.state = "GONE".to_string();
+                            } else {
+                                r_status.state = "UNKNOWN".to_string();
+                            }
+                        }
+                    }
+                }
+            }
             if r_status.state == "FILLED" {
                 let fill_px = if r_status.entry_price > 0.0 {
                     r_status.entry_price
@@ -1097,28 +1208,39 @@ impl ExecutionEngine {
         let two_book_active = !is_backtest
             && (cfg.get_bool("platform_pp50_enabled", false)
                 || cfg.get_bool("pond_enabled", false));
-        let split_pct = if two_book_active {
-            cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)
-        } else {
+        let risk_scope = cfg
+            .get_str("risk_caps_reference_scope", "BOOK")
+            .trim()
+            .to_ascii_uppercase();
+        let split_pct = if risk_scope == "PLATFORM" && !two_book_active {
             1.0
+        } else {
+            cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)
         };
-        let net_pit_transfers = if two_book_active {
+        let net_pit_transfers = if !is_backtest && (risk_scope != "PLATFORM" || two_book_active) {
             self.db.get_net_book_transfer_adjustment("PIT").unwrap_or(0.0)
         } else {
             0.0
         };
-        let raw_platform_eq = if !is_backtest
-            && (mode == "LIVE" || mode == "TESTNET")
-            && prev_snap.total_equity_usdc > 0.0
-        {
-            prev_snap.total_equity_usdc + unrealized_pnl
+        let current_equity = if !is_backtest && risk_scope != "PLATFORM" {
+            self.db
+                .compute_pit_equity_and_idle_usdc()
+                .map(|(eq, _)| eq)
+                .unwrap_or_else(|_| {
+                    (initial_equity * split_pct
+                        + net_pit_transfers
+                        + realized_pnl
+                        + unrealized_pnl
+                        + accrued_yield_usdc)
+                        .max(50.0)
+                })
         } else {
-            initial_equity + realized_pnl + unrealized_pnl + accrued_yield_usdc
-        };
-        let current_equity = if !is_backtest && (mode == "LIVE" || mode == "TESTNET") {
-            (raw_platform_eq * split_pct + net_pit_transfers).max(0.0)
-        } else {
-            (raw_platform_eq * split_pct + net_pit_transfers).max(50.0)
+            (initial_equity * split_pct
+                + net_pit_transfers
+                + realized_pnl
+                + unrealized_pnl
+                + accrued_yield_usdc)
+                .max(50.0)
         };
 
         let mut open_symbols: HashSet<String> =
@@ -1148,6 +1270,14 @@ impl ExecutionEngine {
                 .max(2);
             let max_longs = cfg.get_usize("max_concurrent_long_positions", 2).max(1);
             let max_shorts = cfg.get_usize("max_concurrent_short_positions", 2).max(1);
+            let mut pending_longs = resting_after
+                .iter()
+                .filter(|t| t.side.eq_ignore_ascii_case("LONG"))
+                .count();
+            let mut pending_shorts = resting_after
+                .iter()
+                .filter(|t| t.side.eq_ignore_ascii_case("SHORT"))
+                .count();
             for ev in evaluations {
                 if ev.signal_action != "LONG" && ev.signal_action != "SHORT" {
                     continue;
@@ -1156,12 +1286,14 @@ impl ExecutionEngine {
                     continue;
                 }
                 if ev.signal_action == "LONG"
-                    && active_trades.iter().filter(|t| t.side == "LONG").count() >= max_longs
+                    && active_trades.iter().filter(|t| t.side == "LONG").count() + pending_longs
+                        >= max_longs
                 {
                     continue;
                 }
                 if ev.signal_action == "SHORT"
-                    && active_trades.iter().filter(|t| t.side == "SHORT").count() >= max_shorts
+                    && active_trades.iter().filter(|t| t.side == "SHORT").count() + pending_shorts
+                        >= max_shorts
                 {
                     continue;
                 }
@@ -1293,13 +1425,30 @@ impl ExecutionEngine {
                     closed_at: None,
                     exit_reason: None,
                 };
-                let tid = self.db.insert_trade(&new_trade)?;
+                let ex_oid_for_rollback = new_trade.exchange_order_id.clone();
+                let tid = match self.db.insert_trade(&new_trade) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        if is_open_book {
+                            if let Some(ex_oid) = ex_oid_for_rollback.as_deref() {
+                                let _ = self.cancel_resting_order(&asset.symbol, ex_oid);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
                 let mut inserted = new_trade;
                 inserted.trade_id = tid;
                 open_symbols.insert(asset.symbol.clone());
                 total_wallet_deployed = round_dp(total_wallet_deployed + filled_notional, 2);
                 if is_filled {
                     active_trades.push(inserted);
+                } else if is_open_book {
+                    if inserted.side.eq_ignore_ascii_case("LONG") {
+                        pending_longs += 1;
+                    } else if inserted.side.eq_ignore_ascii_case("SHORT") {
+                        pending_shorts += 1;
+                    }
                 }
             }
         }
@@ -1338,13 +1487,49 @@ impl ExecutionEngine {
         let prob_chop = regime_ev.map(|e| e.prob_chop).unwrap_or(0.3334);
 
         let realized_after = self.db.get_total_realized_pnl()?;
+        let pond_total_pnl = if !is_backtest {
+            let pond_realized = self.db.get_pond_realized_pnl().unwrap_or(0.0);
+            let pond_upnl: f64 = self
+                .db
+                .get_open_pond_cells()
+                .unwrap_or_default()
+                .iter()
+                .map(|c| {
+                    let entry_px = c.entry_price.unwrap_or(0.0);
+                    let qty = c.quantity.unwrap_or(0.0);
+                    let mark_px = self
+                        .db
+                        .get_ohlcv_bars(&c.symbol, "1h", 1, None)
+                        .ok()
+                        .and_then(|bars| bars.last().map(|b| b.close))
+                        .filter(|&p| p > 0.0)
+                        .unwrap_or(entry_px);
+                    let price_pnl = if entry_px > 0.0 && qty > 0.0 {
+                        if c.side.eq_ignore_ascii_case("LONG") {
+                            (mark_px - entry_px) * qty
+                        } else {
+                            (entry_px - mark_px) * qty
+                        }
+                    } else {
+                        0.0
+                    };
+                    price_pnl + c.realized_pnl_usdc + c.funding_accrued_usdc - c.fees_paid_usdc
+                })
+                .sum();
+            pond_realized + pond_upnl
+        } else {
+            0.0
+        };
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
         let wallet = cfg.get_str("wallet_address", "").trim().to_string();
 
+        let accounting_eq = round_dp(
+            initial_equity + realized_after + total_upnl + pond_total_pnl + accrued_yield_usdc,
+            2,
+        );
         let mut basis_notional = 0.0;
-        let mut total_equity =
-            round_dp(initial_equity + realized_after + total_upnl + accrued_yield_usdc, 2);
+        let mut total_equity = accounting_eq;
 
         if !is_backtest && (mode == "LIVE" || mode == "TESTNET") && !wallet.is_empty() {
             let vault_state = self.fetch_hlp_vault_state(Some(&wallet), None, Some(is_testnet));
@@ -1367,19 +1552,27 @@ impl ExecutionEngine {
 
                 basis_notional = round_dp(vault_eq_now, 2);
                 accrued_yield_usdc = round_dp(vault_yield_now, 4);
+                let accounting_eq_now = round_dp(
+                    initial_equity
+                        + realized_after
+                        + total_upnl
+                        + pond_total_pnl
+                        + accrued_yield_usdc,
+                    2,
+                );
                 if let Some(peq) = perp_eq_now.filter(|&p| p > 0.0 || vault_eq_now > 0.0) {
-                    total_equity = round_dp(peq + vault_eq_now, 2);
-                } else if prev_snap.total_equity_usdc > 0.0 {
-                    total_equity = prev_snap.total_equity_usdc;
+                    let live_wallet_eq = round_dp(peq + vault_eq_now, 2);
+                    total_equity = if live_wallet_eq > 0.0 && live_wallet_eq < accounting_eq_now {
+                        live_wallet_eq
+                    } else {
+                        accounting_eq_now
+                    };
                 } else {
-                    total_equity = round_dp(
-                        initial_equity + realized_after + total_upnl + accrued_yield_usdc,
-                        2,
-                    );
+                    total_equity = accounting_eq_now;
                 }
             } else if prev_snap.total_equity_usdc > 0.0 {
                 basis_notional = prev_snap.basis_harvest_notional_usdc;
-                total_equity = prev_snap.total_equity_usdc;
+                total_equity = prev_snap.total_equity_usdc.min(accounting_eq);
             }
         } else {
             let available_cash = (initial_equity + realized_after + total_upnl + accrued_yield_usdc
@@ -1432,7 +1625,7 @@ impl ExecutionEngine {
             round_dp((total_equity - deployed_notional).max(0.0), 2)
         };
 
-        let pit_book_equity = if two_book_active {
+        let pit_book_equity = if !is_backtest && (risk_scope != "PLATFORM" || two_book_active) {
             (total_equity * split_pct + net_pit_transfers).max(1.0)
         } else {
             total_equity.max(1.0)

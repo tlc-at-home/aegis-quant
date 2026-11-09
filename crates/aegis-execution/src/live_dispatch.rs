@@ -456,6 +456,12 @@ impl ExecutionEngine {
                 } else {
                     0.0
                 };
+                let _ = self.db.log_order_state_transition(
+                    coid,
+                    "SUBMITTED",
+                    "FILLED",
+                    Some("HL_LIVE_FILLED_RECONCILED"),
+                );
                 return OrderExecutionResult::filled(
                     coid,
                     &ack_res.exchange_order_id,
@@ -478,12 +484,19 @@ impl ExecutionEngine {
             }
         }
 
+        let _ = self.db.log_order_state_transition(
+            coid,
+            "SUBMITTED",
+            &ack_res.fsm_state,
+            Some(&ack_res.fill_type),
+        );
+
         ack_res
     }
 
     /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`, `R3-H4`, `R3-H16`).
     /// Returns `(reachable, Option<(filled_sz, avg_px, total_fee)>)`.
-    fn query_hyperliquid_fills_for_oid_with_reachability(
+    pub(crate) fn query_hyperliquid_fills_for_oid_with_reachability(
         &self,
         wallet_address: &str,
         target_oid: u64,

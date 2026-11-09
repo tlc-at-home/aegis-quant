@@ -495,6 +495,7 @@ impl DatabaseManager {
         slippage_paid_usd: f64,
     ) -> Result<bool> {
         let notional = round_dp(filled_units * avg_fill_price, 4);
+        let ts = self.now_ms();
         self.with_conn(|conn| {
             let rows = conn
                 .execute(
@@ -507,6 +508,10 @@ impl DatabaseManager {
                          current_price = ?2,
                          avg_fill_price = ?2,
                          notional_usdc = ?3,
+                         risk_budget_usdc = CASE
+                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             ELSE risk_budget_usdc
+                         END,
                          highest_price_seen = MAX(highest_price_seen, ?2),
                          lowest_price_seen = CASE WHEN lowest_price_seen > 0.0 THEN MIN(lowest_price_seen, ?2) ELSE ?2 END,
                          fees_paid_usdc = ?4,
@@ -524,13 +529,31 @@ impl DatabaseManager {
                     ],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
+            if rows > 0 {
+                if let Ok(Some(cli_id)) = conn
+                    .query_row(
+                        "SELECT COALESCE(client_order_id, exchange_order_id, 'trade-' || trade_id)
+                         FROM trades WHERE trade_id = ?1;",
+                        params![trade_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                {
+                    let _ = conn.execute(
+                        "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
+                         VALUES (?1, 'OPEN_ON_BOOK', 'FILLED', ?2, 'RESTING_ORDER_FILLED');",
+                        params![cli_id, ts],
+                    );
+                }
+            }
             Ok(rows > 0)
         })
     }
 
     /// Cancel an unfilled resting `OPEN_ON_BOOK` trade row (`NH-4`, `R7-S3`).
     pub fn cancel_resting_trade(&self, trade_id: i64, reason: &str) -> Result<bool> {
-        let closed_iso = aegis_core::format_ms_iso8601_utc(self.now_ms());
+        let now_ms = self.now_ms();
+        let closed_iso = aegis_core::format_ms_iso8601_utc(now_ms);
         self.with_conn(|conn| {
             let rows = conn
                 .execute(
@@ -545,6 +568,23 @@ impl DatabaseManager {
                     params![closed_iso, reason, trade_id],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
+            if rows > 0 {
+                if let Ok(Some(cli_id)) = conn
+                    .query_row(
+                        "SELECT COALESCE(client_order_id, exchange_order_id, 'trade-' || trade_id)
+                         FROM trades WHERE trade_id = ?1;",
+                        params![trade_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                {
+                    let _ = conn.execute(
+                        "INSERT INTO order_state_audit (client_order_id, from_state, to_state, timestamp_utc, reason)
+                         VALUES (?1, 'OPEN_ON_BOOK', 'CANCELLED', ?2, ?3);",
+                        params![cli_id, now_ms, reason],
+                    );
+                }
+            }
             Ok(rows > 0)
         })
     }
@@ -600,6 +640,242 @@ impl DatabaseManager {
         })
     }
 
+    /// Repairs half-completed `trades_v11_rebuild` crash windows and upgrades legacy `trades` tables
+    /// whose `status` CHECK constraint lacks `'PENDING'` (`CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED'))`),
+    /// preserving all rows, columns, child foreign-key rows, indexes, and dependent views.
+    pub(crate) fn ensure_trades_pending_status_check(conn: &rusqlite::Connection) -> Result<()> {
+        let has_main: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or(false);
+        let has_rebuild: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades_v11_rebuild';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+        if has_rebuild && !has_main {
+            conn.execute_batch(
+                "ALTER TABLE trades_v11_rebuild RENAME TO trades;
+                 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status, opened_at DESC);
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_client_order_id_unique
+                     ON trades(client_order_id)
+                     WHERE client_order_id IS NOT NULL AND client_order_id != '';
+                 CREATE VIEW IF NOT EXISTS v_trades_pit AS SELECT * FROM trades;",
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("Failed to recover trades_v11_rebuild: {e}"))
+            })?;
+            return Ok(());
+        } else if has_rebuild && has_main {
+            conn.execute_batch("DROP TABLE IF EXISTS trades_v11_rebuild;")
+                .map_err(|e| {
+                    AegisError::Database(format!("Failed to drop stale trades_v11_rebuild: {e}"))
+                })?;
+        }
+
+        if !has_main {
+            return Ok(());
+        }
+
+        let trades_sql: String = conn
+            .query_row(
+                "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='table' AND name='trades';",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or_default();
+
+        let sql_upper = trades_sql.to_ascii_uppercase();
+        if !sql_upper.contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')") {
+            return Ok(());
+        }
+
+        let had_pit_view: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='view' AND name='v_trades_pit';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .unwrap_or(false);
+
+        let mut view_stmt = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'view' AND sql IS NOT NULL AND LOWER(sql) LIKE '%trades%';",
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+        let dependent_views: Vec<(String, String)> = view_stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .flatten()
+            .collect();
+        drop(view_stmt);
+
+        let target_cols = [
+            "trade_id",
+            "symbol",
+            "base_asset",
+            "side",
+            "status",
+            "entry_price",
+            "current_price",
+            "exit_price",
+            "quantity",
+            "notional_usdc",
+            "risk_budget_usdc",
+            "conviction_multiplier",
+            "initial_stop_price",
+            "chandelier_stop_price",
+            "highest_price_seen",
+            "lowest_price_seen",
+            "realized_pnl_usdc",
+            "unrealized_pnl_usdc",
+            "fees_paid_usdc",
+            "funding_accrued_usdc",
+            "exchange_order_id",
+            "opened_at",
+            "closed_at",
+            "exit_reason",
+            "client_order_id",
+            "fsm_state",
+            "avg_fill_price",
+            "filled_units",
+            "slippage_paid_usd",
+            "last_funding_hour_bucket",
+        ];
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(trades);")
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+        let existing_cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| AegisError::Database(e.to_string()))?
+            .flatten()
+            .filter(|c| target_cols.contains(&c.as_str()))
+            .collect();
+        drop(stmt);
+
+        let col_list = existing_cols.join(", ");
+        let fk_was_on = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(1)
+            != 0;
+        let began_tx = conn.is_autocommit();
+        if began_tx {
+            if fk_was_on {
+                let _ = conn.execute_batch("PRAGMA foreign_keys = OFF;");
+            }
+            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") {
+                if fk_was_on {
+                    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+                }
+                return Err(AegisError::Database(format!(
+                    "Failed to begin trades rebuild tx: {e}"
+                )));
+            }
+        }
+
+        let mut drop_views_sql = String::from("DROP VIEW IF EXISTS v_trades_pit;\n");
+        for (v_name, _) in &dependent_views {
+            let escaped = v_name.replace('"', "\"\"");
+            drop_views_sql.push_str(&format!("DROP VIEW IF EXISTS \"{escaped}\";\n"));
+        }
+
+        let mut script = format!(
+            "{drop_views_sql}
+             DROP TABLE IF EXISTS trades_v11_rebuild;
+             CREATE TABLE trades_v11_rebuild (
+                 trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 symbol TEXT NOT NULL,
+                 base_asset TEXT NOT NULL,
+                 side TEXT NOT NULL CHECK (side IN ('LONG', 'SHORT', 'BASIS_HARVEST')),
+                 status TEXT NOT NULL CHECK (status IN ('PENDING', 'OPEN', 'CLOSED', 'CANCELLED')) DEFAULT 'OPEN',
+                 entry_price REAL NOT NULL,
+                 current_price REAL NOT NULL,
+                 exit_price REAL,
+                 quantity REAL NOT NULL,
+                 notional_usdc REAL NOT NULL,
+                 risk_budget_usdc REAL NOT NULL,
+                 conviction_multiplier REAL NOT NULL DEFAULT 1.0,
+                 initial_stop_price REAL NOT NULL,
+                 chandelier_stop_price REAL NOT NULL,
+                 highest_price_seen REAL NOT NULL,
+                 lowest_price_seen REAL NOT NULL,
+                 realized_pnl_usdc REAL NOT NULL DEFAULT 0.0,
+                 unrealized_pnl_usdc REAL NOT NULL DEFAULT 0.0,
+                 fees_paid_usdc REAL NOT NULL DEFAULT 0.0,
+                 funding_accrued_usdc REAL NOT NULL DEFAULT 0.0,
+                 exchange_order_id TEXT,
+                 opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                 closed_at TEXT,
+                 exit_reason TEXT,
+                 client_order_id TEXT,
+                 fsm_state TEXT DEFAULT 'PENDING' CHECK(fsm_state IN ('PENDING', 'OPEN_ON_BOOK', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED')),
+                 avg_fill_price REAL,
+                 filled_units REAL DEFAULT 0.0,
+                 slippage_paid_usd REAL DEFAULT 0.0,
+                 last_funding_hour_bucket INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO trades_v11_rebuild ({col_list}) SELECT {col_list} FROM trades;
+             DROP TABLE trades;
+             ALTER TABLE trades_v11_rebuild RENAME TO trades;
+             CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status, opened_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_client_order_id_unique
+                 ON trades(client_order_id)
+                 WHERE client_order_id IS NOT NULL AND client_order_id != '';"
+        );
+        for (_, v_sql) in &dependent_views {
+            let trimmed = v_sql.trim().trim_end_matches(';');
+            if !trimmed.is_empty() {
+                script.push_str(&format!("\n{trimmed};"));
+            }
+        }
+        if had_pit_view {
+            script.push_str("\nCREATE VIEW IF NOT EXISTS v_trades_pit AS SELECT * FROM trades;");
+        }
+
+        match conn.execute_batch(&script) {
+            Ok(()) => {
+                if began_tx {
+                    let commit_res = conn.execute_batch("COMMIT;");
+                    if fk_was_on {
+                        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+                    }
+                    commit_res.map_err(|e| {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                        AegisError::Database(format!("Failed to commit trades rebuild tx: {e}"))
+                    })?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if began_tx {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    if fk_was_on {
+                        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+                    }
+                }
+                Err(AegisError::Database(format!(
+                    "Failed to rebuild legacy trades table for PENDING status: {e}"
+                )))
+            }
+        }
+    }
+
     pub fn insert_trade(&self, trade: &TradeRecord) -> Result<i64> {
         let _ = OrderFsmState::parse(&trade.fsm_state)?;
         let cli_id = if trade.client_order_id.trim().is_empty() {
@@ -612,7 +888,7 @@ impl DatabaseManager {
         } else {
             aegis_core::normalize_timestamp_iso8601_utc(&trade.opened_at)
         };
-        self.with_immediate_tx(|conn| {
+        let try_insert = |conn: &rusqlite::Connection| -> Result<i64> {
             if let Some(existing_id) = conn
                 .query_row(
                     "SELECT trade_id FROM trades WHERE client_order_id = ?1 LIMIT 1;",
@@ -673,9 +949,21 @@ impl DatabaseManager {
                 ],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
-            let row_id = conn.last_insert_rowid();
-            Ok(row_id)
-        })
+            Ok(conn.last_insert_rowid())
+        };
+
+        match self.with_immediate_tx(try_insert) {
+            Ok(row_id) => Ok(row_id),
+            Err(e)
+                if e.to_string()
+                    .to_ascii_uppercase()
+                    .contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')") =>
+            {
+                self.with_conn(Self::ensure_trades_pending_status_check)?;
+                self.with_immediate_tx(try_insert)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn log_order_state_transition(

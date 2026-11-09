@@ -698,11 +698,7 @@ impl DatabaseManager {
     pub fn get_open_pit_symbols(&self) -> Result<HashSet<String>> {
         self.with_conn(|conn| {
             let mut stmt = conn
-                .prepare(
-                    "SELECT DISTINCT symbol FROM trades
-                     WHERE status = 'OPEN'
-                       AND NOT (COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, quantity) <= 0.0);",
-                )
+                .prepare("SELECT DISTINCT symbol FROM trades WHERE status IN ('OPEN', 'PENDING');")
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             let iter = stmt
                 .query_map([], |r| r.get::<_, String>(0))
@@ -760,15 +756,16 @@ impl DatabaseManager {
                 .query_row(
                     "SELECT COALESCE(SUM(ABS(quantity) * current_price), 0.0)
                      FROM trades
-                     WHERE status = 'OPEN'
-                       AND NOT (COALESCE(fsm_state, '') = 'OPEN_ON_BOOK' AND COALESCE(filled_units, quantity) <= 0.0);",
+                     WHERE status IN ('OPEN', 'PENDING');",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap_or(0.0);
             let pond_dep: f64 = conn
                 .query_row(
-                    "SELECT COALESCE(SUM(COALESCE(notional_usdc, 0.0)), 0.0) FROM pond_cells WHERE state IN ('OPEN', 'TRAILED');",
+                    "SELECT COALESCE(SUM(COALESCE(notional_usdc, 0.0)), 0.0)
+                     FROM pond_cells
+                     WHERE state IN ('OPEN', 'TRAILED', 'ARMED');",
                     [],
                     |r| r.get(0),
                 )

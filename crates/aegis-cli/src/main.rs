@@ -464,6 +464,7 @@ impl AegisOrchestrator {
         let (frozen, _) = self.pit.is_entry_frozen()?;
         let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
         let evaluations = self.signals.evaluate_universe(true)?;
+        self.last_pit_cycle_ms = Some(self.db.now_ms());
         let snapshot =
             self.execution
                 .reconcile_cycle_with_options(&evaluations, false, frozen)?;
@@ -598,6 +599,7 @@ impl AegisOrchestrator {
             "pit" => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.maybe_run_maintenance(is_live_mode);
+                    self.last_pit_cycle_ms = Some(self.db.now_ms());
                     let r = self.pit.run_cycle(true, false).map(|_| ());
                     if r.is_ok() {
                         self.last_pit_cycle_ms = Some(self.db.now_ms());

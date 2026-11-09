@@ -1998,5 +1998,217 @@ mod tests {
         assert_eq!(closed_pit.exit_reason.as_deref(), Some("TEST_CLOSE"));
         assert!((closed_pit.realized_pnl_usdc - 100.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_legacy_trades_check_constraint_rebuild_allows_pending_status() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Simulate a legacy database whose `trades` table still has
+        // `CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED'))` (without 'PENDING'),
+        // AND has both a dependent view (`v_portfolio_summary`) AND child foreign-key tables
+        // (`funding_payments`, `order_events`) with `PRAGMA foreign_keys = ON`.
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP VIEW IF EXISTS v_portfolio_summary;
+                 ALTER TABLE trades RENAME TO trades_tmp_legacy;
+                 CREATE TABLE trades (
+                     trade_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                     client_order_id         TEXT    NOT NULL UNIQUE,
+                     symbol                  TEXT    NOT NULL,
+                     base_asset              TEXT    NOT NULL,
+                     side                    TEXT    NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+                     status                  TEXT    NOT NULL DEFAULT 'OPEN'
+                                                     CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED')),
+                     fsm_state               TEXT    NOT NULL DEFAULT 'FILLED'
+                                                     CHECK (fsm_state IN (
+                                                         'IDLE', 'VALIDATED', 'MAKER_QUOTING', 'OPEN_ON_BOOK',
+                                                         'PARTIAL_FILL', 'CHASES_EXHAUSTED', 'IOC_SWEEP',
+                                                         'FILLED', 'CANCELLED', 'REJECTED', 'HALTED'
+                                                     )),
+                     entry_price             REAL    NOT NULL CHECK (entry_price > 0.0),
+                     current_price           REAL    NOT NULL CHECK (current_price > 0.0),
+                     exit_price              REAL,
+                     quantity                REAL    NOT NULL CHECK (quantity > 0.0),
+                     filled_units            REAL    NOT NULL DEFAULT 0.0 CHECK (filled_units >= 0.0),
+                     avg_fill_price          REAL,
+                     notional_usdc           REAL    NOT NULL CHECK (notional_usdc > 0.0),
+                     risk_budget_usdc        REAL    NOT NULL DEFAULT 50.0,
+                     conviction_multiplier   REAL    NOT NULL DEFAULT 1.0,
+                     initial_stop_price      REAL    NOT NULL CHECK (initial_stop_price > 0.0),
+                     chandelier_stop_price   REAL    NOT NULL CHECK (chandelier_stop_price > 0.0),
+                     current_stop_price      REAL    NOT NULL DEFAULT 0.0,
+                     highest_price_seen      REAL    NOT NULL CHECK (highest_price_seen > 0.0),
+                     lowest_price_seen       REAL    NOT NULL CHECK (lowest_price_seen > 0.0),
+                     realized_pnl_usdc       REAL    NOT NULL DEFAULT 0.0,
+                     unrealized_pnl_usdc     REAL    NOT NULL DEFAULT 0.0,
+                     fees_paid_usdc          REAL    NOT NULL DEFAULT 0.0,
+                     funding_accrued_usdc    REAL    NOT NULL DEFAULT 0.0,
+                     slippage_paid_usd       REAL    NOT NULL DEFAULT 0.0,
+                     exchange_order_id       TEXT,
+                     opened_at               TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                     closed_at               TEXT,
+                     exit_reason             TEXT
+                 );
+                 DROP TABLE trades_tmp_legacy;
+                 CREATE VIEW IF NOT EXISTS v_portfolio_summary AS
+                 SELECT COUNT(*) AS open_count FROM trades WHERE status = 'OPEN';
+                 CREATE TABLE IF NOT EXISTS funding_payments (
+                     payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     trade_id INTEGER NOT NULL REFERENCES trades(trade_id),
+                     amount_usdc REAL NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS order_events (
+                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     trade_id INTEGER NOT NULL REFERENCES trades(trade_id),
+                     event_type TEXT NOT NULL
+                 );
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let existing_open = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "hl-open-1".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 90_000.0,
+            current_price: 90_000.0,
+            exit_price: None,
+            quantity: 0.01,
+            filled_units: 0.01,
+            avg_fill_price: Some(90_000.0),
+            notional_usdc: 900.0,
+            risk_budget_usdc: 10.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 87_000.0,
+            chandelier_stop_price: 87_000.0,
+            current_stop_price: 87_000.0,
+            highest_price_seen: 90_000.0,
+            lowest_price_seen: 90_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.1,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-111".to_string()),
+            opened_at: "2026-11-09T15:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let open_id = db.insert_trade(&existing_open).unwrap();
+
+        // Insert child FK rows referencing `open_id` with `PRAGMA foreign_keys = ON`.
+        db.with_conn(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO funding_payments (trade_id, amount_usdc) VALUES (?1, -0.25);",
+                rusqlite::params![open_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO order_events (trade_id, event_type) VALUES (?1, 'FILLED');",
+                rusqlite::params![open_id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Inserting a resting `PENDING` (`OPEN_ON_BOOK`) trade must self-heal the legacy CHECK constraint
+        // even with `PRAGMA foreign_keys = ON`, child FK rows, and dependent views.
+        let mut pending_trade = existing_open.clone();
+        pending_trade.client_order_id = "hl-pending-near".to_string();
+        pending_trade.symbol = "NEAR/USDC:USDC".to_string();
+        pending_trade.base_asset = "NEAR".to_string();
+        pending_trade.side = "SHORT".to_string();
+        pending_trade.status = "PENDING".to_string();
+        pending_trade.fsm_state = "OPEN_ON_BOOK".to_string();
+        pending_trade.entry_price = 3.612;
+        pending_trade.current_price = 3.612;
+        pending_trade.quantity = 34.6;
+        pending_trade.filled_units = 0.0;
+        pending_trade.avg_fill_price = None;
+        pending_trade.notional_usdc = 124.98;
+        pending_trade.risk_budget_usdc = 4.7748;
+        pending_trade.initial_stop_price = 3.75;
+        pending_trade.chandelier_stop_price = 3.75;
+        pending_trade.current_stop_price = 3.75;
+        pending_trade.highest_price_seen = 3.612;
+        pending_trade.lowest_price_seen = 3.612;
+        pending_trade.exchange_order_id = Some("hl-64920976942".to_string());
+
+        let pending_id = db
+            .insert_trade(&pending_trade)
+            .expect("insert_trade must auto-upgrade legacy trades CHECK constraint with FK rows and views");
+        assert!(pending_id > open_id);
+
+        // Verify child FK rows and dependent view survived the table rebuild
+        db.with_conn(|conn| {
+            let fk_funding: i64 = conn
+                .query_row("SELECT COUNT(*) FROM funding_payments WHERE trade_id = ?1;", rusqlite::params![open_id], |r| r.get(0))
+                .unwrap();
+            let fk_events: i64 = conn
+                .query_row("SELECT COUNT(*) FROM order_events WHERE trade_id = ?1;", rusqlite::params![open_id], |r| r.get(0))
+                .unwrap();
+            let view_open_cnt: i64 = conn
+                .query_row("SELECT open_count FROM v_portfolio_summary;", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(fk_funding, 1);
+            assert_eq!(fk_events, 1);
+            assert_eq!(view_open_cnt, 1);
+            Ok(())
+        })
+        .unwrap();
+
+        // Verify cross-book symbol exclusion includes PENDING PIT symbols
+        let wallet_syms = db.get_all_open_wallet_symbols().unwrap();
+        assert!(wallet_syms.contains("BTC/USDC:USDC"));
+        assert!(wallet_syms.contains("NEAR/USDC:USDC"));
+
+        let resting = db.get_resting_pit_trades().unwrap();
+        assert_eq!(resting.len(), 1);
+        assert_eq!(resting[0].trade_id, pending_id);
+        assert_eq!(resting[0].status, "PENDING");
+        assert_eq!(
+            resting[0].exchange_order_id.as_deref(),
+            Some("hl-64920976942")
+        );
+
+        let open_after = db.get_open_trades().unwrap();
+        assert_eq!(open_after.len(), 1);
+        assert_eq!(open_after[0].trade_id, open_id);
+
+        // Promote the resting trade on a 50% partial fill (17.3 NEAR @ 3.612) and verify:
+        // 1. status transitions to OPEN, quantity = 17.3, risk_budget_usdc rescaled to |3.612 - 3.75| * 17.3 = 2.3874
+        // 2. order_state_audit records the OPEN_ON_BOOK -> FILLED transition
+        assert!(db
+            .promote_resting_trade_to_open(pending_id, 17.3, 3.612, 0.01, 0.0)
+            .unwrap());
+        let open_promoted = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pending_id)
+            .unwrap();
+        assert_eq!(open_promoted.status, "OPEN");
+        assert_eq!(open_promoted.fsm_state, "FILLED");
+        assert!((open_promoted.quantity - 17.3).abs() < 1e-6);
+        assert!((open_promoted.risk_budget_usdc - 2.3874).abs() < 1e-4);
+
+        let audit_rows = db.get_order_state_audit(Some("hl-pending-near"), 10).unwrap();
+        assert!(audit_rows.iter().any(|r| {
+            r.get("client_order_id").and_then(|v| v.as_str()) == Some("hl-pending-near")
+                && r.get("from_state").and_then(|v| v.as_str()) == Some("OPEN_ON_BOOK")
+                && r.get("to_state").and_then(|v| v.as_str()) == Some("FILLED")
+        }));
+    }
 }
 

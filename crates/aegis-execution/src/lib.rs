@@ -1887,5 +1887,203 @@ mod tests {
             "ExecutionEngine::resolved_asset_cache must cache resolved orphan/universe assets (R7-N3)"
         );
     }
+
+    #[test]
+    fn test_dangling_order_cancelled_on_partial_fill_and_pit_sizing_ignores_unallocated_spot_usdc() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet", &json!(true))
+            .unwrap();
+        db.scale_risk_caps_for_equity(1000.0).unwrap();
+
+        let exec = ExecutionEngine::new(db.clone());
+
+        // 1. Suppose an untracked resting order (oid=64920976942) on NEAR partially filled (-23.1 NEAR short on-chain).
+        // Even though `ex_positions` contains "NEAR" (and even after "NEAR" is imported into `local_trades`),
+        // `reconcile_exchange_state` MUST flag and cancel the untracked resting order (`!is_known_resting_oid`).
+        let mut on_chain = HashMap::new();
+        on_chain.insert(
+            "NEAR".to_string(),
+            json!({"szi": -23.1, "entryPx": 3.612, "markPx": 3.612, "unrealizedPnl": 0.0}),
+        );
+        let open_orders = vec![json!({"coin": "NEAR", "oid": 64920976942_u64})];
+
+        let rep1 = exec.reconcile_exchange_state(Some(&on_chain), Some(&open_orders));
+        assert_eq!(rep1.status, ReconcileStatus::Reconciled);
+        assert!(
+            rep1.discrepancies
+                .iter()
+                .any(|d| d.get("type").and_then(|v| v.as_str()) == Some("DANGLING_OPEN_ORDER_CANCELLED")
+                    && d.get("base_asset").and_then(|v| v.as_str()) == Some("NEAR")),
+            "Untracked resting order on coin with partial-fill position must be cancelled on tick 1"
+        );
+
+        // Tick 2: NEAR is now in `local_trades` (`seen_coins` contains "NEAR") and position grew to -115.2 NEAR.
+        // Because oid 64920976942 is NOT a known resting order (`known_resting_oids`), it must still be cancelled!
+        on_chain.insert(
+            "NEAR".to_string(),
+            json!({"szi": -115.2, "entryPx": 3.612, "markPx": 3.612, "unrealizedPnl": 0.0}),
+        );
+        let rep2 = exec.reconcile_exchange_state(Some(&on_chain), Some(&open_orders));
+        assert!(
+            rep2.discrepancies
+                .iter()
+                .any(|d| d.get("type").and_then(|v| v.as_str()) == Some("DANGLING_OPEN_ORDER_CANCELLED")
+                    && d.get("base_asset").and_then(|v| v.as_str()) == Some("NEAR")),
+            "Untracked resting order on coin with existing local trade + exchange position must still be cancelled"
+        );
+
+        // Close the reconciled NEAR trade so we can test tracked resting order edge cases and new entry sizing cleanly
+        let open_trades = db.get_open_trades().unwrap();
+        for t in open_trades {
+            db.close_trade(t.trade_id, 3.612, 0.0, 0.0, "TEST_CLEANUP")
+                .unwrap();
+        }
+
+        // 1b. Suppose a tracked resting PIT order (status = PENDING, oid = hl-11111) exists on SOL:
+        // - Before any fill (ex_positions is empty), if open_orders has both tracked oid 11111 AND untracked oid 22222 on SOL,
+        //   oid 11111 must be spared while untracked oid 22222 MUST be cancelled as DANGLING_OPEN_ORDER_CANCELLED.
+        // - When oid 11111 partially fills on-chain while still resting in open_orders, reconcile_exchange_state must NOT
+        //   import a duplicate ORPHAN_ON_CHAIN_IMPORTED trade and must NOT cancel oid 11111.
+        let tracked_resting = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "hl-tracked-sol".to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "SHORT".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 87.358,
+            current_price: 87.358,
+            exit_price: None,
+            quantity: 1.37,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 119.68,
+            risk_budget_usdc: 5.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 91.0,
+            chandelier_stop_price: 91.0,
+            current_stop_price: 91.0,
+            highest_price_seen: 87.358,
+            lowest_price_seen: 87.358,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-11111".to_string()),
+            opened_at: "2026-11-09T16:08:51Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let tracked_tid = db.insert_trade(&tracked_resting).unwrap();
+
+        let empty_ex = HashMap::new();
+        let orders_mixed = vec![
+            json!({"coin": "SOL", "oid": 11111_u64}),
+            json!({"coin": "SOL", "oid": 22222_u64}),
+        ];
+        let rep_mixed = exec.reconcile_exchange_state(Some(&empty_ex), Some(&orders_mixed));
+        assert_eq!(rep_mixed.discrepancies.len(), 1);
+        assert_eq!(
+            rep_mixed.discrepancies[0].get("type").and_then(|v| v.as_str()),
+            Some("DANGLING_OPEN_ORDER_CANCELLED")
+        );
+        assert_eq!(
+            rep_mixed.discrepancies[0].get("oid").and_then(|v| v.as_u64()),
+            Some(22222_u64)
+        );
+
+        let mut partial_sol_ex = HashMap::new();
+        partial_sol_ex.insert(
+            "SOL".to_string(),
+            json!({"szi": -0.50, "entryPx": 87.358, "markPx": 87.358, "unrealizedPnl": 0.0}),
+        );
+        let orders_tracked_only = vec![json!({"coin": "SOL", "oid": 11111_u64})];
+        let rep_partial =
+            exec.reconcile_exchange_state(Some(&partial_sol_ex), Some(&orders_tracked_only));
+        assert_eq!(
+            rep_partial.discrepancies.len(),
+            0,
+            "Tracked resting order with partial fill on-chain must not trigger ORPHAN_ON_CHAIN_IMPORTED or DANGLING_OPEN_ORDER_CANCELLED"
+        );
+        assert!(db.get_open_trades().unwrap().is_empty());
+
+        db.cancel_resting_trade(tracked_tid, "TEST_CLEANUP")
+            .unwrap();
+
+        // 2. Pollute `portfolio_snapshots.total_equity_usdc` with $10,972.25 (simulating $10,517.65 unallocated Testnet faucet Spot USDC)
+        // while `initial_equity_usdc = 1000.0` ($500 Book A, $125 single-asset cap).
+        let mut polluted_snap = db.get_latest_portfolio_snapshot().unwrap();
+        polluted_snap.total_equity_usdc = 10_972.25;
+        polluted_snap.available_cash_usdc = 10_972.25;
+        db.save_portfolio_snapshot(&polluted_snap).unwrap();
+
+        // Seed 30 1H bars for SOL/USDC:USDC around $100.0
+        let base_ts = 1_760_000_000_000_i64;
+        let mut bars = Vec::new();
+        for i in 0..30 {
+            bars.push(aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + i * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 100_000.0,
+                funding_rate_hourly: 0.0,
+                is_synthetic: 0,
+            });
+        }
+        db.upsert_ohlcv_batch(&bars).unwrap();
+
+        // Run `reconcile_cycle_with_options` in PAPER mode (with `platform_pp50_enabled = false`, `pond_enabled = false`, `risk_caps_reference_scope = BOOK`)
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        db.set_config_value("platform_pp50_enabled", &json!(false))
+            .unwrap();
+        db.set_config_value("pond_enabled", &json!(false)).unwrap();
+        let eval = aegis_core::SignalEvaluation {
+            eval_id: None,
+            timestamp_ms: base_ts + 29 * 14_400_000,
+            base_asset: "SOL".to_string(),
+            exec_symbol: "SOL/USDC:USDC".to_string(),
+            synth_symbol: "SOL/BTC".to_string(),
+            hmm_regime: "BEAR".to_string(),
+            prob_bull: 0.05,
+            prob_bear: 0.90,
+            prob_chop: 0.05,
+            snr_score: -1.5,
+            snr_synth: -1.5,
+            rs_96: -0.05,
+            r_usdc_8: -0.02,
+            mace_score: -0.85,
+            blended_conviction: -0.85,
+            rs_rank: 15,
+            signal_action: "SHORT".to_string(),
+            funding_rate_hourly: 0.0,
+            created_at: None,
+        };
+        let snap_after = exec
+            .reconcile_cycle_with_options(&[eval], false, false)
+            .unwrap();
+        assert!(
+            (snap_after.total_equity_usdc - 1000.0).abs() < 5.0,
+            "Snapshot total_equity_usdc must be anchored to ~$1,000, got {}",
+            snap_after.total_equity_usdc
+        );
+        let opened = db.get_open_trades().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(
+            opened[0].notional_usdc <= 130.0,
+            "Book A single-asset notional on $500 book must be capped near $125 (never 22x = $2,742), got ${}",
+            opened[0].notional_usdc
+        );
+    }
 }
 
