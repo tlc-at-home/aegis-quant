@@ -1,4 +1,4 @@
-//! SQLite schema initialization, transactional idempotent migration runner (001..010),
+//! SQLite schema initialization, transactional idempotent migration runner (001..011),
 //! routing mode reconciliation, and database integrity verification.
 
 use crate::fernet::ensure_master_key_for_db;
@@ -9,14 +9,15 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-/// Ordered list of SQLite schema migration files (`001..010`).
+/// Ordered list of SQLite schema migration files (`001..011`).
 ///
-/// Invariant (`R5-M1`):
+/// Invariants (`R5-M1`, `R7-S2`):
 /// 1. Each migration file is executed atomically inside a SQLite transaction
 ///    (`execute_sql_transactional`), so migration scripts must not include
 ///    non-transactional statements such as `VACUUM` or `PRAGMA journal_mode`.
-/// 2. Numbered migration files are treated as frozen once shipped; follow-up
-///    schema or data repairs must be placed in a new numbered migration file.
+/// 2. Numbered migration files are strictly immutable once shipped; any follow-up
+///    schema, config-seed, or data repairs must be placed in a new additive
+///    numbered migration file (never edited retroactively).
 pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/001_v020_config_expansion.sql",
     "sql/migrations/002_v020_order_fsm.sql",
@@ -28,6 +29,7 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/008_v030_round3_remediation.sql",
     "sql/migrations/009_v030_round4_remediation.sql",
     "sql/migrations/010_v030_round5_remediation.sql",
+    "sql/migrations/011_v030_round7_stop_tightening.sql",
 ];
 
 impl DatabaseManager {
@@ -249,6 +251,10 @@ impl DatabaseManager {
     /// Reconciles legacy or inconsistent execution routing mode rows in `system_config`
     /// so that `execution_mode`, `hyperliquid_testnet`, `pond_execution_mode`, `environment`,
     /// and descriptions never contradict each other across `PAPER`, `TESTNET`, and `LIVE`.
+    ///
+    /// Invariant (`R7-B1`, `R7-QA`):
+    /// This function is invoked along the `load_config()` read path and MUST NEVER read or
+    /// mutate any table other than `system_config`, nor overwrite operator-calibrated risk/stop keys.
     pub fn reconcile_routing_config(&self) {
         let _ = self.with_conn(|conn| {
             let mut stmt = match conn.prepare(
@@ -391,15 +397,32 @@ impl DatabaseManager {
             }
 
             // Consolidate to a single `hyperliquid_vault_address` key and auto-switch standard HLP vault per network
-            let _ = conn.execute(
-                "DELETE FROM system_config WHERE config_key IN (
-                    'hyperliquid_default_vault_mainnet',
-                    'hyperliquid_default_vault_testnet',
-                    'hyperliquid_mainnet_vault_address',
-                    'hyperliquid_testnet_vault_address'
-                );",
-                [],
-            );
+            let has_legacy_vault_keys: bool = conn
+                .query_row(
+                    "SELECT 1 FROM system_config WHERE config_key IN (
+                        'hyperliquid_default_vault_mainnet',
+                        'hyperliquid_default_vault_testnet',
+                        'hyperliquid_mainnet_vault_address',
+                        'hyperliquid_testnet_vault_address'
+                    ) LIMIT 1;",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            if has_legacy_vault_keys {
+                let _ = conn.execute(
+                    "DELETE FROM system_config WHERE config_key IN (
+                        'hyperliquid_default_vault_mainnet',
+                        'hyperliquid_default_vault_testnet',
+                        'hyperliquid_mainnet_vault_address',
+                        'hyperliquid_testnet_vault_address'
+                    );",
+                    [],
+                );
+            }
             let cur_vault: Option<String> = conn
                 .query_row(
                     "SELECT config_value FROM system_config WHERE config_key = 'hyperliquid_vault_address';",
@@ -429,78 +452,20 @@ impl DatabaseManager {
                     params![target_vault],
                 );
             }
-
-            // Ensure tightened Chandelier stop config keys exist on already-migrated v10 databases
-            let has_tight_trail: bool = conn
-                .query_row(
-                    "SELECT 1 FROM system_config WHERE config_key = 'chandelier_trail_max_pct';",
-                    [],
-                    |_| Ok(true),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .unwrap_or(false);
-            if !has_tight_trail {
-                let _ = conn.execute_batch(
-                    "UPDATE system_config
-                     SET config_value = '1.2',
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                     WHERE config_key IN ('chandelier_atr_multiplier_long', 'chandelier_atr_multiplier_short')
-                       AND config_value IN ('3.0', '3.5', '3.8');
-                     UPDATE system_config
-                     SET config_value = '0.004',
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                     WHERE config_key = 'chandelier_min_atr_pct'
-                       AND config_value = '0.022';
-                     UPDATE system_config
-                     SET config_value = '0.35',
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                     WHERE config_key IN ('chandelier_wick_overshoot_atr', 'chandelier_wick_buffer_atr')
-                       AND config_value = '0.85';
-                     INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at) VALUES
-                         ('chandelier_wick_buffer_atr', '0.35', 'float', 'stops', 'Intrabar wick overshoot buffer in ATR multiples before Tier-1 emergency stop', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('chandelier_trail_atr_multiplier', '0.45', 'float', 'stops', 'Tight current-price trailing stop distance in ATR multiples', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('chandelier_trail_max_pct', '0.008', 'float', 'stops', 'Maximum trailing stop distance as fraction of current price (0.8%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('orphan_reconcile_stop_pct', '0.015', 'float', 'stops', 'Initial protective stop distance fraction for reconciled on-chain orphan positions (1.5%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('long_break_even_trigger_atr', '0.8', 'float', 'stops', 'Favorable excursion in ATR multiples to lock break-even on Long positions', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('long_break_even_lock_atr', '0.25', 'float', 'stops', 'Locked profit buffer in ATR multiples above entry once Long break-even triggers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('short_break_even_trigger_atr', '0.8', 'float', 'stops', 'Favorable excursion in ATR multiples to lock break-even on Short positions', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-                         ('short_break_even_lock_atr', '0.25', 'float', 'stops', 'Locked profit buffer in ATR multiples below entry once Short break-even triggers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
-                );
-            }
-
-            // Keep open live/reconciled trades' unrealized_pnl_usdc and tight chandelier_stop_price synchronized
-            let _ = conn.execute_batch(
-                "UPDATE trades
-                 SET unrealized_pnl_usdc = ROUND(
-                         (CASE WHEN side = 'LONG' THEN (current_price - entry_price) ELSE (entry_price - current_price) END) * ABS(quantity),
-                         4
-                     ),
-                     chandelier_stop_price = CASE
-                         WHEN side = 'LONG' AND (chandelier_stop_price <= 0.0 OR chandelier_stop_price >= current_price OR chandelier_stop_price < current_price * 0.992)
-                             THEN ROUND(current_price * 0.992, 4)
-                         WHEN side = 'SHORT' AND (chandelier_stop_price <= 0.0 OR chandelier_stop_price <= current_price * 1.002 OR chandelier_stop_price > current_price * 1.008)
-                             THEN ROUND(current_price * 1.008, 4)
-                         ELSE chandelier_stop_price
-                     END
-                 WHERE status = 'OPEN'
-                   AND current_price > 0.0
-                   AND entry_price > 0.0
-                   AND (COALESCE(exchange_order_id, '') LIKE 'hl-%'
-                        OR COALESCE(exchange_order_id, '') LIKE 'onchain-reconciled-%');",
-            );
             Ok(())
         });
     }
 
     pub fn run_migrations(&self) -> Result<Vec<String>> {
         let root = resolve_project_root();
+        let cur_ver = self.get_schema_version().unwrap_or(0).max(0) as usize;
         let mut applied = Vec::new();
-        for rel in ALL_MIGRATION_FILES {
+        for (idx, rel) in ALL_MIGRATION_FILES.iter().enumerate() {
             let p = root.join(rel);
             if p.exists() {
-                self.apply_migration(&p)?;
+                if idx + 1 > cur_ver {
+                    self.apply_migration(&p)?;
+                }
                 applied.push((*rel).to_string());
             }
         }
@@ -549,10 +514,30 @@ impl DatabaseManager {
                 .get(..3)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
+            let has_mig_table_before: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations';",
+                    [],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+                .unwrap_or(false);
+            let max_applied_ver: usize = if has_mig_table_before {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                .max(0) as usize
+            } else {
+                0
+            };
             if target_num >= 3 {
                 for (idx, prereq) in ALL_MIGRATION_FILES.iter().enumerate() {
                     let prereq_num = idx + 1;
-                    if prereq_num < target_num {
+                    if prereq_num > max_applied_ver && prereq_num < target_num {
                         let p = root.join(prereq);
                         if p.exists() {
                             if let Ok(s) = fs::read_to_string(&p) {

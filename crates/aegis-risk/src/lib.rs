@@ -293,16 +293,17 @@ impl RiskEngine {
             }
 
             let tight_floor = bar_close - tight_trail_dist;
+            let min_step = tick_size.max(1e-8);
             let mut cand_stop = tight_floor;
             if (new_highest - entry_price) >= long_break_even_trigger_atr * eff_atr {
-                cand_stop = cand_stop.max(
-                    (entry_price + long_break_even_lock_atr * eff_atr).min(tight_floor),
-                );
+                let be_lock = (entry_price + long_break_even_lock_atr * eff_atr)
+                    .min((bar_close - min_step).max(min_step));
+                cand_stop = cand_stop.max(be_lock);
             }
             let new_stop = Self::round_step(
                 active_stop
                     .max(cand_stop)
-                    .min((bar_close - tick_size).max(tick_size)),
+                    .min((bar_close - min_step).max(min_step)),
                 tick_size,
                 true,
             );
@@ -427,16 +428,17 @@ impl RiskEngine {
             }
 
             let tight_ceil = bar_close + tight_trail_dist;
+            let min_step = tick_size.max(1e-8);
             let mut cand_stop = tight_ceil;
             if (entry_price - new_lowest) >= short_break_even_trigger_atr * eff_atr {
-                cand_stop = cand_stop.min(
-                    (entry_price - short_break_even_lock_atr * eff_atr).max(tight_ceil),
-                );
+                let be_lock = (entry_price - short_break_even_lock_atr * eff_atr)
+                    .max(bar_close + min_step);
+                cand_stop = cand_stop.min(be_lock);
             }
             let new_stop = Self::round_step(
                 active_stop
                     .min(cand_stop)
-                    .max(bar_close + tick_size),
+                    .max(bar_close + min_step),
                 tick_size,
                 false,
             );
@@ -945,7 +947,53 @@ mod tests {
             "Stop {} must remain at tight_trail_dist (~87.60), not clamped to 1 tick above 86.97",
             sol_eval.chandelier_stop_price
         );
+
+        // 4. R7-S1: Break-even lock binds in tight-trail mode when price retraces toward entry
+        // after exceeding break-even trigger excursion (0.8 * ATR):
+        // LONG: entry=100.0, atr=2.0, highest=101.80 (>= 101.60 trigger), bar_close=100.70.
+        // tight_floor = 100.70 * (1 - 0.008) = 99.8944, while break-even lock = 100.0 + 0.25 * 2.0 = 100.50.
+        let long_be = risk.evaluate_two_tier_chandelier_stop(
+            "LONG",
+            100.0,  // entry_price
+            10.0,   // quantity
+            98.0,   // current_stop
+            101.80, // highest_price
+            99.80,  // lowest_price
+            101.20, // bar_high
+            100.20, // bar_low
+            100.70, // bar_close
+            2.0,    // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(!long_be.triggered);
+        assert!(
+            (long_be.chandelier_stop_price - 100.50).abs() < 1e-6,
+            "R7-S1: Long break-even lock must raise tight-trail stop to 100.50 (above tight_floor ~99.89), got {}",
+            long_be.chandelier_stop_price
+        );
+
+        // SHORT: entry=100.0, atr=2.0, lowest=98.20 (<= 98.40 trigger), bar_close=99.30.
+        // tight_ceil = 99.30 * (1 + 0.008) = 100.0944, while break-even lock = 100.0 - 0.25 * 2.0 = 99.50.
+        let short_be = risk.evaluate_two_tier_chandelier_stop(
+            "SHORT",
+            100.0,  // entry_price
+            10.0,   // quantity
+            102.0,  // current_stop
+            100.20, // highest_price
+            98.20,  // lowest_price
+            99.80,  // bar_high
+            98.80,  // bar_low
+            99.30,  // bar_close
+            2.0,    // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(!short_be.triggered);
+        assert!(
+            (short_be.chandelier_stop_price - 99.50).abs() < 1e-6,
+            "R7-S1: Short break-even lock must lower tight-trail stop to 99.50 (below tight_ceil ~100.10), got {}",
+            short_be.chandelier_stop_price
+        );
     }
 }
-
-

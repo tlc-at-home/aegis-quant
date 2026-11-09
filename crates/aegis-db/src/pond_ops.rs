@@ -789,22 +789,23 @@ impl DatabaseManager {
         cell_id: i64,
         exit_price: f64,
         exit_reason: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE pond_cells
-                 SET state = 'CLOSED',
-                     exit_price = ?1,
-                     exit_reason = ?2,
-                     closed_at = ?3,
-                     updated_at = ?3,
-                     resting_order_id = NULL
-                 WHERE cell_id = ?4 AND state IN ('OPEN', 'TRAILED', 'ARMED');",
-                params![exit_price, exit_reason, now_iso, cell_id],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
+            let rows = conn
+                .execute(
+                    "UPDATE pond_cells
+                     SET state = 'CLOSED',
+                         exit_price = ?1,
+                         exit_reason = ?2,
+                         closed_at = ?3,
+                         updated_at = ?3,
+                         resting_order_id = NULL
+                     WHERE cell_id = ?4 AND state IN ('OPEN', 'TRAILED', 'ARMED');",
+                    params![exit_price, exit_reason, now_iso, cell_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(rows > 0)
         })
     }
 
@@ -1373,7 +1374,7 @@ impl DatabaseManager {
             )));
         }
 
-        let updated_count = self.with_conn(|conn| {
+        let updated_count = self.with_immediate_tx(|conn| {
             let count = conn
                 .execute(
                     "UPDATE book_transfers
@@ -1384,10 +1385,24 @@ impl DatabaseManager {
                     params![trimmed],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES (
+                     'dry_run_reclassify_before_utc',
+                     ?1,
+                     'string',
+                     'settling',
+                     'Optional ISO-8601 UTC cutoff timestamp before which historical PARTIAL_IDLE_CAPPED rows are reclassified to DRY_RUN',
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 )
+                 ON CONFLICT(config_key) DO UPDATE SET
+                     config_value = excluded.config_value,
+                     updated_at = excluded.updated_at;",
+                params![trimmed],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(count)
         })?;
-
-        let _ = self.set_config_value("dry_run_reclassify_before_utc", &serde_json::json!(trimmed));
         tracing::info!(
             "Reclassified {updated_count} PARTIAL_IDLE_CAPPED transfer row(s) before {trimmed} to DRY_RUN (R6-N4)"
         );

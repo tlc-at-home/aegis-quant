@@ -1710,6 +1710,9 @@ impl OrderExecutionResult {
 }
 
 /// Normalized trade record (`trades` table).
+///
+/// Invariant (`R7-N4`): `quantity` and `filled_units` are strictly non-negative magnitudes
+/// (`>= 0.0`); directional sign is represented exclusively by `side` (`"LONG"` vs `"SHORT"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
     #[serde(default)]
@@ -1723,7 +1726,9 @@ pub struct TradeRecord {
     pub entry_price: f64,
     pub current_price: f64,
     pub exit_price: Option<f64>,
+    /// Positive position size magnitude (`>= 0.0`; `R7-N4`).
     pub quantity: f64,
+    /// Positive filled unit magnitude (`>= 0.0`; `R7-N4`).
     pub filled_units: f64,
     pub avg_fill_price: Option<f64>,
     pub notional_usdc: f64,

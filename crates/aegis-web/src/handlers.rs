@@ -713,8 +713,20 @@ pub async fn api_close_trade(
 ) -> Response {
     let _guard = state.cycle_lock.lock().await;
     match run_db_blocking(state.db.clone(), move |db| {
+        if payload.trade_id.is_some() && payload.cell_id.is_some() {
+            return Err(aegis_core::AegisError::Validation(
+                "Specify either trade_id or cell_id, not both".to_string(),
+            )
+            .into());
+        }
         let exec = ExecutionEngine::new(db.clone());
-        let reason = payload.reason.as_deref();
+        let normalized_reason = payload
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(64).collect::<String>());
+        let reason = normalized_reason.as_deref();
         let close_result = if let Some(trade_id) = payload.trade_id {
             exec.close_open_trade_manual(trade_id, reason)?
         } else if let Some(cell_id) = payload.cell_id {

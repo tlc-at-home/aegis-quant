@@ -78,33 +78,7 @@ SET last_funding_hour_bucket = CAST(strftime('%s', 'now') AS INTEGER) / 3600
 WHERE status IN ('OPEN', 'PENDING')
   AND COALESCE(last_funding_hour_bucket, 0) = 0;
 
--- 5. Tighten Chandelier trailing stop defaults in system_config
-UPDATE system_config
-SET config_value = '1.2',
-    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-WHERE config_key IN ('chandelier_atr_multiplier_long', 'chandelier_atr_multiplier_short');
-
-UPDATE system_config
-SET config_value = '0.004',
-    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-WHERE config_key = 'chandelier_min_atr_pct';
-
-UPDATE system_config
-SET config_value = '0.35',
-    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-WHERE config_key IN ('chandelier_wick_overshoot_atr', 'chandelier_wick_buffer_atr');
-
-INSERT OR REPLACE INTO system_config (config_key, config_value, value_type, category, description, updated_at) VALUES
-    ('chandelier_wick_buffer_atr', '0.35', 'float', 'stops', 'Intrabar wick overshoot buffer in ATR multiples before Tier-1 emergency stop', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('chandelier_trail_atr_multiplier', '0.45', 'float', 'stops', 'Tight current-price trailing stop distance in ATR multiples', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('chandelier_trail_max_pct', '0.008', 'float', 'stops', 'Maximum trailing stop distance as fraction of current price (0.8%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('orphan_reconcile_stop_pct', '0.015', 'float', 'stops', 'Initial protective stop distance fraction for reconciled on-chain orphan positions (1.5%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('long_break_even_trigger_atr', '0.8', 'float', 'stops', 'Favorable excursion in ATR multiples to lock break-even on Long positions', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('long_break_even_lock_atr', '0.25', 'float', 'stops', 'Locked profit buffer in ATR multiples above entry once Long break-even triggers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('short_break_even_trigger_atr', '0.8', 'float', 'stops', 'Favorable excursion in ATR multiples to lock break-even on Short positions', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('short_break_even_lock_atr', '0.25', 'float', 'stops', 'Locked profit buffer in ATR multiples below entry once Short break-even triggers', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
-
--- 6. Bump schema_version to 10
+-- 5. Bump schema_version to 10
 UPDATE system_config
 SET config_value = '10',
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -112,4 +86,3 @@ WHERE config_key = 'schema_version';
 
 INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
 VALUES (10, CAST(strftime('%s', 'now') AS INTEGER), '010_v030_round5_remediation: Transactional migration repair, PAPER dry-run reclassification, and trades funding bucket backfill');
-

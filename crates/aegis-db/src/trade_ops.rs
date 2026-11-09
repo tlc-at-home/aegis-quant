@@ -528,21 +528,24 @@ impl DatabaseManager {
         })
     }
 
-    /// Cancel an unfilled resting `OPEN_ON_BOOK` trade row (`NH-4`).
-    pub fn cancel_resting_trade(&self, trade_id: i64, reason: &str) -> Result<()> {
+    /// Cancel an unfilled resting `OPEN_ON_BOOK` trade row (`NH-4`, `R7-S3`).
+    pub fn cancel_resting_trade(&self, trade_id: i64, reason: &str) -> Result<bool> {
         let closed_iso = aegis_core::format_ms_iso8601_utc(self.now_ms());
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE trades
-                 SET status = 'CANCELLED',
-                     fsm_state = 'CANCELLED',
-                     closed_at = ?1,
-                     exit_reason = ?2
-                 WHERE trade_id = ?3;",
-                params![closed_iso, reason, trade_id],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
+            let rows = conn
+                .execute(
+                    "UPDATE trades
+                     SET status = 'CANCELLED',
+                         fsm_state = 'CANCELLED',
+                         closed_at = ?1,
+                         exit_reason = ?2
+                     WHERE trade_id = ?3
+                       AND status IN ('PENDING', 'OPEN')
+                       AND fsm_state = 'OPEN_ON_BOOK';",
+                    params![closed_iso, reason, trade_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(rows > 0)
         })
     }
 
@@ -571,7 +574,7 @@ impl DatabaseManager {
                      current_price = CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END
                  WHERE trade_id = ?7 AND status = 'OPEN';",
                 params![
-                    round_dp(remaining_qty, 8),
+                    round_dp(remaining_qty.abs(), 8),
                     round_dp(remaining_notional, 4),
                     round_dp(realized_pnl_delta, 4),
                     round_dp(fees_delta, 4),
@@ -651,7 +654,7 @@ impl DatabaseManager {
                     trade.fsm_state,
                     trade.entry_price,
                     trade.current_price,
-                    trade.quantity,
+                    trade.quantity.abs(),
                     trade.notional_usdc,
                     trade.risk_budget_usdc,
                     trade.conviction_multiplier,
@@ -664,7 +667,7 @@ impl DatabaseManager {
                     trade.unrealized_pnl_usdc,
                     trade.exchange_order_id,
                     trade.avg_fill_price,
-                    trade.filled_units,
+                    trade.filled_units.abs(),
                     trade.slippage_paid_usd,
                     opened_iso,
                 ],
@@ -873,6 +876,8 @@ impl DatabaseManager {
         })
     }
 
+    /// Atomically transitions an `OPEN` trade to `CLOSED` (`R7-S3`).
+    /// Returns `Ok(true)` if the row was open and transitioned to `CLOSED`, or `Ok(false)` if already closed/absent.
     pub fn close_trade(
         &self,
         trade_id: i64,
@@ -880,35 +885,37 @@ impl DatabaseManager {
         realized_pnl_usdc: f64,
         fees_paid_usdc: f64,
         exit_reason: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let closed_iso = chrono::DateTime::from_timestamp_millis(self.now_ms())
             .unwrap_or_else(Utc::now)
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
 
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE trades
-                 SET status = 'CLOSED',
-                     current_price = ?1,
-                     exit_price = ?1,
-                     realized_pnl_usdc = ?2,
-                     unrealized_pnl_usdc = 0.0,
-                     fees_paid_usdc = ?3,
-                     closed_at = ?4,
-                     exit_reason = ?5
-                 WHERE trade_id = ?6;",
-                params![
-                    exit_price,
-                    realized_pnl_usdc,
-                    fees_paid_usdc,
-                    closed_iso,
-                    exit_reason,
-                    trade_id
-                ],
-            )
-            .map_err(|e| AegisError::Database(e.to_string()))?;
-            Ok(())
+            let rows = conn
+                .execute(
+                    "UPDATE trades
+                     SET status = 'CLOSED',
+                         current_price = ?1,
+                         exit_price = ?1,
+                         realized_pnl_usdc = ?2,
+                         unrealized_pnl_usdc = 0.0,
+                         fees_paid_usdc = ?3,
+                         closed_at = ?4,
+                         exit_reason = ?5
+                     WHERE trade_id = ?6
+                       AND status = 'OPEN';",
+                    params![
+                        exit_price,
+                        realized_pnl_usdc,
+                        fees_paid_usdc,
+                        closed_iso,
+                        exit_reason,
+                        trade_id
+                    ],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(rows > 0)
         })
     }
 

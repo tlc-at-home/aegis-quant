@@ -1482,9 +1482,9 @@ async function triggerTakeProfit(tradeId, symbol, btnEl) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ trade_id: Number(tradeId), reason: 'MANUAL_TAKE_PROFIT' })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      alert(`Failed to close ${symbol || '#' + tradeId}: ${data.detail || data.error || 'Unknown error'}`);
+      alert(`Failed to close ${symbol || '#' + tradeId}: ${data.detail || data.error || res.statusText || 'Unknown error'}`);
       return;
     }
     if (data.dashboard) {
@@ -1492,6 +1492,8 @@ async function triggerTakeProfit(tradeId, symbol, btnEl) {
     } else {
       await fetchInitialDashboard();
     }
+  } catch (err) {
+    alert(`Failed to close ${symbol || '#' + tradeId}: ${err && err.message ? err.message : String(err)}`);
   } finally {
     if (btnEl) {
       btnEl.disabled = false;
@@ -1511,9 +1513,9 @@ async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cell_id: Number(cellId), reason: 'MANUAL_TAKE_PROFIT' })
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${data.detail || data.error || 'Unknown error'}`);
+      alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${data.detail || data.error || res.statusText || 'Unknown error'}`);
       return;
     }
     if (data.dashboard) {
@@ -1521,6 +1523,8 @@ async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
     } else {
       await fetchInitialDashboard();
     }
+  } catch (err) {
+    alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${err && err.message ? err.message : String(err)}`);
   } finally {
     if (btnEl) {
       btnEl.disabled = false;
@@ -1528,3 +1532,4 @@ async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
     }
   }
 }
+

@@ -348,27 +348,13 @@ impl MarketIngestionEngine {
                 } else {
                     t.entry_price.max(1.0)
                 };
-                usdc_assets.push(aegis_core::UniverseAsset {
-                    asset_id: 0,
-                    symbol: t.symbol.clone(),
-                    base_asset: t.base_asset.clone(),
-                    quote_asset: "USDC".to_string(),
-                    instrument_type: "USDC_PERP".to_string(),
-                    tier: 3,
-                    tier_name: "ORPHAN".to_string(),
-                    exec_timeframe: "4h".to_string(),
-                    rs_timeframe: "4h".to_string(),
-                    tick_size: pond_meta.map(|p| p.tick_size).unwrap_or(0.0001),
-                    lot_step_size: pond_meta.map(|p| p.lot_step_size).unwrap_or(0.001),
-                    min_notional_usdc: pond_meta.map(|p| p.min_notional_usdc).unwrap_or(10.0),
-                    max_leverage: pond_meta.map(|p| p.max_leverage).unwrap_or(10.0),
-                    is_active: 1,
-                    updated_at: String::new(),
-                    reference_price: pond_meta
-                        .map(|p| p.reference_price)
-                        .filter(|&p| p > 0.0)
-                        .unwrap_or(ref_px),
-                });
+                usdc_assets.push(crate::build_orphan_or_pond_universe_asset(
+                    &t.symbol,
+                    &t.base_asset,
+                    ref_px,
+                    pond_meta,
+                    "ORPHAN",
+                ));
             }
         }
         let alt_pairs = self.db.get_alt_pairs_universe()?;

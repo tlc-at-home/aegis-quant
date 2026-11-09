@@ -254,7 +254,12 @@ impl DatabaseManager {
         )))
     }
 
-    /// Execute a closure with a pooled SQLite WAL or `:memory:` connection (`R2`, `R6-N3`).
+    /// Execute a closure with a pooled SQLite WAL or `:memory:` connection (`R2`, `R6-N3`, `R7-QA`).
+    ///
+    /// Invariants:
+    /// - When invoked along the `load_config()` / `reconcile_routing_config()` read path, closures
+    ///   must never mutate any table other than `system_config` (`R7-B1`, `R7-QA`).
+    /// - Do not nest `with_conn` or `with_immediate_tx` inside an active `with_conn` closure.
     pub fn with_conn<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
@@ -282,6 +287,9 @@ impl DatabaseManager {
     }
 
     /// Execute a closure inside a `BEGIN IMMEDIATE;` write transaction with automatic rollback and recycling (`R6-N3`).
+    ///
+    /// Invariant: Acquires its own pooled connection (or `:memory:` mutex), so callers must not
+    /// nest `with_immediate_tx` or `with_conn` inside an active `with_conn` / `with_immediate_tx` closure.
     pub fn with_immediate_tx<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
@@ -1290,7 +1298,7 @@ mod tests {
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 10);
+        assert_eq!(db.get_schema_version().unwrap(), 11);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1528,7 +1536,7 @@ mod tests {
         use rusqlite::OptionalExtension;
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 10);
+        assert_eq!(db.get_schema_version().unwrap(), 11);
 
         // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
         db.with_conn(|conn| {
@@ -1839,6 +1847,156 @@ mod tests {
         let transfers_after = db.get_recent_book_transfers(10).unwrap();
         let t2_after = transfers_after.iter().find(|t| t.transfer_id == id2).unwrap();
         assert_eq!(t2_after.status, "DRY_RUN");
+    }
+
+    #[test]
+    fn test_r7_b1_s2_s3_n4_config_read_purity_and_migration_011_stop_tightening() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 11);
+
+        // 1. R7-B1 & R7-QA: Operator sets custom chandelier_atr_multiplier_long = 2.0
+        // and inserts an OPEN trade with a wide 4H stop (e.g. $86,000 on a $90,000 BTC LONG).
+        // Calling load_config(), get_config_rows(), and get_credentials_status() MUST NOT
+        // overwrite the operator's config or mutate ANY trades row!
+        db.set_config_value("chandelier_atr_multiplier_long", &json!(2.0))
+            .unwrap();
+        let pit_tid = db
+            .insert_trade(&aegis_core::TradeRecord {
+                trade_id: 0,
+                client_order_id: "hl-paper-pit-long-1".to_string(),
+                symbol: "BTC/USDC:USDC".to_string(),
+                base_asset: "BTC".to_string(),
+                side: "LONG".to_string(),
+                status: "OPEN".to_string(),
+                fsm_state: "FILLED".to_string(),
+                entry_price: 90_000.0,
+                current_price: 90_000.0,
+                exit_price: None,
+                quantity: -0.1,     // R7-N4: negative input must be normalized to +0.1
+                filled_units: -0.1, // R7-N4: negative input must be normalized to +0.1
+                avg_fill_price: Some(90_000.0),
+                notional_usdc: 9_000.0,
+                risk_budget_usdc: 400.0,
+                conviction_multiplier: 1.0,
+                initial_stop_price: 86_000.0,
+                chandelier_stop_price: 86_000.0,
+                current_stop_price: 86_000.0,
+                highest_price_seen: 90_000.0,
+                lowest_price_seen: 90_000.0,
+                realized_pnl_usdc: 0.0,
+                unrealized_pnl_usdc: 0.0,
+                fees_paid_usdc: 1.0,
+                funding_accrued_usdc: 0.0,
+                slippage_paid_usd: 0.0,
+                exchange_order_id: Some("sim-pit-long-1".to_string()),
+                opened_at: "2026-11-09T00:00:00Z".to_string(),
+                closed_at: None,
+                exit_reason: None,
+            })
+            .unwrap();
+
+        let cfg = db.load_config().unwrap();
+        let _rows = db.get_config_rows(true).unwrap();
+        let _creds = db.get_credentials_status().unwrap();
+        assert!(
+            (cfg.get_f64("chandelier_atr_multiplier_long", 0.0) - 2.0).abs() < 1e-9,
+            "load_config() must never overwrite operator-configured chandelier_atr_multiplier_long (R7-B1)"
+        );
+
+        let open_trades = db.get_open_trades().unwrap();
+        let pit_trade = open_trades.iter().find(|t| t.trade_id == pit_tid).unwrap();
+        assert!(
+            (pit_trade.current_stop_price - 86_000.0).abs() < 1e-6
+                && (pit_trade.chandelier_stop_price - 86_000.0).abs() < 1e-6,
+            "load_config() / reconcile_routing_config() must NEVER mutate open trades stop prices (R7-B1, R7-QA)"
+        );
+        assert!(
+            (pit_trade.quantity - 0.1).abs() < 1e-9 && (pit_trade.filled_units - 0.1).abs() < 1e-9,
+            "insert_trade must enforce non-negative quantity and filled_units (R7-N4)"
+        );
+
+        // 2. R7-S2: Migration 011 one-time stop-band normalization applies ONLY to
+        // `onchain-reconciled-%` open rows when schema_version < 11, and leaves `hl-%` / `hl-paper-%` untouched.
+        db.reconcile_on_chain_orphan_position(
+            "ETH/USDC:USDC",
+            "ETH",
+            "LONG",
+            1.0,
+            3_000.0,
+            3_000.0,
+            0.0,
+        )
+        .unwrap();
+        // Simulate a legacy wide stop ($2,760.00) on the onchain-reconciled ETH trade before v11
+        let eth_tid = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.symbol == "ETH/USDC:USDC")
+            .unwrap()
+            .trade_id;
+        db.update_open_trade(
+            eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0,
+        )
+        .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "UPDATE system_config SET config_value = '10' WHERE config_key = 'schema_version';
+                 DELETE FROM schema_migrations WHERE version >= 11;",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        db.apply_migration("sql/migrations/011_v030_round7_stop_tightening.sql")
+            .unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 11);
+
+        let after_mig = db.get_open_trades().unwrap();
+        let pit_after = after_mig.iter().find(|t| t.trade_id == pit_tid).unwrap();
+        let eth_after = after_mig.iter().find(|t| t.trade_id == eth_tid).unwrap();
+        assert!(
+            (pit_after.current_stop_price - 86_000.0).abs() < 1e-6,
+            "Migration 011 must not touch hl-paper-% or hl-% strategy trades (R7-B1, R7-S2)"
+        );
+        assert!(
+            (eth_after.current_stop_price - 2_976.0).abs() < 1e-3,
+            "Migration 011 must tighten legacy wide onchain-reconciled-% stop ($2,760.00) to 0.8% cap ($2,976.00)"
+        );
+
+        // Verify that if an operator sets chandelier_atr_multiplier_long = 3.0 at v11 (or post-b392d2b),
+        // re-running run_migrations() or apply_migration(011) preserves 3.0 untouched (R7-S2).
+        db.set_config_value("chandelier_atr_multiplier_long", &json!(3.0))
+            .unwrap();
+        db.run_migrations().unwrap();
+        db.apply_migration("sql/migrations/011_v030_round7_stop_tightening.sql")
+            .unwrap();
+        let cfg_after_remig = db.load_config().unwrap();
+        assert!(
+            (cfg_after_remig.get_f64("chandelier_atr_multiplier_long", 0.0) - 3.0).abs() < 1e-9,
+            "Re-running migrations at v11 must never overwrite operator-calibrated 3.0 stop multiplier (R7-S2)"
+        );
+
+        // 3. R7-S3: close_trade and cancel_resting_trade enforce status predicates and return bool
+        assert!(
+            db.close_trade(pit_tid, 91_000.0, 100.0, 1.0, "TEST_CLOSE")
+                .unwrap(),
+            "First close_trade on OPEN trade must return true (R7-S3)"
+        );
+        assert!(
+            !db.close_trade(pit_tid, 99_000.0, 900.0, 9.0, "OVERWRITE_ATTEMPT")
+                .unwrap(),
+            "Second close_trade on already-CLOSED trade must return false and not overwrite PnL/exit_reason (R7-S3)"
+        );
+        let closed_pit = db
+            .get_recent_trades(10)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pit_tid)
+            .unwrap();
+        assert_eq!(closed_pit.exit_reason.as_deref(), Some("TEST_CLOSE"));
+        assert!((closed_pit.realized_pnl_usdc - 100.0).abs() < 1e-6);
     }
 }
 

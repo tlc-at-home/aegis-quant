@@ -1,14 +1,14 @@
-//! Standalone SQLite WAL Schema v10 Migration & Verification CLI (`aegis-db-tool`).
+//! Standalone SQLite WAL Schema v11 Migration & Verification CLI (`aegis-db-tool`).
 //!
 //! Usage:
-//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/010_v030_round5_remediation.sql`
+//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/011_v030_round7_stop_tightening.sql`
 
 use aegis_core::AegisError;
 use aegis_db::DatabaseManager;
 use serde_json::json;
 use std::path::PathBuf;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     db: Option<PathBuf>,
     apply_migration: Option<PathBuf>,
@@ -20,20 +20,64 @@ struct Args {
     reclassify_dry_run_before: Option<String>,
 }
 
-fn parse_args() -> Args {
+fn require_non_empty_flag_value<I>(iter: &mut I, flag: &str) -> aegis_core::Result<String>
+where
+    I: Iterator<Item = String>,
+{
+    match iter.next() {
+        Some(val) if !val.trim().is_empty() && !val.starts_with("--") => Ok(val),
+        Some(next_flag) if next_flag.starts_with("--") => Err(AegisError::Validation(format!(
+            "Flag '{flag}' requires a value, but found another flag '{next_flag}'"
+        ))),
+        _ => Err(AegisError::Validation(format!(
+            "Flag '{flag}' requires a non-empty value"
+        ))),
+    }
+}
+
+fn parse_args_from<I, S>(raw_args: I) -> aegis_core::Result<Args>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut args = Args::default();
-    let mut iter = std::env::args().skip(1);
+    let mut iter = raw_args.into_iter().map(Into::into);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--db" | "--db-path" => {
-                if let Some(val) = iter.next() {
-                    args.db = Some(PathBuf::from(val));
+                let val = require_non_empty_flag_value(&mut iter, arg.as_str())?;
+                args.db = Some(PathBuf::from(val));
+            }
+            s if s.starts_with("--db=") => {
+                let val = s.trim_start_matches("--db=").trim();
+                if val.is_empty() {
+                    return Err(AegisError::Validation(
+                        "Flag '--db=' requires a non-empty value".to_string(),
+                    ));
                 }
+                args.db = Some(PathBuf::from(val));
+            }
+            s if s.starts_with("--db-path=") => {
+                let val = s.trim_start_matches("--db-path=").trim();
+                if val.is_empty() {
+                    return Err(AegisError::Validation(
+                        "Flag '--db-path=' requires a non-empty value".to_string(),
+                    ));
+                }
+                args.db = Some(PathBuf::from(val));
             }
             "--apply-migration" => {
-                if let Some(val) = iter.next() {
-                    args.apply_migration = Some(PathBuf::from(val));
+                let val = require_non_empty_flag_value(&mut iter, "--apply-migration")?;
+                args.apply_migration = Some(PathBuf::from(val));
+            }
+            s if s.starts_with("--apply-migration=") => {
+                let val = s.trim_start_matches("--apply-migration=").trim();
+                if val.is_empty() {
+                    return Err(AegisError::Validation(
+                        "Flag '--apply-migration=' requires a non-empty value".to_string(),
+                    ));
                 }
+                args.apply_migration = Some(PathBuf::from(val));
             }
             "--init" | "--migrate" => args.init = true,
             "--force" => args.force = true,
@@ -41,23 +85,32 @@ fn parse_args() -> Args {
             "--show-web-token" => args.show_web_token = true,
             "--audit-dry-run-residue" => args.audit_dry_run_residue = true,
             "--reclassify-dry-run-before" => {
-                if let Some(val) = iter.next() {
-                    args.reclassify_dry_run_before = Some(val);
-                }
+                let val = require_non_empty_flag_value(&mut iter, "--reclassify-dry-run-before")?;
+                args.reclassify_dry_run_before = Some(val);
             }
             s if s.starts_with("--reclassify-dry-run-before=") => {
-                let val = s.trim_start_matches("--reclassify-dry-run-before=");
+                let val = s.trim_start_matches("--reclassify-dry-run-before=").trim();
+                if val.is_empty() {
+                    return Err(AegisError::Validation(
+                        "Flag '--reclassify-dry-run-before=' requires a non-empty value"
+                            .to_string(),
+                    ));
+                }
                 args.reclassify_dry_run_before = Some(val.to_string());
             }
             "--verify" => {}
-            _ => {}
+            other => {
+                return Err(AegisError::Validation(format!(
+                    "Unrecognized aegis-db-tool argument: '{other}'"
+                )));
+            }
         }
     }
-    args
+    Ok(args)
 }
 
 fn main() -> aegis_core::Result<()> {
-    let args = parse_args();
+    let args = parse_args_from(std::env::args().skip(1))?;
     if args.generate_key {
         println!("{}", aegis_db::fernet::generate_fernet_key());
         return Ok(());
@@ -139,3 +192,29 @@ fn main() -> aegis_core::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_args_rejects_missing_value_for_reclassify_dry_run_before() {
+        assert!(parse_args_from(["--reclassify-dry-run-before"]).is_err());
+        assert!(parse_args_from(["--reclassify-dry-run-before="]).is_err());
+        assert!(parse_args_from(["--reclassify-dry-run-before", "--init"]).is_err());
+        assert!(parse_args_from(["--db"]).is_err());
+        assert!(parse_args_from(["--apply-migration"]).is_err());
+        assert!(parse_args_from(["--unknown-flag"]).is_err());
+
+        let ok = parse_args_from([
+            "--db",
+            "data/aegis_quant.db",
+            "--reclassify-dry-run-before=2026-04-09T09:56:00Z",
+        ])
+        .unwrap();
+        assert_eq!(ok.db, Some(PathBuf::from("data/aegis_quant.db")));
+        assert_eq!(
+            ok.reclassify_dry_run_before.as_deref(),
+            Some("2026-04-09T09:56:00Z")
+        );
+    }
+}

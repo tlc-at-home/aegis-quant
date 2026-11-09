@@ -614,7 +614,7 @@ mod tests {
         db.initialize_schema(true).expect("seed schema");
 
         let payload = build_dashboard_payload(&db).expect("dashboard payload");
-        assert_eq!(payload.schema_version, 10);
+        assert_eq!(payload.schema_version, 11);
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pond.universe.len(), 80);
 
@@ -634,7 +634,7 @@ mod tests {
         db.initialize_schema(true).expect("init schema");
 
         let payload = build_dashboard_payload(&db).expect("build dashboard payload");
-        assert_eq!(payload.schema_version, 10);
+        assert_eq!(payload.schema_version, 11);
 
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pp50.pit.equity_usdc, 5000.0);
@@ -1110,6 +1110,20 @@ mod tests {
             .unwrap();
         let empty_resp = app.clone().oneshot(empty_req).await.unwrap();
         assert_eq!(empty_resp.status(), StatusCode::BAD_REQUEST);
+
+        // R7-N6: Supplying both trade_id and cell_id simultaneously is rejected with 400 Bad Request
+        let both_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/trades/close")
+            .header(header::AUTHORIZATION, "Bearer test-tp-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"trade_id":{},"cell_id":{}}}"#,
+                tao.trade_id, cell_id
+            )))
+            .unwrap();
+        let both_resp = app.clone().oneshot(both_req).await.unwrap();
+        assert_eq!(both_resp.status(), StatusCode::BAD_REQUEST);
 
         let dup_req = axum::http::Request::builder()
             .method("POST")

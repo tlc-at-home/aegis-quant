@@ -311,6 +311,78 @@ pub struct FundingSyncReport {
 
 pub type AssetIndexCache = Arc<Mutex<HashMap<(bool, String), (u32, i64)>>>;
 
+/// Infers a price-scaled fallback tick size for symbols not present in `universe_assets` or `pond_universe` (`R7-N5`).
+pub fn infer_synthetic_tick_size(ref_price: f64) -> f64 {
+    if ref_price >= 1000.0 {
+        0.1
+    } else if ref_price >= 10.0 {
+        0.01
+    } else if ref_price >= 1.0 {
+        0.0001
+    } else {
+        0.00001
+    }
+}
+
+/// Builds a synthetic [`UniverseAsset`] for a Pond or reconciled orphan symbol (`R7-N3`, `R7-N5`).
+/// Preserves positive `min_notional_usdc` from `pond_universe` without overriding values `< 10.0`.
+pub fn build_orphan_or_pond_universe_asset(
+    symbol: &str,
+    base_asset: &str,
+    ref_price: f64,
+    pond_row: Option<&aegis_core::PondUniverseRow>,
+    tier_name: &str,
+) -> UniverseAsset {
+    let base = if base_asset.trim().is_empty() {
+        symbol.split('/').next().unwrap_or(symbol).trim().to_string()
+    } else {
+        base_asset.trim().to_string()
+    };
+    let inferred_tick = infer_synthetic_tick_size(ref_price);
+    let tick_size = pond_row
+        .map(|p| p.tick_size)
+        .filter(|&t| t > 0.0)
+        .unwrap_or(inferred_tick)
+        .max(1e-8);
+    let lot_step_size = pond_row
+        .map(|p| p.lot_step_size)
+        .filter(|&l| l > 0.0)
+        .unwrap_or(0.001)
+        .max(1e-8);
+    let min_notional_usdc = pond_row
+        .map(|p| p.min_notional_usdc)
+        .filter(|&n| n > 0.0)
+        .unwrap_or(10.0);
+    let max_leverage = pond_row
+        .map(|p| p.max_leverage)
+        .filter(|&m| m > 0.0)
+        .unwrap_or(10.0)
+        .max(1.0);
+    let reference_price = pond_row
+        .map(|p| p.reference_price)
+        .filter(|&p| p > 0.0)
+        .unwrap_or_else(|| ref_price.max(0.01));
+
+    UniverseAsset {
+        asset_id: 0,
+        symbol: symbol.to_string(),
+        base_asset: base,
+        quote_asset: "USDC".to_string(),
+        instrument_type: "USDC_PERP".to_string(),
+        tier: 3,
+        tier_name: tier_name.to_string(),
+        exec_timeframe: "4h".to_string(),
+        rs_timeframe: "4h".to_string(),
+        tick_size,
+        lot_step_size,
+        min_notional_usdc,
+        max_leverage,
+        is_active: 1,
+        updated_at: String::new(),
+        reference_price,
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionEngine {
     pub db: DatabaseManager,
@@ -324,6 +396,8 @@ pub struct ExecutionEngine {
     pub(crate) hlp_vault_error_streak: Arc<Mutex<usize>>,
     /// Dynamic cache of `(is_testnet, COIN_UPPER) -> (asset_index, cached_at_ms)` (`NM-12`).
     pub asset_index_cache: AssetIndexCache,
+    /// In-memory cache of `symbol -> UniverseAsset` for Pit, Pond, and reconciled orphan symbols (`R7-N3`).
+    pub resolved_asset_cache: Arc<Mutex<HashMap<String, UniverseAsset>>>,
 }
 
 impl ExecutionEngine {
@@ -347,6 +421,7 @@ impl ExecutionEngine {
             stop_cooldown_until_ms: Arc::new(Mutex::new(HashMap::new())),
             hlp_vault_error_streak: Arc::new(Mutex::new(0)),
             asset_index_cache: Arc::new(Mutex::new(HashMap::new())),
+            resolved_asset_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1710,6 +1785,107 @@ mod tests {
             .expect("closing ARMED Pond cell succeeds");
         assert_eq!(armed_close["status"], "CANCELLED_ARMED");
         assert!(db.get_armed_pond_cells().unwrap().is_empty());
+
+        // 6. R7-N3 & R7-N5: build_orphan_or_pond_universe_asset preserves positive min_notional_usdc < 10.0
+        let pepe_row = aegis_core::PondUniverseRow {
+            symbol: "PEPE/USDC:USDC".to_string(),
+            rank: 42,
+            median_daily_volume_usdc: 5_000_000.0,
+            tick_size: 1e-8,
+            lot_step_size: 1.0,
+            min_notional_usdc: 5.0,
+            max_leverage: 5.0,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-11-09T00:00:00Z".to_string(),
+            delisted_at: None,
+            reference_price: 0.00001234,
+            is_synthetic_volume: 0,
+        };
+        let pepe_asset = build_orphan_or_pond_universe_asset(
+            "PEPE/USDC:USDC",
+            "PEPE",
+            0.00001234,
+            Some(&pepe_row),
+            "POND",
+        );
+        assert!(
+            (pepe_asset.min_notional_usdc - 5.0).abs() < 1e-9,
+            "build_orphan_or_pond_universe_asset must preserve min_notional_usdc = 5.0 (< 10.0) from pond_universe (R7-N3, R7-N5)"
+        );
+        assert_eq!(pepe_asset.lot_step_size, 1.0);
+        assert!((pepe_asset.tick_size - 1e-8).abs() < 1e-12);
+
+        // 7. R7-S4: In TESTNET/LIVE mode without valid live exchange fills or confirmed exchange absence,
+        // manual close of a non-paper trade or Pond cell MUST return an error and keep the position OPEN locally.
+        db.set_config_value("execution_mode", &serde_json::json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &serde_json::json!("TESTNET"))
+            .unwrap();
+        let live_err = exec.close_open_trade_manual(tao_long_id, Some("MANUAL_TAKE_PROFIT"));
+        assert!(
+            live_err.is_err(),
+            "Manual close in TESTNET mode must fail when exchange close/absence cannot be confirmed (R7-S4)"
+        );
+        assert!(
+            db.get_open_trades()
+                .unwrap()
+                .iter()
+                .any(|t| t.trade_id == tao_long_id),
+            "Trade must remain OPEN in local DB when TESTNET exchange close fails (R7-S4)"
+        );
+
+        let live_cell_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "NEAR/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(1.45),
+                quantity: Some(500.0),
+                notional_usdc: Some(725.0),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(0.0),
+                funding_rate_entry: Some(0.0),
+                initial_stop: Some(1.48),
+                chandelier_stop: Some(1.48),
+                highest_price_seen: Some(1.45),
+                lowest_price_seen: Some(1.45),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                exit_price: None,
+                exit_reason: None,
+                opened_at: Some("2026-11-09T09:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-09T09:00:00Z".to_string(),
+                resting_order_id: Some("123456789".to_string()), // non-paper order ID
+            })
+            .unwrap();
+        let live_cell_err = exec.close_open_pond_cell_manual(live_cell_id, None);
+        assert!(
+            live_cell_err.is_err(),
+            "Manual Pond cell close in TESTNET mode must fail when exchange close/absence cannot be confirmed (R7-S4)"
+        );
+        assert!(
+            db.get_open_pond_cells()
+                .unwrap()
+                .iter()
+                .any(|c| c.cell_id == live_cell_id),
+            "Pond cell must remain OPEN in local DB when TESTNET exchange close fails (R7-S4)"
+        );
+        assert!(
+            exec.resolved_asset_cache
+                .lock()
+                .contains_key("TAO/USDC:USDC"),
+            "ExecutionEngine::resolved_asset_cache must cache resolved orphan/universe assets (R7-N3)"
+        );
     }
 }
 

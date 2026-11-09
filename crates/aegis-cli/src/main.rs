@@ -254,6 +254,7 @@ pub struct AegisOrchestrator {
     pub last_pond_4h_bucket: Option<i64>,
     pub last_reconcile_ms: Option<i64>,
     pub last_retention_prune_ms: Option<i64>,
+    pub reconcile_error_streak: usize,
 }
 
 impl AegisOrchestrator {
@@ -281,6 +282,7 @@ impl AegisOrchestrator {
             last_pond_4h_bucket: None,
             last_reconcile_ms: Some(now_ms),
             last_retention_prune_ms: Some(now_ms),
+            reconcile_error_streak: 0,
         }
     }
 
@@ -368,18 +370,52 @@ impl AegisOrchestrator {
     }
 
     /// Evaluates periodic maintenance triggers (exchange reconcile and retention pruning)
-    /// based on elapsed wall-clock time rather than cycle-count multiples (`R6-N1`).
+    /// based on elapsed wall-clock time rather than cycle-count multiples (`R6-N1`, `R7-S5`).
     pub fn maybe_run_maintenance(&mut self, is_live_mode: bool) {
         let now_ms = self.db.now_ms();
 
-        // R6-N1: Exchange reconcile runs on every cycle in LIVE/TESTNET mode, or every 5 minutes (300_000 ms) in PAPER mode.
+        // R6-N1 / R7-S5: Exchange reconcile runs on every cycle in LIVE/TESTNET mode, or every 5 minutes (300_000 ms) in PAPER mode.
         let reconcile_due = is_live_mode
             || self
                 .last_reconcile_ms
                 .map(|last| (now_ms - last) >= 300_000)
                 .unwrap_or(true);
         if reconcile_due {
-            let _ = self.execution.reconcile_exchange_state(None, None);
+            let recon = self.execution.reconcile_exchange_state(None, None);
+            if recon.status == aegis_execution::ReconcileStatus::ErrorDbUnavailable
+                || (is_live_mode
+                    && recon.status == aegis_execution::ReconcileStatus::SkippedOffline)
+            {
+                self.reconcile_error_streak += 1;
+                let msg = format!(
+                    "Periodic exchange reconciliation degraded (streak={}, status={}, reason={})",
+                    self.reconcile_error_streak,
+                    recon.status,
+                    recon.reason.as_deref().unwrap_or("unknown")
+                );
+                tracing::error!("{msg}");
+                let _ = self.db.log_telemetry(
+                    "ERROR",
+                    "engine.orchestrator",
+                    &msg,
+                    serde_json::to_value(&recon).ok(),
+                );
+                self.telemetry.publish_event(
+                    "ERROR",
+                    "engine.orchestrator",
+                    &msg,
+                    serde_json::to_value(&recon).ok(),
+                );
+                if self.reconcile_error_streak == 3 || self.reconcile_error_streak.is_multiple_of(20) {
+                    let _ = self.execution.alerts.notify_critical_event(
+                        "EXCHANGE_RECONCILE_DEGRADED",
+                        &msg,
+                        serde_json::to_value(&recon).ok(),
+                    );
+                }
+            } else {
+                self.reconcile_error_streak = 0;
+            }
             self.last_reconcile_ms = Some(now_ms);
         }
 
@@ -416,8 +452,12 @@ impl AegisOrchestrator {
         self.cycle_count += 1;
 
         let cfg = self.db.load_config()?;
-        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let is_live_mode = mode == "LIVE" || mode == "TESTNET";
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_mode = matches!(exec_mode.as_str(), "LIVE" | "TESTNET")
+            || matches!(pond_mode.as_str(), "LIVE" | "TESTNET");
 
         self.maybe_run_maintenance(is_live_mode);
 
@@ -526,7 +566,7 @@ impl AegisOrchestrator {
 
     /// Executes one scheduled daemon iteration for `book_mode` (`"pit"`, `"pond"`, or `"both"`)
     /// inside a `std::panic::catch_unwind` fault-isolation boundary (`Invariant F6`) and returns
-    /// `(step_result, sleep_seconds)` dynamically resolved from `system_config` (`R5-M3`, `R5-QB`, `R5-N3`).
+    /// `(step_result, sleep_seconds)` dynamically resolved from `system_config` (`R5-M3`, `R5-QB`, `R5-N3`, `R7-S5`).
     pub fn run_scheduled_daemon_step(
         &mut self,
         book_mode: &str,
@@ -535,6 +575,12 @@ impl AegisOrchestrator {
         let cfg = self
             .db
             .load_config_or_log_default("aegis-cli.run_scheduled_daemon_step");
+        let exec_mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .to_ascii_uppercase();
+        let is_live_mode = matches!(exec_mode.as_str(), "LIVE" | "TESTNET")
+            || matches!(pond_mode.as_str(), "LIVE" | "TESTNET");
         let cycle_bars = cfg
             .get_i64("ingest_lookback_bars", fallback_lookback_bars as i64)
             .clamp(60, 1500) as usize;
@@ -551,6 +597,7 @@ impl AegisOrchestrator {
         match mode_norm.as_str() {
             "pit" => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.maybe_run_maintenance(is_live_mode);
                     let r = self.pit.run_cycle(true, false).map(|_| ());
                     if r.is_ok() {
                         self.last_pit_cycle_ms = Some(self.db.now_ms());
@@ -569,7 +616,7 @@ impl AegisOrchestrator {
             }
             "pond" => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.maybe_run_maintenance(false);
+                    self.maybe_run_maintenance(is_live_mode);
                     self.run_pond_scheduled_step().map(|_| ())
                 }))
                 .unwrap_or_else(|_| {
@@ -592,7 +639,7 @@ impl AegisOrchestrator {
                     if pit_due {
                         self.run_single_cycle(cycle_bars).map(|_| ())
                     } else {
-                        self.maybe_run_maintenance(false);
+                        self.maybe_run_maintenance(is_live_mode);
                         self.run_pond_scheduled_step().map(|_| ())
                     }
                 }))
@@ -632,19 +679,19 @@ pub fn run_readiness_suite(
     // =========================================================================
     // GATE 1: DATABASE & SCHEMA INTEGRITY
     // =========================================================================
-    let (jmode, fk, schema_ver, usdc_cnt, synth_cnt, pair_cnt) = db.with_conn(|conn| {
+    let (jmode, fk) = db.with_conn(|conn| {
         let jm: String = conn
             .query_row("PRAGMA journal_mode;", [], |r| r.get(0))
             .unwrap_or_default();
         let fk_on: i64 = conn
             .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
             .unwrap_or(0);
-        let sv = db.get_schema_version().unwrap_or(-1);
-        let uc = db.get_usdc_perp_universe().map(|v| v.len()).unwrap_or(0);
-        let sc = db.get_btc_synth_universe().map(|v| v.len()).unwrap_or(0);
-        let pc = db.get_alt_pairs_universe().map(|v| v.len()).unwrap_or(0);
-        Ok((jm.to_ascii_lowercase(), fk_on, sv, uc, sc, pc))
+        Ok((jm.to_ascii_lowercase(), fk_on))
     })?;
+    let schema_ver = db.get_schema_version().unwrap_or(-1);
+    let usdc_cnt = db.get_usdc_perp_universe().map(|v| v.len()).unwrap_or(0);
+    let synth_cnt = db.get_btc_synth_universe().map(|v| v.len()).unwrap_or(0);
+    let pair_cnt = db.get_alt_pairs_universe().map(|v| v.len()).unwrap_or(0);
 
     checks.push(CheckResult {
         gate: "Gate 1: Database & Schema".to_string(),
@@ -664,13 +711,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 10 {
+        status: if schema_ver >= 11 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 10 (migrations 001..010 applied)".to_string(),
+        requirement: "schema_version >= 11 (migrations 001..011 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -876,9 +923,19 @@ pub fn run_readiness_suite(
     let chand_long = cfg.get_f64("chandelier_atr_multiplier_long", 1.2);
     let chand_short = cfg.get_f64("chandelier_atr_multiplier_short", 1.2);
     let wick_buf = cfg.get_f64("chandelier_wick_buffer_atr", 0.35);
-    let stops_ok = (0.5..=5.0).contains(&chand_long)
-        && (0.5..=5.5).contains(&chand_short)
-        && (0.15..=1.5).contains(&wick_buf);
+    let trail_atr = cfg.get_f64("chandelier_trail_atr_multiplier", 0.45);
+    let trail_max_pct = cfg.get_f64("chandelier_trail_max_pct", 0.008);
+    let tight_trail_mode = (0.002..=0.05).contains(&trail_max_pct);
+    let classic_trail_mode = (0.05..=0.50).contains(&trail_max_pct) && !tight_trail_mode;
+    let stops_ok = (0.15..=1.5).contains(&wick_buf)
+        && ((tight_trail_mode
+            && (0.5..=5.0).contains(&chand_long)
+            && (0.5..=5.5).contains(&chand_short)
+            && (0.15..=3.0).contains(&trail_atr))
+            || (classic_trail_mode
+                && (2.0..=5.0).contains(&chand_long)
+                && (2.0..=5.5).contains(&chand_short)
+                && (0.15..=10.0).contains(&trail_atr)));
 
     checks.push(CheckResult {
         gate: "Gate 3: Risk Guardrails".to_string(),
@@ -886,9 +943,10 @@ pub fn run_readiness_suite(
         name: "Two-Tier Chandelier Stop Parameters".to_string(),
         status: if stops_ok { "PASS" } else { "FAIL" }.to_string(),
         observed: format!(
-            "Long={chand_long}x ATR, Short={chand_short}x ATR, WickBuffer={wick_buf}x ATR"
+            "Live Tight-Trail: Long={chand_long}x ATR, Short={chand_short}x ATR, WickBuffer={wick_buf}x ATR, Trail={trail_atr}x ATR / {:.2}% cap (4H Backtest scales to 3.5x/3.8x ATR)",
+            trail_max_pct * 100.0
         ),
-        requirement: "Long in [0.5, 5.0]x, Short in [0.5, 5.5]x, WickBuffer in [0.15, 1.5]x"
+        requirement: "Tight-trail (TrailMaxPct in [0.2%, 5.0%]): Long in [0.5, 5.0]x, Short in [0.5, 5.5]x, TrailATR in [0.15, 3.0]x; Classic (TrailMaxPct in (5.0%, 50.0%]): Long in [2.0, 5.0]x, Short in [2.0, 5.5]x; WickBuffer in [0.15, 1.5]x"
             .to_string(),
         remediation: "Restore Chandelier ATR parameters in system_config"
             .to_string(),
@@ -1085,7 +1143,10 @@ pub fn run_readiness_suite(
             check_id: "QUANT-01".to_string(),
             name: "Out-of-Sample Annualized Sharpe Ratio".to_string(),
             status: if ts.gate_sharpe_pass { "PASS" } else { "FAIL" }.to_string(),
-            observed: format!("Sharpe = {:.2}", ts.annualized_sharpe),
+            observed: format!(
+                "Sharpe = {:.2} (4H backtest replay uses 3.5x/3.8x ATR stop profile)",
+                ts.annualized_sharpe
+            ),
             requirement: "Annualized Sharpe >= 1.20".to_string(),
             remediation: "Run walk-forward calibration: aegis-quant run --once --calibrate"
                 .to_string(),
@@ -1859,9 +1920,71 @@ mod tests {
             "Retention pruning must trigger after 1 hour elapsed wall-clock (R6-N1)"
         );
 
-        // In LIVE mode, reconcile runs on every cycle
-        let t_before_live = orch.last_reconcile_ms.unwrap();
+        // In LIVE mode, reconcile runs on every cycle and logs ERROR telemetry when SkippedOffline (R7-S5)
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        orch.last_reconcile_ms = Some(t0 - 1_000);
         orch.maybe_run_maintenance(true);
-        assert!(orch.last_reconcile_ms.unwrap() >= t_before_live);
+        assert!(orch.last_reconcile_ms.unwrap() > t0 - 1_000);
+        let logs = db.get_recent_logs(20).unwrap();
+        assert!(
+            logs.iter().any(|l| {
+                l["level"] == "ERROR"
+                    && l["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Periodic exchange reconciliation degraded")
+            }),
+            "Live/Testnet maintenance must log ERROR telemetry when exchange reconcile returns SkippedOffline (R7-S5)"
+        );
+
+        // R7-S5: Verify `run_scheduled_daemon_step` in TESTNET mode runs maintenance on every tick
+        // across `--book pond` and `--book both` (when !pit_due) instead of hardcoding `false`.
+        let now_bucket_ms = db.now_ms();
+        orch.last_pond_scan_hour_bucket = Some(now_bucket_ms / 3_600_000);
+        orch.last_pond_4h_bucket = Some(now_bucket_ms / 14_400_000);
+        orch.last_reconcile_ms = Some(t0 - 1_000);
+        let (_res, _) = orch.run_scheduled_daemon_step("pond", 60);
+        assert!(
+            orch.last_reconcile_ms.unwrap() > t0 - 1_000,
+            "--book pond in TESTNET mode must run live maintenance on every tick (R7-S5)"
+        );
+
+        let now_bucket_ms2 = db.now_ms();
+        orch.last_pond_scan_hour_bucket = Some(now_bucket_ms2 / 3_600_000);
+        orch.last_pond_4h_bucket = Some(now_bucket_ms2 / 14_400_000);
+        orch.last_reconcile_ms = Some(t0 - 1_000);
+        orch.last_pit_cycle_ms = Some(now_bucket_ms2); // !pit_due
+        let (_res2, _) = orch.run_scheduled_daemon_step("both", 60);
+        assert!(
+            orch.last_reconcile_ms.unwrap() > t0 - 1_000,
+            "--book both (!pit_due) in TESTNET mode must run live maintenance on every tick (R7-S5)"
+        );
+        assert_eq!(
+            orch.reconcile_error_streak, 3,
+            "Three consecutive SkippedOffline reconciles in TESTNET mode must increment reconcile_error_streak to 3 (R7-S5)"
+        );
+
+        // Healthy PAPER reconcile resets reconcile_error_streak to 0
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        orch.last_reconcile_ms = Some(t0 - 305_000);
+        orch.maybe_run_maintenance(false);
+        assert_eq!(orch.reconcile_error_streak, 0);
+
+        // R7-N8: Verify RISK-02 rejects < 2.0x ATR initial stops when tight-trail is disabled (classic mode)
+        db.set_config_value("chandelier_atr_multiplier_long", &json!(1.2))
+            .unwrap();
+        db.set_config_value("chandelier_trail_max_pct", &json!(0.20))
+            .unwrap();
+        let (_ok, _verdict, checks) = run_readiness_suite(&db, Some("PAPER"), true).unwrap();
+        let risk02_bad = checks
+            .iter()
+            .find(|c| c.check_id == "RISK-02")
+            .unwrap();
+        assert_eq!(
+            risk02_bad.status, "FAIL",
+            "RISK-02 must FAIL when chandelier_atr_multiplier_long < 2.0 in classic trail mode (R7-N8)"
+        );
     }
 }
