@@ -52,6 +52,31 @@ pub struct DatabaseManager {
     pub(crate) cipher_cache: Arc<RwLock<Option<CachedFernetState>>>,
 }
 
+/// RAII guard that recycles an acquired SQLite connection back to `conn_pool` upon drop,
+/// ensuring panic safety during unwinding (`R6-N3`).
+struct PooledConnGuard<'a> {
+    pool: &'a Arc<Mutex<Vec<Connection>>>,
+    conn: Option<Connection>,
+}
+
+impl<'a> Drop for PooledConnGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // If the connection was left inside an active transaction due to panic or error,
+            // attempt a clean rollback before recycling.
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+            if conn.is_autocommit() {
+                let mut pool = self.pool.lock();
+                if pool.len() < 8 {
+                    pool.push(conn);
+                }
+            }
+        }
+    }
+}
+
 impl DatabaseManager {
     pub fn new(db_path: impl AsRef<Path>) -> Self {
         let project_root = resolve_project_root();
@@ -229,7 +254,7 @@ impl DatabaseManager {
         )))
     }
 
-    /// Execute a closure with a pooled SQLite WAL or `:memory:` connection (`R2`).
+    /// Execute a closure with a pooled SQLite WAL or `:memory:` connection (`R2`, `R6-N3`).
     pub fn with_conn<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
@@ -248,15 +273,35 @@ impl DatabaseManager {
             None => self.open_configured_file_conn()?,
         };
 
-        let result = f(&conn);
+        let guard = PooledConnGuard {
+            pool: &self.conn_pool,
+            conn: Some(conn),
+        };
 
-        if conn.is_autocommit() {
-            let mut pool = self.conn_pool.lock();
-            if pool.len() < 8 {
-                pool.push(conn);
+        f(guard.conn.as_ref().expect("conn present in PooledConnGuard"))
+    }
+
+    /// Execute a closure inside a `BEGIN IMMEDIATE;` write transaction with automatic rollback and recycling (`R6-N3`).
+    pub fn with_immediate_tx<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        self.with_conn(|conn| {
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            let res = f(conn);
+            match res {
+                Ok(val) => {
+                    conn.execute_batch("COMMIT;")
+                        .map_err(|e| AegisError::Database(e.to_string()))?;
+                    Ok(val)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
             }
-        }
-        result
+        })
     }
 
     pub(crate) fn resolve_cached_fernet_state(&self) -> Result<CachedFernetState> {
@@ -458,12 +503,9 @@ impl DatabaseManager {
             updates.push((k, enc_v));
         }
 
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+        self.with_immediate_tx(|conn| {
             for (k, enc_v) in &updates {
-                tx.execute(
+                conn.execute(
                     "UPDATE system_config
                      SET config_value = ?1,
                          updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -472,8 +514,6 @@ impl DatabaseManager {
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(())
         })?;
 
@@ -1639,6 +1679,166 @@ mod tests {
                 .unwrap(),
             "Open trade backfilled by migration 010 must not double-accrue the current hour bucket (R5-N2)"
         );
+    }
+
+    #[test]
+    fn test_r6_n3_pooled_conn_guard_panic_safety() {
+        let db_path = std::env::temp_dir().join(format!("panic_safe_{}.db", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&db_path);
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(false).unwrap();
+
+        // Prime the pool with a normal connection
+        db.with_conn(|conn| {
+            let _ = conn.execute_batch("SELECT 1;");
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.conn_pool.lock().len(),
+            1,
+            "Pool should contain 1 connection after prime"
+        );
+
+        // Cause a panic inside with_conn and catch it with catch_unwind
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = db.with_conn(|conn| {
+                let _ = conn.execute_batch("SELECT 1;");
+                panic!("deliberate panic inside with_conn closure");
+            });
+        }));
+        assert!(panic_res.is_err(), "Panic must occur");
+
+        // R6-N3: PooledConnGuard must have recycled the connection to conn_pool
+        assert_eq!(
+            db.conn_pool.lock().len(),
+            1,
+            "PooledConnGuard must recycle the connection back to pool on panic unwind (R6-N3)"
+        );
+
+        // Also verify that a panic inside an open transaction executes ROLLBACK before recycling
+        let tx_panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = db.with_conn(|conn| {
+                conn.execute_batch("BEGIN TRANSACTION;").unwrap();
+                panic!("deliberate panic inside open transaction");
+            });
+        }));
+        assert!(tx_panic_res.is_err(), "Panic must occur");
+
+        assert_eq!(
+            db.conn_pool.lock().len(),
+            1,
+            "Pooled connection must be rolled back and recycled to pool"
+        );
+
+        // Ensure the recycled connection is clean and usable
+        let check_res = db.with_conn(|conn| {
+            assert!(conn.is_autocommit(), "Connection must be back in autocommit mode");
+            Ok(42)
+        });
+        assert_eq!(check_res.unwrap(), 42);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+    }
+
+    #[test]
+    fn test_r6_n4_reclassify_dry_run_transfers_before() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Insert two PARTIAL_IDLE_CAPPED transfers at different timestamps
+        let id1 = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-05".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 100.0,
+                    pre_from_usdc: Some(1000.0),
+                    pre_to_usdc: Some(500.0),
+                    post_from_usdc: Some(900.0),
+                    post_to_usdc: Some(600.0),
+                    drift_bps_before: Some(50.0),
+                    drift_bps_after: Some(10.0),
+                    blocked_remainder_usdc: 50.0,
+                    status: "PARTIAL_IDLE_CAPPED".to_string(),
+                    attempts: 0,
+                    tx_ref: Some("live-tx-old".to_string()),
+                    created_at: "2026-11-05T10:00:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE book_transfers SET created_at = '2026-11-05T10:00:00Z' WHERE transfer_id = ?1;",
+                params![id1],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let id2 = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-08".to_string(),
+                    from_book: "POND".to_string(),
+                    to_book: "PIT".to_string(),
+                    amount_usdc: 200.0,
+                    pre_from_usdc: Some(600.0),
+                    pre_to_usdc: Some(1100.0),
+                    post_from_usdc: Some(400.0),
+                    post_to_usdc: Some(1300.0),
+                    drift_bps_before: Some(40.0),
+                    drift_bps_after: Some(5.0),
+                    blocked_remainder_usdc: 100.0,
+                    status: "PARTIAL_IDLE_CAPPED".to_string(),
+                    attempts: 0,
+                    tx_ref: Some("live-tx-new".to_string()),
+                    created_at: "2026-11-08T15:00:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE book_transfers SET created_at = '2026-11-08T15:00:00Z' WHERE transfer_id = ?1;",
+                params![id2],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Invalid timestamp should return validation error
+        assert!(db.reclassify_dry_run_transfers_before("not-a-timestamp").is_err());
+
+        // Reclassify cutoff between id1 and id2
+        let count1 = db
+            .reclassify_dry_run_transfers_before("2026-11-06T00:00:00Z")
+            .unwrap();
+        assert_eq!(count1, 1, "Only id1 should be reclassified");
+
+        let transfers = db.get_recent_book_transfers(10).unwrap();
+        let t1 = transfers.iter().find(|t| t.transfer_id == id1).unwrap();
+        let t2 = transfers.iter().find(|t| t.transfer_id == id2).unwrap();
+        assert_eq!(t1.status, "DRY_RUN");
+        assert_eq!(t2.status, "PARTIAL_IDLE_CAPPED");
+
+        // Reclassify up to cutoff after id2
+        let count2 = db
+            .reclassify_dry_run_transfers_before("2026-11-09T00:00:00Z")
+            .unwrap();
+        assert_eq!(count2, 1, "id2 should now be reclassified");
+
+        let transfers_after = db.get_recent_book_transfers(10).unwrap();
+        let t2_after = transfers_after.iter().find(|t| t.transfer_id == id2).unwrap();
+        assert_eq!(t2_after.status, "DRY_RUN");
     }
 }
 

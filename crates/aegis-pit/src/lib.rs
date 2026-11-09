@@ -137,7 +137,11 @@ impl PitOrchestrator {
     }
 }
 
-/// Spawns the Book A (`PIT`) background loop inside a panic-isolated supervision boundary (Invariant F6).
+/// Spawns the Book A (`PIT`) background Tokio task inside a panic-isolated supervision boundary (`Invariant F6`, `R4-M1`, `R6-QA`).
+///
+/// NOTE: This async background task spawner serves as a Tokio supervision test fixture and standalone async alternative to the
+/// synchronous daemon loop `run_scheduled_daemon_step` in `crates/aegis-cli/src/main.rs`. Cadence execution is single-sourced
+/// through `PitOrchestrator::run_cycle`, ensuring identical cadence semantics and config reloading across both paths.
 pub fn spawn_pit_task(
     orchestrator: PitOrchestrator,
     interval_sec: u64,

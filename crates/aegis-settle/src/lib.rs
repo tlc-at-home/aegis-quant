@@ -438,7 +438,31 @@ impl SettleController {
                 blocked_remainder.0,
             )?;
             if !transfer_mode_used.is_empty() {
-                let _ = self.db.update_book_transfer_mode(tid, &transfer_mode_used);
+                if let Err(e) = self.db.update_book_transfer_mode(tid, &transfer_mode_used) {
+                    let err_msg = format!(
+                        "Failed to update transfer_mode '{transfer_mode_used}' for transfer_id={tid}: {e}"
+                    );
+                    tracing::error!("{err_msg}");
+                    let details = Some(serde_json::json!({
+                        "transfer_id": tid,
+                        "transfer_mode": transfer_mode_used,
+                        "error": e.to_string(),
+                    }));
+                    let _ = self.db.log_telemetry(
+                        "ERROR",
+                        "aegis-settle.update_book_transfer_mode",
+                        &err_msg,
+                        details.clone(),
+                    );
+                    if let Some(tb) = &self.telemetry {
+                        tb.publish_event(
+                            "ERROR",
+                            "aegis-settle.update_book_transfer_mode",
+                            &err_msg,
+                            details,
+                        );
+                    }
+                }
             }
             tid
         } else {

@@ -267,8 +267,10 @@ fn test_concurrent_sqlite_wal_pit_pond_settle() {
 
     let tmp_dir = resolve_project_root().join("target").join("tmp_wal_test");
     let _ = fs::create_dir_all(&tmp_dir);
-    let db_path = tmp_dir.join(format!("pp50_wal_{}.db", std::process::id()));
+    let db_path = tmp_dir.join(format!("pp50_wal_{}.db", uuid::Uuid::new_v4()));
     let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
 
     let db = DatabaseManager::new(&db_path);
     db.initialize_schema(true).unwrap();
@@ -322,4 +324,6 @@ fn test_concurrent_sqlite_wal_pit_pond_settle() {
     assert_eq!(integrity["books_count"], 2);
     assert_eq!(integrity["pond_universe_count"], 80);
     let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
 }

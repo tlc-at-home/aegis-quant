@@ -40,12 +40,9 @@ impl DatabaseManager {
         if rows.is_empty() {
             return Ok(0);
         }
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+        self.with_immediate_tx(|conn| {
             {
-                let mut stmt = tx
+                let mut stmt = conn
                     .prepare_cached(
                         "INSERT INTO pond_universe (
                             symbol, rank, median_daily_volume_usdc, tick_size, lot_step_size,
@@ -97,8 +94,6 @@ impl DatabaseManager {
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 }
             }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(rows.len())
         })
     }
@@ -1352,6 +1347,51 @@ impl DatabaseManager {
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(iter.flatten().collect())
         })
+    }
+
+    /// Reclassifies historical `PARTIAL_IDLE_CAPPED` rows created before `cutoff_iso` to `DRY_RUN` (`R6-N4`).
+    ///
+    /// Sets `status = 'DRY_RUN'` and `transfer_mode = 'DRY_RUN_RECLASSIFIED'` for all matching rows,
+    /// updates `dry_run_reclassify_before_utc` in `system_config` for operator auditability, and returns
+    /// the number of reclassified rows.
+    pub fn reclassify_dry_run_transfers_before(&self, cutoff_iso: &str) -> Result<usize> {
+        let trimmed = cutoff_iso.trim();
+        if trimmed.is_empty() {
+            return Err(AegisError::Validation(
+                "Cutoff ISO timestamp must not be empty".to_string(),
+            ));
+        }
+
+        // Validate timestamp format using ISO8601 parser
+        if chrono::DateTime::parse_from_rfc3339(trimmed).is_err()
+            && chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S").is_err()
+            && chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S").is_err()
+            && chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_err()
+        {
+            return Err(AegisError::Validation(format!(
+                "Invalid ISO-8601 cutoff timestamp: '{trimmed}'. Expected format like 'YYYY-MM-DDTHH:MM:SSZ', 'YYYY-MM-DD HH:MM:SS', or 'YYYY-MM-DD'."
+            )));
+        }
+
+        let updated_count = self.with_conn(|conn| {
+            let count = conn
+                .execute(
+                    "UPDATE book_transfers
+                     SET status = 'DRY_RUN',
+                         transfer_mode = 'DRY_RUN_RECLASSIFIED'
+                     WHERE status = 'PARTIAL_IDLE_CAPPED'
+                       AND datetime(created_at) <= datetime(?1);",
+                    params![trimmed],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(count)
+        })?;
+
+        let _ = self.set_config_value("dry_run_reclassify_before_utc", &serde_json::json!(trimmed));
+        tracing::info!(
+            "Reclassified {updated_count} PARTIAL_IDLE_CAPPED transfer row(s) before {trimmed} to DRY_RUN (R6-N4)"
+        );
+        Ok(updated_count)
     }
 
     pub fn get_recent_book_transfers(&self, limit: usize) -> Result<Vec<BookTransfer>> {

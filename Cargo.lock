@@ -55,6 +55,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -172,6 +173,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

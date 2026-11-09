@@ -30,3 +30,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }
+uuid = { workspace = true }

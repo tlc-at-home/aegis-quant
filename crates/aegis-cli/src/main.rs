@@ -145,6 +145,9 @@ enum Commands {
         /// Audit `book_transfers` for any ledger-counted `PARTIAL_IDLE_CAPPED` rows lacking a `DRY_RUN` marker (`R5-M2`)
         #[arg(long)]
         audit_dry_run_residue: bool,
+        /// Reclassify historical `PARTIAL_IDLE_CAPPED` rows created before `<ISO8601>` to `DRY_RUN` (`R6-N4`)
+        #[arg(long)]
+        reclassify_dry_run_before: Option<String>,
     },
     /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
     Backtest {
@@ -249,6 +252,8 @@ pub struct AegisOrchestrator {
     pub last_pit_cycle_ms: Option<i64>,
     pub last_pond_scan_hour_bucket: Option<i64>,
     pub last_pond_4h_bucket: Option<i64>,
+    pub last_reconcile_ms: Option<i64>,
+    pub last_retention_prune_ms: Option<i64>,
 }
 
 impl AegisOrchestrator {
@@ -260,6 +265,7 @@ impl AegisOrchestrator {
         let calibrator = WalkForwardCalibrator::new(db.clone());
         let pit = PitOrchestrator::new(db.clone(), Some(telemetry.clone()));
         let pond = PondOrchestrator::new(db.clone(), Some(telemetry.clone()));
+        let now_ms = db.now_ms();
         Self {
             db,
             telemetry,
@@ -273,10 +279,16 @@ impl AegisOrchestrator {
             last_pit_cycle_ms: None,
             last_pond_scan_hour_bucket: None,
             last_pond_4h_bucket: None,
+            last_reconcile_ms: Some(now_ms),
+            last_retention_prune_ms: Some(now_ms),
         }
     }
 
-    /// Spawns Book A (`PitOrchestrator`) and Book B (`PondOrchestrator`) background Tokio tasks (`NQ-3`, `R4-M1`).
+    /// Spawns Book A (`PitOrchestrator`) and Book B (`PondOrchestrator`) background Tokio tasks (`NQ-3`, `R4-M1`, `R6-QA`).
+    ///
+    /// NOTE: Serves as a Tokio-based supervision test fixture and async alternative to the synchronous
+    /// daemon loop `run_scheduled_daemon_step`. Both paths share identical single-sourced execution delegates
+    /// (`PitOrchestrator::run_cycle` and `PondOrchestrator::run_scheduled_step`).
     pub fn spawn_async_book_tasks(
         &self,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -355,17 +367,22 @@ impl AegisOrchestrator {
         Ok(())
     }
 
-    pub fn run_single_cycle(&mut self, lookback_bars: usize) -> Result<PortfolioSnapshot> {
-        let t0 = Instant::now();
-        self.cycle_count += 1;
+    /// Evaluates periodic maintenance triggers (exchange reconcile and retention pruning)
+    /// based on elapsed wall-clock time rather than cycle-count multiples (`R6-N1`).
+    pub fn maybe_run_maintenance(&mut self, is_live_mode: bool) {
+        let now_ms = self.db.now_ms();
 
-        let cfg = self.db.load_config()?;
-        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let is_live_mode = mode == "LIVE" || mode == "TESTNET";
-
-        if is_live_mode || (self.cycle_count > 1 && self.cycle_count.is_multiple_of(20)) {
+        // R6-N1: Exchange reconcile runs on every cycle in LIVE/TESTNET mode, or every 5 minutes (300_000 ms) in PAPER mode.
+        let reconcile_due = is_live_mode
+            || self
+                .last_reconcile_ms
+                .map(|last| (now_ms - last) >= 300_000)
+                .unwrap_or(true);
+        if reconcile_due {
             let _ = self.execution.reconcile_exchange_state(None, None);
+            self.last_reconcile_ms = Some(now_ms);
         }
+
         if let Ok(stranded) = self.db.check_and_record_stranded_transfer_alert() {
             if !stranded.is_empty() {
                 let ids: Vec<i64> = stranded.iter().map(|r| r.transfer_id).collect();
@@ -380,11 +397,29 @@ impl AegisOrchestrator {
                 );
             }
         }
-        if self.cycle_count.is_multiple_of(240) {
+
+        // R6-N1: Retention pruning runs every 1 hour (3_600_000 ms) regardless of cadence interval.
+        let prune_due = self
+            .last_retention_prune_ms
+            .map(|last| (now_ms - last) >= 3_600_000)
+            .unwrap_or(true);
+        if prune_due {
             if let Err(e) = self.db.prune_retention_data() {
                 tracing::warn!("Periodic retention pruning warning: {e}");
             }
+            self.last_retention_prune_ms = Some(now_ms);
         }
+    }
+
+    pub fn run_single_cycle(&mut self, lookback_bars: usize) -> Result<PortfolioSnapshot> {
+        let t0 = Instant::now();
+        self.cycle_count += 1;
+
+        let cfg = self.db.load_config()?;
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let is_live_mode = mode == "LIVE" || mode == "TESTNET";
+
+        self.maybe_run_maintenance(is_live_mode);
 
         let (frozen, _) = self.pit.is_entry_frozen()?;
         let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
@@ -480,47 +515,13 @@ impl AegisOrchestrator {
         Ok(snapshot)
     }
 
-    /// Executes Book B (`POND`) scheduled step: hourly S-Cycle scan (with 4H close boundary flag)
-    /// when a new UTC hour or 4H bucket is entered, or `run_tick_15s()` otherwise (`R5-M3`, `R5-QB`).
+    /// Executes Book B (`POND`) scheduled step: delegates to `PondOrchestrator::run_scheduled_step`
+    /// for single-sourced cadence semantics across synchronous daemon and Tokio spawners (`R5-M3`, `R5-QB`, `R6-QA`).
     pub fn run_pond_scheduled_step(&mut self) -> Result<Option<aegis_pond::PondCycleSummary>> {
-        let now_ms = self.db.now_ms();
-        let now_hour_bucket = now_ms / 3_600_000;
-        let now_4h_bucket = now_ms / 14_400_000;
-        let is_hourly_scan = self.last_pond_scan_hour_bucket != Some(now_hour_bucket);
-        let is_4h_close = self.last_pond_4h_bucket != Some(now_4h_bucket);
-        if is_hourly_scan || is_4h_close {
-            match self.pond.run_scan_cycle(is_4h_close) {
-                Ok(summary) => {
-                    self.last_pond_scan_hour_bucket = Some(now_hour_bucket);
-                    if is_4h_close {
-                        self.last_pond_4h_bucket = Some(now_4h_bucket);
-                    }
-                    Ok(Some(summary))
-                }
-                Err(e) => {
-                    tracing::error!("Hourly Pond scan cycle failed: {e}");
-                    let _ = self.db.log_telemetry(
-                        "ERROR",
-                        "pond.orchestrator",
-                        &format!("Hourly Pond scan cycle failed: {e}"),
-                        None,
-                    );
-                    Err(e)
-                }
-            }
-        } else {
-            if let Err(e) = self.pond.run_tick_15s() {
-                tracing::error!("Pond 15s tick failed: {e}");
-                let _ = self.db.log_telemetry(
-                    "ERROR",
-                    "pond.orchestrator",
-                    &format!("Pond 15s tick failed: {e}"),
-                    None,
-                );
-                return Err(e);
-            }
-            Ok(None)
-        }
+        self.pond.run_scheduled_step(
+            &mut self.last_pond_scan_hour_bucket,
+            &mut self.last_pond_4h_bucket,
+        )
     }
 
     /// Executes one scheduled daemon iteration for `book_mode` (`"pit"`, `"pond"`, or `"both"`)
@@ -568,6 +569,7 @@ impl AegisOrchestrator {
             }
             "pond" => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.maybe_run_maintenance(false);
                     self.run_pond_scheduled_step().map(|_| ())
                 }))
                 .unwrap_or_else(|_| {
@@ -590,6 +592,7 @@ impl AegisOrchestrator {
                     if pit_due {
                         self.run_single_cycle(cycle_bars).map(|_| ())
                     } else {
+                        self.maybe_run_maintenance(false);
                         self.run_pond_scheduled_step().map(|_| ())
                     }
                 }))
@@ -1205,6 +1208,7 @@ fn main() -> anyhow::Result<()> {
             generate_key,
             show_web_token,
             audit_dry_run_residue,
+            reclassify_dry_run_before,
         }) => {
             if audit_dry_run_residue {
                 let rows = db.audit_suspect_dry_run_book_transfers()?;
@@ -1227,6 +1231,25 @@ fn main() -> anyhow::Result<()> {
                         rows.len()
                     );
                     println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                return Ok(());
+            }
+            if let Some(cutoff) = reclassify_dry_run_before {
+                let count = db.reclassify_dry_run_transfers_before(&cutoff)?;
+                if json_out {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "status": "ok",
+                            "reclassified_count": count,
+                            "cutoff_utc": cutoff,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "Reclassified {} historical PARTIAL_IDLE_CAPPED row(s) before {} to DRY_RUN.",
+                        count, cutoff
+                    );
                 }
                 return Ok(());
             }
@@ -1803,5 +1826,42 @@ mod tests {
             daemon_orch.cycle_count, 2,
             "Tick after pit_tick_interval_seconds elapsed must run full PIT cycle (R5-M3)"
         );
+    }
+
+    #[test]
+    fn test_r6_n1_time_based_maintenance_triggers() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let mut orch = AegisOrchestrator::new(db.clone());
+
+        let t0 = orch.last_reconcile_ms.unwrap();
+        let p0 = orch.last_retention_prune_ms.unwrap();
+
+        // Immediate check in PAPER mode: no trigger because 5 min / 1 hour not elapsed
+        orch.maybe_run_maintenance(false);
+        assert_eq!(orch.last_reconcile_ms.unwrap(), t0);
+        assert_eq!(orch.last_retention_prune_ms.unwrap(), p0);
+
+        // Advance reconcile clock past 5 minutes (300_000 ms)
+        orch.last_reconcile_ms = Some(t0 - 305_000);
+        orch.maybe_run_maintenance(false);
+        assert!(
+            orch.last_reconcile_ms.unwrap() > t0,
+            "Reconcile must trigger after 5 minutes elapsed wall-clock (R6-N1)"
+        );
+        assert_eq!(orch.last_retention_prune_ms.unwrap(), p0);
+
+        // Advance retention prune clock past 1 hour (3_600_000 ms)
+        orch.last_retention_prune_ms = Some(p0 - 3_605_000);
+        orch.maybe_run_maintenance(false);
+        assert!(
+            orch.last_retention_prune_ms.unwrap() > p0,
+            "Retention pruning must trigger after 1 hour elapsed wall-clock (R6-N1)"
+        );
+
+        // In LIVE mode, reconcile runs on every cycle
+        let t_before_live = orch.last_reconcile_ms.unwrap();
+        orch.maybe_run_maintenance(true);
+        assert!(orch.last_reconcile_ms.unwrap() >= t_before_live);
     }
 }

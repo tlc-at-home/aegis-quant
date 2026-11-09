@@ -157,12 +157,9 @@ impl DatabaseManager {
         if bars.is_empty() {
             return Ok(0);
         }
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+        self.with_immediate_tx(|conn| {
             {
-                let mut stmt = tx
+                let mut stmt = conn
                     .prepare_cached(
                         "INSERT INTO market_ohlcv (
                             symbol, timeframe, timestamp_ms, open, high, low, close,
@@ -194,8 +191,6 @@ impl DatabaseManager {
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 }
             }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(bars.len())
         })
     }
@@ -275,17 +270,14 @@ impl DatabaseManager {
         if evaluations.is_empty() {
             return Ok(());
         }
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+        self.with_immediate_tx(|conn| {
             {
-                let mut del_stmt = tx
+                let mut del_stmt = conn
                     .prepare_cached(
                         "DELETE FROM signal_evaluations WHERE timestamp_ms = ?1 AND base_asset = ?2;",
                     )
                     .map_err(|e| AegisError::Database(e.to_string()))?;
-                let mut stmt = tx
+                let mut stmt = conn
                     .prepare_cached(
                         "INSERT INTO signal_evaluations (
                             timestamp_ms, base_asset, exec_symbol, synth_symbol,
@@ -322,8 +314,6 @@ impl DatabaseManager {
                     .map_err(|e| AegisError::Database(e.to_string()))?;
                 }
             }
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(())
         })
     }
@@ -619,11 +609,8 @@ impl DatabaseManager {
         } else {
             aegis_core::normalize_timestamp_iso8601_utc(&trade.opened_at)
         };
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            if let Some(existing_id) = tx
+        self.with_immediate_tx(|conn| {
+            if let Some(existing_id) = conn
                 .query_row(
                     "SELECT trade_id FROM trades WHERE client_order_id = ?1 LIMIT 1;",
                     params![cli_id],
@@ -632,12 +619,10 @@ impl DatabaseManager {
                 .optional()
                 .map_err(|e| AegisError::Database(e.to_string()))?
             {
-                tx.commit()
-                    .map_err(|e| AegisError::Database(e.to_string()))?;
                 return Ok(existing_id);
             }
 
-            tx.execute(
+            conn.execute(
                 "INSERT INTO trades (
                     client_order_id, symbol, base_asset, side, status, fsm_state,
                     entry_price, current_price, quantity, notional_usdc,
@@ -685,9 +670,7 @@ impl DatabaseManager {
                 ],
             )
             .map_err(|e| AegisError::Database(e.to_string()))?;
-            let row_id = tx.last_insert_rowid();
-            tx.commit()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+            let row_id = conn.last_insert_rowid();
             Ok(row_id)
         })
     }
@@ -1156,12 +1139,9 @@ impl DatabaseManager {
         let ohlcv_cutoff_ms = now_ms - ohlcv_retention_days * 86_400_000;
         let telemetry_cutoff_ms = now_ms - telemetry_retention_days * 86_400_000;
 
-        self.with_conn(|conn| {
-            let tx = conn
-                .unchecked_transaction()
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+        self.with_immediate_tx(|conn| {
             // Preserve the core 7-asset Pit universe bars for full backtest history; prune old non-Pit Pond/synthetic bars
-            let ohlcv_deleted = tx
+            let ohlcv_deleted = conn
                 .execute(
                     "DELETE FROM market_ohlcv
                      WHERE timestamp_ms < ?1
@@ -1170,14 +1150,14 @@ impl DatabaseManager {
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            let telemetry_age_deleted = tx
+            let telemetry_age_deleted = conn
                 .execute(
                     "DELETE FROM telemetry_logs WHERE timestamp_ms < ?1;",
                     params![telemetry_cutoff_ms],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            let telemetry_cap_deleted = tx
+            let telemetry_cap_deleted = conn
                 .execute(
                     "DELETE FROM telemetry_logs
                      WHERE log_id NOT IN (
@@ -1187,9 +1167,6 @@ impl DatabaseManager {
                      );",
                     params![telemetry_max_rows],
                 )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-
-            tx.commit()
                 .map_err(|e| AegisError::Database(e.to_string()))?;
 
             Ok(json!({

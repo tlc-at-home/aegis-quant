@@ -553,6 +553,54 @@ impl PondOrchestrator {
         Ok(exits_triggered)
     }
 
+    /// Executes a scheduled Book B (`POND`) step: hourly S-Cycle scan on UTC hour boundary
+    /// (with 4H close flag on 4H boundary), or 15s tick otherwise (`R5-M3`, `R6-QA`).
+    pub fn run_scheduled_step(
+        &self,
+        last_scan_hour_bucket: &mut Option<i64>,
+        last_4h_close_bucket: &mut Option<i64>,
+    ) -> Result<Option<PondCycleSummary>> {
+        let now_ms = self.scoped_db.now_ms();
+        let now_hour_bucket = now_ms / 3_600_000;
+        let now_4h_bucket = now_ms / 14_400_000;
+        let is_hourly_scan = *last_scan_hour_bucket != Some(now_hour_bucket);
+        let is_4h_close = *last_4h_close_bucket != Some(now_4h_bucket);
+
+        if is_hourly_scan || is_4h_close {
+            match self.run_scan_cycle(is_4h_close) {
+                Ok(summary) => {
+                    *last_scan_hour_bucket = Some(now_hour_bucket);
+                    if is_4h_close {
+                        *last_4h_close_bucket = Some(now_4h_bucket);
+                    }
+                    Ok(Some(summary))
+                }
+                Err(e) => {
+                    tracing::error!("Hourly Pond scan cycle failed: {e}");
+                    let _ = self.scoped_db.log_telemetry(
+                        "ERROR",
+                        "pond.orchestrator",
+                        &format!("Hourly Pond scan cycle failed: {e}"),
+                        None,
+                    );
+                    Err(e)
+                }
+            }
+        } else {
+            if let Err(e) = self.run_tick_15s() {
+                tracing::error!("Pond 15s tick failed: {e}");
+                let _ = self.scoped_db.log_telemetry(
+                    "ERROR",
+                    "pond.orchestrator",
+                    &format!("Pond 15s tick failed: {e}"),
+                    None,
+                );
+                return Err(e);
+            }
+            Ok(None)
+        }
+    }
+
     /// Executes the 15-second tick loop step for open Pond cells (Tier 1 Catastrophic Wick Stop).
     pub fn run_tick_15s(&self) -> Result<usize> {
         if let Ok(stranded) = self.scoped_db.check_and_record_stranded_transfer_alert() {
@@ -918,7 +966,11 @@ impl PondOrchestrator {
     }
 }
 
-/// Spawns the Book B (`POND`) background loop inside a panic-isolated supervision boundary (Invariant F6).
+/// Spawns the Book B (`POND`) background Tokio task inside a panic-isolated supervision boundary (`Invariant F6`, `R4-M1`, `R6-QA`).
+///
+/// NOTE: This async background task spawner serves as a Tokio supervision test fixture and standalone async alternative to the
+/// synchronous daemon loop `run_scheduled_daemon_step` in `crates/aegis-cli/src/main.rs`. Cadence execution is single-sourced
+/// through `PondOrchestrator::run_scheduled_step`, ensuring identical cadence semantics and config reloading across both paths.
 pub fn spawn_pond_task(
     orchestrator: PondOrchestrator,
     tick_interval_sec: u64,
@@ -933,35 +985,25 @@ pub fn spawn_pond_task(
                 break;
             }
             let orch = orchestrator.clone();
-            let now_ms = Utc::now().timestamp_millis();
-            let now_hour_bucket = now_ms / 3_600_000;
-            let now_4h_bucket = now_ms / 14_400_000;
-            let is_hourly_scan = last_scan_hour_bucket != Some(now_hour_bucket);
-            let is_4h_close = last_4h_close_bucket != Some(now_4h_bucket);
+            let mut scan_bucket = last_scan_hour_bucket;
+            let mut close_bucket = last_4h_close_bucket;
 
             let step_fut = AssertUnwindSafe(async move {
                 tokio::task::spawn_blocking(move || {
-                    if is_hourly_scan || is_4h_close {
-                        orch.run_scan_cycle(is_4h_close).map(|_| ())
-                    } else {
-                        orch.run_tick_15s().map(|_| ())
-                    }
+                    let res = orch.run_scheduled_step(&mut scan_bucket, &mut close_bucket);
+                    (res, scan_bucket, close_bucket)
                 })
                 .await
             })
             .catch_unwind();
 
             match step_fut.await {
-                Ok(Ok(Ok(()))) => {
+                Ok(Ok((Ok(_summary_opt), scan_b, close_b))) => {
                     ticks += 1;
-                    if is_hourly_scan || is_4h_close {
-                        last_scan_hour_bucket = Some(now_hour_bucket);
-                    }
-                    if is_4h_close {
-                        last_4h_close_bucket = Some(now_4h_bucket);
-                    }
+                    last_scan_hour_bucket = scan_b;
+                    last_4h_close_bucket = close_b;
                 }
-                Ok(Ok(Err(e))) => {
+                Ok(Ok((Err(e), _, _))) => {
                     tracing::error!("Book B (POND) step error: {e}");
                 }
                 Ok(Err(join_err)) => {

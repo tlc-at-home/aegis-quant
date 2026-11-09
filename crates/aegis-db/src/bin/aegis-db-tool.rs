@@ -17,6 +17,7 @@ struct Args {
     generate_key: bool,
     show_web_token: bool,
     audit_dry_run_residue: bool,
+    reclassify_dry_run_before: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -39,6 +40,15 @@ fn parse_args() -> Args {
             "--generate-key" => args.generate_key = true,
             "--show-web-token" => args.show_web_token = true,
             "--audit-dry-run-residue" => args.audit_dry_run_residue = true,
+            "--reclassify-dry-run-before" => {
+                if let Some(val) = iter.next() {
+                    args.reclassify_dry_run_before = Some(val);
+                }
+            }
+            s if s.starts_with("--reclassify-dry-run-before=") => {
+                let val = s.trim_start_matches("--reclassify-dry-run-before=");
+                args.reclassify_dry_run_before = Some(val.to_string());
+            }
             "--verify" => {}
             _ => {}
         }
@@ -78,6 +88,19 @@ fn main() -> aegis_core::Result<()> {
             serde_json::to_string_pretty(&json!({
                 "suspect_partial_idle_capped_count": rows.len(),
                 "rows": rows,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if let Some(cutoff) = &args.reclassify_dry_run_before {
+        let count = db.reclassify_dry_run_transfers_before(cutoff)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "RECLASSIFIED",
+                "reclassified_count": count,
+                "cutoff_utc": cutoff,
             }))?
         );
         return Ok(());

@@ -32,7 +32,7 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-> **Note on Test Suite Execution Counts (`R5-N1`)**: The workspace defines and executes `95` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 4 unit + 5 `test_firewall_ast` integration, `aegis-core`: 8, `aegis-db`: 16, `aegis-execution`: 14, `aegis-pit`: 3, `aegis-pond`: 10, `aegis-risk`: 3, `aegis-settle`: 10, `aegis-signals`: 7, `aegis-telemetry`: 2, `aegis-web`: 8).
+> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`)**: The workspace defines and executes `101` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 18, `aegis-execution`: 15, `aegis-pit`: 3, `aegis-pond`: 10, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 7, `aegis-telemetry`: 2, `aegis-web`: 9).
 
 ### 2. Initialize / Migrate SQLite Database (Schema v10)
 
@@ -91,14 +91,15 @@ Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashb
 
 ### 5. Operational Cadence & Cross-Book Settling Runbook
 
-- **Loop Cadence Keys (`system_config`, `R5-M3`, `R5-QB`)**:
-  - `pit_tick_interval_seconds` (default `900`): Book A (`PitOrchestrator`) evaluation cadence. In `--book pit` mode (`aegis-pit.service`), the daemon sleeps for `pit_tick_interval_seconds` between cycles and reloads the key from `system_config` on every tick (`R5-N3`). In `--book both` mode (`aegis-quant.service`), full Book A cycles (`ingest_universe` + `evaluate_universe` + `reconcile_cycle_with_options`) execute on Cycle #1 and whenever `pit_tick_interval_seconds` has elapsed since `last_pit_cycle_ms`.
+- **Loop Cadence Keys (`system_config`, `R5-M3`, `R5-QB`, `R6-N1`, `R6-N5`)**:
+  - `pit_tick_interval_seconds` (default `900`): Book A (`PitOrchestrator`) evaluation cadence. In `--book pit` mode (`aegis-pit.service`), the daemon sleeps for `pit_tick_interval_seconds` between cycles and reloads the key from `system_config` on every tick (`R5-N3`). In `--book both` mode (`aegis-quant.service`), full Book A cycles (`ingest_universe` + `evaluate_universe` + `reconcile_cycle_with_options`, including Chandelier trailing-stop ratchets, regime exit evaluations, and LIVE exchange reconcile) execute on Cycle #1 and whenever `pit_tick_interval_seconds` has elapsed since `last_pit_cycle_ms`. Operators should note that Book A position management reacts at `pit_tick_interval_seconds` granularity (up to 900s), whereas Book B position management (wick-stop monitoring, Chandelier trailing, and resting-order state) evaluates at `pond_tick_interval_seconds` granularity (15s) (`R6-N1`).
   - `pond_tick_interval_seconds` (default `15`): Book B (`PondOrchestrator`) 15s Tier 1 wick-stop and resting-order evaluation cadence (with hourly S-Cycle scans on UTC hour boundaries and 4H close ratchets on 4H boundaries). Reloaded dynamically on every tick.
-  - `polling_interval_seconds` (default `15`): Top-level wake cadence ceiling in `--book both` mode (`sleep_sec = min(pond_tick_interval_seconds, polling_interval_seconds, pit_tick_interval_seconds)`).
+  - `polling_interval_seconds` (default `15`): Top-level wake cadence ceiling in `--book both` mode (`sleep_sec = min(pond_tick_interval_seconds, polling_interval_seconds, pit_tick_interval_seconds).max(1)`). Note the wake formula asymmetry (`R6-N5`): in `--book both` mode, the Pond step executes on every daemon wake iteration unless a Book A cycle is due. Consequently, `pond_tick_interval_seconds` only slows down Pond evaluations if it is configured smaller than `polling_interval_seconds`; setting `pond_tick_interval_seconds` higher than `polling_interval_seconds` will not throttle Pond ticks unless `polling_interval_seconds` is also increased.
+  - **Time-Based Periodic Maintenance Triggers (`R6-N1`)**: Rather than relying on cycle-count multiples (which drift when `pit_tick_interval_seconds` is lengthened), periodic maintenance triggers in `AegisOrchestrator` evaluate elapsed wall-clock time: exchange state reconciliation in PAPER mode runs every 5 minutes (`now_ms - last_reconcile_ms >= 300_000`, while LIVE/TESTNET reconciles on every PIT cycle), and retention data pruning runs every 1 hour (`now_ms - last_retention_prune_ms >= 3_600_000`), preserving intended operational intervals regardless of cadence configuration.
 - **Cross-Book Transfer Quarantine (`PARTIAL` / `AMBIGUOUS`)**:
   - Only `COMPLETED`, `CONFIRMED`, and live `PARTIAL_IDLE_CAPPED` rows in `book_transfers` are credited in virtual book equity (`BookTransferStatus::is_ledger_counted()`).
   - If a 2-leg subaccount transfer fails after Leg 1 (`attempts = 1`), it transitions to `PARTIAL` (USDC stranded in master wallet). If an L1 transfer times out post-broadcast (`POST_SEND_UNCERTAIN`), it transitions to `AMBIGUOUS`. Both states emit a throttled critical alert (`STRANDED_BOOK_TRANSFER`) until reconciled by an operator.
-- **Pre-Live Dry-Run Residue Audit & Remediation (`R5-M2`)**:
+- **Pre-Live Dry-Run Residue Audit & Remediation (`R5-M2`, `R6-N4`)**:
   - Before executing the first live settle on a database upgraded from pre-v8 builds, audit `book_transfers` for any historical `PARTIAL_IDLE_CAPPED` rows that lack a `DRY_RUN` marker:
     ```bash
     ./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
@@ -112,11 +113,11 @@ Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashb
       AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%';
     ```
   - If any historical dry-run rows remain from pre-v8 test windows, remediate using either:
-    1. **Timestamp-Window Reclassification**: Set `dry_run_reclassify_before_utc` in `system_config` to the ISO-8601 UTC cutoff timestamp before running `db --migrate`, or reclassify the known dry-run window directly:
-       ```sql
-       UPDATE book_transfers
-       SET status = 'DRY_RUN', transfer_mode = 'DRY_RUN_RECLASSIFIED'
-       WHERE status = 'PARTIAL_IDLE_CAPPED'
-         AND datetime(created_at) <= datetime('2026-11-08T00:00:00Z');
+    1. **Operator CLI Reclassification (`R6-N4`)**: Reclassify historical `PARTIAL_IDLE_CAPPED` rows before an ISO-8601 UTC timestamp directly via CLI without raw SQL:
+       ```bash
+       ./target/release/aegis-quant --db data/aegis_quant.db db --reclassify-dry-run-before 2026-11-08T00:00:00Z
+       # Or via standalone db tool:
+       ./target/release/aegis-db-tool --db data/aegis_quant.db --reclassify-dry-run-before 2026-11-08T00:00:00Z
        ```
-    2. **One-Step Ledger Baseline Reset**: Set `equity_baseline_reset_at` in `system_config` to the current ISO-8601 UTC upgrade timestamp (`YYYY-MM-DDTHH:MM:SSZ`), which rebases both books' ledgers and zeroes any prior historical transfer or PnL distortion in a single step.
+    2. **Migration Cutoff Reclassification**: Set `dry_run_reclassify_before_utc` in `system_config` to the ISO-8601 UTC cutoff timestamp before running `db --migrate`.
+    3. **One-Step Ledger Baseline Reset**: Set `equity_baseline_reset_at` in `system_config` to the current ISO-8601 UTC upgrade timestamp (`YYYY-MM-DDTHH:MM:SSZ`), which rebases both books' ledgers and zeroes any prior historical transfer or PnL distortion in a single step.

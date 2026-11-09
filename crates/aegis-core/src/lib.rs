@@ -144,6 +144,7 @@ impl Usdc {
 
     #[inline]
     pub fn new(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Usdc::new called with non-finite value: {val}");
         if val.is_finite() {
             Self(round_dp(val, 4))
         } else {
@@ -153,6 +154,7 @@ impl Usdc {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Usdc::new_clamped called with non-finite value: {val}");
         if val.is_finite() && val > 0.0 {
             Self(round_dp(val, 4))
         } else {
@@ -289,6 +291,7 @@ impl Price {
 
     #[inline]
     pub fn new(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Price::new called with non-finite value: {val}");
         if val.is_finite() {
             Self(val)
         } else {
@@ -298,6 +301,7 @@ impl Price {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Price::new_clamped called with non-finite value: {val}");
         if val.is_finite() && val > 0.0 {
             Self(val)
         } else {
@@ -374,6 +378,7 @@ impl Quantity {
 
     #[inline]
     pub fn new(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Quantity::new called with non-finite value: {val}");
         if val.is_finite() {
             Self(val)
         } else {
@@ -383,6 +388,7 @@ impl Quantity {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Quantity::new_clamped called with non-finite value: {val}");
         if val.is_finite() && val > 0.0 {
             Self(val)
         } else {
@@ -457,6 +463,7 @@ impl Leverage {
 
     #[inline]
     pub fn new(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Leverage::new called with non-finite value: {val}");
         if val.is_finite() {
             Self(val)
         } else {
@@ -466,6 +473,7 @@ impl Leverage {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Leverage::new_clamped called with non-finite value: {val}");
         if val.is_finite() && val >= 0.0 {
             Self(val)
         } else {
@@ -489,6 +497,7 @@ impl Bps {
 
     #[inline]
     pub fn new(val: f64) -> Self {
+        debug_assert!(val.is_finite(), "Bps::new called with non-finite value: {val}");
         if val.is_finite() {
             Self(val)
         } else {
@@ -503,6 +512,7 @@ impl Bps {
 
     #[inline]
     pub fn from_fraction(frac: f64) -> Self {
+        debug_assert!(frac.is_finite(), "Bps::from_fraction called with non-finite value: {frac}");
         if frac.is_finite() {
             Self(frac * 10_000.0)
         } else {
@@ -2626,14 +2636,42 @@ mod tests {
 
     #[test]
     fn test_r5_qa_usdc_price_quantity_finiteness_and_rounding() {
-        // Finiteness guards on Usdc::new, Price::new, Quantity::new
-        assert_eq!(Usdc::new(f64::NAN), Usdc::ZERO);
-        assert_eq!(Usdc::new(f64::INFINITY), Usdc::ZERO);
-        assert_eq!(Usdc::new(f64::NEG_INFINITY), Usdc::ZERO);
-        assert_eq!(Price::new(f64::NAN), Price::ZERO);
-        assert_eq!(Price::new(f64::INFINITY), Price::ZERO);
-        assert_eq!(Quantity::new(f64::NAN), Quantity::ZERO);
-        assert_eq!(Quantity::new(f64::NEG_INFINITY), Quantity::ZERO);
+        // R6-N2: Finiteness guards on Usdc, Price, Quantity, Leverage, Bps
+        #[cfg(debug_assertions)]
+        {
+            assert!(std::panic::catch_unwind(|| Usdc::new(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Usdc::new(f64::INFINITY)).is_err());
+            assert!(std::panic::catch_unwind(|| Usdc::new(f64::NEG_INFINITY)).is_err());
+            assert!(std::panic::catch_unwind(|| Usdc::new_clamped(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Price::new(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Price::new(f64::INFINITY)).is_err());
+            assert!(std::panic::catch_unwind(|| Price::new_clamped(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Quantity::new(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Quantity::new(f64::NEG_INFINITY)).is_err());
+            assert!(std::panic::catch_unwind(|| Quantity::new_clamped(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Leverage::new(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Leverage::new_clamped(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Bps::new(f64::NAN)).is_err());
+            assert!(std::panic::catch_unwind(|| Bps::from_fraction(f64::NAN)).is_err());
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(Usdc::new(f64::NAN), Usdc::ZERO);
+            assert_eq!(Usdc::new(f64::INFINITY), Usdc::ZERO);
+            assert_eq!(Usdc::new(f64::NEG_INFINITY), Usdc::ZERO);
+            assert_eq!(Usdc::new_clamped(f64::NAN), Usdc::ZERO);
+            assert_eq!(Price::new(f64::NAN), Price::ZERO);
+            assert_eq!(Price::new(f64::INFINITY), Price::ZERO);
+            assert_eq!(Price::new_clamped(f64::NAN), Price::ZERO);
+            assert_eq!(Quantity::new(f64::NAN), Quantity::ZERO);
+            assert_eq!(Quantity::new(f64::NEG_INFINITY), Quantity::ZERO);
+            assert_eq!(Quantity::new_clamped(f64::NAN), Quantity::ZERO);
+            assert_eq!(Leverage::new(f64::NAN), Leverage::ZERO);
+            assert_eq!(Leverage::new_clamped(f64::NAN), Leverage::ZERO);
+            assert_eq!(Bps::new(f64::NAN), Bps::ZERO);
+            assert_eq!(Bps::from_fraction(f64::NAN), Bps::ZERO);
+        }
 
         // 4-decimal rounding in Usdc::new, Add, Sub, AddAssign, SubAssign, Mul, Div
         let a = Usdc::new(0.1);

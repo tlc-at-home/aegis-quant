@@ -1644,12 +1644,10 @@ impl ExecutionEngine {
         let ref_px = last_bar
             .map(|b| b.close)
             .filter(|&p| p > 0.0)
-            .unwrap_or_else(|| {
-                if trade.current_price > 0.0 {
-                    trade.current_price
-                } else {
-                    trade.entry_price
-                }
+            .unwrap_or(if trade.current_price > 0.0 {
+                trade.current_price
+            } else {
+                trade.entry_price
             });
         let bar_high = last_bar.map(|b| b.high).unwrap_or(ref_px);
         let bar_low = last_bar.map(|b| b.low).unwrap_or(ref_px);
