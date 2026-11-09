@@ -151,9 +151,29 @@ impl PondOrchestrator {
                         .and_then(|r| r.strip_prefix("RESTING_OID:"))
                         .map(|s| s.to_string())
                 });
-            let status: RestingOrderStatus = self
+            let mut status: RestingOrderStatus = self
                 .execution
                 .check_resting_order_status(&cell.symbol, resting_oid.as_deref());
+            let mut cancel_confirmed_at_boundary = false;
+            if is_1h_boundary
+                && !(status.state == "FILLED" && status.filled_units > 0.0)
+                && status.state != "GONE"
+                && status.state != "CANCELLED_OR_GONE"
+            {
+                if let Some(oid_str) = resting_oid.as_deref() {
+                    cancel_confirmed_at_boundary = self
+                        .execution
+                        .cancel_resting_order(&cell.symbol, oid_str)
+                        .unwrap_or(false);
+                    status = self.execution.verify_post_cancel_resting_order(
+                        &cell.symbol,
+                        oid_str,
+                        cancel_confirmed_at_boundary,
+                    );
+                } else {
+                    cancel_confirmed_at_boundary = true;
+                }
+            }
             match status.state.as_str() {
                 "FILLED" if status.filled_units > 0.0 => {
                     let fill_px = if status.entry_price > 0.0 {
@@ -178,7 +198,12 @@ impl PondOrchestrator {
                     promoted += 1;
                 }
                 "GONE" | "CANCELLED_OR_GONE" => {
-                    cell.exit_reason = Some("RESTING_ENTRY_CANCELLED_OR_EXPIRED".to_string());
+                    let reason = if is_1h_boundary && cancel_confirmed_at_boundary {
+                        "RESTING_ENTRY_UNFILLED_EXPIRED"
+                    } else {
+                        "RESTING_ENTRY_CANCELLED_OR_EXPIRED"
+                    };
+                    cell.exit_reason = Some(reason.to_string());
                     cell.resting_order_id = None;
                     cell.closed_at = Some(now_str.clone());
                     cell.cooldown_until = Some(
@@ -192,14 +217,7 @@ impl PondOrchestrator {
                 "UNKNOWN" => {
                     // R3-H4: /info endpoint unreachable; preserve ARMED state and do not blindly mark REJECTED
                     if is_1h_boundary {
-                        let cancel_confirmed = match resting_oid.as_deref() {
-                            Some(oid_str) => self
-                                .execution
-                                .cancel_resting_order(&cell.symbol, oid_str)
-                                .unwrap_or(false),
-                            None => true,
-                        };
-                        if cancel_confirmed {
+                        if resting_oid.is_none() {
                             cell.exit_reason = Some("RESTING_ENTRY_UNFILLED_EXPIRED".to_string());
                             cell.resting_order_id = None;
                             cell.closed_at = Some(now_str.clone());
@@ -214,21 +232,14 @@ impl PondOrchestrator {
                             tracing::warn!(
                                 symbol = %cell.symbol,
                                 cell_id = cell.cell_id,
-                                "Resting ARMED Pond order status is UNKNOWN and cancel could not be confirmed at 1H boundary; keeping cell ARMED (R3-H4)"
+                                "Resting ARMED Pond order status is UNKNOWN at 1H boundary; keeping cell ARMED (R3-H4)"
                             );
                         }
                     }
                 }
                 _ => {
                     if is_1h_boundary {
-                        let cancel_confirmed = match resting_oid.as_deref() {
-                            Some(oid_str) => self
-                                .execution
-                                .cancel_resting_order(&cell.symbol, oid_str)
-                                .unwrap_or(false),
-                            None => true,
-                        };
-                        if cancel_confirmed {
+                        if cancel_confirmed_at_boundary && status.state != "OPEN_ON_BOOK" {
                             cell.exit_reason = Some("RESTING_ENTRY_UNFILLED_EXPIRED".to_string());
                             cell.resting_order_id = None;
                             cell.closed_at = Some(now_str.clone());

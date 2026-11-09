@@ -2016,6 +2016,51 @@ mod tests {
         db.cancel_resting_trade(tracked_tid, "TEST_CLEANUP")
             .unwrap();
 
+        // 1c. A historical CLOSED/REJECTED Pond cell that still has a leftover `resting_order_id`
+        // must NOT pollute `known_resting_oids` or `seen_coins` in `reconcile_exchange_state`.
+        db.upsert_pond_cell(&aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "AVAX/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "REJECTED".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(25.0),
+            quantity: Some(5.0),
+            notional_usdc: Some(125.0),
+            risk_budget_usdc: Some(5.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.5),
+            funding_rate_entry: Some(0.0005),
+            initial_stop: Some(26.5),
+            chandelier_stop: Some(26.5),
+            highest_price_seen: Some(25.0),
+            lowest_price_seen: Some(25.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: Some("RESTING_OID:33333".to_string()),
+            resting_order_id: Some("hl-33333".to_string()),
+            opened_at: None,
+            closed_at: Some("2026-11-09T16:00:00Z".to_string()),
+            cooldown_until: None,
+            updated_at: "2026-11-09T16:00:00Z".to_string(),
+        })
+        .unwrap();
+        let rep_stale_pond = exec.reconcile_exchange_state(
+            Some(&empty_ex),
+            Some(&[json!({"coin": "AVAX", "oid": 33333_u64})]),
+        );
+        assert!(
+            rep_stale_pond.discrepancies.iter().any(|d| {
+                d.get("type").and_then(|v| v.as_str()) == Some("DANGLING_OPEN_ORDER_CANCELLED")
+                    && d.get("oid").and_then(|v| v.as_u64()) == Some(33333_u64)
+            }),
+            "Stale REJECTED/CLOSED Pond cell with leftover resting_order_id must not shield oid 33333 from dangling-order cancellation"
+        );
+
         // 2. Pollute `portfolio_snapshots.total_equity_usdc` with $10,972.25 (simulating $10,517.65 unallocated Testnet faucet Spot USDC)
         // while `initial_equity_usdc = 1000.0` ($500 Book A, $125 single-asset cap).
         let mut polluted_snap = db.get_latest_portfolio_snapshot().unwrap();

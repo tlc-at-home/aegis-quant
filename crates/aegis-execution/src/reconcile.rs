@@ -459,7 +459,6 @@ impl ExecutionEngine {
             }
         };
         let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
-        let all_pond_cells = self.db.get_pond_cells(200).unwrap_or_default();
 
         // Aggregate local quantities per coin across both books (NM-5, NM-10)
         let mut pit_qty_by_coin: HashMap<String, f64> = HashMap::new();
@@ -496,28 +495,29 @@ impl ExecutionEngine {
             }
         }
         // R3-B4 & R4-N11: Protect resting Pond ARMED cells and their resting_order_id orders from dangling-order cancellation
-        for c in armed_pond_cells.iter().chain(all_pond_cells.iter()) {
+        for c in &armed_pond_cells {
+            if !c.state.eq_ignore_ascii_case("ARMED") {
+                continue;
+            }
             let resting_oid_raw = c.resting_order_id.as_deref().or_else(|| {
                 c.exit_reason
                     .as_deref()
                     .and_then(|r| r.strip_prefix("RESTING_OID:"))
             });
-            if c.state.eq_ignore_ascii_case("ARMED") || resting_oid_raw.is_some() {
-                let coin = c
-                    .symbol
-                    .split('/')
-                    .next()
-                    .unwrap_or(&c.symbol)
-                    .trim()
-                    .to_uppercase();
-                seen_coins.insert(coin);
-                if let Some(oid) = resting_oid_raw
-                    .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|&id| id > 0)
-                {
-                    known_resting_oids.insert(oid);
-                }
+            let coin = c
+                .symbol
+                .split('/')
+                .next()
+                .unwrap_or(&c.symbol)
+                .trim()
+                .to_uppercase();
+            seen_coins.insert(coin);
+            if let Some(oid) = resting_oid_raw
+                .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&id| id > 0)
+            {
+                known_resting_oids.insert(oid);
             }
         }
 
@@ -837,8 +837,6 @@ impl ExecutionEngine {
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
         // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`)
-        let is_testnet_cycle = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
-        let wallet_cycle = cfg.get_str("wallet_address", "").trim().to_string();
         let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
         for r_trade in resting_trades {
             let mut r_status = self
@@ -848,34 +846,8 @@ impl ExecutionEngine {
                     let cancel_confirmed = self
                         .cancel_resting_order(&r_trade.symbol, oid_str)
                         .unwrap_or(false);
-                    r_status = self.check_resting_order_status(&r_trade.symbol, Some(oid_str));
-                    if cancel_confirmed && r_status.state == "OPEN_ON_BOOK" {
-                        if let Some(target_oid) = oid_str
-                            .strip_prefix("hl-")
-                            .or(Some(oid_str))
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .filter(|&id| id > 0)
-                        {
-                            let (fills_reachable, fill_opt) = self
-                                .query_hyperliquid_fills_for_oid_with_reachability(
-                                    &wallet_cycle,
-                                    target_oid,
-                                    is_testnet_cycle,
-                                );
-                            if let Some((filled_sz, avg_px, total_fee)) = fill_opt {
-                                r_status = crate::RestingOrderStatus {
-                                    state: "FILLED".to_string(),
-                                    filled_units: filled_sz,
-                                    entry_price: avg_px,
-                                    fee_usdc: total_fee,
-                                };
-                            } else if fills_reachable {
-                                r_status.state = "GONE".to_string();
-                            } else {
-                                r_status.state = "UNKNOWN".to_string();
-                            }
-                        }
-                    }
+                    r_status =
+                        self.verify_post_cancel_resting_order(&r_trade.symbol, oid_str, cancel_confirmed);
                 }
             }
             if r_status.state == "FILLED" {

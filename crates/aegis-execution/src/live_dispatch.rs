@@ -417,7 +417,7 @@ impl ExecutionEngine {
             cfg.get_f64("taker_fee_bps", 4.5)
         };
 
-        let ack_res = parse_hyperliquid_order_ack(
+        let mut ack_res = parse_hyperliquid_order_ack(
             &resp,
             &asset.symbol,
             norm_side,
@@ -432,6 +432,71 @@ impl ExecutionEngine {
             let resp_lower = resp.to_string().to_ascii_lowercase();
             if resp_lower.contains("asset") || resp_lower.contains("invalid") {
                 self.asset_index_cache.lock().clear();
+            }
+            if is_reduce_only
+                && !prefer_maker
+                && ack_res
+                    .fill_type
+                    .to_ascii_lowercase()
+                    .contains("could not immediately match")
+            {
+                let info_endpoint = self.info_url(cfg, is_testnet);
+                let coin_key = asset.base_asset.trim().to_uppercase();
+                let live_mid = self
+                    .http_post_json(&info_endpoint, &json!({ "type": "allMids" }))
+                    .and_then(|mids| {
+                        mids.get(&coin_key)
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .filter(|&p| p.is_finite() && p > 0.0)
+                    })
+                    .unwrap_or(reference_price);
+                let retry_limit_px = if is_buy {
+                    live_mid * 1.05
+                } else {
+                    live_mid * 0.95
+                };
+                let retry_px_str =
+                    format_hl_wire_price(retry_limit_px, asset.tick_size, sz_decimals);
+                let retry_sz_str =
+                    format_hl_wire_size(quantity, asset.lot_step_size, sz_decimals);
+                let retry_action = OrderAction {
+                    action_type: "order".to_string(),
+                    orders: vec![OrderWire {
+                        a: asset_idx,
+                        b: is_buy,
+                        p: retry_px_str,
+                        s: retry_sz_str,
+                        r: true,
+                        t: OrderTypeWire {
+                            limit: Some(LimitOrderType {
+                                tif: "Ioc".to_string(),
+                            }),
+                            trigger: None,
+                        },
+                        c: None,
+                    }],
+                    grouping: "na".to_string(),
+                };
+                if let Ok((_, Some(retry_resp))) = self.post_signed_l1_action_with_nonce_retry(
+                    &priv_key,
+                    &retry_action,
+                    cfg,
+                    is_testnet,
+                ) {
+                    ack_res = parse_hyperliquid_order_ack(
+                        &retry_resp,
+                        &asset.symbol,
+                        norm_side,
+                        quantity,
+                        live_mid,
+                        false,
+                        fee_bps,
+                        coid,
+                    );
+                }
             }
         }
 
@@ -777,9 +842,80 @@ impl ExecutionEngine {
         let (_, resp_opt) =
             self.post_signed_l1_action_with_nonce_retry(&priv_key, &action, &cfg, is_testnet)?;
         if let Some(resp) = resp_opt {
-            return Ok(resp.get("status").and_then(Value::as_str) == Some("ok"));
+            if resp.get("status").and_then(Value::as_str) != Some("ok") {
+                return Ok(false);
+            }
+            if let Some(first_status) = resp
+                .get("response")
+                .and_then(|r| r.get("data"))
+                .and_then(|d| d.get("statuses"))
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+            {
+                if first_status.as_str() == Some("success") {
+                    return Ok(true);
+                }
+                if let Some(err_str) = first_status.get("error").and_then(Value::as_str) {
+                    let err_lower = err_str.to_ascii_lowercase();
+                    return Ok(err_lower.contains("already canceled")
+                        || err_lower.contains("already cancelled")
+                        || err_lower.contains("never placed")
+                        || err_lower.contains("filled")
+                        || err_lower.contains("unknown oid"));
+                }
+            }
+            return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Re-verifies a resting order's status immediately after attempting an L1 cancel (`NH-6`, `R3-H4`, `R3-H16`).
+    /// If `openOrders` is momentarily stale (`OPEN_ON_BOOK`) after a confirmed cancel, falls back to `userFills`
+    /// with reachability tracking so race-window or partial fills are promoted rather than dropped.
+    pub fn verify_post_cancel_resting_order(
+        &self,
+        symbol: &str,
+        oid_str: &str,
+        cancel_confirmed: bool,
+    ) -> RestingOrderStatus {
+        let mut r_status = self.check_resting_order_status(symbol, Some(oid_str));
+        if cancel_confirmed && r_status.state == "OPEN_ON_BOOK" {
+            if let Some(target_oid) = oid_str
+                .strip_prefix("hl-")
+                .or(Some(oid_str))
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&id| id > 0)
+            {
+                let cfg = self.load_config_logged("verify_post_cancel_resting_order");
+                let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+                let pond_mode = cfg
+                    .get_str("pond_execution_mode", &mode)
+                    .to_ascii_uppercase();
+                let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
+                    || mode == "TESTNET"
+                    || pond_mode == "TESTNET";
+                let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+                let (fills_reachable, fill_opt) = self
+                    .query_hyperliquid_fills_for_oid_with_reachability(
+                        &wallet,
+                        target_oid,
+                        is_testnet,
+                    );
+                if let Some((filled_sz, avg_px, total_fee)) = fill_opt {
+                    r_status = RestingOrderStatus {
+                        state: "FILLED".to_string(),
+                        filled_units: round_dp(filled_sz, 6),
+                        entry_price: round_dp(avg_px, 6),
+                        fee_usdc: round_dp(total_fee, 4),
+                    };
+                } else if fills_reachable {
+                    r_status.state = "GONE".to_string();
+                } else {
+                    r_status.state = "UNKNOWN".to_string();
+                }
+            }
+        }
+        r_status
     }
 
     /// Queries Hyperliquid `meta` endpoint to resolve dynamic coin -> integer asset index with TTL (`NM-10`).
@@ -1138,9 +1274,22 @@ impl ExecutionEngine {
                     }
                 }
             }
-            if let Some((spot_tot, spot_free)) =
+            if let Some((raw_spot_tot, raw_spot_free)) =
                 self.fetch_hyperliquid_spot_usdc_balance(&wallet, testnet)
             {
+                let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
+                let faucet_offset = if testnet
+                    && init_eq > 0.0
+                    && init_eq <= 5_000.0
+                    && raw_spot_tot >= 10_000.0
+                    && (ch_tot + raw_spot_tot + user_equity_usdc) > init_eq * 2.5
+                {
+                    10_000.0
+                } else {
+                    0.0
+                };
+                let spot_tot = (raw_spot_tot - faucet_offset).max(0.0);
+                let spot_free = (raw_spot_free - faucet_offset).max(0.0);
                 if spot_tot > 0.0 {
                     ch_tot += spot_tot;
                     ch_free += spot_free;
@@ -1352,21 +1501,34 @@ impl ExecutionEngine {
                 .unwrap_or(perp_eq);
         }
 
-        if let Some((spot_tot, spot_free)) =
+        let vault_state = self.fetch_hlp_vault_state(Some(&wallet), None, Some(is_testnet));
+        let vault_eq = vault_state
+            .get("user_vault_equity_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        if let Some((raw_spot_tot, raw_spot_free)) =
             self.fetch_hyperliquid_spot_usdc_balance(&wallet, is_testnet)
         {
+            let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
+            let faucet_offset = if is_testnet
+                && init_eq > 0.0
+                && init_eq <= 5_000.0
+                && raw_spot_tot >= 10_000.0
+                && (perp_eq + raw_spot_tot + vault_eq) > init_eq * 2.5
+            {
+                10_000.0
+            } else {
+                0.0
+            };
+            let spot_tot = (raw_spot_tot - faucet_offset).max(0.0);
+            let spot_free = (raw_spot_free - faucet_offset).max(0.0);
             if spot_tot > 0.0 {
                 perp_eq += spot_tot;
                 withdrawable += spot_free;
                 live_ok = true;
             }
         }
-
-        let vault_state = self.fetch_hlp_vault_state(Some(&wallet), None, Some(is_testnet));
-        let vault_eq = vault_state
-            .get("user_vault_equity_usdc")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
         let total_eq = round_dp(perp_eq + vault_eq, 2);
 
         if live_ok && total_eq > 0.0 {
