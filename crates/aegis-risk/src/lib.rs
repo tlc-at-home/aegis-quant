@@ -145,31 +145,44 @@ impl RiskEngine {
         let mult_long = cfg_ref
             .get_f64(
                 "chandelier_atr_multiplier_long",
-                cfg_ref.get_f64("chandelier_atr_multiplier", 3.0),
+                cfg_ref.get_f64("chandelier_atr_multiplier", 1.2),
             )
-            .max(0.5);
+            .max(0.3);
         let mult_short = cfg_ref
             .get_f64(
                 "chandelier_atr_multiplier_short",
-                (mult_long * 1.25).max(3.8),
+                mult_long.max(1.2),
             )
-            .max(0.5);
+            .max(0.3);
 
         let min_atr_pct = cfg_ref.get_f64(
             "chandelier_min_atr_pct",
-            cfg_ref.get_f64("risk_min_stop_pct_floor", 0.022),
+            cfg_ref.get_f64("risk_min_stop_pct_floor", 0.004),
         );
         let eff_atr = atr_value.max(bar_close * min_atr_pct).max(1e-8);
 
         let wick_buffer_atr = cfg_ref.get_f64(
             "chandelier_wick_buffer_atr",
-            cfg_ref.get_f64("chandelier_wick_overshoot_atr", 0.85),
+            cfg_ref.get_f64("chandelier_wick_overshoot_atr", 0.35),
         );
         let wick_overshoot_frac = cfg_ref.get_f64("wick_overshoot_slippage_fraction", 0.15);
         let stop_slippage_bps = cfg_ref.get_f64("stop_slippage_bps", 8.0);
+        let long_break_even_trigger_atr =
+            cfg_ref.get_f64("long_break_even_trigger_atr", 0.8);
+        let long_break_even_lock_atr = cfg_ref.get_f64("long_break_even_lock_atr", 0.25);
         let short_break_even_trigger_atr =
-            cfg_ref.get_f64("short_break_even_trigger_atr", 1.6);
-        let short_break_even_lock_atr = cfg_ref.get_f64("short_break_even_lock_atr", 0.45);
+            cfg_ref.get_f64("short_break_even_trigger_atr", 0.8);
+        let short_break_even_lock_atr = cfg_ref.get_f64("short_break_even_lock_atr", 0.25);
+        let trail_atr_mult = cfg_ref
+            .get_f64("chandelier_trail_atr_multiplier", 0.45)
+            .clamp(0.15, 3.0);
+        let trail_max_pct = cfg_ref
+            .get_f64("chandelier_trail_max_pct", 0.008)
+            .clamp(0.002, 0.50);
+        let tight_trail_enabled = trail_max_pct <= 0.05;
+        let tight_trail_dist = (trail_atr_mult * eff_atr)
+            .min(bar_close * trail_max_pct)
+            .max(tick_size * 2.0);
         let qty = quantity.abs();
 
         if side == "LONG" {
@@ -181,7 +194,15 @@ impl RiskEngine {
             };
 
             // Tier 1: Intrabar Low-Wick Emergency Stop
-            let wick_trigger_price = active_stop - wick_buffer_atr * eff_atr;
+            let prior_high = highest_price.max(entry_price);
+            let wick_base_stop = if tight_trail_enabled {
+                init_stop
+                    .max((prior_high - mult_long * eff_atr).min(bar_close - mult_long * eff_atr))
+                    .min(active_stop)
+            } else {
+                active_stop
+            };
+            let wick_trigger_price = wick_base_stop - wick_buffer_atr * eff_atr;
             if bar_low <= wick_trigger_price {
                 let overshoot = (wick_trigger_price - bar_low).max(0.0);
                 let raw_fill = (wick_trigger_price - wick_overshoot_frac * overshoot)
@@ -207,17 +228,53 @@ impl RiskEngine {
                 };
             }
 
-            // Tier 2: Confirmed Bar-Close Chandelier Ratchet
+            // Tier 2: Confirmed Bar-Close Chandelier Ratchet + Tight Current-Price Trail
             let new_highest = highest_price.max(entry_price).max(bar_close);
             let new_lowest = if lowest_price > 0.0 {
                 lowest_price.min(bar_low)
             } else {
                 bar_low
             };
-            let cand_stop = new_highest - mult_long * eff_atr;
-            let new_stop = Self::round_step(active_stop.max(cand_stop), tick_size, true);
 
-            if bar_close <= new_stop {
+            if !tight_trail_enabled {
+                let mut cand_stop = new_highest - mult_long * eff_atr;
+                if (new_highest - entry_price) >= long_break_even_trigger_atr * eff_atr {
+                    cand_stop = cand_stop.max(entry_price + long_break_even_lock_atr * eff_atr);
+                }
+                let new_stop = Self::round_step(active_stop.max(cand_stop), tick_size, true);
+                if bar_close <= new_stop {
+                    let raw_fill = bar_close * (1.0 - stop_slippage_bps / 10000.0);
+                    let fill_price =
+                        Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
+                    let exit_slippage_usdc = round_dp((bar_close - fill_price).max(0.0) * qty, 4);
+                    return ChandelierStopEvaluation {
+                        triggered: true,
+                        is_wick_stop: false,
+                        exit_reason: Some("CHANDELIER_STOP_LONG".to_string()),
+                        exit_fill_price: fill_price,
+                        exit_slippage_usdc,
+                        chandelier_stop_price: new_stop,
+                        highest_price_seen: new_highest,
+                        lowest_price_seen: new_lowest,
+                        effective_atr: eff_atr,
+                    };
+                }
+                return ChandelierStopEvaluation {
+                    triggered: false,
+                    is_wick_stop: false,
+                    exit_reason: None,
+                    exit_fill_price: 0.0,
+                    exit_slippage_usdc: 0.0,
+                    chandelier_stop_price: new_stop,
+                    highest_price_seen: new_highest,
+                    lowest_price_seen: new_lowest,
+                    effective_atr: eff_atr,
+                };
+            }
+
+            let trigger_stop = Self::round_step(active_stop, tick_size, true);
+
+            if bar_close <= trigger_stop {
                 let raw_fill = bar_close * (1.0 - stop_slippage_bps / 10000.0);
                 let fill_price =
                     Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
@@ -228,12 +285,27 @@ impl RiskEngine {
                     exit_reason: Some("CHANDELIER_STOP_LONG".to_string()),
                     exit_fill_price: fill_price,
                     exit_slippage_usdc,
-                    chandelier_stop_price: new_stop,
+                    chandelier_stop_price: trigger_stop,
                     highest_price_seen: new_highest,
                     lowest_price_seen: new_lowest,
                     effective_atr: eff_atr,
                 };
             }
+
+            let tight_floor = bar_close - tight_trail_dist;
+            let mut cand_stop = tight_floor;
+            if (new_highest - entry_price) >= long_break_even_trigger_atr * eff_atr {
+                cand_stop = cand_stop.max(
+                    (entry_price + long_break_even_lock_atr * eff_atr).min(tight_floor),
+                );
+            }
+            let new_stop = Self::round_step(
+                active_stop
+                    .max(cand_stop)
+                    .min((bar_close - tick_size).max(tick_size)),
+                tick_size,
+                true,
+            );
 
             ChandelierStopEvaluation {
                 triggered: false,
@@ -256,7 +328,19 @@ impl RiskEngine {
             };
 
             // Tier 1: Intrabar High-Wick Emergency Stop
-            let wick_trigger_price = active_stop + wick_buffer_atr * eff_atr;
+            let prior_low = if lowest_price > 0.0 {
+                lowest_price.min(entry_price)
+            } else {
+                entry_price
+            };
+            let wick_base_stop = if tight_trail_enabled {
+                init_stop
+                    .min((prior_low + mult_short * eff_atr).max(bar_close + mult_short * eff_atr))
+                    .max(active_stop)
+            } else {
+                active_stop
+            };
+            let wick_trigger_price = wick_base_stop + wick_buffer_atr * eff_atr;
             if bar_high >= wick_trigger_price {
                 let overshoot = (bar_high - wick_trigger_price).max(0.0);
                 let raw_fill = (wick_trigger_price + wick_overshoot_frac * overshoot)
@@ -273,29 +357,58 @@ impl RiskEngine {
                     exit_slippage_usdc,
                     chandelier_stop_price: Self::round_step(active_stop, tick_size, false),
                     highest_price_seen: highest_price.max(bar_high),
-                    lowest_price_seen: if lowest_price > 0.0 {
-                        lowest_price.min(entry_price)
-                    } else {
-                        entry_price
-                    },
+                    lowest_price_seen: prior_low,
                     effective_atr: eff_atr,
                 };
             }
 
-            // Tier 2: Confirmed Bar-Close Chandelier Ratchet + Profit Lock
+            // Tier 2: Confirmed Bar-Close Chandelier Ratchet + Profit Lock + Tight Current-Price Trail
             let new_lowest = if lowest_price > 0.0 {
                 lowest_price.min(entry_price).min(bar_close)
             } else {
                 entry_price.min(bar_close)
             };
             let new_highest = highest_price.max(bar_high);
-            let mut cand_stop = new_lowest + mult_short * eff_atr;
-            if (entry_price - new_lowest) >= short_break_even_trigger_atr * eff_atr {
-                cand_stop = cand_stop.min(entry_price - short_break_even_lock_atr * eff_atr);
-            }
-            let new_stop = Self::round_step(active_stop.min(cand_stop), tick_size, false);
 
-            if bar_close >= new_stop {
+            if !tight_trail_enabled {
+                let mut cand_stop = new_lowest + mult_short * eff_atr;
+                if (entry_price - new_lowest) >= short_break_even_trigger_atr * eff_atr {
+                    cand_stop = cand_stop.min(entry_price - short_break_even_lock_atr * eff_atr);
+                }
+                let new_stop = Self::round_step(active_stop.min(cand_stop), tick_size, false);
+                if bar_close >= new_stop {
+                    let raw_fill = bar_close * (1.0 + stop_slippage_bps / 10000.0);
+                    let fill_price =
+                        Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
+                    let exit_slippage_usdc = round_dp((fill_price - bar_close).max(0.0) * qty, 4);
+                    return ChandelierStopEvaluation {
+                        triggered: true,
+                        is_wick_stop: false,
+                        exit_reason: Some("CHANDELIER_STOP_SHORT".to_string()),
+                        exit_fill_price: fill_price,
+                        exit_slippage_usdc,
+                        chandelier_stop_price: new_stop,
+                        highest_price_seen: new_highest,
+                        lowest_price_seen: new_lowest,
+                        effective_atr: eff_atr,
+                    };
+                }
+                return ChandelierStopEvaluation {
+                    triggered: false,
+                    is_wick_stop: false,
+                    exit_reason: None,
+                    exit_fill_price: 0.0,
+                    exit_slippage_usdc: 0.0,
+                    chandelier_stop_price: new_stop,
+                    highest_price_seen: new_highest,
+                    lowest_price_seen: new_lowest,
+                    effective_atr: eff_atr,
+                };
+            }
+
+            let trigger_stop = Self::round_step(active_stop, tick_size, false);
+
+            if bar_close >= trigger_stop {
                 let raw_fill = bar_close * (1.0 + stop_slippage_bps / 10000.0);
                 let fill_price =
                     Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
@@ -306,12 +419,27 @@ impl RiskEngine {
                     exit_reason: Some("CHANDELIER_STOP_SHORT".to_string()),
                     exit_fill_price: fill_price,
                     exit_slippage_usdc,
-                    chandelier_stop_price: new_stop,
+                    chandelier_stop_price: trigger_stop,
                     highest_price_seen: new_highest,
                     lowest_price_seen: new_lowest,
                     effective_atr: eff_atr,
                 };
             }
+
+            let tight_ceil = bar_close + tight_trail_dist;
+            let mut cand_stop = tight_ceil;
+            if (entry_price - new_lowest) >= short_break_even_trigger_atr * eff_atr {
+                cand_stop = cand_stop.min(
+                    (entry_price - short_break_even_lock_atr * eff_atr).max(tight_ceil),
+                );
+            }
+            let new_stop = Self::round_step(
+                active_stop
+                    .min(cand_stop)
+                    .max(bar_close + tick_size),
+                tick_size,
+                false,
+            );
 
             ChandelierStopEvaluation {
                 triggered: false,
@@ -372,15 +500,15 @@ impl RiskEngine {
 
         let mult_long = cfg.get_f64(
             "chandelier_atr_multiplier_long",
-            cfg.get_f64("chandelier_atr_multiplier", 3.0),
+            cfg.get_f64("chandelier_atr_multiplier", 1.2),
         );
         let mult_short = cfg.get_f64(
             "chandelier_atr_multiplier_short",
-            (mult_long * 1.25).max(3.8),
+            mult_long.max(1.2),
         );
         let min_atr_pct = cfg.get_f64(
             "chandelier_min_atr_pct",
-            cfg.get_f64("risk_min_stop_pct_floor", 0.022),
+            cfg.get_f64("risk_min_stop_pct_floor", 0.004),
         );
         let chandelier_mult = if side == "LONG" { mult_long } else { mult_short };
 
@@ -692,5 +820,132 @@ mod tests {
         assert!((50.0..=250.0).contains(&budget));
         assert!((0.5..=2.0).contains(&mult));
     }
+
+    #[test]
+    fn test_tight_chandelier_trailing_stop_long_and_short() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let risk = RiskEngine::new(db.clone());
+
+        // 1. SHORT position (like NEAR/SOL/TAO): entry=317.85, current=299.10, wide prior stop=476.78
+        // Even if current_chandelier_stop started very wide (e.g. 476.78 from orphan reconciliation),
+        // evaluate_two_tier_chandelier_stop must ratchet it tightly above current price (~0.8% = ~301.49).
+        let short_eval = risk.evaluate_two_tier_chandelier_stop(
+            "SHORT",
+            317.85,  // entry_price
+            0.39,    // quantity
+            476.775, // current_stop
+            317.85,  // highest_price
+            299.10,  // lowest_price
+            305.00,  // bar_high (intrabar high above tight stop, but below catastrophic stop)
+            295.00,  // bar_low
+            299.10,  // bar_close
+            5.50,    // atr_value
+            0.01,    // tick_size
+            None,
+        );
+        assert!(
+            !short_eval.triggered,
+            "Intrabar bar_high within normal 4h bar must not prematurely stop out when bar_close is safely below active_stop"
+        );
+        assert!(
+            short_eval.chandelier_stop_price > 299.10
+                && short_eval.chandelier_stop_price <= 299.10 * 1.01,
+            "Short trailing stop {} must trail tightly within 1% of current price 299.10",
+            short_eval.chandelier_stop_price
+        );
+
+        // Next tick: price bounces above the tight trailed stop (e.g. bar_close = 302.50 > ~301.49)
+        let short_trig = risk.evaluate_two_tier_chandelier_stop(
+            "SHORT",
+            317.85,                          // entry_price
+            0.39,                            // quantity
+            short_eval.chandelier_stop_price, // current_stop
+            317.85,                          // highest_price
+            299.10,                          // lowest_price
+            303.00,                          // bar_high
+            298.00,                          // bar_low
+            302.50,                          // bar_close
+            5.50,                            // atr_value
+            0.01,                            // tick_size
+            None,
+        );
+        assert!(
+            short_trig.triggered,
+            "Bounce above tight short trailing stop must trigger exit"
+        );
+
+        // 2. LONG position: entry=100.0, current=108.0, prior stop=98.0
+        let long_eval = risk.evaluate_two_tier_chandelier_stop(
+            "LONG",
+            100.0, // entry_price
+            10.0,  // quantity
+            98.0,  // current_stop
+            108.5, // highest_price
+            100.0, // lowest_price
+            108.5, // bar_high
+            106.0, // bar_low (intrabar dip above catastrophic stop)
+            108.0, // bar_close
+            2.0,   // atr_value
+            0.01,  // tick_size
+            None,
+        );
+        assert!(!long_eval.triggered);
+        assert!(
+            long_eval.chandelier_stop_price < 108.0
+                && long_eval.chandelier_stop_price >= 108.0 * 0.99,
+            "Long trailing stop {} must trail tightly within 1% of current price 108.0",
+            long_eval.chandelier_stop_price
+        );
+
+        // Next tick: price drops below tight long trailing stop
+        let long_trig = risk.evaluate_two_tier_chandelier_stop(
+            "LONG",
+            100.0,                           // entry_price
+            10.0,                            // quantity
+            long_eval.chandelier_stop_price, // current_stop
+            108.5,                           // highest_price
+            100.0,                           // lowest_price
+            108.0,                           // bar_high
+            106.5,                           // bar_low
+            106.8,                           // bar_close
+            2.0,                             // atr_value
+            0.01,                            // tick_size
+            None,
+        );
+        assert!(
+            long_trig.triggered,
+            "Drop below tight long trailing stop must trigger exit"
+        );
+
+        // 3. Multi-day watermark bounce (SOL/USDC:USDC case):
+        // lowest_price=85.235 from days ago, current_stop=87.60, bar_close=86.97, atr=1.4375.
+        // Even though lowest_price + 1.2 * atr = 86.96 < bar_close (86.97), bar_close is safely
+        // below current_stop (87.60), so it must NOT falsely trigger and must NOT clamp stop to 1 tick.
+        let sol_eval = risk.evaluate_two_tier_chandelier_stop(
+            "SHORT",
+            90.32,  // entry_price
+            0.23,   // quantity
+            87.60,  // current_stop
+            92.009, // highest_price
+            85.235, // lowest_price
+            87.20,  // bar_high
+            85.45,  // bar_low
+            86.97,  // bar_close
+            1.4375, // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(
+            !sol_eval.triggered,
+            "Bounce from multi-day low watermark must not trigger when bar_close (86.97) < active_stop (87.60)"
+        );
+        assert!(
+            sol_eval.chandelier_stop_price >= 87.50 && sol_eval.chandelier_stop_price <= 87.60,
+            "Stop {} must remain at tight_trail_dist (~87.60), not clamped to 1 tick above 86.97",
+            sol_eval.chandelier_stop_price
+        );
+    }
 }
+
 

@@ -492,12 +492,14 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/v1/pond", get(api_pond))
         .route("/api/v1/pond/universe", get(api_pond_universe))
         .route("/api/v1/pond/cells", get(api_pond_cells))
+        .route("/api/v1/pond/cells/close", post(api_close_trade))
         .route("/api/v1/pond/cycles", get(api_pond_cycles))
         .route("/api/v1/pond/scan", post(api_trigger_pond_scan))
         .route("/api/v1/settle", get(api_settle))
         .route("/api/v1/settle/run", post(api_settle_run))
         .route("/api/v1/signals", get(api_signals))
         .route("/api/v1/trades", get(api_trades))
+        .route("/api/v1/trades/close", post(api_close_trade))
         .route("/api/v1/config", get(api_config).post(api_update_config))
         .route("/api/v1/config/batch", post(api_update_config_batch))
         .route(
@@ -516,11 +518,13 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/dashboard", get(api_dashboard))
         .route("/api/portfolio", get(api_portfolio))
         .route("/api/pond", get(api_pond))
+        .route("/api/pond/cells/close", post(api_close_trade))
         .route("/api/pond/scan", post(api_trigger_pond_scan))
         .route("/api/settle", get(api_settle))
         .route("/api/settle/run", post(api_settle_run))
         .route("/api/signals", get(api_signals))
         .route("/api/trades", get(api_trades))
+        .route("/api/trades/close", post(api_close_trade))
         .route("/api/config", get(api_config).post(api_update_config))
         .route("/api/config/batch", post(api_update_config_batch))
         .route(
@@ -1001,4 +1005,128 @@ mod tests {
         assert!(payloads::validate_config_update("calibration_timeframes_csv", "1h,4h").is_ok());
         assert!(payloads::validate_config_update("calibration_timeframes_csv", "1h,3h").is_err());
     }
+
+    #[tokio::test]
+    async fn test_manual_take_profit_close_endpoints_and_ui_wiring() {
+        let root = resolve_project_root();
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).expect("seed schema");
+        db.set_config_value("web_api_token", &json!("test-tp-token"))
+            .expect("set token");
+
+        // 1. Insert an open trade and an open Pond cell
+        db.reconcile_on_chain_orphan_position(
+            "TAO/USDC:USDC",
+            "TAO",
+            "SHORT",
+            0.39,
+            317.85,
+            299.10,
+            7.31,
+        )
+        .expect("insert open trade");
+        let open_trades = db.get_open_trades().unwrap();
+        let tao = open_trades
+            .iter()
+            .find(|t| t.symbol == "TAO/USDC:USDC")
+            .expect("TAO open trade");
+
+        let cell_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "NEAR/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(1.4486),
+                quantity: Some(747.8),
+                notional_usdc: Some(1083.26),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(0.0),
+                funding_rate_entry: Some(0.0),
+                initial_stop: Some(1.47),
+                chandelier_stop: Some(1.437),
+                highest_price_seen: Some(1.4486),
+                lowest_price_seen: Some(1.4258),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.2,
+                exit_price: None,
+                exit_reason: None,
+                opened_at: Some("2026-11-09T05:13:02Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-09T05:13:02Z".to_string(),
+                resting_order_id: None,
+            })
+            .expect("insert open pond cell");
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 2. Close open trade via POST /api/v1/trades/close
+        let close_trade_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/trades/close")
+            .header(header::AUTHORIZATION, "Bearer test-tp-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"trade_id":{}}}"#, tao.trade_id)))
+            .unwrap();
+        let close_trade_resp = app.clone().oneshot(close_trade_req).await.unwrap();
+        assert_eq!(close_trade_resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(close_trade_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let close_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(close_json["status"], "ok");
+        assert_eq!(close_json["close_result"]["exit_reason"], "MANUAL_TAKE_PROFIT");
+
+        // 3. Close open Pond cell via POST /api/v1/pond/cells/close
+        let close_cell_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/pond/cells/close")
+            .header(header::AUTHORIZATION, "Bearer test-tp-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"cell_id":{}}}"#, cell_id)))
+            .unwrap();
+        let close_cell_resp = app.clone().oneshot(close_cell_req).await.unwrap();
+        assert_eq!(close_cell_resp.status(), StatusCode::OK);
+        let cell_bytes = axum::body::to_bytes(close_cell_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let cell_json: serde_json::Value = serde_json::from_slice(&cell_bytes).unwrap();
+        assert_eq!(cell_json["status"], "ok");
+        assert_eq!(cell_json["close_result"]["exit_reason"], "MANUAL_TAKE_PROFIT");
+
+        // 4. Edge cases: empty payload and already-closed trade return 400 Bad Request
+        let empty_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/trades/close")
+            .header(header::AUTHORIZATION, "Bearer test-tp-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let empty_resp = app.clone().oneshot(empty_req).await.unwrap();
+        assert_eq!(empty_resp.status(), StatusCode::BAD_REQUEST);
+
+        let dup_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/trades/close")
+            .header(header::AUTHORIZATION, "Bearer test-tp-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"trade_id":{}}}"#, tao.trade_id)))
+            .unwrap();
+        let dup_resp = app.oneshot(dup_req).await.unwrap();
+        assert_eq!(dup_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 5. Verify static HTML and JS contain Take Profit button wiring
+        let app_js = std::fs::read_to_string(root.join("web/static/app.js")).unwrap();
+        assert!(app_js.contains("data-take-profit-trade"));
+        assert!(app_js.contains("data-take-profit-cell"));
+        assert!(app_js.contains("/api/v1/trades/close"));
+        assert!(app_js.contains("/api/v1/pond/cells/close"));
+    }
 }
+

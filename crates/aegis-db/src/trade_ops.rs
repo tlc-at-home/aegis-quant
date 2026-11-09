@@ -1279,21 +1279,29 @@ impl DatabaseManager {
     ) -> Result<i64> {
         let cfg = self.load_config_opts(false).unwrap_or_default();
         let stop_pct = cfg
-            .get_f64("orphan_reconcile_stop_pct", 0.09)
-            .clamp(0.005, 0.50);
+            .get_f64("orphan_reconcile_stop_pct", 0.015)
+            .clamp(0.002, 0.50);
+        let trail_pct = cfg
+            .get_f64("chandelier_trail_max_pct", 0.008)
+            .clamp(0.002, stop_pct);
         let size = quantity.abs();
         let px = if entry_price > 0.0 {
             entry_price
         } else {
             mark_price
         };
+        let ref_mark = if mark_price > 0.0 { mark_price } else { px };
         let notional = size * px;
-        let stop_mult = if side == "LONG" {
-            1.0 - stop_pct
+        let default_stop = if side == "LONG" {
+            round_dp((px * (1.0 - stop_pct)).min(ref_mark * (1.0 - trail_pct)), 6)
         } else {
-            1.0 + stop_pct
+            round_dp((px * (1.0 + stop_pct)).max(ref_mark * (1.0 + trail_pct)), 6)
         };
-        let default_stop = round_dp(px * stop_mult, 6);
+        let trail_stop = if side == "LONG" {
+            round_dp(ref_mark * (1.0 - trail_pct), 6)
+        } else {
+            round_dp(ref_mark * (1.0 + trail_pct), 6)
+        };
         let cli_id = format!("reconciled-{}", &Uuid::new_v4().simple().to_string()[..12]);
         let ex_id = format!("onchain-reconciled-{base_asset}-{}", self.now_ms());
 
@@ -1306,7 +1314,7 @@ impl DatabaseManager {
             status: "OPEN".to_string(),
             fsm_state: "FILLED".to_string(),
             entry_price: px,
-            current_price: if mark_price > 0.0 { mark_price } else { px },
+            current_price: ref_mark,
             exit_price: None,
             quantity: size,
             filled_units: size,
@@ -1315,14 +1323,10 @@ impl DatabaseManager {
             risk_budget_usdc: round_dp((px - default_stop).abs() * size, 2),
             conviction_multiplier: 1.0,
             initial_stop_price: default_stop,
-            chandelier_stop_price: default_stop,
-            current_stop_price: default_stop,
-            highest_price_seen: px.max(mark_price),
-            lowest_price_seen: if mark_price > 0.0 {
-                px.min(mark_price)
-            } else {
-                px
-            },
+            chandelier_stop_price: trail_stop,
+            current_stop_price: trail_stop,
+            highest_price_seen: px.max(ref_mark),
+            lowest_price_seen: px.min(ref_mark),
             realized_pnl_usdc: 0.0,
             unrealized_pnl_usdc,
             fees_paid_usdc: 0.0,

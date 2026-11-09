@@ -376,6 +376,34 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const openTradesTbody = document.getElementById('open-trades-tbody');
+  if (openTradesTbody) {
+    openTradesTbody.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-take-profit-trade]') : null;
+      if (btn) {
+        const tradeId = Number(btn.getAttribute('data-take-profit-trade'));
+        const symbol = btn.getAttribute('data-trade-symbol') || '';
+        if (Number.isFinite(tradeId) && tradeId > 0) {
+          triggerTakeProfit(tradeId, symbol, btn);
+        }
+      }
+    });
+  }
+
+  const pondCellsTbody = document.getElementById('pond-cells-tbody');
+  if (pondCellsTbody) {
+    pondCellsTbody.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest ? e.target.closest('button[data-take-profit-cell]') : null;
+      if (btn) {
+        const cellId = Number(btn.getAttribute('data-take-profit-cell'));
+        const symbol = btn.getAttribute('data-cell-symbol') || '';
+        if (Number.isFinite(cellId) && cellId > 0) {
+          triggerPondCellTakeProfit(cellId, symbol, btn);
+        }
+      }
+    });
+  }
+
   const hash = (window.location.hash || '').replace('#', '').toLowerCase();
   if (['overall', 'pit', 'pond', 'settings'].includes(hash)) {
     switchDashboardPage(hash);
@@ -650,7 +678,7 @@ function renderDashboard(data) {
   document.getElementById('open-trades-count').textContent = `${openTrades.length} OPEN`;
   const openTbody = document.getElementById('open-trades-tbody');
   if (openTrades.length === 0) {
-    openTbody.innerHTML = `<tr><td colspan="9" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
+    openTbody.innerHTML = `<tr><td colspan="10" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
   } else {
     openTbody.innerHTML = openTrades.map(t => {
       const upnl = (t.unrealized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0);
@@ -665,6 +693,7 @@ function renderDashboard(data) {
           <td>${fmtUsd(t.risk_budget_usdc)}</td>
           <td>${formatPnlPillHtml(upnl)}</td>
           <td class="text-muted">${escapeHtml(formatLocalTimestamp(t.opened_at))}</td>
+          <td><button type="button" class="success" style="padding: 3px 8px; font-size: 11px;" data-take-profit-trade="${escapeHtml(t.trade_id)}" data-trade-symbol="${escapeHtml(t.symbol)}" title="Manually take profit / close position #${escapeHtml(t.trade_id)}">Take Profit</button></td>
         </tr>
       `;
     }).join('');
@@ -737,7 +766,7 @@ function renderDashboard(data) {
   const recentCells = pond.recent_cells || [];
   const pondCellsTbody = document.getElementById('pond-cells-tbody');
   if (recentCells.length === 0) {
-    pondCellsTbody.innerHTML = '<tr><td colspan="17" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>';
+    pondCellsTbody.innerHTML = '<tr><td colspan="18" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>';
   } else {
     pondCellsTbody.innerHTML = recentCells.map((c) => {
       const isOpen = ['OPEN', 'TRAILED', 'ARMED'].includes(c.state);
@@ -756,6 +785,9 @@ function renderDashboard(data) {
         : (c.cooldown_until ? `COOLDOWN (${formatLocalTimestamp(c.cooldown_until)})` : '-');
       const reasonText = c.exit_reason ? replaceUtcTimestampsInText(c.exit_reason) : exitFallback;
       const exitLabel = escapeHtml(`${c.exit_tier ? `T${c.exit_tier}: ` : ''}${reasonText}`);
+      const actionCell = isOpen
+        ? `<button type="button" class="success" style="padding: 3px 8px; font-size: 11px;" data-take-profit-cell="${escapeHtml(c.cell_id)}" data-cell-symbol="${escapeHtml(c.symbol)}" title="Manually take profit / close Pond cell #${escapeHtml(c.cell_id)}">Take Profit</button>`
+        : '<span class="text-muted">-</span>';
       return `
         <tr>
           <td>#${escapeHtml(c.cell_id)}</td>
@@ -775,6 +807,7 @@ function renderDashboard(data) {
           <td class="${getPnlClass(c.unrealized_pnl_usdc)}">${formatPnlText(c.unrealized_pnl_usdc)}</td>
           <td>${formatPnlPillHtml(netPnl)}</td>
           <td class="text-muted">${exitLabel}</td>
+          <td>${actionCell}</td>
         </tr>
       `;
     }).join('');
@@ -1435,5 +1468,63 @@ async function triggerBacktest() {
   } finally {
     btn.disabled = false;
     btn.textContent = 'Run 365d Tear Sheet';
+  }
+}
+
+async function triggerTakeProfit(tradeId, symbol, btnEl) {
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Closing...';
+  }
+  try {
+    const res = await apiFetch('/api/v1/trades/close', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trade_id: Number(tradeId), reason: 'MANUAL_TAKE_PROFIT' })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(`Failed to close ${symbol || '#' + tradeId}: ${data.detail || data.error || 'Unknown error'}`);
+      return;
+    }
+    if (data.dashboard) {
+      renderDashboard(data.dashboard);
+    } else {
+      await fetchInitialDashboard();
+    }
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Take Profit';
+    }
+  }
+}
+
+async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = 'Closing...';
+  }
+  try {
+    const res = await apiFetch('/api/v1/pond/cells/close', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cell_id: Number(cellId), reason: 'MANUAL_TAKE_PROFIT' })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${data.detail || data.error || 'Unknown error'}`);
+      return;
+    }
+    if (data.dashboard) {
+      renderDashboard(data.dashboard);
+    } else {
+      await fetchInitialDashboard();
+    }
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Take Profit';
+    }
   }
 }

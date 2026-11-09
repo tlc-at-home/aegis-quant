@@ -618,7 +618,13 @@ impl ExecutionEngine {
         if mode == "LIVE" || mode == "TESTNET" {
             let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
             let chase_bps = cfg.get_f64("maker_chaser_offset_bps", 1.5);
-            let limit_px = if norm_side == "LONG" {
+            let limit_px = if is_reduce_only {
+                if norm_side == "LONG" {
+                    reference_price * 1.005
+                } else {
+                    reference_price * 0.995
+                }
+            } else if norm_side == "LONG" {
                 reference_price * (1.0 - chase_bps / 10_000.0)
             } else {
                 reference_price * (1.0 + chase_bps / 10_000.0)
@@ -1528,4 +1534,182 @@ mod tests {
             ingestion.compute_median_daily_volume_from_bars("SOL/USDC:USDC", 50_000.0, 7);
         assert!((median_vol - 480_000.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_orphan_position_stop_reconciliation_and_manual_take_profit() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // 1. Reconcile an orphan SHORT position on TAO/USDC:USDC (not in Pit universe_assets)
+        db.reconcile_on_chain_orphan_position(
+            "TAO/USDC:USDC",
+            "TAO",
+            "SHORT",
+            0.39,
+            317.85,
+            305.00,
+            5.01,
+        )
+        .unwrap();
+
+        let open_trades = db.get_open_trades().unwrap();
+        let tao = open_trades
+            .iter()
+            .find(|t| t.symbol == "TAO/USDC:USDC")
+            .expect("orphan TAO trade created");
+        // Verify initial stop and chandelier stop are tight around mark_price (305.00), NOT +50% (476.78)
+        assert!(
+            tao.chandelier_stop_price > 305.00 && tao.chandelier_stop_price < 310.00,
+            "Orphan chandelier stop {} should be tight (~0.8% above mark 305.00)",
+            tao.chandelier_stop_price
+        );
+
+        // 2. Insert 1h bars for TAO/USDC:USDC with latest close = 299.10 (no 4h bars needed due to 1h fallback)
+        let mut tao_bars = Vec::new();
+        let base_ts = 1_762_000_000_000i64;
+        for i in 0..20 {
+            let close = if i == 19 { 299.10 } else { 305.00 };
+            tao_bars.push(aegis_core::OhlcvBar {
+                symbol: "TAO/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + i * 3_600_000,
+                open: close,
+                high: close + 1.5,
+                low: close - 1.5,
+                close,
+                volume: 1000.0,
+                funding_rate_hourly: 0.0,
+                is_synthetic: 0,
+            });
+        }
+        db.upsert_ohlcv_batch(&tao_bars).unwrap();
+
+        // Run reconcile_cycle_with_options(&[], false, true) (stops-only mode) and verify TAO/USDC:USDC is evaluated
+        let _snapshot = exec.reconcile_cycle_with_options(&[], false, true).unwrap();
+
+        let open_after = db.get_open_trades().unwrap();
+        let tao_after = open_after
+            .iter()
+            .find(|t| t.symbol == "TAO/USDC:USDC")
+            .expect("TAO still open");
+        assert!(
+            (tao_after.current_price - 299.10).abs() < 1e-6,
+            "Orphan trade current_price must update to 299.10 (got {})",
+            tao_after.current_price
+        );
+        let expected_upnl = (317.85 - 299.10) * 0.39;
+        assert!(
+            (tao_after.unrealized_pnl_usdc - expected_upnl).abs() < 1e-3,
+            "Orphan trade uPnL must update to {:.4} (got {:.4})",
+            expected_upnl,
+            tao_after.unrealized_pnl_usdc
+        );
+        assert!(
+            tao_after.chandelier_stop_price > 299.10 && tao_after.chandelier_stop_price < 302.00,
+            "Orphan trade chandelier_stop_price must ratchet tightly above 299.10 (got {})",
+            tao_after.chandelier_stop_price
+        );
+
+        // 3. Manual Take Profit closes TAO/USDC:USDC
+        let close_res = exec
+            .close_open_trade_manual(tao_after.trade_id, None)
+            .expect("manual take profit succeeds");
+        assert_eq!(close_res["status"], "CLOSED");
+        assert_eq!(close_res["exit_reason"], "MANUAL_TAKE_PROFIT");
+        assert!((close_res["exit_price"].as_f64().unwrap() - 299.10).abs() < 1e-6);
+
+        // Edge case: attempting to close the same trade again must return an error
+        assert!(
+            exec.close_open_trade_manual(tao_after.trade_id, None)
+                .is_err(),
+            "Closing an already closed trade must return an error"
+        );
+        // Edge case: non-existent trade_id must return an error
+        assert!(
+            exec.close_open_trade_manual(999_999, None).is_err(),
+            "Closing a non-existent trade must return an error"
+        );
+
+        // 4. Verify sync_funding_payments recomputes unrealized_pnl_usdc from mark_px instead of keeping stale uPnL
+        let tao_long_id = db
+            .reconcile_on_chain_orphan_position(
+                "TAO/USDC:USDC",
+                "TAO",
+                "LONG",
+                0.548,
+                218.12,
+                224.24,
+                3.3538, // initially positive at 224.24
+            )
+            .unwrap();
+        let next_hour_ts = base_ts + 20 * 3_600_000;
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "TAO/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: next_hour_ts,
+            open: 204.20,
+            high: 205.00,
+            low: 203.50,
+            close: 204.20,
+            volume: 1200.0,
+            funding_rate_hourly: 0.0001,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+        let funding_report = exec.sync_funding_payments(Some(next_hour_ts), true);
+        assert_eq!(funding_report.positions_updated, 1);
+        let open_after_funding = db.get_open_trades().unwrap();
+        let tao_long = open_after_funding
+            .iter()
+            .find(|t| t.trade_id == tao_long_id)
+            .expect("TAO LONG still open");
+        let expected_long_upnl = aegis_core::round_dp((204.20 - 218.12) * 0.548, 4);
+        assert!(
+            (tao_long.unrealized_pnl_usdc - expected_long_upnl).abs() < 1e-4,
+            "sync_funding_payments must update unrealized_pnl_usdc to {} (got {})",
+            expected_long_upnl,
+            tao_long.unrealized_pnl_usdc
+        );
+
+        // 5. Verify close_open_pond_cell_manual cancels an ARMED Pond cell cleanly
+        let armed_cell_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "NEAR/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "ARMED".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(1.45),
+                quantity: Some(500.0),
+                notional_usdc: Some(725.0),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(0.0),
+                funding_rate_entry: Some(0.0),
+                initial_stop: Some(1.48),
+                chandelier_stop: Some(1.48),
+                highest_price_seen: Some(1.45),
+                lowest_price_seen: Some(1.45),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                exit_price: None,
+                exit_reason: None,
+                opened_at: None,
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-09T09:00:00Z".to_string(),
+                resting_order_id: Some("hl-paper-armed-1".to_string()),
+            })
+            .unwrap();
+        let armed_close = exec
+            .close_open_pond_cell_manual(armed_cell_id, None)
+            .expect("closing ARMED Pond cell succeeds");
+        assert_eq!(armed_close["status"], "CANCELLED_ARMED");
+        assert!(db.get_armed_pond_cells().unwrap().is_empty());
+    }
 }
+

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aegis_core::{
-    round_dp, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
+    round_dp, AegisError, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
 };
 use aegis_risk::RiskEngine;
 use serde_json::{json, Value};
@@ -139,11 +139,19 @@ impl ExecutionEngine {
                 },
                 4,
             );
+            let upnl = round_dp(
+                if trade.side == "LONG" {
+                    (mark_px - trade.entry_price) * trade.quantity.abs()
+                } else {
+                    (trade.entry_price - mark_px) * trade.quantity.abs()
+                },
+                4,
+            );
             match self.db.accrue_trade_funding_for_hour(
                 trade.trade_id,
                 hour_bucket_idx,
                 mark_px,
-                trade.unrealized_pnl_usdc,
+                upnl,
                 delta,
             ) {
                 Ok(true) => {
@@ -276,7 +284,25 @@ impl ExecutionEngine {
                                     .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                             })
                             .unwrap_or(0.0);
-                        ex_positions.insert(coin, (szi, entry_px, entry_px, upnl));
+                        let mark_px = pos
+                            .get("markPx")
+                            .and_then(|v| {
+                                v.as_f64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                            })
+                            .unwrap_or_else(|| {
+                                if szi.abs() > 1e-9 && entry_px > 0.0 {
+                                    let implied = entry_px + upnl / szi;
+                                    if implied.is_finite() && implied > 0.0 {
+                                        round_dp(implied, 6)
+                                    } else {
+                                        entry_px
+                                    }
+                                } else {
+                                    entry_px
+                                }
+                            });
+                        ex_positions.insert(coin, (szi, entry_px, mark_px, upnl));
                     }
                 }
             } else {
@@ -785,10 +811,41 @@ impl ExecutionEngine {
         }
 
         let usdc_assets = self.db.get_usdc_perp_universe()?;
-        let asset_by_symbol: HashMap<String, UniverseAsset> = usdc_assets
+        let mut asset_by_symbol: HashMap<String, UniverseAsset> = usdc_assets
             .into_iter()
             .map(|a| (a.symbol.clone(), a))
             .collect();
+        if let Ok(pond_rows) = self.db.get_pond_universe(false) {
+            for p in pond_rows {
+                asset_by_symbol.entry(p.symbol.clone()).or_insert_with(|| {
+                    let base = p
+                        .symbol
+                        .split('/')
+                        .next()
+                        .unwrap_or(&p.symbol)
+                        .trim()
+                        .to_string();
+                    UniverseAsset {
+                        asset_id: 0,
+                        symbol: p.symbol,
+                        base_asset: base,
+                        quote_asset: "USDC".to_string(),
+                        instrument_type: "USDC_PERP".to_string(),
+                        tier: 3,
+                        tier_name: "POND".to_string(),
+                        exec_timeframe: "4h".to_string(),
+                        rs_timeframe: "4h".to_string(),
+                        tick_size: p.tick_size.max(1e-8),
+                        lot_step_size: p.lot_step_size.max(1e-8),
+                        min_notional_usdc: p.min_notional_usdc.max(10.0),
+                        max_leverage: p.max_leverage.max(1.0),
+                        is_active: 1,
+                        updated_at: String::new(),
+                        reference_price: p.reference_price,
+                    }
+                });
+            }
+        }
         let eval_by_symbol: HashMap<String, &SignalEvaluation> = evaluations
             .iter()
             .map(|e| (e.exec_symbol.clone(), e))
@@ -800,12 +857,23 @@ impl ExecutionEngine {
         // 1. Evaluate open positions (Two-Tier Chandelier Stop + Regime Exit)
         let open_trades = self.db.get_open_trades()?;
         for trade in open_trades {
-            let Some(asset) = asset_by_symbol.get(&trade.symbol) else {
-                continue;
+            let fallback_asset;
+            let asset = match asset_by_symbol.get(&trade.symbol) {
+                Some(a) => a,
+                None => {
+                    fallback_asset =
+                        self.resolve_trade_asset(&trade.symbol, &trade.base_asset, trade.entry_price);
+                    &fallback_asset
+                }
             };
-            let bars =
+            let mut bars =
                 self.db
                     .get_ohlcv_bars(&trade.symbol, &asset.exec_timeframe, 30, Some(now_ms))?;
+            if bars.is_empty() && asset.exec_timeframe != "1h" {
+                bars = self
+                    .db
+                    .get_ohlcv_bars(&trade.symbol, "1h", 30, Some(now_ms))?;
+            }
             if bars.is_empty() {
                 continue;
             }
@@ -879,8 +947,13 @@ impl ExecutionEngine {
             if let Some(reason) = exit_reason {
                 let mut actual_exit_px = exit_px;
                 let actual_fees;
+                let is_paper_trade = trade
+                    .exchange_order_id
+                    .as_deref()
+                    .map(|oid| oid.starts_with("hl-paper-") || oid.starts_with("sim-"))
+                    .unwrap_or(false);
 
-                if (mode == "LIVE" || mode == "TESTNET") && !is_backtest {
+                if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && !is_paper_trade {
                     let close_side = if trade.side == "LONG" {
                         "SHORT"
                     } else {
@@ -930,24 +1003,67 @@ impl ExecutionEngine {
                         actual_fees =
                             round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
                     } else {
-                        let upnl = if trade.side == "LONG" {
-                            (last_bar.close - trade.entry_price) * trade.quantity
-                        } else {
-                            (trade.entry_price - last_bar.close) * trade.quantity
-                        };
-                        self.db.update_open_trade(
-                            trade.trade_id,
-                            last_bar.close,
-                            stop_eval.chandelier_stop_price,
-                            stop_eval.highest_price_seen,
-                            stop_eval.lowest_price_seen,
-                            round_dp(upnl, 4),
-                            trade.funding_accrued_usdc,
-                        )?;
-                        continue;
+                        let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+                        let priv_key = self.db.get_signing_private_key().unwrap_or_default();
+                        let is_testnet =
+                            cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+                        let mut confirmed_absent_on_exchange = false;
+                        if !wallet.is_empty() && !priv_key.trim().is_empty() {
+                            if let Some(ch) =
+                                self.fetch_hyperliquid_clearinghouse_state(&wallet, is_testnet)
+                            {
+                                if let Some(asset_positions) =
+                                    ch.get("assetPositions").and_then(Value::as_array)
+                                {
+                                    let target_coin = asset.base_asset.to_uppercase();
+                                    let mut found_open = false;
+                                    for item in asset_positions {
+                                        let pos = item.get("position").unwrap_or(item);
+                                        let coin = pos
+                                            .get("coin")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_uppercase();
+                                        let szi = pos
+                                            .get("szi")
+                                            .and_then(|v| {
+                                                v.as_f64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                                })
+                                            })
+                                            .unwrap_or(0.0);
+                                        if coin == target_coin && szi.abs() > 1e-8 {
+                                            found_open = true;
+                                            break;
+                                        }
+                                    }
+                                    confirmed_absent_on_exchange = !found_open;
+                                }
+                            }
+                        }
+                        if !confirmed_absent_on_exchange {
+                            let upnl = if trade.side == "LONG" {
+                                (last_bar.close - trade.entry_price) * trade.quantity
+                            } else {
+                                (trade.entry_price - last_bar.close) * trade.quantity
+                            };
+                            self.db.update_open_trade(
+                                trade.trade_id,
+                                last_bar.close,
+                                stop_eval.chandelier_stop_price,
+                                stop_eval.highest_price_seen,
+                                stop_eval.lowest_price_seen,
+                                round_dp(upnl, 4),
+                                trade.funding_accrued_usdc,
+                            )?;
+                            continue;
+                        }
+                        let exit_notional = trade.quantity.abs() * actual_exit_px;
+                        let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
+                        actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
                     }
                 } else {
-                    let exit_notional = trade.quantity * actual_exit_px;
+                    let exit_notional = trade.quantity.abs() * actual_exit_px;
                     let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
                     actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
                 }
@@ -1390,5 +1506,551 @@ impl ExecutionEngine {
         }
 
         Ok(snap)
+    }
+
+    /// Resolves `UniverseAsset` metadata for an open trade symbol from `universe_assets`,
+    /// falling back to `pond_universe` or price-scaled tick/lot defaults for orphan positions.
+    pub fn resolve_trade_asset(
+        &self,
+        symbol: &str,
+        base_asset: &str,
+        ref_price: f64,
+    ) -> UniverseAsset {
+        if let Ok(assets) = self.db.get_usdc_perp_universe() {
+            if let Some(found) = assets
+                .into_iter()
+                .find(|a| a.symbol == symbol || a.base_asset == base_asset)
+            {
+                return found;
+            }
+        }
+        if let Ok(pond_rows) = self.db.get_pond_universe(false) {
+            if let Some(p) = pond_rows.into_iter().find(|r| r.symbol == symbol) {
+                let base = if base_asset.trim().is_empty() {
+                    p.symbol
+                        .split('/')
+                        .next()
+                        .unwrap_or(&p.symbol)
+                        .trim()
+                        .to_string()
+                } else {
+                    base_asset.trim().to_string()
+                };
+                return UniverseAsset {
+                    asset_id: 0,
+                    symbol: p.symbol,
+                    base_asset: base,
+                    quote_asset: "USDC".to_string(),
+                    instrument_type: "USDC_PERP".to_string(),
+                    tier: 3,
+                    tier_name: "POND".to_string(),
+                    exec_timeframe: "4h".to_string(),
+                    rs_timeframe: "4h".to_string(),
+                    tick_size: p.tick_size.max(1e-8),
+                    lot_step_size: p.lot_step_size.max(1e-8),
+                    min_notional_usdc: p.min_notional_usdc.max(10.0),
+                    max_leverage: p.max_leverage.max(1.0),
+                    is_active: 1,
+                    updated_at: String::new(),
+                    reference_price: if p.reference_price > 0.0 {
+                        p.reference_price
+                    } else {
+                        ref_price.max(0.01)
+                    },
+                };
+            }
+        }
+        let inferred_tick = if ref_price >= 1000.0 {
+            0.1
+        } else if ref_price >= 10.0 {
+            0.01
+        } else if ref_price >= 1.0 {
+            0.0001
+        } else {
+            0.00001
+        };
+        let base = if base_asset.trim().is_empty() {
+            symbol.split('/').next().unwrap_or(symbol).trim().to_string()
+        } else {
+            base_asset.trim().to_string()
+        };
+        UniverseAsset {
+            asset_id: 0,
+            symbol: symbol.to_string(),
+            base_asset: base,
+            quote_asset: "USDC".to_string(),
+            instrument_type: "USDC_PERP".to_string(),
+            tier: 3,
+            tier_name: "ORPHAN".to_string(),
+            exec_timeframe: "4h".to_string(),
+            rs_timeframe: "4h".to_string(),
+            tick_size: inferred_tick,
+            lot_step_size: 0.001,
+            min_notional_usdc: 10.0,
+            max_leverage: 10.0,
+            is_active: 1,
+            updated_at: String::new(),
+            reference_price: ref_price.max(0.01),
+        }
+    }
+
+    /// Manually closes / takes profit on an open Book A (`PIT`) position (`trade_id`).
+    pub fn close_open_trade_manual(
+        &self,
+        trade_id: i64,
+        reason_override: Option<&str>,
+    ) -> Result<Value> {
+        let reason = reason_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("MANUAL_TAKE_PROFIT");
+
+        let open_trades = self.db.get_open_trades()?;
+        let Some(trade) = open_trades.into_iter().find(|t| t.trade_id == trade_id) else {
+            let resting = self.db.get_resting_pit_trades().unwrap_or_default();
+            if let Some(rt) = resting.into_iter().find(|t| t.trade_id == trade_id) {
+                if let Some(ref oid) = rt.exchange_order_id {
+                    let _ = self.cancel_resting_order(&rt.symbol, oid);
+                }
+                self.db.cancel_resting_trade(trade_id, reason)?;
+                return Ok(json!({
+                    "status": "CANCELLED_RESTING",
+                    "trade_id": trade_id,
+                    "symbol": rt.symbol,
+                    "exit_reason": reason,
+                }));
+            }
+            return Err(AegisError::Validation(format!(
+                "Open trade #{trade_id} not found or already closed"
+            )));
+        };
+
+        let cfg = self.db.load_config()?;
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
+        let asset = self.resolve_trade_asset(&trade.symbol, &trade.base_asset, trade.entry_price);
+
+        let mut bars = self
+            .db
+            .get_ohlcv_bars(&trade.symbol, &asset.exec_timeframe, 5, None)
+            .unwrap_or_default();
+        if bars.is_empty() && asset.exec_timeframe != "1h" {
+            bars = self
+                .db
+                .get_ohlcv_bars(&trade.symbol, "1h", 5, None)
+                .unwrap_or_default();
+        }
+        let last_bar = bars.last();
+        let ref_px = last_bar
+            .map(|b| b.close)
+            .filter(|&p| p > 0.0)
+            .unwrap_or_else(|| {
+                if trade.current_price > 0.0 {
+                    trade.current_price
+                } else {
+                    trade.entry_price
+                }
+            });
+        let bar_high = last_bar.map(|b| b.high).unwrap_or(ref_px);
+        let bar_low = last_bar.map(|b| b.low).unwrap_or(ref_px);
+        let bar_vol = last_bar.map(|b| b.volume).unwrap_or(50_000.0);
+
+        let close_side = if trade.side == "LONG" {
+            "SHORT"
+        } else {
+            "LONG"
+        };
+
+        let mut actual_exit_px = ref_px;
+        let actual_fees;
+        let is_paper_trade = trade
+            .exchange_order_id
+            .as_deref()
+            .map(|oid| oid.starts_with("hl-paper-") || oid.starts_with("sim-"))
+            .unwrap_or(false);
+
+        if (mode == "LIVE" || mode == "TESTNET") && !is_paper_trade {
+            let exec_close = self.execute_maker_limit_chaser(
+                &asset,
+                close_side,
+                trade.quantity,
+                ref_px,
+                bar_high,
+                bar_low,
+                bar_vol,
+                None,
+                None,
+                None,
+                true,
+            );
+            if exec_close.fsm_state == "FILLED"
+                && exec_close.filled_units > 0.0
+                && exec_close.avg_fill_price > 0.0
+            {
+                if exec_close.filled_units + 1e-8 < trade.quantity.abs() {
+                    let remaining_qty = (trade.quantity.abs() - exec_close.filled_units).max(0.0);
+                    let remaining_notional = round_dp(remaining_qty * trade.entry_price, 4);
+                    let partial_gross_pnl = if trade.side == "LONG" {
+                        (exec_close.avg_fill_price - trade.entry_price) * exec_close.filled_units
+                    } else {
+                        (trade.entry_price - exec_close.avg_fill_price) * exec_close.filled_units
+                    };
+                    self.db.reduce_open_trade_partial_exit(
+                        trade.trade_id,
+                        remaining_qty,
+                        remaining_notional,
+                        round_dp(partial_gross_pnl, 4),
+                        round_dp(exec_close.fees_paid_usdc, 4),
+                        round_dp(exec_close.slippage_paid_usd, 4),
+                        ref_px,
+                    )?;
+                    let _ = self.reconcile_cycle_with_options(&[], false, true);
+                    return Ok(json!({
+                        "status": "PARTIAL_CLOSE",
+                        "trade_id": trade.trade_id,
+                        "symbol": trade.symbol,
+                        "side": trade.side,
+                        "filled_units": exec_close.filled_units,
+                        "remaining_units": remaining_qty,
+                        "exit_price": exec_close.avg_fill_price,
+                        "realized_pnl_delta_usdc": round_dp(partial_gross_pnl - exec_close.fees_paid_usdc, 4),
+                        "exit_reason": reason,
+                    }));
+                }
+                actual_exit_px = exec_close.avg_fill_price;
+                actual_fees = round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
+            } else {
+                // Check if position still exists on exchange before falling back to local close
+                let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+                let priv_key = self.db.get_signing_private_key().unwrap_or_default();
+                let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+                let mut still_open_on_exchange = false;
+                if !wallet.is_empty() && !priv_key.trim().is_empty() {
+                    if let Some(ch) =
+                        self.fetch_hyperliquid_clearinghouse_state(&wallet, is_testnet)
+                    {
+                        if let Some(asset_positions) =
+                            ch.get("assetPositions").and_then(Value::as_array)
+                        {
+                            let target_coin = asset.base_asset.to_uppercase();
+                            for item in asset_positions {
+                                let pos = item.get("position").unwrap_or(item);
+                                let coin = pos
+                                    .get("coin")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_uppercase();
+                                let szi = pos
+                                    .get("szi")
+                                    .and_then(|v| {
+                                        v.as_f64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                        })
+                                    })
+                                    .unwrap_or(0.0);
+                                if coin == target_coin && szi.abs() > 1e-8 {
+                                    still_open_on_exchange = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if still_open_on_exchange {
+                    return Err(AegisError::Validation(format!(
+                        "Exchange reduce-only close order for {} (#{}) did not fill (state={})",
+                        trade.symbol, trade.trade_id, exec_close.fsm_state
+                    )));
+                }
+                let exit_notional = trade.quantity.abs() * actual_exit_px;
+                let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
+                actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
+            }
+        } else {
+            let exit_notional = trade.quantity.abs() * actual_exit_px;
+            let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
+            actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
+        }
+
+        let gross_pnl = if trade.side == "LONG" {
+            (actual_exit_px - trade.entry_price) * trade.quantity
+        } else {
+            (trade.entry_price - actual_exit_px) * trade.quantity
+        };
+        let net_pnl = round_dp(
+            gross_pnl + trade.realized_pnl_usdc - actual_fees + trade.funding_accrued_usdc,
+            4,
+        );
+        self.db.close_trade(
+            trade.trade_id,
+            actual_exit_px,
+            net_pnl,
+            actual_fees,
+            reason,
+        )?;
+        let _ = self.db.log_telemetry(
+            "INFO",
+            "engine.execution",
+            &format!(
+                "Manual take-profit / close executed for {} (#{} {}) at {:.4} (net_pnl={:+.4} USDC)",
+                trade.symbol, trade.trade_id, trade.side, actual_exit_px, net_pnl
+            ),
+            Some(json!({
+                "trade_id": trade.trade_id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "entry_price": trade.entry_price,
+                "exit_price": actual_exit_px,
+                "quantity": trade.quantity,
+                "realized_pnl_usdc": net_pnl,
+                "fees_paid_usdc": actual_fees,
+                "exit_reason": reason,
+            })),
+        );
+        let _ = self.reconcile_cycle_with_options(&[], false, true);
+
+        Ok(json!({
+            "status": "CLOSED",
+            "trade_id": trade.trade_id,
+            "symbol": trade.symbol,
+            "side": trade.side,
+            "quantity": trade.quantity,
+            "entry_price": trade.entry_price,
+            "exit_price": actual_exit_px,
+            "realized_pnl_usdc": net_pnl,
+            "fees_paid_usdc": actual_fees,
+            "exit_reason": reason,
+        }))
+    }
+
+    /// Manually closes / takes profit on an open or armed Book B (`POND`) cell (`cell_id`).
+    pub fn close_open_pond_cell_manual(
+        &self,
+        cell_id: i64,
+        reason_override: Option<&str>,
+    ) -> Result<Value> {
+        let reason = reason_override
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("MANUAL_TAKE_PROFIT");
+
+        let open_cells = self.db.get_open_pond_cells()?;
+        let cell = if let Some(c) = open_cells.into_iter().find(|c| c.cell_id == cell_id) {
+            c
+        } else {
+            let armed_cells = self.db.get_armed_pond_cells()?;
+            let Some(armed) = armed_cells.into_iter().find(|c| c.cell_id == cell_id) else {
+                return Err(AegisError::Validation(format!(
+                    "Open Pond cell #{cell_id} not found or already closed"
+                )));
+            };
+            if let Some(ref oid_str) = armed.resting_order_id {
+                if !oid_str.starts_with("hl-paper-") && !oid_str.starts_with("sim-") {
+                    let _ = self.cancel_resting_order(&armed.symbol, oid_str);
+                }
+            }
+            let ref_px = armed.entry_price.unwrap_or(0.0);
+            self.db
+                .reconcile_close_phantom_pond_cell(armed.cell_id, ref_px, reason)?;
+            let _ = self.db.log_telemetry(
+                "INFO",
+                "engine.pond",
+                &format!(
+                    "Manual cancel executed for ARMED Pond cell #{} ({} {})",
+                    armed.cell_id, armed.symbol, armed.side
+                ),
+                Some(json!({
+                    "cell_id": armed.cell_id,
+                    "symbol": armed.symbol,
+                    "side": armed.side,
+                    "exit_reason": reason,
+                })),
+            );
+            return Ok(json!({
+                "status": "CANCELLED_ARMED",
+                "cell_id": armed.cell_id,
+                "symbol": armed.symbol,
+                "side": armed.side,
+                "exit_reason": reason,
+            }));
+        };
+
+        let cfg = self.db.load_config()?;
+        let pond_mode = cfg
+            .get_str(
+                "pond_execution_mode",
+                &cfg.get_str("execution_mode", "PAPER"),
+            )
+            .to_ascii_uppercase();
+        let entry_px = cell.entry_price.unwrap_or(100.0);
+        let qty = cell.quantity.unwrap_or(0.0).abs();
+        let asset = self.resolve_trade_asset(&cell.symbol, "", entry_px);
+        let bars = self
+            .db
+            .get_ohlcv_bars(&cell.symbol, "1h", 5, None)
+            .unwrap_or_default();
+        let last_bar = bars.last();
+        let mark_px = last_bar
+            .map(|b| b.close)
+            .filter(|&p| p > 0.0)
+            .unwrap_or(entry_px);
+        let high_px = last_bar.map(|b| b.high).unwrap_or(mark_px);
+        let low_px = last_bar.map(|b| b.low).unwrap_or(mark_px);
+        let vol = last_bar.map(|b| b.volume).unwrap_or(50_000.0);
+        let close_side = if cell.side == "LONG" { "SELL" } else { "BUY" };
+
+        let fill = self.execute_pond_order(
+            &cell.symbol,
+            close_side,
+            qty,
+            mark_px,
+            asset.tick_size,
+            asset.lot_step_size,
+            high_px,
+            low_px,
+            vol,
+            true,
+            false,
+            true,
+            None,
+        );
+        if (pond_mode == "LIVE" || pond_mode == "TESTNET") && fill.fsm_state != "FILLED" {
+            let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+            let priv_key = self.db.get_signing_private_key().unwrap_or_default();
+            let is_testnet =
+                cfg.get_bool("hyperliquid_testnet", false) || pond_mode == "TESTNET";
+            let mut still_open_on_exchange = false;
+            if !wallet.is_empty() && !priv_key.trim().is_empty() {
+                if let Some(ch) = self.fetch_hyperliquid_clearinghouse_state(&wallet, is_testnet) {
+                    if let Some(asset_positions) =
+                        ch.get("assetPositions").and_then(Value::as_array)
+                    {
+                        let target_coin = asset.base_asset.to_uppercase();
+                        for item in asset_positions {
+                            let pos = item.get("position").unwrap_or(item);
+                            let coin = pos
+                                .get("coin")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_uppercase();
+                            let szi = pos
+                                .get("szi")
+                                .and_then(|v| {
+                                    v.as_f64().or_else(|| {
+                                        v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                    })
+                                })
+                                .unwrap_or(0.0);
+                            if coin == target_coin && szi.abs() > 1e-8 {
+                                still_open_on_exchange = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if still_open_on_exchange {
+                return Err(AegisError::Validation(format!(
+                    "Exchange reduce-only close order for Pond cell #{} ({}) did not fill (state={})",
+                    cell.cell_id, cell.symbol, fill.fsm_state
+                )));
+            }
+        }
+        let exit_px = if fill.avg_fill_price > 0.0 {
+            fill.avg_fill_price
+        } else {
+            mark_px
+        };
+        if fill.filled_units > 0.0 && fill.filled_units + 1e-8 < qty {
+            let partial_gross = if cell.side == "LONG" {
+                (exit_px - entry_px) * fill.filled_units
+            } else {
+                (entry_px - exit_px) * fill.filled_units
+            };
+            let rem_qty = round_dp((qty - fill.filled_units).max(0.0), 6);
+            let rem_notional = round_dp(rem_qty * entry_px, 2);
+            let _ = self.db.reduce_open_pond_cell_partial_exit(
+                cell.cell_id,
+                &cell.state,
+                cell.chandelier_stop,
+                cell.highest_price_seen,
+                cell.lowest_price_seen,
+                rem_qty,
+                rem_notional,
+                partial_gross,
+                fill.fees_paid_usdc,
+            )?;
+            return Ok(json!({
+                "status": "PARTIAL_CLOSE",
+                "cell_id": cell.cell_id,
+                "symbol": cell.symbol,
+                "side": cell.side,
+                "filled_units": fill.filled_units,
+                "remaining_units": rem_qty,
+                "exit_price": exit_px,
+                "realized_pnl_delta_usdc": round_dp(partial_gross - fill.fees_paid_usdc, 4),
+                "exit_reason": reason,
+            }));
+        }
+        let gross_pnl = if cell.side == "LONG" {
+            (exit_px - entry_px) * qty
+        } else {
+            (entry_px - exit_px) * qty
+        };
+        let cd_hours = cfg.get_i64("pond_cooldown_hours", 4).max(1);
+        let now = chrono::Utc::now();
+        let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let cooldown_str = (now + chrono::Duration::hours(cd_hours))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+
+        self.db.close_open_pond_cell(
+            cell.cell_id,
+            "COOLDOWN",
+            cell.chandelier_stop,
+            cell.highest_price_seen,
+            cell.lowest_price_seen,
+            exit_px,
+            gross_pnl,
+            fill.fees_paid_usdc,
+            Some(reason),
+            &now_str,
+            &cooldown_str,
+        )?;
+        let net_pnl = round_dp(
+            cell.realized_pnl_usdc + gross_pnl + cell.funding_accrued_usdc
+                - (cell.fees_paid_usdc + fill.fees_paid_usdc),
+            4,
+        );
+        let _ = self.db.log_telemetry(
+            "INFO",
+            "engine.pond",
+            &format!(
+                "Manual take-profit / close executed for Pond cell #{} ({} {}) at {:.4} (net_pnl={:+.4} USDC)",
+                cell.cell_id, cell.symbol, cell.side, exit_px, net_pnl
+            ),
+            Some(json!({
+                "cell_id": cell.cell_id,
+                "symbol": cell.symbol,
+                "side": cell.side,
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "quantity": qty,
+                "realized_pnl_usdc": net_pnl,
+                "exit_reason": reason,
+            })),
+        );
+
+        Ok(json!({
+            "status": "CLOSED",
+            "cell_id": cell.cell_id,
+            "symbol": cell.symbol,
+            "side": cell.side,
+            "quantity": qty,
+            "entry_price": entry_px,
+            "exit_price": exit_px,
+            "realized_pnl_usdc": net_pnl,
+            "exit_reason": reason,
+        }))
     }
 }

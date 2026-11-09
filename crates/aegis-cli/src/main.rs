@@ -870,12 +870,12 @@ pub fn run_readiness_suite(
                 .to_string(),
     });
 
-    let chand_long = cfg.get_f64("chandelier_atr_multiplier_long", 3.0);
-    let chand_short = cfg.get_f64("chandelier_atr_multiplier_short", 3.8);
-    let wick_buf = cfg.get_f64("chandelier_wick_buffer_atr", 0.85);
-    let stops_ok = (2.0..=5.0).contains(&chand_long)
-        && (2.5..=5.5).contains(&chand_short)
-        && (0.3..=1.5).contains(&wick_buf);
+    let chand_long = cfg.get_f64("chandelier_atr_multiplier_long", 1.2);
+    let chand_short = cfg.get_f64("chandelier_atr_multiplier_short", 1.2);
+    let wick_buf = cfg.get_f64("chandelier_wick_buffer_atr", 0.35);
+    let stops_ok = (0.5..=5.0).contains(&chand_long)
+        && (0.5..=5.5).contains(&chand_short)
+        && (0.15..=1.5).contains(&wick_buf);
 
     checks.push(CheckResult {
         gate: "Gate 3: Risk Guardrails".to_string(),
@@ -885,9 +885,9 @@ pub fn run_readiness_suite(
         observed: format!(
             "Long={chand_long}x ATR, Short={chand_short}x ATR, WickBuffer={wick_buf}x ATR"
         ),
-        requirement: "Long in [2.0, 5.0]x, Short in [2.5, 5.5]x, WickBuffer in [0.3, 1.5]x"
+        requirement: "Long in [0.5, 5.0]x, Short in [0.5, 5.5]x, WickBuffer in [0.15, 1.5]x"
             .to_string(),
-        remediation: "Restore Calibration 2 Chandelier ATR parameters in system_config"
+        remediation: "Restore Chandelier ATR parameters in system_config"
             .to_string(),
     });
 

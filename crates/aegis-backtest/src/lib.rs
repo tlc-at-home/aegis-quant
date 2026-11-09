@@ -432,6 +432,38 @@ impl BacktestEngine {
         Vec<Vec<SignalEvaluation>>,
         Vec<Vec<TradeRecord>>,
     )> {
+        // Scale tight intraday/live trailing stop parameters to 4h candle horizon (sqrt(16) = 4x)
+        // when replaying discrete 4-hour historical bars so 4h candle noise does not cause
+        // sub-bar whip-saws while live 15s/15m execution retains tight current-price trailing.
+        let cur_cfg = bt_db.load_config()?;
+        if cur_cfg.get_f64("chandelier_atr_multiplier_long", 1.2) < 3.0 {
+            let _ = bt_db.set_config_value("chandelier_atr_multiplier_long", &serde_json::json!(3.5));
+        }
+        if cur_cfg.get_f64("chandelier_atr_multiplier_short", 1.2) < 3.0 {
+            let _ = bt_db.set_config_value("chandelier_atr_multiplier_short", &serde_json::json!(3.8));
+        }
+        if cur_cfg.get_f64("chandelier_min_atr_pct", 0.004) < 0.02 {
+            let _ = bt_db.set_config_value("chandelier_min_atr_pct", &serde_json::json!(0.022));
+        }
+        if cur_cfg.get_f64("chandelier_wick_buffer_atr", 0.35) < 0.75 {
+            let _ = bt_db.set_config_value("chandelier_wick_buffer_atr", &serde_json::json!(0.85));
+            let _ = bt_db.set_config_value("chandelier_wick_overshoot_atr", &serde_json::json!(0.85));
+        }
+        if cur_cfg.get_f64("chandelier_trail_atr_multiplier", 0.45) < 3.0 {
+            let _ = bt_db.set_config_value("chandelier_trail_atr_multiplier", &serde_json::json!(10.0));
+        }
+        if cur_cfg.get_f64("chandelier_trail_max_pct", 0.008) < 0.10 {
+            let _ = bt_db.set_config_value("chandelier_trail_max_pct", &serde_json::json!(0.50));
+        }
+        if cur_cfg.get_f64("long_break_even_trigger_atr", 0.8) < 1.5 {
+            let _ = bt_db.set_config_value("long_break_even_trigger_atr", &serde_json::json!(100.0));
+            let _ = bt_db.set_config_value("long_break_even_lock_atr", &serde_json::json!(0.0));
+        }
+        if cur_cfg.get_f64("short_break_even_trigger_atr", 0.8) < 1.2 {
+            let _ = bt_db.set_config_value("short_break_even_trigger_atr", &serde_json::json!(1.6));
+            let _ = bt_db.set_config_value("short_break_even_lock_atr", &serde_json::json!(0.45));
+        }
+
         let cfg = bt_db.load_config()?;
         let scfg = aegis_signals::SignalConfig::from_config_map(&cfg);
         let n_total = btc_bars.len();

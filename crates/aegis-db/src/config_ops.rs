@@ -266,6 +266,114 @@ fn alert_config_defaults(
                 "Default relative-strength timeframe",
             ),
         ),
+        (
+            "chandelier_atr_multiplier_long",
+            (
+                "1.2",
+                "float",
+                "stops",
+                "Chandelier trailing stop ATR multiplier for Long positions",
+            ),
+        ),
+        (
+            "chandelier_atr_multiplier_short",
+            (
+                "1.2",
+                "float",
+                "stops",
+                "Inverted Chandelier trailing stop ATR multiplier for Short positions",
+            ),
+        ),
+        (
+            "chandelier_min_atr_pct",
+            (
+                "0.004",
+                "float",
+                "stops",
+                "Minimum effective ATR floor as fraction of price (0.4%)",
+            ),
+        ),
+        (
+            "chandelier_wick_buffer_atr",
+            (
+                "0.35",
+                "float",
+                "stops",
+                "Intrabar wick overshoot buffer in ATR multiples before Tier-1 emergency stop",
+            ),
+        ),
+        (
+            "chandelier_wick_overshoot_atr",
+            (
+                "0.35",
+                "float",
+                "stops",
+                "Intrabar wick overshoot buffer in ATR multiples before Tier-1 emergency stop",
+            ),
+        ),
+        (
+            "chandelier_trail_atr_multiplier",
+            (
+                "0.45",
+                "float",
+                "stops",
+                "Tight current-price trailing stop distance in ATR multiples",
+            ),
+        ),
+        (
+            "chandelier_trail_max_pct",
+            (
+                "0.008",
+                "float",
+                "stops",
+                "Maximum trailing stop distance as fraction of current price (0.8%)",
+            ),
+        ),
+        (
+            "orphan_reconcile_stop_pct",
+            (
+                "0.015",
+                "float",
+                "stops",
+                "Initial protective stop distance fraction for reconciled on-chain orphan positions (1.5%)",
+            ),
+        ),
+        (
+            "long_break_even_trigger_atr",
+            (
+                "0.8",
+                "float",
+                "stops",
+                "Favorable excursion in ATR multiples to lock break-even on Long positions",
+            ),
+        ),
+        (
+            "long_break_even_lock_atr",
+            (
+                "0.25",
+                "float",
+                "stops",
+                "Locked profit buffer in ATR multiples above entry once Long break-even triggers",
+            ),
+        ),
+        (
+            "short_break_even_trigger_atr",
+            (
+                "0.8",
+                "float",
+                "stops",
+                "Favorable excursion in ATR multiples to lock break-even on Short positions",
+            ),
+        ),
+        (
+            "short_break_even_lock_atr",
+            (
+                "0.25",
+                "float",
+                "stops",
+                "Locked profit buffer in ATR multiples below entry once Short break-even triggers",
+            ),
+        ),
     ])
 }
 

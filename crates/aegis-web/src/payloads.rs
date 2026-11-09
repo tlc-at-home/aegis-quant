@@ -98,6 +98,20 @@ pub struct ApiErrorBody {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CloseTradePayload {
+    pub trade_id: Option<i64>,
+    pub cell_id: Option<i64>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloseTradeResponse {
+    pub status: &'static str,
+    pub close_result: Value,
+    pub dashboard: FullDashboardPayload,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortfolioDashboardPayload {
     pub initial_equity_usdc: f64,

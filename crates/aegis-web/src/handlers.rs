@@ -7,11 +7,11 @@ use crate::{
         enrich_pond_cells, enrich_signals, map_err_response, run_db_blocking, AlertsUpdatePayload,
         AlertsUpdateResponse, ApiErrorBody, AuthLoginPayload, AuthLoginResponse,
         BacktestRequestPayload, BacktestRunResponse, BatchConfigUpdateResponse,
-        CalibrateRunResponse, ConfigBatchUpdatePayload, ConfigUpdatePayload,
-        CredentialsUpdatePayload, CredentialsUpdateResponse, CycleTriggerResponse, HealthPayload,
-        LimitQuery, PondScanTriggerResponse, PortfolioSummaryPayload, SettleRequestPayload,
-        SettleTriggerResponse, SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload,
-        WalletSyncResponse,
+        CalibrateRunResponse, CloseTradePayload, CloseTradeResponse, ConfigBatchUpdatePayload,
+        ConfigUpdatePayload, CredentialsUpdatePayload, CredentialsUpdateResponse,
+        CycleTriggerResponse, HealthPayload, LimitQuery, PondScanTriggerResponse,
+        PortfolioSummaryPayload, SettleRequestPayload, SettleTriggerResponse,
+        SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload, WalletSyncResponse,
     },
     AppState,
 };
@@ -697,6 +697,38 @@ pub async fn api_trigger_pond_scan(State(state): State<AppState>) -> Response {
         Ok(PondScanTriggerResponse {
             status: "ok",
             scan: scan_outcome,
+            dashboard,
+        })
+    })
+    .await
+    {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => map_err_response(e),
+    }
+}
+
+pub async fn api_close_trade(
+    State(state): State<AppState>,
+    Json(payload): Json<CloseTradePayload>,
+) -> Response {
+    let _guard = state.cycle_lock.lock().await;
+    match run_db_blocking(state.db.clone(), move |db| {
+        let exec = ExecutionEngine::new(db.clone());
+        let reason = payload.reason.as_deref();
+        let close_result = if let Some(trade_id) = payload.trade_id {
+            exec.close_open_trade_manual(trade_id, reason)?
+        } else if let Some(cell_id) = payload.cell_id {
+            exec.close_open_pond_cell_manual(cell_id, reason)?
+        } else {
+            return Err(aegis_core::AegisError::Validation(
+                "Either trade_id or cell_id must be provided".to_string(),
+            )
+            .into());
+        };
+        let dashboard = build_dashboard_payload(&db)?;
+        Ok(CloseTradeResponse {
+            status: "ok",
+            close_result,
             dashboard,
         })
     })
