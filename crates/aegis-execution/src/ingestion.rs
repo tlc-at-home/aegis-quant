@@ -1052,10 +1052,12 @@ impl MarketIngestionEngine {
                     .unwrap_or(0.0)
             });
 
+            let now_hour_bucket = now_ms / 3_600_000;
+            let now_4h_bucket = now_ms / 14_400_000;
             let need_1h = bars_1h.len() < hours
                 || bars_1h
                     .last()
-                    .map(|b| now_ms - b.timestamp_ms > 3_600_000)
+                    .map(|b| b.timestamp_ms / 3_600_000 < now_hour_bucket)
                     .unwrap_or(true);
             if need_1h {
                 if let Some(fetched_1h) =
@@ -1063,12 +1065,36 @@ impl MarketIngestionEngine {
                 {
                     bars_1h = fetched_1h;
                 }
+            } else if live_funding_map.is_none() {
+                if let Some(mut recent_1h) =
+                    self.fetch_hyperliquid_candles(&coin, "1h", 4, f_rate)
+                {
+                    for rb in &mut recent_1h {
+                        if let Some(existing) = bars_1h
+                            .iter_mut()
+                            .rev()
+                            .find(|b| b.timestamp_ms == rb.timestamp_ms)
+                        {
+                            if existing.funding_rate_hourly.abs() > 0.0 {
+                                rb.funding_rate_hourly = existing.funding_rate_hourly;
+                            }
+                            *existing = rb.clone();
+                        } else if rb.timestamp_ms
+                            > bars_1h.last().map(|b| b.timestamp_ms).unwrap_or(0)
+                        {
+                            bars_1h.push(rb.clone());
+                        }
+                    }
+                    if let Err(e) = self.db.upsert_ohlcv_batch(&recent_1h) {
+                        tracing::error!(symbol = symbol, error = %e, "Failed to upsert recent 1h pond bars");
+                    }
+                }
             }
 
             let need_4h = bars_4h.len() < (hours / 4).max(65)
                 || bars_4h
                     .last()
-                    .map(|b| now_ms - b.timestamp_ms > 14_400_000)
+                    .map(|b| b.timestamp_ms / 14_400_000 < now_4h_bucket)
                     .unwrap_or(true);
             if need_4h {
                 if let Some(fetched_4h) =
@@ -1078,6 +1104,30 @@ impl MarketIngestionEngine {
                         tracing::error!(symbol = symbol, error = %e, "Failed to upsert 4h pond bars");
                     }
                     bars_4h = fetched_4h;
+                }
+            } else if live_funding_map.is_none() {
+                if let Some(mut recent_4h) =
+                    self.fetch_hyperliquid_candles(&coin, "4h", 2, f_rate)
+                {
+                    for rb in &mut recent_4h {
+                        if let Some(existing) = bars_4h
+                            .iter_mut()
+                            .rev()
+                            .find(|b| b.timestamp_ms == rb.timestamp_ms)
+                        {
+                            if existing.funding_rate_hourly.abs() > 0.0 {
+                                rb.funding_rate_hourly = existing.funding_rate_hourly;
+                            }
+                            *existing = rb.clone();
+                        } else if rb.timestamp_ms
+                            > bars_4h.last().map(|b| b.timestamp_ms).unwrap_or(0)
+                        {
+                            bars_4h.push(rb.clone());
+                        }
+                    }
+                    if let Err(e) = self.db.upsert_ohlcv_batch(&recent_4h) {
+                        tracing::error!(symbol = symbol, error = %e, "Failed to upsert recent 4h pond bars");
+                    }
                 }
             }
 

@@ -433,29 +433,79 @@ impl ExecutionEngine {
             if resp_lower.contains("asset") || resp_lower.contains("invalid") {
                 self.asset_index_cache.lock().clear();
             }
-            if !prefer_maker
-                && ack_res
-                    .fill_type
-                    .to_ascii_lowercase()
-                    .contains("could not immediately match")
-            {
+            let fill_lower = ack_res.fill_type.to_ascii_lowercase();
+            let is_no_match = fill_lower.contains("could not immediately match");
+            let is_oracle_band = fill_lower.contains("price too far from oracle");
+            if !prefer_maker && (is_no_match || is_oracle_band) {
                 let info_endpoint = self.info_url(cfg, is_testnet);
                 let coin_key = asset.base_asset.trim().to_uppercase();
-                let live_mid = self
-                    .http_post_json(&info_endpoint, &json!({ "type": "allMids" }))
-                    .and_then(|mids| {
-                        mids.get(&coin_key)
-                            .and_then(|v| {
-                                v.as_f64()
-                                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                            })
-                            .filter(|&p| p.is_finite() && p > 0.0)
-                    })
-                    .unwrap_or(reference_price);
+                let mut live_mid_opt: Option<f64> = None;
+                let mut oracle_px_opt: Option<f64> = None;
+                if let Some(meta_ctxs) =
+                    self.http_post_json(&info_endpoint, &json!({ "type": "metaAndAssetCtxs" }))
+                {
+                    if let Some(arr) = meta_ctxs.as_array() {
+                        if arr.len() >= 2 {
+                            if let (Some(univ), Some(ctxs)) = (
+                                arr[0].get("universe").and_then(Value::as_array),
+                                arr[1].as_array(),
+                            ) {
+                                for (m, c) in univ.iter().zip(ctxs.iter()) {
+                                    let name = m.get("name").and_then(Value::as_str).unwrap_or("");
+                                    if name.eq_ignore_ascii_case(&coin_key) {
+                                        oracle_px_opt = c
+                                            .get("oraclePx")
+                                            .and_then(|v| {
+                                                v.as_f64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                                })
+                                            })
+                                            .filter(|&p| p.is_finite() && p > 0.0);
+                                        live_mid_opt = c
+                                            .get("midPx")
+                                            .or_else(|| c.get("markPx"))
+                                            .and_then(|v| {
+                                                v.as_f64().or_else(|| {
+                                                    v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                                })
+                                            })
+                                            .filter(|&p| p.is_finite() && p > 0.0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if live_mid_opt.is_none() {
+                    live_mid_opt = self
+                        .http_post_json(&info_endpoint, &json!({ "type": "allMids" }))
+                        .and_then(|mids| {
+                            mids.get(&coin_key)
+                                .and_then(|v| {
+                                    v.as_f64().or_else(|| {
+                                        v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                    })
+                                })
+                                .filter(|&p| p.is_finite() && p > 0.0)
+                        });
+                }
+                let live_mid = live_mid_opt.unwrap_or(reference_price);
+                let slip_mult = if is_no_match { 0.05 } else { 0.003 };
                 let retry_limit_px = if is_buy {
-                    live_mid * 1.05
+                    let cand = live_mid * (1.0 + slip_mult);
+                    if let Some(opx) = oracle_px_opt {
+                        cand.min(opx * 1.0395)
+                    } else {
+                        cand
+                    }
                 } else {
-                    live_mid * 0.95
+                    let cand = live_mid * (1.0 - slip_mult);
+                    if let Some(opx) = oracle_px_opt {
+                        cand.max(opx * 0.9605)
+                    } else {
+                        cand
+                    }
                 };
                 let retry_px_str =
                     format_hl_wire_price(retry_limit_px, asset.tick_size, sz_decimals);

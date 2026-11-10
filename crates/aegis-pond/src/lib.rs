@@ -359,10 +359,76 @@ impl PondOrchestrator {
                     loaded
                 }
             };
-            let atr_1h = compute_atr_from_bars(&bars_1h, cfg.pond_atr_period.max(1)).max(0.01);
+            let last_1h = bars_1h.last();
+            let entry_px = cell.entry_price.unwrap_or(100.0);
+            let mark_px = last_1h
+                .map(|b| b.close)
+                .filter(|&p| p > 0.0)
+                .unwrap_or(entry_px);
+            let opened_at_ms = cell
+                .opened_at
+                .as_deref()
+                .and_then(parse_utc_timestamp)
+                .map(|dt| dt.and_utc().timestamp_millis());
+            let last_bar_high = last_1h.map(|b| b.high).unwrap_or(mark_px);
+            let last_bar_low = last_1h.map(|b| b.low).unwrap_or(mark_px);
+            let mut watermark_high = last_bar_high;
+            let mut watermark_low = last_bar_low;
+            let mut high_px = last_bar_high;
+            let mut low_px = last_bar_low;
+            let mut extreme_bar_idx = bars_1h.len().saturating_sub(1);
+            if let Some(open_ms) = opened_at_ms {
+                let start_idx = bars_1h.len().saturating_sub(6);
+                let mut peak_idx = start_idx;
+                let mut trough_idx = start_idx;
+                for (idx, b) in bars_1h.iter().enumerate().skip(start_idx) {
+                    if b.timestamp_ms >= open_ms {
+                        if b.high >= watermark_high {
+                            watermark_high = b.high;
+                            peak_idx = idx;
+                        }
+                        if b.low > 0.0 && b.low <= watermark_low {
+                            watermark_low = b.low;
+                            trough_idx = idx;
+                        }
+                    }
+                }
+                let post_watermark_start = if cell.side == "LONG" {
+                    if watermark_high >= cell.highest_price_seen.unwrap_or(0.0) - 1e-8 {
+                        peak_idx
+                    } else {
+                        start_idx
+                    }
+                } else if watermark_low <= cell.lowest_price_seen.unwrap_or(f64::MAX) + 1e-8 {
+                    trough_idx
+                } else {
+                    start_idx
+                };
+                for (idx, b) in bars_1h.iter().enumerate().skip(post_watermark_start) {
+                    if b.timestamp_ms >= open_ms {
+                        if b.high > high_px {
+                            high_px = b.high;
+                            if cell.side != "LONG" {
+                                extreme_bar_idx = idx;
+                            }
+                        }
+                        if b.low > 0.0 && b.low < low_px {
+                            low_px = b.low;
+                            if cell.side == "LONG" {
+                                extreme_bar_idx = idx;
+                            }
+                        }
+                    }
+                }
+            }
+            let atr_1h_slice = if extreme_bar_idx >= 2 && extreme_bar_idx < bars_1h.len() {
+                &bars_1h[..extreme_bar_idx]
+            } else {
+                &bars_1h[..]
+            };
+            let atr_1h = compute_atr_from_bars(atr_1h_slice, cfg.pond_atr_period.max(1)).max(0.01);
             let atr_4h = compute_atr_from_bars(&bars_4h, cfg.pond_atr_period.max(1))
                 .max(atr_1h * cfg.pond_gate6_atr_4h_floor_mult);
-            let last_1h = bars_1h.last();
             let bars_1h_fresh = !is_live_or_testnet
                 || last_1h
                     .map(|b| now_ms.saturating_sub(b.timestamp_ms) <= max_staleness_ms)
@@ -381,14 +447,6 @@ impl PondOrchestrator {
             }
             let effective_1h_boundary = is_1h_boundary && bars_1h_fresh;
             let effective_4h_close = is_4h_bar_close && bars_4h_fresh;
-
-            let entry_px = cell.entry_price.unwrap_or(100.0);
-            let mark_px = last_1h
-                .map(|b| b.close)
-                .filter(|&p| p > 0.0)
-                .unwrap_or(entry_px);
-            let high_px = last_1h.map(|b| b.high).unwrap_or(mark_px);
-            let low_px = last_1h.map(|b| b.low).unwrap_or(mark_px);
             let bar_4h_close = bars_4h.last().map(|b| b.close).unwrap_or(mark_px);
             let cur_funding = funding_series
                 .last()
@@ -410,15 +468,36 @@ impl PondOrchestrator {
                     cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
                 }
             }
+            let prev_stop = cell.chandelier_stop.or(cell.initial_stop).unwrap_or(0.0);
+            let prev_chandelier_stop = cell.chandelier_stop;
             let _price_pnl = update_cell_mark_and_chandelier(
                 &mut cell,
                 mark_px,
-                high_px,
-                low_px,
+                watermark_high,
+                watermark_low,
                 atr_4h,
                 chand_mult,
                 effective_4h_close,
             );
+            let (eval_high_px, eval_low_px) = if cell.chandelier_stop != prev_chandelier_stop {
+                let wick_buf = wick_mult * atr_1h;
+                let breached_prev_stop = if prev_stop > 0.0 {
+                    if cell.side == "LONG" {
+                        low_px <= prev_stop - wick_buf
+                    } else {
+                        high_px >= prev_stop + wick_buf
+                    }
+                } else {
+                    false
+                };
+                if breached_prev_stop {
+                    (high_px, low_px)
+                } else {
+                    (last_bar_high, last_bar_low)
+                }
+            } else {
+                (high_px, low_px)
+            };
 
             let hold_hours = cell
                 .opened_at
@@ -430,8 +509,8 @@ impl PondOrchestrator {
 
             let eval_input = CellExitEvalInput {
                 mark_price: mark_px,
-                intrabar_high: high_px,
-                intrabar_low: low_px,
+                intrabar_high: eval_high_px,
+                intrabar_low: eval_low_px,
                 atr_14_1h: atr_1h,
                 bar_4h_close,
                 atr_14_4h: atr_4h,
@@ -827,8 +906,28 @@ impl PondOrchestrator {
         for u in &universe {
             let rank = u.rank.max(1) as usize;
             let is_active_row = u.status.eq_ignore_ascii_case("ACTIVE");
-            let (funding_series, bars_1h, bars_4h) = match cached_map.get(&u.symbol) {
-                Some(triple) => triple.clone(),
+            let (mut funding_series, mut bars_1h, bars_4h) = match cached_map.get(&u.symbol) {
+                Some(triple) => {
+                    let mut cloned = triple.clone();
+                    if let Some(fmap) = live_funding_map.as_ref() {
+                        let coin = u
+                            .symbol
+                            .split('/')
+                            .next()
+                            .unwrap_or(&u.symbol)
+                            .trim()
+                            .to_uppercase();
+                        if let Some(&lf) = fmap.get(&coin) {
+                            if let Some(last_f) = cloned.0.last_mut() {
+                                *last_f = lf;
+                            }
+                            if let Some(last_b) = cloned.1.last_mut() {
+                                last_b.funding_rate_hourly = lf;
+                            }
+                        }
+                    }
+                    cloned
+                }
                 None => self.ingestion.load_or_fetch_pond_funding_and_bars(
                     &u.symbol,
                     rank,
@@ -837,6 +936,7 @@ impl PondOrchestrator {
                     is_active_row,
                 ),
             };
+            let _ = (&mut funding_series, &mut bars_1h);
             scan_inputs.push(PondAssetScanInput {
                 universe_row: u.clone(),
                 funding_series_168h: funding_series,
@@ -1919,5 +2019,215 @@ mod tests {
             .discrepancies
             .iter()
             .any(|d| d["type"] == "DIRECTION_FLIP_POND_CELL_RECONCILED" && d["cell_id"] == open_id));
+    }
+
+    #[test]
+    fn test_intrabar_crash_does_not_self_inflate_atr_wick_buffer() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        let _ = orch.initialize_or_refresh_universe().unwrap();
+
+        let base_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let mut bars_1h: Vec<OhlcvBar> = (0..179)
+            .map(|i| OhlcvBar {
+                symbol: "ETH/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open: 2110.0,
+                high: 2119.5,
+                low: 2100.5,
+                close: 2110.0,
+                volume: 50_000.0,
+                funding_rate_hourly: -0.00012 + ((i % 5) as f64) * 0.00001,
+                is_synthetic: 0,
+            })
+            .collect();
+        // Bar 179 (13:00Z): crashes from 2096.2 down to 1970.2 (TR = 126.0)
+        bars_1h.push(OhlcvBar {
+            symbol: "ETH/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_315_600_000,
+            open: 2094.2,
+            high: 2096.2,
+            low: 1970.2,
+            close: 1992.9,
+            volume: 54_364.0,
+            funding_rate_hourly: -0.000116,
+            is_synthetic: 0,
+        });
+        // Bar 180 (14:00Z rollover): new hour bar with narrower range at 1988.9
+        bars_1h.push(OhlcvBar {
+            symbol: "ETH/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_319_200_000,
+            open: 1992.9,
+            high: 1993.0,
+            low: 1988.9,
+            close: 1988.9,
+            volume: 5_000.0,
+            funding_rate_hourly: -0.000116,
+            is_synthetic: 0,
+        });
+        db.upsert_ohlcv_batch(&bars_1h).unwrap();
+        let funding_series: Vec<f64> = bars_1h.iter().map(|b| b.funding_rate_hourly).collect();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "ETH/USDC:USDC".to_string(),
+            (funding_series, bars_1h.clone(), Vec::new()),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache);
+
+        let cell = PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "TRAILED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(2130.8),
+            quantity: Some(0.0587),
+            notional_usdc: Some(125.08),
+            risk_budget_usdc: Some(26.86),
+            conviction_multiplier: Some(1.0807),
+            funding_z_entry: Some(-2.1419),
+            funding_rate_entry: Some(-0.000116),
+            initial_stop: Some(1993.10457143),
+            chandelier_stop: Some(1993.28857143),
+            highest_price_seen: Some(2131.5),
+            lowest_price_seen: Some(2087.7),
+            funding_accrued_usdc: 0.0145,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0563,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T09:11:36Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T13:05:04Z".to_string(),
+        };
+        let cid = orch.scoped_db.upsert_pond_cell(&cell).unwrap();
+
+        let exits = orch.evaluate_open_cells(false, false).unwrap();
+        assert_eq!(exits, 1);
+        let after = orch
+            .scoped_db
+            .get_pond_cells(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cid)
+            .unwrap();
+        assert_eq!(after.state, "COOLDOWN");
+        assert_eq!(
+            after.exit_reason.as_deref(),
+            Some("TIER1_CATASTROPHIC_WICK_STOP")
+        );
+        assert_eq!(after.lowest_price_seen, Some(1970.2));
+    }
+
+    #[test]
+    fn test_pre_rally_dip_does_not_falsely_stop_out_ratcheted_cell() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        let _ = orch.initialize_or_refresh_universe().unwrap();
+
+        let base_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let mut bars_1h: Vec<OhlcvBar> = (0..178)
+            .map(|i| OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open: 100.0,
+                high: 100.5,
+                low: 99.5,
+                close: 100.0,
+                volume: 50_000.0,
+                funding_rate_hourly: -0.00012 + ((i % 5) as f64) * 0.00001,
+                is_synthetic: 0,
+            })
+            .collect();
+        // Entry bar (12:00Z): dips to 99.0 before rallying
+        bars_1h.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_312_000_000,
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 104.0,
+            volume: 60_000.0,
+            funding_rate_hourly: -0.00012,
+            is_synthetic: 0,
+        });
+        // Rally bar (13:00Z): rallies to 130.0 (low = 124.0)
+        bars_1h.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_315_600_000,
+            open: 104.0,
+            high: 130.0,
+            low: 124.0,
+            close: 128.0,
+            volume: 80_000.0,
+            funding_rate_hourly: -0.00012,
+            is_synthetic: 0,
+        });
+        db.upsert_ohlcv_batch(&bars_1h).unwrap();
+        let funding_series: Vec<f64> = bars_1h.iter().map(|b| b.funding_rate_hourly).collect();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "SOL/USDC:USDC".to_string(),
+            (funding_series, bars_1h.clone(), Vec::new()),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache);
+
+        let cell = PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(100.0),
+            quantity: Some(1.0),
+            notional_usdc: Some(100.0),
+            risk_budget_usdc: Some(5.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.5),
+            funding_rate_entry: Some(-0.00012),
+            initial_stop: Some(95.0),
+            chandelier_stop: Some(95.0),
+            highest_price_seen: Some(105.0),
+            lowest_price_seen: Some(99.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.04,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T12:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T12:00:00Z".to_string(),
+        };
+        let cid = orch.scoped_db.upsert_pond_cell(&cell).unwrap();
+
+        // At 4H bar close, Chandelier stop ratchets far above 99.0 (the pre-rally dip),
+        // but must NOT falsely stop out the cell since post-peak low is 124.0.
+        let exits = orch.evaluate_open_cells(false, true).unwrap();
+        assert_eq!(exits, 0);
+        let after = orch
+            .scoped_db
+            .get_pond_cells(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cid)
+            .unwrap();
+        assert_eq!(after.state, "TRAILED");
+        assert!(after.chandelier_stop.unwrap() > 110.0);
     }
 }

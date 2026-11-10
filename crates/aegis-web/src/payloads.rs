@@ -484,15 +484,68 @@ pub fn build_portfolio_payload(db: &DatabaseManager) -> Result<PortfolioDashboar
         .unwrap_or((pit_init, pit_init));
 
     let open_trades = db.get_open_trades().unwrap_or_default();
+    let resting_trades = db.get_resting_pit_trades().unwrap_or_default();
     let realized_pnl = round_dp(db.get_total_realized_pnl().unwrap_or(0.0), 4);
     let unrealized_pnl = round_dp(open_trades.iter().map(|t| t.unrealized_pnl_usdc).sum(), 4);
     let funding_accrued = round_dp(open_trades.iter().map(|t| t.funding_accrued_usdc).sum(), 4);
-    let total_pnl = round_dp(realized_pnl + unrealized_pnl + funding_accrued, 4);
+    let open_fees: f64 = open_trades.iter().map(|t| t.fees_paid_usdc).sum();
+    let has_baseline_reset = db.get_equity_baseline_reset_at().ok().flatten().is_some();
+    let yield_usdc = if has_baseline_reset {
+        0.0
+    } else {
+        snap.accrued_yield_usdc
+    };
+    let total_pnl = round_dp(
+        realized_pnl + unrealized_pnl + funding_accrued - open_fees + yield_usdc,
+        4,
+    );
     let total_pnl_pct = if pit_init > 0.0 {
         round_dp((total_pnl / pit_init) * 100.0, 2)
     } else {
         0.0
     };
+
+    let (deployed_notional_usdc, gross_leverage, portfolio_heat_usdc, portfolio_heat_pct) =
+        if !open_trades.is_empty()
+            || !resting_trades.is_empty()
+            || (snap.open_long_count + snap.open_short_count) > 0
+        {
+            let mut live_deployed = 0.0;
+            let mut live_heat = 0.0;
+            for t in &open_trades {
+                let px = if t.current_price > 0.0 {
+                    t.current_price
+                } else {
+                    t.entry_price
+                };
+                live_deployed += t.quantity.abs() * px;
+                let stop_px = if t.chandelier_stop_price > 0.0 {
+                    t.chandelier_stop_price
+                } else {
+                    t.initial_stop_price
+                };
+                if stop_px > 0.0 {
+                    live_heat += (t.entry_price - stop_px).abs() * t.quantity.abs();
+                }
+            }
+            for rt in &resting_trades {
+                live_deployed += rt.notional_usdc.max(rt.quantity.abs() * rt.entry_price);
+            }
+            let ref_eq = pit_eq.max(1.0);
+            (
+                round_dp(live_deployed, 2),
+                round_dp(live_deployed / ref_eq, 4),
+                round_dp(live_heat, 2),
+                round_dp(live_heat / ref_eq, 6),
+            )
+        } else {
+            (
+                snap.deployed_notional_usdc,
+                snap.gross_leverage,
+                snap.portfolio_heat_usdc,
+                snap.portfolio_heat_pct,
+            )
+        };
 
     let lookback_24h_ms = db.now_ms() - 86_400_000;
     let peak_24h: f64 = db
@@ -541,11 +594,11 @@ pub fn build_portfolio_payload(db: &DatabaseManager) -> Result<PortfolioDashboar
         total_pnl_pct,
         daily_drawdown_pct,
         max_daily_drawdown_alert_pct: max_dd_alert,
-        deployed_notional_usdc: snap.deployed_notional_usdc,
-        gross_leverage: snap.gross_leverage,
+        deployed_notional_usdc,
+        gross_leverage,
         max_gross_leverage: max_lev,
-        portfolio_heat_usdc: snap.portfolio_heat_usdc,
-        portfolio_heat_pct: snap.portfolio_heat_pct,
+        portfolio_heat_usdc,
+        portfolio_heat_pct,
         max_portfolio_heat_usdc: max_heat,
         baseline_risk_per_trade_usdc: baseline_risk,
         min_risk_per_trade_usdc: min_risk,
@@ -679,7 +732,13 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
         0.0
     };
 
-    let realized_pnl = round_dp(db.get_pond_realized_pnl().unwrap_or(0.0), 4);
+    let closed_realized_pnl = db.get_pond_realized_pnl().unwrap_or(0.0);
+    let open_partial_realized_pnl: f64 = open_cells
+        .iter()
+        .map(|c| c.cell.realized_pnl_usdc)
+        .sum();
+    let open_fees_paid: f64 = open_cells.iter().map(|c| c.cell.fees_paid_usdc).sum();
+    let realized_pnl = round_dp(closed_realized_pnl + open_partial_realized_pnl, 4);
     let unrealized_pnl: f64 = round_dp(open_cells.iter().map(|c| c.unrealized_pnl_usdc).sum(), 4);
     let funding_accrued: f64 = round_dp(
         open_cells
@@ -690,7 +749,10 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
     );
 
     let init_cap = pond_cfg.pond_baseline_equity_usdc.max(1.0);
-    let total_pnl = round_dp(realized_pnl + unrealized_pnl + funding_accrued, 4);
+    let total_pnl = round_dp(
+        realized_pnl + unrealized_pnl + funding_accrued - open_fees_paid,
+        4,
+    );
     let total_pnl_pct = if init_cap > 0.0 {
         round_dp((total_pnl / init_cap) * 100.0, 2)
     } else {
@@ -745,9 +807,6 @@ pub fn build_pp50_payload_with_books(
     let platform_pp50_halt = cfg.get_bool("platform_pp50_halt", false);
 
     let transfers = db.get_recent_book_transfers(20)?;
-    let latest_snapshot = db.get_latest_pp50_platform_snapshot().ok();
-    let recent_snapshots: Vec<Pp50PlatformSnapshot> =
-        latest_snapshot.clone().into_iter().collect();
 
     let pit_init = pit_portfolio.pit_initial_capital_usdc;
     let pond_init = pond_status.initial_capital_usdc;
@@ -757,6 +816,28 @@ pub fn build_pp50_payload_with_books(
     let pond_eq = pond_status.pond_equity_usdc;
     let total_eq = round_dp(pit_eq + pond_eq, 2);
     let drift_bps = round_dp(compute_drift_bps(pit_eq, total_eq, split_pct), 2);
+
+    let latest_snapshot = db
+        .get_latest_pp50_platform_snapshot()
+        .ok()
+        .map(|mut snap| {
+            if snap.snapshot_id.is_none() {
+                snap.platform_equity_usdc = total_eq;
+                snap.pit_equity_usdc = pit_eq;
+                snap.pond_equity_usdc = pond_eq;
+                snap.drift_bps = drift_bps;
+                snap.pit_open_count = pit_portfolio.open_positions_count as i64;
+                snap.pond_open_cells = pond_status.open_cells.len() as i64;
+                if settling_in_progress {
+                    snap.settling_status = "IN_PROGRESS".to_string();
+                } else if let Some(last_tx) = transfers.first() {
+                    snap.settling_status = last_tx.status.clone();
+                }
+            }
+            snap
+        });
+    let recent_snapshots: Vec<Pp50PlatformSnapshot> =
+        latest_snapshot.clone().into_iter().collect();
 
     let total_pnl = round_dp(pit_portfolio.total_pnl_usdc + pond_status.total_pnl_usdc, 4);
     let total_pnl_pct = if platform_init > 0.0 {

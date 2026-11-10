@@ -1142,5 +1142,87 @@ mod tests {
         assert!(app_js.contains("/api/v1/trades/close"));
         assert!(app_js.contains("/api/v1/pond/cells/close"));
     }
+
+    #[test]
+    fn test_dashboard_live_pit_and_pond_pnl_and_notional_consistency() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).expect("seed schema");
+
+        // 1. Insert an open PIT trade and update its mark price
+        db.reconcile_on_chain_orphan_position(
+            "SOL/USDC:USDC",
+            "SOL",
+            "SHORT",
+            2.0,
+            100.0,
+            95.0,
+            10.0,
+        )
+        .expect("insert open SOL trade");
+
+        // 2. Insert an open Pond cell with partial-exit realized PnL and fees
+        let cell_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "ETH/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "TRAILED".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(2000.0),
+                quantity: Some(0.05),
+                notional_usdc: Some(100.0),
+                risk_budget_usdc: Some(10.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.2),
+                funding_rate_entry: Some(-0.0001),
+                initial_stop: Some(1900.0),
+                chandelier_stop: Some(1950.0),
+                highest_price_seen: Some(2050.0),
+                lowest_price_seen: Some(1980.0),
+                funding_accrued_usdc: 0.25,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.05,
+                exit_price: None,
+                exit_reason: None,
+                opened_at: Some("2026-11-10T09:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-10T09:00:00Z".to_string(),
+                resting_order_id: None,
+            })
+            .expect("insert open pond cell");
+
+        db.reduce_open_pond_cell_partial_exit(
+            cell_id,
+            "TRAILED",
+            Some(1950.0),
+            Some(2050.0),
+            Some(1980.0),
+            0.02,
+            40.0,
+            -5.50,
+            0.04,
+        )
+        .expect("partial exit reduction");
+
+        let payload = build_dashboard_payload(&db).expect("build dashboard payload");
+        assert_eq!(payload.portfolio.deployed_notional_usdc, 190.0);
+        assert!(payload.portfolio.gross_leverage > 0.0);
+        assert!(
+            (payload.portfolio.pit_initial_capital_usdc + payload.portfolio.total_pnl_usdc
+                - payload.portfolio.pit_equity_usdc)
+                .abs()
+                < 0.02
+        );
+        assert_eq!(payload.pond.realized_pnl_usdc, -5.50);
+        assert!(
+            (payload.pond.initial_capital_usdc + payload.pond.total_pnl_usdc
+                - payload.pond.pond_equity_usdc)
+                .abs()
+                < 0.02
+        );
+    }
 }
 

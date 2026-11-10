@@ -771,7 +771,7 @@ function renderDashboard(data) {
     pondCellsTbody.innerHTML = recentCells.map((c) => {
       const isOpen = ['OPEN', 'TRAILED', 'ARMED'].includes(c.state);
       const netPnl = isOpen
-        ? ((c.unrealized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))
+        ? ((c.unrealized_pnl_usdc || 0) + (c.realized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))
         : (c.realized_pnl_usdc || 0);
       const sideBadge = c.option_analogue === 'SHORT_CALL'
         ? '<span class="badge badge-bear">SHORT / SHORT_CALL</span>'

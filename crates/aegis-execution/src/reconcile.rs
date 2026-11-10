@@ -501,6 +501,7 @@ impl ExecutionEngine {
                     } else {
                         0.0
                     };
+                    let mut size_reconciled = false;
                     if (expected_pit_qty - lt.quantity.abs()).abs() > 1e-6 && expected_pit_qty > 0.0
                     {
                         match self.db.reconcile_open_trade_size(
@@ -509,6 +510,7 @@ impl ExecutionEngine {
                             Some(entry_px),
                         ) {
                             Ok(true) => {
+                                size_reconciled = true;
                                 pit_qty_by_coin.insert(
                                     coin.clone(),
                                     other_pit_qty_on_coin + expected_pit_qty,
@@ -530,6 +532,43 @@ impl ExecutionEngine {
                                 );
                             }
                         }
+                    }
+                    if mark_px > 0.0 {
+                        let eff_qty = if size_reconciled {
+                            expected_pit_qty
+                        } else {
+                            lt.quantity.abs()
+                        };
+                        let eff_entry_px = if size_reconciled && entry_px > 0.0 {
+                            entry_px
+                        } else {
+                            lt.entry_price
+                        };
+                        let live_upnl = round_dp(
+                            if lt.side.eq_ignore_ascii_case("LONG")
+                                || lt.side.eq_ignore_ascii_case("BUY")
+                            {
+                                (mark_px - eff_entry_px) * eff_qty
+                            } else {
+                                (eff_entry_px - mark_px) * eff_qty
+                            },
+                            4,
+                        );
+                        let high_seen = lt.highest_price_seen.max(mark_px);
+                        let low_seen = if lt.lowest_price_seen <= 0.0 {
+                            mark_px
+                        } else {
+                            lt.lowest_price_seen.min(mark_px)
+                        };
+                        let _ = self.db.update_open_trade(
+                            lt.trade_id,
+                            round_dp(mark_px, 6),
+                            lt.chandelier_stop_price,
+                            round_dp(high_seen, 6),
+                            round_dp(low_seen, 6),
+                            live_upnl,
+                            lt.funding_accrued_usdc,
+                        );
                     }
                 }
             }
