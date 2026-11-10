@@ -374,6 +374,15 @@ fn alert_config_defaults(
                 "Locked profit buffer in ATR multiples below entry once Short break-even triggers",
             ),
         ),
+        (
+            "testnet_faucet_offset_usdc",
+            (
+                "10000.0",
+                "float",
+                "risk",
+                "Unallocated Hyperliquid Testnet Faucet Spot USDC grant to exclude from Perps equity and risk-cap scaling",
+            ),
+        ),
     ])
 }
 

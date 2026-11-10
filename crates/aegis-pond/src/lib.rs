@@ -153,7 +153,7 @@ impl PondOrchestrator {
                 });
             let mut status: RestingOrderStatus = self
                 .execution
-                .check_resting_order_status(&cell.symbol, resting_oid.as_deref());
+                .check_resting_order_status(resting_oid.as_deref());
             let mut cancel_confirmed_at_boundary = false;
             if is_1h_boundary
                 && !(status.state == "FILLED" && status.filled_units > 0.0)
@@ -431,7 +431,7 @@ impl PondOrchestrator {
                 let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
                 let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
 
-                // Escalate maker exit to market/IOC on retry or overdue max-hold timeout (NM-7)
+                // Escalate maker exit to market/IOC on retry, Testnet, or overdue max-hold timeout (NM-7)
                 let prev_attempts = self
                     .exit_attempt_count
                     .lock()
@@ -439,6 +439,7 @@ impl PondOrchestrator {
                     .copied()
                     .unwrap_or(0);
                 let effective_prefer_maker = decision.prefer_maker
+                    && !cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET")
                     && prev_attempts == 0
                     && !(decision.tier == Some(5) && hold_hours >= max_hold + 1.0);
 
@@ -653,7 +654,12 @@ impl PondOrchestrator {
             .lock()
             .map(|last_ms| now_ms - last_ms >= refresh_interval_ms)
             .unwrap_or(false);
-        if universe.is_empty() || needs_periodic_refresh {
+        let has_synthetic_universe_in_live = is_live_or_testnet
+            && universe
+                .iter()
+                .filter(|u| u.status.eq_ignore_ascii_case("ACTIVE"))
+                .all(|u| u.is_synthetic_volume != 0);
+        if universe.is_empty() || needs_periodic_refresh || has_synthetic_universe_in_live {
             universe = self.initialize_or_refresh_universe()?;
         } else {
             let mut guard = self.last_universe_refresh_ms.lock();
@@ -739,6 +745,12 @@ impl PondOrchestrator {
         let active_champ = self.scoped_db.get_active_pond_champion()?;
         let champion_id_num = active_champ.champion_id;
         let champion_version = active_champ.version;
+        let is_testnet_mode = cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET");
+        let effective_min_daily_vol_usdc = if is_testnet_mode {
+            cfg.pond_min_daily_volume_usdc.min(100.0)
+        } else {
+            cfg.pond_min_daily_volume_usdc
+        };
         let direction_policy = cfg.pond_direction_policy;
 
         let params = PondScannerParams {
@@ -747,7 +759,7 @@ impl PondOrchestrator {
             funding_z_window_hours: cfg.pond_funding_z_window_hours,
             z_entry_threshold: cfg.pond_funding_z_entry,
             min_funding_abs: cfg.pond_funding_floor_hourly,
-            min_daily_vol_usdc: cfg.pond_min_daily_volume_usdc,
+            min_daily_vol_usdc: effective_min_daily_vol_usdc,
             liquidity_score_ref_usdc: cfg.pond_liquidity_score_ref_usdc,
             trend_veto_ema_fast: cfg.pond_trend_veto_ema_fast,
             trend_veto_ema_slow: cfg.pond_trend_veto_ema_slow,
@@ -788,6 +800,7 @@ impl PondOrchestrator {
         let mut scan_inputs = Vec::with_capacity(universe.len());
         for u in &universe {
             let rank = u.rank.max(1) as usize;
+            let is_active_row = u.status.eq_ignore_ascii_case("ACTIVE");
             let (funding_series, bars_1h, bars_4h) = match cached_map.get(&u.symbol) {
                 Some(triple) => triple.clone(),
                 None => self.ingestion.load_or_fetch_pond_funding_and_bars(
@@ -795,7 +808,7 @@ impl PondOrchestrator {
                     rank,
                     180,
                     live_funding_map.as_ref(),
-                    true,
+                    is_active_row,
                 ),
             };
             scan_inputs.push(PondAssetScanInput {
@@ -862,6 +875,7 @@ impl PondOrchestrator {
             transition_cell_state(&mut new_cell, PondCellState::Candidate)?;
             transition_cell_state(&mut new_cell, PondCellState::Armed)?;
 
+            let prefer_maker_entry = !is_testnet_mode;
             let fill = self.execution.execute_pond_order(
                 &cand.symbol,
                 cand.side.as_str(),
@@ -873,7 +887,7 @@ impl PondOrchestrator {
                 cand.bar_low,
                 cand.bar_volume,
                 false,
-                true,
+                prefer_maker_entry,
                 false,
                 None,
             );
@@ -888,6 +902,33 @@ impl PondOrchestrator {
                 new_cell.resting_order_id = Some(resting_oid.to_string());
                 if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
                     let _ = self.execution.cancel_resting_order(&cand.symbol, resting_oid);
+                    let _ = self.scoped_db.log_telemetry(
+                        "CRITICAL",
+                        "engine.pond",
+                        &format!(
+                            "Failed to persist ARMED Pond cell for {} (oid={}) after resting order placement: {e}",
+                            cand.symbol, resting_oid
+                        ),
+                        Some(json!({
+                            "symbol": cand.symbol,
+                            "side": cand.side,
+                            "resting_oid": resting_oid,
+                            "error": e.to_string(),
+                        })),
+                    );
+                    let _ = self.execution.alerts.notify_critical_event(
+                        "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
+                        &format!(
+                            "Pond resting order for {} (oid={}) placed, but upsert_pond_cell failed: {e}",
+                            cand.symbol, resting_oid
+                        ),
+                        Some(json!({
+                            "symbol": cand.symbol,
+                            "side": cand.side,
+                            "resting_oid": resting_oid,
+                            "error": e.to_string(),
+                        })),
+                    );
                     return Err(e);
                 }
                 open_heat = round_dp(open_heat + cand.risk_budget_usdc, 2);
@@ -929,7 +970,48 @@ impl PondOrchestrator {
             new_cell.opened_at = Some(now_str.clone());
             transition_cell_state(&mut new_cell, PondCellState::Open)?;
 
-            self.scoped_db.upsert_pond_cell(&new_cell)?;
+            if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
+                let _ = self.scoped_db.log_telemetry(
+                    "CRITICAL",
+                    "engine.pond",
+                    &format!(
+                        "Failed to persist OPEN Pond cell for {} ({} {} @ {:.4}, oid={}) after order fill: {e}",
+                        cand.symbol,
+                        cand.side,
+                        actual_qty,
+                        fill_px,
+                        fill.exchange_order_id
+                    ),
+                    Some(json!({
+                        "symbol": cand.symbol,
+                        "side": cand.side,
+                        "quantity": actual_qty,
+                        "entry_price": fill_px,
+                        "exchange_order_id": fill.exchange_order_id,
+                        "error": e.to_string(),
+                    })),
+                );
+                let _ = self.execution.alerts.notify_critical_event(
+                    "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
+                    &format!(
+                        "Pond order for {} ({} {} @ {:.4}, oid={}) filled, but upsert_pond_cell failed: {e}",
+                        cand.symbol,
+                        cand.side,
+                        actual_qty,
+                        fill_px,
+                        fill.exchange_order_id
+                    ),
+                    Some(json!({
+                        "symbol": cand.symbol,
+                        "side": cand.side,
+                        "quantity": actual_qty,
+                        "entry_price": fill_px,
+                        "exchange_order_id": fill.exchange_order_id,
+                        "error": e.to_string(),
+                    })),
+                );
+                return Err(e);
+            }
             entries_opened += 1;
             open_heat = round_dp(open_heat + cand.risk_budget_usdc, 2);
             deployed_notional = round_dp(deployed_notional + fill_notional, 2);
@@ -1674,6 +1756,53 @@ mod tests {
             .rejections_by_gate
             .iter()
             .any(|(_, r)| r == "GATE1_SYNTHETIC_VOLUME_REJECTED_IN_LIVE"));
+
+        // Verify TESTNET synthetic->live universe refresh replaces synthetic WARMUP rows and retires absent synthetic rows
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        let mut init_rows = orch.initialize_or_refresh_universe().unwrap();
+        init_rows[79].status = "WARMUP".to_string();
+        init_rows[79].warmup_until = Some("2099-01-01T00:00:00Z".to_string());
+        orch.scoped_db
+            .upsert_pond_universe_batch(&init_rows)
+            .unwrap();
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+            .unwrap();
+
+        let live_cands = vec![PondUniverseRow {
+            symbol: init_rows[79].symbol.clone(),
+            rank: 1,
+            median_daily_volume_usdc: 900.0,
+            tick_size: 0.0001,
+            lot_step_size: 1.0,
+            min_notional_usdc: 10.0,
+            max_leverage: 5.0,
+            reference_price: 0.25,
+            status: "ACTIVE".to_string(),
+            warmup_until: Some("2026-01-01T00:00:00Z".to_string()),
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        }];
+        let refreshed = orch
+            .universe_mgr
+            .refresh_universe(Some(live_cands))
+            .unwrap();
+        let promoted = refreshed
+            .iter()
+            .find(|r| r.symbol == init_rows[79].symbol)
+            .unwrap();
+        assert_eq!(promoted.status, "ACTIVE");
+        assert_eq!(promoted.is_synthetic_volume, 0);
+        let retired_synth = refreshed
+            .iter()
+            .find(|r| r.symbol == init_rows[0].symbol)
+            .unwrap();
+        assert_eq!(retired_synth.status, "RETIRED");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 pub mod http_client;
 pub mod ingestion;
 pub mod live_dispatch;
+pub mod manual_close;
 pub mod reconcile;
 pub mod signing;
 
@@ -396,8 +397,8 @@ pub struct ExecutionEngine {
     pub(crate) hlp_vault_error_streak: Arc<Mutex<usize>>,
     /// Dynamic cache of `(is_testnet, COIN_UPPER) -> (asset_index, cached_at_ms)` (`NM-12`).
     pub asset_index_cache: AssetIndexCache,
-    /// In-memory cache of `symbol -> UniverseAsset` for Pit, Pond, and reconciled orphan symbols (`R7-N3`).
-    pub resolved_asset_cache: Arc<Mutex<HashMap<String, UniverseAsset>>>,
+    /// In-memory cache of `symbol -> (UniverseAsset, cached_at_ms)` for Pit, Pond, and reconciled orphan symbols (`R7-N3`, `R8-N2`).
+    pub resolved_asset_cache: Arc<Mutex<HashMap<String, (UniverseAsset, i64)>>>,
 }
 
 impl ExecutionEngine {
@@ -1332,7 +1333,7 @@ mod tests {
 
         // R3-H4: When /info endpoint is unreachable, must report UNKNOWN (never GONE)
         let unreachable_status =
-            exec.check_resting_order_status("SOL/USDC:USDC", Some("hl-123456"));
+            exec.check_resting_order_status(Some("hl-123456"));
         assert_eq!(unreachable_status.state, "UNKNOWN");
 
         // Spin up a local mock /info server that returns empty openOrders, empty userFills, and empty orderStatus
@@ -1393,7 +1394,7 @@ mod tests {
         .unwrap();
 
         // NH-6 & R3-H4: When /info is reachable and order is absent from both openOrders and userFills, it must report GONE
-        let status = exec.check_resting_order_status("SOL/USDC:USDC", Some("hl-123456"));
+        let status = exec.check_resting_order_status(Some("hl-123456"));
         stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap();
         assert_eq!(status.state, "GONE");
@@ -2128,6 +2129,214 @@ mod tests {
             opened[0].notional_usdc <= 130.0,
             "Book A single-asset notional on $500 book must be capped near $125 (never 22x = $2,742), got ${}",
             opened[0].notional_usdc
+        );
+    }
+
+    #[test]
+    fn test_r9_s1_n2_r8_n2_same_coin_multi_row_reconciliation_and_faucet_offset() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet", &json!(true))
+            .unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // 1. R9-S1: Insert two OPEN PIT trades on the same coin (ETH) with 1.0 ETH each (sum = 2.0 ETH),
+        // while the exchange clearinghouseState holds only 1.0 ETH total.
+        // Without R9-S1 netting, each row would see expected = 1.0 ETH (leaving sum = 2.0 ETH = 2x inflation),
+        // or if exchange had 1.5 ETH, each row would resize to 1.5 ETH (sum = 3.0 ETH = 2x inflation).
+        let base_eth_trade = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "hl-eth-dup-1".to_string(),
+            symbol: "ETH/USDC:USDC".to_string(),
+            base_asset: "ETH".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 3_000.0,
+            current_price: 3_000.0,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 1.0,
+            avg_fill_price: Some(3_000.0),
+            notional_usdc: 3_000.0,
+            risk_budget_usdc: 60.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 2_940.0,
+            chandelier_stop_price: 2_940.0,
+            current_stop_price: 2_940.0,
+            highest_price_seen: 3_000.0,
+            lowest_price_seen: 3_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 1.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-eth-1".to_string()),
+            opened_at: "2026-11-10T00:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let t1 = db.insert_trade(&base_eth_trade).unwrap();
+        let mut eth_trade_2 = base_eth_trade.clone();
+        eth_trade_2.client_order_id = "hl-eth-dup-2".to_string();
+        eth_trade_2.exchange_order_id = Some("hl-eth-2".to_string());
+        let t2 = db.insert_trade(&eth_trade_2).unwrap();
+
+        // Also insert two OPEN Pond cells on SUI (100 SUI each = 200 SUI local vs 100 SUI on-chain)
+        let base_sui_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "SUI/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(2.0),
+            quantity: Some(100.0),
+            notional_usdc: Some(200.0),
+            risk_budget_usdc: Some(10.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.5),
+            funding_rate_entry: Some(0.0005),
+            initial_stop: Some(2.1),
+            chandelier_stop: Some(2.1),
+            highest_price_seen: Some(2.0),
+            lowest_price_seen: Some(2.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.1,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T00:00:00Z".to_string(),
+        };
+        let c1 = db.upsert_pond_cell(&base_sui_cell).unwrap();
+        let c2 = db.upsert_pond_cell(&base_sui_cell).unwrap();
+
+        let mut on_chain = HashMap::new();
+        on_chain.insert(
+            "ETH".to_string(),
+            json!({"szi": 1.5, "entryPx": 3000.0, "markPx": 3000.0, "unrealizedPnl": 0.0}),
+        );
+        on_chain.insert(
+            "SUI".to_string(),
+            json!({"szi": -100.0, "entryPx": 2.0, "markPx": 2.0, "unrealizedPnl": 0.0}),
+        );
+
+        let rep1 = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
+        assert_eq!(rep1.status, ReconcileStatus::Reconciled);
+
+        // Must flag DUPLICATE_SAME_COIN_OPEN_ROWS for both PIT (ETH) and POND (SUI)
+        assert!(
+            rep1.discrepancies.iter().any(|d| {
+                d.get("type").and_then(|v| v.as_str()) == Some("DUPLICATE_SAME_COIN_OPEN_ROWS")
+                    && d.get("book").and_then(|v| v.as_str()) == Some("PIT")
+                    && d.get("base_asset").and_then(|v| v.as_str()) == Some("ETH")
+            }),
+            "reconcile_exchange_state must emit DUPLICATE_SAME_COIN_OPEN_ROWS for duplicate OPEN PIT trades (R9-S1)"
+        );
+        assert!(
+            rep1.discrepancies.iter().any(|d| {
+                d.get("type").and_then(|v| v.as_str()) == Some("DUPLICATE_SAME_COIN_OPEN_ROWS")
+                    && d.get("book").and_then(|v| v.as_str()) == Some("POND")
+                    && d.get("base_asset").and_then(|v| v.as_str()) == Some("SUI")
+            }),
+            "reconcile_exchange_state must emit DUPLICATE_SAME_COIN_OPEN_ROWS for duplicate OPEN Pond cells (R9-S1)"
+        );
+
+        // Sum of local ETH PIT trades must equal exactly 1.5 ETH (never 3.0 ETH!), and risk_budget_usdc rescaled
+        let open_eth: Vec<_> = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.trade_id == t1 || t.trade_id == t2)
+            .collect();
+        let total_eth_qty: f64 = open_eth.iter().map(|t| t.quantity).sum();
+        assert!(
+            (total_eth_qty - 1.5).abs() < 1e-6,
+            "Total local ETH PIT quantity across duplicate rows must equal exchange 1.5 ETH (never 3.0 ETH), got {total_eth_qty} (R9-S1)"
+        );
+        let total_eth_risk: f64 = open_eth.iter().map(|t| t.risk_budget_usdc).sum();
+        assert!(
+            (total_eth_risk - 90.0).abs() < 1e-3,
+            "Total local ETH PIT risk_budget_usdc must rescale to |3000 - 2940| * 1.5 = $90.0, got {total_eth_risk} (R9-N5)"
+        );
+
+        // Sum of local SUI Pond cells must equal exactly 100.0 SUI (resized from 100+100=200 down to 50+50=100)
+        let open_sui: Vec<_> = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.cell_id == c1 || c.cell_id == c2)
+            .collect();
+        let total_sui_qty: f64 = open_sui.iter().map(|c| c.quantity.unwrap_or(0.0)).sum();
+        assert!(
+            (total_sui_qty - 100.0).abs() < 1e-6,
+            "Total local SUI Pond quantity across duplicate cells must equal exchange 100.0 SUI (never 200.0 SUI), got {total_sui_qty} (R9-S1)"
+        );
+
+        // On Tick 2, size drift must be completely converged (zero SIZE_DRIFT_RECONCILED / SIZE_DRIFT_POND_CELL_RECONCILED)
+        let rep2 = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
+        assert!(
+            !rep2.discrepancies.iter().any(|d| {
+                let ty = d.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                ty == "SIZE_DRIFT_RECONCILED" || ty == "SIZE_DRIFT_POND_CELL_RECONCILED"
+            }),
+            "Second reconcile tick must have zero size drift after same-coin multi-row convergence (R9-S1): {:?}",
+            rep2.discrepancies
+        );
+
+        // 2. R9-N2: Verify adjust_testnet_faucet_spot_usdc uses `testnet_faucet_offset_usdc` from ConfigMap
+        let cfg_default = db.load_config().unwrap();
+        let (adj_tot, adj_hold) = exec.adjust_testnet_faucet_spot_usdc(
+            &cfg_default,
+            true,
+            1_000.0,
+            450.0,
+            10_517.65,
+            0.0,
+            0.0,
+        );
+        assert!((adj_tot - 517.65).abs() < 1e-2);
+        assert!((adj_hold - 0.0).abs() < 1e-6);
+
+        db.set_config_value("testnet_faucet_offset_usdc", &json!(5_000.0))
+            .unwrap();
+        let cfg_custom = db.load_config().unwrap();
+        let (adj_tot_custom, _) = exec.adjust_testnet_faucet_spot_usdc(
+            &cfg_custom,
+            true,
+            1_000.0,
+            450.0,
+            5_517.65,
+            0.0,
+            0.0,
+        );
+        assert!(
+            (adj_tot_custom - 517.65).abs() < 1e-2,
+            "adjust_testnet_faucet_spot_usdc must honor custom testnet_faucet_offset_usdc=5000.0 (R9-N2)"
+        );
+
+        // 3. R8-N2: Verify resolved_asset_cache TTL expiry refreshes stale cached UniverseAsset
+        let stale_asset = build_orphan_or_pond_universe_asset(
+            "BTC/USDC:USDC",
+            "BTC",
+            90_000.0,
+            None,
+            "ORPHAN",
+        );
+        exec.resolved_asset_cache
+            .lock()
+            .insert("BTC/USDC:USDC".to_string(), (stale_asset, 0));
+        let refreshed = exec.resolve_trade_asset("BTC/USDC:USDC", "BTC", 90_000.0);
+        assert_ne!(
+            refreshed.tier_name, "ORPHAN",
+            "Expired entry in resolved_asset_cache (cached_at_ms=0) must be refreshed from universe_assets (R8-N2)"
         );
     }
 }

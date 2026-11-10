@@ -433,8 +433,7 @@ impl ExecutionEngine {
             if resp_lower.contains("asset") || resp_lower.contains("invalid") {
                 self.asset_index_cache.lock().clear();
             }
-            if is_reduce_only
-                && !prefer_maker
+            if !prefer_maker
                 && ack_res
                     .fill_type
                     .to_ascii_lowercase()
@@ -469,7 +468,7 @@ impl ExecutionEngine {
                         b: is_buy,
                         p: retry_px_str,
                         s: retry_sz_str,
-                        r: true,
+                        r: is_reduce_only,
                         t: OrderTypeWire {
                             limit: Some(LimitOrderType {
                                 tif: "Ioc".to_string(),
@@ -503,8 +502,7 @@ impl ExecutionEngine {
         if ack_res.fill_type == "HL_ACK_MISSING_FILL_DETAILS_PENDING_RECONCILE"
             && ack_res.exchange_order_id.starts_with("hl-")
         {
-            let status =
-                self.check_resting_order_status(&asset.symbol, Some(&ack_res.exchange_order_id));
+            let status = self.check_resting_order_status(Some(&ack_res.exchange_order_id));
             if status.state == "FILLED" && status.filled_units > 0.0 && status.entry_price > 0.0 {
                 let fees_paid_usdc = if status.fee_usdc > 0.0 {
                     round_dp(status.fee_usdc, 4)
@@ -559,8 +557,13 @@ impl ExecutionEngine {
         ack_res
     }
 
-    /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`, `R3-H4`, `R3-H16`).
+    /// Queries Hyperliquid `userFills` for a specific `oid` (`NH-6`, `R3-H4`, `R3-H16`, `R9-N4`).
     /// Returns `(reachable, Option<(filled_sz, avg_px, total_fee)>)`.
+    ///
+    /// Note (`R9-N4`): Hyperliquid's `/info` `userFills` endpoint returns up to the 2,000 most
+    /// recent fills for the user. This recency window comfortably spans active 15s reconciles,
+    /// 15m Book A (`PIT`) cycles, and 1h Book B (`POND`) resting-order horizons. If an older fill
+    /// ever ages out of `userFills`, `check_resting_order_status` falls back to `orderStatus` by `oid`.
     pub(crate) fn query_hyperliquid_fills_for_oid_with_reachability(
         &self,
         wallet_address: &str,
@@ -651,16 +654,28 @@ impl ExecutionEngine {
 
     /// Checks whether a resting ALO order (`OPEN_ON_BOOK`) is still resting on `openOrders`,
     /// has filled (`userFills` / `orderStatus` by `oid`), was cancelled/expired (`GONE`), or
-    /// could not be verified because all `/info` calls failed (`UNKNOWN`) (`NH-6`, `R3-H4`, `R3-H16`).
+    /// could not be verified because all `/info` calls failed (`UNKNOWN`) (`NH-6`, `R3-H4`, `R3-H16`, `R9-N3`, `R9-N4`).
     ///
     /// - Never attributes an unrelated pre-existing `clearinghouseState` position `szi` to a
     ///   cancelled/expired resting order (`NH-6`).
     /// - Never falls back to coin-level `ord_coin == coin` matching when `oid` is missing (`R3-H4`).
     /// - Returns `"UNKNOWN"` when all Hyperliquid `/info` lookups fail (`R3-H4`).
+    /// - Uses `userFills` (up to 2,000 most recent fills — safe for 15s/15m/1h resting orders)
+    ///   followed by `orderStatus` by `oid` as fallback (`R9-N4`).
     pub fn check_resting_order_status(
         &self,
-        _symbol: &str,
         exchange_order_id: Option<&str>,
+    ) -> RestingOrderStatus {
+        self.check_resting_order_status_with_open_orders(exchange_order_id, false)
+    }
+
+    /// Variant of [`Self::check_resting_order_status`] that skips a redundant `openOrders` HTTP
+    /// fetch when the caller (e.g., the 15s poll in `reconcile_exchange_state`) has already fetched
+    /// `openOrders` and confirmed the target `oid` is no longer on the book (`known_off_book = true`) (`R9-N3`).
+    pub fn check_resting_order_status_with_open_orders(
+        &self,
+        exchange_order_id: Option<&str>,
+        known_off_book: bool,
     ) -> RestingOrderStatus {
         let cfg = self.load_config_logged("check_resting_order_status");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
@@ -694,25 +709,27 @@ impl ExecutionEngine {
             };
         };
 
-        let mut any_info_reachable = false;
+        let mut any_info_reachable = known_off_book;
 
-        if let Some(open_orders) = self.fetch_hyperliquid_open_orders(&wallet, is_testnet) {
-            any_info_reachable = true;
-            let still_open = open_orders.iter().any(|ord| {
-                let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
-                    ord.get("oid")
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<u64>().ok())
+        if !known_off_book {
+            if let Some(open_orders) = self.fetch_hyperliquid_open_orders(&wallet, is_testnet) {
+                any_info_reachable = true;
+                let still_open = open_orders.iter().any(|ord| {
+                    let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
+                        ord.get("oid")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    });
+                    ord_oid == Some(oid)
                 });
-                ord_oid == Some(oid)
-            });
-            if still_open {
-                return RestingOrderStatus {
-                    state: "OPEN_ON_BOOK".to_string(),
-                    filled_units: 0.0,
-                    entry_price: 0.0,
-                    fee_usdc: 0.0,
-                };
+                if still_open {
+                    return RestingOrderStatus {
+                        state: "OPEN_ON_BOOK".to_string(),
+                        filled_units: 0.0,
+                        entry_price: 0.0,
+                        fee_usdc: 0.0,
+                    };
+                }
             }
         }
 
@@ -801,7 +818,7 @@ impl ExecutionEngine {
         }
     }
 
-    /// Cancels a resting order on Hyperliquid by `exchange_order_id` (`hl-<oid>`).
+    /// Cancels a resting order on Hyperliquid by `exchange_order_id` (`hl-<oid>`) (`R9-N6`).
     pub fn cancel_resting_order(&self, symbol: &str, exchange_order_id: &str) -> Result<bool> {
         let cfg = self.db.load_config()?;
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
@@ -864,7 +881,13 @@ impl ExecutionEngine {
                         || err_lower.contains("unknown oid"));
                 }
             }
-            return Ok(true);
+            tracing::warn!(
+                symbol = symbol,
+                exchange_order_id = exchange_order_id,
+                response = ?resp,
+                "Unrecognized or empty statuses array in Hyperliquid cancel response; treating cancel as unconfirmed (R9-N6)"
+            );
+            return Ok(false);
         }
         Ok(false)
     }
@@ -874,11 +897,11 @@ impl ExecutionEngine {
     /// with reachability tracking so race-window or partial fills are promoted rather than dropped.
     pub fn verify_post_cancel_resting_order(
         &self,
-        symbol: &str,
+        _symbol: &str,
         oid_str: &str,
         cancel_confirmed: bool,
     ) -> RestingOrderStatus {
-        let mut r_status = self.check_resting_order_status(symbol, Some(oid_str));
+        let mut r_status = self.check_resting_order_status(Some(oid_str));
         if cancel_confirmed && r_status.state == "OPEN_ON_BOOK" {
             if let Some(target_oid) = oid_str
                 .strip_prefix("hl-")
@@ -1278,18 +1301,15 @@ impl ExecutionEngine {
                 self.fetch_hyperliquid_spot_usdc_balance(&wallet, testnet)
             {
                 let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
-                let faucet_offset = if testnet
-                    && init_eq > 0.0
-                    && init_eq <= 5_000.0
-                    && raw_spot_tot >= 10_000.0
-                    && (ch_tot + raw_spot_tot + user_equity_usdc) > init_eq * 2.5
-                {
-                    10_000.0
-                } else {
-                    0.0
-                };
-                let spot_tot = (raw_spot_tot - faucet_offset).max(0.0);
-                let spot_free = (raw_spot_free - faucet_offset).max(0.0);
+                let (spot_tot, spot_free) = self.adjust_testnet_faucet_spot_usdc(
+                    &cfg,
+                    testnet,
+                    init_eq,
+                    ch_tot,
+                    raw_spot_tot,
+                    raw_spot_free,
+                    user_equity_usdc,
+                );
                 if spot_tot > 0.0 {
                     ch_tot += spot_tot;
                     ch_free += spot_free;
@@ -1320,6 +1340,44 @@ impl ExecutionEngine {
             "perp_free_usdc": perp_free_usdc,
             "live_queried": live_queried,
         })
+    }
+
+    /// Adjusts raw Hyperliquid Spot USDC balances (`(raw_spot_tot, raw_spot_free)`) by subtracting
+    /// the configured `testnet_faucet_offset_usdc` (default `$10,000.00`) when running on Testnet
+    /// with a sub-$5,000 `initial_equity_usdc` and an unallocated Testnet faucet Spot USDC grant (`R9-N2`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adjust_testnet_faucet_spot_usdc(
+        &self,
+        cfg: &ConfigMap,
+        is_testnet: bool,
+        init_eq: f64,
+        perp_eq: f64,
+        raw_spot_tot: f64,
+        raw_spot_free: f64,
+        vault_eq: f64,
+    ) -> (f64, f64) {
+        let configured_offset = cfg.get_f64("testnet_faucet_offset_usdc", 10_000.0).max(0.0);
+        let faucet_offset = if is_testnet
+            && configured_offset > 0.0
+            && init_eq > 0.0
+            && init_eq <= 5_000.0
+            && raw_spot_tot >= configured_offset
+            && (perp_eq + raw_spot_tot + vault_eq) > init_eq * 2.5
+        {
+            tracing::debug!(
+                raw_spot_tot = raw_spot_tot,
+                faucet_offset = configured_offset,
+                init_eq = init_eq,
+                "Applying configured testnet_faucet_offset_usdc to Hyperliquid Spot USDC balance (R9-N2)"
+            );
+            configured_offset
+        } else {
+            0.0
+        };
+        (
+            (raw_spot_tot - faucet_offset).max(0.0),
+            (raw_spot_free - faucet_offset).max(0.0),
+        )
     }
 
     /// Executes or simulates an HLP Vault deposit/withdrawal (`vaultTransfer`).
@@ -1511,18 +1569,15 @@ impl ExecutionEngine {
             self.fetch_hyperliquid_spot_usdc_balance(&wallet, is_testnet)
         {
             let init_eq = cfg.get_f64("initial_equity_usdc", 10000.0);
-            let faucet_offset = if is_testnet
-                && init_eq > 0.0
-                && init_eq <= 5_000.0
-                && raw_spot_tot >= 10_000.0
-                && (perp_eq + raw_spot_tot + vault_eq) > init_eq * 2.5
-            {
-                10_000.0
-            } else {
-                0.0
-            };
-            let spot_tot = (raw_spot_tot - faucet_offset).max(0.0);
-            let spot_free = (raw_spot_free - faucet_offset).max(0.0);
+            let (spot_tot, spot_free) = self.adjust_testnet_faucet_spot_usdc(
+                &cfg,
+                is_testnet,
+                init_eq,
+                perp_eq,
+                raw_spot_tot,
+                raw_spot_free,
+                vault_eq,
+            );
             if spot_tot > 0.0 {
                 perp_eq += spot_tot;
                 withdrawable += spot_free;

@@ -1298,7 +1298,7 @@ mod tests {
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 11);
+        assert_eq!(db.get_schema_version().unwrap(), 12);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1536,7 +1536,7 @@ mod tests {
         use rusqlite::OptionalExtension;
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 11);
+        assert_eq!(db.get_schema_version().unwrap(), 12);
 
         // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
         db.with_conn(|conn| {
@@ -1668,9 +1668,23 @@ mod tests {
         };
         let tid = db.insert_trade(&trade).unwrap();
 
-        // Apply migration 010 transactionally
-        db.apply_migration("sql/migrations/010_v030_round5_remediation.sql")
+        // Simulate pre-v10 migration state (v9) before applying migration 010 transactionally (R8-S1)
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "UPDATE system_config SET config_value = '9' WHERE config_key = 'schema_version';
+                 DELETE FROM schema_migrations WHERE version >= 10;",
+            )
             .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let mig_010_rep = db
+            .apply_migration("sql/migrations/010_v030_round5_remediation.sql")
+            .unwrap();
+        assert_eq!(
+            mig_010_rep.get("already_applied").and_then(|v| v.as_bool()),
+            Some(false)
+        );
 
         let suspect_after = db.audit_suspect_dry_run_book_transfers().unwrap();
         assert!(
@@ -1853,7 +1867,7 @@ mod tests {
     fn test_r7_b1_s2_s3_n4_config_read_purity_and_migration_011_stop_tightening() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 11);
+        assert_eq!(db.get_schema_version().unwrap(), 12);
 
         // 1. R7-B1 & R7-QA: Operator sets custom chandelier_atr_multiplier_long = 2.0
         // and inserts an OPEN trade with a wide 4H stop (e.g. $86,000 on a $90,000 BTC LONG).
@@ -1966,16 +1980,52 @@ mod tests {
         );
 
         // Verify that if an operator sets chandelier_atr_multiplier_long = 3.0 at v11 (or post-b392d2b),
-        // re-running run_migrations() or apply_migration(011) preserves 3.0 untouched (R7-S2).
+        // re-running run_migrations() or apply_migration(011) preserves 3.0 untouched (R7-S2, R8-S1, R8-S2).
         db.set_config_value("chandelier_atr_multiplier_long", &json!(3.0))
             .unwrap();
-        db.run_migrations().unwrap();
-        db.apply_migration("sql/migrations/011_v030_round7_stop_tightening.sql")
+        let newly_applied = db.run_migrations().unwrap();
+        assert_eq!(
+            newly_applied,
+            vec!["sql/migrations/012_v030_round9_remediation.sql".to_string()],
+            "run_migrations() from v11 must report ONLY migration 012 as newly applied (R8-S2)"
+        );
+        assert_eq!(
+            db.run_migrations().unwrap(),
+            Vec::<String>::new(),
+            "run_migrations() when already at v12 must return empty Vec (R8-S2)"
+        );
+        // R8-S1: If an operator widens the ETH stop at v12 and calls apply_migration(011) directly,
+        // target_num (11) <= max_applied_ver (12), so the SQL script must NOT re-execute!
+        db.update_open_trade(
+            eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0,
+        )
+        .unwrap();
+        let rep_011 = db
+            .apply_migration("sql/migrations/011_v030_round7_stop_tightening.sql")
             .unwrap();
+        assert_eq!(
+            rep_011.get("already_applied").and_then(|v| v.as_bool()),
+            Some(true),
+            "apply_migration(011) at v12 must report already_applied = true (R8-S1)"
+        );
+        let eth_after_011 = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == eth_tid)
+            .unwrap();
+        assert!(
+            (eth_after_011.current_stop_price - 2_760.0).abs() < 1e-6,
+            "apply_migration(011) when max_applied_ver=12 must skip re-running target SQL script (R8-S1)"
+        );
         let cfg_after_remig = db.load_config().unwrap();
         assert!(
             (cfg_after_remig.get_f64("chandelier_atr_multiplier_long", 0.0) - 3.0).abs() < 1e-9,
-            "Re-running migrations at v11 must never overwrite operator-calibrated 3.0 stop multiplier (R7-S2)"
+            "Re-running migrations at v11/v12 must never overwrite operator-calibrated 3.0 stop multiplier (R7-S2)"
+        );
+        assert!(
+            (cfg_after_remig.get_f64("testnet_faucet_offset_usdc", 0.0) - 10_000.0).abs() < 1e-6,
+            "Migration 012 must seed testnet_faucet_offset_usdc = 10000.0 (R9-N2)"
         );
 
         // 3. R7-S3: close_trade and cancel_resting_trade enforce status predicates and return bool
@@ -2150,6 +2200,19 @@ mod tests {
             .expect("insert_trade must auto-upgrade legacy trades CHECK constraint with FK rows and views");
         assert!(pending_id > open_id);
 
+        // R9-QA: Verify telemetry_logs recorded the schema self-heal rebuild under component `db.schema_self_heal`
+        let logs = db.get_recent_logs(20).unwrap();
+        assert!(
+            logs.iter().any(|l| {
+                l.get("component").and_then(|v| v.as_str()) == Some("db.schema_self_heal")
+                    && l.get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .contains("PENDING")
+            }),
+            "ensure_trades_pending_status_check must emit db.schema_self_heal telemetry when rebuilding trades table (R9-QA)"
+        );
+
         // Verify child FK rows and dependent view survived the table rebuild
         db.with_conn(|conn| {
             let fk_funding: i64 = conn
@@ -2202,6 +2265,59 @@ mod tests {
         assert_eq!(open_promoted.fsm_state, "FILLED");
         assert!((open_promoted.quantity - 17.3).abs() < 1e-6);
         assert!((open_promoted.risk_budget_usdc - 2.3874).abs() < 1e-4);
+
+        // R9-N5: Verify reconcile_open_trade_size rescales risk_budget_usdc in both Some(entry_px) and None branches
+        assert!(db
+            .reconcile_open_trade_size(pending_id, 10.0, Some(3.60))
+            .unwrap());
+        let resized_some = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pending_id)
+            .unwrap();
+        assert!(
+            (resized_some.risk_budget_usdc - 1.5).abs() < 1e-4,
+            "reconcile_open_trade_size(Some(3.60)) must rescale risk_budget_usdc to |3.60 - 3.75| * 10 = 1.50 (R9-N5)"
+        );
+        assert!(db.reconcile_open_trade_size(pending_id, 20.0, None).unwrap());
+        let resized_none = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pending_id)
+            .unwrap();
+        assert!(
+            (resized_none.risk_budget_usdc - 3.0).abs() < 1e-4,
+            "reconcile_open_trade_size(None) must rescale risk_budget_usdc to |3.60 - 3.75| * 20 = 3.00 (R9-N5)"
+        );
+
+        // R9-N1: Verify cancel_resting_trade cancels a resting trade whose fsm_state is 'PENDING' as well as 'OPEN_ON_BOOK'
+        let mut pending_fsm_trade = pending_trade.clone();
+        pending_fsm_trade.client_order_id = "hl-pending-fsm-sol".to_string();
+        pending_fsm_trade.symbol = "SOL/USDC:USDC".to_string();
+        pending_fsm_trade.base_asset = "SOL".to_string();
+        pending_fsm_trade.status = "PENDING".to_string();
+        pending_fsm_trade.fsm_state = "OPEN_ON_BOOK".to_string();
+        let sol_pending_id = db.insert_trade(&pending_fsm_trade).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .unwrap();
+            conn.execute(
+                "UPDATE trades SET fsm_state = 'PENDING' WHERE trade_id = ?1;",
+                rusqlite::params![sol_pending_id],
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            db.cancel_resting_trade(sol_pending_id, "TEST_CANCEL_PENDING_FSM")
+                .unwrap(),
+            "cancel_resting_trade must cancel resting trades with fsm_state IN ('OPEN_ON_BOOK', 'PENDING') (R9-N1)"
+        );
 
         let audit_rows = db.get_order_state_audit(Some("hl-pending-near"), 10).unwrap();
         assert!(audit_rows.iter().any(|r| {

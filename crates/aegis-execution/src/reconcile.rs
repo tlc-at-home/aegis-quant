@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aegis_core::{
-    round_dp, AegisError, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
+    round_dp, PortfolioSnapshot, Result, SignalEvaluation, TradeRecord, UniverseAsset,
 };
 use aegis_risk::RiskEngine;
 use serde_json::{json, Value};
@@ -192,7 +192,7 @@ impl ExecutionEngine {
     }
 
     /// Reconciles local SQLite `OPEN` trades and Pond cells against Hyperliquid L1
-    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`, `R4-N11`).
+    /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`, `R4-N11`, `R9-S1`).
     pub fn reconcile_exchange_state(
         &self,
         simulated_exchange_positions: Option<&HashMap<String, Value>>,
@@ -207,14 +207,29 @@ impl ExecutionEngine {
             && simulated_exchange_positions.is_none()
             && simulated_open_orders.is_none()
         {
-            let open_trades = self.db.get_open_trades().unwrap_or_default();
-            return ReconcileReport {
-                status: ReconcileStatus::VerifiedPaper,
-                mode: Some("PAPER".to_string()),
-                reason: None,
-                local_open_trades: Some(open_trades.len()),
-                discrepancies_found: 0,
-                discrepancies: Vec::new(),
+            return match self.db.get_open_trades() {
+                Ok(open_trades) => ReconcileReport {
+                    status: ReconcileStatus::VerifiedPaper,
+                    mode: Some("PAPER".to_string()),
+                    reason: None,
+                    local_open_trades: Some(open_trades.len()),
+                    discrepancies_found: 0,
+                    discrepancies: Vec::new(),
+                },
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Paper-mode reconcile_exchange_state failed to query local open trades (R8-N5)"
+                    );
+                    ReconcileReport {
+                        status: ReconcileStatus::ErrorDbUnavailable,
+                        mode: Some("PAPER".to_string()),
+                        reason: Some(e.to_string()),
+                        local_open_trades: None,
+                        discrepancies_found: 0,
+                        discrepancies: Vec::new(),
+                    }
+                }
             };
         }
 
@@ -386,8 +401,11 @@ impl ExecutionEngine {
 
         // In live/testnet mode, if a resting PIT order is no longer on the exchange openOrders book,
         // poll its fill status immediately during the 15s tick so filled orders promote to OPEN without
-        // waiting up to 15 minutes for the next PIT cycle.
-        if simulated_exchange_positions.is_none() && open_orders_slice.is_some() && !resting_trades.is_empty() {
+        // waiting up to 15 minutes for the next PIT cycle (`R9-N1`, `R9-N3`).
+        if simulated_exchange_positions.is_none()
+            && open_orders_slice.is_some()
+            && !resting_trades.is_empty()
+        {
             let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
             let mut resting_changed = false;
             for rt in &resting_trades {
@@ -397,11 +415,16 @@ impl ExecutionEngine {
                     .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
                     .and_then(|s| s.parse::<u64>().ok())
                     .filter(|&id| id > 0);
-                if oid_num.map(|id| open_order_oids.contains(&id)).unwrap_or(false) {
+                if oid_num
+                    .map(|id| open_order_oids.contains(&id))
+                    .unwrap_or(false)
+                {
                     continue;
                 }
-                let r_status = self
-                    .check_resting_order_status(&rt.symbol, rt.exchange_order_id.as_deref());
+                let r_status = self.check_resting_order_status_with_open_orders(
+                    rt.exchange_order_id.as_deref(),
+                    true,
+                );
                 if r_status.state == "FILLED" {
                     let fill_px = if r_status.entry_price > 0.0 {
                         r_status.entry_price
@@ -418,18 +441,26 @@ impl ExecutionEngine {
                     } else {
                         round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
                     };
-                    if self
-                        .db
-                        .promote_resting_trade_to_open(rt.trade_id, fill_qty, fill_px, fee_usdc, 0.0)
-                        .is_ok()
-                    {
+                    if matches!(
+                        self.db.promote_resting_trade_to_open(
+                            rt.trade_id,
+                            fill_qty,
+                            fill_px,
+                            fee_usdc,
+                            0.0
+                        ),
+                        Ok(true)
+                    ) {
                         resting_changed = true;
                     }
                 } else if r_status.state == "GONE"
-                    && self
-                        .db
-                        .cancel_resting_trade(rt.trade_id, "RESTING_ORDER_CANCELLED_OR_EXPIRED")
-                        .is_ok()
+                    && matches!(
+                        self.db.cancel_resting_trade(
+                            rt.trade_id,
+                            "RESTING_ORDER_CANCELLED_OR_EXPIRED"
+                        ),
+                        Ok(true)
+                    )
                 {
                     resting_changed = true;
                 }
@@ -460,14 +491,16 @@ impl ExecutionEngine {
         };
         let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
 
-        // Aggregate local quantities per coin across both books (NM-5, NM-10)
+        // Aggregate local quantities and row IDs per coin across both books (NM-5, NM-10, R9-S1)
         let mut pit_qty_by_coin: HashMap<String, f64> = HashMap::new();
+        let mut pit_ids_by_coin: HashMap<String, Vec<i64>> = HashMap::new();
         for lt in &local_trades {
-            *pit_qty_by_coin
-                .entry(lt.base_asset.to_uppercase())
-                .or_insert(0.0) += lt.quantity.abs();
+            let coin = lt.base_asset.to_uppercase();
+            *pit_qty_by_coin.entry(coin.clone()).or_insert(0.0) += lt.quantity.abs();
+            pit_ids_by_coin.entry(coin).or_default().push(lt.trade_id);
         }
         let mut pond_qty_by_coin: HashMap<String, f64> = HashMap::new();
+        let mut pond_ids_by_coin: HashMap<String, Vec<i64>> = HashMap::new();
         for cell in &local_pond_cells {
             let coin = cell
                 .symbol
@@ -476,7 +509,12 @@ impl ExecutionEngine {
                 .unwrap_or(&cell.symbol)
                 .trim()
                 .to_uppercase();
-            *pond_qty_by_coin.entry(coin).or_insert(0.0) += cell.quantity.unwrap_or(0.0).abs();
+            *pond_qty_by_coin.entry(coin.clone()).or_insert(0.0) +=
+                cell.quantity.unwrap_or(0.0).abs();
+            pond_ids_by_coin
+                .entry(coin)
+                .or_default()
+                .push(cell.cell_id);
         }
 
         let mut seen_coins: HashSet<String> = HashSet::new();
@@ -494,11 +532,8 @@ impl ExecutionEngine {
                 known_resting_oids.insert(oid);
             }
         }
-        // R3-B4 & R4-N11: Protect resting Pond ARMED cells and their resting_order_id orders from dangling-order cancellation
+        // R3-B4, R4-N11, R9-N7: Protect resting Pond ARMED cells and their resting_order_id orders from dangling-order cancellation
         for c in &armed_pond_cells {
-            if !c.state.eq_ignore_ascii_case("ARMED") {
-                continue;
-            }
             let resting_oid_raw = c.resting_order_id.as_deref().or_else(|| {
                 c.exit_reason
                     .as_deref()
@@ -522,6 +557,68 @@ impl ExecutionEngine {
         }
 
         let mut discrepancies: Vec<Value> = Vec::new();
+
+        // R9-S1: Flag duplicate open rows sharing the same coin within PIT or POND
+        let mut dup_pit_coins: Vec<_> = pit_ids_by_coin
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect();
+        dup_pit_coins.sort_by_key(|(a, _)| *a);
+        for (coin, ids) in dup_pit_coins {
+            let _ = self.db.log_telemetry(
+                "WARNING",
+                "engine.execution",
+                &format!(
+                    "Detected {} duplicate OPEN PIT trade rows for coin {} (trade_ids={:?})",
+                    ids.len(),
+                    coin,
+                    ids
+                ),
+                Some(json!({
+                    "book": "PIT",
+                    "base_asset": coin,
+                    "count": ids.len(),
+                    "trade_ids": ids,
+                })),
+            );
+            discrepancies.push(json!({
+                "type": "DUPLICATE_SAME_COIN_OPEN_ROWS",
+                "book": "PIT",
+                "base_asset": coin,
+                "count": ids.len(),
+                "trade_ids": ids,
+            }));
+        }
+        let mut dup_pond_coins: Vec<_> = pond_ids_by_coin
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect();
+        dup_pond_coins.sort_by_key(|(a, _)| *a);
+        for (coin, ids) in dup_pond_coins {
+            let _ = self.db.log_telemetry(
+                "WARNING",
+                "engine.pond",
+                &format!(
+                    "Detected {} duplicate OPEN/TRAILED POND cell rows for coin {} (cell_ids={:?})",
+                    ids.len(),
+                    coin,
+                    ids
+                ),
+                Some(json!({
+                    "book": "POND",
+                    "base_asset": coin,
+                    "count": ids.len(),
+                    "cell_ids": ids,
+                })),
+            );
+            discrepancies.push(json!({
+                "type": "DUPLICATE_SAME_COIN_OPEN_ROWS",
+                "book": "POND",
+                "base_asset": coin,
+                "count": ids.len(),
+                "cell_ids": ids,
+            }));
+        }
 
         for lt in &local_trades {
             let coin = lt.base_asset.to_uppercase();
@@ -587,28 +684,50 @@ impl ExecutionEngine {
                         }));
                         continue;
                     }
+                    // R9-S1: Net other same-coin PIT rows when computing expected per-trade size
                     let ex_qty = szi.abs();
-                    let expected_pit_qty = (ex_qty - pond_co_qty).max(0.0);
+                    let current_pit_coin_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                    let other_pit_qty_on_coin = (current_pit_coin_qty - lt.quantity.abs()).max(0.0);
+                    let residual_pit_qty = (ex_qty - pond_co_qty).max(0.0);
+                    let expected_pit_qty = if residual_pit_qty > other_pit_qty_on_coin {
+                        (residual_pit_qty - other_pit_qty_on_coin).max(0.0)
+                    } else if current_pit_coin_qty > 1e-9 {
+                        round_dp(
+                            residual_pit_qty * (lt.quantity.abs() / current_pit_coin_qty),
+                            6,
+                        )
+                    } else {
+                        0.0
+                    };
                     if (expected_pit_qty - lt.quantity.abs()).abs() > 1e-6 && expected_pit_qty > 0.0
                     {
-                        if let Err(e) = self.db.reconcile_open_trade_size(
+                        match self.db.reconcile_open_trade_size(
                             lt.trade_id,
                             expected_pit_qty,
                             Some(entry_px),
                         ) {
-                            tracing::error!(
-                                trade_id = lt.trade_id,
-                                error = %e,
-                                "Failed to reconcile open trade size"
-                            );
+                            Ok(true) => {
+                                pit_qty_by_coin.insert(
+                                    coin.clone(),
+                                    other_pit_qty_on_coin + expected_pit_qty,
+                                );
+                                discrepancies.push(json!({
+                                    "type": "SIZE_DRIFT_RECONCILED",
+                                    "base_asset": coin,
+                                    "trade_id": lt.trade_id,
+                                    "local_qty": lt.quantity,
+                                    "exchange_qty": expected_pit_qty,
+                                }));
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    trade_id = lt.trade_id,
+                                    error = %e,
+                                    "Failed to reconcile open trade size"
+                                );
+                            }
                         }
-                        discrepancies.push(json!({
-                            "type": "SIZE_DRIFT_RECONCILED",
-                            "base_asset": coin,
-                            "trade_id": lt.trade_id,
-                            "local_qty": lt.quantity,
-                            "exchange_qty": expected_pit_qty,
-                        }));
                     }
                 }
             }
@@ -683,9 +802,23 @@ impl ExecutionEngine {
                         }));
                         continue;
                     }
+                    // R9-S1: Net other same-coin POND cell rows when computing expected per-cell size
                     let ex_qty = szi.abs();
-                    let expected_pond_qty = (ex_qty - pit_co_qty).max(0.0);
                     let local_qty = cell.quantity.unwrap_or(0.0).abs();
+                    let current_pond_coin_qty =
+                        pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                    let other_pond_qty_on_coin = (current_pond_coin_qty - local_qty).max(0.0);
+                    let residual_pond_qty = (ex_qty - pit_co_qty).max(0.0);
+                    let expected_pond_qty = if residual_pond_qty > other_pond_qty_on_coin {
+                        (residual_pond_qty - other_pond_qty_on_coin).max(0.0)
+                    } else if current_pond_coin_qty > 1e-9 {
+                        round_dp(
+                            residual_pond_qty * (local_qty / current_pond_coin_qty),
+                            6,
+                        )
+                    } else {
+                        0.0
+                    };
                     if (expected_pond_qty - local_qty).abs() > 1e-6 && expected_pond_qty > 0.0 {
                         match self.db.reconcile_open_pond_cell_size(
                             cell.cell_id,
@@ -693,6 +826,10 @@ impl ExecutionEngine {
                             Some(entry_px),
                         ) {
                             Ok(true) => {
+                                pond_qty_by_coin.insert(
+                                    coin.clone(),
+                                    other_pond_qty_on_coin + expected_pond_qty,
+                                );
                                 discrepancies.push(json!({
                                     "type": "SIZE_DRIFT_POND_CELL_RECONCILED",
                                     "base_asset": coin,
@@ -836,18 +973,21 @@ impl ExecutionEngine {
 
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
-        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`)
+        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`, `R9-N3`)
         let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
         for r_trade in resting_trades {
-            let mut r_status = self
-                .check_resting_order_status(&r_trade.symbol, r_trade.exchange_order_id.as_deref());
+            let mut r_status =
+                self.check_resting_order_status(r_trade.exchange_order_id.as_deref());
             if r_status.state == "OPEN_ON_BOOK" && !freeze_entries && !is_backtest {
                 if let Some(oid_str) = r_trade.exchange_order_id.as_deref() {
                     let cancel_confirmed = self
                         .cancel_resting_order(&r_trade.symbol, oid_str)
                         .unwrap_or(false);
-                    r_status =
-                        self.verify_post_cancel_resting_order(&r_trade.symbol, oid_str, cancel_confirmed);
+                    r_status = self.verify_post_cancel_resting_order(
+                        &r_trade.symbol,
+                        oid_str,
+                        cancel_confirmed,
+                    );
                 }
             }
             if r_status.state == "FILLED" {
@@ -914,7 +1054,7 @@ impl ExecutionEngine {
         {
             let mut cache = self.resolved_asset_cache.lock();
             for (sym, asset) in &asset_by_symbol {
-                cache.insert(sym.clone(), asset.clone());
+                cache.insert(sym.clone(), (asset.clone(), now_ms));
             }
         }
         let eval_by_symbol: HashMap<String, &SignalEvaluation> = evaluations
@@ -1077,13 +1217,11 @@ impl ExecutionEngine {
                             round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
                     } else {
                         let wallet = cfg.get_str("wallet_address", "").trim().to_string();
-                        let priv_key = self.db.get_signing_private_key().unwrap_or_default();
                         let is_testnet =
                             cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
                         let confirmed_absent_on_exchange = self
                             .is_coin_confirmed_absent_on_exchange(
                                 &wallet,
-                                &priv_key,
                                 is_testnet,
                                 &asset.base_asset,
                             );
@@ -1123,13 +1261,17 @@ impl ExecutionEngine {
                     gross_pnl + trade.realized_pnl_usdc - actual_fees + trade.funding_accrued_usdc,
                     4,
                 );
-                let _ = self.db.close_trade(
+                // R8-N4: Check bool returned by close_trade; if already closed concurrently, skip cooldown & duplicate alert
+                let closed = self.db.close_trade(
                     trade.trade_id,
                     actual_exit_px,
                     net_pnl,
                     actual_fees,
                     &reason,
                 )?;
+                if !closed {
+                    continue;
+                }
                 if stop_eval.triggered {
                     let tf_ms = match asset.exec_timeframe.as_str() {
                         "1h" => 3_600_000,
@@ -1406,6 +1548,50 @@ impl ExecutionEngine {
                                 let _ = self.cancel_resting_order(&asset.symbol, ex_oid);
                             }
                         }
+                        // R9-QA: Emit CRITICAL telemetry and alert when insert_trade fails after order placement
+                        let _ = self.db.log_telemetry(
+                            "CRITICAL",
+                            "engine.execution",
+                            &format!(
+                                "Failed to persist PIT trade in SQLite after order dispatch for {} ({} {} @ {:.4}, oid={:?}): {e}",
+                                asset.symbol,
+                                ev.signal_action,
+                                order_qty,
+                                fill_px,
+                                ex_oid_for_rollback
+                            ),
+                            Some(json!({
+                                "symbol": asset.symbol,
+                                "side": ev.signal_action,
+                                "quantity": order_qty,
+                                "entry_price": fill_px,
+                                "fsm_state": exec_res.fsm_state,
+                                "exchange_order_id": ex_oid_for_rollback,
+                                "error": e.to_string(),
+                            })),
+                        );
+                        if !is_backtest {
+                            let _ = self.alerts.notify_critical_event(
+                                "TRADE_INSERT_FAILED_AFTER_LIVE_ORDER",
+                                &format!(
+                                    "PIT order for {} ({} {} @ {:.4}, oid={:?}) succeeded on exchange/sim, but SQLite insert_trade failed: {e}",
+                                    asset.symbol,
+                                    ev.signal_action,
+                                    order_qty,
+                                    fill_px,
+                                    ex_oid_for_rollback
+                                ),
+                                Some(json!({
+                                    "symbol": asset.symbol,
+                                    "side": ev.signal_action,
+                                    "quantity": order_qty,
+                                    "entry_price": fill_px,
+                                    "fsm_state": exec_res.fsm_state,
+                                    "exchange_order_id": ex_oid_for_rollback,
+                                    "error": e.to_string(),
+                                })),
+                            );
+                        }
                         return Err(e);
                     }
                 };
@@ -1634,534 +1820,5 @@ impl ExecutionEngine {
         }
 
         Ok(snap)
-    }
-
-    /// Returns `true` ONLY when `fetch_hyperliquid_clearinghouse_state` succeeds and positively
-    /// confirms that `target_coin` has no open position (`|szi| <= 1e-8`) on the exchange (`R7-S4`).
-    /// Returns `false` if credentials are missing, the API call fails/times out, or the position is still open.
-    pub(crate) fn is_coin_confirmed_absent_on_exchange(
-        &self,
-        wallet: &str,
-        priv_key: &str,
-        is_testnet: bool,
-        target_coin: &str,
-    ) -> bool {
-        if wallet.trim().is_empty() || priv_key.trim().is_empty() {
-            return false;
-        }
-        let Some(ch) = self.fetch_hyperliquid_clearinghouse_state(wallet.trim(), is_testnet) else {
-            return false;
-        };
-        let Some(asset_positions) = ch.get("assetPositions").and_then(Value::as_array) else {
-            return false;
-        };
-        let coin_upper = target_coin.trim().to_uppercase();
-        for item in asset_positions {
-            let pos = item.get("position").unwrap_or(item);
-            let coin = pos
-                .get("coin")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_uppercase();
-            let szi = pos
-                .get("szi")
-                .and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                })
-                .unwrap_or(0.0);
-            if coin == coin_upper && szi.abs() > 1e-8 {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Resolves `UniverseAsset` metadata for an open trade symbol from the engine's
-    /// in-memory `resolved_asset_cache`, populating on miss from `universe_assets`,
-    /// `pond_universe`, or price-scaled tick/lot defaults for orphan positions (`R7-N3`, `R7-N5`).
-    pub fn resolve_trade_asset(
-        &self,
-        symbol: &str,
-        base_asset: &str,
-        ref_price: f64,
-    ) -> UniverseAsset {
-        if let Some(cached) = self.resolved_asset_cache.lock().get(symbol).cloned() {
-            return cached;
-        }
-        let mut resolved: Option<UniverseAsset> = None;
-        if let Ok(assets) = self.db.get_usdc_perp_universe() {
-            let mut cache = self.resolved_asset_cache.lock();
-            for a in assets {
-                if resolved.is_none()
-                    && (a.symbol == symbol
-                        || (!base_asset.trim().is_empty() && a.base_asset == base_asset))
-                {
-                    resolved = Some(a.clone());
-                }
-                cache.insert(a.symbol.clone(), a);
-            }
-        }
-        if let Some(found) = resolved {
-            self.resolved_asset_cache
-                .lock()
-                .insert(symbol.to_string(), found.clone());
-            return found;
-        }
-        if let Ok(pond_rows) = self.db.get_pond_universe(false) {
-            if let Some(p) = pond_rows.into_iter().find(|r| r.symbol == symbol) {
-                let built = crate::build_orphan_or_pond_universe_asset(
-                    &p.symbol,
-                    base_asset,
-                    ref_price,
-                    Some(&p),
-                    "POND",
-                );
-                self.resolved_asset_cache
-                    .lock()
-                    .insert(symbol.to_string(), built.clone());
-                return built;
-            }
-        }
-        let orphan =
-            crate::build_orphan_or_pond_universe_asset(symbol, base_asset, ref_price, None, "ORPHAN");
-        self.resolved_asset_cache
-            .lock()
-            .insert(symbol.to_string(), orphan.clone());
-        orphan
-    }
-
-    /// Manually closes / takes profit on an open Book A (`PIT`) position (`trade_id`) (`R7-S3`, `R7-S4`, `R7-N4`, `R7-N6`).
-    pub fn close_open_trade_manual(
-        &self,
-        trade_id: i64,
-        reason_override: Option<&str>,
-    ) -> Result<Value> {
-        let reason_owned: String = reason_override
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(64).collect())
-            .unwrap_or_else(|| "MANUAL_TAKE_PROFIT".to_string());
-        let reason = reason_owned.as_str();
-
-        let open_trades = self.db.get_open_trades()?;
-        let Some(trade) = open_trades.into_iter().find(|t| t.trade_id == trade_id) else {
-            let resting = self.db.get_resting_pit_trades().unwrap_or_default();
-            if let Some(rt) = resting.into_iter().find(|t| t.trade_id == trade_id) {
-                if let Some(ref oid) = rt.exchange_order_id {
-                    let _ = self.cancel_resting_order(&rt.symbol, oid);
-                }
-                let cancelled = self.db.cancel_resting_trade(trade_id, reason)?;
-                if !cancelled {
-                    return Err(AegisError::Validation(format!(
-                        "Resting trade #{trade_id} is already cancelled or closed"
-                    )));
-                }
-                return Ok(json!({
-                    "status": "CANCELLED_RESTING",
-                    "trade_id": trade_id,
-                    "symbol": rt.symbol,
-                    "exit_reason": reason,
-                }));
-            }
-            return Err(AegisError::Validation(format!(
-                "Open trade #{trade_id} not found or already closed"
-            )));
-        };
-
-        let cfg = self.db.load_config()?;
-        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-        let asset = self.resolve_trade_asset(&trade.symbol, &trade.base_asset, trade.entry_price);
-
-        let mut bars = self
-            .db
-            .get_ohlcv_bars(&trade.symbol, &asset.exec_timeframe, 5, None)
-            .unwrap_or_default();
-        if bars.is_empty() && asset.exec_timeframe != "1h" {
-            bars = self
-                .db
-                .get_ohlcv_bars(&trade.symbol, "1h", 5, None)
-                .unwrap_or_default();
-        }
-        let last_bar = bars.last();
-        let ref_px = last_bar
-            .map(|b| b.close)
-            .filter(|&p| p > 0.0)
-            .unwrap_or(if trade.current_price > 0.0 {
-                trade.current_price
-            } else {
-                trade.entry_price
-            });
-        let bar_high = last_bar.map(|b| b.high).unwrap_or(ref_px);
-        let bar_low = last_bar.map(|b| b.low).unwrap_or(ref_px);
-        let bar_vol = last_bar.map(|b| b.volume).unwrap_or(50_000.0);
-
-        let close_side = if trade.side == "LONG" {
-            "SHORT"
-        } else {
-            "LONG"
-        };
-
-        let mut actual_exit_px = ref_px;
-        let actual_fees;
-        let is_paper_trade = trade
-            .exchange_order_id
-            .as_deref()
-            .map(|oid| oid.starts_with("hl-paper-") || oid.starts_with("sim-"))
-            .unwrap_or(false);
-
-        if (mode == "LIVE" || mode == "TESTNET") && !is_paper_trade {
-            let exec_close = self.execute_maker_limit_chaser(
-                &asset,
-                close_side,
-                trade.quantity.abs(),
-                ref_px,
-                bar_high,
-                bar_low,
-                bar_vol,
-                None,
-                None,
-                None,
-                true,
-            );
-            if exec_close.fsm_state == "FILLED"
-                && exec_close.filled_units > 0.0
-                && exec_close.avg_fill_price > 0.0
-            {
-                if exec_close.filled_units + 1e-8 < trade.quantity.abs() {
-                    let remaining_qty = (trade.quantity.abs() - exec_close.filled_units).max(0.0);
-                    let remaining_notional = round_dp(remaining_qty * trade.entry_price, 4);
-                    let partial_gross_pnl = if trade.side == "LONG" {
-                        (exec_close.avg_fill_price - trade.entry_price) * exec_close.filled_units
-                    } else {
-                        (trade.entry_price - exec_close.avg_fill_price) * exec_close.filled_units
-                    };
-                    self.db.reduce_open_trade_partial_exit(
-                        trade.trade_id,
-                        remaining_qty,
-                        remaining_notional,
-                        round_dp(partial_gross_pnl, 4),
-                        round_dp(exec_close.fees_paid_usdc, 4),
-                        round_dp(exec_close.slippage_paid_usd, 4),
-                        ref_px,
-                    )?;
-                    let _ = self.reconcile_cycle_with_options(&[], false, true);
-                    return Ok(json!({
-                        "status": "PARTIAL_CLOSE",
-                        "trade_id": trade.trade_id,
-                        "symbol": trade.symbol,
-                        "side": trade.side,
-                        "filled_units": exec_close.filled_units,
-                        "remaining_units": remaining_qty,
-                        "exit_price": exec_close.avg_fill_price,
-                        "realized_pnl_delta_usdc": round_dp(partial_gross_pnl - exec_close.fees_paid_usdc, 4),
-                        "exit_reason": reason,
-                    }));
-                }
-                actual_exit_px = exec_close.avg_fill_price;
-                actual_fees = round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
-            } else {
-                // R7-S4: Only fall back to local close if clearinghouseState succeeds AND positively confirms absence
-                let wallet = cfg.get_str("wallet_address", "").trim().to_string();
-                let priv_key = self.db.get_signing_private_key().unwrap_or_default();
-                let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
-                let confirmed_absent_on_exchange = self.is_coin_confirmed_absent_on_exchange(
-                    &wallet,
-                    &priv_key,
-                    is_testnet,
-                    &asset.base_asset,
-                );
-                if !confirmed_absent_on_exchange {
-                    return Err(AegisError::Validation(format!(
-                        "Exchange reduce-only close order for {} (#{}) did not fill (state={}) and exchange position absence could not be confirmed",
-                        trade.symbol, trade.trade_id, exec_close.fsm_state
-                    )));
-                }
-                let exit_notional = trade.quantity.abs() * actual_exit_px;
-                let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
-                actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
-            }
-        } else {
-            let exit_notional = trade.quantity.abs() * actual_exit_px;
-            let exit_fee = exit_notional * (taker_fee_bps / 10_000.0);
-            actual_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
-        }
-
-        let gross_pnl = if trade.side == "LONG" {
-            (actual_exit_px - trade.entry_price) * trade.quantity.abs()
-        } else {
-            (trade.entry_price - actual_exit_px) * trade.quantity.abs()
-        };
-        let net_pnl = round_dp(
-            gross_pnl + trade.realized_pnl_usdc - actual_fees + trade.funding_accrued_usdc,
-            4,
-        );
-        let closed = self.db.close_trade(
-            trade.trade_id,
-            actual_exit_px,
-            net_pnl,
-            actual_fees,
-            reason,
-        )?;
-        if !closed {
-            return Err(AegisError::Validation(format!(
-                "Open trade #{trade_id} is already closed"
-            )));
-        }
-        let _ = self.db.log_telemetry(
-            "INFO",
-            "engine.execution",
-            &format!(
-                "Manual take-profit / close executed for {} (#{} {}) at {:.4} (net_pnl={:+.4} USDC)",
-                trade.symbol, trade.trade_id, trade.side, actual_exit_px, net_pnl
-            ),
-            Some(json!({
-                "trade_id": trade.trade_id,
-                "symbol": trade.symbol,
-                "side": trade.side,
-                "entry_price": trade.entry_price,
-                "exit_price": actual_exit_px,
-                "quantity": trade.quantity.abs(),
-                "realized_pnl_usdc": net_pnl,
-                "fees_paid_usdc": actual_fees,
-                "exit_reason": reason,
-            })),
-        );
-        let _ = self.reconcile_cycle_with_options(&[], false, true);
-
-        Ok(json!({
-            "status": "CLOSED",
-            "trade_id": trade.trade_id,
-            "symbol": trade.symbol,
-            "side": trade.side,
-            "quantity": trade.quantity.abs(),
-            "entry_price": trade.entry_price,
-            "exit_price": actual_exit_px,
-            "realized_pnl_usdc": net_pnl,
-            "fees_paid_usdc": actual_fees,
-            "exit_reason": reason,
-        }))
-    }
-
-    /// Manually closes / takes profit on an open or armed Book B (`POND`) cell (`cell_id`) (`R7-S3`, `R7-S4`, `R7-N6`).
-    pub fn close_open_pond_cell_manual(
-        &self,
-        cell_id: i64,
-        reason_override: Option<&str>,
-    ) -> Result<Value> {
-        let reason_owned: String = reason_override
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(64).collect())
-            .unwrap_or_else(|| "MANUAL_TAKE_PROFIT".to_string());
-        let reason = reason_owned.as_str();
-
-        let open_cells = self.db.get_open_pond_cells()?;
-        let cell = if let Some(c) = open_cells.into_iter().find(|c| c.cell_id == cell_id) {
-            c
-        } else {
-            let armed_cells = self.db.get_armed_pond_cells()?;
-            let Some(armed) = armed_cells.into_iter().find(|c| c.cell_id == cell_id) else {
-                return Err(AegisError::Validation(format!(
-                    "Open Pond cell #{cell_id} not found or already closed"
-                )));
-            };
-            if let Some(ref oid_str) = armed.resting_order_id {
-                if !oid_str.starts_with("hl-paper-") && !oid_str.starts_with("sim-") {
-                    let _ = self.cancel_resting_order(&armed.symbol, oid_str);
-                }
-            }
-            let ref_px = armed.entry_price.unwrap_or(0.0);
-            let closed_armed = self
-                .db
-                .reconcile_close_phantom_pond_cell(armed.cell_id, ref_px, reason)?;
-            if !closed_armed {
-                return Err(AegisError::Validation(format!(
-                    "Armed Pond cell #{cell_id} is already closed"
-                )));
-            }
-            let _ = self.db.log_telemetry(
-                "INFO",
-                "engine.pond",
-                &format!(
-                    "Manual cancel executed for ARMED Pond cell #{} ({} {})",
-                    armed.cell_id, armed.symbol, armed.side
-                ),
-                Some(json!({
-                    "cell_id": armed.cell_id,
-                    "symbol": armed.symbol,
-                    "side": armed.side,
-                    "exit_reason": reason,
-                })),
-            );
-            return Ok(json!({
-                "status": "CANCELLED_ARMED",
-                "cell_id": armed.cell_id,
-                "symbol": armed.symbol,
-                "side": armed.side,
-                "exit_reason": reason,
-            }));
-        };
-
-        let cfg = self.db.load_config()?;
-        let pond_mode = cfg
-            .get_str(
-                "pond_execution_mode",
-                &cfg.get_str("execution_mode", "PAPER"),
-            )
-            .to_ascii_uppercase();
-        let entry_px = cell.entry_price.unwrap_or(100.0);
-        let qty = cell.quantity.unwrap_or(0.0).abs();
-        let asset = self.resolve_trade_asset(&cell.symbol, "", entry_px);
-        let bars = self
-            .db
-            .get_ohlcv_bars(&cell.symbol, "1h", 5, None)
-            .unwrap_or_default();
-        let last_bar = bars.last();
-        let mark_px = last_bar
-            .map(|b| b.close)
-            .filter(|&p| p > 0.0)
-            .unwrap_or(entry_px);
-        let high_px = last_bar.map(|b| b.high).unwrap_or(mark_px);
-        let low_px = last_bar.map(|b| b.low).unwrap_or(mark_px);
-        let vol = last_bar.map(|b| b.volume).unwrap_or(50_000.0);
-        let close_side = if cell.side == "LONG" { "SELL" } else { "BUY" };
-
-        let fill = self.execute_pond_order(
-            &cell.symbol,
-            close_side,
-            qty,
-            mark_px,
-            asset.tick_size,
-            asset.lot_step_size,
-            high_px,
-            low_px,
-            vol,
-            true,
-            false,
-            true,
-            None,
-        );
-        if (pond_mode == "LIVE" || pond_mode == "TESTNET") && fill.fsm_state != "FILLED" {
-            let wallet = cfg.get_str("wallet_address", "").trim().to_string();
-            let priv_key = self.db.get_signing_private_key().unwrap_or_default();
-            let is_testnet =
-                cfg.get_bool("hyperliquid_testnet", false) || pond_mode == "TESTNET";
-            let confirmed_absent_on_exchange = self.is_coin_confirmed_absent_on_exchange(
-                &wallet,
-                &priv_key,
-                is_testnet,
-                &asset.base_asset,
-            );
-            if !confirmed_absent_on_exchange {
-                return Err(AegisError::Validation(format!(
-                    "Exchange reduce-only close order for Pond cell #{} ({}) did not fill (state={}) and exchange position absence could not be confirmed",
-                    cell.cell_id, cell.symbol, fill.fsm_state
-                )));
-            }
-        }
-        let exit_px = if fill.avg_fill_price > 0.0 {
-            fill.avg_fill_price
-        } else {
-            mark_px
-        };
-        if fill.filled_units > 0.0 && fill.filled_units + 1e-8 < qty {
-            let partial_gross = if cell.side == "LONG" {
-                (exit_px - entry_px) * fill.filled_units
-            } else {
-                (entry_px - exit_px) * fill.filled_units
-            };
-            let rem_qty = round_dp((qty - fill.filled_units).max(0.0), 6);
-            let rem_notional = round_dp(rem_qty * entry_px, 2);
-            let _ = self.db.reduce_open_pond_cell_partial_exit(
-                cell.cell_id,
-                &cell.state,
-                cell.chandelier_stop,
-                cell.highest_price_seen,
-                cell.lowest_price_seen,
-                rem_qty,
-                rem_notional,
-                partial_gross,
-                fill.fees_paid_usdc,
-            )?;
-            return Ok(json!({
-                "status": "PARTIAL_CLOSE",
-                "cell_id": cell.cell_id,
-                "symbol": cell.symbol,
-                "side": cell.side,
-                "filled_units": fill.filled_units,
-                "remaining_units": rem_qty,
-                "exit_price": exit_px,
-                "realized_pnl_delta_usdc": round_dp(partial_gross - fill.fees_paid_usdc, 4),
-                "exit_reason": reason,
-            }));
-        }
-        let gross_pnl = if cell.side == "LONG" {
-            (exit_px - entry_px) * qty
-        } else {
-            (entry_px - exit_px) * qty
-        };
-        let cd_hours = cfg.get_i64("pond_cooldown_hours", 4).max(1);
-        let now = chrono::Utc::now();
-        let now_str = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let cooldown_str = (now + chrono::Duration::hours(cd_hours))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
-
-        let closed = self.db.close_open_pond_cell(
-            cell.cell_id,
-            "COOLDOWN",
-            cell.chandelier_stop,
-            cell.highest_price_seen,
-            cell.lowest_price_seen,
-            exit_px,
-            gross_pnl,
-            fill.fees_paid_usdc,
-            Some(reason),
-            &now_str,
-            &cooldown_str,
-        )?;
-        if !closed {
-            return Err(AegisError::Validation(format!(
-                "Open Pond cell #{cell_id} is already closed"
-            )));
-        }
-        let net_pnl = round_dp(
-            cell.realized_pnl_usdc + gross_pnl + cell.funding_accrued_usdc
-                - (cell.fees_paid_usdc + fill.fees_paid_usdc),
-            4,
-        );
-        let _ = self.db.log_telemetry(
-            "INFO",
-            "engine.pond",
-            &format!(
-                "Manual take-profit / close executed for Pond cell #{} ({} {}) at {:.4} (net_pnl={:+.4} USDC)",
-                cell.cell_id, cell.symbol, cell.side, exit_px, net_pnl
-            ),
-            Some(json!({
-                "cell_id": cell.cell_id,
-                "symbol": cell.symbol,
-                "side": cell.side,
-                "entry_price": entry_px,
-                "exit_price": exit_px,
-                "quantity": qty,
-                "realized_pnl_usdc": net_pnl,
-                "exit_reason": reason,
-            })),
-        );
-
-        Ok(json!({
-            "status": "CLOSED",
-            "cell_id": cell.cell_id,
-            "symbol": cell.symbol,
-            "side": cell.side,
-            "quantity": qty,
-            "entry_price": entry_px,
-            "exit_price": exit_px,
-            "realized_pnl_usdc": net_pnl,
-            "exit_reason": reason,
-        }))
     }
 }

@@ -106,7 +106,8 @@ impl MarketIngestionEngine {
     ) -> Result<Vec<OhlcvBar>> {
         let tf_sec = timeframe_seconds(interval);
         let now_ms = Utc::now().timestamp_millis();
-        let start_ms = now_ms - ((lookback_bars as i64 + 2) * tf_sec * 1000);
+        let lookback_span = (lookback_bars as i64 * 2).max(lookback_bars as i64 + 24);
+        let start_ms = now_ms - (lookback_span * tf_sec * 1000);
         let payload = json!({
             "type": "candleSnapshot",
             "req": {
@@ -684,6 +685,14 @@ impl MarketIngestionEngine {
         let pond_mode = cfg
             .get_str("pond_execution_mode", &exec_mode)
             .to_ascii_uppercase();
+        let is_testnet = pond_mode == "TESTNET"
+            || (pond_mode != "LIVE"
+                && (exec_mode == "TESTNET" || cfg.get_bool("hyperliquid_testnet", false)));
+        let effective_min_vol = if is_testnet {
+            min_daily_vol_usdc.min(100.0)
+        } else {
+            min_daily_vol_usdc
+        };
         let has_custom_info_url = !cfg.get_str("hyperliquid_info_url", "").trim().is_empty()
             || !cfg
                 .get_str("hyperliquid_testnet_info_url", "")
@@ -732,7 +741,7 @@ impl MarketIngestionEngine {
                                 day_vlm,
                                 median_window_days,
                             );
-                            if median_vlm >= min_daily_vol_usdc {
+                            if median_vlm >= effective_min_vol {
                                 let sz_decimals = u
                                     .get("szDecimals")
                                     .and_then(Value::as_u64)
@@ -1024,7 +1033,7 @@ impl MarketIngestionEngine {
             .collect();
         let mut bars_4h: Vec<OhlcvBar> = self
             .db
-            .get_ohlcv_bars(symbol, "4h", (hours / 4).max(45), None)
+            .get_ohlcv_bars(symbol, "4h", (hours / 4).max(65), None)
             .unwrap_or_default()
             .into_iter()
             .filter(|b| b.is_synthetic == 0)
@@ -1056,14 +1065,14 @@ impl MarketIngestionEngine {
                 }
             }
 
-            let need_4h = bars_4h.len() < (hours / 4).max(45)
+            let need_4h = bars_4h.len() < (hours / 4).max(65)
                 || bars_4h
                     .last()
                     .map(|b| now_ms - b.timestamp_ms > 14_400_000)
                     .unwrap_or(true);
             if need_4h {
                 if let Some(fetched_4h) =
-                    self.fetch_hyperliquid_candles(&coin, "4h", (hours / 4).max(45), f_rate)
+                    self.fetch_hyperliquid_candles(&coin, "4h", (hours / 4).max(65), f_rate)
                 {
                     if let Err(e) = self.db.upsert_ohlcv_batch(&fetched_4h) {
                         tracing::error!(symbol = symbol, error = %e, "Failed to upsert 4h pond bars");

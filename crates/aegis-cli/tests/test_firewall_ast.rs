@@ -159,9 +159,9 @@ fn test_invariant_f2_ast_source_token_scan() {
         }
     }
 
-    // 4. R7-B1 & R7-QA: Scan crates/aegis-db/src/schema_ops.rs (`reconcile_routing_config`)
-    // and crates/aegis-db/src/config_ops.rs (`load_config`, `get_config_rows`) to guarantee
-    // config read/routing-reconcile paths never execute DML against `trades`, `pond_cells`, or `book_transfers`.
+    // 4. R7-B1, R7-QA & R8-N1: Static source-token scan on crates/aegis-db/src/schema_ops.rs
+    // and crates/aegis-db/src/config_ops.rs to guarantee config read/routing-reconcile paths
+    // never execute DML against `trades`, `pond_cells`, or `book_transfers`.
     let schema_ops_src =
         fs::read_to_string(root.join("crates/aegis-db/src/schema_ops.rs")).unwrap();
     let config_ops_src =
@@ -169,22 +169,31 @@ fn test_invariant_f2_ast_source_token_scan() {
     let config_dml_forbidden = [
         "UPDATE trades",
         "INSERT INTO trades",
+        "INSERT OR REPLACE INTO trades",
+        "INSERT OR IGNORE INTO trades",
+        "REPLACE INTO trades",
         "DELETE FROM trades",
         "UPDATE pond_cells",
         "INSERT INTO pond_cells",
+        "INSERT OR REPLACE INTO pond_cells",
+        "INSERT OR IGNORE INTO pond_cells",
+        "REPLACE INTO pond_cells",
         "DELETE FROM pond_cells",
         "UPDATE book_transfers",
+        "INSERT INTO book_transfers",
+        "INSERT OR REPLACE INTO book_transfers",
+        "REPLACE INTO book_transfers",
         "DELETE FROM book_transfers",
     ];
     for token in config_dml_forbidden {
         assert!(
             !schema_ops_src.contains(token),
-            "R7-QA AST violation in crates/aegis-db/src/schema_ops.rs: forbidden DML token '{}'",
+            "R7-QA/R8-N1 static source-token violation in crates/aegis-db/src/schema_ops.rs: forbidden DML token '{}'",
             token
         );
         assert!(
             !config_ops_src.contains(token),
-            "R7-QA AST violation in crates/aegis-db/src/config_ops.rs: forbidden DML token '{}'",
+            "R7-QA/R8-N1 static source-token violation in crates/aegis-db/src/config_ops.rs: forbidden DML token '{}'",
             token
         );
     }

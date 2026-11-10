@@ -382,6 +382,9 @@ impl AegisOrchestrator {
                 .unwrap_or(true);
         if reconcile_due {
             let recon = self.execution.reconcile_exchange_state(None, None);
+            // R8-N5: Track `ErrorDbUnavailable` in all modes (including PAPER mode, where
+            // `reconcile_exchange_state` now surfaces DB query failures instead of swallowing them),
+            // and additionally track `SkippedOffline` when running in `LIVE` or `TESTNET` mode.
             if recon.status == aegis_execution::ReconcileStatus::ErrorDbUnavailable
                 || (is_live_mode
                     && recon.status == aegis_execution::ReconcileStatus::SkippedOffline)
@@ -713,13 +716,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 11 {
+        status: if schema_ver >= 12 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 11 (migrations 001..011 applied)".to_string(),
+        requirement: "schema_version >= 12 (migrations 001..012 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 
@@ -1383,6 +1386,10 @@ fn main() -> anyhow::Result<()> {
                             "applied": applied,
                             "schema_version": sv,
                         }))?
+                    );
+                } else if applied.is_empty() {
+                    println!(
+                        "Database schema already up to date (schema_version={sv}) — 0 new migrations applied"
                     );
                 } else {
                     println!(

@@ -1,7 +1,7 @@
-//! Standalone SQLite WAL Schema v11 Migration & Verification CLI (`aegis-db-tool`).
+//! Standalone SQLite WAL Schema v12 Migration & Verification CLI (`aegis-db-tool`).
 //!
 //! Usage:
-//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/011_v030_round7_stop_tightening.sql`
+//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/012_v030_round9_remediation.sql`
 
 use aegis_core::AegisError;
 use aegis_db::DatabaseManager;
@@ -171,7 +171,8 @@ fn main() -> aegis_core::Result<()> {
         let champ = db.get_active_pond_champion().ok();
         let cfg = db.load_config().unwrap_or_default();
         let out = json!({
-            "status": "APPLIED",
+            "status": rep.get("status").and_then(|v| v.as_str()).unwrap_or("APPLIED"),
+            "already_applied": rep.get("already_applied").and_then(|v| v.as_bool()).unwrap_or(false),
             "migration": mig_path.display().to_string(),
             "db_path": db.db_path.display().to_string(),
             "schema_version": rep.get("schema_version").and_then(|v| v.as_i64()).unwrap_or(-1),

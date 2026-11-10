@@ -1,4 +1,4 @@
-//! SQLite schema initialization, transactional idempotent migration runner (001..011),
+//! SQLite schema initialization, transactional idempotent migration runner (001..012),
 //! routing mode reconciliation, and database integrity verification.
 
 use crate::fernet::ensure_master_key_for_db;
@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-/// Ordered list of SQLite schema migration files (`001..011`).
+/// Ordered list of SQLite schema migration files (`001..012`).
 ///
 /// Invariants (`R5-M1`, `R7-S2`):
 /// 1. Each migration file is executed atomically inside a SQLite transaction
@@ -30,6 +30,7 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/009_v030_round4_remediation.sql",
     "sql/migrations/010_v030_round5_remediation.sql",
     "sql/migrations/011_v030_round7_stop_tightening.sql",
+    "sql/migrations/012_v030_round9_remediation.sql",
 ];
 
 impl DatabaseManager {
@@ -37,7 +38,7 @@ impl DatabaseManager {
     /// migration crashed mid-rebuild (`R5-M1`).
     ///
     /// Specifically handles the two crash windows of the v9 `book_transfers` table rebuild:
-    /// - Crash Window A (after `CREATE`/`INSERT INTO book_transfers_v9`, before `DROP TABLE book_transfers`):
+    /// - Crash Window A (after creating and populating `book_transfers_v9`, before `DROP TABLE book_transfers`):
     ///   both `book_transfers` and `book_transfers_v9` exist -> drops the partial staging table `book_transfers_v9`.
     /// - Crash Window B (after `DROP TABLE book_transfers`, before `ALTER TABLE book_transfers_v9 RENAME TO book_transfers`):
     ///   only `book_transfers_v9` exists -> completes the rename to `book_transfers` and recreates `v_book_transfers_recent`.
@@ -464,10 +465,8 @@ impl DatabaseManager {
         let mut applied = Vec::new();
         for (idx, rel) in ALL_MIGRATION_FILES.iter().enumerate() {
             let p = root.join(rel);
-            if p.exists() {
-                if idx + 1 > cur_ver {
-                    self.apply_migration(&p)?;
-                }
+            if p.exists() && idx + 1 > cur_ver {
+                self.apply_migration(&p)?;
                 applied.push((*rel).to_string());
             }
         }
@@ -511,6 +510,7 @@ impl DatabaseManager {
             .to_string();
         let sql_script = fs::read_to_string(&mig_path)?;
 
+        let mut actually_executed = false;
         self.with_conn(|conn| {
             let target_num = file_name
                 .get(..3)
@@ -549,7 +549,12 @@ impl DatabaseManager {
                     }
                 }
             }
-            Self::execute_sql_transactional(conn, &sql_script)?;
+            if target_num == 0 || target_num > max_applied_ver {
+                Self::execute_sql_transactional(conn, &sql_script)?;
+                actually_executed = true;
+            } else {
+                Self::repair_interrupted_table_rebuilds(conn)?;
+            }
 
             let has_mig_table: Option<String> = conn
                 .query_row(
@@ -578,16 +583,19 @@ impl DatabaseManager {
 
         self.reconcile_routing_config();
         let integrity = self.verify_integrity()?;
-        let _ = self.log_telemetry(
-            "INFO",
-            "engine.database",
-            &format!("Applied SQLite migration {file_name}"),
-            Some(integrity.clone()),
-        );
+        if actually_executed {
+            let _ = self.log_telemetry(
+                "INFO",
+                "engine.database",
+                &format!("Applied SQLite migration {file_name}"),
+                Some(integrity.clone()),
+            );
+        }
 
         let mut out = integrity;
         if let Some(obj) = out.as_object_mut() {
             obj.insert("status".to_string(), json!("APPLIED"));
+            obj.insert("already_applied".to_string(), json!(!actually_executed));
             obj.insert("migration_file".to_string(), json!(file_name));
         }
         Ok(out)

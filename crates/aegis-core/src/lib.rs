@@ -2482,6 +2482,18 @@ pub fn compute_trailing_z_score(values: &[f64], window: usize) -> (f64, f64, f64
     (z, mean, std)
 }
 
+/// Normalizes an optional operator-supplied manual trade/cell exit reason (`R7-N6`, `R8-N6`).
+///
+/// Trims leading/trailing whitespace, caps length at 64 Unicode scalar values,
+/// and falls back to `"MANUAL_TAKE_PROFIT"` when `None` or blank.
+pub fn normalize_manual_exit_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(64).collect())
+        .unwrap_or_else(|| "MANUAL_TAKE_PROFIT".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2588,6 +2600,21 @@ mod tests {
         assert!(is_immutable_security_config_key("telegram_api_base_url"));
         assert!(is_immutable_security_config_key("hyperliquid_info_url_override"));
         assert!(is_immutable_security_config_key("pit_subaccount_address"));
+
+        assert_eq!(normalize_manual_exit_reason(None), "MANUAL_TAKE_PROFIT");
+        assert_eq!(
+            normalize_manual_exit_reason(Some("   ")),
+            "MANUAL_TAKE_PROFIT"
+        );
+        assert_eq!(
+            normalize_manual_exit_reason(Some("  OP_CLOSE  ")),
+            "OP_CLOSE"
+        );
+        let long_reason = "X".repeat(100);
+        assert_eq!(
+            normalize_manual_exit_reason(Some(&long_reason)).chars().count(),
+            64
+        );
     }
 
     #[test]

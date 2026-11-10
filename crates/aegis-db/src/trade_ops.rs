@@ -550,7 +550,7 @@ impl DatabaseManager {
         })
     }
 
-    /// Cancel an unfilled resting `OPEN_ON_BOOK` trade row (`NH-4`, `R7-S3`).
+    /// Cancel an unfilled resting `OPEN_ON_BOOK` or `PENDING` trade row (`NH-4`, `R7-S3`, `R9-N1`).
     pub fn cancel_resting_trade(&self, trade_id: i64, reason: &str) -> Result<bool> {
         let now_ms = self.now_ms();
         let closed_iso = aegis_core::format_ms_iso8601_utc(now_ms);
@@ -564,7 +564,7 @@ impl DatabaseManager {
                          exit_reason = ?2
                      WHERE trade_id = ?3
                        AND status IN ('PENDING', 'OPEN')
-                       AND fsm_state = 'OPEN_ON_BOOK';",
+                       AND COALESCE(fsm_state, '') IN ('OPEN_ON_BOOK', 'PENDING');",
                     params![closed_iso, reason, trade_id],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -642,7 +642,7 @@ impl DatabaseManager {
 
     /// Repairs half-completed `trades_v11_rebuild` crash windows and upgrades legacy `trades` tables
     /// whose `status` CHECK constraint lacks `'PENDING'` (`CHECK (status IN ('OPEN', 'CLOSED', 'CANCELLED'))`),
-    /// preserving all rows, columns, child foreign-key rows, indexes, and dependent views.
+    /// preserving all rows, columns, child foreign-key rows, indexes, and dependent views (`R9-N7`, `R9-QA`).
     pub(crate) fn ensure_trades_pending_status_check(conn: &rusqlite::Connection) -> Result<()> {
         let has_main: bool = conn
             .query_row(
@@ -675,6 +675,16 @@ impl DatabaseManager {
             .map_err(|e| {
                 AegisError::Database(format!("Failed to recover trades_v11_rebuild: {e}"))
             })?;
+            tracing::info!("Recovered interrupted trades_v11_rebuild table rename (R9-QA)");
+            let _ = conn.execute(
+                "INSERT INTO telemetry_logs (timestamp_ms, level, component, message, details_json)
+                 VALUES (?1, 'INFO', 'db.schema_self_heal', ?2, ?3);",
+                params![
+                    Utc::now().timestamp_millis(),
+                    "Recovered interrupted trades_v11_rebuild table rename",
+                    json!({"recovered_from": "trades_v11_rebuild"}).to_string()
+                ],
+            );
             return Ok(());
         } else if has_rebuild && has_main {
             conn.execute_batch("DROP TABLE IF EXISTS trades_v11_rebuild;")
@@ -701,16 +711,6 @@ impl DatabaseManager {
         if !sql_upper.contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')") {
             return Ok(());
         }
-
-        let had_pit_view: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='view' AND name='v_trades_pit';",
-                [],
-                |_| Ok(true),
-            )
-            .optional()
-            .map_err(|e| AegisError::Database(e.to_string()))?
-            .unwrap_or(false);
 
         let mut view_stmt = conn
             .prepare(
@@ -844,9 +844,6 @@ impl DatabaseManager {
                 script.push_str(&format!("\n{trimmed};"));
             }
         }
-        if had_pit_view {
-            script.push_str("\nCREATE VIEW IF NOT EXISTS v_trades_pit AS SELECT * FROM trades;");
-        }
 
         match conn.execute_batch(&script) {
             Ok(()) => {
@@ -860,6 +857,24 @@ impl DatabaseManager {
                         AegisError::Database(format!("Failed to commit trades rebuild tx: {e}"))
                     })?;
                 }
+                tracing::info!(
+                    preserved_columns = existing_cols.len(),
+                    dependent_views = dependent_views.len(),
+                    "Rebuilt legacy trades table to include PENDING in status CHECK constraint (R9-QA)"
+                );
+                let _ = conn.execute(
+                    "INSERT INTO telemetry_logs (timestamp_ms, level, component, message, details_json)
+                     VALUES (?1, 'INFO', 'db.schema_self_heal', ?2, ?3);",
+                    params![
+                        Utc::now().timestamp_millis(),
+                        "Rebuilt legacy trades table to include PENDING in status CHECK constraint",
+                        json!({
+                            "preserved_columns": existing_cols.len(),
+                            "dependent_views": dependent_views.len(),
+                        })
+                        .to_string()
+                    ],
+                );
                 Ok(())
             }
             Err(e) => {
@@ -959,8 +974,49 @@ impl DatabaseManager {
                     .to_ascii_uppercase()
                     .contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')") =>
             {
-                self.with_conn(Self::ensure_trades_pending_status_check)?;
-                self.with_immediate_tx(try_insert)
+                if let Err(heal_err) = self.with_conn(Self::ensure_trades_pending_status_check) {
+                    let msg = format!(
+                        "Critical: legacy trades table self-heal failed while inserting {} ({}): {heal_err}",
+                        trade.symbol, trade.status
+                    );
+                    tracing::error!("{msg}");
+                    let _ = self.log_telemetry(
+                        "CRITICAL",
+                        "db.schema_self_heal",
+                        &msg,
+                        Some(json!({
+                            "symbol": trade.symbol,
+                            "status": trade.status,
+                            "fsm_state": trade.fsm_state,
+                            "exchange_order_id": trade.exchange_order_id,
+                            "error": heal_err.to_string(),
+                        })),
+                    );
+                    return Err(heal_err);
+                }
+                match self.with_immediate_tx(try_insert) {
+                    Ok(row_id) => Ok(row_id),
+                    Err(retry_err) => {
+                        let msg = format!(
+                            "Critical: insert_trade failed after trades schema self-heal for {} ({}): {retry_err}",
+                            trade.symbol, trade.status
+                        );
+                        tracing::error!("{msg}");
+                        let _ = self.log_telemetry(
+                            "CRITICAL",
+                            "db.schema_self_heal",
+                            &msg,
+                            Some(json!({
+                                "symbol": trade.symbol,
+                                "status": trade.status,
+                                "fsm_state": trade.fsm_state,
+                                "exchange_order_id": trade.exchange_order_id,
+                                "error": retry_err.to_string(),
+                            })),
+                        );
+                        Err(retry_err)
+                    }
+                }
             }
             Err(e) => Err(e),
         }
@@ -1505,10 +1561,10 @@ impl DatabaseManager {
         trade_id: i64,
         exchange_size: f64,
         exchange_entry_price: Option<f64>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let size = exchange_size.abs();
         self.with_conn(|conn| {
-            if let Some(px) = exchange_entry_price.filter(|&p| p > 0.0) {
+            let rows = if let Some(px) = exchange_entry_price.filter(|&p| p > 0.0) {
                 let notional = size * px;
                 conn.execute(
                     "UPDATE trades
@@ -1517,24 +1573,32 @@ impl DatabaseManager {
                          entry_price = ?2,
                          avg_fill_price = ?2,
                          notional_usdc = ?3,
+                         risk_budget_usdc = CASE
+                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             ELSE risk_budget_usdc
+                         END,
                          fsm_state = 'FILLED'
                      WHERE trade_id = ?4 AND status = 'OPEN';",
                     params![size, px, notional, trade_id],
                 )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
+                .map_err(|e| AegisError::Database(e.to_string()))?
             } else {
                 conn.execute(
                     "UPDATE trades
                      SET quantity = ?1,
                          filled_units = ?1,
                          notional_usdc = ?1 * entry_price,
+                         risk_budget_usdc = CASE
+                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(entry_price - initial_stop_price) * ?1, 4)
+                             ELSE risk_budget_usdc
+                         END,
                          fsm_state = 'FILLED'
                      WHERE trade_id = ?2 AND status = 'OPEN';",
                     params![size, trade_id],
                 )
-                .map_err(|e| AegisError::Database(e.to_string()))?;
-            }
-            Ok(())
+                .map_err(|e| AegisError::Database(e.to_string()))?
+            };
+            Ok(rows > 0)
         })
     }
 

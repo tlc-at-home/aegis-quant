@@ -41,7 +41,11 @@ impl PondUniverseManager {
 
         let cfg = self.scoped_db.load_pond_config()?;
         let target_size = cfg.pond_universe_target_size.max(1);
-        let min_vol = cfg.pond_min_daily_volume_usdc;
+        let min_vol = if cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET") {
+            cfg.pond_min_daily_volume_usdc.min(100.0)
+        } else {
+            cfg.pond_min_daily_volume_usdc
+        };
         let hysteresis_rank = cfg.pond_universe_delist_rank as i64;
         let warmup_hours = cfg.pond_universe_warmup_hours.max(1);
 
@@ -67,16 +71,26 @@ impl PondUniverseManager {
         let mut updated_symbols = HashSet::new();
         let mut final_rows = Vec::new();
 
-        let is_initial_bootstrap = existing_map.is_empty();
+        let is_live_discovery = discovered.iter().any(|c| c.is_synthetic_volume == 0);
+        let is_initial_bootstrap = existing_map.is_empty()
+            || (is_live_discovery && existing_map.values().all(|r| r.is_synthetic_volume != 0));
 
         for cand in discovered {
             updated_symbols.insert(cand.symbol.clone());
             let prev = existing_map.get(&cand.symbol);
 
             let (added_at, warmup_until_str) = match prev {
-                Some(p) => (
+                Some(p) if !(is_live_discovery && p.is_synthetic_volume != 0) => (
                     p.added_at.clone(),
                     p.warmup_until.clone().unwrap_or_else(|| now_str.clone()),
+                ),
+                Some(p) => (
+                    p.added_at.clone(),
+                    cand.warmup_until.clone().unwrap_or_else(|| {
+                        (now - Duration::hours(warmup_hours + 12))
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string()
+                    }),
                 ),
                 None => {
                     if is_initial_bootstrap {
@@ -143,7 +157,11 @@ impl PondUniverseManager {
             if updated_symbols.contains(&sym) || prev.status == "RETIRED" {
                 continue;
             }
-            let delist_streak = prev.delist_streak + 1;
+            let delist_streak = if is_live_discovery && prev.is_synthetic_volume != 0 {
+                2
+            } else {
+                prev.delist_streak + 1
+            };
             let (status, delisted_at) = if delist_streak >= 2 {
                 if open_cell_symbols.contains(&sym) {
                     ("DELISTING".to_string(), None)
