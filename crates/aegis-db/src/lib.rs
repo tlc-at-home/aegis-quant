@@ -9,6 +9,7 @@ pub mod scoped;
 pub mod trade_ops;
 
 pub use config_ops::{cast_config_value, ConfigMap};
+pub use pond_ops::{PitPnlComponents, PondPnlComponents};
 pub use scoped::{BookScopedDb, PitConfig, PondConfig};
 
 use crate::fernet::{
@@ -2325,6 +2326,151 @@ mod tests {
                 && r.get("from_state").and_then(|v| v.as_str()) == Some("OPEN_ON_BOOK")
                 && r.get("to_state").and_then(|v| v.as_str()) == Some("FILLED")
         }));
+    }
+
+    #[test]
+    fn test_r10_n1_and_r10_s1_migration_audit_and_pond_risk_budget_rescale() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // R10-N1: Simulate a database at schema_version = 6 with schema_migrations missing prerequisite rows (7..11)
+        db.with_conn(|conn| {
+            conn.execute("DELETE FROM schema_migrations WHERE version > 6;", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE system_config SET config_value = '6' WHERE config_key = 'schema_version';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let applied = db
+            .apply_migration("sql/migrations/012_v030_round9_remediation.sql")
+            .unwrap();
+        assert_eq!(applied["status"], "APPLIED");
+
+        let recorded_versions: Vec<i64> = db
+            .with_conn(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT version FROM schema_migrations WHERE version >= 7 ORDER BY version ASC;",
+                    )
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(
+            recorded_versions,
+            vec![7, 8, 9, 10, 11, 12],
+            "apply_migration(012) from version 6 must record prerequisite versions 7..12 in schema_migrations (R10-N1)"
+        );
+
+        // R10-S1: Verify reduce_open_pond_cell_partial_exit and both Some(epx) and None branches of reconcile_open_pond_cell_size
+        // proportionally rescale risk_budget_usdc
+        let cell_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "SOL/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(100.0),
+                quantity: Some(10.0),
+                notional_usdc: Some(1000.0),
+                risk_budget_usdc: Some(50.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.4),
+                funding_rate_entry: Some(-0.0001),
+                initial_stop: Some(95.0),
+                chandelier_stop: Some(95.0),
+                highest_price_seen: Some(100.0),
+                lowest_price_seen: Some(100.0),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.10,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-11T00:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-11T00:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        // 1. 40% partial exit (10.0 -> 6.0): risk_budget_usdc rescales 50.0 -> 30.0
+        assert!(db
+            .reduce_open_pond_cell_partial_exit(
+                cell_id,
+                "TRAILED",
+                Some(96.0),
+                Some(102.0),
+                Some(100.0),
+                6.0,
+                600.0,
+                8.0,
+                0.05,
+            )
+            .unwrap());
+        let after_partial = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cell_id)
+            .unwrap();
+        assert_eq!(after_partial.quantity, Some(6.0));
+        assert_eq!(after_partial.notional_usdc, Some(600.0));
+        assert_eq!(
+            after_partial.risk_budget_usdc,
+            Some(30.0),
+            "reduce_open_pond_cell_partial_exit must proportionally rescale risk_budget_usdc (R10-S1)"
+        );
+
+        // 2. reconcile_open_pond_cell_size Some(101.0) branch (6.0 -> 3.0, entry_price 100.0 -> 101.0 with initial_stop=95.0):
+        // risk_budget_usdc recomputes as ROUND(ABS(101.0 - 95.0) * 3.0, 4) = 18.0
+        assert!(db
+            .reconcile_open_pond_cell_size(cell_id, 3.0, Some(101.0))
+            .unwrap());
+        let after_some = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cell_id)
+            .unwrap();
+        assert_eq!(after_some.quantity, Some(3.0));
+        assert_eq!(after_some.entry_price, Some(101.0));
+        assert_eq!(after_some.notional_usdc, Some(303.0));
+        assert_eq!(
+            after_some.risk_budget_usdc,
+            Some(18.0),
+            "reconcile_open_pond_cell_size(Some(101.0)) must recompute risk_budget_usdc from |ep - initial_stop| * qty = 18.0 (R10-S1)"
+        );
+
+        // 3. reconcile_open_pond_cell_size None branch (3.0 -> 1.0, entry_price stays 101.0):
+        // risk_budget_usdc recomputes as ROUND(ABS(101.0 - 95.0) * 1.0, 4) = 6.0
+        assert!(db.reconcile_open_pond_cell_size(cell_id, 1.0, None).unwrap());
+        let after_none = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cell_id)
+            .unwrap();
+        assert_eq!(after_none.quantity, Some(1.0));
+        assert_eq!(after_none.notional_usdc, Some(101.0));
+        assert_eq!(
+            after_none.risk_budget_usdc,
+            Some(6.0),
+            "reconcile_open_pond_cell_size(None) must rescale risk_budget_usdc to 6.0 (R10-S1)"
+        );
     }
 }
 

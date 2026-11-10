@@ -1224,5 +1224,753 @@ mod tests {
                 < 0.02
         );
     }
+
+    #[test]
+    fn test_r10_qa_r11_qa_twin_parity_invariants() {
+        use aegis_core::{round_dp, BookTransfer, PondCell, PortfolioSnapshot, TradeRecord};
+
+        // =========================================================================
+        // Family 1: SQL UPDATE Twin Parity (trade_ops.rs vs pond_ops.rs)
+        // =========================================================================
+        let db1 = DatabaseManager::memory();
+        db1.initialize_schema(true).expect("seed schema db1");
+
+        let pit_trade_id = db1
+            .insert_trade(&TradeRecord {
+                trade_id: 0,
+                client_order_id: "twin-pit-1".to_string(),
+                symbol: "SOL/USDC:USDC".to_string(),
+                base_asset: "SOL".to_string(),
+                side: "LONG".to_string(),
+                status: "OPEN".to_string(),
+                fsm_state: "FILLED".to_string(),
+                entry_price: 100.0,
+                current_price: 100.0,
+                exit_price: None,
+                quantity: 10.0,
+                filled_units: 10.0,
+                avg_fill_price: Some(100.0),
+                notional_usdc: 1000.0,
+                risk_budget_usdc: 50.0,
+                conviction_multiplier: 1.0,
+                initial_stop_price: 95.0,
+                chandelier_stop_price: 95.0,
+                current_stop_price: 95.0,
+                highest_price_seen: 100.0,
+                lowest_price_seen: 100.0,
+                unrealized_pnl_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.45,
+                funding_accrued_usdc: 1.25,
+                slippage_paid_usd: 0.0,
+                exchange_order_id: Some("hl-pit-1".to_string()),
+                opened_at: "2026-11-10T10:00:00Z".to_string(),
+                closed_at: None,
+                exit_reason: None,
+            })
+            .expect("insert twin pit trade");
+
+        let pond_cell_id = db1
+            .upsert_pond_cell(&PondCell {
+                cell_id: 0,
+                symbol: "SOL/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(100.0),
+                quantity: Some(10.0),
+                notional_usdc: Some(1000.0),
+                risk_budget_usdc: Some(50.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.4),
+                funding_rate_entry: Some(-0.0001),
+                initial_stop: Some(95.0),
+                chandelier_stop: Some(95.0),
+                highest_price_seen: Some(100.0),
+                lowest_price_seen: Some(100.0),
+                funding_accrued_usdc: 1.25,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.45,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-10T10:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-10T10:00:00Z".to_string(),
+            })
+            .expect("insert twin pond cell");
+
+        // 1a. Apply identical 40% partial exit (10.0 -> 6.0) to both PIT trade and POND cell
+        db1.reduce_open_trade_partial_exit(pit_trade_id, 6.0, 600.0, 12.0, 0.27, 0.0, 102.0)
+            .unwrap();
+        assert!(db1
+            .reduce_open_pond_cell_partial_exit(
+                pond_cell_id,
+                "TRAILED",
+                Some(95.0),
+                Some(102.0),
+                Some(100.0),
+                6.0,
+                600.0,
+                12.0,
+                0.27,
+            )
+            .unwrap());
+
+        let t_partial = db1
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pit_trade_id)
+            .unwrap();
+        let c_partial = db1
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == pond_cell_id)
+            .unwrap();
+
+        assert_eq!(t_partial.quantity, c_partial.quantity.unwrap());
+        assert_eq!(t_partial.notional_usdc, c_partial.notional_usdc.unwrap());
+        assert_eq!(
+            t_partial.risk_budget_usdc,
+            c_partial.risk_budget_usdc.unwrap()
+        );
+        assert_eq!(t_partial.risk_budget_usdc, 30.0);
+        assert_eq!(t_partial.realized_pnl_usdc, c_partial.realized_pnl_usdc);
+        assert_eq!(t_partial.realized_pnl_usdc, 12.0);
+        assert!(
+            (t_partial.fees_paid_usdc - c_partial.fees_paid_usdc).abs() < 1e-9,
+            "fees_paid_usdc must match between PIT and POND after partial exit"
+        );
+
+        // 1b. Apply reconcile_open_trade_size / reconcile_open_pond_cell_size with Some(101.0) (6.0 -> 3.0, entry_price 100.0 -> 101.0)
+        // With initial_stop = 95.0, risk_budget_usdc must recompute to |101.0 - 95.0| * 3.0 = 18.0 on both PIT and POND
+        assert!(db1
+            .reconcile_open_trade_size(pit_trade_id, 3.0, Some(101.0))
+            .unwrap());
+        assert!(db1
+            .reconcile_open_pond_cell_size(pond_cell_id, 3.0, Some(101.0))
+            .unwrap());
+
+        let t_some = db1
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pit_trade_id)
+            .unwrap();
+        let c_some = db1
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == pond_cell_id)
+            .unwrap();
+        assert_eq!(t_some.quantity, c_some.quantity.unwrap());
+        assert_eq!(t_some.entry_price, c_some.entry_price.unwrap());
+        assert_eq!(t_some.notional_usdc, c_some.notional_usdc.unwrap());
+        assert_eq!(t_some.notional_usdc, 303.0);
+        assert_eq!(t_some.risk_budget_usdc, c_some.risk_budget_usdc.unwrap());
+        assert_eq!(t_some.risk_budget_usdc, 18.0);
+
+        // 1c. Apply reconcile_open_trade_size / reconcile_open_pond_cell_size with None (3.0 -> 1.5, entry_price stays 101.0)
+        // risk_budget_usdc must recompute to |101.0 - 95.0| * 1.5 = 9.0 on both PIT and POND
+        assert!(db1
+            .reconcile_open_trade_size(pit_trade_id, 1.5, None)
+            .unwrap());
+        assert!(db1
+            .reconcile_open_pond_cell_size(pond_cell_id, 1.5, None)
+            .unwrap());
+
+        let t_none = db1
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == pit_trade_id)
+            .unwrap();
+        let c_none = db1
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == pond_cell_id)
+            .unwrap();
+        assert_eq!(t_none.quantity, c_none.quantity.unwrap());
+        assert_eq!(t_none.notional_usdc, c_none.notional_usdc.unwrap());
+        assert_eq!(t_none.notional_usdc, 151.5);
+        assert_eq!(t_none.risk_budget_usdc, c_none.risk_budget_usdc.unwrap());
+        assert_eq!(t_none.risk_budget_usdc, 9.0);
+
+        // 1d. Close both partially-exited twins at exit_price = 105.0 (final exit fee = 0.08):
+        // Verify realized_pnl_usdc transitions cleanly from partial_realized_pnl_usdc into closed_realized_pnl_usdc without double counting
+        let final_gross_delta = (105.0 - t_none.entry_price) * t_none.quantity.abs(); // (105 - 101) * 1.5 = 6.0
+        let final_fee_delta = 0.08;
+        let total_pit_fees = round_dp(t_none.fees_paid_usdc + final_fee_delta, 4); // 0.72 + 0.08 = 0.80
+        let total_pit_net_pnl = round_dp(
+            final_gross_delta + t_none.realized_pnl_usdc - total_pit_fees + t_none.funding_accrued_usdc,
+            4,
+        ); // 6.0 + 12.0 - 0.80 + 1.25 = 18.45
+        assert!(db1
+            .close_trade(pit_trade_id, 105.0, total_pit_net_pnl, total_pit_fees, "TEST_CLOSE")
+            .unwrap());
+        assert!(db1
+            .close_open_pond_cell(
+                pond_cell_id,
+                "COOLDOWN",
+                Some(95.0),
+                Some(105.0),
+                Some(100.0),
+                105.0,
+                final_gross_delta,
+                final_fee_delta,
+                Some("TEST_CLOSE"),
+                "2026-11-10T12:00:00Z",
+                "2026-11-10T16:00:00Z",
+            )
+            .unwrap());
+        let pit_comp_after_close = db1.compute_pit_pnl_components().unwrap();
+        let pond_comp_after_close = db1.compute_pond_pnl_components().unwrap();
+        assert_eq!(pit_comp_after_close.partial_realized_pnl_usdc, 0.0);
+        assert_eq!(pond_comp_after_close.partial_realized_pnl_usdc, 0.0);
+        assert_eq!(pit_comp_after_close.closed_realized_pnl_usdc, 18.45);
+        assert_eq!(pond_comp_after_close.closed_realized_pnl_usdc, 18.45);
+        assert_eq!(
+            pit_comp_after_close.realized_pnl_usdc,
+            pond_comp_after_close.realized_pnl_usdc
+        );
+        assert_eq!(
+            pit_comp_after_close.total_net_pnl_usdc,
+            pond_comp_after_close.total_net_pnl_usdc
+        );
+
+        // =========================================================================
+        // Family 2 & Family 3: PnL & Equity Accounting Twin Parity + UI Row Formula Parity
+        // =========================================================================
+        let db2 = DatabaseManager::memory();
+        db2.initialize_schema(true).expect("seed schema db2");
+
+        // Configure baseline reset timestamp so closed trades/cells before reset are excluded
+        db2.set_config_value(
+            "equity_baseline_reset_at",
+            &serde_json::json!("2026-11-10T00:00:00Z"),
+        )
+        .unwrap();
+
+        // Seed market candles for mark-to-market price resolution
+        db2.upsert_ohlcv_batch(&[
+            aegis_core::OhlcvBar {
+                symbol: "BTC/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_312_000_000,
+                open: 91_000.0,
+                high: 92_000.0,
+                low: 90_500.0,
+                close: 91_500.0,
+                volume: 100.0,
+                funding_rate_hourly: 0.0001,
+                is_synthetic: 0,
+            },
+            aegis_core::OhlcvBar {
+                symbol: "ETH/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_312_000_000,
+                open: 3_050.0,
+                high: 3_150.0,
+                low: 3_000.0,
+                close: 3_100.0,
+                volume: 500.0,
+                funding_rate_hourly: -0.0001,
+                is_synthetic: 0,
+            },
+        ])
+        .unwrap();
+
+        // (1) Completed book_transfers in both directions (PIT -> POND $300, POND -> PIT $120 => net PIT = -180, net POND = +180)
+        db2.insert_book_transfer(&BookTransfer {
+            transfer_id: 0,
+            settle_date: "2026-11-10".to_string(),
+            from_book: "PIT".to_string(),
+            to_book: "POND".to_string(),
+            amount_usdc: 300.0,
+            pre_from_usdc: Some(5000.0),
+            pre_to_usdc: Some(5000.0),
+            post_from_usdc: Some(4700.0),
+            post_to_usdc: Some(5300.0),
+            drift_bps_before: Some(300.0),
+            drift_bps_after: Some(0.0),
+            blocked_remainder_usdc: 0.0,
+            status: "COMPLETED".to_string(),
+            attempts: 1,
+            tx_ref: Some("TWIN_PARITY_TX_1".to_string()),
+            created_at: "2026-11-10T01:00:00Z".to_string(),
+        })
+        .unwrap();
+        db2.insert_book_transfer(&BookTransfer {
+            transfer_id: 0,
+            settle_date: "2026-11-11".to_string(),
+            from_book: "POND".to_string(),
+            to_book: "PIT".to_string(),
+            amount_usdc: 120.0,
+            pre_from_usdc: Some(5300.0),
+            pre_to_usdc: Some(4700.0),
+            post_from_usdc: Some(5180.0),
+            post_to_usdc: Some(4820.0),
+            drift_bps_before: Some(120.0),
+            drift_bps_after: Some(0.0),
+            blocked_remainder_usdc: 0.0,
+            status: "COMPLETED".to_string(),
+            attempts: 1,
+            tx_ref: Some("TWIN_PARITY_TX_2".to_string()),
+            created_at: "2026-11-10T02:00:00Z".to_string(),
+        })
+        .unwrap();
+
+        // (2) Pre-reset closed PIT trade & POND cell (must be excluded by equity_baseline_reset_at)
+        let pre_reset_pit_id = db2
+            .insert_trade(&TradeRecord {
+                trade_id: 0,
+                client_order_id: "pit-closed-pre-reset".to_string(),
+                symbol: "SOL/USDC:USDC".to_string(),
+                base_asset: "SOL".to_string(),
+                side: "LONG".to_string(),
+                status: "CLOSED".to_string(),
+                fsm_state: "FILLED".to_string(),
+                entry_price: 100.0,
+                current_price: 90.0,
+                exit_price: Some(90.0),
+                quantity: 5.0,
+                filled_units: 5.0,
+                avg_fill_price: Some(100.0),
+                notional_usdc: 500.0,
+                risk_budget_usdc: 25.0,
+                conviction_multiplier: 1.0,
+                initial_stop_price: 90.0,
+                chandelier_stop_price: 90.0,
+                current_stop_price: 90.0,
+                highest_price_seen: 100.0,
+                lowest_price_seen: 90.0,
+                unrealized_pnl_usdc: 0.0,
+                realized_pnl_usdc: -50.0,
+                fees_paid_usdc: 0.5,
+                funding_accrued_usdc: 0.0,
+                slippage_paid_usd: 0.0,
+                exchange_order_id: None,
+                opened_at: "2026-11-09T01:00:00Z".to_string(),
+                closed_at: Some("2026-11-09T05:00:00Z".to_string()),
+                exit_reason: Some("CHANDELIER_STOP".to_string()),
+            })
+            .unwrap();
+        let pre_reset_pond_id = db2
+            .upsert_pond_cell(&PondCell {
+                cell_id: 0,
+                symbol: "SOL/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "CLOSED".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(100.0),
+                quantity: Some(5.0),
+                notional_usdc: Some(500.0),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(2.5),
+                funding_rate_entry: Some(0.0001),
+                initial_stop: Some(110.0),
+                chandelier_stop: Some(110.0),
+                highest_price_seen: Some(110.0),
+                lowest_price_seen: Some(100.0),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: -45.0,
+                fees_paid_usdc: 0.4,
+                exit_price: Some(109.0),
+                exit_reason: Some("STOP_LOSS".to_string()),
+                resting_order_id: None,
+                opened_at: Some("2026-11-09T01:00:00Z".to_string()),
+                closed_at: Some("2026-11-09T06:00:00Z".to_string()),
+                cooldown_until: None,
+                updated_at: "2026-11-09T06:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        // (3) Post-reset closed PIT trade & POND cell (included in realized PnL)
+        db2.insert_trade(&TradeRecord {
+            trade_id: 0,
+            client_order_id: "pit-closed-post-reset".to_string(),
+            symbol: "AVAX/USDC:USDC".to_string(),
+            base_asset: "AVAX".to_string(),
+            side: "LONG".to_string(),
+            status: "CLOSED".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 25.0,
+            current_price: 28.0,
+            exit_price: Some(28.0),
+            quantity: 10.0,
+            filled_units: 10.0,
+            avg_fill_price: Some(25.0),
+            notional_usdc: 250.0,
+            risk_budget_usdc: 15.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 23.5,
+            chandelier_stop_price: 27.0,
+            current_stop_price: 27.0,
+            highest_price_seen: 28.5,
+            lowest_price_seen: 25.0,
+            unrealized_pnl_usdc: 0.0,
+            realized_pnl_usdc: 29.40,
+            fees_paid_usdc: 0.60,
+            funding_accrued_usdc: 0.15,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: None,
+            opened_at: "2026-11-10T03:00:00Z".to_string(),
+            closed_at: Some("2026-11-10T06:00:00Z".to_string()),
+            exit_reason: Some("TAKE_PROFIT".to_string()),
+        })
+        .unwrap();
+        db2.upsert_pond_cell(&PondCell {
+            cell_id: 0,
+            symbol: "LINK/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "CLOSED".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(15.0),
+            quantity: Some(20.0),
+            notional_usdc: Some(300.0),
+            risk_budget_usdc: Some(20.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.6),
+            funding_rate_entry: Some(0.0001),
+            initial_stop: Some(16.0),
+            chandelier_stop: Some(14.2),
+            highest_price_seen: Some(15.0),
+            lowest_price_seen: Some(13.8),
+            funding_accrued_usdc: 0.85,
+            realized_pnl_usdc: 18.20,
+            fees_paid_usdc: 0.30,
+            exit_price: Some(14.1),
+            exit_reason: Some("TIER3_FUNDING_NORMALISATION".to_string()),
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T03:00:00Z".to_string()),
+            closed_at: Some("2026-11-10T07:00:00Z".to_string()),
+            cooldown_until: None,
+            updated_at: "2026-11-10T07:00:00Z".to_string(),
+        })
+        .unwrap();
+
+        // (4) Open PIT trade & POND cell with partial-exit realized_pnl_usdc, fees_paid_usdc, and funding_accrued_usdc
+        db2.insert_trade(&TradeRecord {
+            trade_id: 0,
+            client_order_id: "pit-open-btc".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 90_000.0,
+            current_price: 91_500.0,
+            exit_price: None,
+            quantity: 0.02,
+            filled_units: 0.02,
+            avg_fill_price: Some(90_000.0),
+            notional_usdc: 1_800.0,
+            risk_budget_usdc: 40.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 88_000.0,
+            chandelier_stop_price: 89_500.0,
+            current_stop_price: 89_500.0,
+            highest_price_seen: 92_000.0,
+            lowest_price_seen: 90_000.0,
+            unrealized_pnl_usdc: 30.0,
+            realized_pnl_usdc: 14.50,
+            fees_paid_usdc: 0.85,
+            funding_accrued_usdc: -1.10,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-btc-open".to_string()),
+            opened_at: "2026-11-10T08:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        })
+        .unwrap();
+        db2.upsert_pond_cell(&PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "TRAILED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(3_000.0),
+            quantity: Some(0.5),
+            notional_usdc: Some(1_500.0),
+            risk_budget_usdc: Some(45.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.4),
+            funding_rate_entry: Some(-0.0001),
+            initial_stop: Some(2_910.0),
+            chandelier_stop: Some(2_980.0),
+            highest_price_seen: Some(3_150.0),
+            lowest_price_seen: Some(3_000.0),
+            funding_accrued_usdc: 2.35,
+            realized_pnl_usdc: 9.75,
+            fees_paid_usdc: 0.65,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T08:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T09:00:00Z".to_string(),
+        })
+        .unwrap();
+
+        // (5) Resting orders on both books (PENDING PIT trade and ARMED Pond cell)
+        db2.insert_trade(&TradeRecord {
+            trade_id: 0,
+            client_order_id: "pit-pending-sui".to_string(),
+            symbol: "SUI/USDC:USDC".to_string(),
+            base_asset: "SUI".to_string(),
+            side: "LONG".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 3.0,
+            current_price: 3.0,
+            exit_price: None,
+            quantity: 100.0,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 300.0,
+            risk_budget_usdc: 15.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 2.85,
+            chandelier_stop_price: 2.85,
+            current_stop_price: 2.85,
+            highest_price_seen: 3.0,
+            lowest_price_seen: 3.0,
+            unrealized_pnl_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-sui-resting".to_string()),
+            opened_at: "2026-11-10T09:30:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        })
+        .unwrap();
+        db2.upsert_pond_cell(&PondCell {
+            cell_id: 0,
+            symbol: "DOGE/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(0.25),
+            quantity: Some(1_000.0),
+            notional_usdc: Some(250.0),
+            risk_budget_usdc: Some(12.5),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.3),
+            funding_rate_entry: Some(0.0001),
+            initial_stop: Some(0.2625),
+            chandelier_stop: Some(0.2625),
+            highest_price_seen: Some(0.25),
+            lowest_price_seen: Some(0.25),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: Some("hl-doge-resting".to_string()),
+            opened_at: Some("2026-11-10T09:30:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T09:30:00Z".to_string(),
+        })
+        .unwrap();
+
+        // (6) Non-zero accrued_yield_usdc on the latest portfolio_snapshots row
+        db2.save_portfolio_snapshot(&PortfolioSnapshot {
+            snapshot_id: None,
+            timestamp_ms: 1_794_312_000_000,
+            total_equity_usdc: 10_000.0,
+            available_cash_usdc: 6_450.0,
+            deployed_notional_usdc: 3_550.0,
+            gross_leverage: 0.355,
+            portfolio_heat_usdc: 80.0,
+            portfolio_heat_pct: 0.008,
+            basis_harvest_notional_usdc: 0.0,
+            accrued_yield_usdc: 3.45,
+            hmm_regime: "BULL_TREND".to_string(),
+            prob_bull: 0.70,
+            prob_bear: 0.10,
+            prob_chop: 0.20,
+            open_long_count: 1,
+            open_short_count: 0,
+            created_at: Some("2026-11-10T09:45:00Z".to_string()),
+        })
+        .unwrap();
+
+        let verify_family_2_and_3 = |db_ref: &DatabaseManager, min_closed_ts: &str| {
+            let cfg = db_ref.load_config().unwrap();
+            let pit_init = cfg.get_f64("pit_initial_capital_usdc", 5000.0);
+            let pond_init = cfg.get_f64("pond_initial_capital_usdc", 5000.0);
+            let net_transfers_pit = db_ref.get_net_book_transfer_adjustment("PIT").unwrap();
+            let net_transfers_pond = db_ref.get_net_book_transfer_adjustment("POND").unwrap();
+            assert_eq!(net_transfers_pit, -180.0);
+            assert_eq!(net_transfers_pond, 180.0);
+
+            let (pit_eq, pit_idle) = db_ref.compute_pit_equity_and_idle_usdc().unwrap();
+            let payload_pit = crate::payloads::build_portfolio_payload(db_ref).unwrap();
+            let (pond_eq, pond_idle) = db_ref.compute_pond_equity_and_idle_usdc().unwrap();
+            let payload_pond = crate::payloads::build_pond_payload(db_ref).unwrap();
+            let pp50 = crate::payloads::build_pp50_payload(db_ref).unwrap();
+
+            // Family 2 — Book A (PIT) Twin Parity
+            assert_eq!(
+                pit_eq,
+                round_dp(
+                    (pit_init + net_transfers_pit + payload_pit.total_pnl_usdc).max(0.0),
+                    2
+                ),
+                "PIT equity must equal round_dp(pit_init + net_transfers_pit + payload_pit.total_pnl_usdc, 2)"
+            );
+            assert_eq!(
+                pit_idle,
+                round_dp((pit_eq - payload_pit.deployed_notional_usdc).max(0.0), 2),
+                "PIT idle capital must equal round_dp(pit_eq - payload_pit.deployed_notional_usdc, 2)"
+            );
+
+            // Family 2 — Book B (POND) Twin Parity
+            assert_eq!(
+                pond_eq,
+                round_dp(
+                    (pond_init + net_transfers_pond + payload_pond.total_pnl_usdc).max(0.0),
+                    2
+                ),
+                "POND equity must equal round_dp(pond_init + net_transfers_pond + payload_pond.total_pnl_usdc, 2)"
+            );
+            assert_eq!(
+                pond_idle,
+                round_dp((pond_eq - payload_pond.deployed_notional_usdc).max(0.0), 2),
+                "POND idle capital must equal round_dp(pond_eq - payload_pond.deployed_notional_usdc, 2)"
+            );
+
+            // Family 2 — PP50 Combined Platform Parity
+            assert_eq!(
+                pp50.total_platform_equity_usdc,
+                round_dp(pit_eq + pond_eq, 2),
+                "PP50 total_platform_equity_usdc must equal round_dp(pit_eq + pond_eq, 2)"
+            );
+            assert_eq!(
+                pp50.total_platform_pnl_usdc,
+                round_dp(payload_pit.total_pnl_usdc + payload_pond.total_pnl_usdc, 4),
+                "PP50 total_platform_pnl_usdc must equal round_dp(payload_pit.total_pnl_usdc + payload_pond.total_pnl_usdc, 4)"
+            );
+
+            // Family 3 — UI Row-Level PnL Formula Parity (R11-N2)
+            let dash = build_dashboard_payload(db_ref).unwrap();
+            let pit_open_rows_net_sum: f64 = dash
+                .open_trades
+                .iter()
+                .filter(|t| t.status == "OPEN")
+                .map(|t| {
+                    t.unrealized_pnl_usdc + t.funding_accrued_usdc - t.fees_paid_usdc
+                        + t.realized_pnl_usdc
+                })
+                .sum();
+            let pit_closed_rows_since_reset_sum: f64 = dash
+                .recent_trades
+                .iter()
+                .filter(|t| {
+                    t.status == "CLOSED"
+                        && t.closed_at.as_deref().unwrap_or("") >= min_closed_ts
+                })
+                .map(|t| t.realized_pnl_usdc)
+                .sum();
+            assert_eq!(
+                round_dp(
+                    pit_open_rows_net_sum
+                        + pit_closed_rows_since_reset_sum
+                        + payload_pit.accrued_yield_usdc,
+                    4
+                ),
+                payload_pit.total_pnl_usdc,
+                "Sum of PIT UI row-level net PnL + closed realized PnL since reset + yield must equal payload_pit.total_pnl_usdc (R11-N2 / R11-QA)"
+            );
+
+            let pond_open_rows_net_sum: f64 = payload_pond
+                .open_cells
+                .iter()
+                .filter(|c| matches!(c.cell.state.as_str(), "OPEN" | "TRAILED"))
+                .map(|c| {
+                    c.unrealized_pnl_usdc + c.cell.funding_accrued_usdc - c.cell.fees_paid_usdc
+                        + c.cell.realized_pnl_usdc
+                })
+                .sum();
+            let pond_closed_rows_since_reset_sum: f64 = payload_pond
+                .recent_cells
+                .iter()
+                .filter(|c| {
+                    matches!(c.cell.state.as_str(), "CLOSED" | "COOLDOWN")
+                        && c.cell.closed_at.as_deref().unwrap_or("") >= min_closed_ts
+                })
+                .map(|c| c.cell.realized_pnl_usdc)
+                .sum();
+            assert_eq!(
+                round_dp(pond_open_rows_net_sum + pond_closed_rows_since_reset_sum, 4),
+                payload_pond.total_pnl_usdc,
+                "Sum of POND UI row-level net PnL + closed realized PnL since reset must equal payload_pond.total_pnl_usdc (R11-QA)"
+            );
+        };
+
+        // Pass A: With equity_baseline_reset_at = "2026-11-10T00:00:00Z" (pre-reset closed rows excluded)
+        verify_family_2_and_3(&db2, "2026-11-10T00:00:00Z");
+
+        // Pass B: Without equity_baseline_reset_at (verifying non-zero accrued_yield_usdc = 3.45 is included)
+        db2.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM trades WHERE trade_id = ?1;",
+                [pre_reset_pit_id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM pond_cells WHERE cell_id = ?1;",
+                [pre_reset_pond_id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        db2.set_config_value("equity_baseline_reset_at", &serde_json::json!(""))
+            .unwrap();
+        assert_eq!(
+            crate::payloads::build_portfolio_payload(&db2)
+                .unwrap()
+                .accrued_yield_usdc,
+            3.45
+        );
+        verify_family_2_and_3(&db2, "");
+
+        let app_js_src = std::fs::read_to_string(
+            aegis_core::resolve_project_root().join("web/static/app.js"),
+        )
+        .expect("read web/static/app.js");
+        assert!(
+            app_js_src.contains("const upnl = (t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0);"),
+            "web/static/app.js openTrades row must compute unrealized + realized + funding - fees (R11-N2, R11-QA)"
+        );
+        assert!(
+            app_js_src.contains("const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0)) : (t.realized_pnl_usdc || 0);"),
+            "web/static/app.js recentTrades OPEN row must compute unrealized + realized + funding - fees (R11-N2, R11-QA)"
+        );
+        assert!(
+            app_js_src.contains("? ((c.unrealized_pnl_usdc || 0) + (c.realized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))"),
+            "web/static/app.js recentCells OPEN row must compute unrealized + realized + funding - fees (R11-QA)"
+        );
+    }
 }
 

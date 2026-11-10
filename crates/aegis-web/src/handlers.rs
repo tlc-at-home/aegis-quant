@@ -720,8 +720,7 @@ pub async fn api_close_trade(
             .into());
         }
         let exec = ExecutionEngine::new(db.clone());
-        let normalized_reason = aegis_core::normalize_manual_exit_reason(payload.reason.as_deref());
-        let reason = Some(normalized_reason.as_str());
+        let reason = payload.reason.as_deref();
         let close_result = if let Some(trade_id) = payload.trade_id {
             exec.close_open_trade_manual(trade_id, reason)?
         } else if let Some(cell_id) = payload.cell_id {

@@ -182,6 +182,7 @@ fn test_invariant_f2_ast_source_token_scan() {
         "UPDATE book_transfers",
         "INSERT INTO book_transfers",
         "INSERT OR REPLACE INTO book_transfers",
+        "INSERT OR IGNORE INTO book_transfers",
         "REPLACE INTO book_transfers",
         "DELETE FROM book_transfers",
     ];

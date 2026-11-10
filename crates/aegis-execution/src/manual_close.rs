@@ -60,9 +60,13 @@ impl ExecutionEngine {
         let now_ms = self.db.now_ms();
         let ttl_ms = self
             .db
-            .load_config()
-            .map(|cfg| cfg.get_i64("asset_index_cache_ttl_secs", 3600).max(60) * 1000)
-            .unwrap_or(3_600_000);
+            .get_raw_config_value("asset_index_cache_ttl_secs")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().trim_matches('"').parse::<f64>().ok().map(|f| f as i64))
+            .unwrap_or(3600)
+            .max(60)
+            * 1000;
         if let Some((cached, cached_at_ms)) = self.resolved_asset_cache.lock().get(symbol).cloned()
         {
             if (now_ms - cached_at_ms).abs() <= ttl_ms {
@@ -130,7 +134,26 @@ impl ExecutionEngine {
             let resting = self.db.get_resting_pit_trades().unwrap_or_default();
             if let Some(rt) = resting.into_iter().find(|t| t.trade_id == trade_id) {
                 if let Some(ref oid) = rt.exchange_order_id {
-                    let _ = self.cancel_resting_order(&rt.symbol, oid);
+                    match self.cancel_resting_order(&rt.symbol, oid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                trade_id = trade_id,
+                                symbol = %rt.symbol,
+                                oid = %oid,
+                                "Resting PIT order cancel returned false during manual cancel (R10-N3)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                trade_id = trade_id,
+                                symbol = %rt.symbol,
+                                oid = %oid,
+                                error = %e,
+                                "Resting PIT order cancel failed during manual cancel (R10-N3)"
+                            );
+                        }
+                    }
                 }
                 let cancelled = self.db.cancel_resting_trade(trade_id, reason)?;
                 if !cancelled {
@@ -344,7 +367,26 @@ impl ExecutionEngine {
             };
             if let Some(ref oid_str) = armed.resting_order_id {
                 if !oid_str.starts_with("hl-paper-") && !oid_str.starts_with("sim-") {
-                    let _ = self.cancel_resting_order(&armed.symbol, oid_str);
+                    match self.cancel_resting_order(&armed.symbol, oid_str) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                cell_id = armed.cell_id,
+                                symbol = %armed.symbol,
+                                oid = %oid_str,
+                                "Resting POND order cancel returned false during manual cancel (R10-N3)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                cell_id = armed.cell_id,
+                                symbol = %armed.symbol,
+                                oid = %oid_str,
+                                error = %e,
+                                "Resting POND order cancel failed during manual cancel (R10-N3)"
+                            );
+                        }
+                    }
                 }
             }
             let ref_px = armed.entry_price.unwrap_or(0.0);

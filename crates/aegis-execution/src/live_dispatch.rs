@@ -20,6 +20,20 @@ use crate::{
 
 static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
+/// Hyperliquid L1 oracle price band margin (`±3.95%`), safely inside the exchange's `±4.0%`
+/// (`Price too far from oracle`) rejection boundary (`1.0 + HL_ORACLE_BAND_PCT == 1.0395`,
+/// `1.0 - HL_ORACLE_BAND_PCT == 0.9605`) (`R11-S1`).
+pub const HL_ORACLE_BAND_PCT: f64 = 0.0395;
+
+/// Aggressive IOC retry slippage (`5.0%`) applied around `live_mid` when an IOC order is
+/// rejected with `"Order could not immediately match against any resting orders"`, before
+/// clamping to [`HL_ORACLE_BAND_PCT`] (`R11-S1`).
+pub const HL_NO_MATCH_RETRY_SLIP_PCT: f64 = 0.05;
+
+/// Tight IOC retry slippage (`0.3%`) applied around `live_mid` when an IOC order is
+/// rejected with `"Order price too far from oracle"`, before clamping to [`HL_ORACLE_BAND_PCT`] (`R11-S1`).
+pub const HL_ORACLE_RETRY_SLIP_PCT: f64 = 0.003;
+
 /// Parses a Hyperliquid `/exchange` order response into an `OrderExecutionResult` (`NH-7`, `NM-9`, `Q1`).
 ///
 /// Key safety invariants:
@@ -491,18 +505,22 @@ impl ExecutionEngine {
                         });
                 }
                 let live_mid = live_mid_opt.unwrap_or(reference_price);
-                let slip_mult = if is_no_match { 0.05 } else { 0.003 };
+                let slip_mult = if is_no_match {
+                    HL_NO_MATCH_RETRY_SLIP_PCT
+                } else {
+                    HL_ORACLE_RETRY_SLIP_PCT
+                };
                 let retry_limit_px = if is_buy {
                     let cand = live_mid * (1.0 + slip_mult);
                     if let Some(opx) = oracle_px_opt {
-                        cand.min(opx * 1.0395)
+                        cand.min(opx * (1.0 + HL_ORACLE_BAND_PCT))
                     } else {
                         cand
                     }
                 } else {
                     let cand = live_mid * (1.0 - slip_mult);
                     if let Some(opx) = oracle_px_opt {
-                        cand.max(opx * 0.9605)
+                        cand.max(opx * (1.0 - HL_ORACLE_BAND_PCT))
                     } else {
                         cand
                     }

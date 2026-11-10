@@ -607,15 +607,19 @@ impl DatabaseManager {
                  SET quantity = ?1,
                      filled_units = ?1,
                      notional_usdc = ?2,
-                     risk_budget_usdc = ABS(entry_price - initial_stop_price) * ?1,
-                     realized_pnl_usdc = realized_pnl_usdc + ?3,
-                     fees_paid_usdc = fees_paid_usdc + ?4,
-                     slippage_paid_usd = COALESCE(slippage_paid_usd, 0.0) + ?5,
+                     risk_budget_usdc = CASE
+                         WHEN initial_stop_price > 0.0 AND ABS(entry_price - initial_stop_price) > 1e-12 THEN ROUND(ABS(entry_price - initial_stop_price) * ?1, 4)
+                         WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
+                         ELSE risk_budget_usdc
+                     END,
+                     realized_pnl_usdc = ROUND(realized_pnl_usdc + ?3, 4),
+                     fees_paid_usdc = ROUND(fees_paid_usdc + ?4, 4),
+                     slippage_paid_usd = ROUND(COALESCE(slippage_paid_usd, 0.0) + ?5, 4),
                      current_price = CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END
                  WHERE trade_id = ?7 AND status = 'OPEN';",
                 params![
                     round_dp(remaining_qty.abs(), 8),
-                    round_dp(remaining_notional, 4),
+                    round_dp(remaining_notional, 2),
                     round_dp(realized_pnl_delta, 4),
                     round_dp(fees_delta, 4),
                     round_dp(slippage_delta, 4),
@@ -1588,7 +1592,7 @@ impl DatabaseManager {
         let size = exchange_size.abs();
         self.with_conn(|conn| {
             let rows = if let Some(px) = exchange_entry_price.filter(|&p| p > 0.0) {
-                let notional = size * px;
+                let notional = round_dp(size * px, 2);
                 conn.execute(
                     "UPDATE trades
                      SET quantity = ?1,
@@ -1597,7 +1601,8 @@ impl DatabaseManager {
                          avg_fill_price = ?2,
                          notional_usdc = ?3,
                          risk_budget_usdc = CASE
-                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             WHEN initial_stop_price > 0.0 AND ABS(?2 - initial_stop_price) > 1e-12 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
                              ELSE risk_budget_usdc
                          END,
                          fsm_state = 'FILLED'
@@ -1610,9 +1615,10 @@ impl DatabaseManager {
                     "UPDATE trades
                      SET quantity = ?1,
                          filled_units = ?1,
-                         notional_usdc = ?1 * entry_price,
+                         notional_usdc = ROUND(?1 * COALESCE(entry_price, 0.0), 2),
                          risk_budget_usdc = CASE
-                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(entry_price - initial_stop_price) * ?1, 4)
+                             WHEN initial_stop_price > 0.0 AND ABS(entry_price - initial_stop_price) > 1e-12 THEN ROUND(ABS(entry_price - initial_stop_price) * ?1, 4)
+                             WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
                              ELSE risk_budget_usdc
                          END,
                          fsm_state = 'FILLED'

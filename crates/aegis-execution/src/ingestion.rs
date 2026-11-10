@@ -688,8 +688,14 @@ impl MarketIngestionEngine {
         let is_testnet = pond_mode == "TESTNET"
             || (pond_mode != "LIVE"
                 && (exec_mode == "TESTNET" || cfg.get_bool("hyperliquid_testnet", false)));
+        let testnet_vol_cap = cfg
+            .get_f64(
+                "pond_testnet_min_vol_cap_usdc",
+                aegis_core::TESTNET_POND_MIN_VOL_CAP_USDC,
+            )
+            .max(0.0);
         let effective_min_vol = if is_testnet {
-            min_daily_vol_usdc.min(100.0)
+            min_daily_vol_usdc.min(testnet_vol_cap)
         } else {
             min_daily_vol_usdc
         };
@@ -990,6 +996,40 @@ impl MarketIngestionEngine {
             .map(|v| v.into_iter().map(|(_, r)| r).collect())
     }
 
+    /// Merges recently fetched OHLCV candles into `bars`, preserving any non-zero
+    /// `funding_rate_hourly` on existing matching bars, appending strictly newer bars,
+    /// and persisting `recent` via `upsert_ohlcv_batch` (`R11-N4`).
+    fn merge_recent_bars(
+        &self,
+        symbol: &str,
+        bars: &mut Vec<OhlcvBar>,
+        mut recent: Vec<OhlcvBar>,
+        timeframe: &str,
+    ) {
+        for rb in &mut recent {
+            if let Some(existing) = bars
+                .iter_mut()
+                .rev()
+                .find(|b| b.timestamp_ms == rb.timestamp_ms)
+            {
+                if existing.funding_rate_hourly.abs() > 0.0 {
+                    rb.funding_rate_hourly = existing.funding_rate_hourly;
+                }
+                *existing = rb.clone();
+            } else if rb.timestamp_ms > bars.last().map(|b| b.timestamp_ms).unwrap_or(0) {
+                bars.push(rb.clone());
+            }
+        }
+        if let Err(e) = self.db.upsert_ohlcv_batch(&recent) {
+            tracing::error!(
+                symbol = symbol,
+                timeframe = timeframe,
+                error = %e,
+                "Failed to upsert recent pond bars"
+            );
+        }
+    }
+
     /// Loads or fetches 1H funding history + 1H/4H OHLCV bars for a Pond asset.
     pub fn load_or_fetch_pond_funding_and_bars(
         &self,
@@ -1066,28 +1106,10 @@ impl MarketIngestionEngine {
                     bars_1h = fetched_1h;
                 }
             } else if live_funding_map.is_none() {
-                if let Some(mut recent_1h) =
+                if let Some(recent_1h) =
                     self.fetch_hyperliquid_candles(&coin, "1h", 4, f_rate)
                 {
-                    for rb in &mut recent_1h {
-                        if let Some(existing) = bars_1h
-                            .iter_mut()
-                            .rev()
-                            .find(|b| b.timestamp_ms == rb.timestamp_ms)
-                        {
-                            if existing.funding_rate_hourly.abs() > 0.0 {
-                                rb.funding_rate_hourly = existing.funding_rate_hourly;
-                            }
-                            *existing = rb.clone();
-                        } else if rb.timestamp_ms
-                            > bars_1h.last().map(|b| b.timestamp_ms).unwrap_or(0)
-                        {
-                            bars_1h.push(rb.clone());
-                        }
-                    }
-                    if let Err(e) = self.db.upsert_ohlcv_batch(&recent_1h) {
-                        tracing::error!(symbol = symbol, error = %e, "Failed to upsert recent 1h pond bars");
-                    }
+                    self.merge_recent_bars(symbol, &mut bars_1h, recent_1h, "1h");
                 }
             }
 
@@ -1106,28 +1128,10 @@ impl MarketIngestionEngine {
                     bars_4h = fetched_4h;
                 }
             } else if live_funding_map.is_none() {
-                if let Some(mut recent_4h) =
+                if let Some(recent_4h) =
                     self.fetch_hyperliquid_candles(&coin, "4h", 2, f_rate)
                 {
-                    for rb in &mut recent_4h {
-                        if let Some(existing) = bars_4h
-                            .iter_mut()
-                            .rev()
-                            .find(|b| b.timestamp_ms == rb.timestamp_ms)
-                        {
-                            if existing.funding_rate_hourly.abs() > 0.0 {
-                                rb.funding_rate_hourly = existing.funding_rate_hourly;
-                            }
-                            *existing = rb.clone();
-                        } else if rb.timestamp_ms
-                            > bars_4h.last().map(|b| b.timestamp_ms).unwrap_or(0)
-                        {
-                            bars_4h.push(rb.clone());
-                        }
-                    }
-                    if let Err(e) = self.db.upsert_ohlcv_batch(&recent_4h) {
-                        tracing::error!(symbol = symbol, error = %e, "Failed to upsert recent 4h pond bars");
-                    }
+                    self.merge_recent_bars(symbol, &mut bars_4h, recent_4h, "4h");
                 }
             }
 

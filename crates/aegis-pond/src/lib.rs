@@ -55,6 +55,139 @@ pub struct PondCycleSummary {
     pub idle_usdc: f64,
 }
 
+/// Post-entry watermark and adverse-wick context for an open Pond cell (`R11-N5`, `R11-QB`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WickContext {
+    pub watermark_high: f64,
+    pub watermark_low: f64,
+    pub post_watermark_high: f64,
+    pub post_watermark_low: f64,
+    pub last_bar_high: f64,
+    pub last_bar_low: f64,
+    pub extreme_bar_idx: usize,
+    pub atr_14_1h: f64,
+}
+
+/// Computes post-entry price watermarks, post-watermark adverse wick extremes, the index
+/// of the extreme adverse bar, and the crash-bar-excluded 14-period 1H ATR (`R11-N5`, `R11-QB`).
+///
+/// When `opened_at_ms > 0`, scans all bars in `bars_1h` from the first bar with
+/// `b.timestamp_ms >= opened_at_ms` (falling back to `bars_1h.len().saturating_sub(6)` when
+/// `opened_at_ms <= 0` or when no bar satisfies `b.timestamp_ms >= opened_at_ms`) so even an
+/// engine outage longer than 6 hours catches any stop-breaching wicks during the downtime.
+pub fn compute_wick_context(
+    bars_1h: &[OhlcvBar],
+    side: &str,
+    opened_at_ms: i64,
+    stored_high: Option<f64>,
+    stored_low: Option<f64>,
+    entry_price: f64,
+) -> WickContext {
+    let last_1h = bars_1h.last();
+    let mark_px = last_1h
+        .map(|b| b.close)
+        .filter(|&p| p > 0.0)
+        .unwrap_or(entry_price);
+    let last_bar_high = last_1h.map(|b| b.high).unwrap_or(mark_px);
+    let last_bar_low = last_1h.map(|b| b.low).unwrap_or(mark_px);
+    let mut watermark_high = last_bar_high;
+    let mut watermark_low = last_bar_low;
+    let mut post_watermark_high = last_bar_high;
+    let mut post_watermark_low = last_bar_low;
+    let mut extreme_bar_idx = bars_1h.len().saturating_sub(1);
+
+    if !bars_1h.is_empty() {
+        let start_idx = if opened_at_ms > 0 {
+            bars_1h
+                .iter()
+                .position(|b| b.timestamp_ms >= opened_at_ms)
+                .unwrap_or_else(|| bars_1h.len().saturating_sub(6))
+        } else {
+            bars_1h.len().saturating_sub(6)
+        };
+        let min_ts = if opened_at_ms > 0 {
+            opened_at_ms
+        } else {
+            i64::MIN
+        };
+        let mut peak_idx = start_idx;
+        let mut trough_idx = start_idx;
+        for (idx, b) in bars_1h.iter().enumerate().skip(start_idx) {
+            if b.timestamp_ms >= min_ts {
+                if b.high >= watermark_high {
+                    watermark_high = b.high;
+                    peak_idx = idx;
+                }
+                if b.low > 0.0 && b.low <= watermark_low {
+                    watermark_low = b.low;
+                    trough_idx = idx;
+                }
+            }
+        }
+        let is_long = side.eq_ignore_ascii_case("LONG");
+        let post_watermark_start = if is_long {
+            if watermark_high >= stored_high.unwrap_or(0.0) - 1e-8 {
+                peak_idx
+            } else {
+                start_idx
+            }
+        } else if watermark_low <= stored_low.unwrap_or(f64::MAX) + 1e-8 {
+            trough_idx
+        } else {
+            start_idx
+        };
+        for (idx, b) in bars_1h.iter().enumerate().skip(post_watermark_start) {
+            if b.timestamp_ms >= min_ts {
+                if b.high > post_watermark_high {
+                    post_watermark_high = b.high;
+                    if !is_long {
+                        extreme_bar_idx = idx;
+                    }
+                }
+                if b.low > 0.0 && b.low < post_watermark_low {
+                    post_watermark_low = b.low;
+                    if is_long {
+                        extreme_bar_idx = idx;
+                    }
+                }
+            }
+        }
+    }
+
+    let atr_1h_slice = if extreme_bar_idx >= 2 && extreme_bar_idx < bars_1h.len() {
+        &bars_1h[..extreme_bar_idx]
+    } else {
+        bars_1h
+    };
+    let atr_14_1h = compute_atr_from_bars(atr_1h_slice, 14).max(0.01);
+
+    WickContext {
+        watermark_high,
+        watermark_low,
+        post_watermark_high,
+        post_watermark_low,
+        last_bar_high,
+        last_bar_low,
+        extreme_bar_idx,
+        atr_14_1h,
+    }
+}
+
+/// Stamps the latest live funding rate onto the trailing element of both `funding_series`
+/// and `bars_1h` (`R11-N6`).
+fn stamp_live_funding_on_last_bar(
+    funding_series: &mut [f64],
+    bars_1h: &mut [OhlcvBar],
+    live_f: f64,
+) {
+    if let Some(last_f) = funding_series.last_mut() {
+        *last_f = live_f;
+    }
+    if let Some(last_b) = bars_1h.last_mut() {
+        last_b.funding_rate_hourly = live_f;
+    }
+}
+
 /// Book B (`POND`) orchestrator.
 #[derive(Clone)]
 pub struct PondOrchestrator {
@@ -372,61 +505,42 @@ impl PondOrchestrator {
                 .map(|dt| dt.and_utc().timestamp_millis());
             let last_bar_high = last_1h.map(|b| b.high).unwrap_or(mark_px);
             let last_bar_low = last_1h.map(|b| b.low).unwrap_or(mark_px);
-            let mut watermark_high = last_bar_high;
-            let mut watermark_low = last_bar_low;
-            let mut high_px = last_bar_high;
-            let mut low_px = last_bar_low;
-            let mut extreme_bar_idx = bars_1h.len().saturating_sub(1);
-            if let Some(open_ms) = opened_at_ms {
-                let start_idx = bars_1h.len().saturating_sub(6);
-                let mut peak_idx = start_idx;
-                let mut trough_idx = start_idx;
-                for (idx, b) in bars_1h.iter().enumerate().skip(start_idx) {
-                    if b.timestamp_ms >= open_ms {
-                        if b.high >= watermark_high {
-                            watermark_high = b.high;
-                            peak_idx = idx;
-                        }
-                        if b.low > 0.0 && b.low <= watermark_low {
-                            watermark_low = b.low;
-                            trough_idx = idx;
-                        }
-                    }
+            let wick_ctx = if let Some(open_ms) = opened_at_ms {
+                compute_wick_context(
+                    &bars_1h,
+                    &cell.side,
+                    open_ms,
+                    cell.highest_price_seen,
+                    cell.lowest_price_seen,
+                    entry_px,
+                )
+            } else {
+                WickContext {
+                    watermark_high: last_bar_high,
+                    watermark_low: last_bar_low,
+                    post_watermark_high: last_bar_high,
+                    post_watermark_low: last_bar_low,
+                    last_bar_high,
+                    last_bar_low,
+                    extreme_bar_idx: bars_1h.len().saturating_sub(1),
+                    atr_14_1h: compute_atr_from_bars(&bars_1h, 14).max(0.01),
                 }
-                let post_watermark_start = if cell.side == "LONG" {
-                    if watermark_high >= cell.highest_price_seen.unwrap_or(0.0) - 1e-8 {
-                        peak_idx
-                    } else {
-                        start_idx
-                    }
-                } else if watermark_low <= cell.lowest_price_seen.unwrap_or(f64::MAX) + 1e-8 {
-                    trough_idx
-                } else {
-                    start_idx
-                };
-                for (idx, b) in bars_1h.iter().enumerate().skip(post_watermark_start) {
-                    if b.timestamp_ms >= open_ms {
-                        if b.high > high_px {
-                            high_px = b.high;
-                            if cell.side != "LONG" {
-                                extreme_bar_idx = idx;
-                            }
-                        }
-                        if b.low > 0.0 && b.low < low_px {
-                            low_px = b.low;
-                            if cell.side == "LONG" {
-                                extreme_bar_idx = idx;
-                            }
-                        }
-                    }
-                }
-            }
+            };
+            let watermark_high = wick_ctx.watermark_high;
+            let watermark_low = wick_ctx.watermark_low;
+            let high_px = wick_ctx.post_watermark_high;
+            let low_px = wick_ctx.post_watermark_low;
+            let extreme_bar_idx = wick_ctx.extreme_bar_idx;
             let atr_1h_slice = if extreme_bar_idx >= 2 && extreme_bar_idx < bars_1h.len() {
                 &bars_1h[..extreme_bar_idx]
             } else {
                 &bars_1h[..]
             };
-            let atr_1h = compute_atr_from_bars(atr_1h_slice, cfg.pond_atr_period.max(1)).max(0.01);
+            let atr_1h = if cfg.pond_atr_period.max(1) == 14 {
+                wick_ctx.atr_14_1h
+            } else {
+                compute_atr_from_bars(atr_1h_slice, cfg.pond_atr_period.max(1)).max(0.01)
+            };
             let atr_4h = compute_atr_from_bars(&bars_4h, cfg.pond_atr_period.max(1))
                 .max(atr_1h * cfg.pond_gate6_atr_4h_floor_mult);
             let bars_1h_fresh = !is_live_or_testnet
@@ -852,7 +966,8 @@ impl PondOrchestrator {
         let champion_version = active_champ.version;
         let is_testnet_mode = cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET");
         let effective_min_daily_vol_usdc = if is_testnet_mode {
-            cfg.pond_min_daily_volume_usdc.min(100.0)
+            cfg.pond_min_daily_volume_usdc
+                .min(cfg.pond_testnet_min_vol_cap_usdc)
         } else {
             cfg.pond_min_daily_volume_usdc
         };
@@ -906,25 +1021,18 @@ impl PondOrchestrator {
         for u in &universe {
             let rank = u.rank.max(1) as usize;
             let is_active_row = u.status.eq_ignore_ascii_case("ACTIVE");
-            let (mut funding_series, mut bars_1h, bars_4h) = match cached_map.get(&u.symbol) {
+            let (funding_series, bars_1h, bars_4h) = match cached_map.get(&u.symbol) {
                 Some(triple) => {
                     let mut cloned = triple.clone();
-                    if let Some(fmap) = live_funding_map.as_ref() {
-                        let coin = u
-                            .symbol
-                            .split('/')
-                            .next()
-                            .unwrap_or(&u.symbol)
-                            .trim()
-                            .to_uppercase();
-                        if let Some(&lf) = fmap.get(&coin) {
-                            if let Some(last_f) = cloned.0.last_mut() {
-                                *last_f = lf;
-                            }
-                            if let Some(last_b) = cloned.1.last_mut() {
-                                last_b.funding_rate_hourly = lf;
-                            }
-                        }
+                    let coin = u
+                        .symbol
+                        .split('/')
+                        .next()
+                        .unwrap_or(&u.symbol)
+                        .trim()
+                        .to_uppercase();
+                    if let Some(&lf) = live_funding_map.as_ref().and_then(|fmap| fmap.get(&coin)) {
+                        stamp_live_funding_on_last_bar(&mut cloned.0, &mut cloned.1, lf);
                     }
                     cloned
                 }
@@ -936,7 +1044,6 @@ impl PondOrchestrator {
                     is_active_row,
                 ),
             };
-            let _ = (&mut funding_series, &mut bars_1h);
             scan_inputs.push(PondAssetScanInput {
                 universe_row: u.clone(),
                 funding_series_168h: funding_series,
@@ -1027,7 +1134,24 @@ impl PondOrchestrator {
                 new_cell.entry_price = Some(cand.reference_price);
                 new_cell.resting_order_id = Some(resting_oid.to_string());
                 if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
-                    let _ = self.execution.cancel_resting_order(&cand.symbol, resting_oid);
+                    match self.execution.cancel_resting_order(&cand.symbol, resting_oid) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                symbol = %cand.symbol,
+                                oid = %resting_oid,
+                                "Resting POND order cancel returned false after upsert_pond_cell error (R10-N3)"
+                            );
+                        }
+                        Err(cancel_err) => {
+                            tracing::error!(
+                                symbol = %cand.symbol,
+                                oid = %resting_oid,
+                                error = %cancel_err,
+                                "Resting POND order cancel failed after upsert_pond_cell error (R10-N3)"
+                            );
+                        }
+                    }
                     let _ = self.scoped_db.log_telemetry(
                         "CRITICAL",
                         "engine.pond",
@@ -2229,5 +2353,368 @@ mod tests {
             .unwrap();
         assert_eq!(after.state, "TRAILED");
         assert!(after.chandelier_stop.unwrap() > 110.0);
+    }
+
+    #[test]
+    fn test_r11_qb_wick_context_scenarios() {
+        let base_ts = 1_794_300_000_000i64;
+        let mk_bar = |idx: usize, open: f64, high: f64, low: f64, close: f64| OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: base_ts + (idx as i64) * 3_600_000,
+            open,
+            high,
+            low,
+            close,
+            volume: 50_000.0,
+            funding_rate_hourly: -0.00012,
+            is_synthetic: 0,
+        };
+
+        // Table-driven scenarios 1-4 for `compute_wick_context` (including >6 bars since open per R11-N5)
+        struct Case {
+            name: &'static str,
+            bars: Vec<OhlcvBar>,
+            side: &'static str,
+            opened_at_ms: i64,
+            stored_high: Option<f64>,
+            stored_low: Option<f64>,
+            entry_price: f64,
+            expected_watermark_high: f64,
+            expected_watermark_low: f64,
+            expected_post_high: f64,
+            expected_post_low: f64,
+            expected_extreme_idx: usize,
+        }
+
+        let cases = vec![
+            // Scenario 1: LONG cell where peak occurs at bar k=4 and adverse wick occurs at bar k-2=2 (before peak)
+            // -> post-watermark low does NOT include the pre-peak wick (88.0), only bars >= peak_idx (118.0)
+            Case {
+                name: "LONG_pre_peak_wick_ignored",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 102.0, 99.5, 101.0),
+                    mk_bar(2, 101.0, 103.0, 88.0, 102.0), // k-2 pre-peak wick
+                    mk_bar(3, 102.0, 110.0, 101.0, 109.0),
+                    mk_bar(4, 109.0, 125.0, 118.0, 122.0), // k peak bar
+                    mk_bar(5, 122.0, 123.0, 119.0, 121.0),
+                ],
+                side: "LONG",
+                opened_at_ms: base_ts + 3_600_000, // opened at bar 1
+                stored_high: Some(105.0),
+                stored_low: Some(99.5),
+                entry_price: 100.0,
+                expected_watermark_high: 125.0,
+                expected_watermark_low: 88.0,
+                expected_post_high: 125.0,
+                expected_post_low: 118.0,
+                expected_extreme_idx: 4,
+            },
+            // Scenario 2: LONG cell where peak occurs at bar k-2=2 and adverse wick occurs at bar k=4 (after peak)
+            // -> post-watermark low DOES include the post-peak wick (85.0), and extreme_bar_idx == 4
+            Case {
+                name: "LONG_post_peak_wick_included",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 104.0, 99.5, 103.0),
+                    mk_bar(2, 103.0, 130.0, 102.0, 125.0), // k-2 peak bar
+                    mk_bar(3, 125.0, 126.0, 115.0, 116.0),
+                    mk_bar(4, 116.0, 117.0, 85.0, 92.0), // k adverse wick bar after peak
+                    mk_bar(5, 92.0, 96.0, 91.0, 95.0),
+                ],
+                side: "LONG",
+                opened_at_ms: base_ts + 3_600_000,
+                stored_high: Some(110.0),
+                stored_low: Some(99.5),
+                entry_price: 100.0,
+                expected_watermark_high: 130.0,
+                expected_watermark_low: 85.0,
+                expected_post_high: 130.0,
+                expected_post_low: 85.0,
+                expected_extreme_idx: 4,
+            },
+            // Scenario 3a: SHORT cell where trough occurs at bar k=4 and adverse upward wick occurs at bar k-2=2 (before trough)
+            // -> post-watermark high does NOT include the pre-trough spike (118.0)
+            Case {
+                name: "SHORT_pre_trough_spike_ignored",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 101.5, 98.0, 99.0),
+                    mk_bar(2, 99.0, 118.0, 97.0, 98.0), // k-2 pre-trough upward spike
+                    mk_bar(3, 98.0, 99.0, 90.0, 91.0),
+                    mk_bar(4, 91.0, 84.0, 75.0, 78.0), // k trough bar
+                    mk_bar(5, 78.0, 82.0, 77.0, 80.0),
+                ],
+                side: "SHORT",
+                opened_at_ms: base_ts + 3_600_000,
+                stored_high: Some(101.5),
+                stored_low: Some(95.0),
+                entry_price: 100.0,
+                expected_watermark_high: 118.0,
+                expected_watermark_low: 75.0,
+                expected_post_high: 84.0,
+                expected_post_low: 75.0,
+                expected_extreme_idx: 4,
+            },
+            // Scenario 3b: SHORT cell where trough occurs at bar k-2=2 and adverse upward wick occurs at bar k=4 (after trough)
+            // -> post-watermark high DOES include the post-trough spike (119.0), and extreme_bar_idx == 4
+            Case {
+                name: "SHORT_post_trough_spike_included",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 100.5, 96.0, 97.0),
+                    mk_bar(2, 97.0, 98.0, 72.0, 76.0), // k-2 trough bar
+                    mk_bar(3, 76.0, 85.0, 75.0, 84.0),
+                    mk_bar(4, 84.0, 119.0, 83.0, 108.0), // k adverse spike after trough
+                    mk_bar(5, 108.0, 110.0, 104.0, 106.0),
+                ],
+                side: "SHORT",
+                opened_at_ms: base_ts + 3_600_000,
+                stored_high: Some(100.5),
+                stored_low: Some(90.0),
+                entry_price: 100.0,
+                expected_watermark_high: 119.0,
+                expected_watermark_low: 72.0,
+                expected_post_high: 119.0,
+                expected_post_low: 72.0,
+                expected_extreme_idx: 4,
+            },
+            // Scenario 4: Stored high/low in DB is already more extreme than any bar in scan window
+            // -> post_watermark_start falls back to start_idx (including >6 bars since open per R11-N5)
+            Case {
+                name: "stored_watermark_more_extreme_falls_back_to_start_idx_across_full_open_window",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 103.0, 81.0, 98.0), // 8 bars before end, adverse wick after prior DB peak
+                    mk_bar(2, 98.0, 104.0, 96.0, 102.0), // local bar peak (104.0 < stored_high 150.0)
+                    mk_bar(3, 102.0, 103.0, 97.0, 100.0),
+                    mk_bar(4, 100.0, 101.0, 98.0, 99.0),
+                    mk_bar(5, 99.0, 100.0, 97.5, 99.0),
+                    mk_bar(6, 99.0, 100.5, 98.0, 99.5),
+                    mk_bar(7, 99.5, 101.0, 98.5, 100.0),
+                    mk_bar(8, 100.0, 101.0, 99.0, 100.0),
+                ],
+                side: "LONG",
+                opened_at_ms: base_ts + 3_600_000, // bar 1 (8 bars ago > 6)
+                stored_high: Some(150.0),          // higher than any bar in bars_1h
+                stored_low: Some(95.0),
+                entry_price: 100.0,
+                expected_watermark_high: 104.0,
+                expected_watermark_low: 81.0,
+                expected_post_high: 104.0,
+                expected_post_low: 81.0,
+                expected_extreme_idx: 1,
+            },
+            // Scenario 6a: opened_at_ms falls strictly between two bar timestamps (11m36s into bar 1)
+            // AND outage lasts >6 hours (11 bars after open): peak at bar 3 (9h ago) and stop-breaching wick at bar 4 (8h ago)
+            // are still caught even though bar 4 is outside the last-6-bars tail!
+            Case {
+                name: "mid_hour_opened_at_and_outage_longer_than_6h_catches_wick_8h_ago",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 70.0, 100.0), // before opened_at_ms
+                    mk_bar(1, 100.0, 140.0, 72.0, 100.0), // bar 1 start < opened_at_ms (11m36s into bar 1) -> excluded
+                    mk_bar(2, 100.0, 105.0, 99.0, 104.0), // first bar >= opened_at_ms
+                    mk_bar(3, 104.0, 132.0, 103.0, 128.0), // peak 9h ago
+                    mk_bar(4, 128.0, 129.0, 82.0, 96.0),  // stop-breaching wick 8h ago (outside last 6 bars!)
+                    mk_bar(5, 96.0, 99.0, 95.0, 98.0),
+                    mk_bar(6, 98.0, 100.0, 97.0, 99.0),
+                    mk_bar(7, 99.0, 100.5, 98.0, 100.0),
+                    mk_bar(8, 100.0, 101.0, 98.5, 100.0),
+                    mk_bar(9, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(10, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(11, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(12, 100.0, 101.0, 99.0, 100.0),
+                ],
+                side: "LONG",
+                opened_at_ms: base_ts + 3_600_000 + 696_000, // 01:11:36 after base_ts (between bar 1 and bar 2)
+                stored_high: Some(110.0),
+                stored_low: Some(99.0),
+                entry_price: 100.0,
+                expected_watermark_high: 132.0,
+                expected_watermark_low: 82.0,
+                expected_post_high: 132.0,
+                expected_post_low: 82.0,
+                expected_extreme_idx: 4,
+            },
+        ];
+
+        for c in &cases {
+            let ctx = compute_wick_context(
+                &c.bars,
+                c.side,
+                c.opened_at_ms,
+                c.stored_high,
+                c.stored_low,
+                c.entry_price,
+            );
+            assert!(
+                (ctx.watermark_high - c.expected_watermark_high).abs() < 1e-6,
+                "{}: watermark_high {} != {}",
+                c.name,
+                ctx.watermark_high,
+                c.expected_watermark_high
+            );
+            assert!(
+                (ctx.watermark_low - c.expected_watermark_low).abs() < 1e-6,
+                "{}: watermark_low {} != {}",
+                c.name,
+                ctx.watermark_low,
+                c.expected_watermark_low
+            );
+            assert!(
+                (ctx.post_watermark_high - c.expected_post_high).abs() < 1e-6,
+                "{}: post_watermark_high {} != {}",
+                c.name,
+                ctx.post_watermark_high,
+                c.expected_post_high
+            );
+            assert!(
+                (ctx.post_watermark_low - c.expected_post_low).abs() < 1e-6,
+                "{}: post_watermark_low {} != {}",
+                c.name,
+                ctx.post_watermark_low,
+                c.expected_post_low
+            );
+            assert_eq!(
+                ctx.extreme_bar_idx, c.expected_extreme_idx,
+                "{}: extreme_bar_idx",
+                c.name
+            );
+            if c.expected_extreme_idx >= 2 {
+                let expected_atr =
+                    compute_atr_from_bars(&c.bars[..c.expected_extreme_idx], 14).max(0.01);
+                assert!(
+                    (ctx.atr_14_1h - expected_atr).abs() < 1e-9,
+                    "{}: atr_14_1h {} != {} (crash-bar excluded)",
+                    c.name,
+                    ctx.atr_14_1h,
+                    expected_atr
+                );
+            }
+        }
+
+        // Scenario 5: extreme_bar_idx < 2 -> atr_1h_slice falls back to full &bars_1h[..]
+        let short_bars = vec![
+            mk_bar(0, 100.0, 102.0, 99.0, 101.0),
+            mk_bar(1, 101.0, 101.5, 80.0, 85.0),
+            mk_bar(2, 85.0, 90.0, 84.0, 88.0),
+        ];
+        let ctx_idx1 = compute_wick_context(
+            &short_bars,
+            "LONG",
+            base_ts,
+            Some(102.0),
+            Some(99.0),
+            100.0,
+        );
+        assert_eq!(ctx_idx1.extreme_bar_idx, 1);
+        assert!(
+            (ctx_idx1.atr_14_1h - compute_atr_from_bars(&short_bars, 14).max(0.01)).abs() < 1e-9,
+            "extreme_bar_idx < 2 must fall back to full bars_1h slice for atr_14_1h (R11-QB)"
+        );
+
+        // Scenario 6: Chandelier ratchets on the same cycle AND breached_prev_stop is true vs false
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        let _ = orch.initialize_or_refresh_universe().unwrap();
+
+        let base_180_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let mut bars_breached: Vec<OhlcvBar> = (0..178)
+            .map(|i| OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_180_ts + (i as i64) * 3_600_000,
+                open: 100.0,
+                high: 100.5,
+                low: 99.5,
+                close: 100.0,
+                volume: 50_000.0,
+                funding_rate_hourly: -0.00012 + ((i % 5) as f64) * 0.00001,
+                is_synthetic: 0,
+            })
+            .collect();
+        // Bar 178 (12:00Z): rallies to 130.0 (peak) AND wicks down to 85.0 (breaching prev_stop=95.0 - wick_buf)
+        bars_breached.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_312_000_000,
+            open: 100.0,
+            high: 130.0,
+            low: 85.0,
+            close: 120.0,
+            volume: 80_000.0,
+            funding_rate_hourly: -0.00012,
+            is_synthetic: 0,
+        });
+        // Bar 179 (13:00Z): last bar stays high (125..128), so only Bar 178's low (85.0) breached prev_stop
+        bars_breached.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_315_600_000,
+            open: 120.0,
+            high: 128.0,
+            low: 125.0,
+            close: 127.0,
+            volume: 60_000.0,
+            funding_rate_hourly: -0.00012,
+            is_synthetic: 0,
+        });
+        db.upsert_ohlcv_batch(&bars_breached).unwrap();
+        let f_series: Vec<f64> = bars_breached.iter().map(|b| b.funding_rate_hourly).collect();
+        let mut cache = HashMap::new();
+        cache.insert(
+            "SOL/USDC:USDC".to_string(),
+            (f_series, bars_breached, Vec::new()),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache);
+
+        let cell_breached = PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(100.0),
+            quantity: Some(1.0),
+            notional_usdc: Some(100.0),
+            risk_budget_usdc: Some(5.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.5),
+            funding_rate_entry: Some(-0.00012),
+            initial_stop: Some(95.0),
+            chandelier_stop: Some(95.0),
+            highest_price_seen: Some(100.0),
+            lowest_price_seen: Some(99.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.04,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T12:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T12:00:00Z".to_string(),
+        };
+        let cid_b = orch.scoped_db.upsert_pond_cell(&cell_breached).unwrap();
+        // When breached_prev_stop is true (85.0 <= 95.0 - wick_buf), even though Chandelier ratchets on 4H close,
+        // eval_low_px retains (high_px, low_px) = 85.0 and triggers TIER1_CATASTROPHIC_WICK_STOP
+        let exits_b = orch.evaluate_open_cells(false, true).unwrap();
+        assert_eq!(exits_b, 1);
+        let closed_b = orch
+            .scoped_db
+            .get_pond_cells(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cid_b)
+            .unwrap();
+        assert_eq!(
+            closed_b.exit_reason.as_deref(),
+            Some("TIER1_CATASTROPHIC_WICK_STOP")
+        );
     }
 }

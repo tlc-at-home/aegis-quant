@@ -78,6 +78,7 @@ pub struct PondConfig {
     pub pond_universe_delist_rank: usize,
     pub pond_universe_warmup_hours: i64,
     pub pond_min_daily_volume_usdc: f64,
+    pub pond_testnet_min_vol_cap_usdc: f64,
     pub pond_scan_offset_seconds: u64,
     pub pond_funding_z_window_hours: usize,
     pub pond_funding_z_entry: f64,
@@ -144,6 +145,12 @@ impl PondConfig {
             pond_universe_delist_rank: cfg.get_usize("pond_universe_delist_rank", 95),
             pond_universe_warmup_hours: cfg.get_i64("pond_universe_warmup_hours", 168),
             pond_min_daily_volume_usdc: cfg.get_f64("pond_min_daily_volume_usdc", 50_000.0),
+            pond_testnet_min_vol_cap_usdc: cfg
+                .get_f64(
+                    "pond_testnet_min_vol_cap_usdc",
+                    aegis_core::TESTNET_POND_MIN_VOL_CAP_USDC,
+                )
+                .max(0.0),
             pond_scan_offset_seconds: cfg.get_i64("pond_scan_offset_seconds", 10).max(0) as u64,
             pond_funding_z_window_hours: cfg.get_usize("pond_funding_z_window_hours", 168),
             pond_funding_z_entry: cfg.get_f64("pond_funding_z_entry", 2.0),

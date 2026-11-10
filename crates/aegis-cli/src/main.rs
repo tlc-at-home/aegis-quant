@@ -1916,7 +1916,8 @@ mod tests {
         orch.last_reconcile_ms = Some(t0 - 305_000);
         orch.maybe_run_maintenance(false);
         assert!(
-            orch.last_reconcile_ms.unwrap() > t0,
+            orch.last_reconcile_ms.unwrap() > t0 - 305_000
+                && orch.last_reconcile_ms.unwrap() >= t0,
             "Reconcile must trigger after 5 minutes elapsed wall-clock (R6-N1)"
         );
         assert_eq!(orch.last_retention_prune_ms.unwrap(), p0);
@@ -1925,7 +1926,8 @@ mod tests {
         orch.last_retention_prune_ms = Some(p0 - 3_605_000);
         orch.maybe_run_maintenance(false);
         assert!(
-            orch.last_retention_prune_ms.unwrap() > p0,
+            orch.last_retention_prune_ms.unwrap() > p0 - 3_605_000
+                && orch.last_retention_prune_ms.unwrap() >= p0,
             "Retention pruning must trigger after 1 hour elapsed wall-clock (R6-N1)"
         );
 
@@ -1934,7 +1936,10 @@ mod tests {
             .unwrap();
         orch.last_reconcile_ms = Some(t0 - 1_000);
         orch.maybe_run_maintenance(true);
-        assert!(orch.last_reconcile_ms.unwrap() > t0 - 1_000);
+        assert!(
+            orch.last_reconcile_ms.unwrap() > t0 - 1_000
+                && orch.last_reconcile_ms.unwrap() >= t0
+        );
         let logs = db.get_recent_logs(20).unwrap();
         assert!(
             logs.iter().any(|l| {

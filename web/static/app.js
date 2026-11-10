@@ -681,7 +681,7 @@ function renderDashboard(data) {
     openTbody.innerHTML = `<tr><td colspan="10" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
   } else {
     openTbody.innerHTML = openTrades.map(t => {
-      const upnl = (t.unrealized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0);
+      const upnl = (t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0);
       return `
         <tr>
           <td><strong>${escapeHtml(t.symbol)}</strong></td>
@@ -703,7 +703,7 @@ function renderDashboard(data) {
   const recTbody = document.getElementById('recent-trades-tbody');
   recTbody.innerHTML = recentTrades.slice(0, 20).map(t => {
     const tradeState = t.status || t.state || 'CLOSED';
-    const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0)) : (t.realized_pnl_usdc || 0);
+    const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0)) : (t.realized_pnl_usdc || 0);
     const fPnl = t.funding_accrued_usdc || 0;
     const tradeTs = tradeState === 'OPEN' ? t.opened_at : (t.closed_at || t.opened_at);
     return `

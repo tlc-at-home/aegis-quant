@@ -536,6 +536,7 @@ impl DatabaseManager {
             } else {
                 0
             };
+            let mut replayed_prereqs: Vec<(i64, String)> = Vec::new();
             if target_num >= 3 {
                 for (idx, prereq) in ALL_MIGRATION_FILES.iter().enumerate() {
                     let prereq_num = idx + 1;
@@ -544,6 +545,20 @@ impl DatabaseManager {
                         if p.exists() {
                             if let Ok(s) = fs::read_to_string(&p) {
                                 Self::execute_sql_transactional(conn, &s)?;
+                                let prereq_stem = p
+                                    .file_stem()
+                                    .and_then(|st| st.to_str())
+                                    .unwrap_or(prereq)
+                                    .to_string();
+                                let _ = conn.execute(
+                                    "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
+                                     VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
+                                    params![
+                                        prereq_num as i64,
+                                        format!("Migration {:03}: {prereq_stem}", prereq_num)
+                                    ],
+                                );
+                                replayed_prereqs.push((prereq_num as i64, prereq_stem));
                             }
                         }
                     }
@@ -565,17 +580,29 @@ impl DatabaseManager {
                 .optional()
                 .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            if has_mig_table.is_some() && file_name.len() >= 3 {
-                if let Ok(ver_num) = file_name[..3].parse::<i64>() {
-                    let stem = mig_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&file_name);
+            if has_mig_table.is_some() {
+                for (prereq_ver, prereq_stem) in &replayed_prereqs {
                     let _ = conn.execute(
                         "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
                          VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
-                        params![ver_num, format!("Migration {:03}: {stem}", ver_num)],
+                        params![
+                            prereq_ver,
+                            format!("Migration {:03}: {prereq_stem}", prereq_ver)
+                        ],
                     );
+                }
+                if file_name.len() >= 3 {
+                    if let Ok(ver_num) = file_name[..3].parse::<i64>() {
+                        let stem = mig_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&file_name);
+                        let _ = conn.execute(
+                            "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
+                             VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
+                            params![ver_num, format!("Migration {:03}: {stem}", ver_num)],
+                        );
+                    }
                 }
             }
             Ok(())
