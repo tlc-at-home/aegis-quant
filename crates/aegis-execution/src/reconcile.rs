@@ -6,191 +6,9 @@ use aegis_core::{
 use aegis_risk::RiskEngine;
 use serde_json::{json, Value};
 
-use crate::{
-    ExecutionEngine, FundingSyncReport, FundingSyncStatus, ReconcileReport, ReconcileStatus,
-};
+use crate::{ExecutionEngine, ReconcileReport, ReconcileStatus};
 
 impl ExecutionEngine {
-    /// Accrues or reconciles hourly funding payments across open Book A (`PIT`) perpetual positions (`NM-4`, `R3-B1`, `R4-N4`).
-    ///
-    /// Note (`R3-B1`): Book B (`POND`) cells accrue hourly funding exclusively inside
-    /// `PondOrchestrator::evaluate_open_cells` via `accrue_pond_cell_funding_for_hour`
-    /// so Pond cells are never double-credited or double-debited.
-    pub fn sync_funding_payments(
-        &self,
-        current_ts_ms: Option<i64>,
-        is_backtest: bool,
-    ) -> FundingSyncReport {
-        let now_ms = current_ts_ms.unwrap_or_else(|| self.db.now_ms());
-        let hour_bucket = (now_ms / 3_600_000) * 3_600_000;
-        let hour_bucket_idx = now_ms.div_euclid(3_600_000);
-        if *self.last_funding_sync_hour_ts.lock() == Some(hour_bucket) {
-            return FundingSyncReport {
-                status: FundingSyncStatus::AlreadySyncedThisHour,
-                reason: None,
-                hour_bucket_ms: hour_bucket,
-                positions_updated: 0,
-                net_funding_delta_usdc: 0.0,
-            };
-        }
-
-        let open_trades = match self.db.get_open_trades() {
-            Ok(trades) => trades,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to query open trades during sync_funding_payments");
-                return FundingSyncReport {
-                    status: FundingSyncStatus::Error,
-                    reason: Some(e.to_string()),
-                    hour_bucket_ms: hour_bucket,
-                    positions_updated: 0,
-                    net_funding_delta_usdc: 0.0,
-                };
-            }
-        };
-
-        if open_trades.is_empty() {
-            *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
-            return FundingSyncReport {
-                status: FundingSyncStatus::NoOpenPositions,
-                reason: None,
-                hour_bucket_ms: hour_bucket,
-                positions_updated: 0,
-                net_funding_delta_usdc: 0.0,
-            };
-        }
-
-        let mut onchain_rate_by_coin: HashMap<String, f64> = HashMap::new();
-        if !is_backtest {
-            let cfg = self.load_config_logged("sync_funding_payments");
-            let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-            let pond_mode = cfg
-                .get_str("pond_execution_mode", &mode)
-                .to_ascii_uppercase();
-            let is_live_or_testnet = mode == "LIVE"
-                || mode == "TESTNET"
-                || pond_mode == "LIVE"
-                || pond_mode == "TESTNET";
-            let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
-                || mode == "TESTNET"
-                || pond_mode == "TESTNET";
-            let wallet = cfg.get_str("wallet_address", "");
-            if is_live_or_testnet && !wallet.trim().is_empty() {
-                if let Some(entries) = self.fetch_hyperliquid_user_funding(
-                    &wallet,
-                    hour_bucket.saturating_sub(3_600_000),
-                    is_testnet,
-                ) {
-                    for entry in entries {
-                        let delta_obj = entry.get("delta").unwrap_or(&entry);
-                        let coin = delta_obj
-                            .get("coin")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            .to_uppercase();
-                        let rate_opt = delta_obj.get("fundingRate").and_then(|v| {
-                            v.as_f64()
-                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                        });
-                        if !coin.is_empty() {
-                            if let Some(rate) = rate_opt.filter(|r| r.is_finite()) {
-                                onchain_rate_by_coin.insert(coin, rate);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut updated = 0usize;
-        let mut net_funding_delta = 0.0;
-
-        for trade in open_trades {
-            if trade.fsm_state == "OPEN_ON_BOOK" && trade.filled_units <= 0.0 {
-                continue;
-            }
-            let bars = self
-                .db
-                .get_ohlcv_bars(&trade.symbol, "1h", 2, Some(now_ms))
-                .unwrap_or_default();
-            let coin = trade.base_asset.trim().to_uppercase();
-            let Some(funding_rate) = onchain_rate_by_coin
-                .get(&coin)
-                .copied()
-                .or_else(|| bars.last().map(|b| b.funding_rate_hourly))
-            else {
-                tracing::warn!(
-                    trade_id = trade.trade_id,
-                    symbol = %trade.symbol,
-                    "Skipping hourly funding accrual: no on-chain or 1h bar funding rate available"
-                );
-                continue;
-            };
-            let mark_px = bars
-                .last()
-                .map(|b| b.close)
-                .unwrap_or(trade.current_price);
-            let notional = trade.quantity.abs() * mark_px;
-            let delta = round_dp(
-                if trade.side == "LONG" {
-                    -notional * funding_rate
-                } else {
-                    notional * funding_rate
-                },
-                4,
-            );
-            let upnl = round_dp(
-                if trade.side == "LONG" {
-                    (mark_px - trade.entry_price) * trade.quantity.abs()
-                } else {
-                    (trade.entry_price - mark_px) * trade.quantity.abs()
-                },
-                4,
-            );
-            match self.db.accrue_trade_funding_for_hour(
-                trade.trade_id,
-                hour_bucket_idx,
-                mark_px,
-                upnl,
-                delta,
-            ) {
-                Ok(true) => {
-                    net_funding_delta += delta;
-                    updated += 1;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(
-                        trade_id = trade.trade_id,
-                        error = %e,
-                        "Failed to accrue open trade funding (R4-N4)"
-                    );
-                }
-            }
-        }
-
-        *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
-
-        if !is_backtest && updated > 0 {
-            let _ = self.db.log_telemetry(
-                "INFO",
-                "engine.execution",
-                &format!(
-                    "Synced 1H funding across {updated} open positions (net delta: ${net_funding_delta:+.4})"
-                ),
-                None,
-            );
-        }
-
-        FundingSyncReport {
-            status: FundingSyncStatus::Synced,
-            reason: None,
-            hour_bucket_ms: hour_bucket,
-            positions_updated: updated,
-            net_funding_delta_usdc: round_dp(net_funding_delta, 4),
-        }
-    }
-
     /// Reconciles local SQLite `OPEN` trades and Pond cells against Hyperliquid L1
     /// `clearinghouseState` and `openOrders` (`NM-5`, `NM-10`, `R3-B4`, `R3-H3`, `R4-N11`, `R9-S1`).
     pub fn reconcile_exchange_state(
@@ -401,71 +219,17 @@ impl ExecutionEngine {
 
         // In live/testnet mode, if a resting PIT order is no longer on the exchange openOrders book,
         // poll its fill status immediately during the 15s tick so filled orders promote to OPEN without
-        // waiting up to 15 minutes for the next PIT cycle (`R9-N1`, `R9-N3`).
+        // waiting up to 15 minutes for the next PIT cycle (`R9-N1`, `R9-N3`, `R9-QB`).
         if simulated_exchange_positions.is_none()
             && open_orders_slice.is_some()
             && !resting_trades.is_empty()
         {
             let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
-            let mut resting_changed = false;
-            for rt in &resting_trades {
-                let oid_num = rt
-                    .exchange_order_id
-                    .as_deref()
-                    .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .filter(|&id| id > 0);
-                if oid_num
-                    .map(|id| open_order_oids.contains(&id))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let r_status = self.check_resting_order_status_with_open_orders(
-                    rt.exchange_order_id.as_deref(),
-                    true,
-                );
-                if r_status.state == "FILLED" {
-                    let fill_px = if r_status.entry_price > 0.0 {
-                        r_status.entry_price
-                    } else {
-                        rt.entry_price
-                    };
-                    let fill_qty = if r_status.filled_units > 0.0 {
-                        r_status.filled_units
-                    } else {
-                        rt.quantity
-                    };
-                    let fee_usdc = if r_status.fee_usdc > 0.0 {
-                        round_dp(r_status.fee_usdc, 4)
-                    } else {
-                        round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
-                    };
-                    if matches!(
-                        self.db.promote_resting_trade_to_open(
-                            rt.trade_id,
-                            fill_qty,
-                            fill_px,
-                            fee_usdc,
-                            0.0
-                        ),
-                        Ok(true)
-                    ) {
-                        resting_changed = true;
-                    }
-                } else if r_status.state == "GONE"
-                    && matches!(
-                        self.db.cancel_resting_trade(
-                            rt.trade_id,
-                            "RESTING_ORDER_CANCELLED_OR_EXPIRED"
-                        ),
-                        Ok(true)
-                    )
-                {
-                    resting_changed = true;
-                }
-            }
-            if resting_changed {
+            if self.poll_resting_pit_trades_on_15s_tick(
+                &resting_trades,
+                &open_order_oids,
+                maker_fee_bps,
+            ) {
                 if let Ok(updated_open) = self.db.get_open_trades() {
                     local_trades = updated_open;
                 }
@@ -499,6 +263,8 @@ impl ExecutionEngine {
             *pit_qty_by_coin.entry(coin.clone()).or_insert(0.0) += lt.quantity.abs();
             pit_ids_by_coin.entry(coin).or_default().push(lt.trade_id);
         }
+        let initial_pit_qty_by_coin = pit_qty_by_coin.clone();
+
         let mut pond_qty_by_coin: HashMap<String, f64> = HashMap::new();
         let mut pond_ids_by_coin: HashMap<String, Vec<i64>> = HashMap::new();
         for cell in &local_pond_cells {
@@ -516,6 +282,7 @@ impl ExecutionEngine {
                 .or_default()
                 .push(cell.cell_id);
         }
+        let initial_pond_qty_by_coin = pond_qty_by_coin.clone();
 
         let mut seen_coins: HashSet<String> = HashSet::new();
         let mut open_pos_coins: HashSet<String> = HashSet::new();
@@ -642,6 +409,8 @@ impl ExecutionEngine {
                                 "Failed to close phantom local trade"
                             );
                         }
+                        let cur_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                        pit_qty_by_coin.insert(coin.clone(), (cur_qty - lt.quantity.abs()).max(0.0));
                         discrepancies.push(json!({
                             "type": "PHANTOM_LOCAL_CLOSED",
                             "base_asset": coin,
@@ -689,11 +458,44 @@ impl ExecutionEngine {
                     let current_pit_coin_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
                     let other_pit_qty_on_coin = (current_pit_coin_qty - lt.quantity.abs()).max(0.0);
                     let residual_pit_qty = (ex_qty - pond_co_qty).max(0.0);
-                    let expected_pit_qty = if residual_pit_qty > other_pit_qty_on_coin {
-                        (residual_pit_qty - other_pit_qty_on_coin).max(0.0)
-                    } else if current_pit_coin_qty > 1e-9 {
+                    if residual_pit_qty <= 1e-9 {
+                        if !open_order_coins.contains(&coin) {
+                            if let Err(e) = self.db.close_trade(
+                                lt.trade_id,
+                                mark_px,
+                                0.0,
+                                lt.fees_paid_usdc,
+                                "RECONCILED_CLOSED_ON_EXCHANGE",
+                            ) {
+                                tracing::error!(
+                                    trade_id = lt.trade_id,
+                                    error = %e,
+                                    "Failed to close phantom local trade covered by Pond position"
+                                );
+                            }
+                            pit_qty_by_coin.insert(coin.clone(), other_pit_qty_on_coin);
+                            discrepancies.push(json!({
+                                "type": "PHANTOM_LOCAL_CLOSED",
+                                "base_asset": coin,
+                                "trade_id": lt.trade_id,
+                            }));
+                        }
+                        continue;
+                    }
+                    let is_last_on_coin = pit_ids_by_coin
+                        .get(&coin)
+                        .and_then(|ids| ids.last())
+                        .copied()
+                        == Some(lt.trade_id);
+                    let initial_pit_coin_qty =
+                        initial_pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                    let expected_pit_qty = if (current_pit_coin_qty - residual_pit_qty).abs() <= 1e-6
+                        || is_last_on_coin
+                    {
+                        round_dp((residual_pit_qty - other_pit_qty_on_coin).max(0.0), 6)
+                    } else if initial_pit_coin_qty > 1e-9 {
                         round_dp(
-                            residual_pit_qty * (lt.quantity.abs() / current_pit_coin_qty),
+                            residual_pit_qty * (lt.quantity.abs() / initial_pit_coin_qty),
                             6,
                         )
                     } else {
@@ -744,6 +546,7 @@ impl ExecutionEngine {
             seen_coins.insert(coin.clone());
             open_pos_coins.insert(coin.clone());
             let pit_co_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+            let local_qty = cell.quantity.unwrap_or(0.0).abs();
 
             match ex_positions.get(&coin) {
                 None => {
@@ -759,6 +562,8 @@ impl ExecutionEngine {
                                 "Failed to close phantom pond cell"
                             );
                         }
+                        let cur_qty = pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                        pond_qty_by_coin.insert(coin.clone(), (cur_qty - local_qty).max(0.0));
                         discrepancies.push(json!({
                             "type": "PHANTOM_POND_CELL_CLOSED",
                             "base_asset": coin,
@@ -804,16 +609,47 @@ impl ExecutionEngine {
                     }
                     // R9-S1: Net other same-coin POND cell rows when computing expected per-cell size
                     let ex_qty = szi.abs();
-                    let local_qty = cell.quantity.unwrap_or(0.0).abs();
                     let current_pond_coin_qty =
                         pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
                     let other_pond_qty_on_coin = (current_pond_coin_qty - local_qty).max(0.0);
                     let residual_pond_qty = (ex_qty - pit_co_qty).max(0.0);
-                    let expected_pond_qty = if residual_pond_qty > other_pond_qty_on_coin {
-                        (residual_pond_qty - other_pond_qty_on_coin).max(0.0)
-                    } else if current_pond_coin_qty > 1e-9 {
+                    if residual_pond_qty <= 1e-9 {
+                        if !open_order_coins.contains(&coin) {
+                            if let Err(e) = self.db.reconcile_close_phantom_pond_cell(
+                                cell.cell_id,
+                                mark_px,
+                                "RECONCILED_CLOSED_ON_EXCHANGE",
+                            ) {
+                                tracing::error!(
+                                    cell_id = cell.cell_id,
+                                    error = %e,
+                                    "Failed to close phantom pond cell covered by PIT position"
+                                );
+                            }
+                            pond_qty_by_coin.insert(coin.clone(), other_pond_qty_on_coin);
+                            discrepancies.push(json!({
+                                "type": "PHANTOM_POND_CELL_CLOSED",
+                                "base_asset": coin,
+                                "cell_id": cell.cell_id,
+                            }));
+                        }
+                        continue;
+                    }
+                    let is_last_on_coin = pond_ids_by_coin
+                        .get(&coin)
+                        .and_then(|ids| ids.last())
+                        .copied()
+                        == Some(cell.cell_id);
+                    let initial_pond_coin_qty =
+                        initial_pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
+                    let expected_pond_qty = if (current_pond_coin_qty - residual_pond_qty).abs()
+                        <= 1e-6
+                        || is_last_on_coin
+                    {
+                        round_dp((residual_pond_qty - other_pond_qty_on_coin).max(0.0), 6)
+                    } else if initial_pond_coin_qty > 1e-9 {
                         round_dp(
-                            residual_pond_qty * (local_qty / current_pond_coin_qty),
+                            residual_pond_qty * (local_qty / initial_pond_coin_qty),
                             6,
                         )
                     } else {
@@ -973,65 +809,8 @@ impl ExecutionEngine {
 
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
-        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`, `R9-N3`)
-        let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
-        for r_trade in resting_trades {
-            let mut r_status =
-                self.check_resting_order_status(r_trade.exchange_order_id.as_deref());
-            if r_status.state == "OPEN_ON_BOOK" && !freeze_entries && !is_backtest {
-                if let Some(oid_str) = r_trade.exchange_order_id.as_deref() {
-                    let cancel_confirmed = self
-                        .cancel_resting_order(&r_trade.symbol, oid_str)
-                        .unwrap_or(false);
-                    r_status = self.verify_post_cancel_resting_order(
-                        &r_trade.symbol,
-                        oid_str,
-                        cancel_confirmed,
-                    );
-                }
-            }
-            if r_status.state == "FILLED" {
-                let fill_px = if r_status.entry_price > 0.0 {
-                    r_status.entry_price
-                } else {
-                    r_trade.entry_price
-                };
-                let fill_qty = if r_status.filled_units > 0.0 {
-                    r_status.filled_units
-                } else {
-                    r_trade.quantity
-                };
-                let fee_usdc = if r_status.fee_usdc > 0.0 {
-                    round_dp(r_status.fee_usdc, 4)
-                } else {
-                    round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
-                };
-                if let Err(e) = self.db.promote_resting_trade_to_open(
-                    r_trade.trade_id,
-                    fill_qty,
-                    fill_px,
-                    fee_usdc,
-                    0.0,
-                ) {
-                    tracing::error!(
-                        trade_id = r_trade.trade_id,
-                        error = %e,
-                        "Failed to promote resting PIT trade to OPEN (R3-H2)"
-                    );
-                }
-            } else if r_status.state == "GONE" {
-                if let Err(e) = self
-                    .db
-                    .cancel_resting_trade(r_trade.trade_id, "RESTING_ORDER_CANCELLED_OR_EXPIRED")
-                {
-                    tracing::error!(
-                        trade_id = r_trade.trade_id,
-                        error = %e,
-                        "Failed to cancel expired resting PIT trade"
-                    );
-                }
-            }
-        }
+        // 0. Poll resting PIT orders (`OPEN_ON_BOOK`) before evaluating stops (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`, `R9-N3`, `R9-QB`)
+        self.reconcile_resting_pit_trades_for_cycle(freeze_entries, is_backtest, maker_fee_bps);
 
         let usdc_assets = self.db.get_usdc_perp_universe()?;
         let mut asset_by_symbol: HashMap<String, UniverseAsset> = usdc_assets
@@ -1571,6 +1350,22 @@ impl ExecutionEngine {
                             })),
                         );
                         if !is_backtest {
+                            let err_str = e.to_string();
+                            if err_str.contains("trades table")
+                                || err_str.contains("trades_v11_rebuild")
+                            {
+                                let _ = self.alerts.notify_critical_event(
+                                    "TRADES_SCHEMA_SELF_HEAL_FAILED",
+                                    &format!(
+                                        "Legacy trades schema self-heal failed while inserting PIT trade for {}: {err_str}",
+                                        asset.symbol
+                                    ),
+                                    Some(json!({
+                                        "symbol": asset.symbol,
+                                        "error": err_str,
+                                    })),
+                                );
+                            }
                             let _ = self.alerts.notify_critical_event(
                                 "TRADE_INSERT_FAILED_AFTER_LIVE_ORDER",
                                 &format!(

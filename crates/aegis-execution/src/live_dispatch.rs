@@ -1344,7 +1344,7 @@ impl ExecutionEngine {
 
     /// Adjusts raw Hyperliquid Spot USDC balances (`(raw_spot_tot, raw_spot_free)`) by subtracting
     /// the configured `testnet_faucet_offset_usdc` (default `$10,000.00`) when running on Testnet
-    /// with a sub-$5,000 `initial_equity_usdc` and an unallocated Testnet faucet Spot USDC grant (`R9-N2`).
+    /// with `initial_equity_usdc <= testnet_faucet_offset_usdc` and an unallocated Testnet faucet Spot USDC grant (`R9-N2`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn adjust_testnet_faucet_spot_usdc(
         &self,
@@ -1357,12 +1357,13 @@ impl ExecutionEngine {
         vault_eq: f64,
     ) -> (f64, f64) {
         let configured_offset = cfg.get_f64("testnet_faucet_offset_usdc", 10_000.0).max(0.0);
+        let combined_eq = perp_eq + raw_spot_tot + vault_eq;
         let faucet_offset = if is_testnet
             && configured_offset > 0.0
             && init_eq > 0.0
-            && init_eq <= 5_000.0
+            && init_eq <= configured_offset
             && raw_spot_tot >= configured_offset
-            && (perp_eq + raw_spot_tot + vault_eq) > init_eq * 2.5
+            && (combined_eq > init_eq * 2.5 || combined_eq >= init_eq + configured_offset * 0.5)
         {
             tracing::debug!(
                 raw_spot_tot = raw_spot_tot,

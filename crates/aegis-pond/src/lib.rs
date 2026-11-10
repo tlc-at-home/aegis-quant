@@ -194,7 +194,33 @@ impl PondOrchestrator {
                     cell.exit_reason = None;
                     cell.resting_order_id = None;
                     transition_cell_state(&mut cell, PondCellState::Open)?;
-                    self.scoped_db.upsert_pond_cell(&cell)?;
+                    if let Err(e) = self.scoped_db.upsert_pond_cell(&cell) {
+                        let msg = format!(
+                            "Critical: upsert_pond_cell failed after promoting FILLED resting Pond order for {} ({} oid={:?} units={:.6}): {e}",
+                            cell.symbol, cell.cell_id, resting_oid, status.filled_units
+                        );
+                        tracing::error!("{msg}");
+                        let details = json!({
+                            "cell_id": cell.cell_id,
+                            "symbol": cell.symbol,
+                            "state": cell.state.as_str(),
+                            "resting_order_id": resting_oid,
+                            "filled_units": status.filled_units,
+                            "error": e.to_string(),
+                        });
+                        let _ = self.scoped_db.log_telemetry(
+                            "CRITICAL",
+                            "engine.pond",
+                            &msg,
+                            Some(details.clone()),
+                        );
+                        let _ = self.execution.alerts.notify_critical_event(
+                            "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
+                            &msg,
+                            Some(details),
+                        );
+                        return Err(e);
+                    }
                     promoted += 1;
                 }
                 "GONE" | "CANCELLED_OR_GONE" => {

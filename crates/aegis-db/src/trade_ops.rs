@@ -972,7 +972,11 @@ impl DatabaseManager {
             Err(e)
                 if e.to_string()
                     .to_ascii_uppercase()
-                    .contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')") =>
+                    .contains("STATUS IN ('OPEN', 'CLOSED', 'CANCELLED')")
+                    || (trade.status.eq_ignore_ascii_case("PENDING")
+                        && e.to_string()
+                            .to_ascii_uppercase()
+                            .contains("CHECK CONSTRAINT FAILED")) =>
             {
                 if let Err(heal_err) = self.with_conn(Self::ensure_trades_pending_status_check) {
                     let msg = format!(
@@ -1018,7 +1022,26 @@ impl DatabaseManager {
                     }
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                let msg = format!(
+                    "Critical: insert_trade failed for {} (status={} fsm_state={} oid={:?}): {e}",
+                    trade.symbol, trade.status, trade.fsm_state, trade.exchange_order_id
+                );
+                tracing::error!("{msg}");
+                let _ = self.log_telemetry(
+                    "CRITICAL",
+                    "db.trade_ops",
+                    &msg,
+                    Some(json!({
+                        "symbol": trade.symbol,
+                        "status": trade.status,
+                        "fsm_state": trade.fsm_state,
+                        "exchange_order_id": trade.exchange_order_id,
+                        "error": e.to_string(),
+                    })),
+                );
+                Err(e)
+            }
         }
     }
 

@@ -5,13 +5,16 @@
 //! - [`http_client`]: HTTPS endpoint validation (`NH-2`) and shared blocking JSON HTTP helper (`NQ-2`)
 //! - [`ingestion`]: Hyperliquid `candleSnapshot`, `metaAndAssetCtxs`, `fundingHistory` ingestion & synthetic seeding
 //! - [`live_dispatch`]: Live Hyperliquid order submission, resting order status by `oid` (`NH-6`), and subaccount transfer (`NB-1`, `NM-6`)
-//! - [`reconcile`]: Hourly funding sync (`NM-4`), single-wallet reconciliation (`NM-5`, `NM-10`), and execution cycle (`NH-4`, `NH-8`, `NH-10`)
+//! - [`manual_close`]: Manual take-profit/close helpers, exchange absence confirmation, and cached `UniverseAsset` resolution (`R7-S3`, `R7-S4`, `R8-N2`, `R8-N3`, `R9-QB`)
+//! - [`resting_reconcile`]: Hourly funding sync (`NM-4`) and resting PIT order reconciliation (`NH-4`, `R9-N1`, `R9-N3`, `R9-QB`)
+//! - [`reconcile`]: Single-wallet exchange reconciliation (`NM-5`, `NM-10`, `R9-S1`) and execution cycle (`NH-4`, `NH-8`, `NH-10`)
 
 pub mod http_client;
 pub mod ingestion;
 pub mod live_dispatch;
 pub mod manual_close;
 pub mod reconcile;
+pub mod resting_reconcile;
 pub mod signing;
 
 use std::collections::HashMap;
@@ -2249,7 +2252,7 @@ mod tests {
             "reconcile_exchange_state must emit DUPLICATE_SAME_COIN_OPEN_ROWS for duplicate OPEN Pond cells (R9-S1)"
         );
 
-        // Sum of local ETH PIT trades must equal exactly 1.5 ETH (never 3.0 ETH!), and risk_budget_usdc rescaled
+        // Sum of local ETH PIT trades must equal 1.5 ETH AND each 1.0 ETH row must receive an equal 0.75 ETH share
         let open_eth: Vec<_> = db
             .get_open_trades()
             .unwrap()
@@ -2261,13 +2264,20 @@ mod tests {
             (total_eth_qty - 1.5).abs() < 1e-6,
             "Total local ETH PIT quantity across duplicate rows must equal exchange 1.5 ETH (never 3.0 ETH), got {total_eth_qty} (R9-S1)"
         );
+        for row in &open_eth {
+            assert!(
+                (row.quantity - 0.75).abs() < 1e-6,
+                "Equal 1.0 ETH duplicate rows must each receive 0.75 ETH proportional share, got {} (R9-S1)",
+                row.quantity
+            );
+        }
         let total_eth_risk: f64 = open_eth.iter().map(|t| t.risk_budget_usdc).sum();
         assert!(
             (total_eth_risk - 90.0).abs() < 1e-3,
             "Total local ETH PIT risk_budget_usdc must rescale to |3000 - 2940| * 1.5 = $90.0, got {total_eth_risk} (R9-N5)"
         );
 
-        // Sum of local SUI Pond cells must equal exactly 100.0 SUI (resized from 100+100=200 down to 50+50=100)
+        // Sum of local SUI Pond cells must equal 100.0 SUI AND each 100.0 SUI cell must receive 50.0 SUI
         let open_sui: Vec<_> = db
             .get_open_pond_cells()
             .unwrap()
@@ -2279,6 +2289,13 @@ mod tests {
             (total_sui_qty - 100.0).abs() < 1e-6,
             "Total local SUI Pond quantity across duplicate cells must equal exchange 100.0 SUI (never 200.0 SUI), got {total_sui_qty} (R9-S1)"
         );
+        for cell in &open_sui {
+            assert!(
+                (cell.quantity.unwrap_or(0.0) - 50.0).abs() < 1e-6,
+                "Equal 100.0 SUI duplicate Pond cells must each receive 50.0 SUI proportional share, got {:?} (R9-S1)",
+                cell.quantity
+            );
+        }
 
         // On Tick 2, size drift must be completely converged (zero SIZE_DRIFT_RECONCILED / SIZE_DRIFT_POND_CELL_RECONCILED)
         let rep2 = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
@@ -2291,7 +2308,101 @@ mod tests {
             rep2.discrepancies
         );
 
+        // 1b. R9-S1 3-row proportional weighting + cross-book phantom closure:
+        // Insert 3 equal 1.0 BTC OPEN PIT trades (sum = 3.0 BTC vs 1.2 BTC on-chain -> 0.4 BTC each),
+        // plus 1 phantom 5.0 SOL OPEN PIT trade while Pond holds 10.0 SOL on-chain (ex_qty = 10.0, pond_co_qty = 10.0).
+        let mut btc_trade = base_eth_trade.clone();
+        btc_trade.symbol = "BTC/USDC:USDC".to_string();
+        btc_trade.base_asset = "BTC".to_string();
+        btc_trade.entry_price = 90_000.0;
+        btc_trade.current_price = 90_000.0;
+        btc_trade.initial_stop_price = 88_200.0;
+        btc_trade.chandelier_stop_price = 88_200.0;
+        btc_trade.current_stop_price = 88_200.0;
+        btc_trade.notional_usdc = 90_000.0;
+        btc_trade.risk_budget_usdc = 1_800.0;
+        btc_trade.client_order_id = "hl-btc-dup-1".to_string();
+        let b1 = db.insert_trade(&btc_trade).unwrap();
+        btc_trade.client_order_id = "hl-btc-dup-2".to_string();
+        let b2 = db.insert_trade(&btc_trade).unwrap();
+        btc_trade.client_order_id = "hl-btc-dup-3".to_string();
+        let b3 = db.insert_trade(&btc_trade).unwrap();
+
+        let mut sol_pit_phantom = base_eth_trade.clone();
+        sol_pit_phantom.symbol = "SOL/USDC:USDC".to_string();
+        sol_pit_phantom.base_asset = "SOL".to_string();
+        sol_pit_phantom.side = "LONG".to_string();
+        sol_pit_phantom.entry_price = 150.0;
+        sol_pit_phantom.current_price = 150.0;
+        sol_pit_phantom.initial_stop_price = 145.0;
+        sol_pit_phantom.chandelier_stop_price = 145.0;
+        sol_pit_phantom.current_stop_price = 145.0;
+        sol_pit_phantom.quantity = 5.0;
+        sol_pit_phantom.filled_units = 5.0;
+        sol_pit_phantom.notional_usdc = 750.0;
+        sol_pit_phantom.risk_budget_usdc = 25.0;
+        sol_pit_phantom.client_order_id = "hl-sol-pit-phantom".to_string();
+        let sol_pit_id = db.insert_trade(&sol_pit_phantom).unwrap();
+
+        let mut sol_pond_cell = base_sui_cell.clone();
+        sol_pond_cell.symbol = "SOL/USDC:USDC".to_string();
+        sol_pond_cell.side = "LONG".to_string();
+        sol_pond_cell.option_analogue = "SHORT_PUT".to_string();
+        sol_pond_cell.entry_price = Some(150.0);
+        sol_pond_cell.quantity = Some(10.0);
+        sol_pond_cell.notional_usdc = Some(1_500.0);
+        sol_pond_cell.risk_budget_usdc = Some(50.0);
+        sol_pond_cell.initial_stop = Some(145.0);
+        sol_pond_cell.chandelier_stop = Some(145.0);
+        let sol_pond_id = db.upsert_pond_cell(&sol_pond_cell).unwrap();
+
+        on_chain.insert(
+            "BTC".to_string(),
+            json!({"szi": 1.2, "entryPx": 90000.0, "markPx": 90000.0, "unrealizedPnl": 0.0}),
+        );
+        on_chain.insert(
+            "SOL".to_string(),
+            json!({"szi": 10.0, "entryPx": 150.0, "markPx": 150.0, "unrealizedPnl": 0.0}),
+        );
+
+        let rep3 = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
+        assert_eq!(rep3.status, ReconcileStatus::Reconciled);
+
+        let open_btc: Vec<_> = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.trade_id == b1 || t.trade_id == b2 || t.trade_id == b3)
+            .collect();
+        assert_eq!(open_btc.len(), 3);
+        for row in &open_btc {
+            assert!(
+                (row.quantity - 0.4).abs() < 1e-6,
+                "Each of the 3 equal 1.0 BTC rows must resize equally to 0.4 BTC, got {} (R9-S1)",
+                row.quantity
+            );
+        }
+        assert!(
+            db.get_open_trades()
+                .unwrap()
+                .iter()
+                .all(|t| t.trade_id != sol_pit_id),
+            "Phantom PIT trade on SOL must be closed as PHANTOM_LOCAL_CLOSED when Pond holds the entire 10.0 SOL exchange position (R9-S1)"
+        );
+        let sol_pond_after = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == sol_pond_id)
+            .expect("SOL Pond cell must remain OPEN");
+        assert!(
+            (sol_pond_after.quantity.unwrap_or(0.0) - 10.0).abs() < 1e-6,
+            "SOL Pond cell quantity must remain intact at 10.0 SOL after phantom PIT row closure, got {:?} (R9-S1)",
+            sol_pond_after.quantity
+        );
+
         // 2. R9-N2: Verify adjust_testnet_faucet_spot_usdc uses `testnet_faucet_offset_usdc` from ConfigMap
+        // including when `5_000.0 < initial_equity_usdc <= testnet_faucet_offset_usdc`
         let cfg_default = db.load_config().unwrap();
         let (adj_tot, adj_hold) = exec.adjust_testnet_faucet_spot_usdc(
             &cfg_default,
@@ -2304,6 +2415,20 @@ mod tests {
         );
         assert!((adj_tot - 517.65).abs() < 1e-2);
         assert!((adj_hold - 0.0).abs() < 1e-6);
+
+        let (adj_tot_6k, _) = exec.adjust_testnet_faucet_spot_usdc(
+            &cfg_default,
+            true,
+            6_000.0,
+            3_000.0,
+            13_000.0,
+            0.0,
+            0.0,
+        );
+        assert!(
+            (adj_tot_6k - 3_000.0).abs() < 1e-2,
+            "adjust_testnet_faucet_spot_usdc must subtract 10k faucet offset when init_eq=6000 <= configured_offset=10000 (R9-N2), got {adj_tot_6k}"
+        );
 
         db.set_config_value("testnet_faucet_offset_usdc", &json!(5_000.0))
             .unwrap();
@@ -2338,6 +2463,100 @@ mod tests {
             refreshed.tier_name, "ORPHAN",
             "Expired entry in resolved_asset_cache (cached_at_ms=0) must be refreshed from universe_assets (R8-N2)"
         );
+
+        // 4. R9-N6: HTTP wire-mock verification of `cancel_resting_order` response parsing
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let pk = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        db.set_config_value("private_key", &json!(pk)).unwrap();
+        exec.asset_index_cache
+            .lock()
+            .insert((true, "ETH".to_string()), (0_u32, db.now_ms()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let responses = [
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#,
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"Order was already canceled"}]}}}"#,
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[]}}}"#,
+            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"unexpected":1}]}}}"#,
+        ];
+        let handle = std::thread::spawn(move || {
+            let mut idx = 0usize;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+                && idx < responses.len()
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut buf = [0u8; 4096];
+                        let mut total = Vec::new();
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            total.extend_from_slice(&buf[..n]);
+                            if let Some(hdr_end) =
+                                total.windows(4).position(|w| w == b"\r\n\r\n")
+                            {
+                                if total.len() > hdr_end + 4 {
+                                    break;
+                                }
+                            }
+                        }
+                        let body = responses[idx];
+                        idx += 1;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        let _ = stream.read(&mut buf);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        db.set_config_value("hyperliquid_testnet_url", &json!(format!("http://{addr}")))
+            .unwrap();
+        assert!(
+            exec.cancel_resting_order("ETH/USDC:USDC", "hl-90001")
+                .unwrap(),
+            "statuses: [\"success\"] must return Ok(true) (R9-N6)"
+        );
+        assert!(
+            exec.cancel_resting_order("ETH/USDC:USDC", "hl-90002")
+                .unwrap(),
+            "statuses: [{{\"error\": \"Order was already canceled\"}}] must return Ok(true) (R9-N6)"
+        );
+        assert!(
+            !exec
+                .cancel_resting_order("ETH/USDC:USDC", "hl-90003")
+                .unwrap(),
+            "Empty statuses: [] must return Ok(false) (R9-N6)"
+        );
+        assert!(
+            !exec
+                .cancel_resting_order("ETH/USDC:USDC", "hl-90004")
+                .unwrap(),
+            "Malformed statuses: [{{\"unexpected\": 1}}] must return Ok(false) (R9-N6)"
+        );
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.join();
     }
 }
 

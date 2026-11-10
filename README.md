@@ -11,7 +11,7 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
    - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), transactional schema version v12 auto-migration (`001..012`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
    - `aegis-signals`: 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, and Continuous Signal-to-Noise Ratio (SNR) ensemble.
    - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and correlation cluster limits.
-   - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`), live mark-to-market synchronization, and config validator.
+   - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`, `resting_reconcile`), live mark-to-market synchronization, and config validator.
    - `aegis-pit`: Book A (The Pit) directional BTC/Altcoin strategy engine.
    - `aegis-pond`: Book B (The Pond) Champion `NPS-01` Naked-Option Perpetual Analogue Scanner across an 80-coin dynamic universe (10-state cell FSM, 6-tier exit priority engine).
    - `aegis-settle`: Daily `00:05 UTC` 50/50 Cross-Book Settling Engine enforcing Invariant F5 (`available_idle_usdc` transfer cap), per-leg L1 progress tracking, `PARTIAL`/`AMBIGUOUS` quarantine, and atomic SQLite transactions.
