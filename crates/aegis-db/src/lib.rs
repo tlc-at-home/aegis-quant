@@ -2808,6 +2808,66 @@ mod tests {
             })
             .unwrap();
 
+        let open_avax_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "AVAX/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(92.043),
+                quantity: Some(1.0),
+                notional_usdc: Some(92.04),
+                risk_budget_usdc: Some(5.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(3.5),
+                funding_rate_entry: Some(0.0003),
+                initial_stop: Some(97.09785714),
+                chandelier_stop: Some(97.09785714),
+                highest_price_seen: Some(92.5),
+                lowest_price_seen: Some(82.415), // contaminated pre-open low
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-11T12:39:07Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-11T15:00:00Z".to_string(),
+            })
+            .unwrap();
+        db.upsert_ohlcv_batch(&[
+            aegis_core::OhlcvBar {
+                symbol: "AVAX/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_398_400_000, // 2026-11-11T12:00:00Z (opening hour, valid low 90.50 >= 92.043 * 0.92)
+                open: 92.043,
+                high: 92.50,
+                low: 90.50,
+                close: 91.00,
+                volume: 10_000.0,
+                funding_rate_hourly: 0.0003,
+                is_synthetic: 0,
+            },
+            aegis_core::OhlcvBar {
+                symbol: "AVAX/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_402_000_000, // 2026-11-11T13:00:00Z (strictly post-open, higher low 91.224)
+                open: 91.00,
+                high: 92.20,
+                low: 91.224,
+                close: 91.80,
+                volume: 10_000.0,
+                funding_rate_hourly: 0.0003,
+                is_synthetic: 0,
+            },
+        ])
+        .unwrap();
+
         // Rewind schema_migrations to v12 and apply migration 013
         db.with_conn(|conn| {
             conn.execute_batch(
@@ -2847,6 +2907,12 @@ mod tests {
         assert!(
             (eth.lowest_price_seen.unwrap() - 3000.0).abs() < 1e-6,
             "Migration 013 must reset contaminated <0.92*entry_price low on TRAILED cell to entry_price when no post-open bars exist"
+        );
+
+        let avax = cells.iter().find(|c| c.cell_id == open_avax_id).unwrap();
+        assert!(
+            (avax.lowest_price_seen.unwrap() - 90.50).abs() < 1e-6,
+            "Migration 013 must include valid opening-hour low (90.50) even when later post-open bars have higher lows (91.224)"
         );
     }
 }

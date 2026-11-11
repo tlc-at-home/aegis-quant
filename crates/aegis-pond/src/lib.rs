@@ -90,8 +90,42 @@ pub fn compute_wick_context(
         .map(|b| b.close)
         .filter(|&p| p > 0.0)
         .unwrap_or(entry_price);
-    let last_bar_high = last_1h.map(|b| b.high).unwrap_or(mark_px);
-    let last_bar_low = last_1h.map(|b| b.low).unwrap_or(mark_px);
+    let sanitize_bar_high = |b: &OhlcvBar| -> f64 {
+        if opened_at_ms > 0
+            && b.timestamp_ms < opened_at_ms
+            && entry_price > 0.0
+            && b.high > entry_price * 1.08
+        {
+            let base = b.close.max(entry_price);
+            stored_high
+                .filter(|&h| h <= entry_price * 1.08)
+                .map(|h| base.max(h))
+                .unwrap_or(base)
+        } else {
+            b.high
+        }
+    };
+    let sanitize_bar_low = |b: &OhlcvBar| -> f64 {
+        if opened_at_ms > 0
+            && b.timestamp_ms < opened_at_ms
+            && entry_price > 0.0
+            && b.low < entry_price * 0.92
+        {
+            let base = if b.close > 0.0 {
+                b.close.min(entry_price)
+            } else {
+                entry_price
+            };
+            stored_low
+                .filter(|&l| l >= entry_price * 0.92)
+                .map(|l| base.min(l))
+                .unwrap_or(base)
+        } else {
+            b.low
+        }
+    };
+    let last_bar_high = last_1h.map(sanitize_bar_high).unwrap_or(mark_px);
+    let last_bar_low = last_1h.map(sanitize_bar_low).unwrap_or(mark_px);
     let mut watermark_high = last_bar_high;
     let mut watermark_low = last_bar_low;
     let mut post_watermark_high = last_bar_high;
@@ -110,12 +144,14 @@ pub fn compute_wick_context(
         let mut peak_idx = start_idx;
         let mut trough_idx = start_idx;
         for (idx, b) in bars_1h.iter().enumerate().skip(start_idx) {
-            if b.high >= watermark_high {
-                watermark_high = b.high;
+            let b_high = sanitize_bar_high(b);
+            let b_low = sanitize_bar_low(b);
+            if b_high >= watermark_high {
+                watermark_high = b_high;
                 peak_idx = idx;
             }
-            if b.low > 0.0 && b.low <= watermark_low {
-                watermark_low = b.low;
+            if b_low > 0.0 && b_low <= watermark_low {
+                watermark_low = b_low;
                 trough_idx = idx;
             }
         }
@@ -132,14 +168,16 @@ pub fn compute_wick_context(
             start_idx
         };
         for (idx, b) in bars_1h.iter().enumerate().skip(post_watermark_start) {
-            if b.high > post_watermark_high {
-                post_watermark_high = b.high;
+            let b_high = sanitize_bar_high(b);
+            let b_low = sanitize_bar_low(b);
+            if b_high > post_watermark_high {
+                post_watermark_high = b_high;
                 if !is_long {
                     extreme_bar_idx = idx;
                 }
             }
-            if b.low > 0.0 && b.low < post_watermark_low {
-                post_watermark_low = b.low;
+            if b_low > 0.0 && b_low < post_watermark_low {
+                post_watermark_low = b_low;
                 if is_long {
                     extreme_bar_idx = idx;
                 }
@@ -2644,6 +2682,29 @@ mod tests {
                 expected_watermark_low: 99.0,
                 expected_post_high: 103.0,
                 expected_post_low: 99.0,
+                expected_extreme_idx: 5,
+            },
+            // Scenario 6c: opened_at_ms is mid-hour on the newest bar (bar 5) AND bar 5 itself has a pre-open >8% crash wick
+            // (low = 82.415 < 92.043 * 0.92). Sanitization clamps the pre-open low to min(close, entry_price, stored_low).
+            Case {
+                name: "mid_hour_open_on_same_hour_pre_open_crash_wick_sanitized",
+                bars: vec![
+                    mk_bar(0, 92.0, 93.0, 91.5, 92.0),
+                    mk_bar(1, 92.0, 93.0, 91.5, 92.0),
+                    mk_bar(2, 92.0, 93.0, 91.5, 92.0),
+                    mk_bar(3, 92.0, 93.0, 91.5, 92.0),
+                    mk_bar(4, 92.0, 93.0, 91.5, 92.0),
+                    mk_bar(5, 83.0, 93.17, 82.415, 92.331), // 12:00Z bar with pre-open 82.415 low before 12:39:07Z open
+                ],
+                side: "SHORT",
+                opened_at_ms: base_ts + 5 * 3_600_000 + 2_347_000, // 39m07s into bar 5
+                stored_high: Some(92.043),
+                stored_low: Some(92.043),
+                entry_price: 92.043,
+                expected_watermark_high: 93.17,
+                expected_watermark_low: 92.043,
+                expected_post_high: 93.17,
+                expected_post_low: 92.043,
                 expected_extreme_idx: 5,
             },
         ];

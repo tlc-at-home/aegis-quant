@@ -74,17 +74,16 @@ SET initial_stop = CASE
     highest_price_seen = COALESCE(
         MAX(
             entry_price,
-            COALESCE(
-                (SELECT MAX(m.high) FROM market_ohlcv m
-                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
-                   AND pond_cells.opened_at IS NOT NULL
-                   AND m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000),
-                (SELECT MAX(m.high) FROM market_ohlcv m
-                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
-                   AND pond_cells.opened_at IS NOT NULL
-                   AND m.high <= pond_cells.entry_price * 1.08
-                   AND m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000)
-            )
+            (SELECT MAX(m.high) FROM market_ohlcv m
+             WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+               AND pond_cells.opened_at IS NOT NULL
+               AND (
+                   m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000
+                   OR (
+                       m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000
+                       AND m.high <= pond_cells.entry_price * 1.08
+                   )
+               ))
         ),
         CASE
             WHEN highest_price_seen IS NULL OR highest_price_seen < entry_price OR highest_price_seen > entry_price * 1.08
@@ -95,18 +94,17 @@ SET initial_stop = CASE
     lowest_price_seen = COALESCE(
         MIN(
             entry_price,
-            COALESCE(
-                (SELECT MIN(m.low) FROM market_ohlcv m
-                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
-                   AND pond_cells.opened_at IS NOT NULL
-                   AND m.low > 0.0
-                   AND m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000),
-                (SELECT MIN(m.low) FROM market_ohlcv m
-                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
-                   AND pond_cells.opened_at IS NOT NULL
-                   AND m.low >= pond_cells.entry_price * 0.92
-                   AND m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000)
-            )
+            (SELECT MIN(m.low) FROM market_ohlcv m
+             WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+               AND pond_cells.opened_at IS NOT NULL
+               AND m.low > 0.0
+               AND (
+                   m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000
+                   OR (
+                       m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000
+                       AND m.low >= pond_cells.entry_price * 0.92
+                   )
+               ))
         ),
         CASE
             WHEN lowest_price_seen IS NULL OR lowest_price_seen <= 0.0 OR lowest_price_seen > entry_price OR lowest_price_seen < entry_price * 0.92
