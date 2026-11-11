@@ -32,7 +32,7 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`, `R7-QB`, `R9-QA`, `R10-QA`, `R11-QA`, `R12-QA`)**: The workspace defines and executes `119` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 22 unit + 1 `aegis-db-tool` bin = 23, `aegis-execution`: 19, `aegis-pit`: 3, `aegis-pond`: 15, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 8, `aegis-telemetry`: 2, `aegis-web`: 12).
+> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`, `R7-QB`, `R9-QA`, `R10-QA`, `R11-QA`, `R12-QA`)**: The workspace defines and executes `120` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 23 unit + 1 `aegis-db-tool` bin = 24, `aegis-execution`: 19, `aegis-pit`: 3, `aegis-pond`: 15, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 8, `aegis-telemetry`: 2, `aegis-web`: 12).
 
 ### 2. Initialize / Migrate SQLite Database (Schema v13)
 
