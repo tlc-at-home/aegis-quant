@@ -57,6 +57,7 @@ pub struct PondScannerParams {
     pub atr_period: usize,
     pub gate6_atr_4h_floor_mult: f64,
     pub min_stop_pct_floor: f64,
+    pub max_stop_distance_pct: f64,
     pub conviction_z_span: f64,
     pub conviction_scale_min: f64,
     pub conviction_scale_max: f64,
@@ -96,6 +97,7 @@ impl Default for PondScannerParams {
             atr_period: 14,
             gate6_atr_4h_floor_mult: 1.8,
             min_stop_pct_floor: 0.005,
+            max_stop_distance_pct: 0.06,
             conviction_z_span: 2.0,
             conviction_scale_min: 0.5,
             conviction_scale_max: 1.5,
@@ -430,7 +432,11 @@ pub fn run_nps01_scan(
         };
         let ref_px = Price::new_clamped(last_1h.close);
         let floor_pct = params.min_stop_pct_floor.max(0.0001);
-        let cap_pct = 0.06_f64.max(floor_pct);
+        let cap_pct = if params.max_stop_distance_pct > 0.0 {
+            params.max_stop_distance_pct.max(floor_pct)
+        } else {
+            0.06_f64.max(floor_pct)
+        };
         let raw_stop_dist = (params.initial_stop_atr_mult * atr_1h).max(ref_px.as_f64() * floor_pct);
         let stop_distance = Price::new_clamped(raw_stop_dist.min(ref_px.as_f64() * cap_pct));
 

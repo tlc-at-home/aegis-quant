@@ -76,6 +76,7 @@ pub struct WickContext {
 /// after the latest bar's `timestamp_ms`), falls back to the last bar (`bars_1h.len().saturating_sub(1)`)
 /// so pre-open wicks on earlier bars never contaminate watermarks (`R12-S1`). Keeps the
 /// `bars_1h.len().saturating_sub(6)` fallback only when `opened_at_ms <= 0`.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_wick_context(
     bars_1h: &[OhlcvBar],
     side: &str,
@@ -84,42 +85,87 @@ pub fn compute_wick_context(
     stored_low: Option<f64>,
     entry_price: f64,
     atr_period: usize,
+    active_stop: Option<f64>,
+    wick_buffer_atr_mult: f64,
 ) -> WickContext {
+    let is_long = side.eq_ignore_ascii_case("LONG");
     let last_1h = bars_1h.last();
     let mark_px = last_1h
         .map(|b| b.close)
         .filter(|&p| p > 0.0)
         .unwrap_or(entry_price);
+    let pre_open_slice = if bars_1h.len() > 2 {
+        &bars_1h[..bars_1h.len() - 1]
+    } else {
+        bars_1h
+    };
+    let pre_open_atr_1h = compute_atr_from_bars(pre_open_slice, atr_period.max(1)).max(0.01);
+    let default_stop_dist =
+        (2.5 * pre_open_atr_1h).clamp(entry_price * 0.005, entry_price * 0.06);
+    let wick_buf = wick_buffer_atr_mult.max(0.0) * pre_open_atr_1h;
+    let eff_stop_low = active_stop
+        .filter(|&s| s > 0.0 && s < entry_price)
+        .unwrap_or_else(|| (entry_price - default_stop_dist).max(1e-8));
+    let eff_stop_high = active_stop
+        .filter(|&s| s > entry_price)
+        .unwrap_or(entry_price + default_stop_dist);
+    let stop_dist_low = (entry_price - eff_stop_low).max(default_stop_dist);
+    let stop_dist_high = (eff_stop_high - entry_price).max(default_stop_dist);
+    let trigger_low = (eff_stop_low - wick_buf).max(1e-8);
+    let trigger_high = eff_stop_high + wick_buf;
+    let in_band_low_threshold =
+        (entry_price - (stop_dist_low - wick_buf).max(pre_open_atr_1h)).max(1e-8);
+    let in_band_high_threshold =
+        entry_price + (stop_dist_high - wick_buf).max(pre_open_atr_1h);
+
     let sanitize_bar_high = |b: &OhlcvBar| -> f64 {
-        if opened_at_ms > 0
-            && b.timestamp_ms < opened_at_ms
-            && entry_price > 0.0
-            && b.high > entry_price * 1.08
-        {
-            let base = b.close.max(entry_price);
-            stored_high
-                .filter(|&h| h <= entry_price * 1.08)
-                .map(|h| base.max(h))
-                .unwrap_or(base)
+        if opened_at_ms > 0 && b.timestamp_ms < opened_at_ms && entry_price > 0.0 {
+            let should_sanitize = if !is_long {
+                // SHORT: high side is the Tier-1 stop side. Any wick >= trigger_high survives
+                // so Tier 1 fires; shallower excursions above in_band_high_threshold are sanitized.
+                b.high < trigger_high && b.high > in_band_high_threshold
+            } else {
+                // LONG: high side is the favorable watermark side (cannot trigger Tier 1).
+                // Sanitize pre-open spikes above in_band_high_threshold so watermark_high is not contaminated.
+                b.high > in_band_high_threshold
+            };
+            if should_sanitize {
+                let base = b.close.max(entry_price);
+                stored_high
+                    .filter(|&h| h <= in_band_high_threshold)
+                    .map(|h| base.max(h))
+                    .unwrap_or(base)
+            } else {
+                b.high
+            }
         } else {
             b.high
         }
     };
     let sanitize_bar_low = |b: &OhlcvBar| -> f64 {
-        if opened_at_ms > 0
-            && b.timestamp_ms < opened_at_ms
-            && entry_price > 0.0
-            && b.low < entry_price * 0.92
-        {
-            let base = if b.close > 0.0 {
-                b.close.min(entry_price)
+        if opened_at_ms > 0 && b.timestamp_ms < opened_at_ms && entry_price > 0.0 {
+            let should_sanitize = if is_long {
+                // LONG: low side is the Tier-1 stop side. Any wick <= trigger_low survives
+                // so Tier 1 fires; shallower excursions below in_band_low_threshold are sanitized.
+                b.low > trigger_low && b.low < in_band_low_threshold
             } else {
-                entry_price
+                // SHORT: low side is the favorable watermark side (cannot trigger Tier 1).
+                // Sanitize pre-open crashes below in_band_low_threshold so watermark_low is not contaminated.
+                b.low < in_band_low_threshold
             };
-            stored_low
-                .filter(|&l| l >= entry_price * 0.92)
-                .map(|l| base.min(l))
-                .unwrap_or(base)
+            if should_sanitize {
+                let base = if b.close > 0.0 {
+                    b.close.min(entry_price)
+                } else {
+                    entry_price
+                };
+                stored_low
+                    .filter(|&l| l >= in_band_low_threshold)
+                    .map(|l| base.min(l))
+                    .unwrap_or(base)
+            } else {
+                b.low
+            }
         } else {
             b.low
         }
@@ -350,10 +396,15 @@ impl PondOrchestrator {
                     cancel_confirmed_at_boundary = true;
                 }
             }
+            let mut promoted_via_clearinghouse = false;
             if status.state == "GONE" || status.state == "CANCELLED_OR_GONE" {
                 if let Some((uncovered_qty, ex_entry_px)) = self
                     .execution
-                    .check_unattributed_onchain_position_for_symbol(&cell.symbol, &cell.side)
+                    .check_unattributed_onchain_position_for_symbol(
+                        &cell.symbol,
+                        &cell.side,
+                        cell.entry_price.unwrap_or(0.0),
+                    )
                 {
                     let cell_qty = cell.quantity.unwrap_or(0.0).abs();
                     status.state = "FILLED".to_string();
@@ -365,6 +416,7 @@ impl PondOrchestrator {
                     if ex_entry_px > 0.0 {
                         status.entry_price = ex_entry_px;
                     }
+                    promoted_via_clearinghouse = true;
                 }
             }
             match status.state.as_str() {
@@ -372,64 +424,66 @@ impl PondOrchestrator {
                     let fill_px = if status.entry_price > 0.0 {
                         status.entry_price
                     } else {
-                        cell.entry_price.unwrap_or(100.0)
+                        cell.entry_price.unwrap_or(0.0)
                     };
+                    if fill_px <= 0.0 {
+                        tracing::warn!(
+                            symbol = %cell.symbol,
+                            cell_id = cell.cell_id,
+                            "Rejecting ARMED Pond cell promotion because fill_px <= 0.0 (R13-N4)"
+                        );
+                        continue;
+                    }
                     let entry_fee = if status.fee_usdc > 0.0 {
                         status.fee_usdc
                     } else {
                         round_dp(status.filled_units * fill_px * (maker_fee_bps / 10_000.0), 4)
                     };
-                    let prev_qty = cell.quantity.unwrap_or(0.0);
-                    cell.entry_price = Some(fill_px);
-                    cell.highest_price_seen = Some(fill_px);
-                    cell.lowest_price_seen = Some(fill_px);
-                    cell.quantity = Some(status.filled_units);
-                    cell.notional_usdc = Some(round_dp(status.filled_units * fill_px, 2));
-                    if let Some(init_stop) = cell
-                        .initial_stop
-                        .filter(|&s| s > 0.0 && (fill_px - s).abs() > 1e-12)
-                    {
-                        cell.risk_budget_usdc =
-                            Some(round_dp((fill_px - init_stop).abs() * status.filled_units, 4));
-                    } else if prev_qty > 0.0 {
-                        if let Some(rb) = cell.risk_budget_usdc {
-                            cell.risk_budget_usdc =
-                                Some(round_dp(rb * (status.filled_units / prev_qty), 4));
+                    match self.scoped_db.promote_armed_pond_cell_to_open(
+                        cell.cell_id,
+                        status.filled_units,
+                        fill_px,
+                        entry_fee,
+                    ) {
+                        Ok(true) => {
+                            if promoted_via_clearinghouse {
+                                self.execution.register_pending_fix4_pond_trueup(
+                                    cell.cell_id,
+                                    resting_oid.as_deref(),
+                                    entry_fee,
+                                );
+                            }
+                            promoted += 1;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            let msg = format!(
+                                "Critical: promote_armed_pond_cell_to_open failed after promoting FILLED resting Pond order for {} ({} oid={:?} units={:.6}): {e}",
+                                cell.symbol, cell.cell_id, resting_oid, status.filled_units
+                            );
+                            tracing::error!("{msg}");
+                            let details = json!({
+                                "cell_id": cell.cell_id,
+                                "symbol": cell.symbol,
+                                "state": cell.state.as_str(),
+                                "resting_order_id": resting_oid,
+                                "filled_units": status.filled_units,
+                                "error": e.to_string(),
+                            });
+                            let _ = self.scoped_db.log_telemetry(
+                                "CRITICAL",
+                                "engine.pond",
+                                &msg,
+                                Some(details.clone()),
+                            );
+                            let _ = self.execution.alerts.notify_critical_event(
+                                "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
+                                &msg,
+                                Some(details),
+                            );
+                            return Err(e);
                         }
                     }
-                    cell.fees_paid_usdc = round_dp(cell.fees_paid_usdc + entry_fee, 4);
-                    cell.opened_at = Some(now_str.clone());
-                    cell.exit_reason = None;
-                    cell.resting_order_id = None;
-                    transition_cell_state(&mut cell, PondCellState::Open)?;
-                    if let Err(e) = self.scoped_db.upsert_pond_cell(&cell) {
-                        let msg = format!(
-                            "Critical: upsert_pond_cell failed after promoting FILLED resting Pond order for {} ({} oid={:?} units={:.6}): {e}",
-                            cell.symbol, cell.cell_id, resting_oid, status.filled_units
-                        );
-                        tracing::error!("{msg}");
-                        let details = json!({
-                            "cell_id": cell.cell_id,
-                            "symbol": cell.symbol,
-                            "state": cell.state.as_str(),
-                            "resting_order_id": resting_oid,
-                            "filled_units": status.filled_units,
-                            "error": e.to_string(),
-                        });
-                        let _ = self.scoped_db.log_telemetry(
-                            "CRITICAL",
-                            "engine.pond",
-                            &msg,
-                            Some(details.clone()),
-                        );
-                        let _ = self.execution.alerts.notify_critical_event(
-                            "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
-                            &msg,
-                            Some(details),
-                        );
-                        return Err(e);
-                    }
-                    promoted += 1;
                 }
                 "GONE" | "CANCELLED_OR_GONE" => {
                     let reason = if is_1h_boundary && cancel_confirmed_at_boundary {
@@ -568,7 +622,7 @@ impl PondOrchestrator {
                 }
             };
             let last_1h = bars_1h.last();
-            let entry_px = cell.entry_price.unwrap_or(100.0);
+            let entry_px = cell.entry_price.unwrap_or(0.0);
             let mark_px = last_1h
                 .map(|b| b.close)
                 .filter(|&p| p > 0.0)
@@ -578,6 +632,21 @@ impl PondOrchestrator {
                 .as_deref()
                 .and_then(parse_utc_timestamp)
                 .map(|dt| dt.and_utc().timestamp_millis());
+            let prev_init = cell.initial_stop.unwrap_or(0.0);
+            let prev_chand = cell.chandelier_stop.unwrap_or(0.0);
+            let prev_stop = if cell.state == "TRAILED" && prev_chand > 0.0 {
+                if cell.side == "LONG" {
+                    prev_init.max(prev_chand)
+                } else if prev_init > 0.0 {
+                    prev_init.min(prev_chand)
+                } else {
+                    prev_chand
+                }
+            } else if prev_init > 0.0 {
+                prev_init
+            } else {
+                prev_chand
+            };
             let wick_ctx = compute_wick_context(
                 &bars_1h,
                 &cell.side,
@@ -586,6 +655,8 @@ impl PondOrchestrator {
                 cell.lowest_price_seen,
                 entry_px,
                 cfg.pond_atr_period.max(1),
+                (prev_stop > 0.0).then_some(prev_stop),
+                wick_mult,
             );
             let watermark_high = wick_ctx.watermark_high;
             let watermark_low = wick_ctx.watermark_low;
@@ -635,21 +706,6 @@ impl PondOrchestrator {
                     cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
                 }
             }
-            let prev_init = cell.initial_stop.unwrap_or(0.0);
-            let prev_chand = cell.chandelier_stop.unwrap_or(0.0);
-            let prev_stop = if cell.state == "TRAILED" && prev_chand > 0.0 {
-                if cell.side == "LONG" {
-                    prev_init.max(prev_chand)
-                } else if prev_init > 0.0 {
-                    prev_init.min(prev_chand)
-                } else {
-                    prev_chand
-                }
-            } else if prev_init > 0.0 {
-                prev_init
-            } else {
-                prev_chand
-            };
             let prev_chandelier_stop = cell.chandelier_stop;
             let _price_pnl = update_cell_mark_and_chandelier(
                 &mut cell,
@@ -1091,6 +1147,7 @@ impl PondOrchestrator {
             atr_period: cfg.pond_atr_period,
             gate6_atr_4h_floor_mult: cfg.pond_gate6_atr_4h_floor_mult,
             min_stop_pct_floor: cfg.pond_min_stop_pct_floor,
+            max_stop_distance_pct: cfg.pond_max_stop_distance_pct,
             conviction_z_span: cfg.pond_conviction_z_span,
             conviction_scale_min: cfg.pond_conviction_scale_min,
             conviction_scale_max: cfg.pond_conviction_scale_max,
@@ -2707,6 +2764,53 @@ mod tests {
                 expected_post_low: 92.043,
                 expected_extreme_idx: 5,
             },
+            // Scenario 6d (R13-S1 Pin Case 1): same-hour adverse wick BEYOND the Tier-1 trigger (100.4 >= trigger_high)
+            // survives sanitization even though 100.4 > 92.043 * 1.08 (99.41), so Tier-1 catastrophic wick stop fires!
+            Case {
+                name: "same_hour_wick_beyond_tier1_trigger_survives_sanitization",
+                bars: vec![
+                    mk_bar(0, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(1, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(2, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(3, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(4, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(5, 92.0, 100.4, 91.8, 92.331), // adverse high wick 100.4 > trigger_high (98.8) and > 8% (99.41)
+                ],
+                side: "SHORT",
+                opened_at_ms: base_ts + 5 * 3_600_000 + 2_347_000,
+                stored_high: Some(92.043),
+                stored_low: Some(92.043),
+                entry_price: 92.043,
+                expected_watermark_high: 100.4,
+                expected_watermark_low: 91.8,
+                expected_post_high: 100.4,
+                expected_post_low: 91.8,
+                expected_extreme_idx: 5,
+            },
+            // Scenario 6e (R13-S1 Pin Case 2): same-hour excursion INSIDE the band (shallower than the Tier-1 trigger
+            // on the adverse side: 96.5 < trigger_high, and contaminating pre-open dip 86.5 inside the old 8% band on the low side)
+            // is sanitized on both sides so neither contaminates watermarks nor prematurely stops out!
+            Case {
+                name: "same_hour_wick_inside_band_sanitized",
+                bars: vec![
+                    mk_bar(0, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(1, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(2, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(3, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(4, 92.0, 93.0, 91.0, 92.0),
+                    mk_bar(5, 92.0, 96.5, 86.5, 92.331), // 96.5 is inside band (< trigger_high); 86.5 is inside old 8% band (> 84.68)
+                ],
+                side: "SHORT",
+                opened_at_ms: base_ts + 5 * 3_600_000 + 2_347_000,
+                stored_high: Some(92.043),
+                stored_low: Some(92.043),
+                entry_price: 92.043,
+                expected_watermark_high: 92.331,
+                expected_watermark_low: 92.043,
+                expected_post_high: 92.331,
+                expected_post_low: 92.043,
+                expected_extreme_idx: 5,
+            },
         ];
 
         for c in &cases {
@@ -2718,6 +2822,8 @@ mod tests {
                 c.stored_low,
                 c.entry_price,
                 14,
+                None,
+                0.85,
             );
             assert!(
                 (ctx.watermark_high - c.expected_watermark_high).abs() < 1e-6,
@@ -2779,6 +2885,8 @@ mod tests {
             Some(99.0),
             100.0,
             14,
+            None,
+            0.85,
         );
         assert_eq!(ctx_idx1.extreme_bar_idx, 1);
         assert!(
@@ -2887,6 +2995,152 @@ mod tests {
         assert_eq!(
             closed_b.exit_reason.as_deref(),
             Some("TIER1_CATASTROPHIC_WICK_STOP")
+        );
+
+        // R13-S1 End-to-End Pin 1: Same-hour adverse wick beyond Tier-1 trigger (100.4 >= 98.8) fires Tier 1 in evaluate_open_cells
+        let mut bars_same_hour_beyond: Vec<OhlcvBar> = (0..179)
+            .map(|i| OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_180_ts + (i as i64) * 3_600_000,
+                open: 92.0,
+                high: 93.0,
+                low: 91.0,
+                close: 92.0,
+                volume: 50_000.0,
+                funding_rate_hourly: 0.0005,
+                is_synthetic: 0,
+            })
+            .collect();
+        // Bar 179 (13:00Z, timestamp = 1_794_315_600_000): cell opens mid-hour at 13:39:07Z (92.043),
+        // initial_stop = 97.098, atr_1h = 2.0, wick_buf = 1.70 -> trigger_high = 98.798.
+        // Same-hour wick to 100.4 (> 8% and >= 98.798) must survive and trigger TIER1_CATASTROPHIC_WICK_STOP.
+        bars_same_hour_beyond.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_315_600_000,
+            open: 92.0,
+            high: 100.4,
+            low: 91.8,
+            close: 92.331,
+            volume: 60_000.0,
+            funding_rate_hourly: 0.0005,
+            is_synthetic: 0,
+        });
+        let f_pos: Vec<f64> = bars_same_hour_beyond
+            .iter()
+            .map(|b| b.funding_rate_hourly)
+            .collect();
+        let mut cache_beyond = HashMap::new();
+        cache_beyond.insert(
+            "SOL/USDC:USDC".to_string(),
+            (f_pos.clone(), bars_same_hour_beyond, Vec::new()),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache_beyond);
+        let cell_same_hour_beyond = PondCell {
+            cell_id: 0,
+            symbol: "SOL/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(92.043),
+            quantity: Some(1.0),
+            notional_usdc: Some(92.04),
+            risk_budget_usdc: Some(5.05),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(3.0),
+            funding_rate_entry: Some(0.0005),
+            initial_stop: Some(97.098),
+            chandelier_stop: Some(97.098),
+            highest_price_seen: Some(92.043),
+            lowest_price_seen: Some(92.043),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.04,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-10T13:39:07Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-10T13:39:07Z".to_string(),
+        };
+        let cid_beyond = orch
+            .scoped_db
+            .upsert_pond_cell(&cell_same_hour_beyond)
+            .unwrap();
+        let exits_beyond = orch.evaluate_open_cells(false, false).unwrap();
+        assert_eq!(
+            exits_beyond, 1,
+            "R13-S1: Same-hour wick beyond Tier-1 trigger (100.4 >= 98.8) must fire Tier 1"
+        );
+        let closed_beyond = orch
+            .scoped_db
+            .get_pond_cells(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cid_beyond)
+            .unwrap();
+        assert_eq!(
+            closed_beyond.exit_reason.as_deref(),
+            Some("TIER1_CATASTROPHIC_WICK_STOP")
+        );
+
+        // R13-S1 End-to-End Pin 2: Same-hour wick inside the band (97.5 < 98.8 and low 86.5) sanitizes and does NOT fire Tier 1
+        let mut bars_same_hour_in_band: Vec<OhlcvBar> = (0..179)
+            .map(|i| OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_180_ts + (i as i64) * 3_600_000,
+                open: 92.0,
+                high: 93.0,
+                low: 91.0,
+                close: 92.0,
+                volume: 50_000.0,
+                funding_rate_hourly: 0.0005,
+                is_synthetic: 0,
+            })
+            .collect();
+        bars_same_hour_in_band.push(OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_315_600_000,
+            open: 92.0,
+            high: 97.5,
+            low: 86.5,
+            close: 92.331,
+            volume: 60_000.0,
+            funding_rate_hourly: 0.0005,
+            is_synthetic: 0,
+        });
+        let mut cache_in_band = HashMap::new();
+        cache_in_band.insert(
+            "SOL/USDC:USDC".to_string(),
+            (f_pos, bars_same_hour_in_band, Vec::new()),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache_in_band);
+        let cid_in_band = orch
+            .scoped_db
+            .upsert_pond_cell(&cell_same_hour_beyond)
+            .unwrap();
+        let exits_in_band = orch.evaluate_open_cells(false, false).unwrap();
+        assert_eq!(
+            exits_in_band, 0,
+            "R13-S1: Same-hour wick inside the band (97.5 < 98.8) must sanitize and NOT fire Tier 1"
+        );
+        let open_in_band = orch
+            .scoped_db
+            .get_pond_cells(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cid_in_band)
+            .unwrap();
+        assert_eq!(open_in_band.state, "OPEN");
+        assert!(
+            (open_in_band.lowest_price_seen.unwrap() - 92.043).abs() < 1e-6,
+            "R13-S1: In-band pre-open low (86.5) must be sanitized to 92.043"
         );
     }
 
@@ -3002,6 +3256,91 @@ mod tests {
         assert_eq!(
             d_tier2.exit_reason.as_deref(),
             Some("TIER2_4H_CHANDELIER_TRAIL")
+        );
+    }
+
+    #[test]
+    fn test_r13_n3_pond_max_stop_distance_pct_config_wires_into_scanner() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let default_cfg = BookScopedDb::new(db.clone(), BookType::Pond)
+            .load_pond_config()
+            .unwrap();
+        assert!(
+            (default_cfg.pond_max_stop_distance_pct - 0.06).abs() < 1e-9,
+            "Default pond_max_stop_distance_pct must be 0.06 (6%)"
+        );
+
+        db.set_config_value("pond_max_stop_distance_pct", &json!(0.10))
+            .unwrap();
+        let widened_cfg = BookScopedDb::new(db, BookType::Pond)
+            .load_pond_config()
+            .unwrap();
+        assert!(
+            (widened_cfg.pond_max_stop_distance_pct - 0.10).abs() < 1e-9,
+            "Operator update to pond_max_stop_distance_pct must be reflected in PondConfig"
+        );
+
+        // Build a high-volatility asset where 2.5 * atr_1h exceeds 6% of reference price (e.g. ~8.5%)
+        let mut f_pos = vec![0.0001; 179];
+        f_pos.push(0.0009);
+        let mut bars_1h = make_test_bars("HIGHVOL/USDC:USDC", "1h", 180, 100.0);
+        for b in &mut bars_1h {
+            b.open = 100.0;
+            b.high = 101.8;
+            b.low = 98.2;
+            b.close = 100.0;
+        }
+        let bars_4h = make_test_bars("HIGHVOL/USDC:USDC", "4h", 50, 100.0);
+        let input = PondAssetScanInput {
+            universe_row: PondUniverseRow {
+                symbol: "HIGHVOL/USDC:USDC".to_string(),
+                rank: 1,
+                median_daily_volume_usdc: 500_000.0,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                min_notional_usdc: 10.0,
+                max_leverage: 10.0,
+                reference_price: 100.0,
+                status: "ACTIVE".to_string(),
+                warmup_until: None,
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 0,
+            },
+            funding_series_168h: f_pos,
+            bars_1h,
+            bars_4h,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+        };
+
+        // Under 6% cap: SHORT initial_stop is capped at 100.0 * 1.06 = 106.0
+        let params_6pct = PondScannerParams {
+            max_stop_distance_pct: default_cfg.pond_max_stop_distance_pct,
+            ..Default::default()
+        };
+        let out_6pct = run_nps01_scan(std::slice::from_ref(&input), &params_6pct, &HashSet::new());
+        assert_eq!(out_6pct.selected_entries.len(), 1);
+        assert!(
+            (out_6pct.selected_entries[0].initial_stop_price - 106.0).abs() < 1e-6,
+            "Under 6% cap, SHORT initial_stop must be capped at 106.0 (got {})",
+            out_6pct.selected_entries[0].initial_stop_price
+        );
+
+        // Under 10% cap: 2.5 * 3.6 = 9.0 (9% < 10%), so SHORT initial_stop widens to 109.0
+        let params_10pct = PondScannerParams {
+            max_stop_distance_pct: widened_cfg.pond_max_stop_distance_pct,
+            ..Default::default()
+        };
+        let out_10pct = run_nps01_scan(&[input], &params_10pct, &HashSet::new());
+        assert_eq!(out_10pct.selected_entries.len(), 1);
+        assert!(
+            (out_10pct.selected_entries[0].initial_stop_price - 109.0).abs() < 1e-6,
+            "Under 10% cap, SHORT initial_stop must widen to uncapped 2.5*ATR = 109.0 (got {})",
+            out_10pct.selected_entries[0].initial_stop_price
         );
     }
 }

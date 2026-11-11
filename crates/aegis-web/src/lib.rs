@@ -2066,7 +2066,7 @@ mod tests {
         assert_eq!(json_paper_stale["status"], "ok");
         assert_eq!(json_paper_stale["data_fresh"], true);
 
-        // 3. Switch to TESTNET mode -> 7h-old bar exceeds max_bar_staleness_ms (6h) -> 503 Service Unavailable, status: "DEGRADED"
+        // 3. Switch to TESTNET mode -> 10h-old bar exceeds max_bar_staleness_ms (8h) -> 503 Service Unavailable, status: "DEGRADED"
         db.configure_hyperliquid_credentials(
             Some("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
             Some("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),

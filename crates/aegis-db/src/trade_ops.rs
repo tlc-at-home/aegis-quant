@@ -494,6 +494,13 @@ impl DatabaseManager {
         fees_paid_usdc: f64,
         slippage_paid_usd: f64,
     ) -> Result<bool> {
+        if filled_units <= 0.0
+            || avg_fill_price <= 0.0
+            || !filled_units.is_finite()
+            || !avg_fill_price.is_finite()
+        {
+            return Ok(false);
+        }
         let notional = round_dp(filled_units * avg_fill_price, 2);
         let ts = self.now_ms();
         self.with_conn(|conn| {
@@ -547,6 +554,66 @@ impl DatabaseManager {
                     );
                 }
             }
+            Ok(rows > 0)
+        })
+    }
+
+    /// True up an `OPEN` PIT trade that was race-promoted via `clearinghouseState`
+    /// once the exact maker fill appears in `userFills` (`R13-N1`, `R13-N4(b)`).
+    pub fn true_up_promoted_trade_from_user_fills(
+        &self,
+        trade_id: i64,
+        filled_units: f64,
+        avg_fill_price: f64,
+        fees_paid_usdc: f64,
+        slippage_paid_usd: f64,
+    ) -> Result<bool> {
+        if filled_units <= 0.0
+            || avg_fill_price <= 0.0
+            || !filled_units.is_finite()
+            || !avg_fill_price.is_finite()
+        {
+            return Ok(false);
+        }
+        let qty = round_dp(filled_units.abs(), 8);
+        let px = round_dp(avg_fill_price, 8);
+        let notional = round_dp(qty * px, 2);
+        let fee = round_dp(fees_paid_usdc.max(0.0), 4);
+        let slip = round_dp(slippage_paid_usd, 4);
+        self.with_conn(|conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE trades
+                     SET quantity = ?1,
+                         filled_units = ?1,
+                         highest_price_seen = CASE
+                             WHEN ABS(COALESCE(highest_price_seen, entry_price) - COALESCE(entry_price, ?2)) < 1e-9 THEN ?2
+                             ELSE MAX(highest_price_seen, ?2)
+                         END,
+                         lowest_price_seen = CASE
+                             WHEN ABS(COALESCE(lowest_price_seen, entry_price) - COALESCE(entry_price, ?2)) < 1e-9 THEN ?2
+                             WHEN lowest_price_seen > 0.0 THEN MIN(lowest_price_seen, ?2)
+                             ELSE ?2
+                         END,
+                         entry_price = ?2,
+                         avg_fill_price = ?2,
+                         notional_usdc = ?3,
+                         risk_budget_usdc = CASE
+                             WHEN initial_stop_price > 0.0 AND ABS(?2 - initial_stop_price) > 1e-12 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
+                             ELSE risk_budget_usdc
+                         END,
+                         unrealized_pnl_usdc = CASE
+                             WHEN current_price > 0.0 AND ?2 > 0.0 THEN
+                                 ROUND((CASE WHEN UPPER(side) = 'LONG' THEN (current_price - ?2) ELSE (?2 - current_price) END) * ?1, 4)
+                             ELSE unrealized_pnl_usdc
+                         END,
+                         fees_paid_usdc = ?4,
+                         slippage_paid_usd = ?5
+                     WHERE trade_id = ?6 AND status = 'OPEN';",
+                    params![qty, px, notional, fee, slip, trade_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(rows > 0)
         })
     }

@@ -11,6 +11,94 @@ use serde_json::{json, Value};
 use crate::ExecutionEngine;
 
 impl ExecutionEngine {
+    /// Bounds an opening partial bar's range at the PIT Tier-1 wick-stop trigger depth (`R13-S1`).
+    ///
+    /// Adverse wicks deep enough to trigger Tier-1 (`low <= wick_trigger_price` for `LONG`,
+    /// `high >= wick_trigger_price` for `SHORT`) survive so the emergency stop fires during the
+    /// opening window, while in-band and favorable excursions are clamped to `bar_close` so
+    /// pre-open excursions cannot contaminate watermarks or cause premature trailing stops.
+    pub(crate) fn clamp_pit_opening_partial_bar_range(
+        &self,
+        trade: &TradeRecord,
+        partial_high: f64,
+        partial_low: f64,
+        bar_close: f64,
+        atr: f64,
+        cfg: &aegis_db::ConfigMap,
+    ) -> (f64, f64) {
+        let mult_long = cfg.get_f64(
+            "chandelier_atr_multiplier_long",
+            cfg.get_f64("chandelier_atr_multiplier", 2.2),
+        );
+        let mult_short = cfg.get_f64(
+            "chandelier_atr_multiplier_short",
+            cfg.get_f64("chandelier_atr_multiplier", 2.2),
+        );
+        let min_atr_pct = cfg.get_f64(
+            "min_stop_distance_pct_of_price",
+            cfg.get_f64("risk_min_stop_pct_floor", 0.004),
+        );
+        let eff_atr = atr.max(bar_close * min_atr_pct).max(1e-8);
+        let wick_buffer_atr = cfg.get_f64(
+            "chandelier_wick_buffer_atr",
+            cfg.get_f64("chandelier_wick_overshoot_atr", 0.35),
+        );
+        let trail_max_pct = cfg
+            .get_f64("chandelier_trail_max_pct", 0.008)
+            .clamp(0.002, 0.50);
+        let tight_trail_enabled = trail_max_pct <= 0.05;
+
+        if trade.side.eq_ignore_ascii_case("LONG") {
+            let init_stop = trade.entry_price - mult_long * eff_atr;
+            let active_stop = if trade.chandelier_stop_price > 0.0 {
+                trade.chandelier_stop_price
+            } else {
+                init_stop
+            };
+            let prior_high = trade.highest_price_seen.max(trade.entry_price);
+            let wick_base_stop = if tight_trail_enabled {
+                init_stop
+                    .max((prior_high - mult_long * eff_atr).min(bar_close - mult_long * eff_atr))
+                    .min(active_stop)
+            } else {
+                active_stop
+            };
+            let wick_trigger_low = wick_base_stop - wick_buffer_atr * eff_atr;
+            let clamped_low = if partial_low > 0.0 && partial_low <= wick_trigger_low {
+                partial_low
+            } else {
+                bar_close
+            };
+            (bar_close, clamped_low)
+        } else {
+            let init_stop = trade.entry_price + mult_short * eff_atr;
+            let active_stop = if trade.chandelier_stop_price > 0.0 {
+                trade.chandelier_stop_price
+            } else {
+                init_stop
+            };
+            let prior_low = if trade.lowest_price_seen > 0.0 {
+                trade.lowest_price_seen.min(trade.entry_price)
+            } else {
+                trade.entry_price
+            };
+            let wick_base_stop = if tight_trail_enabled {
+                init_stop
+                    .min((prior_low + mult_short * eff_atr).max(bar_close + mult_short * eff_atr))
+                    .max(active_stop)
+            } else {
+                active_stop
+            };
+            let wick_trigger_high = wick_base_stop + wick_buffer_atr * eff_atr;
+            let clamped_high = if partial_high >= wick_trigger_high {
+                partial_high
+            } else {
+                bar_close
+            };
+            (clamped_high, bar_close)
+        }
+    }
+
     /// Runs a complete execution & portfolio management cycle (`engine/execution.py::reconcile_cycle`).
     pub fn reconcile_cycle(
         &self,
@@ -136,30 +224,46 @@ impl ExecutionEngine {
                 .map(|dt| dt.and_utc().timestamp_millis())
                 .unwrap_or(0);
             let (eval_bar_high, eval_bar_low) = if !is_backtest && opened_at_ms > last_bar.timestamp_ms {
-                let post_open_1h: Vec<_> = if !asset.exec_timeframe.eq_ignore_ascii_case("1h") {
+                let recent_1h = if !asset.exec_timeframe.eq_ignore_ascii_case("1h") {
                     self.db
                         .get_ohlcv_bars(&trade.symbol, "1h", 6, Some(now_ms))
                         .unwrap_or_default()
                         .into_iter()
-                        .filter(|b| {
-                            b.timestamp_ms >= opened_at_ms
-                                && (b.is_synthetic == 0 || (mode != "LIVE" && mode != "TESTNET"))
-                        })
-                        .collect()
+                        .filter(|b| b.is_synthetic == 0 || (mode != "LIVE" && mode != "TESTNET"))
+                        .collect::<Vec<_>>()
                 } else {
                     Vec::new()
                 };
+                let post_open_1h: Vec<_> = recent_1h
+                    .iter()
+                    .filter(|b| b.timestamp_ms >= opened_at_ms)
+                    .collect();
+                let opening_partial_bar = recent_1h
+                    .iter()
+                    .rfind(|b| {
+                        b.timestamp_ms < opened_at_ms && b.timestamp_ms + 3_600_000 > opened_at_ms
+                    })
+                    .unwrap_or(last_bar);
+                let (clamped_partial_high, clamped_partial_low) = self
+                    .clamp_pit_opening_partial_bar_range(
+                        &trade,
+                        opening_partial_bar.high,
+                        opening_partial_bar.low,
+                        last_bar.close,
+                        atr,
+                        &cfg,
+                    );
                 if post_open_1h.is_empty() {
-                    (last_bar.close, last_bar.close)
+                    (clamped_partial_high, clamped_partial_low)
                 } else {
                     let h = post_open_1h
                         .iter()
                         .map(|b| b.high)
-                        .fold(last_bar.close, f64::max);
+                        .fold(clamped_partial_high, f64::max);
                     let l = post_open_1h
                         .iter()
                         .map(|b| b.low)
-                        .fold(last_bar.close, f64::min);
+                        .fold(clamped_partial_low, f64::min);
                     (h, l)
                 }
             } else {

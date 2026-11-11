@@ -319,6 +319,7 @@ pub struct FundingSyncReport {
 }
 
 pub type AssetIndexCache = Arc<Mutex<HashMap<(bool, String), (u32, i64)>>>;
+pub type PendingFix4TrueupMap = Arc<Mutex<HashMap<(bool, i64), (String, f64)>>>;
 
 /// Infers a price-scaled fallback tick size for symbols not present in `universe_assets` or `pond_universe` (`R7-N5`).
 pub fn infer_synthetic_tick_size(ref_price: f64) -> f64 {
@@ -407,6 +408,9 @@ pub struct ExecutionEngine {
     pub asset_index_cache: AssetIndexCache,
     /// In-memory cache of `symbol -> (UniverseAsset, cached_at_ms)` for Pit, Pond, and reconciled orphan symbols (`R7-N3`, `R8-N2`).
     pub resolved_asset_cache: Arc<Mutex<HashMap<String, (UniverseAsset, i64)>>>,
+    /// Pending `userFills` true-up queue `(is_pond_cell, row_id) -> (order_id, estimated_fee_usdc)`
+    /// for rows race-promoted via `clearinghouseState` during indexer lag (`R13-N1`, `R13-N4(b)`).
+    pub(crate) pending_fix4_fill_trueups: PendingFix4TrueupMap,
 }
 
 impl ExecutionEngine {
@@ -431,6 +435,7 @@ impl ExecutionEngine {
             hlp_vault_error_streak: Arc::new(Mutex::new(0)),
             asset_index_cache: Arc::new(Mutex::new(HashMap::new())),
             resolved_asset_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_fix4_fill_trueups: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

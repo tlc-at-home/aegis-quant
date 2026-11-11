@@ -115,6 +115,7 @@ pub struct PondConfig {
     pub pond_gate6_atr_4h_floor_mult: f64,
     pub pond_gate6_structural_atr_mult: f64,
     pub pond_min_stop_pct_floor: f64,
+    pub pond_max_stop_distance_pct: f64,
     pub pond_conviction_z_span: f64,
     pub pond_maker_offset_bps: f64,
     pub pond_wick_buffer_atr_mult: f64,
@@ -187,6 +188,7 @@ impl PondConfig {
             pond_gate6_atr_4h_floor_mult: cfg.get_f64("pond_gate6_atr_4h_floor_mult", 1.8),
             pond_gate6_structural_atr_mult: cfg.get_f64("pond_gate6_structural_atr_mult", 2.5),
             pond_min_stop_pct_floor: cfg.get_f64("pond_min_stop_pct_floor", 0.005),
+            pond_max_stop_distance_pct: cfg.get_f64("pond_max_stop_distance_pct", 0.06),
             pond_conviction_z_span: cfg.get_f64("pond_conviction_z_span", 2.0),
             pond_maker_offset_bps: cfg.get_f64("pond_maker_offset_bps", 1.5),
             pond_wick_buffer_atr_mult: cfg.get_f64("pond_wick_buffer_atr_mult", 0.85),
@@ -448,6 +450,18 @@ impl BookScopedDb {
     pub fn upsert_pond_cell(&self, cell: &PondCell) -> Result<i64> {
         self.check_table_access("pond_cells")?;
         self.pool.upsert_pond_cell(cell)
+    }
+
+    pub fn promote_armed_pond_cell_to_open(
+        &self,
+        cell_id: i64,
+        fill_qty: f64,
+        fill_price: f64,
+        fee_usdc: f64,
+    ) -> Result<bool> {
+        self.check_table_access("pond_cells")?;
+        self.pool
+            .promote_armed_pond_cell_to_open(cell_id, fill_qty, fill_price, fee_usdc)
     }
 
     pub fn accrue_pond_cell_funding_for_hour(

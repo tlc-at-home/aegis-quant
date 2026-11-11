@@ -188,9 +188,227 @@ impl ExecutionEngine {
         }
     }
 
+    /// Resolves the bounded fill price when promoting a `"GONE"` resting PIT order or `ARMED` Pond cell
+    /// via `clearinghouseState` during `userFills` indexer lag (`R13-N1`, `R13-N4(a)`).
+    ///
+    /// - When the coin already holds an open position from either book (`already_covered_qty > 1e-6`),
+    ///   `clearinghouseState`'s `entryPx` is an account-level blended average (e.g. 1 BTC at 90k +
+    ///   1 BTC resting fill at 95k -> `entryPx` 92.5k), so we strictly prefer `resting_limit_px`.
+    /// - On an unblended single position (`already_covered_qty <= 1e-6`), we accept `ex_entry_px`
+    ///   only when it is within 50 bps (`0.5%`) of `resting_limit_px` (or when `resting_limit_px <= 0.0`).
+    /// - Never falls back to a magic `100.0` price; returns `0.0` when no valid price exists so the
+    ///   caller rejects promotion (`R13-N4(a)`).
+    pub fn resolve_fix4_clearinghouse_fill_price(
+        _side: &str,
+        resting_limit_px: f64,
+        ex_entry_px: f64,
+        already_covered_qty: f64,
+    ) -> f64 {
+        let valid_limit = resting_limit_px > 0.0 && resting_limit_px.is_finite();
+        let valid_ex = ex_entry_px > 0.0 && ex_entry_px.is_finite();
+        if valid_limit {
+            if already_covered_qty > 1e-6 {
+                return resting_limit_px;
+            }
+            if valid_ex {
+                let rel_diff = (ex_entry_px - resting_limit_px).abs() / resting_limit_px;
+                if rel_diff <= 0.005 {
+                    return ex_entry_px;
+                }
+            }
+            resting_limit_px
+        } else if valid_ex && already_covered_qty <= 1e-6 {
+            ex_entry_px
+        } else {
+            0.0
+        }
+    }
+
+    pub fn register_pending_fix4_pit_trueup(
+        &self,
+        trade_id: i64,
+        oid: Option<&str>,
+        estimated_fee_usdc: f64,
+    ) {
+        if let Some(oid_str) = oid.map(str::trim).filter(|s| !s.is_empty()) {
+            self.pending_fix4_fill_trueups.lock().insert(
+                (false, trade_id),
+                (oid_str.to_string(), estimated_fee_usdc.max(0.0)),
+            );
+        }
+    }
+
+    pub fn register_pending_fix4_pond_trueup(
+        &self,
+        cell_id: i64,
+        oid: Option<&str>,
+        estimated_fee_usdc: f64,
+    ) {
+        if let Some(oid_str) = oid.map(str::trim).filter(|s| !s.is_empty()) {
+            self.pending_fix4_fill_trueups.lock().insert(
+                (true, cell_id),
+                (oid_str.to_string(), estimated_fee_usdc.max(0.0)),
+            );
+        }
+    }
+
+    /// Trues up `entry_price`, `notional_usdc`, `risk_budget_usdc`, and `fees_paid_usdc` on any
+    /// PIT trade or Pond cell that was race-promoted via `clearinghouseState` once its actual
+    /// maker fill is indexed in `userFills` (`R13-N1`, `R13-N4(b)`).
+    pub fn true_up_pending_fix4_promotions(&self, simulated_fills: Option<&[Value]>) -> usize {
+        let pending_entries: Vec<((bool, i64), (String, f64))> = self
+            .pending_fix4_fill_trueups
+            .lock()
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        if pending_entries.is_empty() {
+            return 0;
+        }
+        let mut trued_up = 0usize;
+        for ((is_pond, row_id), (oid_str, est_fee)) in pending_entries {
+            let status_opt = if let Some(fills) = simulated_fills {
+                let oid_num = oid_str
+                    .strip_prefix("hl-")
+                    .unwrap_or(&oid_str)
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&id| id > 0);
+                oid_num.and_then(|target_oid| {
+                    let mut filled_units = 0.0;
+                    let mut notional_sum = 0.0;
+                    let mut fee_sum = 0.0;
+                    for f in fills {
+                        let f_oid = f.get("oid").and_then(Value::as_u64).or_else(|| {
+                            f.get("oid")
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse::<u64>().ok())
+                        });
+                        if f_oid == Some(target_oid) {
+                            let sz = f
+                                .get("sz")
+                                .and_then(|v| {
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .unwrap_or(0.0)
+                                .abs();
+                            let px = f
+                                .get("px")
+                                .and_then(|v| {
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .unwrap_or(0.0);
+                            let fee = f
+                                .get("fee")
+                                .and_then(|v| {
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .unwrap_or(0.0);
+                            if sz > 0.0 && px > 0.0 {
+                                filled_units += sz;
+                                notional_sum += sz * px;
+                                fee_sum += fee.max(0.0);
+                            }
+                        }
+                    }
+                    if filled_units > 0.0 {
+                        Some((filled_units, notional_sum / filled_units, fee_sum))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                let st = self.check_resting_order_status_with_open_orders(Some(&oid_str), true);
+                if st.state == "FILLED" && st.filled_units > 0.0 && st.entry_price > 0.0 {
+                    Some((st.filled_units, st.entry_price, st.fee_usdc))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((fill_qty, fill_px, actual_fee)) = status_opt {
+                let ok = if is_pond {
+                    matches!(
+                        self.db.true_up_promoted_pond_cell_from_user_fills(
+                            row_id, fill_qty, fill_px, actual_fee, est_fee,
+                        ),
+                        Ok(true)
+                    )
+                } else {
+                    matches!(
+                        self.db.true_up_promoted_trade_from_user_fills(
+                            row_id, fill_qty, fill_px, actual_fee, 0.0,
+                        ),
+                        Ok(true)
+                    )
+                };
+                if ok {
+                    trued_up += 1;
+                }
+                self.pending_fix4_fill_trueups
+                    .lock()
+                    .remove(&(is_pond, row_id));
+            }
+        }
+        trued_up
+    }
+
+    /// Single shared helper for `GONE`-to-promote-via-`clearinghouseState` across Book A (`PIT`)
+    /// and Book B (`POND`) reconciliation paths (`Fix 4`, `R13-N1`, `R13-N4(a),(b)`, `R13-QA`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_promote_gone_via_clearinghouse<F>(
+        &self,
+        coin: &str,
+        side: &str,
+        resting_qty: f64,
+        resting_limit_px: f64,
+        maker_fee_bps: f64,
+        ex_positions: &HashMap<String, (f64, f64, f64, f64)>,
+        existing_open_qty_by_coin: &mut HashMap<String, f64>,
+        promote_fn: F,
+    ) -> Option<(f64, f64, f64)>
+    where
+        F: FnOnce(f64, f64, f64) -> aegis_core::Result<bool>,
+    {
+        let &(szi, ex_entry_px, _, _) = ex_positions.get(coin)?;
+        let same_side = (side.eq_ignore_ascii_case("LONG") && szi > 0.0)
+            || (side.eq_ignore_ascii_case("SHORT") && szi < 0.0);
+        let already_covered = existing_open_qty_by_coin.get(coin).copied().unwrap_or(0.0);
+        let uncovered_qty = (szi.abs() - already_covered).max(0.0);
+        if !same_side || uncovered_qty <= 1e-6 {
+            return None;
+        }
+        let fill_px = Self::resolve_fix4_clearinghouse_fill_price(
+            side,
+            resting_limit_px,
+            ex_entry_px,
+            already_covered,
+        );
+        if fill_px <= 0.0 {
+            return None;
+        }
+        let fill_qty = if resting_qty > 0.0 {
+            uncovered_qty.min(resting_qty)
+        } else {
+            uncovered_qty
+        };
+        let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
+        if matches!(promote_fn(fill_qty, fill_px, fee_usdc), Ok(true)) {
+            *existing_open_qty_by_coin
+                .entry(coin.to_string())
+                .or_insert(0.0) += fill_qty.abs();
+            Some((fill_qty, fill_px, fee_usdc))
+        } else {
+            None
+        }
+    }
+
     /// Polls resting Book A (`PIT`) orders (`status = 'PENDING'` / `fsm_state = 'OPEN_ON_BOOK'`)
     /// that are no longer present in the 15s `openOrders` snapshot, promoting filled orders to
-    /// `OPEN` or cancelling expired orders immediately (`R9-N1`, `R9-N3`, `R9-QB`).
+    /// `OPEN` or cancelling expired orders immediately (`R9-N1`, `R9-N3`, `R9-QB`, `R13-QA`).
     ///
     /// Cross-checks `ex_positions` before cancelling a `"GONE"` resting order so an order that filled
     /// on-chain during Hyperliquid's `userFills` indexing window is promoted to `OPEN` with its
@@ -202,6 +420,7 @@ impl ExecutionEngine {
         ex_positions: &HashMap<String, (f64, f64, f64, f64)>,
         existing_open_qty_by_coin: &mut HashMap<String, f64>,
         maker_fee_bps: f64,
+        is_simulated: bool,
     ) -> bool {
         let mut resting_promoted_or_cancelled = false;
         for rt in resting_trades {
@@ -218,16 +437,28 @@ impl ExecutionEngine {
                 continue;
             }
             let coin = rt.base_asset.to_uppercase();
-            let r_status = self.check_resting_order_status_with_open_orders(
-                rt.exchange_order_id.as_deref(),
-                true,
-            );
+            let r_status = if is_simulated {
+                crate::RestingOrderStatus {
+                    state: "GONE".to_string(),
+                    filled_units: 0.0,
+                    entry_price: 0.0,
+                    fee_usdc: 0.0,
+                }
+            } else {
+                self.check_resting_order_status_with_open_orders(
+                    rt.exchange_order_id.as_deref(),
+                    true,
+                )
+            };
             if r_status.state == "FILLED" {
                 let fill_px = if r_status.entry_price > 0.0 {
                     r_status.entry_price
                 } else {
                     rt.entry_price
                 };
+                if fill_px <= 0.0 {
+                    continue;
+                }
                 let fill_qty = if r_status.filled_units > 0.0 {
                     r_status.filled_units
                 } else {
@@ -259,59 +490,41 @@ impl ExecutionEngine {
                     resting_promoted_or_cancelled = true;
                 }
             } else if r_status.state == "GONE" {
-                let on_chain_fill = ex_positions.get(&coin).and_then(|&(szi, ex_entry_px, _, _)| {
-                    let same_side = (rt.side == "LONG" && szi > 0.0)
-                        || (rt.side == "SHORT" && szi < 0.0);
-                    let already_covered = existing_open_qty_by_coin
-                        .get(&coin)
-                        .copied()
-                        .unwrap_or(0.0);
-                    let uncovered = (szi.abs() - already_covered).max(0.0);
-                    if same_side && uncovered > 1e-6 {
-                        Some((uncovered, ex_entry_px))
-                    } else {
-                        None
-                    }
-                });
-                if let Some((uncovered_qty, ex_entry_px)) = on_chain_fill {
-                    let fill_px = if ex_entry_px > 0.0 {
-                        ex_entry_px
-                    } else {
-                        rt.entry_price
-                    };
-                    let fill_qty = if rt.quantity > 0.0 {
-                        uncovered_qty.min(rt.quantity)
-                    } else {
-                        uncovered_qty
-                    };
-                    let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
-                    if matches!(
-                        self.db.promote_resting_trade_to_open(
+                if let Some((fill_qty, fill_px, fee_usdc)) = self.try_promote_gone_via_clearinghouse(
+                    &coin,
+                    &rt.side,
+                    rt.quantity,
+                    rt.entry_price,
+                    maker_fee_bps,
+                    ex_positions,
+                    existing_open_qty_by_coin,
+                    |q, p, fee| {
+                        self.db
+                            .promote_resting_trade_to_open(rt.trade_id, q, p, fee, 0.0)
+                    },
+                ) {
+                    self.register_pending_fix4_pit_trueup(
+                        rt.trade_id,
+                        rt.exchange_order_id.as_deref(),
+                        fee_usdc,
+                    );
+                    tracing::info!(
+                        trade_id = rt.trade_id,
+                        symbol = %rt.symbol,
+                        fill_qty = fill_qty,
+                        fill_px = fill_px,
+                        "Promoted resting PIT order to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
+                    );
+                    resting_promoted_or_cancelled = true;
+                } else if !is_simulated
+                    && matches!(
+                        self.db.cancel_resting_trade(
                             rt.trade_id,
-                            fill_qty,
-                            fill_px,
-                            fee_usdc,
-                            0.0
+                            "RESTING_ORDER_CANCELLED_OR_EXPIRED"
                         ),
                         Ok(true)
-                    ) {
-                        *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
-                        tracing::info!(
-                            trade_id = rt.trade_id,
-                            symbol = %rt.symbol,
-                            fill_qty = fill_qty,
-                            fill_px = fill_px,
-                            "Promoted resting PIT order to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
-                        );
-                        resting_promoted_or_cancelled = true;
-                    }
-                } else if matches!(
-                    self.db.cancel_resting_trade(
-                        rt.trade_id,
-                        "RESTING_ORDER_CANCELLED_OR_EXPIRED"
-                    ),
-                    Ok(true)
-                ) {
+                    )
+                {
                     tracing::info!(
                         trade_id = rt.trade_id,
                         symbol = %rt.symbol,
@@ -324,7 +537,7 @@ impl ExecutionEngine {
         resting_promoted_or_cancelled
     }
 
-    /// Polls and reconciles off-book `ARMED` Pond cells during the 15s exchange reconciliation tick (`Fix 4`).
+    /// Polls and reconciles off-book `ARMED` Pond cells during the 15s exchange reconciliation tick (`Fix 4`, `R13-QA`).
     /// If a resting Pond entry order is no longer on `openOrders` and has filled (via `userFills` or
     /// `clearinghouseState` cross-check during `userFills` indexer lag), promotes the `ARMED` Pond cell
     /// to `OPEN` with its original `initial_stop` and `chandelier_stop` preserved instead of allowing it
@@ -336,6 +549,7 @@ impl ExecutionEngine {
         ex_positions: &HashMap<String, (f64, f64, f64, f64)>,
         existing_open_qty_by_coin: &mut HashMap<String, f64>,
         maker_fee_bps: f64,
+        is_simulated: bool,
     ) -> bool {
         let mut armed_promoted = false;
         for cell in armed_cells {
@@ -354,7 +568,16 @@ impl ExecutionEngine {
             {
                 continue;
             }
-            let r_status = self.check_resting_order_status_with_open_orders(resting_oid, true);
+            let r_status = if is_simulated {
+                crate::RestingOrderStatus {
+                    state: "GONE".to_string(),
+                    filled_units: 0.0,
+                    entry_price: 0.0,
+                    fee_usdc: 0.0,
+                }
+            } else {
+                self.check_resting_order_status_with_open_orders(resting_oid, true)
+            };
             let coin = cell
                 .symbol
                 .split('/')
@@ -363,12 +586,21 @@ impl ExecutionEngine {
                 .trim()
                 .to_uppercase();
             let cell_qty = cell.quantity.unwrap_or(0.0).abs();
+            let cell_limit_px = cell.entry_price.unwrap_or(0.0);
             if r_status.state == "FILLED" && (r_status.filled_units > 0.0 || cell_qty > 0.0) {
                 let fill_px = if r_status.entry_price > 0.0 {
                     r_status.entry_price
                 } else {
-                    cell.entry_price.unwrap_or(100.0)
+                    cell_limit_px
                 };
+                if fill_px <= 0.0 {
+                    tracing::warn!(
+                        cell_id = cell.cell_id,
+                        symbol = %cell.symbol,
+                        "Rejecting ARMED Pond cell promotion because fill_px <= 0.0 (R13-N4)"
+                    );
+                    continue;
+                }
                 let fill_qty = if r_status.filled_units > 0.0 {
                     r_status.filled_units
                 } else {
@@ -399,51 +631,28 @@ impl ExecutionEngine {
                     armed_promoted = true;
                 }
             } else if r_status.state == "GONE" {
-                let on_chain_fill = ex_positions.get(&coin).and_then(|&(szi, ex_entry_px, _, _)| {
-                    let same_side = (cell.side == "LONG" && szi > 0.0)
-                        || (cell.side == "SHORT" && szi < 0.0);
-                    let already_covered = existing_open_qty_by_coin
-                        .get(&coin)
-                        .copied()
-                        .unwrap_or(0.0);
-                    let uncovered = (szi.abs() - already_covered).max(0.0);
-                    if same_side && uncovered > 1e-6 {
-                        Some((uncovered, ex_entry_px))
-                    } else {
-                        None
-                    }
-                });
-                if let Some((uncovered_qty, ex_entry_px)) = on_chain_fill {
-                    let fill_px = if ex_entry_px > 0.0 {
-                        ex_entry_px
-                    } else {
-                        cell.entry_price.unwrap_or(100.0)
-                    };
-                    let fill_qty = if cell_qty > 0.0 {
-                        uncovered_qty.min(cell_qty)
-                    } else {
-                        uncovered_qty
-                    };
-                    let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
-                    if matches!(
-                        self.db.promote_armed_pond_cell_to_open(
-                            cell.cell_id,
-                            fill_qty,
-                            fill_px,
-                            fee_usdc
-                        ),
-                        Ok(true)
-                    ) {
-                        *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
-                        tracing::info!(
-                            cell_id = cell.cell_id,
-                            symbol = %cell.symbol,
-                            fill_qty = fill_qty,
-                            fill_px = fill_px,
-                            "Promoted ARMED Pond cell to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
-                        );
-                        armed_promoted = true;
-                    }
+                if let Some((fill_qty, fill_px, fee_usdc)) = self.try_promote_gone_via_clearinghouse(
+                    &coin,
+                    &cell.side,
+                    cell_qty,
+                    cell_limit_px,
+                    maker_fee_bps,
+                    ex_positions,
+                    existing_open_qty_by_coin,
+                    |q, p, fee| {
+                        self.db
+                            .promote_armed_pond_cell_to_open(cell.cell_id, q, p, fee)
+                    },
+                ) {
+                    self.register_pending_fix4_pond_trueup(cell.cell_id, resting_oid, fee_usdc);
+                    tracing::info!(
+                        cell_id = cell.cell_id,
+                        symbol = %cell.symbol,
+                        fill_qty = fill_qty,
+                        fill_px = fill_px,
+                        "Promoted ARMED Pond cell to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
+                    );
+                    armed_promoted = true;
                 }
             }
         }
@@ -451,7 +660,7 @@ impl ExecutionEngine {
     }
 
     /// Queries Hyperliquid `clearinghouseState` to check if an unattributed on-chain position
-    /// exists on the same side for `symbol` (`Fix 4`).
+    /// exists on the same side for `symbol` (`Fix 4`, `R13-N1`, `R13-N4(a)`).
     /// Used when `check_resting_order_status` returns `"GONE"` during `userFills` indexer lag
     /// so filled resting PIT orders and `ARMED` Pond cells promote to `OPEN` instead of being
     /// cancelled/rejected and re-imported as degraded orphans.
@@ -459,6 +668,7 @@ impl ExecutionEngine {
         &self,
         symbol: &str,
         side: &str,
+        resting_limit_px: f64,
     ) -> Option<(f64, f64)> {
         let cfg = self
             .load_config_logged("check_unattributed_onchain_position_for_symbol");
@@ -529,7 +739,13 @@ impl ExecutionEngine {
         }
         let uncovered = (found_szi.abs() - covered_qty).max(0.0);
         if uncovered > 1e-6 {
-            Some((uncovered, found_entry_px))
+            let bounded_px = Self::resolve_fix4_clearinghouse_fill_price(
+                side,
+                resting_limit_px,
+                found_entry_px,
+                covered_qty,
+            );
+            Some((uncovered, bounded_px))
         } else {
             None
         }
@@ -542,6 +758,9 @@ impl ExecutionEngine {
         is_backtest: bool,
         maker_fee_bps: f64,
     ) {
+        if !is_backtest {
+            let _ = self.true_up_pending_fix4_promotions(None);
+        }
         let resting_trades = self.db.get_resting_pit_trades().unwrap_or_default();
         for r_trade in resting_trades {
             let mut r_status =
@@ -569,9 +788,14 @@ impl ExecutionEngine {
                     );
                 }
             }
+            let mut promoted_via_clearinghouse = false;
             if r_status.state == "GONE" && !is_backtest {
-                if let Some((uncovered_qty, ex_entry_px)) =
-                    self.check_unattributed_onchain_position_for_symbol(&r_trade.symbol, &r_trade.side)
+                if let Some((uncovered_qty, ex_entry_px)) = self
+                    .check_unattributed_onchain_position_for_symbol(
+                        &r_trade.symbol,
+                        &r_trade.side,
+                        r_trade.entry_price,
+                    )
                 {
                     r_status.state = "FILLED".to_string();
                     r_status.filled_units = if r_trade.quantity > 0.0 {
@@ -582,6 +806,7 @@ impl ExecutionEngine {
                     if ex_entry_px > 0.0 {
                         r_status.entry_price = ex_entry_px;
                     }
+                    promoted_via_clearinghouse = true;
                 }
             }
             if r_status.state == "FILLED" {
@@ -590,6 +815,9 @@ impl ExecutionEngine {
                 } else {
                     r_trade.entry_price
                 };
+                if fill_px <= 0.0 {
+                    continue;
+                }
                 let fill_qty = if r_status.filled_units > 0.0 {
                     r_status.filled_units
                 } else {
@@ -600,18 +828,30 @@ impl ExecutionEngine {
                 } else {
                     round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
                 };
-                if let Err(e) = self.db.promote_resting_trade_to_open(
+                match self.db.promote_resting_trade_to_open(
                     r_trade.trade_id,
                     fill_qty,
                     fill_px,
                     fee_usdc,
                     0.0,
                 ) {
-                    tracing::error!(
-                        trade_id = r_trade.trade_id,
-                        error = %e,
-                        "Failed to promote resting PIT trade to OPEN (R3-H2)"
-                    );
+                    Ok(true) => {
+                        if promoted_via_clearinghouse {
+                            self.register_pending_fix4_pit_trueup(
+                                r_trade.trade_id,
+                                r_trade.exchange_order_id.as_deref(),
+                                fee_usdc,
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            trade_id = r_trade.trade_id,
+                            error = %e,
+                            "Failed to promote resting PIT trade to OPEN (R3-H2)"
+                        );
+                    }
                 }
             } else if r_status.state == "GONE" {
                 if let Err(e) = self

@@ -230,9 +230,13 @@ impl ExecutionEngine {
         };
         let mut armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
 
+        if simulated_exchange_positions.is_none() {
+            let _ = self.true_up_pending_fix4_promotions(None);
+        }
+
         // In live/testnet mode (or simulated mode with explicit open_orders_slice), if a resting PIT order
         // or ARMED Pond cell is no longer on the exchange openOrders book, poll its fill status or cross-check
-        // ex_positions immediately during the 15s tick so filled orders promote to OPEN with original stops intact (`R9-N1`, `R9-N3`, `R9-QB`, Fix 4).
+        // ex_positions immediately during the 15s tick so filled orders promote to OPEN with original stops intact (`R9-N1`, `R9-N3`, `R9-QB`, Fix 4, `R13-QA`).
         if open_orders_slice.is_some()
             && (!resting_trades.is_empty() || !armed_pond_cells.is_empty())
         {
@@ -255,139 +259,24 @@ impl ExecutionEngine {
                     cell.quantity.unwrap_or(0.0).abs();
             }
 
-            let changed = if simulated_exchange_positions.is_none() {
-                let pit_changed = self.poll_resting_pit_trades_on_15s_tick(
-                    &resting_trades,
-                    &open_order_oids,
-                    &ex_positions,
-                    &mut existing_open_qty_by_coin,
-                    maker_fee_bps,
-                );
-                let pond_changed = self.poll_armed_pond_cells_on_15s_tick(
-                    &armed_pond_cells,
-                    &open_order_oids,
-                    &ex_positions,
-                    &mut existing_open_qty_by_coin,
-                    maker_fee_bps,
-                );
-                pit_changed || pond_changed
-            } else {
-                let mut promoted_sim = false;
-                for rt in &resting_trades {
-                    let oid_num = rt
-                        .exchange_order_id
-                        .as_deref()
-                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&id| id > 0);
-                    if oid_num
-                        .map(|id| open_order_oids.contains(&id))
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let coin = rt.base_asset.to_uppercase();
-                    if let Some(&(szi, ex_entry_px, _, _)) = ex_positions.get(&coin) {
-                        let same_side = (rt.side == "LONG" && szi > 0.0)
-                            || (rt.side == "SHORT" && szi < 0.0);
-                        let already_covered = existing_open_qty_by_coin
-                            .get(&coin)
-                            .copied()
-                            .unwrap_or(0.0);
-                        let uncovered = (szi.abs() - already_covered).max(0.0);
-                        if same_side && uncovered > 1e-6 {
-                            let fill_px = if ex_entry_px > 0.0 {
-                                ex_entry_px
-                            } else {
-                                rt.entry_price
-                            };
-                            let fill_qty = if rt.quantity > 0.0 {
-                                uncovered.min(rt.quantity)
-                            } else {
-                                uncovered
-                            };
-                            let fee_usdc =
-                                round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
-                            if matches!(
-                                self.db.promote_resting_trade_to_open(
-                                    rt.trade_id,
-                                    fill_qty,
-                                    fill_px,
-                                    fee_usdc,
-                                    0.0
-                                ),
-                                Ok(true)
-                            ) {
-                                *existing_open_qty_by_coin.entry(coin).or_insert(0.0) +=
-                                    fill_qty.abs();
-                                promoted_sim = true;
-                            }
-                        }
-                    }
-                }
-                for cell in &armed_pond_cells {
-                    let resting_oid = cell.resting_order_id.as_deref().or_else(|| {
-                        cell.exit_reason
-                            .as_deref()
-                            .and_then(|r| r.strip_prefix("RESTING_OID:"))
-                    });
-                    let oid_num = resting_oid
-                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&id| id > 0);
-                    if oid_num
-                        .map(|id| open_order_oids.contains(&id))
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let coin = cell
-                        .symbol
-                        .split('/')
-                        .next()
-                        .unwrap_or(&cell.symbol)
-                        .trim()
-                        .to_uppercase();
-                    if let Some(&(szi, ex_entry_px, _, _)) = ex_positions.get(&coin) {
-                        let same_side = (cell.side == "LONG" && szi > 0.0)
-                            || (cell.side == "SHORT" && szi < 0.0);
-                        let already_covered = existing_open_qty_by_coin
-                            .get(&coin)
-                            .copied()
-                            .unwrap_or(0.0);
-                        let uncovered = (szi.abs() - already_covered).max(0.0);
-                        if same_side && uncovered > 1e-6 {
-                            let fill_px = if ex_entry_px > 0.0 {
-                                ex_entry_px
-                            } else {
-                                cell.entry_price.unwrap_or(100.0)
-                            };
-                            let cell_qty = cell.quantity.unwrap_or(0.0).abs();
-                            let fill_qty = if cell_qty > 0.0 {
-                                uncovered.min(cell_qty)
-                            } else {
-                                uncovered
-                            };
-                            let fee_usdc =
-                                round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
-                            if matches!(
-                                self.db.promote_armed_pond_cell_to_open(
-                                    cell.cell_id,
-                                    fill_qty,
-                                    fill_px,
-                                    fee_usdc
-                                ),
-                                Ok(true)
-                            ) {
-                                *existing_open_qty_by_coin.entry(coin).or_insert(0.0) +=
-                                    fill_qty.abs();
-                                promoted_sim = true;
-                            }
-                        }
-                    }
-                }
-                promoted_sim
-            };
+            let is_simulated = simulated_exchange_positions.is_some();
+            let pit_changed = self.poll_resting_pit_trades_on_15s_tick(
+                &resting_trades,
+                &open_order_oids,
+                &ex_positions,
+                &mut existing_open_qty_by_coin,
+                maker_fee_bps,
+                is_simulated,
+            );
+            let pond_changed = self.poll_armed_pond_cells_on_15s_tick(
+                &armed_pond_cells,
+                &open_order_oids,
+                &ex_positions,
+                &mut existing_open_qty_by_coin,
+                maker_fee_bps,
+                is_simulated,
+            );
+            let changed = pit_changed || pond_changed;
 
             if changed {
                 if let Ok(updated_open) = self.db.get_open_trades() {

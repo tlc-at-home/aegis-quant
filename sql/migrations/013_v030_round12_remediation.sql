@@ -7,8 +7,9 @@
 --      `chandelier_atr_multiplier_short`) from 1.2x to 2.2x ATR while gating tight-trail
 --      (`0.45x ATR` / `0.8%` cap) behind `tight_trail_trigger_atr = 1.0` ATR favorable excursion.
 --   2. Fix 2 & Fix 6: Seed `pond_max_stop_distance_pct` (`0.06`), `pond_testnet_min_vol_cap_usdc`
---      (`5000.0`), `signal_short_bounce_veto_pct` (`0.020`), `signal_long_crash_veto_pct` (`0.020`),
---      and `max_bar_staleness_ms` (`21600000` = 6h) in `system_config` idempotently.
+--      (`5000.0`), `signal_short_bounce_veto_pct` (`0.020`), and `signal_long_crash_veto_pct`
+--      (`0.020`) in `system_config` idempotently (`max_bar_staleness_ms` is already seeded at
+--      `28800000` = 8h by migration 007; `R13-N2`).
 --   3. Fix 2: Normalize any open `pond_cells` whose `initial_stop` or `chandelier_stop` violated
 --      the 6% maximum stop distance cap or `initial_stop` floor/ceiling invariant.
 --   4. Bump `schema_version` to 13 and record migration 13 in `schema_migrations`.
@@ -22,14 +23,13 @@ WHERE config_key IN ('chandelier_atr_multiplier_long', 'chandelier_atr_multiplie
   AND config_value = '1.2'
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 13);
 
--- 2. Seed Round-12 risk, Pond, signal, and health-staleness configuration keys idempotently
+-- 2. Seed Round-12 risk, Pond, and signal configuration keys idempotently
 INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at) VALUES
     ('tight_trail_trigger_atr', '1.0', 'float', 'stops', 'Minimum favorable excursion in ATR multiples before tight current-price trailing stop activates', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('pond_max_stop_distance_pct', '0.06', 'float', 'pond', 'Maximum initial protective stop distance as fraction of reference price for Pond NPS-01 cells (6.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('pond_testnet_min_vol_cap_usdc', '5000.0', 'float', 'pond', 'Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('signal_short_bounce_veto_pct', '0.020', 'float', 'signals', 'Short-horizon (12h/4h) upward bounce threshold vetoing lagging 4H SHORT entries (2.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('signal_long_crash_veto_pct', '0.020', 'float', 'signals', 'Short-horizon (12h/4h) downward crash threshold vetoing lagging 4H LONG entries (2.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('max_bar_staleness_ms', '21600000', 'int', 'execution', 'Maximum allowed primary OHLCV bar staleness in milliseconds before /health reports 503 DEGRADED in LIVE/TESTNET (6h)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    ('signal_long_crash_veto_pct', '0.020', 'float', 'signals', 'Short-horizon (12h/4h) downward crash threshold vetoing lagging 4H LONG entries (2.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 ON CONFLICT(config_key) DO NOTHING;
 
 -- 3. Ensure Pond Testnet volume floor is raised from legacy $100 to $5,000 when upgrading to v13
@@ -76,6 +76,7 @@ SET initial_stop = CASE
             entry_price,
             (SELECT MAX(m.high) FROM market_ohlcv m
              WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+               AND m.is_synthetic = 0
                AND pond_cells.opened_at IS NOT NULL
                AND (
                    m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000
@@ -96,6 +97,7 @@ SET initial_stop = CASE
             entry_price,
             (SELECT MIN(m.low) FROM market_ohlcv m
              WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+               AND m.is_synthetic = 0
                AND pond_cells.opened_at IS NOT NULL
                AND m.low > 0.0
                AND (
@@ -111,7 +113,8 @@ SET initial_stop = CASE
                 THEN entry_price
             ELSE lowest_price_seen
         END
-    )
+    ),
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE state IN ('OPEN', 'TRAILED')
   AND entry_price > 0.0
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 13);

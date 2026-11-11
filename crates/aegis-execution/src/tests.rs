@@ -2264,3 +2264,395 @@
         assert!((promoted_cell.initial_stop.unwrap() - 0.00171).abs() < 1e-6);
         assert!((promoted_cell.chandelier_stop.unwrap() - 0.00171).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_r13_s1_pit_same_hour_partial_bar_beyond_trigger_fires_and_in_band_sanitizes() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        let base_ts = 1_794_300_000_000i64;
+        // Seed 20 1h bars with steady TR = 2.0 (high=101, low=99, close=100) so 1h ATR ≈ 2.0.
+        // With mult_long = 2.2 and wick_buffer_atr = 0.35, init_stop = 95.6, wick_trigger_low ≈ 94.9.
+        let mut bars_1h: Vec<aegis_core::OhlcvBar> = (0..19)
+            .map(|i| aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 50_000.0,
+                funding_rate_hourly: 0.0,
+                is_synthetic: 0,
+            })
+            .collect();
+        let latest_1h_ts = base_ts + 19 * 3_600_000;
+        bars_1h.push(aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: latest_1h_ts,
+            open: 100.0,
+            high: 106.0, // pre-open favorable spike inside the opening hour bar
+            low: 96.2,   // in-band dip shallower than wick_trigger_low (~94.9)
+            close: 100.0,
+            volume: 50_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        });
+        db.upsert_ohlcv_batch(&bars_1h).unwrap();
+
+        // Trade opened mid-1h-bar (30m after latest_1h_ts, so opened_at_ms > last_bar.timestamp_ms and post_open_1h is empty)
+        let opened_iso = aegis_core::format_ms_iso8601_utc(latest_1h_ts + 1_800_000);
+        let mk_trade = |cli_id: &str| aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: cli_id.to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 100.0,
+            current_price: 100.0,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 1.0,
+            avg_fill_price: Some(100.0),
+            notional_usdc: 100.0,
+            risk_budget_usdc: 4.4,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 95.6,
+            chandelier_stop_price: 95.6,
+            current_stop_price: 95.6,
+            highest_price_seen: 100.0,
+            lowest_price_seen: 100.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some(format!("hl-{cli_id}")),
+            opened_at: opened_iso.clone(),
+            closed_at: None,
+            exit_reason: None,
+        };
+
+        // Pin Case 1 (In-Band): partial bar low 96.2 > wick_trigger_low (~94.9) and high 106.0 -> clamped to close (100.0).
+        // Must NOT fire stop and must NOT contaminate highest_price_seen with 106.0 or lowest_price_seen with 96.2!
+        let tid_in_band = db.insert_trade(&mk_trade("pit-in-band")).unwrap();
+        let eval = aegis_core::SignalEvaluation {
+            eval_id: None,
+            timestamp_ms: latest_1h_ts + 2_400_000,
+            base_asset: "SOL".to_string(),
+            exec_symbol: "SOL/USDC:USDC".to_string(),
+            synth_symbol: "SOL/BTC:SYNTH".to_string(),
+            hmm_regime: "BULL".to_string(),
+            prob_bull: 0.80,
+            prob_bear: 0.10,
+            prob_chop: 0.10,
+            snr_score: 1.2,
+            snr_synth: 0.8,
+            rs_96: 0.05,
+            r_usdc_8: 0.02,
+            mace_score: 0.7,
+            blended_conviction: 0.75,
+            rs_rank: 1,
+            signal_action: "HOLD".to_string(),
+            funding_rate_hourly: 0.0,
+            created_at: None,
+        };
+        exec.reconcile_cycle(std::slice::from_ref(&eval), false)
+            .unwrap();
+        let open_after_in_band = db.get_open_trades().unwrap();
+        assert_eq!(
+            open_after_in_band.len(),
+            1,
+            "R13-S1 PIT Pin 1: In-band partial-bar low (96.2 > trigger) must be sanitized and NOT stop out"
+        );
+        assert_eq!(open_after_in_band[0].trade_id, tid_in_band);
+        assert!(
+            (open_after_in_band[0].highest_price_seen - 100.0).abs() < 1e-6,
+            "R13-S1 PIT Pin 1: Pre-open partial-bar high (106.0) must be clamped so highest_price_seen stays 100.0"
+        );
+        assert!(
+            (open_after_in_band[0].lowest_price_seen - 100.0).abs() < 1e-6,
+            "R13-S1 PIT Pin 1: In-band partial-bar low (96.2) must be clamped so lowest_price_seen stays 100.0"
+        );
+
+        // Pin Case 2 (Beyond Trigger): opening-hour 1h bar has a genuine post-open stop-breaching wick (low = 93.5 <= ~94.9)
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: latest_1h_ts, // overlaps opened_at_ms (latest_1h_ts + 30m < latest_1h_ts + 60m)
+            open: 100.0,
+            high: 101.0,
+            low: 93.5, // beyond wick_trigger_low (~94.9)
+            close: 100.0,
+            volume: 20_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+        exec.reconcile_cycle(&[eval], false).unwrap();
+        let open_after_beyond = db.get_open_trades().unwrap();
+        assert!(
+            open_after_beyond.is_empty(),
+            "R13-S1 PIT Pin 2: Same-hour partial-bar wick beyond trigger (93.5 <= ~94.9) must fire Tier-1 wick stop"
+        );
+        let closed = db
+            .get_recent_trades(5)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == tid_in_band)
+            .unwrap();
+        assert_eq!(closed.status, "CLOSED");
+        assert_eq!(
+            closed.exit_reason.as_deref(),
+            Some("INTRABAR_LOW_WICK_CHANDELIER_STOP_LONG")
+        );
+    }
+
+    #[test]
+    fn test_r13_n1_n4_qa_fix4_blended_entry_px_bound_and_user_fills_true_up() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // 1. Existing open BTC LONG of 1.0 BTC at 90,000
+        let existing_btc = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "btc-open-1".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 90_000.0,
+            current_price: 95_000.0,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 1.0,
+            avg_fill_price: Some(90_000.0),
+            notional_usdc: 90_000.0,
+            risk_budget_usdc: 2_000.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 88_000.0,
+            chandelier_stop_price: 88_000.0,
+            current_stop_price: 88_000.0,
+            highest_price_seen: 95_000.0,
+            lowest_price_seen: 90_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 5_000.0,
+            fees_paid_usdc: 13.5,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-111".to_string()),
+            opened_at: "2026-11-11T10:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        db.insert_trade(&existing_btc).unwrap();
+
+        // 2. Resting PIT BTC LONG of 1.0 BTC at limit 95,000 (stop = 93,000, risk = 2,000)
+        let resting_btc = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "btc-resting-2".to_string(),
+            symbol: "BTC/USDC:USDC".to_string(),
+            base_asset: "BTC".to_string(),
+            side: "LONG".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 95_000.0,
+            current_price: 95_000.0,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 95_000.0,
+            risk_budget_usdc: 2_000.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 93_000.0,
+            chandelier_stop_price: 93_000.0,
+            current_stop_price: 93_000.0,
+            highest_price_seen: 95_000.0,
+            lowest_price_seen: 95_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-222222".to_string()),
+            opened_at: "2026-11-11T12:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let resting_tid = db.insert_trade(&resting_btc).unwrap();
+
+        // 3. Also insert an ARMED Pond cell on ETH where an open ETH cell already exists (blended entryPx)
+        // plus an ARMED cell with missing entry_price (None) and 0.0 ex_entry_px to test R13-N4(a) rejection
+        let open_eth_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(3_000.0),
+            quantity: Some(1.0),
+            notional_usdc: Some(3_000.0),
+            risk_budget_usdc: Some(150.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.5),
+            funding_rate_entry: Some(-0.0002),
+            initial_stop: Some(2_850.0),
+            chandelier_stop: Some(2_850.0),
+            highest_price_seen: Some(3_000.0),
+            lowest_price_seen: Some(3_000.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.45,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-11T10:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-11T10:00:00Z".to_string(),
+        };
+        db.upsert_pond_cell(&open_eth_cell).unwrap();
+
+        let armed_eth_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "ETH/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(3_200.0),
+            quantity: Some(1.0),
+            notional_usdc: Some(3_200.0),
+            risk_budget_usdc: Some(160.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.8),
+            funding_rate_entry: Some(-0.0003),
+            initial_stop: Some(3_040.0),
+            chandelier_stop: Some(3_040.0),
+            highest_price_seen: Some(3_200.0),
+            lowest_price_seen: Some(3_200.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: Some("hl-333333".to_string()),
+            opened_at: None,
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-11T12:00:00Z".to_string(),
+        };
+        let armed_eth_cid = db.upsert_pond_cell(&armed_eth_cell).unwrap();
+
+        let armed_zero_px = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "ZERO/USDC:USDC".to_string(),
+            state: "ARMED".to_string(),
+            entry_price: None, // R13-N4(a): must NOT fall back to 100.0
+            resting_order_id: Some("hl-444444".to_string()),
+            ..armed_eth_cell.clone()
+        };
+        let zero_cid = db.upsert_pond_cell(&armed_zero_px).unwrap();
+
+        // clearinghouseState reports blended entryPx:
+        // - BTC: szi = 2.0, entryPx = 92,500.0 (blend of 90k and 95k)
+        // - ETH: szi = 2.0, entryPx = 3,100.0 (blend of 3000 and 3200)
+        // - ZERO: szi = 1.0, entryPx = 0.0
+        let mut on_chain = HashMap::new();
+        on_chain.insert(
+            "BTC".to_string(),
+            json!({ "szi": 2.0, "entryPx": 92_500.0, "markPx": 95_000.0, "unrealizedPnl": 5_000.0 }),
+        );
+        on_chain.insert(
+            "ETH".to_string(),
+            json!({ "szi": 2.0, "entryPx": 3_100.0, "markPx": 3_200.0, "unrealizedPnl": 200.0 }),
+        );
+        on_chain.insert(
+            "ZERO".to_string(),
+            json!({ "szi": 1.0, "entryPx": 0.0, "markPx": 0.0, "unrealizedPnl": 0.0 }),
+        );
+
+        let _ = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
+
+        // Verify R13-N1: promoted BTC trade uses resting limit price 95,000.0, NOT blended 92,500.0!
+        let open_trades = db.get_open_trades().unwrap();
+        let promoted_btc = open_trades
+            .iter()
+            .find(|t| t.trade_id == resting_tid)
+            .expect("Resting BTC trade should be promoted");
+        assert!(
+            (promoted_btc.entry_price - 95_000.0).abs() < 1e-6,
+            "R13-N1: Promoted BTC trade must use resting limit 95,000.0 instead of blended 92,500.0 (got {})",
+            promoted_btc.entry_price
+        );
+        assert!(
+            (promoted_btc.notional_usdc - 95_000.0).abs() < 1e-2,
+            "R13-N1: Notional must be 95,000.0"
+        );
+        assert!(
+            (promoted_btc.risk_budget_usdc - 2_000.0).abs() < 1e-2,
+            "R13-N1: Risk budget must be |95,000 - 93,000| * 1.0 = 2,000.0 (not blended 500.0)"
+        );
+
+        // Verify R13-N1 on Pond cell: promoted ETH cell uses resting limit 3,200.0, NOT blended 3,100.0!
+        let open_cells = db.get_open_pond_cells().unwrap();
+        let promoted_eth = open_cells
+            .iter()
+            .find(|c| c.cell_id == armed_eth_cid)
+            .expect("ARMED ETH cell should be promoted");
+        assert!(
+            (promoted_eth.entry_price.unwrap() - 3_200.0).abs() < 1e-6,
+            "R13-N1: Promoted ETH cell must use resting limit 3,200.0 instead of blended 3,100.0"
+        );
+        assert!(
+            (promoted_eth.risk_budget_usdc.unwrap() - 160.0).abs() < 1e-2,
+            "R13-N1: Promoted ETH cell risk_budget_usdc must be |3,200 - 3,040| * 1.0 = 160.0"
+        );
+
+        // Verify R13-N4(a): ZERO cell with entry_price=None and ex_entry_px=0.0 was NOT promoted with magic 100.0
+        assert!(
+            open_cells.iter().all(|c| c.cell_id != zero_cid),
+            "R13-N4(a): ARMED cell with no valid entry price must NOT be promoted with magic 100.0"
+        );
+
+        // Verify R13-N1 & R13-N4(b): Next-tick userFills true-up updates entry_price, notional, risk_budget, and actual fees
+        let fills = vec![
+            json!({ "oid": 222222u64, "sz": "1.0", "px": "94980.0", "fee": "9.498" }),
+            json!({ "oid": 333333u64, "sz": "1.0", "px": "3195.0", "fee": "0.3195" }),
+        ];
+        let trued_up = exec.true_up_pending_fix4_promotions(Some(&fills));
+        assert_eq!(trued_up, 2, "Both race-promoted rows must be trued up once userFills indexes their fills");
+
+        let trued_btc = db
+            .get_open_trades()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == resting_tid)
+            .unwrap();
+        assert!((trued_btc.entry_price - 94_980.0).abs() < 1e-6);
+        assert!((trued_btc.notional_usdc - 94_980.0).abs() < 1e-2);
+        assert!((trued_btc.risk_budget_usdc - 1_980.0).abs() < 1e-2);
+        assert!((trued_btc.fees_paid_usdc - 9.498).abs() < 1e-4);
+
+        let trued_eth = db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == armed_eth_cid)
+            .unwrap();
+        assert!((trued_eth.entry_price.unwrap() - 3_195.0).abs() < 1e-6);
+        assert!((trued_eth.notional_usdc.unwrap() - 3_195.0).abs() < 1e-2);
+        assert!((trued_eth.risk_budget_usdc.unwrap() - 155.0).abs() < 1e-2);
+        assert!((trued_eth.fees_paid_usdc - 0.3195).abs() < 1e-4);
+    }

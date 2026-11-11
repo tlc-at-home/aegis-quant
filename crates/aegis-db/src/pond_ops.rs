@@ -883,7 +883,7 @@ impl DatabaseManager {
         })
     }
 
-    /// Atomically promote an `ARMED` Pond cell to `OPEN` when its resting limit order has filled (`Fix 4`).
+    /// Atomically promote an `ARMED` Pond cell to `OPEN` when its resting limit order has filled (`Fix 4`, `R13-QA`).
     /// Preserves the cell's original `initial_stop` and `chandelier_stop` while initializing watermarks
     /// to `fill_price` and rescaling `notional_usdc` and `risk_budget_usdc`.
     pub fn promote_armed_pond_cell_to_open(
@@ -893,6 +893,9 @@ impl DatabaseManager {
         fill_price: f64,
         fee_usdc: f64,
     ) -> Result<bool> {
+        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite() {
+            return Ok(false);
+        }
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let qty = round_dp(fill_qty.abs(), 8);
         let px = round_dp(fill_price, 8);
@@ -920,6 +923,55 @@ impl DatabaseManager {
                          resting_order_id = NULL
                      WHERE cell_id = ?6 AND state = 'ARMED';",
                     params![px, qty, notional, fee, now_iso, cell_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(rows > 0)
+        })
+    }
+
+    /// True up an `OPEN` / `TRAILED` Pond cell that was race-promoted via `clearinghouseState`
+    /// once the exact maker fill appears in `userFills` (`R13-N1`, `R13-N4(b)`).
+    pub fn true_up_promoted_pond_cell_from_user_fills(
+        &self,
+        cell_id: i64,
+        fill_qty: f64,
+        fill_price: f64,
+        actual_fee_usdc: f64,
+        estimated_fee_usdc: f64,
+    ) -> Result<bool> {
+        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite() {
+            return Ok(false);
+        }
+        let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let qty = round_dp(fill_qty.abs(), 8);
+        let px = round_dp(fill_price, 8);
+        let notional = round_dp(qty * px, 2);
+        let fee_delta = round_dp(actual_fee_usdc.max(0.0) - estimated_fee_usdc.max(0.0), 4);
+        self.with_conn(|conn| {
+            let rows = conn
+                .execute(
+                    "UPDATE pond_cells
+                     SET highest_price_seen = CASE
+                             WHEN ABS(COALESCE(highest_price_seen, entry_price) - COALESCE(entry_price, ?1)) < 1e-9 THEN ?1
+                             ELSE MAX(COALESCE(highest_price_seen, ?1), ?1)
+                         END,
+                         lowest_price_seen = CASE
+                             WHEN ABS(COALESCE(lowest_price_seen, entry_price) - COALESCE(entry_price, ?1)) < 1e-9 THEN ?1
+                             WHEN COALESCE(lowest_price_seen, 0.0) > 0.0 THEN MIN(lowest_price_seen, ?1)
+                             ELSE ?1
+                         END,
+                         entry_price = ?1,
+                         quantity = ?2,
+                         notional_usdc = ?3,
+                         risk_budget_usdc = CASE
+                             WHEN initial_stop > 0.0 AND ABS(?1 - initial_stop) > 1e-12 THEN ROUND(ABS(?1 - initial_stop) * ?2, 4)
+                             WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?2 / quantity), 4)
+                             ELSE risk_budget_usdc
+                         END,
+                         fees_paid_usdc = MAX(0.0, ROUND(COALESCE(fees_paid_usdc, 0.0) + ?4, 4)),
+                         updated_at = ?5
+                     WHERE cell_id = ?6 AND state IN ('OPEN', 'TRAILED');",
+                    params![px, qty, notional, fee_delta, now_iso, cell_id],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(rows > 0)

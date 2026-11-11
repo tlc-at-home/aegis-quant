@@ -2865,13 +2865,26 @@ mod tests {
                 funding_rate_hourly: 0.0003,
                 is_synthetic: 0,
             },
+            aegis_core::OhlcvBar {
+                symbol: "AVAX/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_405_600_000, // 2026-11-11T14:00:00Z (synthetic bar with extreme low — must be ignored by R13-N4(d))
+                open: 91.80,
+                high: 99.00,
+                low: 88.00,
+                close: 91.80,
+                volume: 0.0,
+                funding_rate_hourly: 0.0003,
+                is_synthetic: 1,
+            },
         ])
         .unwrap();
 
-        // Rewind schema_migrations to v12 and apply migration 013
+        // Force a known historical updated_at before running migration 013 (R13-N4(c))
         db.with_conn(|conn| {
             conn.execute_batch(
-                "UPDATE system_config SET config_value = '12' WHERE config_key = 'schema_version';
+                "UPDATE pond_cells SET updated_at = '2026-01-01T00:00:00Z';
+                 UPDATE system_config SET config_value = '12' WHERE config_key = 'schema_version';
                  DELETE FROM schema_migrations WHERE version >= 13;",
             )
             .unwrap();
@@ -2881,9 +2894,18 @@ mod tests {
         db.apply_migration("sql/migrations/013_v030_round12_remediation.sql")
             .unwrap();
         assert_eq!(db.get_schema_version().unwrap(), 13);
+        assert_eq!(
+            db.get_raw_config_value("max_bar_staleness_ms").unwrap().as_deref(),
+            Some("28800000"),
+            "R13-N2: max_bar_staleness_ms must remain 28800000 (8h)"
+        );
 
         let cells = db.get_open_pond_cells().unwrap();
         let sol = cells.iter().find(|c| c.cell_id == open_sol_id).unwrap();
+        assert_ne!(
+            sol.updated_at, "2026-01-01T00:00:00Z",
+            "R13-N4(c): Migration 013 must bump updated_at on repaired pond_cells"
+        );
         assert!((sol.initial_stop.unwrap() - 97.09785714).abs() < 1e-6);
         assert!(
             (sol.chandelier_stop.unwrap() - 97.09785714).abs() < 1e-6,
@@ -2896,6 +2918,10 @@ mod tests {
         assert!((sol.highest_price_seen.unwrap() - 93.179).abs() < 1e-6);
 
         let eth = cells.iter().find(|c| c.cell_id == trailed_eth_id).unwrap();
+        assert_ne!(
+            eth.updated_at, "2026-01-01T00:00:00Z",
+            "R13-N4(c): Migration 013 must bump updated_at on TRAILED pond_cells"
+        );
         assert!(
             (eth.initial_stop.unwrap() - 3180.0).abs() < 1e-6,
             "Migration 013 must cap TRAILED cell initial_stop at 6% (3180.0)"
@@ -2912,7 +2938,11 @@ mod tests {
         let avax = cells.iter().find(|c| c.cell_id == open_avax_id).unwrap();
         assert!(
             (avax.lowest_price_seen.unwrap() - 90.50).abs() < 1e-6,
-            "Migration 013 must include valid opening-hour low (90.50) even when later post-open bars have higher lows (91.224)"
+            "Migration 013 must include valid opening-hour low (90.50) and ignore synthetic bars (R13-N4(d))"
+        );
+        assert!(
+            (avax.highest_price_seen.unwrap() - 92.50).abs() < 1e-6,
+            "Migration 013 must ignore synthetic high (99.00) in market_ohlcv watermark subquery (R13-N4(d))"
         );
     }
 }

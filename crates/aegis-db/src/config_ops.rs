@@ -431,10 +431,10 @@ fn alert_config_defaults(
         (
             "max_bar_staleness_ms",
             (
-                "21600000",
+                "28800000",
                 "int",
                 "execution",
-                "Maximum allowed primary OHLCV bar staleness in milliseconds before /health reports 503 DEGRADED in LIVE/TESTNET (6h)",
+                "Maximum allowed primary OHLCV bar staleness in milliseconds before /health reports 503 DEGRADED in LIVE/TESTNET (8h)",
             ),
         ),
     ])
