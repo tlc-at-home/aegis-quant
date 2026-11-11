@@ -494,7 +494,7 @@ impl DatabaseManager {
         fees_paid_usdc: f64,
         slippage_paid_usd: f64,
     ) -> Result<bool> {
-        let notional = round_dp(filled_units * avg_fill_price, 4);
+        let notional = round_dp(filled_units * avg_fill_price, 2);
         let ts = self.now_ms();
         self.with_conn(|conn| {
             let rows = conn
@@ -509,7 +509,8 @@ impl DatabaseManager {
                          avg_fill_price = ?2,
                          notional_usdc = ?3,
                          risk_budget_usdc = CASE
-                             WHEN initial_stop_price > 0.0 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             WHEN initial_stop_price > 0.0 AND ABS(?2 - initial_stop_price) > 1e-12 THEN ROUND(ABS(?2 - initial_stop_price) * ?1, 4)
+                             WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
                              ELSE risk_budget_usdc
                          END,
                          highest_price_seen = MAX(highest_price_seen, ?2),
@@ -615,7 +616,18 @@ impl DatabaseManager {
                      realized_pnl_usdc = ROUND(realized_pnl_usdc + ?3, 4),
                      fees_paid_usdc = ROUND(fees_paid_usdc + ?4, 4),
                      slippage_paid_usd = ROUND(COALESCE(slippage_paid_usd, 0.0) + ?5, 4),
-                     current_price = CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END
+                     current_price = CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END,
+                     unrealized_pnl_usdc = CASE
+                         WHEN (CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END) > 0.0 AND entry_price > 0.0 THEN
+                             ROUND(
+                                 (CASE WHEN UPPER(side) = 'LONG'
+                                     THEN ((CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END) - entry_price)
+                                     ELSE (entry_price - (CASE WHEN ?6 > 0.0 THEN ?6 ELSE current_price END))
+                                 END) * ?1,
+                                 4
+                             )
+                         ELSE unrealized_pnl_usdc
+                     END
                  WHERE trade_id = ?7 AND status = 'OPEN';",
                 params![
                     round_dp(remaining_qty.abs(), 8),
@@ -1605,6 +1617,11 @@ impl DatabaseManager {
                              WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
                              ELSE risk_budget_usdc
                          END,
+                         unrealized_pnl_usdc = CASE
+                             WHEN current_price > 0.0 AND ?2 > 0.0 THEN
+                                 ROUND((CASE WHEN UPPER(side) = 'LONG' THEN (current_price - ?2) ELSE (?2 - current_price) END) * ?1, 4)
+                             ELSE 0.0
+                         END,
                          fsm_state = 'FILLED'
                      WHERE trade_id = ?4 AND status = 'OPEN';",
                     params![size, px, notional, trade_id],
@@ -1620,6 +1637,11 @@ impl DatabaseManager {
                              WHEN initial_stop_price > 0.0 AND ABS(entry_price - initial_stop_price) > 1e-12 THEN ROUND(ABS(entry_price - initial_stop_price) * ?1, 4)
                              WHEN quantity > 0.0 THEN ROUND(risk_budget_usdc * (?1 / quantity), 4)
                              ELSE risk_budget_usdc
+                         END,
+                         unrealized_pnl_usdc = CASE
+                             WHEN current_price > 0.0 AND entry_price > 0.0 THEN
+                                 ROUND((CASE WHEN UPPER(side) = 'LONG' THEN (current_price - entry_price) ELSE (entry_price - current_price) END) * ?1, 4)
+                             ELSE unrealized_pnl_usdc
                          END,
                          fsm_state = 'FILLED'
                      WHERE trade_id = ?2 AND status = 'OPEN';",

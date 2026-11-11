@@ -492,16 +492,19 @@ impl AlertEngine {
                     "WARNING" => "[WARNING]",
                     _ => "[INFO]",
                 };
+                let safe_title = title.replace('_', "\\_");
+                let safe_message = message.replace('_', "\\_");
                 let mut text_lines = vec![
-                    format!("{icon} *Aegis Quant — {title}*"),
+                    format!("{icon} *Aegis Quant — {safe_title}*"),
                     format!("Severity: `{severity}` | Time: `{ts_utc}`"),
                     String::new(),
-                    message.to_string(),
+                    safe_message,
                 ];
                 if let Some(Value::Object(map)) = &details {
                     text_lines.push(String::new());
                     for (k, v) in map {
-                        text_lines.push(format!("• *{k}*: `{v}`"));
+                        let safe_k = k.replace('_', "\\_");
+                        text_lines.push(format!("• *{safe_k}*: `{v}`"));
                     }
                 }
                 let text_joined = text_lines.join("\n");
@@ -532,28 +535,66 @@ impl AlertEngine {
                         }));
                     }
                     Ok(resp) => {
-                        any_error = true;
                         let http_status = resp.status();
-                        if http_status.as_u16() == 429 || http_status.is_server_error() {
-                            retriable_error = true;
-                        }
                         let body: Value = resp.json().unwrap_or_else(|_| json!({}));
                         let tg_desc = body
                             .get("description")
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let raw_err_str = if tg_desc.is_empty() {
-                            format!("HTTP {http_status}")
-                        } else {
-                            format!("HTTP {http_status}: {tg_desc}")
-                        };
-                        let err_str = sanitize_telemetry_message(&raw_err_str);
-                        error_detail = Some(err_str.clone());
-                        results.push(json!({
-                            "channel": "TELEGRAM",
-                            "http_status": http_status.as_u16(),
-                            "error": err_str,
-                        }));
+                        // Fallback to plain-text sendMessage without parse_mode if Telegram rejects Markdown entities
+                        let mut plain_fallback_succeeded = false;
+                        if http_status.as_u16() == 400
+                            && tg_desc.to_ascii_lowercase().contains("parse entities")
+                        {
+                            let mut plain_lines = vec![
+                                format!("{icon} Aegis Quant — {title}"),
+                                format!("Severity: {severity} | Time: {ts_utc}"),
+                                String::new(),
+                                message.to_string(),
+                            ];
+                            if let Some(Value::Object(map)) = &details {
+                                plain_lines.push(String::new());
+                                for (k, v) in map {
+                                    plain_lines.push(format!("• {k}: {v}"));
+                                }
+                            }
+                            let plain_payload = json!({
+                                "chat_id": tg_chat_id,
+                                "text": plain_lines.join("\n"),
+                                "disable_web_page_preview": true,
+                            });
+                            if let Ok(fb_resp) = client.post(&url).json(&plain_payload).send() {
+                                if fb_resp.status().is_success() {
+                                    let fb_body: Value =
+                                        fb_resp.json().unwrap_or_else(|_| json!({}));
+                                    results.push(json!({
+                                        "channel": "TELEGRAM",
+                                        "http_status": 200,
+                                        "chat_id": masked_chat_id,
+                                        "ok": fb_body.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                                    }));
+                                    plain_fallback_succeeded = true;
+                                }
+                            }
+                        }
+                        if !plain_fallback_succeeded {
+                            any_error = true;
+                            if http_status.as_u16() == 429 || http_status.is_server_error() {
+                                retriable_error = true;
+                            }
+                            let raw_err_str = if tg_desc.is_empty() {
+                                format!("HTTP {http_status}")
+                            } else {
+                                format!("HTTP {http_status}: {tg_desc}")
+                            };
+                            let err_str = sanitize_telemetry_message(&raw_err_str);
+                            error_detail = Some(err_str.clone());
+                            results.push(json!({
+                                "channel": "TELEGRAM",
+                                "http_status": http_status.as_u16(),
+                                "error": err_str,
+                            }));
+                        }
                     }
                     Err(e) => {
                         any_error = true;

@@ -537,7 +537,7 @@ impl DatabaseManager {
                 0
             };
             let mut replayed_prereqs: Vec<(i64, String)> = Vec::new();
-            if target_num >= 3 {
+            if target_num >= 2 {
                 for (idx, prereq) in ALL_MIGRATION_FILES.iter().enumerate() {
                     let prereq_num = idx + 1;
                     if prereq_num > max_applied_ver && prereq_num < target_num {

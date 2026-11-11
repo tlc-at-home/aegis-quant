@@ -690,6 +690,8 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
             deployed_notional_usdc: 0.0,
             resting_notional_usdc: 0.0,
             heat_usdc: 0.0,
+            open_positions_count: 0,
+            resting_positions_count: 0,
         });
     let init_cap = pond_pnl.initial_capital_usdc;
     let pond_eq = pond_pnl.book_equity_usdc;

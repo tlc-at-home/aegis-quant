@@ -9,7 +9,7 @@ pub mod scoped;
 pub mod trade_ops;
 
 pub use config_ops::{cast_config_value, ConfigMap};
-pub use pond_ops::{PitPnlComponents, PondPnlComponents};
+pub use pond_ops::{BookPnlComponents, PitPnlComponents, PondPnlComponents};
 pub use scoped::{BookScopedDb, PitConfig, PondConfig};
 
 use crate::fernet::{
@@ -2471,6 +2471,226 @@ mod tests {
             Some(6.0),
             "reconcile_open_pond_cell_size(None) must rescale risk_budget_usdc to 6.0 (R10-S1)"
         );
+    }
+
+    #[test]
+    fn test_r10_qa_twin_parity_invariants() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Identical $5,000 baseline on both books
+        db.set_config_value("pit_initial_capital_usdc", &json!(5000.0))
+            .unwrap();
+        db.set_config_value("book_baseline_equity_usdc", &json!(5000.0))
+            .unwrap();
+        db.set_config_value("pond_baseline_equity_usdc", &json!(5000.0))
+            .unwrap();
+
+        let sym = "SOL/USDC:USDC";
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: sym.to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_762_800_000_000,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 10_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+
+        // 1. Insert resting PIT trade and ARMED Pond cell with identical parameters
+        let tid = db
+            .insert_trade(&aegis_core::TradeRecord {
+                trade_id: 0,
+                client_order_id: "pit-twin-db-1".to_string(),
+                symbol: sym.to_string(),
+                base_asset: "SOL".to_string(),
+                side: "LONG".to_string(),
+                status: "PENDING".to_string(),
+                fsm_state: "OPEN_ON_BOOK".to_string(),
+                entry_price: 100.0,
+                current_price: 100.0,
+                exit_price: None,
+                quantity: 10.0,
+                filled_units: 0.0,
+                avg_fill_price: None,
+                notional_usdc: 1000.0,
+                risk_budget_usdc: 50.0,
+                conviction_multiplier: 1.0,
+                initial_stop_price: 95.0,
+                chandelier_stop_price: 95.0,
+                current_stop_price: 95.0,
+                highest_price_seen: 100.0,
+                lowest_price_seen: 100.0,
+                realized_pnl_usdc: 0.0,
+                unrealized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                funding_accrued_usdc: 0.0,
+                slippage_paid_usd: 0.0,
+                exchange_order_id: Some("oid-pit-db-1".to_string()),
+                opened_at: "2026-11-11T00:00:00Z".to_string(),
+                closed_at: None,
+                exit_reason: None,
+            })
+            .unwrap();
+
+        let mut pond_cell = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: sym.to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(100.0),
+            quantity: Some(10.0),
+            notional_usdc: Some(1000.0),
+            risk_budget_usdc: Some(50.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.4),
+            funding_rate_entry: Some(-0.0001),
+            initial_stop: Some(95.0),
+            chandelier_stop: Some(95.0),
+            highest_price_seen: Some(100.0),
+            lowest_price_seen: Some(100.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: Some("oid-pond-db-1".to_string()),
+            opened_at: Some("2026-11-11T00:00:00Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-11T00:00:00Z".to_string(),
+        };
+        let cid = db.upsert_pond_cell(&pond_cell).unwrap();
+        pond_cell.cell_id = cid;
+
+        // Resting / ARMED parity: deployed = 1000, heat = 0, PnL = 0
+        let pit_resting = db.compute_pit_pnl_components().unwrap();
+        let pond_resting = db.compute_pond_pnl_components().unwrap();
+        assert_eq!(pit_resting, pond_resting);
+        assert_eq!(pit_resting.deployed_notional_usdc, 1000.0);
+        assert_eq!(pit_resting.heat_usdc, 0.0);
+
+        // 2. Promote both to OPEN at 100.0 with 10.0 units and 0.35 entry fee
+        assert!(db
+            .promote_resting_trade_to_open(tid, 10.0, 100.0, 0.35, 0.0)
+            .unwrap());
+        pond_cell.state = "OPEN".to_string();
+        pond_cell.fees_paid_usdc = 0.35;
+        pond_cell.resting_order_id = None;
+        db.upsert_pond_cell(&pond_cell).unwrap();
+        assert_eq!(
+            db.compute_pit_pnl_components().unwrap(),
+            db.compute_pond_pnl_components().unwrap()
+        );
+
+        let assert_pnl_equity_heat_parity = |pit: &BookPnlComponents, pond: &BookPnlComponents| {
+            assert_eq!(pit.initial_capital_usdc, pond.initial_capital_usdc);
+            assert_eq!(pit.closed_realized_pnl_usdc, pond.closed_realized_pnl_usdc);
+            assert_eq!(pit.partial_realized_pnl_usdc, pond.partial_realized_pnl_usdc);
+            assert_eq!(pit.realized_pnl_usdc, pond.realized_pnl_usdc);
+            assert_eq!(pit.unrealized_pnl_usdc, pond.unrealized_pnl_usdc);
+            assert_eq!(pit.funding_pnl_usdc, pond.funding_pnl_usdc);
+            assert_eq!(pit.open_fees_usdc, pond.open_fees_usdc);
+            assert_eq!(pit.yield_pnl_usdc, pond.yield_pnl_usdc);
+            assert_eq!(pit.total_net_pnl_usdc, pond.total_net_pnl_usdc);
+            assert_eq!(pit.transfer_adj_usdc, pond.transfer_adj_usdc);
+            assert_eq!(pit.book_equity_usdc, pond.book_equity_usdc);
+            assert_eq!(pit.resting_notional_usdc, pond.resting_notional_usdc);
+            assert_eq!(pit.heat_usdc, pond.heat_usdc);
+            assert_eq!(pit.open_positions_count, pond.open_positions_count);
+            assert_eq!(pit.resting_positions_count, pond.resting_positions_count);
+        };
+
+        // 3. Mark price moves to 110.0 (+100.0 uPnL)
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: sym.to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_762_803_600_000,
+            open: 100.0,
+            high: 111.0,
+            low: 100.0,
+            close: 110.0,
+            volume: 12_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+        db.update_open_trade(tid, 110.0, 95.0, 110.0, 100.0, 100.0, 0.0)
+            .unwrap();
+        assert_pnl_equity_heat_parity(
+            &db.compute_pit_pnl_components().unwrap(),
+            &db.compute_pond_pnl_components().unwrap(),
+        );
+
+        // 4. 40% partial exit at 110.0 (4.0 units closed -> +40.0 gross realized delta, 0.15 exit fee;
+        // 6.0 units remain -> +60.0 uPnL, 600.0 notional, 30.0 risk budget)
+        db.reduce_open_trade_partial_exit(tid, 6.0, 600.0, 40.0, 0.15, 0.0, 110.0)
+            .unwrap();
+        assert!(db
+            .reduce_open_pond_cell_partial_exit(
+                cid,
+                "TRAILED",
+                Some(95.0),
+                Some(110.0),
+                Some(100.0),
+                6.0,
+                600.0,
+                40.0,
+                0.15,
+            )
+            .unwrap());
+        let pit_partial = db.compute_pit_pnl_components().unwrap();
+        let pond_partial = db.compute_pond_pnl_components().unwrap();
+        assert_pnl_equity_heat_parity(&pit_partial, &pond_partial);
+        assert!((pit_partial.unrealized_pnl_usdc - 60.0).abs() < 1e-6);
+        assert!((pit_partial.partial_realized_pnl_usdc - 40.0).abs() < 1e-6);
+        assert!((pit_partial.open_fees_usdc - 0.50).abs() < 1e-6);
+        assert!((pit_partial.heat_usdc - 30.0).abs() < 1e-6);
+
+        // 5. Hourly funding accrual (-0.25 USDC)
+        assert!(db
+            .accrue_trade_funding_for_hour(tid, 489_668, 110.0, 60.0, -0.25)
+            .unwrap());
+        assert!(db
+            .accrue_pond_cell_funding_for_hour(cid, 489_668, -0.25)
+            .unwrap());
+        assert_pnl_equity_heat_parity(
+            &db.compute_pit_pnl_components().unwrap(),
+            &db.compute_pond_pnl_components().unwrap(),
+        );
+
+        // 6. Close remaining 6.0 units at 110.0 (+60.0 gross, 0.21 final fee; total fees = 0.35 + 0.15 + 0.21 = 0.71,
+        // total net PnL = 40.0 + 60.0 - 0.71 - 0.25 = 99.04)
+        assert!(db
+            .close_trade(tid, 110.0, 99.04, 0.71, "TP_FULL")
+            .unwrap());
+        assert!(db
+            .close_open_pond_cell(
+                cid,
+                "COOLDOWN",
+                Some(95.0),
+                Some(110.0),
+                Some(100.0),
+                110.0,
+                60.0,
+                0.21,
+                Some("TP_FULL"),
+                "2026-11-11T02:00:00Z",
+                "2026-11-12T02:00:00Z",
+            )
+            .unwrap());
+        let pit_closed = db.compute_pit_pnl_components().unwrap();
+        let pond_closed = db.compute_pond_pnl_components().unwrap();
+        assert_eq!(pit_closed, pond_closed);
+        assert!((pit_closed.realized_pnl_usdc - 99.04).abs() < 1e-6);
+        assert!((pit_closed.book_equity_usdc - 5099.04).abs() < 1e-6);
     }
 }
 

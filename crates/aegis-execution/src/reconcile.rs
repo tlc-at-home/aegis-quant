@@ -322,67 +322,23 @@ impl ExecutionEngine {
 
         let mut discrepancies: Vec<Value> = Vec::new();
 
-        // R9-S1: Flag duplicate open rows sharing the same coin within PIT or POND
-        let mut dup_pit_coins: Vec<_> = pit_ids_by_coin
-            .iter()
-            .filter(|(_, ids)| ids.len() > 1)
-            .collect();
-        dup_pit_coins.sort_by_key(|(a, _)| *a);
-        for (coin, ids) in dup_pit_coins {
-            let _ = self.db.log_telemetry(
-                "WARNING",
-                "engine.execution",
-                &format!(
-                    "Detected {} duplicate OPEN PIT trade rows for coin {} (trade_ids={:?})",
-                    ids.len(),
-                    coin,
-                    ids
-                ),
-                Some(json!({
-                    "book": "PIT",
-                    "base_asset": coin,
-                    "count": ids.len(),
-                    "trade_ids": ids,
-                })),
-            );
-            discrepancies.push(json!({
-                "type": "DUPLICATE_SAME_COIN_OPEN_ROWS",
-                "book": "PIT",
-                "base_asset": coin,
-                "count": ids.len(),
-                "trade_ids": ids,
-            }));
-        }
-        let mut dup_pond_coins: Vec<_> = pond_ids_by_coin
-            .iter()
-            .filter(|(_, ids)| ids.len() > 1)
-            .collect();
-        dup_pond_coins.sort_by_key(|(a, _)| *a);
-        for (coin, ids) in dup_pond_coins {
-            let _ = self.db.log_telemetry(
-                "WARNING",
-                "engine.pond",
-                &format!(
-                    "Detected {} duplicate OPEN/TRAILED POND cell rows for coin {} (cell_ids={:?})",
-                    ids.len(),
-                    coin,
-                    ids
-                ),
-                Some(json!({
-                    "book": "POND",
-                    "base_asset": coin,
-                    "count": ids.len(),
-                    "cell_ids": ids,
-                })),
-            );
-            discrepancies.push(json!({
-                "type": "DUPLICATE_SAME_COIN_OPEN_ROWS",
-                "book": "POND",
-                "base_asset": coin,
-                "count": ids.len(),
-                "cell_ids": ids,
-            }));
-        }
+        // R9-S1 / R10-QB: Flag duplicate open rows sharing the same coin within PIT or POND via shared helper
+        self.record_duplicate_same_coin_rows(
+            &pit_ids_by_coin,
+            "PIT",
+            "engine.execution",
+            "trade_ids",
+            "OPEN PIT trade",
+            &mut discrepancies,
+        );
+        self.record_duplicate_same_coin_rows(
+            &pond_ids_by_coin,
+            "POND",
+            "engine.pond",
+            "cell_ids",
+            "OPEN/TRAILED POND cell",
+            &mut discrepancies,
+        );
 
         for lt in &local_trades {
             let coin = lt.base_asset.to_uppercase();
@@ -450,11 +406,21 @@ impl ExecutionEngine {
                         }));
                         continue;
                     }
-                    // R9-S1: Net other same-coin PIT rows when computing expected per-trade size
-                    let ex_qty = szi.abs();
-                    let current_pit_coin_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
-                    let other_pit_qty_on_coin = (current_pit_coin_qty - lt.quantity.abs()).max(0.0);
-                    let residual_pit_qty = (ex_qty - pond_co_qty).max(0.0);
+                    // R9-S1 / R10-QB: Net other same-coin PIT rows when computing expected per-trade size
+                    let is_last_on_coin = pit_ids_by_coin
+                        .get(&coin)
+                        .and_then(|ids| ids.last())
+                        .copied()
+                        == Some(lt.trade_id);
+                    let (other_pit_qty_on_coin, residual_pit_qty, expected_pit_qty) =
+                        Self::compute_same_coin_expected_row_qty(
+                            szi.abs(),
+                            pond_co_qty,
+                            pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0),
+                            initial_pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0),
+                            lt.quantity.abs(),
+                            is_last_on_coin,
+                        );
                     if residual_pit_qty <= 1e-9 {
                         if !open_order_coins.contains(&coin) {
                             if let Err(e) = self.db.close_trade(
@@ -479,25 +445,6 @@ impl ExecutionEngine {
                         }
                         continue;
                     }
-                    let is_last_on_coin = pit_ids_by_coin
-                        .get(&coin)
-                        .and_then(|ids| ids.last())
-                        .copied()
-                        == Some(lt.trade_id);
-                    let initial_pit_coin_qty =
-                        initial_pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
-                    let expected_pit_qty = if (current_pit_coin_qty - residual_pit_qty).abs() <= 1e-6
-                        || is_last_on_coin
-                    {
-                        round_dp((residual_pit_qty - other_pit_qty_on_coin).max(0.0), 6)
-                    } else if initial_pit_coin_qty > 1e-9 {
-                        round_dp(
-                            residual_pit_qty * (lt.quantity.abs() / initial_pit_coin_qty),
-                            6,
-                        )
-                    } else {
-                        0.0
-                    };
                     let mut size_reconciled = false;
                     if (expected_pit_qty - lt.quantity.abs()).abs() > 1e-6 && expected_pit_qty > 0.0
                     {
@@ -650,12 +597,21 @@ impl ExecutionEngine {
                         }));
                         continue;
                     }
-                    // R9-S1: Net other same-coin POND cell rows when computing expected per-cell size
-                    let ex_qty = szi.abs();
-                    let current_pond_coin_qty =
-                        pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
-                    let other_pond_qty_on_coin = (current_pond_coin_qty - local_qty).max(0.0);
-                    let residual_pond_qty = (ex_qty - pit_co_qty).max(0.0);
+                    // R9-S1 / R10-QB: Net other same-coin POND cell rows when computing expected per-cell size
+                    let is_last_on_coin = pond_ids_by_coin
+                        .get(&coin)
+                        .and_then(|ids| ids.last())
+                        .copied()
+                        == Some(cell.cell_id);
+                    let (other_pond_qty_on_coin, residual_pond_qty, expected_pond_qty) =
+                        Self::compute_same_coin_expected_row_qty(
+                            szi.abs(),
+                            pit_co_qty,
+                            pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0),
+                            initial_pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0),
+                            local_qty,
+                            is_last_on_coin,
+                        );
                     if residual_pond_qty <= 1e-9 {
                         if !open_order_coins.contains(&coin) {
                             if let Err(e) = self.db.reconcile_close_phantom_pond_cell(
@@ -678,26 +634,6 @@ impl ExecutionEngine {
                         }
                         continue;
                     }
-                    let is_last_on_coin = pond_ids_by_coin
-                        .get(&coin)
-                        .and_then(|ids| ids.last())
-                        .copied()
-                        == Some(cell.cell_id);
-                    let initial_pond_coin_qty =
-                        initial_pond_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
-                    let expected_pond_qty = if (current_pond_coin_qty - residual_pond_qty).abs()
-                        <= 1e-6
-                        || is_last_on_coin
-                    {
-                        round_dp((residual_pond_qty - other_pond_qty_on_coin).max(0.0), 6)
-                    } else if initial_pond_coin_qty > 1e-9 {
-                        round_dp(
-                            residual_pond_qty * (local_qty / initial_pond_coin_qty),
-                            6,
-                        )
-                    } else {
-                        0.0
-                    };
                     if (expected_pond_qty - local_qty).abs() > 1e-6 && expected_pond_qty > 0.0 {
                         match self.db.reconcile_open_pond_cell_size(
                             cell.cell_id,
@@ -821,5 +757,72 @@ impl ExecutionEngine {
             discrepancies_found: discrepancies.len(),
             discrepancies,
         }
+    }
+
+    /// Logs a telemetry warning and records a `DUPLICATE_SAME_COIN_OPEN_ROWS` discrepancy
+    /// for any coin with multiple active rows within a book (`R9-S1`, `R10-QB`).
+    fn record_duplicate_same_coin_rows(
+        &self,
+        ids_by_coin: &HashMap<String, Vec<i64>>,
+        book: &str,
+        component: &str,
+        id_key: &str,
+        row_label: &str,
+        discrepancies: &mut Vec<Value>,
+    ) {
+        let mut dup_coins: Vec<_> = ids_by_coin
+            .iter()
+            .filter(|(_, ids)| ids.len() > 1)
+            .collect();
+        dup_coins.sort_by_key(|(a, _)| *a);
+        for (coin, ids) in dup_coins {
+            let mut details = serde_json::Map::new();
+            details.insert("book".to_string(), json!(book));
+            details.insert("base_asset".to_string(), json!(coin));
+            details.insert("count".to_string(), json!(ids.len()));
+            details.insert(id_key.to_string(), json!(ids));
+            let _ = self.db.log_telemetry(
+                "WARNING",
+                component,
+                &format!(
+                    "Detected {} duplicate {} rows for coin {} ({}={:?})",
+                    ids.len(),
+                    row_label,
+                    coin,
+                    id_key,
+                    ids
+                ),
+                Some(Value::Object(details.clone())),
+            );
+            details.insert(
+                "type".to_string(),
+                json!("DUPLICATE_SAME_COIN_OPEN_ROWS"),
+            );
+            discrepancies.push(Value::Object(details));
+        }
+    }
+
+    /// Computes `(other_book_qty_on_coin, residual_book_qty, expected_row_qty)` for a single
+    /// PIT trade or Pond cell row when reconciling same-coin positions (`R9-S1`, `R10-QB`).
+    pub(crate) fn compute_same_coin_expected_row_qty(
+        ex_qty: f64,
+        co_book_qty: f64,
+        current_book_coin_qty: f64,
+        initial_book_coin_qty: f64,
+        row_qty: f64,
+        is_last_on_coin: bool,
+    ) -> (f64, f64, f64) {
+        let other_book_qty_on_coin = (current_book_coin_qty - row_qty).max(0.0);
+        let residual_book_qty = (ex_qty - co_book_qty).max(0.0);
+        let expected_row_qty = if (current_book_coin_qty - residual_book_qty).abs() <= 1e-6
+            || is_last_on_coin
+        {
+            round_dp((residual_book_qty - other_book_qty_on_coin).max(0.0), 6)
+        } else if initial_book_coin_qty > 1e-9 {
+            round_dp(residual_book_qty * (row_qty / initial_book_coin_qty), 6)
+        } else {
+            0.0
+        };
+        (other_book_qty_on_coin, residual_book_qty, expected_row_qty)
     }
 }

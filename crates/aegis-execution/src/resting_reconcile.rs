@@ -283,9 +283,20 @@ impl ExecutionEngine {
                 self.check_resting_order_status(r_trade.exchange_order_id.as_deref());
             if r_status.state == "OPEN_ON_BOOK" && !freeze_entries && !is_backtest {
                 if let Some(oid_str) = r_trade.exchange_order_id.as_deref() {
-                    let cancel_confirmed = self
-                        .cancel_resting_order(&r_trade.symbol, oid_str)
-                        .unwrap_or(false);
+                    let cancel_confirmed =
+                        match self.cancel_resting_order(&r_trade.symbol, oid_str) {
+                            Ok(confirmed) => confirmed,
+                            Err(e) => {
+                                tracing::warn!(
+                                    symbol = %r_trade.symbol,
+                                    trade_id = r_trade.trade_id,
+                                    oid = %oid_str,
+                                    error = %e,
+                                    "cancel_resting_order returned Err during resting PIT trade reconciliation (R10-N3)"
+                                );
+                                false
+                            }
+                        };
                     r_status = self.verify_post_cancel_resting_order(
                         &r_trade.symbol,
                         oid_str,

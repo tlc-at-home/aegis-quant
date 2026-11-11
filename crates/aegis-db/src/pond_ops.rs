@@ -11,9 +11,9 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Shared PnL, equity, and exposure components for Book A (`PIT`) (`R10-QA`, `R11-QA`).
+/// Shared PnL, equity, and exposure components for a trading book (`PIT` or `POND`) (`R10-QA`, `R11-QA`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PitPnlComponents {
+pub struct BookPnlComponents {
     pub initial_capital_usdc: f64,
     pub closed_realized_pnl_usdc: f64,
     pub partial_realized_pnl_usdc: f64,
@@ -33,25 +33,8 @@ pub struct PitPnlComponents {
     pub resting_positions_count: usize,
 }
 
-/// Shared PnL, equity, and exposure components for Book B (`POND`) (`R10-QA`, `R11-QA`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PondPnlComponents {
-    pub initial_capital_usdc: f64,
-    pub closed_realized_pnl_usdc: f64,
-    pub partial_realized_pnl_usdc: f64,
-    pub realized_pnl_usdc: f64,
-    pub unrealized_pnl_usdc: f64,
-    pub funding_pnl_usdc: f64,
-    pub open_fees_usdc: f64,
-    pub yield_pnl_usdc: f64,
-    pub total_net_pnl_usdc: f64,
-    pub transfer_adj_usdc: f64,
-    pub book_equity_usdc: f64,
-    pub idle_usdc: f64,
-    pub deployed_notional_usdc: f64,
-    pub resting_notional_usdc: f64,
-    pub heat_usdc: f64,
-}
+pub type PitPnlComponents = BookPnlComponents;
+pub type PondPnlComponents = BookPnlComponents;
 
 impl DatabaseManager {
     pub fn get_books(&self) -> Result<Vec<BookRow>> {
@@ -617,7 +600,7 @@ impl DatabaseManager {
                         chandelier_stop,
                         highest_price_seen,
                         lowest_price_seen,
-                        round_dp(remaining_qty, 6),
+                        round_dp(remaining_qty.abs(), 8),
                         round_dp(remaining_notional, 2),
                         round_dp(realized_pnl_delta, 4),
                         round_dp(fees_delta, 4),
@@ -1625,53 +1608,21 @@ impl DatabaseManager {
         } else {
             round_dp(latest_snap.accrued_yield_usdc, 4)
         };
-        let partial_realized_pnl_usdc = round_dp(raw_partial_realized, 4);
-        let realized_pnl_usdc = round_dp(closed_realized_pnl_usdc + partial_realized_pnl_usdc, 4);
-        let unrealized_pnl_usdc = round_dp(raw_upnl, 4);
-        let funding_pnl_usdc = round_dp(raw_funding, 4);
-        let open_fees_usdc = round_dp(raw_fees, 4);
-        // R3-N8: Subtract entry/partial-fill fees_paid_usdc on open PIT trades symmetrically with Pond cells
-        let total_net_pnl_usdc = round_dp(
-            realized_pnl_usdc + unrealized_pnl_usdc + funding_pnl_usdc - open_fees_usdc
-                + yield_pnl_usdc,
-            4,
-        );
-        let deployed_notional_usdc = round_dp(open_deployed + resting_notional, 2);
-        let resting_notional_usdc = round_dp(resting_notional, 2);
-        let heat_usdc = round_dp(heat, 2);
-        let book_equity_usdc = round_dp(
-            (initial_capital_usdc + transfer_adj_usdc + total_net_pnl_usdc).max(0.0),
-            2,
-        );
-        let mut idle_usdc = round_dp((book_equity_usdc - deployed_notional_usdc).max(0.0), 2);
-        if let Ok((_, perps_trading_eq, vault_eq, total_wallet_deployed)) =
-            self.get_wallet_perps_margin_state()
-        {
-            if vault_eq > 0.0 || total_wallet_deployed > deployed_notional_usdc {
-                let avail_perps_margin =
-                    round_dp((perps_trading_eq - total_wallet_deployed).max(0.0), 2);
-                idle_usdc = idle_usdc.min(avail_perps_margin);
-            }
-        }
-        Ok(PitPnlComponents {
+        Ok(self.finalize_book_pnl_components(
             initial_capital_usdc,
-            closed_realized_pnl_usdc,
-            partial_realized_pnl_usdc,
-            realized_pnl_usdc,
-            unrealized_pnl_usdc,
-            funding_pnl_usdc,
-            open_fees_usdc,
-            yield_pnl_usdc,
-            total_net_pnl_usdc,
             transfer_adj_usdc,
-            book_equity_usdc,
-            idle_usdc,
-            deployed_notional_usdc,
-            resting_notional_usdc,
-            heat_usdc,
+            closed_realized_pnl_usdc,
+            raw_partial_realized,
+            raw_upnl,
+            raw_funding,
+            raw_fees,
+            yield_pnl_usdc,
+            open_deployed,
+            resting_notional,
+            heat,
             open_positions_count,
             resting_positions_count,
-        })
+        ))
     }
 
     /// Single source of truth for Book A (`PIT`) equity and unlocked idle USDC (`R3-H18`, `R3-QC`, `R3-N8`, `R11-QA`).
@@ -1688,6 +1639,8 @@ impl DatabaseManager {
         let closed_realized_pnl_usdc = round_dp(self.get_pond_realized_pnl()?, 4);
         let open_cells = self.get_open_pond_cells()?;
         let armed_cells = self.get_armed_pond_cells()?;
+        let open_positions_count = open_cells.len();
+        let resting_positions_count = armed_cells.len();
         let mut open_deployed = 0.0;
         let mut resting_notional = 0.0;
         let mut heat = 0.0;
@@ -1721,16 +1674,50 @@ impl DatabaseManager {
             raw_funding += c.funding_accrued_usdc;
             raw_fees += c.fees_paid_usdc;
         }
+        // R11-QA: Resting ARMED cells lock deployed notional but do not contribute open stop heat or PnL.
         for ac in &armed_cells {
             resting_notional += ac.notional_usdc.unwrap_or(0.0);
-            heat += ac.risk_budget_usdc.unwrap_or(0.0);
         }
+        Ok(self.finalize_book_pnl_components(
+            initial_capital_usdc,
+            transfer_adj_usdc,
+            closed_realized_pnl_usdc,
+            raw_partial_realized,
+            raw_upnl,
+            raw_funding,
+            raw_fees,
+            0.0,
+            open_deployed,
+            resting_notional,
+            heat,
+            open_positions_count,
+            resting_positions_count,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_book_pnl_components(
+        &self,
+        initial_capital_usdc: f64,
+        transfer_adj_usdc: f64,
+        closed_realized_pnl_usdc: f64,
+        raw_partial_realized: f64,
+        raw_upnl: f64,
+        raw_funding: f64,
+        raw_fees: f64,
+        yield_pnl_usdc: f64,
+        open_deployed: f64,
+        resting_notional: f64,
+        heat: f64,
+        open_positions_count: usize,
+        resting_positions_count: usize,
+    ) -> BookPnlComponents {
         let partial_realized_pnl_usdc = round_dp(raw_partial_realized, 4);
         let realized_pnl_usdc = round_dp(closed_realized_pnl_usdc + partial_realized_pnl_usdc, 4);
         let unrealized_pnl_usdc = round_dp(raw_upnl, 4);
         let funding_pnl_usdc = round_dp(raw_funding, 4);
         let open_fees_usdc = round_dp(raw_fees, 4);
-        let yield_pnl_usdc = 0.0;
+        // R3-N8 / R11-QA: Shared net PnL formula across PIT and POND books
         let total_net_pnl_usdc = round_dp(
             realized_pnl_usdc + unrealized_pnl_usdc + funding_pnl_usdc - open_fees_usdc
                 + yield_pnl_usdc,
@@ -1753,7 +1740,7 @@ impl DatabaseManager {
                 idle_usdc = idle_usdc.min(avail_perps_margin);
             }
         }
-        Ok(PondPnlComponents {
+        BookPnlComponents {
             initial_capital_usdc,
             closed_realized_pnl_usdc,
             partial_realized_pnl_usdc,
@@ -1769,7 +1756,9 @@ impl DatabaseManager {
             deployed_notional_usdc,
             resting_notional_usdc,
             heat_usdc,
-        })
+            open_positions_count,
+            resting_positions_count,
+        }
     }
 
     /// Single source of truth for Book B (`POND`) equity and unlocked idle USDC (`R3-H17`, `R3-QC`, `R11-QA`).

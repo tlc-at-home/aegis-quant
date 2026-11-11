@@ -403,12 +403,6 @@ impl AegisOrchestrator {
                     &msg,
                     serde_json::to_value(&recon).ok(),
                 );
-                self.telemetry.publish_event(
-                    "ERROR",
-                    "engine.orchestrator",
-                    &msg,
-                    serde_json::to_value(&recon).ok(),
-                );
                 if self.reconcile_error_streak == 3 || self.reconcile_error_streak.is_multiple_of(20) {
                     let _ = self.execution.alerts.notify_critical_event(
                         "EXCHANGE_RECONCILE_DEGRADED",

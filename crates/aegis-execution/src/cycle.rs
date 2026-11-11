@@ -550,7 +550,26 @@ impl ExecutionEngine {
                         None
                     },
                     notional_usdc: filled_notional,
-                    risk_budget_usdc: sizing.risk_budget_usdc,
+                    risk_budget_usdc: if is_filled {
+                        if sizing.initial_stop_price > 0.0
+                            && (fill_px - sizing.initial_stop_price).abs() > 1e-12
+                        {
+                            round_dp(
+                                (fill_px - sizing.initial_stop_price).abs() * order_qty.abs(),
+                                4,
+                            )
+                        } else if sizing.quantity > 0.0 {
+                            round_dp(
+                                sizing.risk_budget_usdc
+                                    * (order_qty.abs() / sizing.quantity.abs()),
+                                4,
+                            )
+                        } else {
+                            sizing.risk_budget_usdc
+                        }
+                    } else {
+                        sizing.risk_budget_usdc
+                    },
                     conviction_multiplier: sizing.conviction_multiplier,
                     initial_stop_price: sizing.initial_stop_price,
                     chandelier_stop_price: sizing.initial_stop_price,

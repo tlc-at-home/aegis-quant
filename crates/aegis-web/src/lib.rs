@@ -1303,7 +1303,20 @@ mod tests {
             })
             .expect("insert twin pond cell");
 
-        // 1a. Apply identical 40% partial exit (10.0 -> 6.0) to both PIT trade and POND cell
+        // 1a. Apply identical 40% partial exit (10.0 -> 6.0) to both PIT trade and POND cell at mark_price = 102.0
+        db1.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: 1_794_310_000_000,
+            open: 100.0,
+            high: 102.5,
+            low: 99.5,
+            close: 102.0,
+            volume: 1000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        }])
+        .unwrap();
         db1.reduce_open_trade_partial_exit(pit_trade_id, 6.0, 600.0, 12.0, 0.27, 0.0, 102.0)
             .unwrap();
         assert!(db1
@@ -1346,6 +1359,18 @@ mod tests {
             (t_partial.fees_paid_usdc - c_partial.fees_paid_usdc).abs() < 1e-9,
             "fees_paid_usdc must match between PIT and POND after partial exit"
         );
+        let assert_step_pnl_heat_parity = |db_ref: &DatabaseManager, step: &str| {
+            let pit_c = db_ref.compute_pit_pnl_components().unwrap();
+            let pond_c = db_ref.compute_pond_pnl_components().unwrap();
+            assert_eq!(pit_c.realized_pnl_usdc, pond_c.realized_pnl_usdc, "{step}: realized_pnl_usdc");
+            assert_eq!(pit_c.unrealized_pnl_usdc, pond_c.unrealized_pnl_usdc, "{step}: unrealized_pnl_usdc");
+            assert_eq!(pit_c.funding_pnl_usdc, pond_c.funding_pnl_usdc, "{step}: funding_pnl_usdc");
+            assert_eq!(pit_c.open_fees_usdc, pond_c.open_fees_usdc, "{step}: open_fees_usdc");
+            assert_eq!(pit_c.total_net_pnl_usdc, pond_c.total_net_pnl_usdc, "{step}: total_net_pnl_usdc");
+            assert_eq!(pit_c.book_equity_usdc, pond_c.book_equity_usdc, "{step}: book_equity_usdc");
+            assert_eq!(pit_c.heat_usdc, pond_c.heat_usdc, "{step}: heat_usdc");
+        };
+        assert_step_pnl_heat_parity(&db1, "step 1a (40% partial exit)");
 
         // 1b. Apply reconcile_open_trade_size / reconcile_open_pond_cell_size with Some(101.0) (6.0 -> 3.0, entry_price 100.0 -> 101.0)
         // With initial_stop = 95.0, risk_budget_usdc must recompute to |101.0 - 95.0| * 3.0 = 18.0 on both PIT and POND
@@ -1374,6 +1399,7 @@ mod tests {
         assert_eq!(t_some.notional_usdc, 303.0);
         assert_eq!(t_some.risk_budget_usdc, c_some.risk_budget_usdc.unwrap());
         assert_eq!(t_some.risk_budget_usdc, 18.0);
+        assert_step_pnl_heat_parity(&db1, "step 1b (reconcile_open_*_size Some)");
 
         // 1c. Apply reconcile_open_trade_size / reconcile_open_pond_cell_size with None (3.0 -> 1.5, entry_price stays 101.0)
         // risk_budget_usdc must recompute to |101.0 - 95.0| * 1.5 = 9.0 on both PIT and POND
@@ -1401,6 +1427,7 @@ mod tests {
         assert_eq!(t_none.notional_usdc, 151.5);
         assert_eq!(t_none.risk_budget_usdc, c_none.risk_budget_usdc.unwrap());
         assert_eq!(t_none.risk_budget_usdc, 9.0);
+        assert_step_pnl_heat_parity(&db1, "step 1c (reconcile_open_*_size None)");
 
         // 1d. Close both partially-exited twins at exit_price = 105.0 (final exit fee = 0.08):
         // Verify realized_pnl_usdc transitions cleanly from partial_realized_pnl_usdc into closed_realized_pnl_usdc without double counting

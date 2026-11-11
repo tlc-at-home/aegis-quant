@@ -105,23 +105,16 @@ pub fn compute_wick_context(
         } else {
             bars_1h.len().saturating_sub(6)
         };
-        let min_ts = if opened_at_ms > 0 {
-            opened_at_ms
-        } else {
-            i64::MIN
-        };
         let mut peak_idx = start_idx;
         let mut trough_idx = start_idx;
         for (idx, b) in bars_1h.iter().enumerate().skip(start_idx) {
-            if b.timestamp_ms >= min_ts {
-                if b.high >= watermark_high {
-                    watermark_high = b.high;
-                    peak_idx = idx;
-                }
-                if b.low > 0.0 && b.low <= watermark_low {
-                    watermark_low = b.low;
-                    trough_idx = idx;
-                }
+            if b.high >= watermark_high {
+                watermark_high = b.high;
+                peak_idx = idx;
+            }
+            if b.low > 0.0 && b.low <= watermark_low {
+                watermark_low = b.low;
+                trough_idx = idx;
             }
         }
         let is_long = side.eq_ignore_ascii_case("LONG");
@@ -137,18 +130,16 @@ pub fn compute_wick_context(
             start_idx
         };
         for (idx, b) in bars_1h.iter().enumerate().skip(post_watermark_start) {
-            if b.timestamp_ms >= min_ts {
-                if b.high > post_watermark_high {
-                    post_watermark_high = b.high;
-                    if !is_long {
-                        extreme_bar_idx = idx;
-                    }
+            if b.high > post_watermark_high {
+                post_watermark_high = b.high;
+                if !is_long {
+                    extreme_bar_idx = idx;
                 }
-                if b.low > 0.0 && b.low < post_watermark_low {
-                    post_watermark_low = b.low;
-                    if is_long {
-                        extreme_bar_idx = idx;
-                    }
+            }
+            if b.low > 0.0 && b.low < post_watermark_low {
+                post_watermark_low = b.low;
+                if is_long {
+                    extreme_bar_idx = idx;
                 }
             }
         }
@@ -294,10 +285,22 @@ impl PondOrchestrator {
                 && status.state != "CANCELLED_OR_GONE"
             {
                 if let Some(oid_str) = resting_oid.as_deref() {
-                    cancel_confirmed_at_boundary = self
+                    cancel_confirmed_at_boundary = match self
                         .execution
                         .cancel_resting_order(&cell.symbol, oid_str)
-                        .unwrap_or(false);
+                    {
+                        Ok(confirmed) => confirmed,
+                        Err(e) => {
+                            tracing::warn!(
+                                symbol = %cell.symbol,
+                                cell_id = cell.cell_id,
+                                oid = %oid_str,
+                                error = %e,
+                                "cancel_resting_order returned Err at 1H boundary for ARMED Pond cell (R10-N3)"
+                            );
+                            false
+                        }
+                    };
                     status = self.execution.verify_post_cancel_resting_order(
                         &cell.symbol,
                         oid_str,
@@ -319,9 +322,22 @@ impl PondOrchestrator {
                     } else {
                         round_dp(status.filled_units * fill_px * (maker_fee_bps / 10_000.0), 4)
                     };
+                    let prev_qty = cell.quantity.unwrap_or(0.0);
                     cell.entry_price = Some(fill_px);
                     cell.quantity = Some(status.filled_units);
                     cell.notional_usdc = Some(round_dp(status.filled_units * fill_px, 2));
+                    if let Some(init_stop) = cell
+                        .initial_stop
+                        .filter(|&s| s > 0.0 && (fill_px - s).abs() > 1e-12)
+                    {
+                        cell.risk_budget_usdc =
+                            Some(round_dp((fill_px - init_stop).abs() * status.filled_units, 4));
+                    } else if prev_qty > 0.0 {
+                        if let Some(rb) = cell.risk_budget_usdc {
+                            cell.risk_budget_usdc =
+                                Some(round_dp(rb * (status.filled_units / prev_qty), 4));
+                        }
+                    }
                     cell.fees_paid_usdc = round_dp(cell.fees_paid_usdc + entry_fee, 4);
                     cell.opened_at = Some(now_str.clone());
                     cell.exit_reason = None;
@@ -503,33 +519,20 @@ impl PondOrchestrator {
                 .as_deref()
                 .and_then(parse_utc_timestamp)
                 .map(|dt| dt.and_utc().timestamp_millis());
-            let last_bar_high = last_1h.map(|b| b.high).unwrap_or(mark_px);
-            let last_bar_low = last_1h.map(|b| b.low).unwrap_or(mark_px);
-            let wick_ctx = if let Some(open_ms) = opened_at_ms {
-                compute_wick_context(
-                    &bars_1h,
-                    &cell.side,
-                    open_ms,
-                    cell.highest_price_seen,
-                    cell.lowest_price_seen,
-                    entry_px,
-                )
-            } else {
-                WickContext {
-                    watermark_high: last_bar_high,
-                    watermark_low: last_bar_low,
-                    post_watermark_high: last_bar_high,
-                    post_watermark_low: last_bar_low,
-                    last_bar_high,
-                    last_bar_low,
-                    extreme_bar_idx: bars_1h.len().saturating_sub(1),
-                    atr_14_1h: compute_atr_from_bars(&bars_1h, 14).max(0.01),
-                }
-            };
+            let wick_ctx = compute_wick_context(
+                &bars_1h,
+                &cell.side,
+                opened_at_ms.unwrap_or(0),
+                cell.highest_price_seen,
+                cell.lowest_price_seen,
+                entry_px,
+            );
             let watermark_high = wick_ctx.watermark_high;
             let watermark_low = wick_ctx.watermark_low;
             let high_px = wick_ctx.post_watermark_high;
             let low_px = wick_ctx.post_watermark_low;
+            let last_bar_high = wick_ctx.last_bar_high;
+            let last_bar_low = wick_ctx.last_bar_low;
             let extreme_bar_idx = wick_ctx.extreme_bar_idx;
             let atr_1h_slice = if extreme_bar_idx >= 2 && extreme_bar_idx < bars_1h.len() {
                 &bars_1h[..extreme_bar_idx]
@@ -582,7 +585,21 @@ impl PondOrchestrator {
                     cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
                 }
             }
-            let prev_stop = cell.chandelier_stop.or(cell.initial_stop).unwrap_or(0.0);
+            let prev_init = cell.initial_stop.unwrap_or(0.0);
+            let prev_chand = cell.chandelier_stop.unwrap_or(0.0);
+            let prev_stop = if cell.state == "TRAILED" && prev_chand > 0.0 {
+                if cell.side == "LONG" {
+                    prev_init.max(prev_chand)
+                } else if prev_init > 0.0 {
+                    prev_init.min(prev_chand)
+                } else {
+                    prev_chand
+                }
+            } else if prev_init > 0.0 {
+                prev_init
+            } else {
+                prev_chand
+            };
             let prev_chandelier_stop = cell.chandelier_stop;
             let _price_pnl = update_cell_mark_and_chandelier(
                 &mut cell,
@@ -1216,6 +1233,18 @@ impl PondOrchestrator {
             new_cell.entry_price = Some(fill_px);
             new_cell.quantity = Some(actual_qty);
             new_cell.notional_usdc = Some(fill_notional);
+            if let Some(init_stop) = new_cell
+                .initial_stop
+                .filter(|&s| s > 0.0 && (fill_px - s).abs() > 1e-12)
+            {
+                new_cell.risk_budget_usdc =
+                    Some(round_dp((fill_px - init_stop).abs() * actual_qty, 4));
+            } else if cand.quantity > 0.0 {
+                if let Some(rb) = new_cell.risk_budget_usdc {
+                    new_cell.risk_budget_usdc =
+                        Some(round_dp(rb * (actual_qty / cand.quantity), 4));
+                }
+            }
             new_cell.fees_paid_usdc = fill.fees_paid_usdc;
             new_cell.opened_at = Some(now_str.clone());
             transition_cell_state(&mut new_cell, PondCellState::Open)?;
