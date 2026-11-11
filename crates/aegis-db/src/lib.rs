@@ -2695,5 +2695,159 @@ mod tests {
         assert!((pit_closed.realized_pnl_usdc - 99.04).abs() < 1e-6);
         assert!((pit_closed.book_equity_usdc - 5099.04).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_migration_013_normalizes_open_and_trailed_pond_cell_stops_and_watermarks() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        // Seed pre-open and post-open 1h bars for SOL/USDC:USDC around opened_at = 2026-11-11T12:39:07Z
+        db.upsert_ohlcv_batch(&[
+            aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_380_400_000, // 2026-11-11T07:00:00Z (pre-open crash wick)
+                open: 82.664,
+                high: 83.498,
+                low: 82.415,
+                close: 83.388,
+                volume: 10_000.0,
+                funding_rate_hourly: 0.005,
+                is_synthetic: 0,
+            },
+            aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_402_000_000, // 2026-11-11T13:00:00Z (post-open)
+                open: 92.239,
+                high: 93.081,
+                low: 91.427,
+                close: 93.075,
+                volume: 10_000.0,
+                funding_rate_hourly: 0.005,
+                is_synthetic: 0,
+            },
+            aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_794_409_200_000, // 2026-11-11T15:00:00Z (post-open low 91.224)
+                open: 92.331,
+                high: 93.179,
+                low: 91.224,
+                close: 93.179,
+                volume: 10_000.0,
+                funding_rate_hourly: 0.005,
+                is_synthetic: 0,
+            },
+        ])
+        .unwrap();
+
+        let open_sol_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "SOL/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(92.043),
+                quantity: Some(1.35),
+                notional_usdc: Some(124.26),
+                risk_budget_usdc: Some(6.8241),
+                conviction_multiplier: Some(1.5),
+                funding_z_entry: Some(8.4441),
+                funding_rate_entry: Some(0.005),
+                initial_stop: Some(97.09785714),
+                chandelier_stop: Some(105.06433714),
+                highest_price_seen: Some(93.17),
+                lowest_price_seen: Some(82.415),
+                funding_accrued_usdc: 1.8446,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0559,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-11T12:39:07Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-11T15:41:50Z".to_string(),
+            })
+            .unwrap();
+
+        let trailed_eth_id = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "ETH/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "TRAILED".to_string(),
+                cycle_opened_id: None,
+                side: "SHORT".to_string(),
+                option_analogue: "SHORT_CALL".to_string(),
+                entry_price: Some(3000.0),
+                quantity: Some(0.1),
+                notional_usdc: Some(300.0),
+                risk_budget_usdc: Some(18.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(3.0),
+                funding_rate_entry: Some(0.0002),
+                initial_stop: Some(3300.0), // > 6% cap (3180.0)
+                chandelier_stop: Some(3250.0),
+                highest_price_seen: Some(3010.0),
+                lowest_price_seen: Some(2500.0), // < 0.92 * 3000.0 without OHLCV bars
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-11T13:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-11T15:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        // Rewind schema_migrations to v12 and apply migration 013
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "UPDATE system_config SET config_value = '12' WHERE config_key = 'schema_version';
+                 DELETE FROM schema_migrations WHERE version >= 13;",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        db.apply_migration("sql/migrations/013_v030_round12_remediation.sql")
+            .unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 13);
+
+        let cells = db.get_open_pond_cells().unwrap();
+        let sol = cells.iter().find(|c| c.cell_id == open_sol_id).unwrap();
+        assert!((sol.initial_stop.unwrap() - 97.09785714).abs() < 1e-6);
+        assert!(
+            (sol.chandelier_stop.unwrap() - 97.09785714).abs() < 1e-6,
+            "Migration 013 must clamp SHORT chandelier_stop down to initial_stop"
+        );
+        assert!(
+            (sol.lowest_price_seen.unwrap() - 91.224).abs() < 1e-6,
+            "Migration 013 must replace contaminated 82.415 pre-open low with true 91.224 post-open low"
+        );
+        assert!((sol.highest_price_seen.unwrap() - 93.179).abs() < 1e-6);
+
+        let eth = cells.iter().find(|c| c.cell_id == trailed_eth_id).unwrap();
+        assert!(
+            (eth.initial_stop.unwrap() - 3180.0).abs() < 1e-6,
+            "Migration 013 must cap TRAILED cell initial_stop at 6% (3180.0)"
+        );
+        assert!(
+            (eth.chandelier_stop.unwrap() - 3180.0).abs() < 1e-6,
+            "Migration 013 must clamp TRAILED cell chandelier_stop to capped initial_stop (3180.0)"
+        );
+        assert!(
+            (eth.lowest_price_seen.unwrap() - 3000.0).abs() < 1e-6,
+            "Migration 013 must reset contaminated <0.92*entry_price low on TRAILED cell to entry_price when no post-open bars exist"
+        );
+    }
 }
 

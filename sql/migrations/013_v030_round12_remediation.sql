@@ -40,7 +40,8 @@ WHERE config_key = 'pond_testnet_min_vol_cap_usdc'
   AND CAST(config_value AS REAL) < 5000.0
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 13);
 
--- 4. One-time normalization of open Pond cells to enforce 6% max stop distance and initial_stop floor/ceiling
+-- 4. One-time normalization of open/trailed Pond cells to enforce 6% max stop distance,
+--    initial_stop floor/ceiling, and post-open highest_price_seen / lowest_price_seen watermarks
 UPDATE pond_cells
 SET initial_stop = CASE
         WHEN side = 'LONG' AND entry_price > 0.0 AND (initial_stop IS NULL OR initial_stop < entry_price * 0.94 OR initial_stop >= entry_price)
@@ -69,8 +70,51 @@ SET initial_stop = CASE
                 END
             )
         ELSE chandelier_stop
-    END
-WHERE state = 'OPEN'
+    END,
+    highest_price_seen = COALESCE(
+        MAX(
+            entry_price,
+            COALESCE(
+                (SELECT MAX(m.high) FROM market_ohlcv m
+                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+                   AND pond_cells.opened_at IS NOT NULL
+                   AND m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000),
+                (SELECT MAX(m.high) FROM market_ohlcv m
+                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+                   AND pond_cells.opened_at IS NOT NULL
+                   AND m.high <= pond_cells.entry_price * 1.08
+                   AND m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000)
+            )
+        ),
+        CASE
+            WHEN highest_price_seen IS NULL OR highest_price_seen < entry_price OR highest_price_seen > entry_price * 1.08
+                THEN entry_price
+            ELSE highest_price_seen
+        END
+    ),
+    lowest_price_seen = COALESCE(
+        MIN(
+            entry_price,
+            COALESCE(
+                (SELECT MIN(m.low) FROM market_ohlcv m
+                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+                   AND pond_cells.opened_at IS NOT NULL
+                   AND m.low > 0.0
+                   AND m.timestamp_ms >= CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) * 1000),
+                (SELECT MIN(m.low) FROM market_ohlcv m
+                 WHERE m.symbol = pond_cells.symbol AND m.timeframe = '1h'
+                   AND pond_cells.opened_at IS NOT NULL
+                   AND m.low >= pond_cells.entry_price * 0.92
+                   AND m.timestamp_ms >= (CAST(strftime('%s', pond_cells.opened_at) AS INTEGER) / 3600) * 3600000)
+            )
+        ),
+        CASE
+            WHEN lowest_price_seen IS NULL OR lowest_price_seen <= 0.0 OR lowest_price_seen > entry_price OR lowest_price_seen < entry_price * 0.92
+                THEN entry_price
+            ELSE lowest_price_seen
+        END
+    )
+WHERE state IN ('OPEN', 'TRAILED')
   AND entry_price > 0.0
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 13);
 
