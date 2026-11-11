@@ -340,7 +340,7 @@ impl ExecutionEngine {
                 } else {
                     matches!(
                         self.db.true_up_promoted_trade_from_user_fills(
-                            row_id, fill_qty, fill_px, actual_fee, 0.0,
+                            row_id, fill_qty, fill_px, actual_fee, est_fee,
                         ),
                         Ok(true)
                     )
@@ -745,7 +745,7 @@ impl ExecutionEngine {
                 found_entry_px,
                 covered_qty,
             );
-            Some((uncovered, bounded_px))
+            (bounded_px > 0.0).then_some((uncovered, bounded_px))
         } else {
             None
         }

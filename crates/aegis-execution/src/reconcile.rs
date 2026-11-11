@@ -185,6 +185,10 @@ impl ExecutionEngine {
             })
             .collect();
 
+        if simulated_exchange_positions.is_none() {
+            let _ = self.true_up_pending_fix4_promotions(None);
+        }
+
         let mut local_trades = match self.db.get_open_trades() {
             Ok(trades) => trades,
             Err(e) => {
@@ -229,10 +233,6 @@ impl ExecutionEngine {
             }
         };
         let mut armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
-
-        if simulated_exchange_positions.is_none() {
-            let _ = self.true_up_pending_fix4_promotions(None);
-        }
 
         // In live/testnet mode (or simulated mode with explicit open_orders_slice), if a resting PIT order
         // or ARMED Pond cell is no longer on the exchange openOrders book, poll its fill status or cross-check

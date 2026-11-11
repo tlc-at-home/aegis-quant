@@ -103,20 +103,23 @@ pub fn compute_wick_context(
     let default_stop_dist =
         (2.5 * pre_open_atr_1h).clamp(entry_price * 0.005, entry_price * 0.06);
     let wick_buf = wick_buffer_atr_mult.max(0.0) * pre_open_atr_1h;
+    let cell_stop_dist = active_stop
+        .filter(|&s| s > 0.0)
+        .map(|s| (s - entry_price).abs())
+        .filter(|&d| d > 1e-8)
+        .unwrap_or(default_stop_dist);
     let eff_stop_low = active_stop
         .filter(|&s| s > 0.0 && s < entry_price)
-        .unwrap_or_else(|| (entry_price - default_stop_dist).max(1e-8));
+        .unwrap_or_else(|| (entry_price - cell_stop_dist).max(1e-8));
     let eff_stop_high = active_stop
         .filter(|&s| s > entry_price)
-        .unwrap_or(entry_price + default_stop_dist);
-    let stop_dist_low = (entry_price - eff_stop_low).max(default_stop_dist);
-    let stop_dist_high = (eff_stop_high - entry_price).max(default_stop_dist);
+        .unwrap_or(entry_price + cell_stop_dist);
     let trigger_low = (eff_stop_low - wick_buf).max(1e-8);
     let trigger_high = eff_stop_high + wick_buf;
     let in_band_low_threshold =
-        (entry_price - (stop_dist_low - wick_buf).max(pre_open_atr_1h)).max(1e-8);
+        (entry_price - (cell_stop_dist - wick_buf).max(pre_open_atr_1h)).max(1e-8);
     let in_band_high_threshold =
-        entry_price + (stop_dist_high - wick_buf).max(pre_open_atr_1h);
+        entry_price + (cell_stop_dist - wick_buf).max(pre_open_atr_1h);
 
     let sanitize_bar_high = |b: &OhlcvBar| -> f64 {
         if opened_at_ms > 0 && b.timestamp_ms < opened_at_ms && entry_price > 0.0 {
@@ -336,6 +339,7 @@ impl PondOrchestrator {
     /// - Stale resting orders at a new 1H boundary are cancelled on the exchange first and only transition
     ///   to `REJECTED` if cancellation is confirmed.
     pub fn reconcile_armed_cells(&self, is_1h_boundary: bool) -> Result<usize> {
+        let _ = self.execution.true_up_pending_fix4_promotions(None);
         let armed_cells = self.scoped_db.get_armed_pond_cells()?;
         if armed_cells.is_empty() {
             return Ok(0);

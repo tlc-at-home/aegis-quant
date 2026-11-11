@@ -238,32 +238,31 @@ impl ExecutionEngine {
                     .iter()
                     .filter(|b| b.timestamp_ms >= opened_at_ms)
                     .collect();
-                let opening_partial_bar = recent_1h
-                    .iter()
-                    .rfind(|b| {
-                        b.timestamp_ms < opened_at_ms && b.timestamp_ms + 3_600_000 > opened_at_ms
-                    })
-                    .unwrap_or(last_bar);
-                let (clamped_partial_high, clamped_partial_low) = self
-                    .clamp_pit_opening_partial_bar_range(
+                if post_open_1h.is_empty() {
+                    let opening_partial_bar = recent_1h
+                        .iter()
+                        .rfind(|b| {
+                            b.timestamp_ms < opened_at_ms
+                                && b.timestamp_ms + 3_600_000 > opened_at_ms
+                        })
+                        .unwrap_or(last_bar);
+                    self.clamp_pit_opening_partial_bar_range(
                         &trade,
                         opening_partial_bar.high,
                         opening_partial_bar.low,
                         last_bar.close,
                         atr,
                         &cfg,
-                    );
-                if post_open_1h.is_empty() {
-                    (clamped_partial_high, clamped_partial_low)
+                    )
                 } else {
                     let h = post_open_1h
                         .iter()
                         .map(|b| b.high)
-                        .fold(clamped_partial_high, f64::max);
+                        .fold(last_bar.close, f64::max);
                     let l = post_open_1h
                         .iter()
                         .map(|b| b.low)
-                        .fold(clamped_partial_low, f64::min);
+                        .fold(last_bar.close, f64::min);
                     (h, l)
                 }
             } else {

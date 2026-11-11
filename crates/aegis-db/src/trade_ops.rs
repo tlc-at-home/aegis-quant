@@ -565,8 +565,8 @@ impl DatabaseManager {
         trade_id: i64,
         filled_units: f64,
         avg_fill_price: f64,
-        fees_paid_usdc: f64,
-        slippage_paid_usd: f64,
+        actual_fee_usdc: f64,
+        estimated_fee_usdc: f64,
     ) -> Result<bool> {
         if filled_units <= 0.0
             || avg_fill_price <= 0.0
@@ -578,8 +578,7 @@ impl DatabaseManager {
         let qty = round_dp(filled_units.abs(), 8);
         let px = round_dp(avg_fill_price, 8);
         let notional = round_dp(qty * px, 2);
-        let fee = round_dp(fees_paid_usdc.max(0.0), 4);
-        let slip = round_dp(slippage_paid_usd, 4);
+        let fee_delta = round_dp(actual_fee_usdc.max(0.0) - estimated_fee_usdc.max(0.0), 4);
         self.with_conn(|conn| {
             let rows = conn
                 .execute(
@@ -608,10 +607,9 @@ impl DatabaseManager {
                                  ROUND((CASE WHEN UPPER(side) = 'LONG' THEN (current_price - ?2) ELSE (?2 - current_price) END) * ?1, 4)
                              ELSE unrealized_pnl_usdc
                          END,
-                         fees_paid_usdc = ?4,
-                         slippage_paid_usd = ?5
-                     WHERE trade_id = ?6 AND status = 'OPEN';",
-                    params![qty, px, notional, fee, slip, trade_id],
+                         fees_paid_usdc = MAX(0.0, ROUND(COALESCE(fees_paid_usdc, 0.0) + ?4, 4))
+                     WHERE trade_id = ?5 AND status = 'OPEN';",
+                    params![qty, px, notional, fee_delta, trade_id],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
             Ok(rows > 0)

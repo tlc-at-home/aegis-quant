@@ -2271,14 +2271,45 @@
         db.initialize_schema(true).unwrap();
         let exec = ExecutionEngine::new(db.clone());
 
-        let base_ts = 1_794_300_000_000i64;
-        // Seed 20 1h bars with steady TR = 2.0 (high=101, low=99, close=100) so 1h ATR ≈ 2.0.
-        // With mult_long = 2.2 and wick_buffer_atr = 0.35, init_stop = 95.6, wick_trigger_low ≈ 94.9.
+        let base_ts = 1_794_240_000_000i64;
+        // Seed 20 4h bars and 20 1h bars with steady TR = 2.0 (high=101, low=99, close=100) so ATR ≈ 2.0.
+        // With mult_long = 2.2 and wick_buffer_atr = 0.35, init_stop = 95.6, wick_trigger_low ≈ 94.9
+        // (and symmetrically for SHORT: init_stop = 104.4, wick_trigger_high ≈ 105.1).
+        let mut bars_4h: Vec<aegis_core::OhlcvBar> = (0..19)
+            .map(|i| aegis_core::OhlcvBar {
+                symbol: "SOL/USDC:USDC".to_string(),
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 14_400_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 200_000.0,
+                funding_rate_hourly: 0.0,
+                is_synthetic: 0,
+            })
+            .collect();
+        let latest_4h_ts = base_ts + 19 * 14_400_000;
+        bars_4h.push(aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "4h".to_string(),
+            timestamp_ms: latest_4h_ts,
+            open: 100.0,
+            high: 106.0,
+            low: 93.5,
+            close: 100.0,
+            volume: 200_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        });
+        db.upsert_ohlcv_batch(&bars_4h).unwrap();
+
+        let latest_1h_ts = latest_4h_ts;
         let mut bars_1h: Vec<aegis_core::OhlcvBar> = (0..19)
             .map(|i| aegis_core::OhlcvBar {
                 symbol: "SOL/USDC:USDC".to_string(),
                 timeframe: "1h".to_string(),
-                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                timestamp_ms: latest_1h_ts - ((19 - i) as i64) * 3_600_000,
                 open: 100.0,
                 high: 101.0,
                 low: 99.0,
@@ -2288,7 +2319,6 @@
                 is_synthetic: 0,
             })
             .collect();
-        let latest_1h_ts = base_ts + 19 * 3_600_000;
         bars_1h.push(aegis_core::OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
@@ -2394,7 +2424,8 @@
             is_synthetic: 0,
         }])
         .unwrap();
-        exec.reconcile_cycle(&[eval], false).unwrap();
+        exec.reconcile_cycle(std::slice::from_ref(&eval), false)
+            .unwrap();
         let open_after_beyond = db.get_open_trades().unwrap();
         assert!(
             open_after_beyond.is_empty(),
@@ -2411,6 +2442,35 @@
             closed.exit_reason.as_deref(),
             Some("INTRABAR_LOW_WICK_CHANDELIER_STOP_LONG")
         );
+
+        // Pin Case 3 (Post-Open 1h Bar Transition): Once a post-open 1h bar (timestamp_ms >= opened_at_ms)
+        // exists, an earlier pre-open crash on the opening partial bar (93.5 at latest_1h_ts) must NOT leak
+        // into the post-open evaluation window.
+        let tid_post_open = db.insert_trade(&mk_trade("pit-post-open-1h")).unwrap();
+        let next_1h_ts = latest_1h_ts + 3_600_000;
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: next_1h_ts, // >= opened_at_ms (latest_1h_ts + 30m)
+            open: 100.0,
+            high: 101.0,
+            low: 99.5,
+            close: 100.0,
+            volume: 20_000.0,
+            funding_rate_hourly: 0.0,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+        let mut eval_next_hour = eval;
+        eval_next_hour.timestamp_ms = next_1h_ts + 600_000;
+        exec.reconcile_cycle(&[eval_next_hour], false).unwrap();
+        let open_after_next_hour = db.get_open_trades().unwrap();
+        assert_eq!(
+            open_after_next_hour.len(),
+            1,
+            "Once a post-open 1h bar exists, earlier partial-bar pre-open crash must not leak into post_open_1h fold"
+        );
+        assert_eq!(open_after_next_hour[0].trade_id, tid_post_open);
     }
 
     #[test]
@@ -2626,9 +2686,11 @@
             "R13-N4(a): ARMED cell with no valid entry price must NOT be promoted with magic 100.0"
         );
 
-        // Verify R13-N1 & R13-N4(b): Next-tick userFills true-up updates entry_price, notional, risk_budget, and actual fees
+        // Verify R13-N1 & R13-N4(b): Next-tick userFills true-up updates entry_price (including multi-slice VWAP),
+        // notional, risk_budget, and actual fees
         let fills = vec![
-            json!({ "oid": 222222u64, "sz": "1.0", "px": "94980.0", "fee": "9.498" }),
+            json!({ "oid": 222222u64, "sz": "0.4", "px": "94970.0", "fee": "3.7988" }),
+            json!({ "oid": 222222u64, "sz": "0.6", "px": "94980.0", "fee": "5.6988" }),
             json!({ "oid": 333333u64, "sz": "1.0", "px": "3195.0", "fee": "0.3195" }),
         ];
         let trued_up = exec.true_up_pending_fix4_promotions(Some(&fills));
@@ -2640,10 +2702,10 @@
             .into_iter()
             .find(|t| t.trade_id == resting_tid)
             .unwrap();
-        assert!((trued_btc.entry_price - 94_980.0).abs() < 1e-6);
-        assert!((trued_btc.notional_usdc - 94_980.0).abs() < 1e-2);
-        assert!((trued_btc.risk_budget_usdc - 1_980.0).abs() < 1e-2);
-        assert!((trued_btc.fees_paid_usdc - 9.498).abs() < 1e-4);
+        assert!((trued_btc.entry_price - 94_976.0).abs() < 1e-6);
+        assert!((trued_btc.notional_usdc - 94_976.0).abs() < 1e-2);
+        assert!((trued_btc.risk_budget_usdc - 1_976.0).abs() < 1e-2);
+        assert!((trued_btc.fees_paid_usdc - 9.4976).abs() < 1e-4);
 
         let trued_eth = db
             .get_open_pond_cells()
