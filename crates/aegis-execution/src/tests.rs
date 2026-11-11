@@ -2134,3 +2134,78 @@
         );
         assert_eq!(retry_px(15), "210");
     }
+
+    #[test]
+    fn test_r12_resting_order_race_window_promotes_instead_of_orphan() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // Insert a resting PIT trade (like DOGE Trade #57) with wide ATR stop 0.08976
+        let resting_doge = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "hl-doge-resting-57".to_string(),
+            symbol: "DOGE/USDC:USDC".to_string(),
+            base_asset: "DOGE".to_string(),
+            side: "LONG".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 0.09551,
+            current_price: 0.09551,
+            exit_price: None,
+            quantity: 2594.0,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 247.75,
+            risk_budget_usdc: 14.92,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 0.08976,
+            chandelier_stop_price: 0.08976,
+            current_stop_price: 0.08976,
+            highest_price_seen: 0.09551,
+            lowest_price_seen: 0.09551,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-56343427644".to_string()),
+            opened_at: "2026-11-11T12:38:38Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let tid = db.insert_trade(&resting_doge).unwrap();
+
+        // Simulate the race window: OID 56343427644 is no longer in openOrders (Some(&[])),
+        // while clearinghouseState already holds the filled 2594 DOGE LONG position @ 0.095519
+        let mut on_chain = HashMap::new();
+        on_chain.insert(
+            "DOGE".to_string(),
+            json!({
+                "szi": 2594.0,
+                "entryPx": 0.095519,
+                "markPx": 0.095400,
+                "unrealizedPnl": -0.31
+            }),
+        );
+
+        let rep = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
+        assert_eq!(rep.status, ReconcileStatus::Reconciled);
+        assert!(
+            rep.discrepancies
+                .iter()
+                .all(|d| d.get("type").and_then(serde_json::Value::as_str) != Some("ORPHAN_ON_CHAIN_IMPORTED")),
+            "Resting DOGE order that filled on-chain must NOT be imported as a degraded orphan: {:?}",
+            rep.discrepancies
+        );
+
+        let open_trades = db.get_open_trades().unwrap();
+        assert_eq!(open_trades.len(), 1);
+        let promoted = &open_trades[0];
+        assert_eq!(promoted.trade_id, tid);
+        assert_eq!(promoted.status, "OPEN");
+        assert_eq!(promoted.fsm_state, "FILLED");
+        assert!((promoted.entry_price - 0.095519).abs() < 1e-6);
+        assert!((promoted.initial_stop_price - 0.08976).abs() < 1e-6);
+        assert!((promoted.chandelier_stop_price - 0.08976).abs() < 1e-6);
+    }

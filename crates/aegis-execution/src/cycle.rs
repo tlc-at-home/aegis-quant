@@ -132,6 +132,23 @@ impl ExecutionEngine {
                 .max(2);
             let atr = self.risk.compute_atr(&bars, atr_period);
 
+            let opened_at_ms = aegis_core::parse_utc_timestamp(&trade.opened_at)
+                .map(|dt| dt.and_utc().timestamp_millis())
+                .unwrap_or(0);
+            let bar_window_ms = if asset.exec_timeframe.eq_ignore_ascii_case("1h") {
+                3_600_000
+            } else {
+                14_400_000
+            };
+            let (eval_bar_high, eval_bar_low) = if !is_backtest
+                && opened_at_ms > last_bar.timestamp_ms
+                && opened_at_ms.saturating_sub(last_bar.timestamp_ms) <= bar_window_ms
+            {
+                (last_bar.close, last_bar.close)
+            } else {
+                (last_bar.high, last_bar.low)
+            };
+
             let stop_eval = self.risk.evaluate_two_tier_chandelier_stop(
                 &trade.side,
                 trade.entry_price,
@@ -139,8 +156,8 @@ impl ExecutionEngine {
                 trade.chandelier_stop_price,
                 trade.highest_price_seen,
                 trade.lowest_price_seen,
-                last_bar.high,
-                last_bar.low,
+                eval_bar_high,
+                eval_bar_low,
                 last_bar.close,
                 atr,
                 asset.tick_size,

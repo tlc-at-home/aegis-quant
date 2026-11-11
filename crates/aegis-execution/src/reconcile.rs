@@ -214,28 +214,6 @@ impl ExecutionEngine {
             }
         };
 
-        // In live/testnet mode, if a resting PIT order is no longer on the exchange openOrders book,
-        // poll its fill status immediately during the 15s tick so filled orders promote to OPEN without
-        // waiting up to 15 minutes for the next PIT cycle (`R9-N1`, `R9-N3`, `R9-QB`).
-        if simulated_exchange_positions.is_none()
-            && open_orders_slice.is_some()
-            && !resting_trades.is_empty()
-        {
-            let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
-            if self.poll_resting_pit_trades_on_15s_tick(
-                &resting_trades,
-                &open_order_oids,
-                maker_fee_bps,
-            ) {
-                if let Ok(updated_open) = self.db.get_open_trades() {
-                    local_trades = updated_open;
-                }
-                if let Ok(updated_resting) = self.db.get_resting_pit_trades() {
-                    resting_trades = updated_resting;
-                }
-            }
-        }
-
         let local_pond_cells = match self.db.get_open_pond_cells() {
             Ok(cells) => cells,
             Err(e) => {
@@ -250,6 +228,100 @@ impl ExecutionEngine {
                 };
             }
         };
+
+        // In live/testnet mode (or simulated mode with explicit open_orders_slice), if a resting PIT order
+        // is no longer on the exchange openOrders book, poll its fill status or cross-check ex_positions
+        // immediately during the 15s tick so filled orders promote to OPEN with original stops intact (`R9-N1`, `R9-N3`, `R9-QB`, Fix 4).
+        if open_orders_slice.is_some() && !resting_trades.is_empty() {
+            let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
+            let mut existing_open_qty_by_coin: HashMap<String, f64> = HashMap::new();
+            for lt in &local_trades {
+                *existing_open_qty_by_coin
+                    .entry(lt.base_asset.to_uppercase())
+                    .or_insert(0.0) += lt.quantity.abs();
+            }
+            for cell in &local_pond_cells {
+                let coin = cell
+                    .symbol
+                    .split('/')
+                    .next()
+                    .unwrap_or(&cell.symbol)
+                    .trim()
+                    .to_uppercase();
+                *existing_open_qty_by_coin.entry(coin).or_insert(0.0) +=
+                    cell.quantity.unwrap_or(0.0).abs();
+            }
+
+            let changed = if simulated_exchange_positions.is_none() {
+                self.poll_resting_pit_trades_on_15s_tick(
+                    &resting_trades,
+                    &open_order_oids,
+                    &ex_positions,
+                    &mut existing_open_qty_by_coin,
+                    maker_fee_bps,
+                )
+            } else {
+                let mut promoted_sim = false;
+                for rt in &resting_trades {
+                    let oid_num = rt
+                        .exchange_order_id
+                        .as_deref()
+                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&id| id > 0);
+                    if oid_num
+                        .map(|id| open_order_oids.contains(&id))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let coin = rt.base_asset.to_uppercase();
+                    if let Some(&(szi, ex_entry_px, _, _)) = ex_positions.get(&coin) {
+                        let same_side = (rt.side == "LONG" && szi > 0.0)
+                            || (rt.side == "SHORT" && szi < 0.0);
+                        let already_covered = existing_open_qty_by_coin
+                            .get(&coin)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let uncovered = (szi.abs() - already_covered).max(0.0);
+                        if same_side && uncovered > 1e-6 {
+                            let fill_px = if ex_entry_px > 0.0 {
+                                ex_entry_px
+                            } else {
+                                rt.entry_price
+                            };
+                            let fill_qty = uncovered.min(rt.quantity.max(uncovered));
+                            let fee_usdc =
+                                round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
+                            if matches!(
+                                self.db.promote_resting_trade_to_open(
+                                    rt.trade_id,
+                                    fill_qty,
+                                    fill_px,
+                                    fee_usdc,
+                                    0.0
+                                ),
+                                Ok(true)
+                            ) {
+                                *existing_open_qty_by_coin.entry(coin).or_insert(0.0) +=
+                                    fill_qty.abs();
+                                promoted_sim = true;
+                            }
+                        }
+                    }
+                }
+                promoted_sim
+            };
+
+            if changed {
+                if let Ok(updated_open) = self.db.get_open_trades() {
+                    local_trades = updated_open;
+                }
+                if let Ok(updated_resting) = self.db.get_resting_pit_trades() {
+                    resting_trades = updated_resting;
+                }
+            }
+        }
         let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
 
         // Aggregate local quantities and row IDs per coin across both books (NM-5, NM-10, R9-S1)

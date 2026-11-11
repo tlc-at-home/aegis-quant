@@ -722,9 +722,18 @@ impl SignalEngine {
             rs_composite: f64,
             rs_96: f64,
             r_usdc_8: f64,
+            r_short_max: f64,
+            r_short_min: f64,
             funding_rate_hourly: f64,
             is_unsupported_live: bool,
         }
+
+        let bounce_veto_pct = cfg
+            .get_f64("signal_short_bounce_veto_pct", 0.020)
+            .clamp(0.005, 0.20);
+        let crash_veto_pct = cfg
+            .get_f64("signal_long_crash_veto_pct", 0.020)
+            .clamp(0.005, 0.20);
 
         let mut raw_metrics = Vec::with_capacity(alt_pairs.len());
         for pair in &alt_pairs {
@@ -788,6 +797,22 @@ impl SignalEngine {
             let u_closes: Vec<f64> = usdc_bars.iter().map(|b| b.close.max(1e-12)).collect();
             let (rs_24, rs_72, rs_96, r_usdc_8) =
                 compute_rs_lookbacks(&s_closes, &u_closes, lb_fast, lb_mid, lb_slow, lb_u8);
+            let r_1bar = if u_closes.len() >= 2 {
+                (u_closes[u_closes.len() - 1] / u_closes[u_closes.len() - 2]) - 1.0
+            } else {
+                0.0
+            };
+            let r_2bar = if u_closes.len() >= 3 {
+                (u_closes[u_closes.len() - 1] / u_closes[u_closes.len() - 3]) - 1.0
+            } else {
+                r_1bar
+            };
+            let r_body = usdc_bars
+                .last()
+                .map(|b| (b.close - b.open) / b.open.max(1e-12))
+                .unwrap_or(0.0);
+            let r_short_max = r_1bar.max(r_2bar).max(r_body);
+            let r_short_min = r_1bar.min(r_2bar).min(r_body);
             let rs_composite = scfg.rs_composite_snr_weight * snr_synth
                 + scfg.rs_composite_fast_weight * (rs_24 * scfg.rs_composite_fast_scale).tanh()
                 + scfg.rs_composite_mid_weight * (rs_72 * scfg.rs_composite_mid_scale).tanh();
@@ -807,6 +832,8 @@ impl SignalEngine {
                 rs_composite,
                 rs_96,
                 r_usdc_8,
+                r_short_max,
+                r_short_min,
                 funding_rate_hourly: funding,
                 is_unsupported_live,
             });
@@ -830,7 +857,7 @@ impl SignalEngine {
 
         for (idx, m) in raw_metrics.into_iter().enumerate() {
             let rank = idx + 1;
-            let action = if m.is_unsupported_live {
+            let mut action = if m.is_unsupported_live {
                 "FLAT".to_string()
             } else {
                 Self::classify_signal_action_with_config(
@@ -855,6 +882,11 @@ impl SignalEngine {
                     &scfg,
                 )
             };
+            if (action == "SHORT" && m.r_short_max > bounce_veto_pct)
+                || (action == "LONG" && m.r_short_min < -crash_veto_pct)
+            {
+                action = "FLAT".to_string();
+            }
 
             evaluations.push(SignalEvaluation {
                 eval_id: None,

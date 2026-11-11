@@ -115,21 +115,32 @@ pub fn update_cell_mark_and_chandelier(
     if is_4h_bar_close && atr_14_4h > 0.0 {
         let dist = chandelier_mult * atr_14_4h;
         let cur_chand = cell.chandelier_stop.unwrap_or(0.0);
+        let init_stop = cell.initial_stop.unwrap_or(0.0);
         if cell.side == "LONG" {
             let high_seen = cell.highest_price_seen.unwrap_or(px.0);
-            let candidate = round_dp((high_seen - dist).max(1e-8), 8);
+            let raw_cand = round_dp((high_seen - dist).max(1e-8), 8);
+            let candidate = if init_stop > 0.0 {
+                raw_cand.max(init_stop)
+            } else {
+                raw_cand
+            };
             if candidate > cur_chand {
                 cell.chandelier_stop = Some(candidate);
-                if cell.state == "OPEN" {
+                if cell.state == "OPEN" && (init_stop <= 0.0 || candidate > init_stop + 1e-8) {
                     let _ = transition_cell_state(cell, PondCellState::Trailed);
                 }
             }
         } else {
             let low_seen = cell.lowest_price_seen.unwrap_or(px.0);
-            let candidate = round_dp((low_seen + dist).max(1e-8), 8);
+            let raw_cand = round_dp((low_seen + dist).max(1e-8), 8);
+            let candidate = if init_stop > 0.0 {
+                raw_cand.min(init_stop)
+            } else {
+                raw_cand
+            };
             if cur_chand <= 0.0 || candidate < cur_chand {
                 cell.chandelier_stop = Some(candidate);
-                if cell.state == "OPEN" {
+                if cell.state == "OPEN" && (init_stop <= 0.0 || candidate < init_stop - 1e-8) {
                     let _ = transition_cell_state(cell, PondCellState::Trailed);
                 }
             }
@@ -206,12 +217,23 @@ pub fn evaluate_exit_priority(cell: &PondCell, input: &CellExitEvalInput) -> Cel
         }
     }
 
-    // Tier 2: 4H Bar-Close Chandelier Trail — evaluated only on 4H bar closes
-    if input.is_4h_bar_close && chand_stop > 0.0 {
-        let tier2_breach = if is_long {
-            input.bar_4h_close <= chand_stop
+    // Tier 2: 4H Bar-Close Chandelier Trail — evaluated only on 4H bar closes against effective stop
+    let tier2_stop = if chand_stop > 0.0 {
+        if is_long {
+            init_stop.max(chand_stop)
+        } else if init_stop > 0.0 {
+            init_stop.min(chand_stop)
         } else {
-            input.bar_4h_close >= chand_stop
+            chand_stop
+        }
+    } else {
+        init_stop
+    };
+    if input.is_4h_bar_close && tier2_stop > 0.0 {
+        let tier2_breach = if is_long {
+            input.bar_4h_close <= tier2_stop
+        } else {
+            input.bar_4h_close >= tier2_stop
         };
         if tier2_breach {
             return CellExitDecision {

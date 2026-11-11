@@ -265,7 +265,7 @@ pub struct FullDashboardPayload {
     pub engine_runtime_detail: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthPayload {
     pub status: &'static str,
     pub service: &'static str,
@@ -273,6 +273,9 @@ pub struct HealthPayload {
     pub schema_version: i64,
     pub runtime: &'static str,
     pub architecture: &'static str,
+    pub data_fresh: bool,
+    pub last_bar_timestamp_ms: i64,
+    pub max_bar_staleness_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -604,17 +607,35 @@ pub fn build_portfolio_payload(db: &DatabaseManager) -> Result<PortfolioDashboar
 }
 
 pub fn enrich_pond_cells(db: &DatabaseManager, cells: Vec<PondCell>) -> Vec<EnrichedPondCell> {
+    let mut mark_cache = HashMap::new();
+    enrich_pond_cells_with_marks(db, cells, &mut mark_cache)
+}
+
+pub fn enrich_pond_cells_with_marks(
+    db: &DatabaseManager,
+    cells: Vec<PondCell>,
+    mark_cache: &mut HashMap<String, f64>,
+) -> Vec<EnrichedPondCell> {
     cells
         .into_iter()
         .map(|c| {
             let entry_px = c.entry_price.unwrap_or(0.0);
             let is_open = matches!(c.state.as_str(), "OPEN" | "TRAILED" | "ARMED");
             let current_price = if is_open {
-                db.get_ohlcv_bars(&c.symbol, "1h", 1, None)
-                    .ok()
-                    .and_then(|bars| bars.last().map(|b| b.close))
-                    .filter(|&p| p > 0.0)
-                    .unwrap_or(entry_px)
+                if let Some(&cached_px) = mark_cache.get(&c.symbol) {
+                    cached_px
+                } else {
+                    let px = db
+                        .get_ohlcv_bars(&c.symbol, "1h", 1, None)
+                        .ok()
+                        .and_then(|bars| bars.last().map(|b| b.close))
+                        .filter(|&p| p > 0.0)
+                        .unwrap_or(entry_px);
+                    if px > 0.0 {
+                        mark_cache.insert(c.symbol.clone(), px);
+                    }
+                    px
+                }
             } else {
                 c.exit_price.unwrap_or(entry_px)
             };
@@ -672,26 +693,31 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
     let pond_orch = PondOrchestrator::new(db.clone(), None);
     let pond_cfg = pond_orch.load_pond_config()?;
     let fallback_init_cap = round_dp(pond_cfg.pond_baseline_equity_usdc.max(1.0), 2);
-    let pond_pnl = db
-        .compute_pond_pnl_components()
-        .unwrap_or(PondPnlComponents {
-            initial_capital_usdc: fallback_init_cap,
-            closed_realized_pnl_usdc: 0.0,
-            partial_realized_pnl_usdc: 0.0,
-            realized_pnl_usdc: 0.0,
-            unrealized_pnl_usdc: 0.0,
-            funding_pnl_usdc: 0.0,
-            open_fees_usdc: 0.0,
-            yield_pnl_usdc: 0.0,
-            total_net_pnl_usdc: 0.0,
-            transfer_adj_usdc: 0.0,
-            book_equity_usdc: fallback_init_cap,
-            idle_usdc: fallback_init_cap,
-            deployed_notional_usdc: 0.0,
-            resting_notional_usdc: 0.0,
-            heat_usdc: 0.0,
-            open_positions_count: 0,
-            resting_positions_count: 0,
+    let (pond_pnl, mut mark_cache) = db
+        .compute_pond_pnl_components_with_marks()
+        .unwrap_or_else(|_| {
+            (
+                PondPnlComponents {
+                    initial_capital_usdc: fallback_init_cap,
+                    closed_realized_pnl_usdc: 0.0,
+                    partial_realized_pnl_usdc: 0.0,
+                    realized_pnl_usdc: 0.0,
+                    unrealized_pnl_usdc: 0.0,
+                    funding_pnl_usdc: 0.0,
+                    open_fees_usdc: 0.0,
+                    yield_pnl_usdc: 0.0,
+                    total_net_pnl_usdc: 0.0,
+                    transfer_adj_usdc: 0.0,
+                    book_equity_usdc: fallback_init_cap,
+                    idle_usdc: fallback_init_cap,
+                    deployed_notional_usdc: 0.0,
+                    resting_notional_usdc: 0.0,
+                    heat_usdc: 0.0,
+                    open_positions_count: 0,
+                    resting_positions_count: 0,
+                },
+                HashMap::new(),
+            )
         });
     let init_cap = pond_pnl.initial_capital_usdc;
     let pond_eq = pond_pnl.book_equity_usdc;
@@ -717,8 +743,8 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
         .filter(|c| c.side.eq_ignore_ascii_case("LONG"))
         .count();
 
-    let open_cells = enrich_pond_cells(db, open_cells_raw);
-    let recent_cells = enrich_pond_cells(db, recent_cells_raw);
+    let open_cells = enrich_pond_cells_with_marks(db, open_cells_raw, &mut mark_cache);
+    let recent_cells = enrich_pond_cells_with_marks(db, recent_cells_raw, &mut mark_cache);
 
     let deployed_notional = pond_pnl.deployed_notional_usdc;
     let open_heat = pond_pnl.heat_usdc;

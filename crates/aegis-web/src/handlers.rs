@@ -172,14 +172,55 @@ pub async fn api_auth_logout(State(state): State<AppState>) -> Response {
 
 pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
     let schema_version = state.db.get_schema_version().unwrap_or(-1);
-    Json(HealthPayload {
-        status: "ok",
-        service: "aegis-quant-pp50-rust",
-        version: PLATFORM_VERSION,
-        schema_version,
-        runtime: "RUST_NATIVE",
-        architecture: "PP-50 Dual-Book (Pit + Pond + Daily 00:05 UTC Settling)",
-    })
+    let cfg = state.db.load_config_logged("aegis-web.api_health");
+    let exec_mode = cfg
+        .get_str("execution_mode", "PAPER")
+        .trim()
+        .to_ascii_uppercase();
+    let pond_mode = cfg
+        .get_str("pond_execution_mode", &exec_mode)
+        .trim()
+        .to_ascii_uppercase();
+    let is_live_or_testnet = matches!(exec_mode.as_str(), "LIVE" | "TESTNET")
+        || matches!(pond_mode.as_str(), "LIVE" | "TESTNET");
+    let max_bar_staleness_ms = cfg
+        .get_i64("max_bar_staleness_ms", 21_600_000)
+        .max(60_000);
+    let now_ms = state.db.now_ms();
+    let last_ms: i64 = state
+        .db
+        .with_conn(|conn| {
+            let ts: Option<i64> = conn
+                .query_row("SELECT MAX(timestamp_ms) FROM market_ohlcv;", [], |r| r.get(0))
+                .unwrap_or(None);
+            Ok(ts.unwrap_or(0))
+        })
+        .unwrap_or(0);
+    let data_fresh = if is_live_or_testnet {
+        last_ms > 0 && now_ms.saturating_sub(last_ms) <= max_bar_staleness_ms
+    } else {
+        last_ms > 0
+    };
+    let degraded = schema_version < 0 || (is_live_or_testnet && !data_fresh);
+    let http_status = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        http_status,
+        Json(HealthPayload {
+            status: if degraded { "DEGRADED" } else { "ok" },
+            service: "aegis-quant-pp50-rust",
+            version: PLATFORM_VERSION,
+            schema_version,
+            runtime: "RUST_NATIVE",
+            architecture: "PP-50 Dual-Book (Pit + Pond + Daily 00:05 UTC Settling)",
+            data_fresh,
+            last_bar_timestamp_ms: last_ms,
+            max_bar_staleness_ms,
+        }),
+    )
 }
 
 pub async fn api_status(State(state): State<AppState>) -> Response {

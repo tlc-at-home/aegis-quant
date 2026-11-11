@@ -69,12 +69,13 @@ pub struct WickContext {
 }
 
 /// Computes post-entry price watermarks, post-watermark adverse wick extremes, the index
-/// of the extreme adverse bar, and the crash-bar-excluded 14-period 1H ATR (`R11-N5`, `R11-QB`).
+/// of the extreme adverse bar, and the crash-bar-excluded 1H ATR (`R11-N5`, `R11-QB`, `R12-S1`).
 ///
 /// When `opened_at_ms > 0`, scans all bars in `bars_1h` from the first bar with
-/// `b.timestamp_ms >= opened_at_ms` (falling back to `bars_1h.len().saturating_sub(6)` when
-/// `opened_at_ms <= 0` or when no bar satisfies `b.timestamp_ms >= opened_at_ms`) so even an
-/// engine outage longer than 6 hours catches any stop-breaching wicks during the downtime.
+/// `b.timestamp_ms >= opened_at_ms`. When `position()` is `None` (the cell opened mid-hour
+/// after the latest bar's `timestamp_ms`), falls back to the last bar (`bars_1h.len().saturating_sub(1)`)
+/// so pre-open wicks on earlier bars never contaminate watermarks (`R12-S1`). Keeps the
+/// `bars_1h.len().saturating_sub(6)` fallback only when `opened_at_ms <= 0`.
 pub fn compute_wick_context(
     bars_1h: &[OhlcvBar],
     side: &str,
@@ -82,6 +83,7 @@ pub fn compute_wick_context(
     stored_high: Option<f64>,
     stored_low: Option<f64>,
     entry_price: f64,
+    atr_period: usize,
 ) -> WickContext {
     let last_1h = bars_1h.last();
     let mark_px = last_1h
@@ -101,7 +103,7 @@ pub fn compute_wick_context(
             bars_1h
                 .iter()
                 .position(|b| b.timestamp_ms >= opened_at_ms)
-                .unwrap_or_else(|| bars_1h.len().saturating_sub(6))
+                .unwrap_or_else(|| bars_1h.len().saturating_sub(1))
         } else {
             bars_1h.len().saturating_sub(6)
         };
@@ -150,7 +152,7 @@ pub fn compute_wick_context(
     } else {
         bars_1h
     };
-    let atr_14_1h = compute_atr_from_bars(atr_1h_slice, 14).max(0.01);
+    let atr_14_1h = compute_atr_from_bars(atr_1h_slice, atr_period.max(1)).max(0.01);
 
     WickContext {
         watermark_high,
@@ -324,6 +326,8 @@ impl PondOrchestrator {
                     };
                     let prev_qty = cell.quantity.unwrap_or(0.0);
                     cell.entry_price = Some(fill_px);
+                    cell.highest_price_seen = Some(fill_px);
+                    cell.lowest_price_seen = Some(fill_px);
                     cell.quantity = Some(status.filled_units);
                     cell.notional_usdc = Some(round_dp(status.filled_units * fill_px, 2));
                     if let Some(init_stop) = cell
@@ -526,6 +530,7 @@ impl PondOrchestrator {
                 cell.highest_price_seen,
                 cell.lowest_price_seen,
                 entry_px,
+                cfg.pond_atr_period.max(1),
             );
             let watermark_high = wick_ctx.watermark_high;
             let watermark_low = wick_ctx.watermark_low;
@@ -533,17 +538,7 @@ impl PondOrchestrator {
             let low_px = wick_ctx.post_watermark_low;
             let last_bar_high = wick_ctx.last_bar_high;
             let last_bar_low = wick_ctx.last_bar_low;
-            let extreme_bar_idx = wick_ctx.extreme_bar_idx;
-            let atr_1h_slice = if extreme_bar_idx >= 2 && extreme_bar_idx < bars_1h.len() {
-                &bars_1h[..extreme_bar_idx]
-            } else {
-                &bars_1h[..]
-            };
-            let atr_1h = if cfg.pond_atr_period.max(1) == 14 {
-                wick_ctx.atr_14_1h
-            } else {
-                compute_atr_from_bars(atr_1h_slice, cfg.pond_atr_period.max(1)).max(0.01)
-            };
+            let atr_1h = wick_ctx.atr_14_1h;
             let atr_4h = compute_atr_from_bars(&bars_4h, cfg.pond_atr_period.max(1))
                 .max(atr_1h * cfg.pond_gate6_atr_4h_floor_mult);
             let bars_1h_fresh = !is_live_or_testnet
@@ -803,6 +798,10 @@ impl PondOrchestrator {
 
     /// Executes a scheduled Book B (`POND`) step: hourly S-Cycle scan on UTC hour boundary
     /// (with 4H close flag on 4H boundary), or 15s tick otherwise (`R5-M3`, `R6-QA`).
+    ///
+    /// On startup or mid-hour daemon restart (`last_scan_hour_bucket == None` / `last_4h_close_bucket == None`),
+    /// seeds bucket trackers from the latest `pond_scan_cycles.started_at` row so a restart inside an
+    /// already-scanned UTC hour or 4H window does not fire an unscheduled S-Cycle scan or false 4H bar close.
     pub fn run_scheduled_step(
         &self,
         last_scan_hour_bucket: &mut Option<i64>,
@@ -811,6 +810,24 @@ impl PondOrchestrator {
         let now_ms = self.scoped_db.now_ms();
         let now_hour_bucket = now_ms / 3_600_000;
         let now_4h_bucket = now_ms / 14_400_000;
+        if last_scan_hour_bucket.is_none() || last_4h_close_bucket.is_none() {
+            if let Ok(cycles) = self.scoped_db.get_recent_pond_scan_cycles(1) {
+                if let Some(latest_ms) = cycles
+                    .first()
+                    .and_then(|c| parse_utc_timestamp(&c.started_at))
+                    .map(|dt| dt.and_utc().timestamp_millis())
+                {
+                    if last_scan_hour_bucket.is_none() {
+                        *last_scan_hour_bucket = Some(latest_ms / 3_600_000);
+                    }
+                    if last_4h_close_bucket.is_none() {
+                        *last_4h_close_bucket = Some(latest_ms / 14_400_000);
+                    }
+                } else if last_4h_close_bucket.is_none() && now_hour_bucket % 4 != 0 {
+                    *last_4h_close_bucket = Some(now_4h_bucket);
+                }
+            }
+        }
         let is_hourly_scan = *last_scan_hour_bucket != Some(now_hour_bucket);
         let is_4h_close = *last_4h_close_bucket != Some(now_4h_bucket);
 
@@ -818,9 +835,7 @@ impl PondOrchestrator {
             match self.run_scan_cycle(is_4h_close) {
                 Ok(summary) => {
                     *last_scan_hour_bucket = Some(now_hour_bucket);
-                    if is_4h_close {
-                        *last_4h_close_bucket = Some(now_4h_bucket);
-                    }
+                    *last_4h_close_bucket = Some(now_4h_bucket);
                     Ok(Some(summary))
                 }
                 Err(e) => {
@@ -1107,8 +1122,8 @@ impl PondOrchestrator {
                 funding_rate_entry: Some(cand.funding_rate_hourly),
                 initial_stop: Some(cand.initial_stop_price),
                 chandelier_stop: Some(cand.chandelier_stop_price),
-                highest_price_seen: Some(cand.bar_high.max(cand.reference_price)),
-                lowest_price_seen: Some(cand.bar_low.min(cand.reference_price)),
+                highest_price_seen: Some(cand.reference_price),
+                lowest_price_seen: Some(cand.reference_price),
                 funding_accrued_usdc: 0.0,
                 realized_pnl_usdc: 0.0,
                 fees_paid_usdc: 0.0,
@@ -1231,6 +1246,8 @@ impl PondOrchestrator {
             };
             let fill_notional = round_dp(actual_qty * fill_px, 2);
             new_cell.entry_price = Some(fill_px);
+            new_cell.highest_price_seen = Some(fill_px);
+            new_cell.lowest_price_seen = Some(fill_px);
             new_cell.quantity = Some(actual_qty);
             new_cell.notional_usdc = Some(fill_notional);
             if let Some(init_stop) = new_cell
@@ -2566,6 +2583,30 @@ mod tests {
                 expected_post_low: 82.0,
                 expected_extreme_idx: 4,
             },
+            // Scenario 6b (R12-S1): opened_at_ms is newer than the newest bar's timestamp_ms (mid-hour open 15m into bar 5)
+            // while an earlier bar (bar 2) has a deep pre-open wick (72.0). Fallback clamps to last bar (idx 5),
+            // so the pre-open low (72.0) does NOT contaminate watermark_low or post_watermark_low!
+            Case {
+                name: "open_newer_than_newest_bar_clamps_to_last_bar_ignoring_pre_open_wicks",
+                bars: vec![
+                    mk_bar(0, 100.0, 101.0, 99.0, 100.0),
+                    mk_bar(1, 100.0, 102.0, 98.0, 101.0),
+                    mk_bar(2, 101.0, 103.0, 72.0, 100.0), // deep pre-open wick 3h before open
+                    mk_bar(3, 100.0, 101.5, 99.0, 100.5),
+                    mk_bar(4, 100.5, 102.0, 99.5, 101.0),
+                    mk_bar(5, 101.0, 103.0, 99.0, 102.0), // newest bar (timestamp = base_ts + 5h)
+                ],
+                side: "LONG",
+                opened_at_ms: base_ts + 5 * 3_600_000 + 900_000, // 15m after newest bar's timestamp_ms
+                stored_high: Some(102.0),
+                stored_low: Some(102.0),
+                entry_price: 102.0,
+                expected_watermark_high: 103.0,
+                expected_watermark_low: 99.0,
+                expected_post_high: 103.0,
+                expected_post_low: 99.0,
+                expected_extreme_idx: 5,
+            },
         ];
 
         for c in &cases {
@@ -2576,6 +2617,7 @@ mod tests {
                 c.stored_high,
                 c.stored_low,
                 c.entry_price,
+                14,
             );
             assert!(
                 (ctx.watermark_high - c.expected_watermark_high).abs() < 1e-6,
@@ -2636,6 +2678,7 @@ mod tests {
             Some(102.0),
             Some(99.0),
             100.0,
+            14,
         );
         assert_eq!(ctx_idx1.extreme_bar_idx, 1);
         assert!(
@@ -2744,6 +2787,121 @@ mod tests {
         assert_eq!(
             closed_b.exit_reason.as_deref(),
             Some("TIER1_CATASTROPHIC_WICK_STOP")
+        );
+    }
+
+    #[test]
+    fn test_r12_mid_hour_restart_seeds_scan_and_4h_buckets_from_db() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        let _ = orch.initialize_or_refresh_universe().unwrap();
+
+        let mut scan_bucket: Option<i64> = None;
+        let mut close_bucket: Option<i64> = None;
+
+        // First call on empty pond_scan_cycles runs the hourly scan and records a PondScanCycle row
+        let first_step = orch
+            .run_scheduled_step(&mut scan_bucket, &mut close_bucket)
+            .unwrap();
+        assert!(first_step.is_some(), "Initial step on empty DB should run scan cycle");
+        assert!(scan_bucket.is_some());
+        assert!(close_bucket.is_some());
+        let cycles_after_first = orch.scoped_db.get_recent_pond_scan_cycles(10).unwrap();
+        assert_eq!(cycles_after_first.len(), 1);
+
+        // Simulate daemon restart within the same UTC hour (in-memory buckets reset to None)
+        let mut restarted_scan_bucket: Option<i64> = None;
+        let mut restarted_close_bucket: Option<i64> = None;
+        let restart_step = orch
+            .run_scheduled_step(&mut restarted_scan_bucket, &mut restarted_close_bucket)
+            .unwrap();
+        assert!(
+            restart_step.is_none(),
+            "Mid-hour daemon restart must seed buckets from pond_scan_cycles and run 15s tick instead of duplicate S-Cycle scan"
+        );
+        assert_eq!(restarted_scan_bucket, scan_bucket);
+        assert_eq!(restarted_close_bucket, close_bucket);
+        let cycles_after_restart = orch.scoped_db.get_recent_pond_scan_cycles(10).unwrap();
+        assert_eq!(cycles_after_restart.len(), 1);
+    }
+
+    #[test]
+    fn test_r12_tier2_chandelier_stop_clamped_by_initial_stop_and_gate5_6h_veto() {
+        // 1. Verify update_cell_mark_and_chandelier clamps candidate against initial_stop
+        // and does not transition OPEN -> TRAILED when raw candidate is looser than initial_stop
+        let mut long_cell = PondCell {
+            cell_id: 1,
+            symbol: "INIT/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: Some(1),
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(0.064014),
+            quantity: Some(5044.0),
+            notional_usdc: Some(322.89),
+            risk_budget_usdc: Some(31.50),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-3.0),
+            funding_rate_entry: Some(-0.0005),
+            initial_stop: Some(0.056178),
+            chandelier_stop: Some(0.056178),
+            highest_price_seen: Some(0.064100),
+            lowest_price_seen: Some(0.064014),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-11-11T12:00:05Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: String::new(),
+        };
+
+        // Wide 4H ATR produces raw_cand = 0.0641 - 3.2 * 0.008568 = 0.03668 < initial_stop (0.056178)
+        let _ = update_cell_mark_and_chandelier(
+            &mut long_cell,
+            0.0600,
+            0.0641,
+            0.0600,
+            0.008568,
+            3.2,
+            true,
+        );
+        assert_eq!(
+            long_cell.chandelier_stop,
+            Some(0.056178),
+            "chandelier_stop must never be looser than initial_stop"
+        );
+        assert_eq!(
+            long_cell.state, "OPEN",
+            "Cell must remain OPEN when chandelier candidate did not improve beyond initial_stop"
+        );
+
+        // Even if a legacy row has chandelier_stop looser than initial_stop (0.048 < 0.056178),
+        // Tier 2 on 4H close must evaluate against the tighter initial_stop (0.056178)
+        long_cell.chandelier_stop = Some(0.04825152);
+        let d_tier2 = evaluate_exit_priority(
+            &long_cell,
+            &CellExitEvalInput {
+                mark_price: 0.0550,
+                intrabar_high: 0.0580,
+                intrabar_low: 0.0550,
+                bar_4h_close: 0.0550,
+                is_4h_bar_close: true,
+                atr_14_1h: 0.0040,
+                wick_buffer_atr_mult: 0.85,
+                ..Default::default()
+            },
+        );
+        assert!(d_tier2.should_exit);
+        assert_eq!(d_tier2.tier, Some(2));
+        assert_eq!(
+            d_tier2.exit_reason.as_deref(),
+            Some("TIER2_4H_CHANDELIER_TRAIL")
         );
     }
 }

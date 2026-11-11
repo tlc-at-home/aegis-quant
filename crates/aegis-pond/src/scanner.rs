@@ -239,6 +239,41 @@ pub fn evaluate_asset_gates_1_to_6(
         if adverse_move > params.blowoff_3h_adverse_atr_mult * atr_1h {
             return Err("GATE5_3H_PARABOLIC_MOMENTUM_VETO");
         }
+        let recent_6h = &input.bars_1h[input.bars_1h.len().saturating_sub(6)..];
+        let (adverse_from_6h_extreme, adverse_6h_pct) = match side {
+            PondSide::Short => {
+                let trough_6h = recent_6h
+                    .iter()
+                    .filter(|b| b.low > 0.0)
+                    .map(|b| b.low)
+                    .fold(last_1h.close, f64::min);
+                let move_up = (last_1h.close - trough_6h).max(0.0);
+                let pct = if trough_6h > 0.0 {
+                    move_up / trough_6h
+                } else {
+                    0.0
+                };
+                (move_up, pct)
+            }
+            PondSide::Long => {
+                let peak_6h = recent_6h
+                    .iter()
+                    .map(|b| b.high)
+                    .fold(last_1h.close, f64::max);
+                let move_down = (peak_6h - last_1h.close).max(0.0);
+                let pct = if peak_6h > 0.0 {
+                    move_down / peak_6h
+                } else {
+                    0.0
+                };
+                (move_down, pct)
+            }
+        };
+        if adverse_from_6h_extreme > (params.blowoff_3h_adverse_atr_mult + 1.0) * atr_1h
+            || adverse_6h_pct > 0.10
+        {
+            return Err("GATE5_3H_PARABOLIC_MOMENTUM_VETO");
+        }
     }
 
     // Gate 6: 4H Structural Momentum & EMA_64 Overextension Veto (Blueprint Section 4.4)
@@ -394,10 +429,10 @@ pub fn run_nps01_scan(
             continue;
         };
         let ref_px = Price::new_clamped(last_1h.close);
-        let stop_distance = Price::new_clamped(
-            (params.initial_stop_atr_mult * atr_1h)
-                .max(ref_px.as_f64() * params.min_stop_pct_floor.max(0.0001)),
-        );
+        let floor_pct = params.min_stop_pct_floor.max(0.0001);
+        let cap_pct = 0.06_f64.max(floor_pct);
+        let raw_stop_dist = (params.initial_stop_atr_mult * atr_1h).max(ref_px.as_f64() * floor_pct);
+        let stop_distance = Price::new_clamped(raw_stop_dist.min(ref_px.as_f64() * cap_pct));
 
         // Conviction-scaled cell risk budget [conviction_scale_min, conviction_scale_max] of baseline risk
         let conviction_scale = ((z_t.abs() - params.z_entry_threshold)
@@ -445,14 +480,16 @@ pub fn run_nps01_scan(
         let chandelier_dist = params.chandelier_atr_mult * atr_4h;
 
         let (initial_stop, chandelier_stop) = match side {
-            PondSide::Long => (
-                round_dp((ref_px.as_f64() - stop_distance.as_f64()).max(1e-8), 8),
-                round_dp((last_1h.high - chandelier_dist).max(1e-8), 8),
-            ),
-            PondSide::Short => (
-                round_dp(ref_px.as_f64() + stop_distance.as_f64(), 8),
-                round_dp(last_1h.low + chandelier_dist, 8),
-            ),
+            PondSide::Long => {
+                let init_s = round_dp((ref_px.as_f64() - stop_distance.as_f64()).max(1e-8), 8);
+                let raw_chand = round_dp((ref_px.as_f64() - chandelier_dist).max(1e-8), 8);
+                (init_s, raw_chand.max(init_s))
+            }
+            PondSide::Short => {
+                let init_s = round_dp(ref_px.as_f64() + stop_distance.as_f64(), 8);
+                let raw_chand = round_dp(ref_px.as_f64() + chandelier_dist, 8);
+                (init_s, raw_chand.min(init_s))
+            }
         };
 
         open_cells += 1;

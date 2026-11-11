@@ -246,6 +246,8 @@ fn is_request_authorized_with_config(
         || path == "/"
         || path == "/static/app.js"
         || path == "/app.js"
+        || path == "/health"
+        || path == "/api/health"
         || path == "/api/v1/health"
         || path == "/api/v1/auth/login"
         || path == "/api/auth/login"
@@ -484,6 +486,8 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/auth/login", post(api_auth_login))
         .route("/api/v1/auth/logout", post(api_auth_logout))
         .route("/api/auth/logout", post(api_auth_logout))
+        .route("/health", get(api_health))
+        .route("/api/health", get(api_health))
         .route("/api/v1/health", get(api_health))
         .route("/api/v1/status", get(api_status))
         .route("/api/status", get(api_status))
@@ -1987,17 +1991,184 @@ mod tests {
         )
         .expect("read web/static/app.js");
         assert!(
-            app_js_src.contains("const upnl = (t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0);"),
-            "web/static/app.js openTrades row must compute unrealized + realized + funding - fees (R11-N2, R11-QA)"
+            app_js_src.contains(
+                "function computeRowPnl(row, isOpen = true) {\n  if (!row) return 0;\n  return isOpen\n    ? ((row.unrealized_pnl_usdc || 0) + (row.realized_pnl_usdc || 0) + (row.funding_accrued_usdc || 0) - (row.fees_paid_usdc || 0))\n    : (row.realized_pnl_usdc || 0);\n}"
+            ),
+            "web/static/app.js must define shared computeRowPnl(row, isOpen) helper (R11-N2, R11-QA, R12-QA)"
         );
         assert!(
-            app_js_src.contains("const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0)) : (t.realized_pnl_usdc || 0);"),
-            "web/static/app.js recentTrades OPEN row must compute unrealized + realized + funding - fees (R11-N2, R11-QA)"
+            app_js_src.contains("const upnl = computeRowPnl(t, true);"),
+            "web/static/app.js openTrades row must delegate to computeRowPnl(t, true) (R12-QA)"
         );
         assert!(
-            app_js_src.contains("? ((c.unrealized_pnl_usdc || 0) + (c.realized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))"),
-            "web/static/app.js recentCells OPEN row must compute unrealized + realized + funding - fees (R11-QA)"
+            app_js_src.contains("const pnl = computeRowPnl(t, tradeState === 'OPEN');"),
+            "web/static/app.js recentTrades row must delegate to computeRowPnl(t, tradeState === 'OPEN') (R12-QA)"
         );
+        assert!(
+            app_js_src.contains("const netPnl = computeRowPnl(c, isOpen);"),
+            "web/static/app.js recentCells row must delegate to computeRowPnl(c, isOpen) (R12-QA)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_r12_n1_api_health_staleness_guard_and_pond_mark_dedup() {
+        let root = resolve_project_root();
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).expect("init schema");
+        let now_ms = db.now_ms();
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 1. In PAPER mode with no bars yet, /health returns 200 OK (status: "ok", data_fresh: false)
+        let req_paper_empty = axum::http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp_paper_empty = app.clone().oneshot(req_paper_empty).await.unwrap();
+        assert_eq!(resp_paper_empty.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp_paper_empty.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_paper_empty: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json_paper_empty["status"], "ok");
+        assert_eq!(json_paper_empty["data_fresh"], false);
+
+        // 2. Insert a bar older than max_bar_staleness_ms (10h old > 8h). In PAPER mode, data_fresh only requires last_ms > 0 -> true, 200 OK.
+        let stale_bar_ts = now_ms - 10 * 3_600_000;
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "BTC/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: stale_bar_ts,
+            open: 90_000.0,
+            high: 90_500.0,
+            low: 89_500.0,
+            close: 90_100.0,
+            volume: 100.0,
+            funding_rate_hourly: 0.0001,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+
+        let req_paper_stale = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp_paper_stale = app.clone().oneshot(req_paper_stale).await.unwrap();
+        assert_eq!(resp_paper_stale.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp_paper_stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_paper_stale: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json_paper_stale["status"], "ok");
+        assert_eq!(json_paper_stale["data_fresh"], true);
+
+        // 3. Switch to TESTNET mode -> 7h-old bar exceeds max_bar_staleness_ms (6h) -> 503 Service Unavailable, status: "DEGRADED"
+        db.configure_hyperliquid_credentials(
+            Some("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+            Some("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+            Some(true),
+            Some("TESTNET"),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let req_testnet_stale = axum::http::Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp_testnet_stale = app.clone().oneshot(req_testnet_stale).await.unwrap();
+        assert_eq!(resp_testnet_stale.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_bytes = axum::body::to_bytes(resp_testnet_stale.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_testnet_stale: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json_testnet_stale["status"], "DEGRADED");
+        assert_eq!(json_testnet_stale["data_fresh"], false);
+
+        // 4. Insert a fresh 1h bar (10m old) -> TESTNET /health returns 200 OK, status: "ok", data_fresh: true
+        let fresh_bar_ts = now_ms - 600_000;
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "BTC/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: fresh_bar_ts,
+            open: 90_100.0,
+            high: 90_800.0,
+            low: 90_000.0,
+            close: 90_600.0,
+            volume: 120.0,
+            funding_rate_hourly: 0.0001,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+
+        let req_testnet_fresh = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/health")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let resp_testnet_fresh = app.clone().oneshot(req_testnet_fresh).await.unwrap();
+        assert_eq!(resp_testnet_fresh.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp_testnet_fresh.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_testnet_fresh: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json_testnet_fresh["status"], "ok");
+        assert_eq!(json_testnet_fresh["data_fresh"], true);
+
+        // 5. Verify R12-N3: compute_pond_pnl_components_with_marks populates mark_cache and enrich_pond_cells_with_marks reuses it
+        let _ = db
+            .upsert_pond_cell(&aegis_core::PondCell {
+                cell_id: 0,
+                symbol: "BTC/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(90_000.0),
+                quantity: Some(0.01),
+                notional_usdc: Some(900.0),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.0),
+                funding_rate_entry: Some(-0.0001),
+                initial_stop: Some(87_500.0),
+                chandelier_stop: Some(87_500.0),
+                highest_price_seen: Some(90_600.0),
+                lowest_price_seen: Some(90_000.0),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some("2026-11-11T00:00:00Z".to_string()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: "2026-11-11T00:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        let (pond_pnl, mut mark_cache) = db.compute_pond_pnl_components_with_marks().unwrap();
+        assert_eq!(mark_cache.get("BTC/USDC:USDC").copied(), Some(90_600.0));
+        assert!((pond_pnl.unrealized_pnl_usdc - 6.0).abs() < 1e-6);
+
+        // Override mark_cache value to prove enrich_pond_cells_with_marks reads from mark_cache without re-querying SQLite
+        mark_cache.insert("BTC/USDC:USDC".to_string(), 91_000.0);
+        let open_cells = db.get_open_pond_cells().unwrap();
+        let enriched =
+            crate::payloads::enrich_pond_cells_with_marks(&db, open_cells, &mut mark_cache);
+        assert_eq!(enriched.len(), 1);
+        assert_eq!(enriched[0].current_price, 91_000.0);
+        assert!((enriched[0].unrealized_pnl_usdc - 10.0).abs() < 1e-6);
     }
 }
 

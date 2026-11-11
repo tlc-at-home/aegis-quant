@@ -462,6 +462,13 @@ function regimeBadgeClass(regime) {
   return 'badge badge-chop';
 }
 
+function computeRowPnl(row, isOpen = true) {
+  if (!row) return 0;
+  return isOpen
+    ? ((row.unrealized_pnl_usdc || 0) + (row.realized_pnl_usdc || 0) + (row.funding_accrued_usdc || 0) - (row.fees_paid_usdc || 0))
+    : (row.realized_pnl_usdc || 0);
+}
+
 function renderDashboard(data) {
   if (!data) return;
   const p = data.portfolio || {};
@@ -681,7 +688,7 @@ function renderDashboard(data) {
     openTbody.innerHTML = `<tr><td colspan="10" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
   } else {
     openTbody.innerHTML = openTrades.map(t => {
-      const upnl = (t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0);
+      const upnl = computeRowPnl(t, true);
       return `
         <tr>
           <td><strong>${escapeHtml(t.symbol)}</strong></td>
@@ -703,7 +710,7 @@ function renderDashboard(data) {
   const recTbody = document.getElementById('recent-trades-tbody');
   recTbody.innerHTML = recentTrades.slice(0, 20).map(t => {
     const tradeState = t.status || t.state || 'CLOSED';
-    const pnl = tradeState === 'OPEN' ? ((t.unrealized_pnl_usdc || 0) + (t.realized_pnl_usdc || 0) + (t.funding_accrued_usdc || 0) - (t.fees_paid_usdc || 0)) : (t.realized_pnl_usdc || 0);
+    const pnl = computeRowPnl(t, tradeState === 'OPEN');
     const fPnl = t.funding_accrued_usdc || 0;
     const tradeTs = tradeState === 'OPEN' ? t.opened_at : (t.closed_at || t.opened_at);
     return `
@@ -770,9 +777,7 @@ function renderDashboard(data) {
   } else {
     pondCellsTbody.innerHTML = recentCells.map((c) => {
       const isOpen = ['OPEN', 'TRAILED', 'ARMED'].includes(c.state);
-      const netPnl = isOpen
-        ? ((c.unrealized_pnl_usdc || 0) + (c.realized_pnl_usdc || 0) + (c.funding_accrued_usdc || 0) - (c.fees_paid_usdc || 0))
-        : (c.realized_pnl_usdc || 0);
+      const netPnl = computeRowPnl(c, isOpen);
       const sideBadge = c.option_analogue === 'SHORT_CALL'
         ? '<span class="badge badge-bear">SHORT / SHORT_CALL</span>'
         : '<span class="badge badge-bull">LONG / SHORT_PUT</span>';

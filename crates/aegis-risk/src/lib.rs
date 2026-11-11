@@ -292,10 +292,15 @@ impl RiskEngine {
                 };
             }
 
-            let tight_floor = bar_close - tight_trail_dist;
+            let tight_trail_trigger_atr = cfg_ref.get_f64("tight_trail_trigger_atr", 1.0).max(0.0);
+            let favorable_excursion = (new_highest - entry_price).max(0.0);
             let min_step = tick_size.max(1e-8);
-            let mut cand_stop = tight_floor;
-            if (new_highest - entry_price) >= long_break_even_trigger_atr * eff_atr {
+            let mut cand_stop = if favorable_excursion >= tight_trail_trigger_atr * eff_atr {
+                bar_close - tight_trail_dist
+            } else {
+                new_highest - mult_long * eff_atr
+            };
+            if favorable_excursion >= long_break_even_trigger_atr * eff_atr {
                 let be_lock = (entry_price + long_break_even_lock_atr * eff_atr)
                     .min((bar_close - min_step).max(min_step));
                 cand_stop = cand_stop.max(be_lock);
@@ -427,10 +432,15 @@ impl RiskEngine {
                 };
             }
 
-            let tight_ceil = bar_close + tight_trail_dist;
+            let tight_trail_trigger_atr = cfg_ref.get_f64("tight_trail_trigger_atr", 1.0).max(0.0);
+            let favorable_excursion = (entry_price - new_lowest).max(0.0);
             let min_step = tick_size.max(1e-8);
-            let mut cand_stop = tight_ceil;
-            if (entry_price - new_lowest) >= short_break_even_trigger_atr * eff_atr {
+            let mut cand_stop = if favorable_excursion >= tight_trail_trigger_atr * eff_atr {
+                bar_close + tight_trail_dist
+            } else {
+                new_lowest + mult_short * eff_atr
+            };
+            if favorable_excursion >= short_break_even_trigger_atr * eff_atr {
                 let be_lock = (entry_price - short_break_even_lock_atr * eff_atr)
                     .max(bar_close + min_step);
                 cand_stop = cand_stop.min(be_lock);
@@ -994,6 +1004,50 @@ mod tests {
             (short_be.chandelier_stop_price - 99.50).abs() < 1e-6,
             "R7-S1: Short break-even lock must lower tight-trail stop to 99.50 (below tight_ceil ~100.10), got {}",
             short_be.chandelier_stop_price
+        );
+
+        // 5. Fix 1: Newly opened trade with < 0.8 ATR excursion must NOT have its initial stop
+        // crushed to 0.8% (tight_trail_dist) on the first 15-second tick after entry!
+        let fresh_short = risk.evaluate_two_tier_chandelier_stop(
+            "SHORT",
+            100.0,  // entry_price
+            10.0,   // quantity
+            104.0,  // current_stop (initial stop = 100.0 + 2.0 * 2.0)
+            100.0,  // highest_price
+            100.0,  // lowest_price (0 excursion)
+            100.10, // bar_high
+            99.80,  // bar_low
+            99.90,  // bar_close (only +0.10 excursion < 1.0 * ATR)
+            2.0,    // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(!fresh_short.triggered);
+        assert!(
+            fresh_short.chandelier_stop_price >= 102.20,
+            "Fix 1: Newly opened SHORT must preserve wide ATR chandelier stop (>= 102.20), not crush to 0.8% (~100.70), got {}",
+            fresh_short.chandelier_stop_price
+        );
+
+        let fresh_long = risk.evaluate_two_tier_chandelier_stop(
+            "LONG",
+            100.0,  // entry_price
+            10.0,   // quantity
+            96.0,   // current_stop (initial stop = 100.0 - 2.0 * 2.0)
+            100.0,  // highest_price (0 excursion)
+            100.0,  // lowest_price
+            100.20, // bar_high
+            99.90,  // bar_low
+            100.10, // bar_close (only +0.10 excursion < 1.0 * ATR)
+            2.0,    // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(!fresh_long.triggered);
+        assert!(
+            fresh_long.chandelier_stop_price <= 97.80,
+            "Fix 1: Newly opened LONG must preserve wide ATR chandelier stop (<= 97.80), not crush to 0.8% (~99.30), got {}",
+            fresh_long.chandelier_stop_price
         );
     }
 }

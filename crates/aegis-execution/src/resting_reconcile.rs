@@ -191,10 +191,16 @@ impl ExecutionEngine {
     /// Polls resting Book A (`PIT`) orders (`status = 'PENDING'` / `fsm_state = 'OPEN_ON_BOOK'`)
     /// that are no longer present in the 15s `openOrders` snapshot, promoting filled orders to
     /// `OPEN` or cancelling expired orders immediately (`R9-N1`, `R9-N3`, `R9-QB`).
+    ///
+    /// Cross-checks `ex_positions` before cancelling a `"GONE"` resting order so an order that filled
+    /// on-chain during Hyperliquid's `userFills` indexing window is promoted to `OPEN` with its
+    /// original stops intact rather than cancelled and re-imported as a degraded orphan (Fix 4).
     pub(crate) fn poll_resting_pit_trades_on_15s_tick(
         &self,
         resting_trades: &[TradeRecord],
         open_order_oids: &HashSet<u64>,
+        ex_positions: &HashMap<String, (f64, f64, f64, f64)>,
+        existing_open_qty_by_coin: &mut HashMap<String, f64>,
         maker_fee_bps: f64,
     ) -> bool {
         let mut resting_promoted_or_cancelled = false;
@@ -211,6 +217,7 @@ impl ExecutionEngine {
             {
                 continue;
             }
+            let coin = rt.base_asset.to_uppercase();
             let r_status = self.check_resting_order_status_with_open_orders(
                 rt.exchange_order_id.as_deref(),
                 true,
@@ -241,6 +248,7 @@ impl ExecutionEngine {
                     ),
                     Ok(true)
                 ) {
+                    *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
                     tracing::info!(
                         trade_id = rt.trade_id,
                         symbol = %rt.symbol,
@@ -250,21 +258,63 @@ impl ExecutionEngine {
                     );
                     resting_promoted_or_cancelled = true;
                 }
-            } else if r_status.state == "GONE"
-                && matches!(
+            } else if r_status.state == "GONE" {
+                let on_chain_fill = ex_positions.get(&coin).and_then(|&(szi, ex_entry_px, _, _)| {
+                    let same_side = (rt.side == "LONG" && szi > 0.0)
+                        || (rt.side == "SHORT" && szi < 0.0);
+                    let already_covered = existing_open_qty_by_coin
+                        .get(&coin)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let uncovered = (szi.abs() - already_covered).max(0.0);
+                    if same_side && uncovered > 1e-6 {
+                        Some((uncovered, ex_entry_px))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((uncovered_qty, ex_entry_px)) = on_chain_fill {
+                    let fill_px = if ex_entry_px > 0.0 {
+                        ex_entry_px
+                    } else {
+                        rt.entry_price
+                    };
+                    let fill_qty = uncovered_qty.min(rt.quantity.max(uncovered_qty));
+                    let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
+                    if matches!(
+                        self.db.promote_resting_trade_to_open(
+                            rt.trade_id,
+                            fill_qty,
+                            fill_px,
+                            fee_usdc,
+                            0.0
+                        ),
+                        Ok(true)
+                    ) {
+                        *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
+                        tracing::info!(
+                            trade_id = rt.trade_id,
+                            symbol = %rt.symbol,
+                            fill_qty = fill_qty,
+                            fill_px = fill_px,
+                            "Promoted resting PIT order to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
+                        );
+                        resting_promoted_or_cancelled = true;
+                    }
+                } else if matches!(
                     self.db.cancel_resting_trade(
                         rt.trade_id,
                         "RESTING_ORDER_CANCELLED_OR_EXPIRED"
                     ),
                     Ok(true)
-                )
-            {
-                tracing::info!(
-                    trade_id = rt.trade_id,
-                    symbol = %rt.symbol,
-                    "Cancelled expired/gone resting PIT order during 15s exchange reconciliation (R9-N1)"
-                );
-                resting_promoted_or_cancelled = true;
+                ) {
+                    tracing::info!(
+                        trade_id = rt.trade_id,
+                        symbol = %rt.symbol,
+                        "Cancelled expired/gone resting PIT order during 15s exchange reconciliation (R9-N1)"
+                    );
+                    resting_promoted_or_cancelled = true;
+                }
             }
         }
         resting_promoted_or_cancelled

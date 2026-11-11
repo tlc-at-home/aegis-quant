@@ -1631,8 +1631,17 @@ impl DatabaseManager {
         Ok((comp.book_equity_usdc, comp.idle_usdc))
     }
 
-    /// Single source of truth for Book B (`POND`) PnL, equity, idle cash, and exposure components (`R10-QA`, `R11-QA`).
+    /// Single source of truth for Book B (`POND`) PnL, equity, idle cash, and exposure components (`R10-QA`, `R11-QA`, `R12-N3`).
     pub fn compute_pond_pnl_components(&self) -> Result<PondPnlComponents> {
+        self.compute_pond_pnl_components_with_marks()
+            .map(|(comp, _)| comp)
+    }
+
+    /// Computes Book B (`POND`) PnL components along with the per-symbol 1h mark-price map
+    /// so callers (e.g. `build_pond_payload`) can reuse the fetched 1h closes without duplicate SQLite queries (`R12-N3`).
+    pub fn compute_pond_pnl_components_with_marks(
+        &self,
+    ) -> Result<(PondPnlComponents, std::collections::HashMap<String, f64>)> {
         let cfg = crate::scoped::PondConfig::from_config_map(&self.load_config()?);
         let initial_capital_usdc = round_dp(cfg.pond_baseline_equity_usdc.max(1.0), 2);
         let transfer_adj_usdc = self.get_net_book_transfer_adjustment("POND")?;
@@ -1648,15 +1657,25 @@ impl DatabaseManager {
         let mut raw_partial_realized = 0.0;
         let mut raw_funding = 0.0;
         let mut raw_fees = 0.0;
+        let mut mark_cache: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::with_capacity(open_cells.len());
         for c in &open_cells {
             let entry_px = c.entry_price.unwrap_or(0.0);
             let qty = c.quantity.unwrap_or(0.0);
-            let mark_px = self
-                .get_ohlcv_bars(&c.symbol, "1h", 1, None)
-                .ok()
-                .and_then(|bars| bars.last().map(|b| b.close))
-                .filter(|&p| p > 0.0)
-                .unwrap_or(entry_px);
+            let mark_px = if let Some(&cached_px) = mark_cache.get(&c.symbol) {
+                cached_px
+            } else {
+                let fetched = self
+                    .get_ohlcv_bars(&c.symbol, "1h", 1, None)
+                    .ok()
+                    .and_then(|bars| bars.last().map(|b| b.close))
+                    .filter(|&p| p > 0.0)
+                    .unwrap_or(entry_px);
+                if fetched > 0.0 {
+                    mark_cache.insert(c.symbol.clone(), fetched);
+                }
+                fetched
+            };
             let price_pnl = if entry_px > 0.0 && qty > 0.0 {
                 if c.side.eq_ignore_ascii_case("LONG") {
                     (mark_px - entry_px) * qty
@@ -1678,7 +1697,7 @@ impl DatabaseManager {
         for ac in &armed_cells {
             resting_notional += ac.notional_usdc.unwrap_or(0.0);
         }
-        Ok(self.finalize_book_pnl_components(
+        let comp = self.finalize_book_pnl_components(
             initial_capital_usdc,
             transfer_adj_usdc,
             closed_realized_pnl_usdc,
@@ -1692,7 +1711,8 @@ impl DatabaseManager {
             heat,
             open_positions_count,
             resting_positions_count,
-        ))
+        );
+        Ok((comp, mark_cache))
     }
 
     #[allow(clippy::too_many_arguments)]
