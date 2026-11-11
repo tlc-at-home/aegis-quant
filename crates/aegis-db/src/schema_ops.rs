@@ -1,4 +1,4 @@
-//! SQLite schema initialization, transactional idempotent migration runner (001..012),
+//! SQLite schema initialization, transactional idempotent migration runner (001..013),
 //! routing mode reconciliation, and database integrity verification.
 
 use crate::fernet::ensure_master_key_for_db;
@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-/// Ordered list of SQLite schema migration files (`001..012`).
+/// Ordered list of SQLite schema migration files (`001..013`).
 ///
 /// Invariants (`R5-M1`, `R7-S2`):
 /// 1. Each migration file is executed atomically inside a SQLite transaction
@@ -31,6 +31,7 @@ pub const ALL_MIGRATION_FILES: &[&str] = &[
     "sql/migrations/010_v030_round5_remediation.sql",
     "sql/migrations/011_v030_round7_stop_tightening.sql",
     "sql/migrations/012_v030_round9_remediation.sql",
+    "sql/migrations/013_v030_round12_remediation.sql",
 ];
 
 impl DatabaseManager {

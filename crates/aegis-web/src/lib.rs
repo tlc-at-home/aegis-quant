@@ -618,7 +618,7 @@ mod tests {
         db.initialize_schema(true).expect("seed schema");
 
         let payload = build_dashboard_payload(&db).expect("dashboard payload");
-        assert_eq!(payload.schema_version, 12);
+        assert_eq!(payload.schema_version, 13);
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pond.universe.len(), 80);
 
@@ -638,7 +638,7 @@ mod tests {
         db.initialize_schema(true).expect("init schema");
 
         let payload = build_dashboard_payload(&db).expect("build dashboard payload");
-        assert_eq!(payload.schema_version, 12);
+        assert_eq!(payload.schema_version, 13);
 
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pp50.pit.equity_usdc, 5000.0);

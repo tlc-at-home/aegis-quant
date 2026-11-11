@@ -724,6 +724,9 @@ impl SignalEngine {
             r_usdc_8: f64,
             r_short_max: f64,
             r_short_min: f64,
+            r_1bar_max: f64,
+            r_1bar_min: f64,
+            atr_pct: f64,
             funding_rate_hourly: f64,
             is_unsupported_live: bool,
         }
@@ -807,12 +810,33 @@ impl SignalEngine {
             } else {
                 r_1bar
             };
+            let r_3bar = if u_closes.len() >= 4 {
+                (u_closes[u_closes.len() - 1] / u_closes[u_closes.len() - 4]) - 1.0
+            } else {
+                r_2bar
+            };
             let r_body = usdc_bars
                 .last()
                 .map(|b| (b.close - b.open) / b.open.max(1e-12))
                 .unwrap_or(0.0);
-            let r_short_max = r_1bar.max(r_2bar).max(r_body);
-            let r_short_min = r_1bar.min(r_2bar).min(r_body);
+            let r_1bar_max = r_1bar.max(r_body);
+            let r_1bar_min = r_1bar.min(r_body);
+            let r_short_max = r_1bar_max.max(r_2bar).max(r_3bar);
+            let r_short_min = r_1bar_min.min(r_2bar).min(r_3bar);
+            let atr_slice = if usdc_bars.len() > 14 {
+                &usdc_bars[usdc_bars.len() - 14..]
+            } else {
+                &usdc_bars[..]
+            };
+            let atr_pct = if atr_slice.is_empty() {
+                0.0
+            } else {
+                atr_slice
+                    .iter()
+                    .map(|b| ((b.high - b.low).max(0.0)) / b.close.max(1e-12))
+                    .sum::<f64>()
+                    / (atr_slice.len() as f64)
+            };
             let rs_composite = scfg.rs_composite_snr_weight * snr_synth
                 + scfg.rs_composite_fast_weight * (rs_24 * scfg.rs_composite_fast_scale).tanh()
                 + scfg.rs_composite_mid_weight * (rs_72 * scfg.rs_composite_mid_scale).tanh();
@@ -834,6 +858,9 @@ impl SignalEngine {
                 r_usdc_8,
                 r_short_max,
                 r_short_min,
+                r_1bar_max,
+                r_1bar_min,
+                atr_pct,
                 funding_rate_hourly: funding,
                 is_unsupported_live,
             });
@@ -857,7 +884,7 @@ impl SignalEngine {
 
         for (idx, m) in raw_metrics.into_iter().enumerate() {
             let rank = idx + 1;
-            let mut action = if m.is_unsupported_live {
+            let raw_action = if m.is_unsupported_live {
                 "FLAT".to_string()
             } else {
                 Self::classify_signal_action_with_config(
@@ -882,11 +909,16 @@ impl SignalEngine {
                     &scfg,
                 )
             };
-            if (action == "SHORT" && m.r_short_max > bounce_veto_pct)
-                || (action == "LONG" && m.r_short_min < -crash_veto_pct)
-            {
-                action = "FLAT".to_string();
-            }
+            let action = Self::apply_short_horizon_reversal_veto(
+                &raw_action,
+                m.r_short_max,
+                m.r_short_min,
+                m.r_1bar_max,
+                m.r_1bar_min,
+                m.atr_pct,
+                bounce_veto_pct,
+                crash_veto_pct,
+            );
 
             evaluations.push(SignalEvaluation {
                 eval_id: None,
@@ -915,6 +947,32 @@ impl SignalEngine {
             self.db.save_signal_evaluations(&evaluations)?;
         }
         Ok(evaluations)
+    }
+
+    /// Vetoes lagging 4H `SHORT` / `LONG` signals when a strong short-horizon (12h/4h) reversal
+    /// bounce or crash is already underway (`Fix 7`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_short_horizon_reversal_veto(
+        raw_action: &str,
+        r_short_max: f64,
+        r_short_min: f64,
+        r_1bar_max: f64,
+        r_1bar_min: f64,
+        atr_pct: f64,
+        bounce_veto_pct: f64,
+        crash_veto_pct: f64,
+    ) -> String {
+        let short_bounce_veto = r_short_max > bounce_veto_pct
+            || (atr_pct >= 0.015 && r_1bar_max > atr_pct.max(bounce_veto_pct * 0.75));
+        let long_crash_veto = r_short_min < -crash_veto_pct
+            || (atr_pct >= 0.015 && r_1bar_min < -atr_pct.max(crash_veto_pct * 0.75));
+        if (raw_action == "SHORT" && short_bounce_veto)
+            || (raw_action == "LONG" && long_crash_veto)
+        {
+            "FLAT".to_string()
+        } else {
+            raw_action.to_string()
+        }
     }
 }
 
@@ -1393,6 +1451,44 @@ mod tests {
         let ic1 = SignalEngine::safe_spearman_ic(&tied_p, &tied_r);
         let ic2 = SignalEngine::safe_spearman_ic(&tied_p, &tied_r_perm);
         assert!((ic1 - ic2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_r12_short_bounce_and_long_crash_reversal_veto() {
+        // 1. Lagging 4H SHORT during a +2.5% 12h/4h relief rally is vetoed to FLAT (Fix 7)
+        assert_eq!(
+            SignalEngine::apply_short_horizon_reversal_veto(
+                "SHORT", 0.025, -0.005, 0.018, -0.002, 0.020, 0.020, 0.020
+            ),
+            "FLAT"
+        );
+        // 2. Lagging 4H SHORT during a > 1.0 * ATR single-bar bounce (e.g. +1.8% vs 1.6% ATR) is vetoed to FLAT
+        assert_eq!(
+            SignalEngine::apply_short_horizon_reversal_veto(
+                "SHORT", 0.018, -0.002, 0.018, -0.002, 0.016, 0.020, 0.020
+            ),
+            "FLAT"
+        );
+        // 3. Normal 4H SHORT without counter-trend bounce remains SHORT
+        assert_eq!(
+            SignalEngine::apply_short_horizon_reversal_veto(
+                "SHORT", 0.005, -0.018, 0.004, -0.012, 0.020, 0.020, 0.020
+            ),
+            "SHORT"
+        );
+        // 4. Symmetric: lagging 4H LONG during a -2.5% crash is vetoed to FLAT, while normal LONG remains LONG
+        assert_eq!(
+            SignalEngine::apply_short_horizon_reversal_veto(
+                "LONG", 0.005, -0.025, 0.002, -0.018, 0.020, 0.020, 0.020
+            ),
+            "FLAT"
+        );
+        assert_eq!(
+            SignalEngine::apply_short_horizon_reversal_veto(
+                "LONG", 0.018, -0.005, 0.012, -0.004, 0.020, 0.020, 0.020
+            ),
+            "LONG"
+        );
     }
 }
 

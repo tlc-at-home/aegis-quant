@@ -1299,7 +1299,7 @@ mod tests {
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 12);
+        assert_eq!(db.get_schema_version().unwrap(), 13);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1537,7 +1537,7 @@ mod tests {
         use rusqlite::OptionalExtension;
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 12);
+        assert_eq!(db.get_schema_version().unwrap(), 13);
 
         // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
         db.with_conn(|conn| {
@@ -1868,7 +1868,7 @@ mod tests {
     fn test_r7_b1_s2_s3_n4_config_read_purity_and_migration_011_stop_tightening() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 12);
+        assert_eq!(db.get_schema_version().unwrap(), 13);
 
         // 1. R7-B1 & R7-QA: Operator sets custom chandelier_atr_multiplier_long = 2.0
         // and inserts an OPEN trade with a wide 4H stop (e.g. $86,000 on a $90,000 BTC LONG).
@@ -1987,13 +1987,16 @@ mod tests {
         let newly_applied = db.run_migrations().unwrap();
         assert_eq!(
             newly_applied,
-            vec!["sql/migrations/012_v030_round9_remediation.sql".to_string()],
-            "run_migrations() from v11 must report ONLY migration 012 as newly applied (R8-S2)"
+            vec![
+                "sql/migrations/012_v030_round9_remediation.sql".to_string(),
+                "sql/migrations/013_v030_round12_remediation.sql".to_string(),
+            ],
+            "run_migrations() from v11 must report ONLY migrations 012..013 as newly applied (R8-S2)"
         );
         assert_eq!(
             db.run_migrations().unwrap(),
             Vec::<String>::new(),
-            "run_migrations() when already at v12 must return empty Vec (R8-S2)"
+            "run_migrations() when already at v13 must return empty Vec (R8-S2)"
         );
         // R8-S1: If an operator widens the ETH stop at v12 and calls apply_migration(011) directly,
         // target_num (11) <= max_applied_ver (12), so the SQL script must NOT re-execute!

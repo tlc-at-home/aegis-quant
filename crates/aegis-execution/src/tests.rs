@@ -2176,8 +2176,41 @@
         };
         let tid = db.insert_trade(&resting_doge).unwrap();
 
-        // Simulate the race window: OID 56343427644 is no longer in openOrders (Some(&[])),
-        // while clearinghouseState already holds the filled 2594 DOGE LONG position @ 0.095519
+        // Insert a resting ARMED Pond cell (e.g. PUMP/USDC:USDC) with initial_stop=0.00171
+        let armed_pump = aegis_core::PondCell {
+            cell_id: 0,
+            symbol: "PUMP/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "ARMED".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(0.00182),
+            quantity: Some(150_000.0),
+            notional_usdc: Some(273.0),
+            risk_budget_usdc: Some(16.5),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.4),
+            funding_rate_entry: Some(-0.0001),
+            initial_stop: Some(0.00171),
+            chandelier_stop: Some(0.00171),
+            highest_price_seen: Some(0.00182),
+            lowest_price_seen: Some(0.00182),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            exit_price: None,
+            exit_reason: None,
+            opened_at: None,
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-11-11T12:38:38Z".to_string(),
+            resting_order_id: Some("hl-56343499999".to_string()),
+        };
+        let cid = db.upsert_pond_cell(&armed_pump).unwrap();
+
+        // Simulate the race window: both OIDs are no longer in openOrders (Some(&[])),
+        // while clearinghouseState already holds the filled DOGE and PUMP positions
         let mut on_chain = HashMap::new();
         on_chain.insert(
             "DOGE".to_string(),
@@ -2188,6 +2221,15 @@
                 "unrealizedPnl": -0.31
             }),
         );
+        on_chain.insert(
+            "PUMP".to_string(),
+            json!({
+                "szi": 150_000.0,
+                "entryPx": 0.001821,
+                "markPx": 0.001825,
+                "unrealizedPnl": 0.60
+            }),
+        );
 
         let rep = exec.reconcile_exchange_state(Some(&on_chain), Some(&[]));
         assert_eq!(rep.status, ReconcileStatus::Reconciled);
@@ -2195,12 +2237,16 @@
             rep.discrepancies
                 .iter()
                 .all(|d| d.get("type").and_then(serde_json::Value::as_str) != Some("ORPHAN_ON_CHAIN_IMPORTED")),
-            "Resting DOGE order that filled on-chain must NOT be imported as a degraded orphan: {:?}",
+            "Resting DOGE trade and ARMED PUMP Pond cell that filled on-chain must NOT be imported as degraded orphans: {:?}",
             rep.discrepancies
         );
 
         let open_trades = db.get_open_trades().unwrap();
-        assert_eq!(open_trades.len(), 1);
+        assert_eq!(
+            open_trades.len(),
+            1,
+            "Only DOGE should be in Book A trades; PUMP must remain in Book B pond_cells"
+        );
         let promoted = &open_trades[0];
         assert_eq!(promoted.trade_id, tid);
         assert_eq!(promoted.status, "OPEN");
@@ -2208,4 +2254,13 @@
         assert!((promoted.entry_price - 0.095519).abs() < 1e-6);
         assert!((promoted.initial_stop_price - 0.08976).abs() < 1e-6);
         assert!((promoted.chandelier_stop_price - 0.08976).abs() < 1e-6);
+
+        let open_cells = db.get_open_pond_cells().unwrap();
+        assert_eq!(open_cells.len(), 1);
+        let promoted_cell = &open_cells[0];
+        assert_eq!(promoted_cell.cell_id, cid);
+        assert_eq!(promoted_cell.state, "OPEN");
+        assert!((promoted_cell.entry_price.unwrap() - 0.001821).abs() < 1e-6);
+        assert!((promoted_cell.initial_stop.unwrap() - 0.00171).abs() < 1e-6);
+        assert!((promoted_cell.chandelier_stop.unwrap() - 0.00171).abs() < 1e-6);
     }

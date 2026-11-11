@@ -312,6 +312,23 @@ impl PondOrchestrator {
                     cancel_confirmed_at_boundary = true;
                 }
             }
+            if status.state == "GONE" || status.state == "CANCELLED_OR_GONE" {
+                if let Some((uncovered_qty, ex_entry_px)) = self
+                    .execution
+                    .check_unattributed_onchain_position_for_symbol(&cell.symbol, &cell.side)
+                {
+                    let cell_qty = cell.quantity.unwrap_or(0.0).abs();
+                    status.state = "FILLED".to_string();
+                    status.filled_units = if cell_qty > 0.0 {
+                        uncovered_qty.min(cell_qty)
+                    } else {
+                        uncovered_qty
+                    };
+                    if ex_entry_px > 0.0 {
+                        status.entry_price = ex_entry_px;
+                    }
+                }
+            }
             match status.state.as_str() {
                 "FILLED" if status.filled_units > 0.0 => {
                     let fill_px = if status.entry_price > 0.0 {
@@ -2068,26 +2085,48 @@ mod tests {
         db.set_config_value("pond_execution_mode", &json!("TESTNET"))
             .unwrap();
 
-        let live_cands = vec![PondUniverseRow {
-            symbol: init_rows[79].symbol.clone(),
-            rank: 1,
-            median_daily_volume_usdc: 900.0,
-            tick_size: 0.0001,
-            lot_step_size: 1.0,
-            min_notional_usdc: 10.0,
-            max_leverage: 5.0,
-            reference_price: 0.25,
-            status: "ACTIVE".to_string(),
-            warmup_until: Some("2026-01-01T00:00:00Z".to_string()),
-            delist_streak: 0,
-            added_at: "2026-01-01T00:00:00Z".to_string(),
-            delisted_at: None,
-            is_synthetic_volume: 0,
-        }];
+        let live_cands = vec![
+            PondUniverseRow {
+                symbol: init_rows[79].symbol.clone(),
+                rank: 1,
+                median_daily_volume_usdc: 15_000.0,
+                tick_size: 0.0001,
+                lot_step_size: 1.0,
+                min_notional_usdc: 10.0,
+                max_leverage: 5.0,
+                reference_price: 0.25,
+                status: "ACTIVE".to_string(),
+                warmup_until: Some("2026-01-01T00:00:00Z".to_string()),
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 0,
+            },
+            PondUniverseRow {
+                symbol: "INIT/USDC:USDC".to_string(),
+                rank: 2,
+                median_daily_volume_usdc: 2_832.0, // Below $5,000 Testnet floor (Fix 6b)
+                tick_size: 0.0001,
+                lot_step_size: 1.0,
+                min_notional_usdc: 10.0,
+                max_leverage: 3.0,
+                reference_price: 0.095,
+                status: "ACTIVE".to_string(),
+                warmup_until: Some("2026-01-01T00:00:00Z".to_string()),
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 0,
+            },
+        ];
         let refreshed = orch
             .universe_mgr
             .refresh_universe(Some(live_cands))
             .unwrap();
+        assert!(
+            refreshed.iter().all(|r| r.symbol != "INIT/USDC:USDC"),
+            "Dead Testnet market with $2,832/day volume must be rejected by $5,000 Testnet floor (Fix 6b)"
+        );
         let promoted = refreshed
             .iter()
             .find(|r| r.symbol == init_rows[79].symbol)

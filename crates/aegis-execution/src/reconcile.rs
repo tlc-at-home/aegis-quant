@@ -214,7 +214,7 @@ impl ExecutionEngine {
             }
         };
 
-        let local_pond_cells = match self.db.get_open_pond_cells() {
+        let mut local_pond_cells = match self.db.get_open_pond_cells() {
             Ok(cells) => cells,
             Err(e) => {
                 tracing::error!(error = %e, "Aborting reconcile_exchange_state: failed to load open pond cells");
@@ -228,11 +228,14 @@ impl ExecutionEngine {
                 };
             }
         };
+        let mut armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
 
         // In live/testnet mode (or simulated mode with explicit open_orders_slice), if a resting PIT order
-        // is no longer on the exchange openOrders book, poll its fill status or cross-check ex_positions
-        // immediately during the 15s tick so filled orders promote to OPEN with original stops intact (`R9-N1`, `R9-N3`, `R9-QB`, Fix 4).
-        if open_orders_slice.is_some() && !resting_trades.is_empty() {
+        // or ARMED Pond cell is no longer on the exchange openOrders book, poll its fill status or cross-check
+        // ex_positions immediately during the 15s tick so filled orders promote to OPEN with original stops intact (`R9-N1`, `R9-N3`, `R9-QB`, Fix 4).
+        if open_orders_slice.is_some()
+            && (!resting_trades.is_empty() || !armed_pond_cells.is_empty())
+        {
             let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
             let mut existing_open_qty_by_coin: HashMap<String, f64> = HashMap::new();
             for lt in &local_trades {
@@ -253,13 +256,21 @@ impl ExecutionEngine {
             }
 
             let changed = if simulated_exchange_positions.is_none() {
-                self.poll_resting_pit_trades_on_15s_tick(
+                let pit_changed = self.poll_resting_pit_trades_on_15s_tick(
                     &resting_trades,
                     &open_order_oids,
                     &ex_positions,
                     &mut existing_open_qty_by_coin,
                     maker_fee_bps,
-                )
+                );
+                let pond_changed = self.poll_armed_pond_cells_on_15s_tick(
+                    &armed_pond_cells,
+                    &open_order_oids,
+                    &ex_positions,
+                    &mut existing_open_qty_by_coin,
+                    maker_fee_bps,
+                );
+                pit_changed || pond_changed
             } else {
                 let mut promoted_sim = false;
                 for rt in &resting_trades {
@@ -290,7 +301,11 @@ impl ExecutionEngine {
                             } else {
                                 rt.entry_price
                             };
-                            let fill_qty = uncovered.min(rt.quantity.max(uncovered));
+                            let fill_qty = if rt.quantity > 0.0 {
+                                uncovered.min(rt.quantity)
+                            } else {
+                                uncovered
+                            };
                             let fee_usdc =
                                 round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
                             if matches!(
@@ -300,6 +315,67 @@ impl ExecutionEngine {
                                     fill_px,
                                     fee_usdc,
                                     0.0
+                                ),
+                                Ok(true)
+                            ) {
+                                *existing_open_qty_by_coin.entry(coin).or_insert(0.0) +=
+                                    fill_qty.abs();
+                                promoted_sim = true;
+                            }
+                        }
+                    }
+                }
+                for cell in &armed_pond_cells {
+                    let resting_oid = cell.resting_order_id.as_deref().or_else(|| {
+                        cell.exit_reason
+                            .as_deref()
+                            .and_then(|r| r.strip_prefix("RESTING_OID:"))
+                    });
+                    let oid_num = resting_oid
+                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&id| id > 0);
+                    if oid_num
+                        .map(|id| open_order_oids.contains(&id))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let coin = cell
+                        .symbol
+                        .split('/')
+                        .next()
+                        .unwrap_or(&cell.symbol)
+                        .trim()
+                        .to_uppercase();
+                    if let Some(&(szi, ex_entry_px, _, _)) = ex_positions.get(&coin) {
+                        let same_side = (cell.side == "LONG" && szi > 0.0)
+                            || (cell.side == "SHORT" && szi < 0.0);
+                        let already_covered = existing_open_qty_by_coin
+                            .get(&coin)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let uncovered = (szi.abs() - already_covered).max(0.0);
+                        if same_side && uncovered > 1e-6 {
+                            let fill_px = if ex_entry_px > 0.0 {
+                                ex_entry_px
+                            } else {
+                                cell.entry_price.unwrap_or(100.0)
+                            };
+                            let cell_qty = cell.quantity.unwrap_or(0.0).abs();
+                            let fill_qty = if cell_qty > 0.0 {
+                                uncovered.min(cell_qty)
+                            } else {
+                                uncovered
+                            };
+                            let fee_usdc =
+                                round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
+                            if matches!(
+                                self.db.promote_armed_pond_cell_to_open(
+                                    cell.cell_id,
+                                    fill_qty,
+                                    fill_px,
+                                    fee_usdc
                                 ),
                                 Ok(true)
                             ) {
@@ -320,9 +396,14 @@ impl ExecutionEngine {
                 if let Ok(updated_resting) = self.db.get_resting_pit_trades() {
                     resting_trades = updated_resting;
                 }
+                if let Ok(updated_open_cells) = self.db.get_open_pond_cells() {
+                    local_pond_cells = updated_open_cells;
+                }
+                if let Ok(updated_armed_cells) = self.db.get_armed_pond_cells() {
+                    armed_pond_cells = updated_armed_cells;
+                }
             }
         }
-        let armed_pond_cells = self.db.get_armed_pond_cells().unwrap_or_default();
 
         // Aggregate local quantities and row IDs per coin across both books (NM-5, NM-10, R9-S1)
         let mut pit_qty_by_coin: HashMap<String, f64> = HashMap::new();

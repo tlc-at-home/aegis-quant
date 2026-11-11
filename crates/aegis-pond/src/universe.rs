@@ -42,7 +42,8 @@ impl PondUniverseManager {
         let cfg = self.scoped_db.load_pond_config()?;
         let target_size = cfg.pond_universe_target_size.max(1);
         let min_vol = if cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET") {
-            cfg.pond_min_daily_volume_usdc.min(100.0)
+            cfg.pond_min_daily_volume_usdc
+                .min(cfg.pond_testnet_min_vol_cap_usdc)
         } else {
             cfg.pond_min_daily_volume_usdc
         };
@@ -76,8 +77,14 @@ impl PondUniverseManager {
             || (is_live_discovery && existing_map.values().all(|r| r.is_synthetic_volume != 0));
 
         for cand in discovered {
-            updated_symbols.insert(cand.symbol.clone());
             let prev = existing_map.get(&cand.symbol);
+            let is_existing_live = prev
+                .map(|p| !(is_live_discovery && p.is_synthetic_volume != 0))
+                .unwrap_or(false);
+            if cand.median_daily_volume_usdc < min_vol && !is_existing_live {
+                continue;
+            }
+            updated_symbols.insert(cand.symbol.clone());
 
             let (added_at, warmup_until_str) = match prev {
                 Some(p) if !(is_live_discovery && p.is_synthetic_volume != 0) => (

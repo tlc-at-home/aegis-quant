@@ -279,7 +279,11 @@ impl ExecutionEngine {
                     } else {
                         rt.entry_price
                     };
-                    let fill_qty = uncovered_qty.min(rt.quantity.max(uncovered_qty));
+                    let fill_qty = if rt.quantity > 0.0 {
+                        uncovered_qty.min(rt.quantity)
+                    } else {
+                        uncovered_qty
+                    };
                     let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
                     if matches!(
                         self.db.promote_resting_trade_to_open(
@@ -320,7 +324,218 @@ impl ExecutionEngine {
         resting_promoted_or_cancelled
     }
 
-    /// Polls and reconciles resting Book A (`PIT`) orders at the start of a PIT execution cycle (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`, `R9-N3`, `R9-QB`).
+    /// Polls and reconciles off-book `ARMED` Pond cells during the 15s exchange reconciliation tick (`Fix 4`).
+    /// If a resting Pond entry order is no longer on `openOrders` and has filled (via `userFills` or
+    /// `clearinghouseState` cross-check during `userFills` indexer lag), promotes the `ARMED` Pond cell
+    /// to `OPEN` with its original `initial_stop` and `chandelier_stop` preserved instead of allowing it
+    /// to be imported as a degraded Book A orphan.
+    pub(crate) fn poll_armed_pond_cells_on_15s_tick(
+        &self,
+        armed_cells: &[aegis_core::PondCell],
+        open_order_oids: &HashSet<u64>,
+        ex_positions: &HashMap<String, (f64, f64, f64, f64)>,
+        existing_open_qty_by_coin: &mut HashMap<String, f64>,
+        maker_fee_bps: f64,
+    ) -> bool {
+        let mut armed_promoted = false;
+        for cell in armed_cells {
+            let resting_oid = cell.resting_order_id.as_deref().or_else(|| {
+                cell.exit_reason
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("RESTING_OID:"))
+            });
+            let oid_num = resting_oid
+                .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|&id| id > 0);
+            if oid_num
+                .map(|id| open_order_oids.contains(&id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let r_status = self.check_resting_order_status_with_open_orders(resting_oid, true);
+            let coin = cell
+                .symbol
+                .split('/')
+                .next()
+                .unwrap_or(&cell.symbol)
+                .trim()
+                .to_uppercase();
+            let cell_qty = cell.quantity.unwrap_or(0.0).abs();
+            if r_status.state == "FILLED" && (r_status.filled_units > 0.0 || cell_qty > 0.0) {
+                let fill_px = if r_status.entry_price > 0.0 {
+                    r_status.entry_price
+                } else {
+                    cell.entry_price.unwrap_or(100.0)
+                };
+                let fill_qty = if r_status.filled_units > 0.0 {
+                    r_status.filled_units
+                } else {
+                    cell_qty
+                };
+                let fee_usdc = if r_status.fee_usdc > 0.0 {
+                    round_dp(r_status.fee_usdc, 4)
+                } else {
+                    round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4)
+                };
+                if matches!(
+                    self.db.promote_armed_pond_cell_to_open(
+                        cell.cell_id,
+                        fill_qty,
+                        fill_px,
+                        fee_usdc
+                    ),
+                    Ok(true)
+                ) {
+                    *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
+                    tracing::info!(
+                        cell_id = cell.cell_id,
+                        symbol = %cell.symbol,
+                        fill_qty = fill_qty,
+                        fill_px = fill_px,
+                        "Promoted filled ARMED Pond cell to OPEN during 15s exchange reconciliation (Fix 4)"
+                    );
+                    armed_promoted = true;
+                }
+            } else if r_status.state == "GONE" {
+                let on_chain_fill = ex_positions.get(&coin).and_then(|&(szi, ex_entry_px, _, _)| {
+                    let same_side = (cell.side == "LONG" && szi > 0.0)
+                        || (cell.side == "SHORT" && szi < 0.0);
+                    let already_covered = existing_open_qty_by_coin
+                        .get(&coin)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let uncovered = (szi.abs() - already_covered).max(0.0);
+                    if same_side && uncovered > 1e-6 {
+                        Some((uncovered, ex_entry_px))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((uncovered_qty, ex_entry_px)) = on_chain_fill {
+                    let fill_px = if ex_entry_px > 0.0 {
+                        ex_entry_px
+                    } else {
+                        cell.entry_price.unwrap_or(100.0)
+                    };
+                    let fill_qty = if cell_qty > 0.0 {
+                        uncovered_qty.min(cell_qty)
+                    } else {
+                        uncovered_qty
+                    };
+                    let fee_usdc = round_dp(fill_qty * fill_px * (maker_fee_bps / 10_000.0), 4);
+                    if matches!(
+                        self.db.promote_armed_pond_cell_to_open(
+                            cell.cell_id,
+                            fill_qty,
+                            fill_px,
+                            fee_usdc
+                        ),
+                        Ok(true)
+                    ) {
+                        *existing_open_qty_by_coin.entry(coin).or_insert(0.0) += fill_qty.abs();
+                        tracing::info!(
+                            cell_id = cell.cell_id,
+                            symbol = %cell.symbol,
+                            fill_qty = fill_qty,
+                            fill_px = fill_px,
+                            "Promoted ARMED Pond cell to OPEN via clearinghouseState cross-check during userFills indexer lag (Fix 4)"
+                        );
+                        armed_promoted = true;
+                    }
+                }
+            }
+        }
+        armed_promoted
+    }
+
+    /// Queries Hyperliquid `clearinghouseState` to check if an unattributed on-chain position
+    /// exists on the same side for `symbol` (`Fix 4`).
+    /// Used when `check_resting_order_status` returns `"GONE"` during `userFills` indexer lag
+    /// so filled resting PIT orders and `ARMED` Pond cells promote to `OPEN` instead of being
+    /// cancelled/rejected and re-imported as degraded orphans.
+    pub fn check_unattributed_onchain_position_for_symbol(
+        &self,
+        symbol: &str,
+        side: &str,
+    ) -> Option<(f64, f64)> {
+        let cfg = self
+            .load_config_logged("check_unattributed_onchain_position_for_symbol");
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        if mode == "PAPER" {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "");
+        if wallet.trim().is_empty() {
+            return None;
+        }
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+        let target_coin = symbol
+            .split('/')
+            .next()
+            .unwrap_or(symbol)
+            .trim()
+            .to_uppercase();
+        let ch = self.fetch_hyperliquid_clearinghouse_state(&wallet, is_testnet)?;
+        let asset_positions = ch.get("assetPositions")?.as_array()?;
+        let mut found_szi = 0.0;
+        let mut found_entry_px = 0.0;
+        for item in asset_positions {
+            let pos = item.get("position").unwrap_or(item);
+            let coin = pos
+                .get("coin")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_uppercase();
+            if coin == target_coin {
+                found_szi = pos
+                    .get("szi")
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    })
+                    .unwrap_or(0.0);
+                found_entry_px = pos
+                    .get("entryPx")
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                    })
+                    .unwrap_or(0.0);
+                break;
+            }
+        }
+        let same_side = (side.eq_ignore_ascii_case("LONG") && found_szi > 0.0)
+            || (side.eq_ignore_ascii_case("SHORT") && found_szi < 0.0);
+        if !same_side || found_szi.abs() <= 1e-6 {
+            return None;
+        }
+        let mut covered_qty = 0.0;
+        if let Ok(open_trades) = self.db.get_open_trades() {
+            for t in open_trades {
+                if t.base_asset.eq_ignore_ascii_case(&target_coin) {
+                    covered_qty += t.quantity.abs();
+                }
+            }
+        }
+        if let Ok(open_cells) = self.db.get_open_pond_cells() {
+            for c in open_cells {
+                let c_coin = c.symbol.split('/').next().unwrap_or(&c.symbol).trim();
+                if c_coin.eq_ignore_ascii_case(&target_coin) {
+                    covered_qty += c.quantity.unwrap_or(0.0).abs();
+                }
+            }
+        }
+        let uncovered = (found_szi.abs() - covered_qty).max(0.0);
+        if uncovered > 1e-6 {
+            Some((uncovered, found_entry_px))
+        } else {
+            None
+        }
+    }
+
+    /// Polls and reconciles resting Book A (`PIT`) orders at the start of a PIT execution cycle (`NH-4`, `R3-H2`, `R3-H4`, `R3-H16`, `R9-N3`, `R9-QB`, `Fix 4`).
     pub(crate) fn reconcile_resting_pit_trades_for_cycle(
         &self,
         freeze_entries: bool,
@@ -352,6 +567,21 @@ impl ExecutionEngine {
                         oid_str,
                         cancel_confirmed,
                     );
+                }
+            }
+            if r_status.state == "GONE" && !is_backtest {
+                if let Some((uncovered_qty, ex_entry_px)) =
+                    self.check_unattributed_onchain_position_for_symbol(&r_trade.symbol, &r_trade.side)
+                {
+                    r_status.state = "FILLED".to_string();
+                    r_status.filled_units = if r_trade.quantity > 0.0 {
+                        uncovered_qty.min(r_trade.quantity)
+                    } else {
+                        uncovered_qty
+                    };
+                    if ex_entry_px > 0.0 {
+                        r_status.entry_price = ex_entry_px;
+                    }
                 }
             }
             if r_status.state == "FILLED" {

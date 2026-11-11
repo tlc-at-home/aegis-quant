@@ -710,13 +710,13 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 12 {
+        status: if schema_ver >= 13 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 12 (migrations 001..012 applied)".to_string(),
+        requirement: "schema_version >= 13 (migrations 001..013 applied)".to_string(),
         remediation: "Run: aegis-quant db --migrate".to_string(),
     });
 

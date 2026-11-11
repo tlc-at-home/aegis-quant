@@ -145,13 +145,13 @@ impl RiskEngine {
         let mult_long = cfg_ref
             .get_f64(
                 "chandelier_atr_multiplier_long",
-                cfg_ref.get_f64("chandelier_atr_multiplier", 1.2),
+                cfg_ref.get_f64("chandelier_atr_multiplier", 2.2),
             )
             .max(0.3);
         let mult_short = cfg_ref
             .get_f64(
                 "chandelier_atr_multiplier_short",
-                mult_long.max(1.2),
+                mult_long.max(2.2),
             )
             .max(0.3);
 
@@ -293,20 +293,26 @@ impl RiskEngine {
             }
 
             let tight_trail_trigger_atr = cfg_ref.get_f64("tight_trail_trigger_atr", 1.0).max(0.0);
-            let favorable_excursion = (new_highest - entry_price).max(0.0);
-            let min_step = tick_size.max(1e-8);
-            let mut cand_stop = if favorable_excursion >= tight_trail_trigger_atr * eff_atr {
-                bar_close - tight_trail_dist
+            let favorable_excursion = if entry_price > 0.0 {
+                (new_highest - entry_price).max(0.0)
             } else {
-                new_highest - mult_long * eff_atr
+                0.0
             };
-            if favorable_excursion >= long_break_even_trigger_atr * eff_atr {
+            let min_step = tick_size.max(1e-8);
+            let mut cand_stop =
+                if entry_price > 0.0 && favorable_excursion >= tight_trail_trigger_atr * eff_atr {
+                    bar_close - tight_trail_dist
+                } else {
+                    new_highest - mult_long * eff_atr
+                };
+            if entry_price > 0.0 && favorable_excursion >= long_break_even_trigger_atr * eff_atr {
                 let be_lock = (entry_price + long_break_even_lock_atr * eff_atr)
                     .min((bar_close - min_step).max(min_step));
                 cand_stop = cand_stop.max(be_lock);
             }
             let new_stop = Self::round_step(
                 active_stop
+                    .max(init_stop)
                     .max(cand_stop)
                     .min((bar_close - min_step).max(min_step)),
                 tick_size,
@@ -433,20 +439,31 @@ impl RiskEngine {
             }
 
             let tight_trail_trigger_atr = cfg_ref.get_f64("tight_trail_trigger_atr", 1.0).max(0.0);
-            let favorable_excursion = (entry_price - new_lowest).max(0.0);
+            let favorable_excursion = if entry_price > 0.0 && new_lowest > 0.0 {
+                (entry_price - new_lowest).max(0.0)
+            } else {
+                0.0
+            };
             let min_step = tick_size.max(1e-8);
-            let mut cand_stop = if favorable_excursion >= tight_trail_trigger_atr * eff_atr {
+            let mut cand_stop = if entry_price > 0.0
+                && new_lowest > 0.0
+                && favorable_excursion >= tight_trail_trigger_atr * eff_atr
+            {
                 bar_close + tight_trail_dist
             } else {
                 new_lowest + mult_short * eff_atr
             };
-            if favorable_excursion >= short_break_even_trigger_atr * eff_atr {
+            if entry_price > 0.0
+                && new_lowest > 0.0
+                && favorable_excursion >= short_break_even_trigger_atr * eff_atr
+            {
                 let be_lock = (entry_price - short_break_even_lock_atr * eff_atr)
                     .max(bar_close + min_step);
                 cand_stop = cand_stop.min(be_lock);
             }
             let new_stop = Self::round_step(
                 active_stop
+                    .min(init_stop)
                     .min(cand_stop)
                     .max(bar_close + min_step),
                 tick_size,
@@ -512,11 +529,11 @@ impl RiskEngine {
 
         let mult_long = cfg.get_f64(
             "chandelier_atr_multiplier_long",
-            cfg.get_f64("chandelier_atr_multiplier", 1.2),
+            cfg.get_f64("chandelier_atr_multiplier", 2.2),
         );
         let mult_short = cfg.get_f64(
             "chandelier_atr_multiplier_short",
-            mult_long.max(1.2),
+            mult_long.max(2.2),
         );
         let min_atr_pct = cfg.get_f64(
             "chandelier_min_atr_pct",
@@ -1006,13 +1023,13 @@ mod tests {
             short_be.chandelier_stop_price
         );
 
-        // 5. Fix 1: Newly opened trade with < 0.8 ATR excursion must NOT have its initial stop
-        // crushed to 0.8% (tight_trail_dist) on the first 15-second tick after entry!
+        // 5. Fix 1: Newly opened trade with < 1.0 ATR excursion must preserve its 2.2x ATR
+        // initial stop band (~4.4%) and NEVER be crushed to 0.8% (tight_trail_dist) on tick 1!
         let fresh_short = risk.evaluate_two_tier_chandelier_stop(
             "SHORT",
             100.0,  // entry_price
             10.0,   // quantity
-            104.0,  // current_stop (initial stop = 100.0 + 2.0 * 2.0)
+            104.4,  // current_stop (initial stop = 100.0 + 2.2 * 2.0)
             100.0,  // highest_price
             100.0,  // lowest_price (0 excursion)
             100.10, // bar_high
@@ -1024,8 +1041,8 @@ mod tests {
         );
         assert!(!fresh_short.triggered);
         assert!(
-            fresh_short.chandelier_stop_price >= 102.20,
-            "Fix 1: Newly opened SHORT must preserve wide ATR chandelier stop (>= 102.20), not crush to 0.8% (~100.70), got {}",
+            fresh_short.chandelier_stop_price >= 104.20,
+            "Fix 1: Newly opened SHORT must preserve wide 2.2x ATR chandelier stop (>= 104.20), not crush to 0.8% (~100.70), got {}",
             fresh_short.chandelier_stop_price
         );
 
@@ -1033,7 +1050,7 @@ mod tests {
             "LONG",
             100.0,  // entry_price
             10.0,   // quantity
-            96.0,   // current_stop (initial stop = 100.0 - 2.0 * 2.0)
+            95.6,   // current_stop (initial stop = 100.0 - 2.2 * 2.0)
             100.0,  // highest_price (0 excursion)
             100.0,  // lowest_price
             100.20, // bar_high
@@ -1045,9 +1062,31 @@ mod tests {
         );
         assert!(!fresh_long.triggered);
         assert!(
-            fresh_long.chandelier_stop_price <= 97.80,
-            "Fix 1: Newly opened LONG must preserve wide ATR chandelier stop (<= 97.80), not crush to 0.8% (~99.30), got {}",
+            fresh_long.chandelier_stop_price <= 95.80,
+            "Fix 1: Newly opened LONG must preserve wide 2.2x ATR chandelier stop (<= 95.80), not crush to 0.8% (~99.30), got {}",
             fresh_long.chandelier_stop_price
+        );
+
+        // 6. Exact 1.0x ATR boundary: once favorable_excursion == 1.0 * eff_atr, tight-trail activates
+        let boundary_long = risk.evaluate_two_tier_chandelier_stop(
+            "LONG",
+            100.0,  // entry_price
+            10.0,   // quantity
+            95.6,   // current_stop
+            102.0,  // highest_price (exactly +1.0 * ATR)
+            100.0,  // lowest_price
+            102.0,  // bar_high
+            101.5,  // bar_low
+            102.0,  // bar_close
+            2.0,    // atr_value
+            0.01,   // tick_size
+            None,
+        );
+        assert!(!boundary_long.triggered);
+        assert!(
+            boundary_long.chandelier_stop_price >= 101.10,
+            "At exact 1.0x ATR excursion (102.0), tight-trail must activate (~101.18), got {}",
+            boundary_long.chandelier_stop_price
         );
     }
 }

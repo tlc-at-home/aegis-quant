@@ -135,16 +135,33 @@ impl ExecutionEngine {
             let opened_at_ms = aegis_core::parse_utc_timestamp(&trade.opened_at)
                 .map(|dt| dt.and_utc().timestamp_millis())
                 .unwrap_or(0);
-            let bar_window_ms = if asset.exec_timeframe.eq_ignore_ascii_case("1h") {
-                3_600_000
-            } else {
-                14_400_000
-            };
-            let (eval_bar_high, eval_bar_low) = if !is_backtest
-                && opened_at_ms > last_bar.timestamp_ms
-                && opened_at_ms.saturating_sub(last_bar.timestamp_ms) <= bar_window_ms
-            {
-                (last_bar.close, last_bar.close)
+            let (eval_bar_high, eval_bar_low) = if !is_backtest && opened_at_ms > last_bar.timestamp_ms {
+                let post_open_1h: Vec<_> = if !asset.exec_timeframe.eq_ignore_ascii_case("1h") {
+                    self.db
+                        .get_ohlcv_bars(&trade.symbol, "1h", 6, Some(now_ms))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|b| {
+                            b.timestamp_ms >= opened_at_ms
+                                && (b.is_synthetic == 0 || (mode != "LIVE" && mode != "TESTNET"))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if post_open_1h.is_empty() {
+                    (last_bar.close, last_bar.close)
+                } else {
+                    let h = post_open_1h
+                        .iter()
+                        .map(|b| b.high)
+                        .fold(last_bar.close, f64::max);
+                    let l = post_open_1h
+                        .iter()
+                        .map(|b| b.low)
+                        .fold(last_bar.close, f64::min);
+                    (h, l)
+                }
             } else {
                 (last_bar.high, last_bar.low)
             };

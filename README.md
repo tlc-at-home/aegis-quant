@@ -8,7 +8,7 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
 
 1. **Workspace Layout (`crates/*`)**:
    - `aegis-core`: Shared domain types (`BookId`, `Side`, `HmmRegime`, `SignalAction`, `PondCellState`, `BookTransferStatus`, `OhlcvBar`, `Usdc`, `Price`, `Quantity`, `Leverage`, `Bps`), telemetry secret redaction (`sanitize_telemetry_message`, `sanitize_telemetry_details`), timeframe validators, and financial math (`calculate_sharpe_sortino_calmar`, `compute_chandelier_stop`, `round_step`, `accrue_chop_basis_harvest_4h`).
-   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), transactional schema version v12 auto-migration (`001..012`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
+   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), transactional schema version v13 auto-migration (`001..013`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
    - `aegis-signals`: 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, and Continuous Signal-to-Noise Ratio (SNR) ensemble.
    - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and correlation cluster limits.
    - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`, `cycle`, `resting_reconcile`), live mark-to-market synchronization, and config validator.
@@ -32,9 +32,9 @@ cargo build --release --workspace
 cargo test --workspace
 ```
 
-> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`, `R7-QB`, `R9-QA`, `R10-QA`, `R11-QA`, `R12-QA`)**: The workspace defines and executes `118` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 22 unit + 1 `aegis-db-tool` bin = 23, `aegis-execution`: 19, `aegis-pit`: 3, `aegis-pond`: 15, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 7, `aegis-telemetry`: 2, `aegis-web`: 12).
+> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`, `R7-QB`, `R9-QA`, `R10-QA`, `R11-QA`, `R12-QA`)**: The workspace defines and executes `119` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 22 unit + 1 `aegis-db-tool` bin = 23, `aegis-execution`: 19, `aegis-pit`: 3, `aegis-pond`: 15, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 8, `aegis-telemetry`: 2, `aegis-web`: 12).
 
-### 2. Initialize / Migrate SQLite Database (Schema v12)
+### 2. Initialize / Migrate SQLite Database (Schema v13)
 
 Both `--db <PATH>` and `--db-path <PATH>` are accepted globally across all subcommands (built binaries are output to `./target/release/aegis-quant` and installed to `./bin/aegis-quant`):
 
@@ -60,6 +60,7 @@ Incremental SQL migrations are stored under `sql/migrations/` and are executed a
 - `sql/migrations/010_v030_round5_remediation.sql`
 - `sql/migrations/011_v030_round7_stop_tightening.sql`
 - `sql/migrations/012_v030_round9_remediation.sql`
+- `sql/migrations/013_v030_round12_remediation.sql`
 
 ### 3. Run the 4-Page Web Dashboard & Dual-Book Background Daemons
 

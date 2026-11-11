@@ -269,7 +269,7 @@ fn alert_config_defaults(
         (
             "chandelier_atr_multiplier_long",
             (
-                "1.2",
+                "2.2",
                 "float",
                 "stops",
                 "Chandelier trailing stop ATR multiplier for Long positions",
@@ -278,10 +278,19 @@ fn alert_config_defaults(
         (
             "chandelier_atr_multiplier_short",
             (
-                "1.2",
+                "2.2",
                 "float",
                 "stops",
                 "Inverted Chandelier trailing stop ATR multiplier for Short positions",
+            ),
+        ),
+        (
+            "tight_trail_trigger_atr",
+            (
+                "1.0",
+                "float",
+                "stops",
+                "Minimum favorable excursion in ATR multiples before tight current-price trailing stop activates",
             ),
         ),
         (
@@ -381,6 +390,51 @@ fn alert_config_defaults(
                 "float",
                 "risk",
                 "Unallocated Hyperliquid Testnet Faucet Spot USDC grant to exclude from Perps equity and risk-cap scaling",
+            ),
+        ),
+        (
+            "pond_max_stop_distance_pct",
+            (
+                "0.06",
+                "float",
+                "pond",
+                "Maximum initial protective stop distance as fraction of reference price for Pond NPS-01 cells (6.0%)",
+            ),
+        ),
+        (
+            "pond_testnet_min_vol_cap_usdc",
+            (
+                "5000.0",
+                "float",
+                "pond",
+                "Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet",
+            ),
+        ),
+        (
+            "signal_short_bounce_veto_pct",
+            (
+                "0.020",
+                "float",
+                "signals",
+                "Short-horizon (12h/4h) upward bounce threshold vetoing lagging 4H SHORT entries (2.0%)",
+            ),
+        ),
+        (
+            "signal_long_crash_veto_pct",
+            (
+                "0.020",
+                "float",
+                "signals",
+                "Short-horizon (12h/4h) downward crash threshold vetoing lagging 4H LONG entries (2.0%)",
+            ),
+        ),
+        (
+            "max_bar_staleness_ms",
+            (
+                "21600000",
+                "int",
+                "execution",
+                "Maximum allowed primary OHLCV bar staleness in milliseconds before /health reports 503 DEGRADED in LIVE/TESTNET (6h)",
             ),
         ),
     ])
