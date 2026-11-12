@@ -2204,7 +2204,7 @@ mod tests {
             PondUniverseRow {
                 symbol: "INIT/USDC:USDC".to_string(),
                 rank: 2,
-                median_daily_volume_usdc: 2_832.0, // Below $5,000 Testnet floor (Fix 6b)
+                median_daily_volume_usdc: 500.0, // Below $1,000 Testnet floor (Fix 6b)
                 tick_size: 0.0001,
                 lot_step_size: 1.0,
                 min_notional_usdc: 10.0,
@@ -2224,7 +2224,7 @@ mod tests {
             .unwrap();
         assert!(
             refreshed.iter().all(|r| r.symbol != "INIT/USDC:USDC"),
-            "Dead Testnet market with $2,832/day volume must be rejected by $5,000 Testnet floor (Fix 6b)"
+            "Dead Testnet market with $500/day volume must be rejected by $1,000 Testnet floor (Fix 6b)"
         );
         let promoted = refreshed
             .iter()

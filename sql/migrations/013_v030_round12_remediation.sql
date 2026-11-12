@@ -7,7 +7,7 @@
 --      `chandelier_atr_multiplier_short`) from 1.2x to 2.2x ATR while gating tight-trail
 --      (`0.45x ATR` / `0.8%` cap) behind `tight_trail_trigger_atr = 1.0` ATR favorable excursion.
 --   2. Fix 2 & Fix 6: Seed `pond_max_stop_distance_pct` (`0.06`), `pond_testnet_min_vol_cap_usdc`
---      (`5000.0`), `signal_short_bounce_veto_pct` (`0.020`), and `signal_long_crash_veto_pct`
+--      (`1000.0`), `signal_short_bounce_veto_pct` (`0.020`), and `signal_long_crash_veto_pct`
 --      (`0.020`) in `system_config` idempotently (`max_bar_staleness_ms` is already seeded at
 --      `28800000` = 8h by migration 007; `R13-N2`).
 --   3. Fix 2: Normalize any open `pond_cells` whose `initial_stop` or `chandelier_stop` violated
@@ -27,17 +27,17 @@ WHERE config_key IN ('chandelier_atr_multiplier_long', 'chandelier_atr_multiplie
 INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at) VALUES
     ('tight_trail_trigger_atr', '1.0', 'float', 'stops', 'Minimum favorable excursion in ATR multiples before tight current-price trailing stop activates', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('pond_max_stop_distance_pct', '0.06', 'float', 'pond', 'Maximum initial protective stop distance as fraction of reference price for Pond NPS-01 cells (6.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    ('pond_testnet_min_vol_cap_usdc', '5000.0', 'float', 'pond', 'Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    ('pond_testnet_min_vol_cap_usdc', '1000.0', 'float', 'pond', 'Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('signal_short_bounce_veto_pct', '0.020', 'float', 'signals', 'Short-horizon (12h/4h) upward bounce threshold vetoing lagging 4H SHORT entries (2.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     ('signal_long_crash_veto_pct', '0.020', 'float', 'signals', 'Short-horizon (12h/4h) downward crash threshold vetoing lagging 4H LONG entries (2.0%)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 ON CONFLICT(config_key) DO NOTHING;
 
--- 3. Ensure Pond Testnet volume floor is raised from legacy $100 to $5,000 when upgrading to v13
+-- 3. Ensure Pond Testnet volume floor is raised from legacy $100 to $1,000 when upgrading to v13
 UPDATE system_config
-SET config_value = '5000.0',
+SET config_value = '1000.0',
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE config_key = 'pond_testnet_min_vol_cap_usdc'
-  AND CAST(config_value AS REAL) < 5000.0
+  AND CAST(config_value AS REAL) < 1000.0
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 13);
 
 -- 4. One-time normalization of open/trailed Pond cells to enforce 6% max stop distance,

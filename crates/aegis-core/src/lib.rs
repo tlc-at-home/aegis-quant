@@ -41,7 +41,7 @@ pub const DEFAULT_MAINNET_HLP_VAULT_ADDRESS: &str = "0xdfc24b077bc1425ad1dea75bc
 pub const DEFAULT_TESTNET_HLP_VAULT_ADDRESS: &str = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
 
 /// Default Hyperliquid Testnet minimum daily volume cap (USDC) for Book B (`POND`) universe discovery and scanning (`R10-N4`, `Fix 6b`).
-pub const TESTNET_POND_MIN_VOL_CAP_USDC: f64 = 5_000.0;
+pub const TESTNET_POND_MIN_VOL_CAP_USDC: f64 = 1_000.0;
 
 /// Security-critical config keys that cannot be weakened or mutated via the Web API.
 pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[

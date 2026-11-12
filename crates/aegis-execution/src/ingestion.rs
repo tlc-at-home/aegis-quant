@@ -783,7 +783,7 @@ impl MarketIngestionEngine {
                     }
                     live_items
                         .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    if live_items.len() >= target_size.min(40) {
+                    if !live_items.is_empty() {
                         return live_items
                             .into_iter()
                             .take(target_size)

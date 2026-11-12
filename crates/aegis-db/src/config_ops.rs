@@ -404,7 +404,7 @@ fn alert_config_defaults(
         (
             "pond_testnet_min_vol_cap_usdc",
             (
-                "5000.0",
+                "1000.0",
                 "float",
                 "pond",
                 "Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet",

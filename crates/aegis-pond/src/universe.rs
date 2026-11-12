@@ -60,6 +60,7 @@ impl PondUniverseManager {
         let open_cell_symbols: HashSet<String> =
             open_cells.into_iter().map(|c| c.symbol).collect();
 
+        let has_override = candidates_override.is_some();
         let discovered = match candidates_override {
             Some(list) => list,
             None => self
@@ -73,8 +74,29 @@ impl PondUniverseManager {
         let mut final_rows = Vec::new();
 
         let is_live_discovery = discovered.iter().any(|c| c.is_synthetic_volume == 0);
+        let is_live_or_testnet = cfg.pond_execution_mode.eq_ignore_ascii_case("LIVE")
+            || cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET");
+        let has_existing_live_active = existing_map
+            .values()
+            .any(|r| r.status != "RETIRED" && r.is_synthetic_volume == 0);
+        if is_live_or_testnet
+            && !has_override
+            && !is_live_discovery
+            && has_existing_live_active
+        {
+            tracing::warn!(
+                "Live/Testnet Pond universe discovery returned synthetic fallback while live universe rows exist; preserving existing universe"
+            );
+            let mut preserved: Vec<PondUniverseRow> = existing_map.into_values().collect();
+            preserved.sort_by_key(|r| r.rank);
+            return Ok(preserved);
+        }
         let is_initial_bootstrap = existing_map.is_empty()
-            || (is_live_discovery && existing_map.values().all(|r| r.is_synthetic_volume != 0));
+            || (is_live_discovery
+                && existing_map
+                    .values()
+                    .filter(|r| r.status != "RETIRED")
+                    .all(|r| r.is_synthetic_volume != 0));
 
         for cand in discovered {
             let prev = existing_map.get(&cand.symbol);
@@ -87,10 +109,15 @@ impl PondUniverseManager {
             updated_symbols.insert(cand.symbol.clone());
 
             let (added_at, warmup_until_str) = match prev {
-                Some(p) if !(is_live_discovery && p.is_synthetic_volume != 0) => (
-                    p.added_at.clone(),
-                    p.warmup_until.clone().unwrap_or_else(|| now_str.clone()),
-                ),
+                Some(p)
+                    if !(is_live_discovery && p.is_synthetic_volume != 0)
+                        && !(is_initial_bootstrap && p.status == "RETIRED") =>
+                {
+                    (
+                        p.added_at.clone(),
+                        p.warmup_until.clone().unwrap_or_else(|| now_str.clone()),
+                    )
+                }
                 Some(p) => (
                     p.added_at.clone(),
                     cand.warmup_until.clone().unwrap_or_else(|| {
