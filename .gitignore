@@ -11,10 +11,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# SQLite WAL database & local master key (contains live credentials and encryption keys)
+# SQLite WAL database, backups & local master key (contains live credentials and encryption keys)
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/backups/
 data/.aegis_master_key
 .aegis_master_key
 **/.aegis_master_key

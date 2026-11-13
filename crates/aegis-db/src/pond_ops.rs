@@ -1252,13 +1252,24 @@ impl DatabaseManager {
             Ok(iter.flatten().collect())
         })?;
 
+        let is_live_or_testnet = self
+            .get_raw_config_value("execution_mode")
+            .ok()
+            .flatten()
+            .map(|m| matches!(m.trim().to_ascii_uppercase().as_str(), "LIVE" | "TESTNET"))
+            .unwrap_or(false);
+
         let mut reconciled = 0usize;
         for (tid, from_book, to_book, amount_usdc, legs_completed, leg1_ref, leg2_ref, tx_ref) in
             pending_rows
         {
             let has_leg2 = leg2_ref
                 .as_deref()
-                .map(|s| !s.trim().is_empty())
+                .map(|s| !s.trim().is_empty() && !s.to_ascii_uppercase().contains("AMBIGUOUS"))
+                .unwrap_or(false);
+            let has_confirmed_leg1 = leg1_ref
+                .as_deref()
+                .map(|s| !s.trim().is_empty() && !s.to_ascii_uppercase().contains("AMBIGUOUS"))
                 .unwrap_or(false);
             let is_ambiguous = tx_ref
                 .as_deref()
@@ -1292,13 +1303,13 @@ impl DatabaseManager {
                         .or(leg2_ref)
                         .unwrap_or_else(|| format!("0xreconciled_confirmed_{tid}")),
                 )
-            } else if legs_completed == 1 || leg1_ref.is_some() {
+            } else if legs_completed == 1 || has_confirmed_leg1 {
                 let l1 = leg1_ref.unwrap_or_else(|| format!("leg1_{tid}"));
                 (
                     BookTransferStatus::Partial,
                     tx_ref.unwrap_or_else(|| format!("PARTIAL_LEG1_ONLY:{l1}")),
                 )
-            } else if is_ambiguous {
+            } else if is_ambiguous || is_live_or_testnet {
                 (
                     BookTransferStatus::Ambiguous,
                     tx_ref.unwrap_or_else(|| format!("AMBIGUOUS_POST_SEND_{tid}")),
@@ -1970,6 +1981,37 @@ impl DatabaseManager {
                 settling_status: "NONE".to_string(),
                 created_at: None,
             })
+        })
+    }
+
+    pub fn get_pond_cell_protective_stop_oid(&self, cell_id: i64) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            let oid: Option<String> = conn
+                .query_row(
+                    "SELECT protective_stop_oid FROM pond_cells WHERE cell_id = ?1;",
+                    params![cell_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+                .flatten();
+            Ok(oid.filter(|s| !s.trim().is_empty()))
+        })
+    }
+
+    pub fn set_pond_cell_protective_stop_oid(
+        &self,
+        cell_id: i64,
+        protective_stop_oid: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let _ = conn
+                .execute(
+                    "UPDATE pond_cells SET protective_stop_oid = ?1 WHERE cell_id = ?2;",
+                    params![protective_stop_oid, cell_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
         })
     }
 }

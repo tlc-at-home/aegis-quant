@@ -50,6 +50,10 @@ pub struct AppState {
     pub cycle_lock: Arc<Mutex<()>>,
     pub session_token: String,
     pub auth_cache: Arc<parking_lot::Mutex<Option<CachedWebAuthConfig>>>,
+    pub active_sessions: Arc<parking_lot::Mutex<std::collections::HashMap<String, i64>>>,
+    pub login_failures:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
+    pub sse_payload_cache: Arc<parking_lot::Mutex<Option<(std::time::Instant, String)>>>,
 }
 
 impl AppState {
@@ -140,7 +144,10 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn extract_cookie_token(headers: &axum::http::HeaderMap, cookie_name: &str) -> Option<String> {
+pub(crate) fn extract_cookie_token(
+    headers: &axum::http::HeaderMap,
+    cookie_name: &str,
+) -> Option<String> {
     let cookie_hdr = headers.get(header::COOKIE)?.to_str().ok()?;
     for part in cookie_hdr.split(';') {
         let trimmed = part.trim();
@@ -300,9 +307,18 @@ fn is_request_authorized_with_config(
 
     let cookie_tok = extract_cookie_token(req.headers(), "aegis_session");
     let has_valid_cookie_token = cookie_tok.as_ref().is_some_and(|cand| {
-        valid_tokens
-            .iter()
-            .any(|expected| constant_time_eq(cand, expected))
+        let now_ms = state.db.now_ms();
+        let in_active_sessions = {
+            let mut sessions = state.active_sessions.lock();
+            sessions.retain(|_, exp| *exp > now_ms);
+            sessions
+                .keys()
+                .any(|active_nonce| constant_time_eq(cand, active_nonce))
+        };
+        in_active_sessions
+            || valid_tokens
+                .iter()
+                .any(|expected| constant_time_eq(cand, expected))
     });
 
     let is_mutating = matches!(
@@ -476,6 +492,9 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         cycle_lock: Arc::new(Mutex::new(())),
         session_token,
         auth_cache: Arc::new(parking_lot::Mutex::new(None)),
+        active_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        login_failures: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        sse_payload_cache: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     Router::new()
@@ -517,6 +536,7 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/v1/engine/cycle", post(api_trigger_cycle))
         .route("/api/v1/engine/backtest", post(api_trigger_backtest))
         .route("/api/v1/engine/calibrate", post(api_trigger_calibrate))
+        .route("/api/v1/db/backup", post(api_trigger_db_backup))
         .route("/api/v1/stream", get(api_stream))
         // Legacy aliases for backwards compatibility
         .route("/api/dashboard", get(api_dashboard))
@@ -542,6 +562,7 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/cycle", post(api_trigger_cycle))
         .route("/api/backtest", post(api_trigger_backtest))
         .route("/api/calibrate", post(api_trigger_calibrate))
+        .route("/api/db/backup", post(api_trigger_db_backup))
         .route("/api/stream", get(api_stream))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -556,11 +577,41 @@ pub async fn run_web_server(
     host: &str,
     port: u16,
 ) -> Result<()> {
+    run_web_server_with_shutdown(db, static_dir, host, port, async {
+        #[cfg(unix)]
+        {
+            if let Ok(mut sigterm) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                return;
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+pub async fn run_web_server_with_shutdown<F>(
+    db: DatabaseManager,
+    static_dir: impl AsRef<Path>,
+    host: &str,
+    port: u16,
+    shutdown_signal: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let app = build_router(db, static_dir);
     let addr = format!("{host}:{port}");
     tracing::info!("Aegis-Quant PP-50 Rust Web Server listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 
@@ -568,6 +619,24 @@ pub async fn run_web_server(
 pub async fn serve_web(db: DatabaseManager, host: &str, port: u16) -> Result<()> {
     let static_dir = resolve_project_root().join("web").join("static");
     run_web_server(db, static_dir, host, port).await
+}
+
+/// Entrypoint invoked by `aegis-cli` (`aegis-quant`) with an explicit `watch::Receiver<bool>` shutdown signal (`HI-5`).
+pub async fn serve_web_with_shutdown(
+    db: DatabaseManager,
+    host: &str,
+    port: u16,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let static_dir = resolve_project_root().join("web").join("static");
+    run_web_server_with_shutdown(db, static_dir, host, port, async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -618,7 +687,7 @@ mod tests {
         db.initialize_schema(true).expect("seed schema");
 
         let payload = build_dashboard_payload(&db).expect("dashboard payload");
-        assert_eq!(payload.schema_version, 13);
+        assert_eq!(payload.schema_version, 14);
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pond.universe.len(), 80);
 
@@ -638,7 +707,7 @@ mod tests {
         db.initialize_schema(true).expect("init schema");
 
         let payload = build_dashboard_payload(&db).expect("build dashboard payload");
-        assert_eq!(payload.schema_version, 13);
+        assert_eq!(payload.schema_version, 14);
 
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pp50.pit.equity_usdc, 5000.0);
@@ -2169,6 +2238,119 @@ mod tests {
         assert_eq!(enriched.len(), 1);
         assert_eq!(enriched[0].current_price, 91_000.0);
         assert!((enriched[0].unrealized_pnl_usdc - 10.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_db_backup_endpoint_and_login_rate_limiting_me13_me14_me19() {
+        let root = resolve_project_root();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_web_backup_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_web_test.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).expect("seed schema");
+        db.set_config_value("web_api_token", &json!("test-backup-token"))
+            .expect("set token");
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 1. Trigger DB backup via POST /api/v1/db/backup
+        let backup_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/db/backup")
+            .header(header::AUTHORIZATION, "Bearer test-backup-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"reason":"dashboard_button_test"}"#))
+            .unwrap();
+        let backup_resp = app.clone().oneshot(backup_req).await.unwrap();
+        assert_eq!(backup_resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(backup_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let backup_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(backup_json["status"], "ok");
+        assert!(backup_json["backup"]["size_bytes"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(backup_json["backup"]["retained_count"], 1);
+
+        // 2. Verify session login sets Max-Age=86400 and logout revokes session cookie (ME-13)
+        let login_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"token":"test-backup-token"}"#))
+            .unwrap();
+        let login_resp = app.clone().oneshot(login_req).await.unwrap();
+        assert_eq!(login_resp.status(), StatusCode::OK);
+        let set_cookie = login_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.contains("Max-Age=86400"));
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+        // Logout with that session cookie revokes the server-side session nonce
+        let logout_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/logout")
+            .header(header::COOKIE, &cookie_pair)
+            .header("x-requested-with", "XMLHttpRequest")
+            .body(Body::empty())
+            .unwrap();
+        let logout_resp = app.clone().oneshot(logout_req).await.unwrap();
+        assert_eq!(logout_resp.status(), StatusCode::OK);
+
+        // Subsequent request with the revoked session cookie must return 401
+        let revoked_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/status")
+            .header(header::COOKIE, &cookie_pair)
+            .body(Body::empty())
+            .unwrap();
+        let revoked_resp = app.clone().oneshot(revoked_req).await.unwrap();
+        assert_eq!(revoked_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Verify 5 consecutive failed logins trigger 429 Too Many Requests on the 6th attempt (ME-14)
+        for _ in 0..5 {
+            let bad_req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"wrong-token"}"#))
+                .unwrap();
+            let bad_resp = app.clone().oneshot(bad_req).await.unwrap();
+            assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let rate_limited_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"token":"wrong-token"}"#))
+            .unwrap();
+        let rate_limited_resp = app.oneshot(rate_limited_req).await.unwrap();
+        assert_eq!(rate_limited_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 4. Verify index.html and app.js contain the DB backup button and handler, and validate_config_update enforces immutable web_api_token + 16-char minimum token length (ME-14)
+        assert!(crate::payloads::validate_config_update("web_api_token", "short").is_err());
+        assert!(crate::payloads::validate_config_update("dashboard_api_token", "short").is_err());
+        assert!(
+            crate::payloads::validate_config_update("dashboard_api_token", "0123456789abcdef")
+                .is_ok()
+        );
+        assert!(EMBEDDED_INDEX_HTML.contains("btn-backup-db"));
+        assert!(EMBEDDED_INDEX_HTML.contains("btn-backup-db-settings"));
+        assert!(EMBEDDED_APP_JS.contains("triggerDbBackup"));
+        assert!(EMBEDDED_APP_JS.contains("/api/v1/db/backup"));
+        assert!(EMBEDDED_APP_JS.contains("CONFIRM_LIVE_SETTLE"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
 

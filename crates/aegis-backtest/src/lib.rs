@@ -439,6 +439,11 @@ impl BacktestEngine {
         // `backtest_scale_4h_stops = false` in `system_config` (R7-N1).
         let cur_cfg = bt_db.load_config()?;
         if cur_cfg.get_bool("backtest_scale_4h_stops", true) {
+            tracing::info!(
+                component = "engine.backtest",
+                backtest_scale_4h_stops = true,
+                "Applying 4H horizon sqrt(16)=4x stop scaling in isolated backtest memory DB (ME-2; set backtest_scale_4h_stops=false to replay raw intraday stops)"
+            );
             if cur_cfg.get_f64("chandelier_atr_multiplier_long", 1.2) < 3.0 {
                 let _ = bt_db.set_config_value("chandelier_atr_multiplier_long", &serde_json::json!(3.5));
             }
@@ -777,7 +782,27 @@ impl BacktestEngine {
                     if stop_eval.is_wick_stop {
                         wick_stop_outs += 1;
                     }
-                    total_slippage_usdc += stop_eval.exit_slippage_usdc;
+                    let non_stop_slippage_usdc = if !stop_eval.triggered {
+                        let non_stop_slip_bps =
+                            cfg.get_f64("non_stop_exit_slippage_bps", 2.0).max(0.0);
+                        exit_px = if trade.side == "LONG" {
+                            RiskEngine::round_step(
+                                bar.close * (1.0 - non_stop_slip_bps / 10_000.0),
+                                p.asset.tick_size,
+                                true,
+                            )
+                        } else {
+                            RiskEngine::round_step(
+                                bar.close * (1.0 + non_stop_slip_bps / 10_000.0),
+                                p.asset.tick_size,
+                                false,
+                            )
+                        };
+                        round_dp((bar.close - exit_px).abs() * trade.quantity, 4)
+                    } else {
+                        0.0
+                    };
+                    total_slippage_usdc += stop_eval.exit_slippage_usdc + non_stop_slippage_usdc;
                     let exit_fee = (trade.quantity * exit_px) * (taker_fee_bps / 10000.0);
                     let total_fees = round_dp(trade.fees_paid_usdc + exit_fee, 4);
                     let gross_pnl = if trade.side == "LONG" {

@@ -29,6 +29,10 @@ pub struct CellExitEvalInput {
     pub max_hold_hours: f64,
     pub cooldown_stop_hours: i64,
     pub cooldown_normal_hours: i64,
+    #[serde(default)]
+    pub min_norm_hold_hours: f64,
+    #[serde(default)]
+    pub net_pnl_usdc: f64,
 }
 
 impl Default for CellExitEvalInput {
@@ -53,6 +57,8 @@ impl Default for CellExitEvalInput {
             max_hold_hours: 72.0,
             cooldown_stop_hours: 56,
             cooldown_normal_hours: 24,
+            min_norm_hold_hours: 6.0,
+            net_pnl_usdc: 0.0,
         }
     }
 }
@@ -250,7 +256,10 @@ pub fn evaluate_exit_priority(cell: &PondCell, input: &CellExitEvalInput) -> Cel
     // Tier 3: Evaluated at 1H S-cycle funding boundary
     if input.is_1h_boundary {
         // Tier 3: Funding Normalisation / Mean-Reversion Harvest (|z_t| <= 0.5)
-        if input.current_funding_z.abs() <= input.z_exit_threshold {
+        // Guarded by minimum hold duration or positive net PnL to prevent premature churn at a loss.
+        if input.current_funding_z.abs() <= input.z_exit_threshold
+            && (input.hold_hours >= input.min_norm_hold_hours || input.net_pnl_usdc > 0.0)
+        {
             return CellExitDecision {
                 should_exit: true,
                 tier: Some(3),

@@ -10,6 +10,7 @@ pub mod trade_ops;
 
 pub use config_ops::{cast_config_value, ConfigMap};
 pub use pond_ops::{BookPnlComponents, PitPnlComponents, PondPnlComponents};
+pub use schema_ops::{DbCycleLockGuard, ALL_MIGRATION_FILES, CANONICAL_SCHEMA_VERSION};
 pub use scoped::{BookScopedDb, PitConfig, PondConfig};
 
 use crate::fernet::{
@@ -45,7 +46,7 @@ pub(crate) struct CachedFernetState {
 pub struct DatabaseManager {
     pub db_path: PathBuf,
     pub schema_path: PathBuf,
-    pub(crate) is_memory: bool,
+    pub is_memory: bool,
     pub(crate) memory_conn: Option<Arc<Mutex<Connection>>>,
     pub(crate) conn_pool: Arc<Mutex<Vec<Connection>>>,
     pub(crate) pit_timestamp_ms: Arc<AtomicI64>,
@@ -1299,7 +1300,7 @@ mod tests {
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 13);
+        assert_eq!(db.get_schema_version().unwrap(), 14);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1507,21 +1508,15 @@ mod tests {
             )
             .unwrap();
         db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE system_config SET config_value = '8' WHERE config_key = 'schema_version';",
-                [],
+            conn.execute_batch(
+                "UPDATE system_config SET config_value = '8' WHERE config_key = 'schema_version';
+                 DELETE FROM schema_migrations WHERE version >= 9;",
             )
             .unwrap();
-            let mig_009 = include_str!("../../../sql/migrations/009_v030_round4_remediation.sql");
-            let filtered: String = mig_009
-                .lines()
-                .filter(|l| !l.contains("ADD COLUMN last_funding_hour_bucket") && !l.contains("ADD COLUMN resting_order_id"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            conn.execute_batch(&filtered).unwrap();
             Ok(())
         })
         .unwrap();
+        db.apply_migration("sql/schema_and_seed.sql").unwrap();
         let rec_hist = db
             .get_recent_book_transfers(10)
             .unwrap()
@@ -1537,7 +1532,7 @@ mod tests {
         use rusqlite::OptionalExtension;
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 13);
+        assert_eq!(db.get_schema_version().unwrap(), 14);
 
         // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
         db.with_conn(|conn| {
@@ -1868,7 +1863,7 @@ mod tests {
     fn test_r7_b1_s2_s3_n4_config_read_purity_and_migration_011_stop_tightening() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 13);
+        assert_eq!(db.get_schema_version().unwrap(), 14);
 
         // 1. R7-B1 & R7-QA: Operator sets custom chandelier_atr_multiplier_long = 2.0
         // and inserts an OPEN trade with a wide 4H stop (e.g. $86,000 on a $90,000 BTC LONG).
@@ -1987,16 +1982,13 @@ mod tests {
         let newly_applied = db.run_migrations().unwrap();
         assert_eq!(
             newly_applied,
-            vec![
-                "sql/migrations/012_v030_round9_remediation.sql".to_string(),
-                "sql/migrations/013_v030_round12_remediation.sql".to_string(),
-            ],
-            "run_migrations() from v11 must report ONLY migrations 012..013 as newly applied (R8-S2)"
+            vec!["sql/schema_and_seed.sql".to_string()],
+            "run_migrations() from v11 must report canonical sql/schema_and_seed.sql as newly applied"
         );
         assert_eq!(
             db.run_migrations().unwrap(),
             Vec::<String>::new(),
-            "run_migrations() when already at v13 must return empty Vec (R8-S2)"
+            "run_migrations() when already at v14 must return empty Vec (R8-S2)"
         );
         // R8-S1: If an operator widens the ETH stop at v12 and calls apply_migration(011) directly,
         // target_num (11) <= max_applied_ver (12), so the SQL script must NOT re-execute!
@@ -2943,6 +2935,92 @@ mod tests {
         assert!(
             (avax.highest_price_seen.unwrap() - 92.50).abs() < 1e-6,
             "Migration 013 must ignore synthetic high (99.00) in market_ohlcv watermark subquery (R13-N4(d))"
+        );
+    }
+
+    #[test]
+    fn test_round14_consolidated_schema_cycle_lock_backup_and_me12() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        assert_eq!(db.get_schema_version().unwrap(), 14);
+
+        let cfg = db.load_config().unwrap();
+        assert!(
+            (cfg.get_f64("pond_funding_floor_hourly", 0.0) - 0.000050).abs() < 1e-9,
+            "Round 14 consolidated schema must seed pond_funding_floor_hourly = 0.000050"
+        );
+        assert!(
+            (cfg.get_f64("pond_min_norm_hold_hours", 0.0) - 6.0).abs() < 1e-9,
+            "Round 14 consolidated schema must seed pond_min_norm_hold_hours = 6.0"
+        );
+        assert!(cfg.get_bool("pond_require_2h_persistence", false));
+        assert!(cfg.get_bool("exchange_protective_stops_enabled", false));
+        assert!((cfg.get_f64("max_correlation_cluster_pct", 0.0) - 0.35).abs() < 1e-9);
+        assert_eq!(cfg.get_i64("backup_retention_days", 0), 7);
+
+        // HI-4: Cross-process advisory cycle lock mutual exclusion & RAII release
+        let guard_a = db.acquire_cycle_lock_guard("cli-daemon", 60_000).unwrap();
+        assert!(guard_a.is_some(), "First owner must acquire cycle lock");
+        let guard_b = db.acquire_cycle_lock_guard("web-trigger", 60_000).unwrap();
+        assert!(
+            guard_b.is_none(),
+            "Concurrent second owner must be blocked while lock is unexpired (HI-4)"
+        );
+        drop(guard_a);
+        let guard_c = db.acquire_cycle_lock_guard("web-trigger", 60_000).unwrap();
+        assert!(
+            guard_c.is_some(),
+            "After dropping guard_a, second owner must acquire cycle lock"
+        );
+        drop(guard_c);
+
+        // ME-19: Automated VACUUM INTO backup creation and retention pruning
+        let tmp_backup_dir =
+            std::env::temp_dir().join(format!("aegis_backup_test_{}", uuid::Uuid::new_v4()));
+        let backup_res = db
+            .create_sqlite_backup(Some(&tmp_backup_dir), Some(7))
+            .unwrap();
+        assert_eq!(backup_res["status"], "OK");
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+        assert!(backup_path.exists());
+        assert!(backup_res["size_bytes"].as_u64().unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&tmp_backup_dir);
+
+        // ME-12: Zero-leg stale PENDING transfer in LIVE/TESTNET mode transitions to AMBIGUOUS
+        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        let tid_live = db
+            .insert_book_transfer_with_mode(
+                &aegis_core::BookTransfer {
+                    transfer_id: 0,
+                    settle_date: "2026-11-12T00:05:00Z".to_string(),
+                    from_book: "PIT".to_string(),
+                    to_book: "POND".to_string(),
+                    amount_usdc: 200.0,
+                    pre_from_usdc: Some(5200.0),
+                    pre_to_usdc: Some(4800.0),
+                    post_from_usdc: Some(5000.0),
+                    post_to_usdc: Some(5000.0),
+                    drift_bps_before: Some(200.0),
+                    drift_bps_after: Some(0.0),
+                    blocked_remainder_usdc: 0.0,
+                    status: "PENDING".to_string(),
+                    attempts: 1,
+                    tx_ref: None,
+                    created_at: "2026-11-12T00:05:00Z".to_string(),
+                },
+                "LIVE",
+            )
+            .unwrap();
+        assert_eq!(db.reconcile_pending_book_transfers().unwrap(), 1);
+        let rec_live = db
+            .get_recent_book_transfers(5)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.transfer_id == tid_live)
+            .unwrap();
+        assert_eq!(
+            rec_live.status, "AMBIGUOUS",
+            "ME-12: Zero-leg PENDING transfer in LIVE mode must quarantine as AMBIGUOUS"
         );
     }
 }

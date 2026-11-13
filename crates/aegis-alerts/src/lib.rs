@@ -171,18 +171,32 @@ impl AlertRetryQueue {
         let queue_ref = self.clone();
         thread::spawn(move || loop {
             loop {
-                let task_opt = {
+                let now_ms = Utc::now().timestamp_millis();
+                let (ready_task, min_wait_ms) = {
                     let mut q = queue_ref.queue.lock();
-                    q.pop_front()
+                    if q.is_empty() {
+                        (None, None)
+                    } else if let Some(ready_idx) =
+                        q.iter().position(|t| t.next_attempt_ms <= now_ms)
+                    {
+                        (q.remove(ready_idx), None)
+                    } else {
+                        let min_next = q
+                            .iter()
+                            .map(|t| t.next_attempt_ms)
+                            .min()
+                            .unwrap_or(now_ms);
+                        (None, Some((min_next - now_ms).clamp(5, 50) as u64))
+                    }
                 };
-                let Some(task) = task_opt else {
+                if let Some(wait_ms) = min_wait_ms {
+                    thread::sleep(Duration::from_millis(wait_ms));
+                    continue;
+                }
+                let Some(task) = ready_task else {
                     break;
                 };
                 queue_ref.in_flight.fetch_add(1, Ordering::SeqCst);
-                let now_ms = Utc::now().timestamp_millis();
-                if task.next_attempt_ms > now_ms {
-                    thread::sleep(Duration::from_millis((task.next_attempt_ms - now_ms) as u64));
-                }
                 let res = engine.send_alert(
                     &task.title,
                     &task.message,
@@ -191,7 +205,8 @@ impl AlertRetryQueue {
                     false,
                     false,
                 );
-                if res.status == "DELIVERED" {
+                let all_ok = res.status == "DELIVERED" && res.error_detail.is_none();
+                if all_ok {
                     queue_ref.delivered_count.fetch_add(1, Ordering::SeqCst);
                 } else if task.attempt < queue_ref.max_retries {
                     let delay_ms = (queue_ref.base_backoff_sec
@@ -657,7 +672,7 @@ impl AlertEngine {
         let mut status = if delivered { "DELIVERED" } else { "ERROR" }.to_string();
         let mut queued_for_retry = false;
 
-        if status == "ERROR" && any_error && retriable_error && allow_retry_queue {
+        if any_error && retriable_error && allow_retry_queue {
             queued_for_retry = self.retry_queue.enqueue(
                 self.clone(),
                 title.to_string(),
@@ -666,7 +681,7 @@ impl AlertEngine {
                 details.clone(),
                 1,
             );
-            if queued_for_retry {
+            if queued_for_retry && status == "ERROR" {
                 status = "QUEUED_FOR_RETRY".to_string();
             }
         }

@@ -100,6 +100,7 @@ impl ExecutionEngine {
         }
 
         let mut updated = 0usize;
+        let mut skipped_missing = 0usize;
         let mut net_funding_delta = 0.0;
 
         for trade in open_trades {
@@ -116,10 +117,11 @@ impl ExecutionEngine {
                 .copied()
                 .or_else(|| bars.last().map(|b| b.funding_rate_hourly))
             else {
+                skipped_missing += 1;
                 tracing::warn!(
                     trade_id = trade.trade_id,
                     symbol = %trade.symbol,
-                    "Skipping hourly funding accrual: no on-chain or 1h bar funding rate available"
+                    "Skipping hourly funding accrual: no on-chain or 1h bar funding rate available (ME-8: will retry this hour)"
                 );
                 continue;
             };
@@ -157,16 +159,20 @@ impl ExecutionEngine {
                 }
                 Ok(false) => {}
                 Err(e) => {
+                    skipped_missing += 1;
                     tracing::error!(
                         trade_id = trade.trade_id,
                         error = %e,
-                        "Failed to accrue open trade funding (R4-N4)"
+                        "Failed to accrue open trade funding (R4-N4, ME-8)"
                     );
                 }
             }
         }
 
-        *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
+        // ME-8: Only mark the hour bucket as completed when no open trades were skipped due to missing rates/errors.
+        if skipped_missing == 0 {
+            *self.last_funding_sync_hour_ts.lock() = Some(hour_bucket);
+        }
 
         if !is_backtest && updated > 0 {
             let _ = self.db.log_telemetry(
@@ -534,7 +540,83 @@ impl ExecutionEngine {
                 }
             }
         }
+        if resting_promoted_or_cancelled {
+            self.enforce_post_promotion_heat_cap(is_simulated);
+        }
         resting_promoted_or_cancelled
+    }
+
+    /// Re-checks Book A (`PIT`) open portfolio heat after promoting resting orders (`HI-8`).
+    /// If open portfolio heat exceeds `max_portfolio_heat_pct * pit_equity`, cancels any remaining
+    /// `OPEN_ON_BOOK` resting PIT orders so delayed/blended resting fills cannot push heat above cap.
+    pub fn enforce_post_promotion_heat_cap(&self, is_simulated: bool) -> usize {
+        let cfg = self.load_config_logged("enforce_post_promotion_heat_cap");
+        let max_heat_pct = cfg.get_f64("max_portfolio_heat_pct", 0.06).clamp(0.01, 0.50);
+        let initial_equity = cfg.get_f64("initial_equity_usdc", 10_000.0).max(50.0);
+        let pit_equity = self
+            .db
+            .compute_pit_equity_and_idle_usdc()
+            .map(|(eq, _)| eq)
+            .unwrap_or(initial_equity)
+            .max(50.0);
+        let max_heat_usdc = pit_equity * max_heat_pct;
+        let open_trades = self.db.get_open_trades().unwrap_or_default();
+        let mut open_heat_usdc = 0.0;
+        for t in &open_trades {
+            let stop_px = if t.chandelier_stop_price > 0.0 {
+                t.chandelier_stop_price
+            } else {
+                t.initial_stop_price
+            };
+            let trade_heat = if stop_px > 0.0 && (t.entry_price - stop_px).abs() > 1e-12 {
+                (t.entry_price - stop_px).abs() * t.quantity.abs()
+            } else {
+                t.risk_budget_usdc.max(0.0)
+            };
+            open_heat_usdc += trade_heat;
+        }
+        if open_heat_usdc <= max_heat_usdc + 1e-6 {
+            return 0;
+        }
+        let resting = self.db.get_resting_pit_trades().unwrap_or_default();
+        let mut cancelled = 0usize;
+        for rt in resting {
+            if !is_simulated {
+                if let Some(oid_str) = rt.exchange_order_id.as_deref() {
+                    let _ = self.cancel_resting_order(&rt.symbol, oid_str);
+                }
+            }
+            if matches!(
+                self.db
+                    .cancel_resting_trade(rt.trade_id, "RESTING_CANCELLED_HEAT_CAP_EXCEEDED"),
+                Ok(true)
+            ) {
+                cancelled += 1;
+                tracing::warn!(
+                    trade_id = rt.trade_id,
+                    symbol = %rt.symbol,
+                    open_heat_usdc = open_heat_usdc,
+                    max_heat_usdc = max_heat_usdc,
+                    "Cancelled remaining resting PIT order after post-promotion heat exceeded cap (HI-8)"
+                );
+                let _ = self.db.log_telemetry(
+                    "WARN",
+                    "engine.execution",
+                    &format!(
+                        "RESTING_FILL_HEAT_CAP_ENFORCED: cancelled resting PIT order #{} ({}) because open heat ${:.2} > cap ${:.2}",
+                        rt.trade_id, rt.symbol, open_heat_usdc, max_heat_usdc
+                    ),
+                    Some(serde_json::json!({
+                        "event": "RESTING_FILL_HEAT_CAP_ENFORCED",
+                        "trade_id": rt.trade_id,
+                        "symbol": rt.symbol,
+                        "open_heat_usdc": open_heat_usdc,
+                        "max_heat_usdc": max_heat_usdc,
+                    })),
+                );
+            }
+        }
+        cancelled
     }
 
     /// Polls and reconciles off-book `ARMED` Pond cells during the 15s exchange reconciliation tick (`Fix 4`, `R13-QA`).
@@ -866,5 +948,6 @@ impl ExecutionEngine {
                 }
             }
         }
+        let _ = self.enforce_post_promotion_heat_cap(is_backtest);
     }
 }

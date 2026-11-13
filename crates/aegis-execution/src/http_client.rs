@@ -250,10 +250,30 @@ pub fn http_post_json(
 
 impl crate::ExecutionEngine {
     pub(crate) fn info_url(&self, cfg: &ConfigMap, is_testnet: bool) -> String {
+        if is_testnet
+            && cfg
+                .get_str("execution_mode", "PAPER")
+                .eq_ignore_ascii_case("LIVE")
+            && cfg.get_bool("hyperliquid_testnet", false)
+        {
+            tracing::warn!(
+                "execution_mode is LIVE while hyperliquid_testnet=true; routing /info request to Testnet endpoint (ME-5)"
+            );
+        }
         resolve_info_url_for_network(cfg, is_testnet)
     }
 
     pub(crate) fn exchange_url(&self, cfg: &ConfigMap, is_testnet: bool) -> String {
+        if is_testnet
+            && cfg
+                .get_str("execution_mode", "PAPER")
+                .eq_ignore_ascii_case("LIVE")
+            && cfg.get_bool("hyperliquid_testnet", false)
+        {
+            tracing::warn!(
+                "execution_mode is LIVE while hyperliquid_testnet=true; routing /exchange action to Testnet endpoint (ME-5)"
+            );
+        }
         resolve_exchange_url_for_network(cfg, is_testnet)
     }
 

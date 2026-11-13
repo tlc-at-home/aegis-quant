@@ -434,13 +434,29 @@ impl MarketIngestionEngine {
                     b
                 }
                 None => {
-                    let existing = if !force_synthetic {
+                    let mut existing = if !force_synthetic {
                         self.db
                             .get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)
                             .unwrap_or_default()
                     } else {
                         Vec::new()
                     };
+                    if is_live_or_testnet {
+                        let max_staleness_ms =
+                            cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+                        let now_ms = Utc::now().timestamp_millis();
+                        if let Some(last_b) = existing.last() {
+                            if now_ms.saturating_sub(last_b.timestamp_ms) > max_staleness_ms {
+                                tracing::warn!(
+                                    tf = %tf,
+                                    age_ms = now_ms.saturating_sub(last_b.timestamp_ms),
+                                    max_staleness_ms = max_staleness_ms,
+                                    "Discarding stale cached BTC/USDC:USDC bars in ingest_universe in live/testnet mode (HI-2)"
+                                );
+                                existing.clear();
+                            }
+                        }
+                    }
                     if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
                         tracing::warn!(
                             "Transient candleSnapshot failure for BTC/USDC:USDC ({}); preserving {} existing bars",
@@ -527,13 +543,30 @@ impl MarketIngestionEngine {
                         total_usdc_bars += self.db.upsert_ohlcv_batch(&bars)?;
                     }
                     None => {
-                        let existing = if !force_synthetic {
+                        let mut existing = if !force_synthetic {
                             self.db
                                 .get_ohlcv_bars(&asset.symbol, &tf, lookback_bars, None)
                                 .unwrap_or_default()
                         } else {
                             Vec::new()
                         };
+                        if is_live_or_testnet {
+                            let max_staleness_ms =
+                                cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+                            let now_ms = Utc::now().timestamp_millis();
+                            if let Some(last_b) = existing.last() {
+                                if now_ms.saturating_sub(last_b.timestamp_ms) > max_staleness_ms {
+                                    tracing::warn!(
+                                        symbol = %asset.symbol,
+                                        tf = %tf,
+                                        age_ms = now_ms.saturating_sub(last_b.timestamp_ms),
+                                        max_staleness_ms = max_staleness_ms,
+                                        "Discarding stale cached altcoin bars in ingest_universe in live/testnet mode (HI-2)"
+                                    );
+                                    existing.clear();
+                                }
+                            }
+                        }
                         if !force_synthetic && (is_live_or_testnet || !existing.is_empty()) {
                             tracing::warn!(
                                 "Transient candleSnapshot failure for {} ({}); preserving {} existing bars",
@@ -924,11 +957,16 @@ impl MarketIngestionEngine {
             })
             .collect();
 
-        if let Some(last) = funding_series.last_mut() {
+        let f_len = funding_series.len();
+        if f_len >= 2 {
             if rank % 11 == 3 {
-                *last = 0.000085 + (rank as f64) * 0.000001;
+                let spike = 0.000085 + (rank as f64) * 0.000001;
+                funding_series[f_len - 2] = round_dp(spike * 0.92, 8);
+                funding_series[f_len - 1] = spike;
             } else if rank % 13 == 5 {
-                *last = -0.000082 - (rank as f64) * 0.000001;
+                let spike = -0.000082 - (rank as f64) * 0.000001;
+                funding_series[f_len - 2] = round_dp(spike * 0.92, 8);
+                funding_series[f_len - 1] = spike;
             }
         }
 

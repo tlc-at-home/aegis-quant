@@ -84,6 +84,8 @@ pub struct PondConfig {
     pub pond_funding_z_entry: f64,
     pub pond_funding_z_exit: f64,
     pub pond_funding_floor_hourly: f64,
+    pub pond_require_2h_persistence: bool,
+    pub pond_min_norm_hold_hours: f64,
     pub pond_trend_veto_ema_fast: usize,
     pub pond_trend_veto_ema_slow: usize,
     pub pond_trend_veto_overextension_pct: f64,
@@ -129,6 +131,7 @@ pub struct PondConfig {
     pub platform_settle_gate_enabled: bool,
     pub platform_settle_gate_enabled_raw: bool,
     pub platform_pp50_halt: bool,
+    pub exchange_protective_stops_enabled: bool,
 }
 
 impl PondConfig {
@@ -156,7 +159,9 @@ impl PondConfig {
             pond_funding_z_window_hours: cfg.get_usize("pond_funding_z_window_hours", 168),
             pond_funding_z_entry: cfg.get_f64("pond_funding_z_entry", 2.0),
             pond_funding_z_exit: cfg.get_f64("pond_funding_z_exit", 0.5),
-            pond_funding_floor_hourly: cfg.get_f64("pond_funding_floor_hourly", 0.000015),
+            pond_funding_floor_hourly: cfg.get_f64("pond_funding_floor_hourly", 0.000050),
+            pond_require_2h_persistence: cfg.get_bool("pond_require_2h_persistence", true),
+            pond_min_norm_hold_hours: cfg.get_f64("pond_min_norm_hold_hours", 6.0),
             pond_trend_veto_ema_fast: cfg.get_usize("pond_trend_veto_ema_fast", 16),
             pond_trend_veto_ema_slow: cfg.get_usize("pond_trend_veto_ema_slow", 64),
             pond_trend_veto_overextension_pct: cfg.get_f64("pond_trend_veto_overextension_pct", 0.08),
@@ -202,6 +207,10 @@ impl PondConfig {
             platform_settle_gate_enabled: settle_gate,
             platform_settle_gate_enabled_raw: settle_gate,
             platform_pp50_halt: cfg.get_bool("platform_pp50_halt", false),
+            exchange_protective_stops_enabled: cfg.get_bool(
+                "exchange_protective_stops_enabled",
+                cfg.get_bool("enable_exchange_trigger_stops", true),
+            ),
         }
     }
 }
@@ -574,5 +583,20 @@ impl BookScopedDb {
     pub fn compute_pond_equity_and_idle_usdc(&self) -> Result<(f64, f64)> {
         self.check_table_access("pond_cells")?;
         self.pool.compute_pond_equity_and_idle_usdc()
+    }
+
+    pub fn get_pond_cell_protective_stop_oid(&self, cell_id: i64) -> Result<Option<String>> {
+        self.check_table_access("pond_cells")?;
+        self.pool.get_pond_cell_protective_stop_oid(cell_id)
+    }
+
+    pub fn set_pond_cell_protective_stop_oid(
+        &self,
+        cell_id: i64,
+        stop_oid: Option<&str>,
+    ) -> Result<()> {
+        self.check_table_access("pond_cells")?;
+        self.pool
+            .set_pond_cell_protective_stop_oid(cell_id, stop_oid)
     }
 }

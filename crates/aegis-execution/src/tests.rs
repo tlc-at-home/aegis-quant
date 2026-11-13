@@ -2718,3 +2718,152 @@
         assert!((trued_eth.risk_budget_usdc.unwrap() - 155.0).abs() < 1e-2);
         assert!((trued_eth.fees_paid_usdc - 0.3195).abs() < 1e-4);
     }
+
+    #[test]
+    fn test_r14_execution_review_fixes_cloid_floor_heat_funding_and_reconcile() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let exec = ExecutionEngine::new(db.clone());
+
+        // 1. ME-6: deterministic 128-bit hex cloid
+        let cloid = crate::signing::derive_hl_cloid_hex("aegis-pit-order-123");
+        assert!(cloid.starts_with("0x"));
+        assert_eq!(cloid.len(), 34);
+        assert_eq!(cloid, crate::signing::derive_hl_cloid_hex("aegis-pit-order-123"));
+
+        // 2. HI-7: format_hl_wire_size_floor floors reduce_only sizes instead of rounding up
+        assert_eq!(
+            crate::signing::format_hl_wire_size_floor(1.239, 0.01, 2),
+            "1.23"
+        );
+        assert_eq!(
+            crate::signing::format_hl_wire_size_floor(10.99, 1.0, 0),
+            "10"
+        );
+
+        // 3. ME-8: sync_funding_payments does not lock the hour bucket when a trade's 1h funding rate is missing
+        let hour_ts = 1_760_000_000_000i64;
+        let open_sol = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "sol-open-me8".to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "SHORT".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 150.0,
+            current_price: 150.0,
+            exit_price: None,
+            quantity: 10.0,
+            filled_units: 10.0,
+            avg_fill_price: Some(150.0),
+            notional_usdc: 1_500.0,
+            risk_budget_usdc: 450.0, // > 300 max heat (6% of 5000 PIT equity)
+            conviction_multiplier: 1.0,
+            initial_stop_price: 195.0,
+            chandelier_stop_price: 195.0,
+            current_stop_price: 195.0,
+            highest_price_seen: 150.0,
+            lowest_price_seen: 150.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-5001".to_string()),
+            opened_at: "2026-11-11T10:00:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let sol_tid = db.insert_trade(&open_sol).unwrap();
+
+        // Call sync_funding_payments before 1h bar exists -> should skip and NOT lock hour bucket
+        let rep1 = exec.sync_funding_payments(Some(hour_ts + 60_000), true);
+        assert_eq!(rep1.positions_updated, 0);
+
+        // Insert 1h bar and retry in the same hour -> must accrue funding now!
+        db.upsert_ohlcv_batch(&[aegis_core::OhlcvBar {
+            symbol: "SOL/USDC:USDC".to_string(),
+            timeframe: "1h".to_string(),
+            timestamp_ms: hour_ts,
+            open: 150.0,
+            high: 151.0,
+            low: 149.0,
+            close: 140.0,
+            volume: 10_000.0,
+            funding_rate_hourly: 0.0002,
+            is_synthetic: 0,
+        }])
+        .unwrap();
+        let rep2 = exec.sync_funding_payments(Some(hour_ts + 120_000), true);
+        assert_eq!(rep2.positions_updated, 1, "ME-8: retry within same hour must succeed once 1h bar arrives");
+
+        // 4. HI-8: enforce_post_promotion_heat_cap cancels remaining resting PIT orders when open heat > cap
+        let resting_eth = aegis_core::TradeRecord {
+            trade_id: 0,
+            client_order_id: "eth-resting-hi8".to_string(),
+            symbol: "ETH/USDC:USDC".to_string(),
+            base_asset: "ETH".to_string(),
+            side: "LONG".to_string(),
+            status: "PENDING".to_string(),
+            fsm_state: "OPEN_ON_BOOK".to_string(),
+            entry_price: 3_000.0,
+            current_price: 3_000.0,
+            exit_price: None,
+            quantity: 1.0,
+            filled_units: 0.0,
+            avg_fill_price: None,
+            notional_usdc: 3_000.0,
+            risk_budget_usdc: 150.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 2_850.0,
+            chandelier_stop_price: 2_850.0,
+            current_stop_price: 2_850.0,
+            highest_price_seen: 3_000.0,
+            lowest_price_seen: 3_000.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("hl-6001".to_string()),
+            opened_at: "2026-11-11T10:05:00Z".to_string(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        db.insert_trade(&resting_eth).unwrap();
+        let cancelled = exec.enforce_post_promotion_heat_cap(true);
+        assert_eq!(cancelled, 1, "HI-8: remaining resting PIT order must be cancelled when open heat exceeds cap");
+        assert!(db.get_resting_pit_trades().unwrap().is_empty());
+
+        // 5. ME-7 & ME-9: Phantom close computes realized PnL from latest 1h bar close (140.0 on SHORT from 150.0 -> +100 USDC),
+        // and reduce-only trigger orders on open positions are NOT cancelled as dangling orders.
+        let mut on_chain = HashMap::new();
+        on_chain.insert(
+            "BTC".to_string(),
+            json!({ "szi": 1.0, "entryPx": 90_000.0, "markPx": 91_000.0, "unrealizedPnl": 1_000.0 }),
+        );
+        let open_orders = vec![
+            json!({ "coin": "BTC", "oid": 999001u64, "isTrigger": true, "reduceOnly": true }),
+        ];
+        let rec = exec.reconcile_exchange_state(Some(&on_chain), Some(&open_orders));
+        assert!(
+            !rec.discrepancies
+                .iter()
+                .any(|d| d["type"] == "DANGLING_OPEN_ORDER_CANCELLED"),
+            "ME-9: reduce-only trigger stop on an open position must not be cancelled as a dangling order"
+        );
+        let closed_sol = db
+            .get_recent_trades(10)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.trade_id == sol_tid)
+            .unwrap();
+        assert_eq!(closed_sol.status, "CLOSED");
+        assert!((closed_sol.exit_price.unwrap() - 140.0).abs() < 1e-6);
+        assert!(
+            closed_sol.realized_pnl_usdc > 99.0,
+            "ME-7: phantom local close must compute realized PnL from latest bar price instead of $0.00 (got {})",
+            closed_sol.realized_pnl_usdc
+        );
+    }

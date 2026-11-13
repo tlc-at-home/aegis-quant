@@ -269,7 +269,8 @@
       font-weight: 600;
     }
 
-    button:disabled {
+    button:disabled,
+    button[aria-disabled="true"] {
       opacity: 0.5;
       cursor: not-allowed;
     }
@@ -569,6 +570,8 @@
       <button id="btn-settle-dry">Dry-Run Settle</button>
       <button id="btn-calibrate">Calibrate MACE</button>
       <button id="btn-backtest">Run 365d Tear Sheet</button>
+      <button type="button" id="btn-backup-db">Backup DB</button>
+      <span class="badge" id="db-backup-status" role="status" aria-live="polite" style="display:none;"></span>
     </div>
   </header>
 
@@ -1329,6 +1332,21 @@
               </div>
             </div>
           </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">SQLite WAL Backup (`VACUUM INTO`) & Retention</span>
+              <span class="badge badge-info" id="db-backup-settings-badge" role="status" aria-live="polite">READY</span>
+            </div>
+            <div class="panel-body">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <span class="text-muted" id="db-backup-settings-detail" style="font-size:11px; font-family:var(--font-mono);">
+                  Online atomic snapshot via SQLite VACUUM INTO (`data/backups/` — 14-backup retention window)
+                </span>
+                <button type="button" class="primary" id="btn-backup-db-settings">Backup Database Now</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1375,7 +1393,7 @@
     </section>
   </main>
 
-  <!-- Externalized to /static/app.js (CSP script-src 'self'): parseUtcToDate, formatLocalTimestamp, formatUtcTimeOfDayToLocal, updateTimezoneIndicators, switchDashboardPage, formatPnlPillHtml, escapeHtml -->
+  <!-- Externalized to /static/app.js (CSP script-src 'self'): parseUtcToDate, formatLocalTimestamp, formatUtcTimeOfDayToLocal, updateTimezoneIndicators, switchDashboardPage, formatPnlPillHtml, escapeHtml, triggerDbBackup -->
   <script src="/static/app.js"></script>
 </body>
 </html>

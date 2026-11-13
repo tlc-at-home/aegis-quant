@@ -151,6 +151,7 @@ impl Usdc {
         if val.is_finite() {
             Self(round_dp(val, 4))
         } else {
+            tracing::warn!(value = %val, "Usdc::new called with non-finite value in release mode; clamping to 0.0 (ME-15)");
             Self(0.0)
         }
     }
@@ -161,6 +162,9 @@ impl Usdc {
         if val.is_finite() && val > 0.0 {
             Self(round_dp(val, 4))
         } else {
+            if !val.is_finite() {
+                tracing::warn!(value = %val, "Usdc::new_clamped called with non-finite value in release mode; clamping to 0.0 (ME-15)");
+            }
             Self(0.0)
         }
     }
@@ -298,6 +302,7 @@ impl Price {
         if val.is_finite() {
             Self(val)
         } else {
+            tracing::warn!(value = %val, "Price::new called with non-finite value in release mode; clamping to 0.0 (ME-15)");
             Self(0.0)
         }
     }
@@ -308,6 +313,9 @@ impl Price {
         if val.is_finite() && val > 0.0 {
             Self(val)
         } else {
+            if !val.is_finite() {
+                tracing::warn!(value = %val, "Price::new_clamped called with non-finite value in release mode; clamping to 0.0 (ME-15)");
+            }
             Self(0.0)
         }
     }
@@ -2083,8 +2091,87 @@ pub fn redact_embedded_url_secrets(input: &str) -> String {
     out
 }
 
+/// Redacts standalone keyless secret literals (`0x` + 64 hex private keys, `<digits>:<30+ chars>`
+/// Telegram bot tokens, and `AIza...` Gemini API keys) even when no key name is present (`ME-15`).
+pub fn redact_keyless_secret_patterns(input: &str) -> String {
+    let mut out = input.to_string();
+
+    // 1. Standalone 0x + 64 hex characters (not preceded by hash/tx/digest/sha256)
+    let mut pos = 0;
+    while pos < out.len() {
+        let lower = out[pos..].to_ascii_lowercase();
+        let Some(rel) = lower.find("0x") else {
+            break;
+        };
+        let start = pos + rel;
+        let hex_start = start + 2;
+        if hex_start > out.len() {
+            break;
+        }
+        let hex_len = out[hex_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        let prev_ok = start == 0
+            || !out[..start]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        let prefix_lower = out[..start].to_ascii_lowercase();
+        let is_public_hash_context = prefix_lower.ends_with("hash=")
+            || prefix_lower.ends_with("hash: ")
+            || prefix_lower.ends_with("sha256=")
+            || prefix_lower.ends_with("sha256: ")
+            || prefix_lower.ends_with("tx_ref=")
+            || prefix_lower.ends_with("digest=");
+        if prev_ok && hex_len == 64 && !is_public_hash_context {
+            out.replace_range(start..hex_start + 64, "[REDACTED]");
+            pos = start + "[REDACTED]".len();
+        } else {
+            pos = hex_start + hex_len.max(1);
+        }
+    }
+
+    // 2. Standalone Telegram bot token `<8-11 digits>:<28-50 token chars>`
+    let mut t_pos = 0;
+    while t_pos < out.len() {
+        let Some(rel_colon) = out[t_pos..].find(':') else {
+            break;
+        };
+        let colon_idx = t_pos + rel_colon;
+        let before = &out[..colon_idx];
+        let digit_len = before
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let start_idx = colon_idx - digit_len;
+        let boundary_before = start_idx == 0
+            || !out[..start_idx]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        let after = &out[colon_idx + 1..];
+        let secret_len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if boundary_before && (8..=12).contains(&digit_len) && (28..=50).contains(&secret_len) {
+            let end_idx = colon_idx + 1 + secret_len;
+            out.replace_range(start_idx..end_idx, "[REDACTED]");
+            t_pos = start_idx + "[REDACTED]".len();
+        } else {
+            t_pos = colon_idx + 1;
+        }
+    }
+
+    out
+}
+
 /// Scrub inline secret patterns (`private_key=...`, `private_key: ...`, `telegram_bot_token = ...`,
-/// embedded Telegram/Discord webhook URLs, etc.) from log strings (`R3-B2`, `R3-B5`, `R4-N5`, `R4-QC`).
+/// embedded Telegram/Discord webhook URLs, and keyless secret patterns) from log strings (`R3-B2`, `R3-B5`, `R4-N5`, `R4-QC`, `ME-15`).
 pub fn sanitize_telemetry_message(message: &str) -> String {
     let mut sanitized = redact_embedded_url_secrets(message);
     let lower = sanitized.to_ascii_lowercase();
@@ -2106,7 +2193,7 @@ pub fn sanitize_telemetry_message(message: &str) -> String {
 
     let has_sensitive = SENSITIVE_KEYS.iter().any(|k| lower.contains(k));
     if !has_sensitive {
-        return sanitized;
+        return redact_keyless_secret_patterns(&sanitized);
     }
 
     // R4-N5: Only redact `config_value`/`value`/`val` when the message explicitly pairs
@@ -2203,7 +2290,7 @@ pub fn sanitize_telemetry_message(message: &str) -> String {
             }
         }
     }
-    sanitized
+    redact_keyless_secret_patterns(&sanitized)
 }
 
 /// Scrub any sensitive keys or inline credential literals from a JSON value before logging (`R3-B2`, `R3-B5`, `R4-N5`, `R4-QC`).
@@ -2634,6 +2721,12 @@ mod tests {
             paired,
             "Updated config_key=private_key config_value=[REDACTED]"
         );
+
+        // ME-15: Keyless standalone 0x + 64-hex private key and Telegram bot token must be redacted
+        let keyless = sanitize_telemetry_message(
+            "Signer init error for 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 and bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
+        );
+        assert_eq!(keyless, "Signer init error for [REDACTED] and bot [REDACTED]");
 
         // JSON details sanitization
         let details = sanitize_telemetry_details(Some(serde_json::json!({

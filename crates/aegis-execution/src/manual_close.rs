@@ -234,34 +234,45 @@ impl ExecutionEngine {
                 && exec_close.avg_fill_price > 0.0
             {
                 if exec_close.filled_units + 1e-8 < trade.quantity.abs() {
-                    let remaining_qty = (trade.quantity.abs() - exec_close.filled_units).max(0.0);
+                    let step = asset.lot_step_size.max(1e-6);
+                    let remaining_qty = aegis_risk::RiskEngine::round_step(
+                        (trade.quantity.abs() - exec_close.filled_units).max(0.0),
+                        step,
+                        true,
+                    );
                     let remaining_notional = round_dp(remaining_qty * trade.entry_price, 4);
-                    let partial_gross_pnl = if trade.side == "LONG" {
-                        (exec_close.avg_fill_price - trade.entry_price) * exec_close.filled_units
-                    } else {
-                        (trade.entry_price - exec_close.avg_fill_price) * exec_close.filled_units
-                    };
-                    self.db.reduce_open_trade_partial_exit(
-                        trade.trade_id,
-                        remaining_qty,
-                        remaining_notional,
-                        round_dp(partial_gross_pnl, 4),
-                        round_dp(exec_close.fees_paid_usdc, 4),
-                        round_dp(exec_close.slippage_paid_usd, 4),
-                        ref_px,
-                    )?;
-                    let _ = self.reconcile_cycle_with_options(&[], false, true);
-                    return Ok(json!({
-                        "status": "PARTIAL_CLOSE",
-                        "trade_id": trade.trade_id,
-                        "symbol": trade.symbol,
-                        "side": trade.side,
-                        "filled_units": exec_close.filled_units,
-                        "remaining_units": remaining_qty,
-                        "exit_price": exec_close.avg_fill_price,
-                        "realized_pnl_delta_usdc": round_dp(partial_gross_pnl - exec_close.fees_paid_usdc, 4),
-                        "exit_reason": reason,
-                    }));
+                    if remaining_qty >= step
+                        && remaining_notional >= asset.min_notional_usdc.max(10.0)
+                    {
+                        let partial_gross_pnl = if trade.side == "LONG" {
+                            (exec_close.avg_fill_price - trade.entry_price)
+                                * exec_close.filled_units
+                        } else {
+                            (trade.entry_price - exec_close.avg_fill_price)
+                                * exec_close.filled_units
+                        };
+                        self.db.reduce_open_trade_partial_exit(
+                            trade.trade_id,
+                            remaining_qty,
+                            remaining_notional,
+                            round_dp(partial_gross_pnl, 4),
+                            round_dp(exec_close.fees_paid_usdc, 4),
+                            round_dp(exec_close.slippage_paid_usd, 4),
+                            ref_px,
+                        )?;
+                        let _ = self.reconcile_cycle_with_options(&[], false, true);
+                        return Ok(json!({
+                            "status": "PARTIAL_CLOSE",
+                            "trade_id": trade.trade_id,
+                            "symbol": trade.symbol,
+                            "side": trade.side,
+                            "filled_units": exec_close.filled_units,
+                            "remaining_units": remaining_qty,
+                            "exit_price": exec_close.avg_fill_price,
+                            "realized_pnl_delta_usdc": round_dp(partial_gross_pnl - exec_close.fees_paid_usdc, 4),
+                            "exit_reason": reason,
+                        }));
+                    }
                 }
                 actual_exit_px = exec_close.avg_fill_price;
                 actual_fees = round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
@@ -299,6 +310,14 @@ impl ExecutionEngine {
             gross_pnl + trade.realized_pnl_usdc - actual_fees + trade.funding_accrued_usdc,
             4,
         );
+        let existing_stop_oid = if (mode == "LIVE" || mode == "TESTNET") && !is_paper_trade {
+            self.db
+                .get_trade_protective_stop_oid(trade.trade_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let closed = self.db.close_trade(
             trade.trade_id,
             actual_exit_px,
@@ -310,6 +329,10 @@ impl ExecutionEngine {
             return Err(AegisError::Validation(format!(
                 "Open trade #{trade_id} is already closed"
             )));
+        }
+        if let Some(ref stop_oid) = existing_stop_oid {
+            let _ = self.cancel_resting_order(&trade.symbol, stop_oid);
+            let _ = self.db.set_trade_protective_stop_oid(trade.trade_id, None);
         }
         let _ = self.db.log_telemetry(
             "INFO",
@@ -428,14 +451,27 @@ impl ExecutionEngine {
                 &cfg.get_str("execution_mode", "PAPER"),
             )
             .to_ascii_uppercase();
-        let entry_px = cell.entry_price.unwrap_or(100.0);
-        let qty = cell.quantity.unwrap_or(0.0).abs();
-        let asset = self.resolve_trade_asset(&cell.symbol, "", entry_px);
         let bars = self
             .db
             .get_ohlcv_bars(&cell.symbol, "1h", 5, None)
             .unwrap_or_default();
         let last_bar = bars.last();
+        let entry_px = cell
+            .entry_price
+            .filter(|&p| p > 0.0 && p.is_finite())
+            .or_else(|| {
+                last_bar
+                    .map(|b| b.close)
+                    .filter(|&p| p > 0.0 && p.is_finite())
+            })
+            .ok_or_else(|| {
+                AegisError::Validation(format!(
+                    "Cannot manually close Pond cell #{} ({}): no valid entry_price or 1h bar reference price available",
+                    cell.cell_id, cell.symbol
+                ))
+            })?;
+        let qty = cell.quantity.unwrap_or(0.0).abs();
+        let asset = self.resolve_trade_asset(&cell.symbol, "", entry_px);
         let mark_px = last_bar
             .map(|b| b.close)
             .filter(|&p| p > 0.0)
@@ -482,35 +518,39 @@ impl ExecutionEngine {
             mark_px
         };
         if fill.filled_units > 0.0 && fill.filled_units + 1e-8 < qty {
-            let partial_gross = if cell.side == "LONG" {
-                (exit_px - entry_px) * fill.filled_units
-            } else {
-                (entry_px - exit_px) * fill.filled_units
-            };
-            let rem_qty = round_dp((qty - fill.filled_units).max(0.0), 6);
+            let step = asset.lot_step_size.max(1e-6);
+            let rem_qty =
+                aegis_risk::RiskEngine::round_step((qty - fill.filled_units).max(0.0), step, true);
             let rem_notional = round_dp(rem_qty * entry_px, 2);
-            let _ = self.db.reduce_open_pond_cell_partial_exit(
-                cell.cell_id,
-                &cell.state,
-                cell.chandelier_stop,
-                cell.highest_price_seen,
-                cell.lowest_price_seen,
-                rem_qty,
-                rem_notional,
-                partial_gross,
-                fill.fees_paid_usdc,
-            )?;
-            return Ok(json!({
-                "status": "PARTIAL_CLOSE",
-                "cell_id": cell.cell_id,
-                "symbol": cell.symbol,
-                "side": cell.side,
-                "filled_units": fill.filled_units,
-                "remaining_units": rem_qty,
-                "exit_price": exit_px,
-                "realized_pnl_delta_usdc": round_dp(partial_gross - fill.fees_paid_usdc, 4),
-                "exit_reason": reason,
-            }));
+            if rem_qty >= step && rem_notional >= asset.min_notional_usdc.max(10.0) {
+                let partial_gross = if cell.side == "LONG" {
+                    (exit_px - entry_px) * fill.filled_units
+                } else {
+                    (entry_px - exit_px) * fill.filled_units
+                };
+                let _ = self.db.reduce_open_pond_cell_partial_exit(
+                    cell.cell_id,
+                    &cell.state,
+                    cell.chandelier_stop,
+                    cell.highest_price_seen,
+                    cell.lowest_price_seen,
+                    rem_qty,
+                    rem_notional,
+                    partial_gross,
+                    fill.fees_paid_usdc,
+                )?;
+                return Ok(json!({
+                    "status": "PARTIAL_CLOSE",
+                    "cell_id": cell.cell_id,
+                    "symbol": cell.symbol,
+                    "side": cell.side,
+                    "filled_units": fill.filled_units,
+                    "remaining_units": rem_qty,
+                    "exit_price": exit_px,
+                    "realized_pnl_delta_usdc": round_dp(partial_gross - fill.fees_paid_usdc, 4),
+                    "exit_reason": reason,
+                }));
+            }
         }
         let gross_pnl = if cell.side == "LONG" {
             (exit_px - entry_px) * qty
@@ -524,6 +564,14 @@ impl ExecutionEngine {
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
 
+        let existing_stop_oid = if pond_mode == "LIVE" || pond_mode == "TESTNET" {
+            self.db
+                .get_pond_cell_protective_stop_oid(cell.cell_id)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let closed = self.db.close_open_pond_cell(
             cell.cell_id,
             "COOLDOWN",
@@ -541,6 +589,12 @@ impl ExecutionEngine {
             return Err(AegisError::Validation(format!(
                 "Open Pond cell #{cell_id} is already closed"
             )));
+        }
+        if let Some(ref stop_oid) = existing_stop_oid {
+            let _ = self.cancel_resting_order(&cell.symbol, stop_oid);
+            let _ = self
+                .db
+                .set_pond_cell_protective_stop_oid(cell.cell_id, None);
         }
         let net_pnl = round_dp(
             cell.realized_pnl_usdc + gross_pnl + cell.funding_accrued_usdc

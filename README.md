@@ -8,17 +8,17 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
 
 1. **Workspace Layout (`crates/*`)**:
    - `aegis-core`: Shared domain types (`BookId`, `Side`, `HmmRegime`, `SignalAction`, `PondCellState`, `BookTransferStatus`, `OhlcvBar`, `Usdc`, `Price`, `Quantity`, `Leverage`, `Bps`), telemetry secret redaction (`sanitize_telemetry_message`, `sanitize_telemetry_details`), timeframe validators, and financial math (`calculate_sharpe_sortino_calmar`, `compute_chandelier_stop`, `round_step`, `accrue_chop_basis_harvest_4h`).
-   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), transactional schema version v13 auto-migration (`001..013`), Fernet secret encryption (`AEGIS_MASTER_KEY`), and `BookScopedDb` compile-time book isolation.
+   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), canonical single-script schema version v14 initialization (`sql/schema_and_seed.sql`), Fernet secret encryption (`AEGIS_MASTER_KEY`), advisory cycle lock (`DbCycleLockGuard`), online `VACUUM INTO` backups, and `BookScopedDb` compile-time book isolation.
    - `aegis-signals`: 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, and Continuous Signal-to-Noise Ratio (SNR) ensemble.
-   - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and correlation cluster limits.
+   - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and `35%` correlation-cluster concentration cap.
    - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`, `cycle`, `resting_reconcile`), live mark-to-market synchronization, and config validator.
    - `aegis-pit`: Book A (The Pit) directional BTC/Altcoin strategy engine.
-   - `aegis-pond`: Book B (The Pond) Champion `NPS-01` Naked-Option Perpetual Analogue Scanner across an 80-coin dynamic universe (10-state cell FSM, 6-tier exit priority engine).
+   - `aegis-pond`: Book B (The Pond) Champion `NPS-01` Naked-Option Perpetual Analogue Scanner across an 80-coin dynamic universe (10-state cell FSM, 6-tier exit priority engine, two-sided structural exhaustion gate, funding floor & 2h persistence gate).
    - `aegis-settle`: Daily `00:05 UTC` 50/50 Cross-Book Settling Engine enforcing Invariant F5 (`available_idle_usdc` transfer cap), per-leg L1 progress tracking, `PARTIAL`/`AMBIGUOUS` quarantine, and atomic SQLite transactions.
    - `aegis-backtest`: 365-Day Walk-Forward Backtest & Tear Sheet simulator (`0.35%` round-trip friction + 1H funding accrual).
    - `aegis-alerts`: Telegram Bot API and Discord webhook alerting dispatcher with redacted error handling and bounded retry queue.
    - `aegis-telemetry`: Inter-task communication bus (`TelemetryBus`) with background SQLite event writer and snapshot broadcasting.
-   - `aegis-web`: Axum REST API (`/api/v1/*`), real-time Server-Sent Events (`/api/v1/stream`), and 4-page institutional dark-mode dashboard (`web/static/index.html` + `web/static/app.js`).
+   - `aegis-web`: Axum REST API (`/api/v1/*`, including `/api/v1/db/backup`), real-time Server-Sent Events (`/api/v1/stream`), and 4-page institutional dark-mode dashboard (`web/static/index.html` + `web/static/app.js`).
    - `aegis-cli`: Unified binary (`aegis-quant`) supporting `run`, `pond`, `settle`, `db`, `backtest`, `alerts`, and `readiness` subcommands.
 
 ---
@@ -29,38 +29,25 @@ An autonomous, single-tenant quantitative perpetuals trading platform built in R
 
 ```bash
 cargo build --release --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-> **Note on Test Suite Execution Counts (`R5-N1`, `R6-QA`, `R7-QB`, `R9-QA`, `R10-QA`, `R11-QA`, `R12-QA`, `R13-QA`)**: The workspace defines and executes `123` `#[test]` / `#[tokio::test]` functions across the 13 crates (`aegis-alerts`: 2, `aegis-backtest`: 3, `aegis-cli`: 5 unit + 5 `test_firewall_ast` integration = 10, `aegis-core`: 8, `aegis-db`: 23 unit + 1 `aegis-db-tool` bin = 24, `aegis-execution`: 21, `aegis-pit`: 3, `aegis-pond`: 16, `aegis-risk`: 4, `aegis-settle`: 10, `aegis-signals`: 8, `aegis-telemetry`: 2, `aegis-web`: 12).
-
-### 2. Initialize / Migrate SQLite Database (Schema v13)
+### 2. Initialize / Upgrade SQLite Database (Schema v14)
 
 Both `--db <PATH>` and `--db-path <PATH>` are accepted globally across all subcommands (built binaries are output to `./target/release/aegis-quant` and installed to `./bin/aegis-quant`):
 
 ```bash
 ./target/release/aegis-quant --db data/aegis_quant.db db --init
 ./target/release/aegis-quant --db data/aegis_quant.db db --migrate
+./target/release/aegis-quant --db data/aegis_quant.db db --backup
 ./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
 ./target/release/aegis-quant --db data/aegis_quant.db db --show-web-token
 ```
 
 > **Security Note (`--show-web-token`)**: `db --show-web-token` is strictly read-only (`R4-N8`)—it never creates or mutates database rows or keys, and prints the decrypted `web_api_token` bearer secret to `stdout`. Do not run it in shared terminals or unredacted CI logs.
 
-Incremental SQL migrations are stored under `sql/migrations/` and are executed atomically inside a SQLite transaction (`R5-M1`, `R8-S1`, `R8-S2`):
-- `sql/migrations/001_v020_config_expansion.sql`
-- `sql/migrations/002_v020_order_fsm.sql`
-- `sql/migrations/003_v020_schema_versioning.sql`
-- `sql/migrations/004_v020_rc2_remediation.sql`
-- `sql/migrations/005_v030_pp50_two_book.sql`
-- `sql/migrations/006_v030_review_remediation.sql`
-- `sql/migrations/007_v030_round2_remediation.sql`
-- `sql/migrations/008_v030_round3_remediation.sql`
-- `sql/migrations/009_v030_round4_remediation.sql`
-- `sql/migrations/010_v030_round5_remediation.sql`
-- `sql/migrations/011_v030_round7_stop_tightening.sql`
-- `sql/migrations/012_v030_round9_remediation.sql`
-- `sql/migrations/013_v030_round12_remediation.sql`
+All SQLite WAL tables, columns, views, indexes, triggers, and seed data (Schema `v14`) are consolidated in the single canonical schema build script `sql/schema_and_seed.sql` (separate `sql/migrations/*.sql` files have been removed and folded into `sql/schema_and_seed.sql`). Both `db --init` and `db --migrate` idempotently initialize fresh databases and upgrade existing databases to Schema `v14`.
 
 ### 3. Run the 4-Page Web Dashboard & Dual-Book Background Daemons
 

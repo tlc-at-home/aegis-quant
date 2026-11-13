@@ -20,6 +20,8 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Cargo Registry & Target
         uses: Swatinem/rust-cache@v2
+      - name: Run Clippy Linter
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run Workspace Unit & Integration Tests
         run: cargo test --workspace
       - name: Build Optimized Release Binary

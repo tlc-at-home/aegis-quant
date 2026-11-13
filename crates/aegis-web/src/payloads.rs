@@ -366,6 +366,19 @@ pub struct CalibrateRunResponse {
     pub calibration_report: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DbBackupRequestPayload {
+    pub reason: Option<String>,
+    pub retention_days: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DbBackupTriggerResponse {
+    pub status: &'static str,
+    pub backup: Value,
+    pub dashboard: FullDashboardPayload,
+}
+
 pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
     let trimmed_key = key.trim();
     if trimmed_key.is_empty() {
@@ -402,6 +415,11 @@ pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()
         }
         "calibration_timeframes_csv" => {
             validate_timeframe_csv(val_str)?;
+        }
+        "web_api_token" | "dashboard_api_token" if val_str.trim().len() < 16 => {
+            return Err(aegis_core::AegisError::Validation(format!(
+                "Configuration value for '{trimmed_key}' must be at least 16 characters long (ME-14)"
+            )));
         }
         _ => {}
     }

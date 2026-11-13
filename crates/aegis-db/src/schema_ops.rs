@@ -1,5 +1,6 @@
-//! SQLite schema initialization, transactional idempotent migration runner (001..013),
-//! routing mode reconciliation, and database integrity verification.
+//! SQLite schema initialization, consolidated schema build runner (`sql/schema_and_seed.sql`),
+//! routing mode reconciliation, cross-process advisory cycle lock, automated `VACUUM INTO` backups,
+//! and database integrity verification.
 
 use crate::fernet::ensure_master_key_for_db;
 use crate::DatabaseManager;
@@ -7,32 +8,25 @@ use aegis_core::{resolve_project_root, AegisError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Ordered list of SQLite schema migration files (`001..013`).
-///
-/// Invariants (`R5-M1`, `R7-S2`):
-/// 1. Each migration file is executed atomically inside a SQLite transaction
-///    (`execute_sql_transactional`), so migration scripts must not include
-///    non-transactional statements such as `VACUUM` or `PRAGMA journal_mode`.
-/// 2. Numbered migration files are strictly immutable once shipped; any follow-up
-///    schema, config-seed, or data repairs must be placed in a new additive
-///    numbered migration file (never edited retroactively).
-pub const ALL_MIGRATION_FILES: &[&str] = &[
-    "sql/migrations/001_v020_config_expansion.sql",
-    "sql/migrations/002_v020_order_fsm.sql",
-    "sql/migrations/003_v020_schema_versioning.sql",
-    "sql/migrations/004_v020_rc2_remediation.sql",
-    "sql/migrations/005_v030_pp50_two_book.sql",
-    "sql/migrations/006_v030_review_remediation.sql",
-    "sql/migrations/007_v030_round2_remediation.sql",
-    "sql/migrations/008_v030_round3_remediation.sql",
-    "sql/migrations/009_v030_round4_remediation.sql",
-    "sql/migrations/010_v030_round5_remediation.sql",
-    "sql/migrations/011_v030_round7_stop_tightening.sql",
-    "sql/migrations/012_v030_round9_remediation.sql",
-    "sql/migrations/013_v030_round12_remediation.sql",
-];
+/// Canonical unified schema version built by `sql/schema_and_seed.sql`.
+pub const CANONICAL_SCHEMA_VERSION: i64 = 14;
+
+/// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
+pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
+
+/// RAII guard for the cross-process SQLite advisory cycle lock (`HI-4`).
+pub struct DbCycleLockGuard {
+    db: DatabaseManager,
+    owner: String,
+}
+
+impl Drop for DbCycleLockGuard {
+    fn drop(&mut self) {
+        let _ = self.db.release_cycle_lock(&self.owner);
+    }
+}
 
 impl DatabaseManager {
     /// Repairs any half-completed table rebuilds left behind if a prior non-transactional
@@ -133,6 +127,13 @@ impl DatabaseManager {
                 if clean.is_empty() {
                     continue;
                 }
+                let lower_clean = clean.to_ascii_lowercase();
+                if !conn.is_autocommit()
+                    && (lower_clean.starts_with("pragma journal_mode")
+                        || lower_clean.starts_with("pragma synchronous"))
+                {
+                    continue;
+                }
                 if let Err(e) = conn.execute_batch(clean) {
                     let msg = e.to_string().to_ascii_lowercase();
                     if msg.contains("duplicate column name") {
@@ -150,9 +151,15 @@ impl DatabaseManager {
                 .join("\n");
             let rem = rem.trim();
             if !rem.is_empty() {
-                if let Err(e) = conn.execute_batch(rem) {
-                    if !e.to_string().to_ascii_lowercase().contains("duplicate column name") {
-                        return Err(AegisError::Database(format!("SQL error: {e}")));
+                let lower_rem = rem.to_ascii_lowercase();
+                if conn.is_autocommit()
+                    || (!lower_rem.starts_with("pragma journal_mode")
+                        && !lower_rem.starts_with("pragma synchronous"))
+                {
+                    if let Err(e) = conn.execute_batch(rem) {
+                        if !e.to_string().to_ascii_lowercase().contains("duplicate column name") {
+                            return Err(AegisError::Database(format!("SQL error: {e}")));
+                        }
                     }
                 }
             }
@@ -170,12 +177,14 @@ impl DatabaseManager {
                 self.schema_path.display()
             )));
         }
-        let mut sql_script = fs::read_to_string(&self.schema_path)?;
-        if self.is_memory {
-            sql_script = sql_script.replace("PRAGMA journal_mode = WAL;", "");
-        }
+        let sql_script = fs::read_to_string(&self.schema_path)?;
+        let is_mem = self.is_memory;
         self.with_conn(|conn| {
-            conn.execute_batch(&sql_script)
+            let _ = conn.execute_batch("PRAGMA busy_timeout = 15000; PRAGMA foreign_keys = ON;");
+            if !is_mem {
+                let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+            }
+            Self::execute_sql_transactional(conn, &sql_script)
                 .map_err(|e| AegisError::Database(format!("Failed to init_db: {e}")))?;
             Ok(())
         })?;
@@ -183,14 +192,7 @@ impl DatabaseManager {
     }
 
     pub fn initialize_database(&self) -> Result<Value> {
-        let mut integrity = self.init_db()?;
-        let root = resolve_project_root();
-        for rel in ALL_MIGRATION_FILES {
-            let p = root.join(rel);
-            if p.exists() {
-                integrity = self.apply_migration(&p)?;
-            }
-        }
+        let integrity = self.init_db()?;
         self.reconcile_routing_config();
         let _ = self.redact_sensitive_telemetry_logs();
         let _ = self.with_conn(|conn| {
@@ -206,7 +208,7 @@ impl DatabaseManager {
         }
         if !force {
             if let Ok(ver) = self.get_schema_version() {
-                if ver >= ALL_MIGRATION_FILES.len() as i64 {
+                if ver >= CANONICAL_SCHEMA_VERSION {
                     let _ = self.with_conn(Self::repair_interrupted_table_rebuilds);
                     self.reconcile_routing_config();
                     return self.verify_integrity();
@@ -461,33 +463,38 @@ impl DatabaseManager {
     }
 
     pub fn run_migrations(&self) -> Result<Vec<String>> {
-        let root = resolve_project_root();
-        let cur_ver = self.get_schema_version().unwrap_or(0).max(0) as usize;
-        let mut applied = Vec::new();
-        for (idx, rel) in ALL_MIGRATION_FILES.iter().enumerate() {
-            let p = root.join(rel);
-            if p.exists() && idx + 1 > cur_ver {
-                self.apply_migration(&p)?;
-                applied.push((*rel).to_string());
-            }
+        let cur_ver = self.get_schema_version().unwrap_or(0).max(0);
+        if cur_ver < CANONICAL_SCHEMA_VERSION {
+            self.apply_migration("sql/schema_and_seed.sql")?;
+            Ok(vec!["sql/schema_and_seed.sql".to_string()])
+        } else {
+            Ok(Vec::new())
         }
-        Ok(applied)
     }
 
     pub fn apply_migration(&self, migration_path: impl AsRef<Path>) -> Result<Value> {
         let root = resolve_project_root();
-        let mut mig_path = migration_path.as_ref().to_path_buf();
-        if !mig_path.exists() {
-            let candidate = root.join(&mig_path);
-            if candidate.exists() {
-                mig_path = candidate;
-            } else {
-                return Err(AegisError::NotFound(format!(
-                    "Migration SQL file not found: {}",
-                    migration_path.as_ref().display()
-                )));
-            }
-        }
+        let req_path = migration_path.as_ref().to_path_buf();
+        let req_file_name = req_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("schema_and_seed.sql")
+            .to_string();
+        let mig_path = if req_path.exists() {
+            req_path.clone()
+        } else if root.join(&req_path).exists() {
+            root.join(&req_path)
+        } else if (req_file_name == "schema_and_seed.sql"
+            || req_path.to_string_lossy().contains("sql/migrations/"))
+            && self.schema_path.exists()
+        {
+            self.schema_path.clone()
+        } else {
+            return Err(AegisError::NotFound(format!(
+                "Migration SQL file not found: {}",
+                migration_path.as_ref().display()
+            )));
+        };
 
         let has_cfg: bool = self.with_conn(|conn| {
             let name: Option<String> = conn
@@ -504,11 +511,7 @@ impl DatabaseManager {
             self.init_db()?;
         }
 
-        let file_name = mig_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        let file_name = req_file_name;
         let sql_script = fs::read_to_string(&mig_path)?;
 
         let mut actually_executed = false;
@@ -517,6 +520,11 @@ impl DatabaseManager {
                 .get(..3)
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(0);
+            let effective_target = if target_num > 0 {
+                target_num
+            } else {
+                CANONICAL_SCHEMA_VERSION as usize
+            };
             let has_mig_table_before: bool = conn
                 .query_row(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations';",
@@ -537,37 +545,26 @@ impl DatabaseManager {
             } else {
                 0
             };
-            let mut replayed_prereqs: Vec<(i64, String)> = Vec::new();
-            if target_num >= 2 {
-                for (idx, prereq) in ALL_MIGRATION_FILES.iter().enumerate() {
-                    let prereq_num = idx + 1;
-                    if prereq_num > max_applied_ver && prereq_num < target_num {
-                        let p = root.join(prereq);
-                        if p.exists() {
-                            if let Ok(s) = fs::read_to_string(&p) {
-                                Self::execute_sql_transactional(conn, &s)?;
-                                let prereq_stem = p
-                                    .file_stem()
-                                    .and_then(|st| st.to_str())
-                                    .unwrap_or(prereq)
-                                    .to_string();
-                                let _ = conn.execute(
-                                    "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
-                                     VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
-                                    params![
-                                        prereq_num as i64,
-                                        format!("Migration {:03}: {prereq_stem}", prereq_num)
-                                    ],
-                                );
-                                replayed_prereqs.push((prereq_num as i64, prereq_stem));
-                            }
-                        }
-                    }
-                }
-            }
-            if target_num == 0 || target_num > max_applied_ver {
+
+            if target_num == 0 && max_applied_ver < CANONICAL_SCHEMA_VERSION as usize {
                 Self::execute_sql_transactional(conn, &sql_script)?;
                 actually_executed = true;
+            } else if target_num > max_applied_ver {
+                Self::execute_sql_transactional(conn, &sql_script)?;
+                actually_executed = true;
+                if target_num < CANONICAL_SCHEMA_VERSION as usize {
+                    let _ = conn.execute(
+                        "DELETE FROM schema_migrations WHERE version > ?1;",
+                        params![target_num as i64],
+                    );
+                    let _ = conn.execute(
+                        "UPDATE system_config
+                         SET config_value = ?1,
+                             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                         WHERE config_key = 'schema_version';",
+                        params![target_num.to_string()],
+                    );
+                }
             } else {
                 Self::repair_interrupted_table_rebuilds(conn)?;
             }
@@ -581,29 +578,16 @@ impl DatabaseManager {
                 .optional()
                 .map_err(|e| AegisError::Database(e.to_string()))?;
 
-            if has_mig_table.is_some() {
-                for (prereq_ver, prereq_stem) in &replayed_prereqs {
+            if has_mig_table.is_some() && target_num > 0 {
+                for v in (max_applied_ver + 1)..=effective_target {
                     let _ = conn.execute(
                         "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
                          VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
                         params![
-                            prereq_ver,
-                            format!("Migration {:03}: {prereq_stem}", prereq_ver)
+                            v as i64,
+                            format!("Consolidated Schema v{:02}: {file_name}", v)
                         ],
                     );
-                }
-                if file_name.len() >= 3 {
-                    if let Ok(ver_num) = file_name[..3].parse::<i64>() {
-                        let stem = mig_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&file_name);
-                        let _ = conn.execute(
-                            "INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description)
-                             VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER), ?2);",
-                            params![ver_num, format!("Migration {:03}: {stem}", ver_num)],
-                        );
-                    }
                 }
             }
             Ok(())
@@ -615,7 +599,7 @@ impl DatabaseManager {
             let _ = self.log_telemetry(
                 "INFO",
                 "engine.database",
-                &format!("Applied SQLite migration {file_name}"),
+                &format!("Applied SQLite schema build {file_name}"),
                 Some(integrity.clone()),
             );
         }
@@ -627,6 +611,290 @@ impl DatabaseManager {
             obj.insert("migration_file".to_string(), json!(file_name));
         }
         Ok(out)
+    }
+
+    /// Cross-process database advisory cycle lock (`HI-4`).
+    ///
+    /// Acquires an exclusive lease in `system_config` (`engine_cycle_lock_owner`, `engine_cycle_lock_expires_ms`)
+    /// inside an atomic `BEGIN IMMEDIATE` transaction so concurrent CLI (`run`, `daemon`) and Web UI
+    /// (`api_trigger_cycle`, `api_trigger_pond_scan`, `api_close_trade`) processes never execute
+    /// overlapping strategy cycles against the same SQLite database.
+    pub fn try_acquire_cycle_lock(&self, owner: &str, ttl_ms: i64) -> Result<bool> {
+        let now_ms = self.now_ms();
+        let clean_owner = owner.trim();
+        let owner_val = if clean_owner.is_empty() {
+            "aegis-engine"
+        } else {
+            clean_owner
+        };
+        let eff_ttl = ttl_ms.max(1_000);
+        let expires_ms = now_ms.saturating_add(eff_ttl);
+
+        self.with_conn(|conn| {
+            let began_tx = conn.is_autocommit();
+            if began_tx {
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+            }
+            let res: Result<bool> = (|| {
+                let cur_owner: String = conn
+                    .query_row(
+                        "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_owner';",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| AegisError::Database(e.to_string()))?
+                    .unwrap_or_default();
+                let cur_exp: i64 = conn
+                    .query_row(
+                        "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| AegisError::Database(e.to_string()))?
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+
+                if !cur_owner.trim().is_empty() && cur_owner.trim() != owner_val && cur_exp > now_ms {
+                    return Ok(false);
+                }
+
+                for (k, v, vt, desc) in [
+                    (
+                        "engine_cycle_lock_owner",
+                        owner_val.to_string(),
+                        "string",
+                        "Owner identifier of the cross-process database advisory cycle lock (HI-4)",
+                    ),
+                    (
+                        "engine_cycle_lock_expires_ms",
+                        expires_ms.to_string(),
+                        "int",
+                        "Epoch expiration timestamp (ms) of the cross-process database advisory cycle lock (HI-4)",
+                    ),
+                ] {
+                    conn.execute(
+                        "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                         VALUES (?1, ?2, ?3, 'system', ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                         ON CONFLICT(config_key) DO UPDATE SET
+                            config_value = excluded.config_value,
+                            updated_at = excluded.updated_at;",
+                        params![k, v, vt, desc],
+                    )
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+                }
+                Ok(true)
+            })();
+            match res {
+                Ok(acquired) => {
+                    if began_tx {
+                        conn.execute_batch("COMMIT;")
+                            .map_err(|e| AegisError::Database(e.to_string()))?;
+                    }
+                    Ok(acquired)
+                }
+                Err(e) => {
+                    if began_tx {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Release the cross-process database advisory cycle lock if held by `owner` (or expired).
+    pub fn release_cycle_lock(&self, owner: &str) -> Result<()> {
+        let now_ms = self.now_ms();
+        let clean_owner = owner.trim();
+        let owner_val = if clean_owner.is_empty() {
+            "aegis-engine"
+        } else {
+            clean_owner
+        };
+        self.with_conn(|conn| {
+            let began_tx = conn.is_autocommit();
+            if began_tx {
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+            }
+            let cur_owner: String = conn
+                .query_row(
+                    "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_owner';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let cur_exp: i64 = conn
+                .query_row(
+                    "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .unwrap_or(None)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+
+            if cur_owner.trim().is_empty()
+                || cur_owner.trim() == owner_val
+                || cur_exp <= now_ms
+            {
+                let _ = conn.execute(
+                    "UPDATE system_config
+                     SET config_value = '',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE config_key = 'engine_cycle_lock_owner';",
+                    [],
+                );
+                let _ = conn.execute(
+                    "UPDATE system_config
+                     SET config_value = '0',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                     WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                    [],
+                );
+            }
+            if began_tx {
+                conn.execute_batch("COMMIT;")
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Acquire the cross-process database advisory cycle lock and return an RAII guard (`HI-4`).
+    pub fn acquire_cycle_lock_guard(
+        &self,
+        owner: &str,
+        ttl_ms: i64,
+    ) -> Result<Option<DbCycleLockGuard>> {
+        if self.try_acquire_cycle_lock(owner, ttl_ms)? {
+            Ok(Some(DbCycleLockGuard {
+                db: self.clone(),
+                owner: owner.trim().to_string(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create an atomic online SQLite backup via `VACUUM INTO` and prune backups older than `retention_days` (`ME-19`).
+    pub fn create_sqlite_backup(
+        &self,
+        backup_dir: Option<&Path>,
+        retention_days: Option<u64>,
+    ) -> Result<Value> {
+        let cfg = self.load_config().unwrap_or_default();
+        let ret_days = retention_days
+            .unwrap_or_else(|| cfg.get_i64("backup_retention_days", 7).max(1) as u64);
+
+        let target_dir: PathBuf = match backup_dir {
+            Some(d) => d.to_path_buf(),
+            None => {
+                if self.is_memory {
+                    std::env::temp_dir().join("aegis_backups")
+                } else {
+                    self.db_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("data"))
+                        .join("backups")
+                }
+            }
+        };
+        fs::create_dir_all(&target_dir).map_err(|e| {
+            AegisError::Database(format!(
+                "Failed to create backup directory {}: {e}",
+                target_dir.display()
+            ))
+        })?;
+
+        let now_dt = chrono::Utc::now();
+        let file_name = format!(
+            "aegis_quant_{}_{:03}.db",
+            now_dt.format("%Y%m%d_%H%M%S"),
+            now_dt.timestamp_subsec_millis()
+        );
+        let backup_path = target_dir.join(&file_name);
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        let backup_path_str = backup_path.to_string_lossy().to_string();
+
+        self.with_conn(|conn| {
+            conn.execute("VACUUM INTO ?1;", params![backup_path_str])
+                .map_err(|e| AegisError::Database(format!("VACUUM INTO failed: {e}")))?;
+            Ok(())
+        })?;
+
+        let size_bytes = fs::metadata(&backup_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if size_bytes == 0 {
+            return Err(AegisError::Database(format!(
+                "Backup file {} is empty after VACUUM INTO",
+                backup_path.display()
+            )));
+        }
+
+        // Prune backup snapshots older than retention_days
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(ret_days.saturating_mul(86_400)))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mut pruned_count = 0usize;
+        let mut retained_count = 1usize;
+        if let Ok(entries) = fs::read_dir(&target_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p == backup_path {
+                    continue;
+                }
+                let fname = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                if fname.starts_with("aegis_quant_") && fname.ends_with(".db") {
+                    let mut pruned = false;
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if modified < cutoff && fs::remove_file(&p).is_ok() {
+                                pruned_count += 1;
+                                pruned = true;
+                            }
+                        }
+                    }
+                    if !pruned {
+                        retained_count += 1;
+                    }
+                }
+            }
+        }
+
+        let summary = json!({
+            "status": "OK",
+            "backup_path": backup_path.display().to_string(),
+            "file_name": file_name,
+            "size_bytes": size_bytes,
+            "retention_days": ret_days,
+            "retained_count": retained_count,
+            "pruned_count": pruned_count,
+            "pruned_files": pruned_count,
+            "created_at": now_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        });
+        let _ = self.log_telemetry(
+            "INFO",
+            "engine.backup",
+            &format!(
+                "Created SQLite VACUUM INTO backup {} ({} bytes, pruned={})",
+                file_name, size_bytes, pruned_count
+            ),
+            Some(summary.clone()),
+        );
+        Ok(summary)
     }
 
     pub fn verify_integrity(&self) -> Result<Value> {

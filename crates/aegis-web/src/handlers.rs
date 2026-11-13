@@ -1,7 +1,7 @@
 //! HTTP and SSE route handlers for `aegis-web`.
 
 use crate::{
-    constant_time_eq,
+    constant_time_eq, extract_cookie_token, generate_ephemeral_session_token,
     payloads::{
         build_dashboard_payload, build_pond_payload, build_portfolio_payload, build_pp50_payload,
         enrich_pond_cells, enrich_signals, map_err_response, run_db_blocking, AlertsUpdatePayload,
@@ -9,9 +9,10 @@ use crate::{
         BacktestRequestPayload, BacktestRunResponse, BatchConfigUpdateResponse,
         CalibrateRunResponse, CloseTradePayload, CloseTradeResponse, ConfigBatchUpdatePayload,
         ConfigUpdatePayload, CredentialsUpdatePayload, CredentialsUpdateResponse,
-        CycleTriggerResponse, HealthPayload, LimitQuery, PondScanTriggerResponse,
-        PortfolioSummaryPayload, SettleRequestPayload, SettleTriggerResponse,
-        SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload, WalletSyncResponse,
+        CycleTriggerResponse, DbBackupRequestPayload, DbBackupTriggerResponse, HealthPayload,
+        LimitQuery, PondScanTriggerResponse, PortfolioSummaryPayload, SettleRequestPayload,
+        SettleTriggerResponse, SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload,
+        WalletSyncResponse,
     },
     AppState,
 };
@@ -76,10 +77,44 @@ pub async fn serve_app_js(State(state): State<AppState>) -> Response {
 
 pub async fn api_auth_login(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<AuthLoginPayload>,
 ) -> Response {
+    let client_key = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or("local").trim().to_string())
+        .unwrap_or_else(|| "local".to_string());
+
+    // ME-14: Rate-limit login failures (>= 5 failures within 60s -> 429 Too Many Requests)
+    {
+        let mut failures = state.login_failures.lock();
+        if let Some((count, window_start)) = failures.get_mut(&client_key) {
+            if window_start.elapsed() > Duration::from_secs(60) {
+                *count = 0;
+                *window_start = std::time::Instant::now();
+            } else if *count >= 5 {
+                let body = ApiErrorBody {
+                    error: "Too Many Requests".to_string(),
+                    detail: "Too many failed authentication attempts; retry in 60 seconds"
+                        .to_string(),
+                };
+                return (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+            }
+        }
+    }
+
     let candidate = payload.token.trim().to_string();
     if candidate.is_empty() {
+        let mut failures = state.login_failures.lock();
+        let entry = failures
+            .entry(client_key)
+            .or_insert_with(|| (0, std::time::Instant::now()));
+        if entry.1.elapsed() > Duration::from_secs(60) {
+            *entry = (1, std::time::Instant::now());
+        } else {
+            entry.0 = entry.0.saturating_add(1);
+        }
         let body = ApiErrorBody {
             error: "Unauthorized".to_string(),
             detail: "Authentication token is required".to_string(),
@@ -111,11 +146,32 @@ pub async fn api_auth_login(
         .any(|expected| constant_time_eq(&candidate, expected));
 
     if !is_valid {
+        let mut failures = state.login_failures.lock();
+        let entry = failures
+            .entry(client_key)
+            .or_insert_with(|| (0, std::time::Instant::now()));
+        if entry.1.elapsed() > Duration::from_secs(60) {
+            *entry = (1, std::time::Instant::now());
+        } else {
+            entry.0 = entry.0.saturating_add(1);
+        }
         let body = ApiErrorBody {
             error: "Unauthorized".to_string(),
             detail: "Invalid API authentication token".to_string(),
         };
         return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    }
+
+    state.login_failures.lock().remove(&client_key);
+
+    // ME-13: Mint a per-session nonce with 24-hour TTL (86,400s)
+    let session_nonce = generate_ephemeral_session_token();
+    let expires_at_ms = state.db.now_ms() + 86_400_000;
+    {
+        let now_ms = state.db.now_ms();
+        let mut sessions = state.active_sessions.lock();
+        sessions.retain(|_, exp| *exp > now_ms);
+        sessions.insert(session_nonce.clone(), expires_at_ms);
     }
 
     let cookie_secure = db_cfg.get_bool("web_cookie_secure", false)
@@ -125,8 +181,7 @@ pub async fn api_auth_login(
             .eq_ignore_ascii_case("production");
 
     let mut cookie = format!(
-        "aegis_session={}; HttpOnly; SameSite=Strict; Path=/",
-        state.session_token
+        "aegis_session={session_nonce}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
     );
     if cookie_secure {
         cookie.push_str("; Secure");
@@ -146,7 +201,13 @@ pub async fn api_auth_login(
     resp
 }
 
-pub async fn api_auth_logout(State(state): State<AppState>) -> Response {
+pub async fn api_auth_logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(cookie_tok) = extract_cookie_token(&headers, "aegis_session") {
+        state.active_sessions.lock().remove(&cookie_tok);
+    }
     let db_cfg = state.db.load_config_logged("aegis-web.api_auth_logout");
     let cookie_secure = db_cfg.get_bool("web_cookie_secure", false)
         || db_cfg
@@ -710,6 +771,18 @@ pub async fn api_update_wallet_sync(
 
 pub async fn api_trigger_cycle(State(state): State<AppState>) -> Response {
     let _guard = state.cycle_lock.lock().await;
+    let Some(_db_lock) = state
+        .db
+        .acquire_cycle_lock_guard("web-api.cycle", 120_000)
+        .ok()
+        .flatten()
+    else {
+        let body = ApiErrorBody {
+            error: "Conflict".to_string(),
+            detail: "Another execution cycle is currently holding the advisory lock".to_string(),
+        };
+        return (StatusCode::CONFLICT, Json(body)).into_response();
+    };
     match run_db_blocking(state.db.clone(), |db| {
         let pit = PitOrchestrator::new(db.clone(), None);
         let pit_summary = pit.run_cycle(true, false)?;
@@ -731,6 +804,18 @@ pub async fn api_trigger_cycle(State(state): State<AppState>) -> Response {
 
 pub async fn api_trigger_pond_scan(State(state): State<AppState>) -> Response {
     let _guard = state.cycle_lock.lock().await;
+    let Some(_db_lock) = state
+        .db
+        .acquire_cycle_lock_guard("web-api.pond_scan", 120_000)
+        .ok()
+        .flatten()
+    else {
+        let body = ApiErrorBody {
+            error: "Conflict".to_string(),
+            detail: "Another execution cycle is currently holding the advisory lock".to_string(),
+        };
+        return (StatusCode::CONFLICT, Json(body)).into_response();
+    };
     match run_db_blocking(state.db.clone(), |db| {
         let pond = PondOrchestrator::new(db.clone(), None);
         let scan_outcome = pond.run_scan_cycle(true)?;
@@ -753,6 +838,18 @@ pub async fn api_close_trade(
     Json(payload): Json<CloseTradePayload>,
 ) -> Response {
     let _guard = state.cycle_lock.lock().await;
+    let Some(_db_lock) = state
+        .db
+        .acquire_cycle_lock_guard("web-api.close_trade", 60_000)
+        .ok()
+        .flatten()
+    else {
+        let body = ApiErrorBody {
+            error: "Conflict".to_string(),
+            detail: "Another execution cycle is currently holding the advisory lock".to_string(),
+        };
+        return (StatusCode::CONFLICT, Json(body)).into_response();
+    };
     match run_db_blocking(state.db.clone(), move |db| {
         if payload.trade_id.is_some() && payload.cell_id.is_some() {
             return Err(aegis_core::AegisError::Validation(
@@ -776,6 +873,27 @@ pub async fn api_close_trade(
         Ok(CloseTradeResponse {
             status: "ok",
             close_result,
+            dashboard,
+        })
+    })
+    .await
+    {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => map_err_response(e),
+    }
+}
+
+pub async fn api_trigger_db_backup(
+    State(state): State<AppState>,
+    payload: Option<Json<DbBackupRequestPayload>>,
+) -> Response {
+    let retention_days = payload.and_then(|p| p.0.retention_days);
+    match run_db_blocking(state.db.clone(), move |db| {
+        let backup = db.create_sqlite_backup(None, retention_days)?;
+        let dashboard = build_dashboard_payload(&db)?;
+        Ok(DbBackupTriggerResponse {
+            status: "ok",
+            backup,
             dashboard,
         })
     })
@@ -838,12 +956,24 @@ pub async fn api_stream(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let interval = tokio::time::interval(Duration::from_secs(3));
     let db = state.db.clone();
+    let sse_cache = state.sse_payload_cache.clone();
     let stream = IntervalStream::new(interval).then(move |_| {
         let db_inner = db.clone();
+        let cache_inner = sse_cache.clone();
         async move {
+            // ME-17: Share cached SSE snapshot across concurrent subscribers within 2s window
+            if let Some((cached_at, ref payload_str)) = *cache_inner.lock() {
+                if cached_at.elapsed() < Duration::from_secs(2) {
+                    return Ok::<Event, Infallible>(Event::default().data(payload_str.clone()));
+                }
+            }
             let data = match run_db_blocking(db_inner, |pool| build_dashboard_payload(&pool)).await
             {
-                Ok(d) => serde_json::to_string(&d).unwrap_or_else(|_| "{}".to_string()),
+                Ok(d) => {
+                    let s = serde_json::to_string(&d).unwrap_or_else(|_| "{}".to_string());
+                    *cache_inner.lock() = Some((std::time::Instant::now(), s.clone()));
+                    s
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "SSE stream payload error");
                     serde_json::to_string(&ApiErrorBody {

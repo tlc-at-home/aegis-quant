@@ -25,7 +25,7 @@ use aegis_risk::RiskEngine;
 use aegis_settle::{SettleController, SettleOverrideInput};
 use aegis_signals::{SignalEngine, WalkForwardCalibrator};
 use aegis_telemetry::TelemetryBus;
-use aegis_web::serve_web;
+use aegis_web::serve_web_with_shutdown;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
@@ -148,6 +148,9 @@ enum Commands {
         /// Reclassify historical `PARTIAL_IDLE_CAPPED` rows created before `<ISO8601>` to `DRY_RUN` (`R6-N4`)
         #[arg(long)]
         reclassify_dry_run_before: Option<String>,
+        /// Create an online atomic SQLite backup via `VACUUM INTO` and prune expired backups (`ME-19`)
+        #[arg(long)]
+        backup: bool,
     },
     /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
     Backtest {
@@ -173,6 +176,17 @@ enum Commands {
         #[arg(long)]
         skip_backtest: bool,
     },
+}
+
+/// Validates `--book` (`pit`, `pond`, or `both`) (`P2-3`).
+pub fn validate_book_mode(raw: &str) -> Result<String> {
+    let norm = raw.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "pit" | "pond" | "both" => Ok(norm),
+        _ => Err(AegisError::Validation(format!(
+            "Invalid --book '{raw}': expected 'pit', 'pond', or 'both'"
+        ))),
+    }
 }
 
 /// Validates `--initial-split` (`<PIT_USDC>:<POND_USDC>`) for `aegis-quant settle`.
@@ -254,6 +268,7 @@ pub struct AegisOrchestrator {
     pub last_pond_4h_bucket: Option<i64>,
     pub last_reconcile_ms: Option<i64>,
     pub last_retention_prune_ms: Option<i64>,
+    pub last_backup_ms: Option<i64>,
     pub reconcile_error_streak: usize,
 }
 
@@ -282,6 +297,7 @@ impl AegisOrchestrator {
             last_pond_4h_bucket: None,
             last_reconcile_ms: Some(now_ms),
             last_retention_prune_ms: Some(now_ms),
+            last_backup_ms: Some(now_ms),
             reconcile_error_streak: 0,
         }
     }
@@ -442,6 +458,20 @@ impl AegisOrchestrator {
             }
             self.last_retention_prune_ms = Some(now_ms);
         }
+
+        // ME-19: Automated daily SQLite VACUUM INTO backup & retention pruning (every 24h on disk DBs).
+        if !self.db.is_memory {
+            let backup_due = self
+                .last_backup_ms
+                .map(|last| (now_ms - last) >= 86_400_000)
+                .unwrap_or(true);
+            if backup_due {
+                if let Err(e) = self.db.create_sqlite_backup(None, None) {
+                    tracing::warn!("Periodic SQLite VACUUM INTO backup warning: {e}");
+                }
+                self.last_backup_ms = Some(now_ms);
+            }
+        }
     }
 
     pub fn run_single_cycle(&mut self, lookback_bars: usize) -> Result<PortfolioSnapshot> {
@@ -592,6 +622,18 @@ impl AegisOrchestrator {
         let poll_interval_sec = cfg.get_i64("polling_interval_seconds", 15).max(1) as u64;
 
         let mode_norm = book_mode.trim().to_ascii_lowercase();
+        let lock_owner = format!("daemon.{mode_norm}.pid{}", std::process::id());
+        let Some(_cycle_lock) = self
+            .db
+            .acquire_cycle_lock_guard(&lock_owner, 120_000)
+            .ok()
+            .flatten()
+        else {
+            tracing::warn!(
+                "Skipping scheduled daemon step ({mode_norm}): advisory cycle lock held by another process"
+            );
+            return (Ok(()), 5);
+        };
         match mode_norm.as_str() {
             "pit" => {
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -710,14 +752,14 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 13 {
+        status: if schema_ver >= 14 {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 13 (migrations 001..013 applied)".to_string(),
-        remediation: "Run: aegis-quant db --migrate".to_string(),
+        requirement: "schema_version >= 14 (canonical sql/schema_and_seed.sql applied)".to_string(),
+        remediation: "Run: aegis-quant db --init or aegis-quant db --migrate".to_string(),
     });
 
     checks.push(CheckResult {
@@ -830,9 +872,11 @@ pub fn run_readiness_suite(
         true
     };
     let creds_ready = wallet_ok && priv_ok && binding_ok;
-    let sec03_status = if creds_ready {
+    let live_routed_to_testnet =
+        target_mode == "LIVE" && cfg.get_bool("hyperliquid_testnet", false);
+    let sec03_status = if creds_ready && !live_routed_to_testnet {
         "PASS"
-    } else if !is_live_or_testnet && binding_ok {
+    } else if (!is_live_or_testnet && binding_ok) || (creds_ready && live_routed_to_testnet) {
         "WARN"
     } else {
         "FAIL"
@@ -843,9 +887,9 @@ pub fn run_readiness_suite(
         name: "Trade-Only Agent Wallet & Key".to_string(),
         status: sec03_status.to_string(),
         observed: format!(
-            "wallet_valid={wallet_ok}, private_key_valid={priv_ok}, signer_binding_ok={binding_ok} (mode={target_mode})"
+            "wallet_valid={wallet_ok}, private_key_valid={priv_ok}, signer_binding_ok={binding_ok}, live_routed_to_testnet={live_routed_to_testnet} (mode={target_mode})"
         ),
-        requirement: "Valid 42-char 0x wallet_address + 64-hex secp256k1 Agent private_key"
+        requirement: "Valid 42-char 0x wallet_address + 64-hex secp256k1 Agent private_key; hyperliquid_testnet=false in LIVE mode (ME-5)"
             .to_string(),
         remediation:
             "Configure Trade-Only API Wallet in WebUI Settings or PUT /api/v1/credentials"
@@ -954,7 +998,13 @@ pub fn run_readiness_suite(
     let mem_db = DatabaseManager::memory();
     mem_db.initialize_schema(false)?;
     let risk_engine = RiskEngine::new(mem_db.clone());
-    let sample_asset = mem_db.get_usdc_perp_universe()?.into_iter().next().unwrap();
+    let sample_asset = mem_db
+        .get_usdc_perp_universe()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            AegisError::Validation("Empty USDC perp universe in readiness self-test".to_string())
+        })?;
     let res_ok = risk_engine.evaluate_order_risk(
         &sample_asset,
         "LONG",
@@ -1191,6 +1241,71 @@ pub fn run_readiness_suite(
         });
     }
 
+    // =========================================================================
+    // GATE 6: DEPLOYMENT, SYSTEMD ISOLATION & BACKUP READINESS (P1-7)
+    // =========================================================================
+    let settle_service_path = project_root.join("deploy").join("aegis-settle.service");
+    let settle_service_src = fs::read_to_string(&settle_service_path).unwrap_or_default();
+    let deploy01_ok = !settle_service_src.is_empty() && !settle_service_src.contains("--execute");
+    checks.push(CheckResult {
+        gate: "Gate 6: Deployment & Backup".to_string(),
+        check_id: "DEPLOY-01".to_string(),
+        name: "Systemd Settle Unit Argument Parity".to_string(),
+        status: if deploy01_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: if deploy01_ok {
+            "deploy/aegis-settle.service ExecStart matches clap Settle CLI flags".to_string()
+        } else {
+            "deploy/aegis-settle.service missing or contains invalid --execute flag".to_string()
+        },
+        requirement: "ExecStart invokes `aegis-quant settle` without invalid `--execute` flag (CR-1)"
+            .to_string(),
+        remediation: "Update deploy/aegis-settle.service ExecStart".to_string(),
+    });
+
+    let quant_service_src =
+        fs::read_to_string(project_root.join("deploy").join("aegis-quant.service"))
+            .unwrap_or_default();
+    let deploy02_ok = quant_service_src.contains("Conflicts=")
+        && quant_service_src.contains("aegis-pit.service")
+        && quant_service_src.contains("aegis-pond.service");
+    checks.push(CheckResult {
+        gate: "Gate 6: Deployment & Backup".to_string(),
+        check_id: "DEPLOY-02".to_string(),
+        name: "Systemd Mutual-Exclusion Conflicts".to_string(),
+        status: if deploy02_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: if deploy02_ok {
+            "Conflicts=aegis-pit.service aegis-pond.service configured".to_string()
+        } else {
+            "Missing Conflicts= directive on deploy/aegis-quant.service".to_string()
+        },
+        requirement: "Systemd units prevent concurrent aegis-quant and aegis-pit/aegis-pond execution (HI-4)"
+            .to_string(),
+        remediation: "Add Conflicts= directives to deploy/aegis-*.service".to_string(),
+    });
+
+    let backup_dir = if db.is_memory {
+        std::env::temp_dir().join("aegis_backups")
+    } else {
+        db.db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("data"))
+            .join("backups")
+    };
+    let deploy03_ok = fs::create_dir_all(&backup_dir).is_ok();
+    checks.push(CheckResult {
+        gate: "Gate 6: Deployment & Backup".to_string(),
+        check_id: "DEPLOY-03".to_string(),
+        name: "SQLite VACUUM INTO Backup Directory".to_string(),
+        status: if deploy03_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "backup_dir={}, writable={deploy03_ok}",
+            backup_dir.display()
+        ),
+        requirement: "Writable backup directory for automated/dashboard VACUUM INTO snapshots (ME-19)"
+            .to_string(),
+        remediation: format!("Ensure {} is writable", backup_dir.display()),
+    });
+
     let fail_count = checks.iter().filter(|c| c.status == "FAIL").count();
     let warn_count = checks.iter().filter(|c| c.status == "WARN").count();
     let is_go = if is_live_or_testnet {
@@ -1250,7 +1365,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let json_out = cli.json;
-    let book_flag = cli.book.clone();
+    let book_flag = validate_book_mode(&cli.book)?;
     let db = match &cli.db {
         Some(p) => DatabaseManager::new(p),
         None => DatabaseManager::default_db(),
@@ -1269,7 +1384,14 @@ fn main() -> anyhow::Result<()> {
             show_web_token,
             audit_dry_run_residue,
             reclassify_dry_run_before,
+            backup,
         }) => {
+            if backup {
+                db.initialize_schema(false)?;
+                let res = db.create_sqlite_backup(None, None)?;
+                println!("{}", serde_json::to_string_pretty(&res)?);
+                return Ok(());
+            }
             if audit_dry_run_residue {
                 let rows = db.audit_suspect_dry_run_book_transfers()?;
                 if json_out {
@@ -1476,6 +1598,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if scan {
+                let _lock_guard = pond
+                    .scoped_db
+                    .inner()
+                    .acquire_cycle_lock_guard("cli-pond-scan", 120_000)?
+                    .ok_or_else(|| {
+                        AegisError::Validation(
+                            "Another Aegis cycle or daemon currently holds the database advisory cycle lock (HI-4)"
+                                .to_string(),
+                        )
+                    })?;
                 let summary = pond.run_scan_cycle(true)?;
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             }
@@ -1619,23 +1751,53 @@ fn run_orchestrator(
                 .build()
             {
                 rt.block_on(async move {
-                    if !no_web {
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    let web_handle = if !no_web {
                         let w_db = web_db.clone();
                         let w_host = bind_host.clone();
-                        tokio::spawn(async move {
+                        Some(tokio::spawn(async move {
                             tracing::info!(
                                 "Starting Aegis Quant Axum WebUI & SSE server on http://{}:{}",
                                 w_host,
                                 port
                             );
-                            if let Err(e) = serve_web(w_db, &w_host, port).await {
+                            if let Err(e) =
+                                serve_web_with_shutdown(w_db, &w_host, port, shutdown_rx).await
+                            {
                                 tracing::error!("Web server error: {e}");
                             }
-                        });
+                        }))
+                    } else {
+                        None
+                    };
+                    #[cfg(unix)]
+                    {
+                        if let Ok(mut sigterm) =
+                            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        {
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {
+                                    tracing::info!("Received SIGINT (Ctrl-C), initiating graceful shutdown...");
+                                }
+                                _ = sigterm.recv() => {
+                                    tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+                                }
+                            }
+                            r_sig.store(false, Ordering::SeqCst);
+                            let _ = shutdown_tx.send(true);
+                            if let Some(h) = web_handle {
+                                let _ = h.await;
+                            }
+                            return;
+                        }
                     }
                     if tokio::signal::ctrl_c().await.is_ok() {
                         tracing::info!("Received Ctrl-C, initiating graceful shutdown...");
                         r_sig.store(false, Ordering::SeqCst);
+                        let _ = shutdown_tx.send(true);
+                        if let Some(h) = web_handle {
+                            let _ = h.await;
+                        }
                     }
                 });
             }
@@ -1649,6 +1811,14 @@ fn run_orchestrator(
 
     let book_mode = book.trim().to_ascii_lowercase();
     if once {
+        let _lock_guard = db
+            .acquire_cycle_lock_guard("cli-run-once", 120_000)?
+            .ok_or_else(|| {
+                AegisError::Validation(
+                    "Another Aegis cycle or daemon currently holds the database advisory cycle lock (HI-4)"
+                        .to_string(),
+                )
+            })?;
         match book_mode.as_str() {
             "pit" => {
                 let sum = orchestrator.pit.run_cycle(true, false)?;
@@ -1833,6 +2003,12 @@ mod tests {
         assert!(parse_and_validate_initial_split("0:5000").is_err());
         assert!(parse_and_validate_initial_split("5000:0").is_err());
         assert!(parse_and_validate_initial_split("0:0").is_err());
+
+        // P2-3: --book validation
+        assert_eq!(validate_book_mode("pit").unwrap(), "pit");
+        assert_eq!(validate_book_mode("POND").unwrap(), "pond");
+        assert_eq!(validate_book_mode("both").unwrap(), "both");
+        assert!(validate_book_mode("invalid_book").is_err());
     }
 
     #[tokio::test]

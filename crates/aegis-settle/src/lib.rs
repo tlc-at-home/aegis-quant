@@ -323,7 +323,12 @@ impl SettleController {
                     let leg1_persisted = pending_transfer_id
                         .and_then(|tid| self.db.get_book_transfer_leg_progress(tid).ok())
                         .and_then(|(legs, l1_ref, _)| {
-                            if legs == 1 || l1_ref.is_some() {
+                            if legs == 1
+                                || l1_ref.as_deref().is_some_and(|r| {
+                                    r != "AMBIGUOUS_IN_FLIGHT_LEG1"
+                                        && !r.starts_with("leg1-broadcast:")
+                                })
+                            {
                                 Some(l1_ref.unwrap_or_else(|| "leg1-completed".to_string()))
                             } else {
                                 None

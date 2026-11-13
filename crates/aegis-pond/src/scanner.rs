@@ -62,6 +62,8 @@ pub struct PondScannerParams {
     pub conviction_scale_min: f64,
     pub conviction_scale_max: f64,
     pub reject_synthetic_volume: bool,
+    #[serde(default)]
+    pub require_2h_funding_persistence: bool,
 }
 
 impl Default for PondScannerParams {
@@ -71,7 +73,7 @@ impl Default for PondScannerParams {
             direction_policy: PondDirectionPolicy::Both,
             funding_z_window_hours: 168,
             z_entry_threshold: 2.0,
-            min_funding_abs: 0.000015,
+            min_funding_abs: 0.000050,
             min_daily_vol_usdc: 50_000.0,
             liquidity_score_ref_usdc: 250_000.0,
             trend_veto_ema_fast: 16,
@@ -102,6 +104,7 @@ impl Default for PondScannerParams {
             conviction_scale_min: 0.5,
             conviction_scale_max: 1.5,
             reject_synthetic_volume: false,
+            require_2h_funding_persistence: false,
         }
     }
 }
@@ -194,13 +197,31 @@ pub fn evaluate_asset_gates_1_to_6(
         return Err("GATE3_MISSING_FUNDING_DATA");
     };
 
-    // Gate 3: Absolute Funding Floor
+    // Gate 3: Absolute Funding Floor & 2-Hour Persistence Check
     if r_hourly.abs() < params.min_funding_abs {
         return Err("GATE3_FUNDING_BELOW_ABS_FLOOR");
     }
+    if params.require_2h_funding_persistence && input.funding_series_168h.len() >= 2 {
+        let r_prev = input.funding_series_168h[input.funding_series_168h.len() - 2];
+        let same_sign = r_prev.signum() == r_hourly.signum() && r_prev.abs() > 0.0;
+        let avg_2h_abs = 0.5 * (r_hourly.abs() + r_prev.abs());
+        if !same_sign
+            || avg_2h_abs < params.min_funding_abs
+            || r_prev.abs() < 0.5 * params.min_funding_abs
+        {
+            return Err("GATE3_FUNDING_NOT_PERSISTENT_2H");
+        }
+    }
 
-    // Gate 4: Statistical Extreme (z-Score Gate) + Direction Policy
-    let (z_t, _, _) = compute_trailing_z_score(&input.funding_series_168h, req_window);
+    // Gate 4: Statistical Extreme (z-Score Gate with Minimum Std-Dev Floor) + Direction Policy
+    let (raw_z, mean, std) = compute_trailing_z_score(&input.funding_series_168h, req_window);
+    let std_floor = (params.min_funding_abs / params.z_entry_threshold.max(1.0)).max(0.000015);
+    let eff_std = std.max(std_floor);
+    let z_t = if std > 1e-12 {
+        ((r_hourly - mean) / eff_std).clamp(-10.0, 10.0)
+    } else {
+        raw_z
+    };
     if z_t.abs() < params.z_entry_threshold {
         return Err("GATE4_Z_SCORE_BELOW_THRESHOLD");
     }
@@ -289,6 +310,7 @@ pub fn evaluate_asset_gates_1_to_6(
             (closes_4h.last(), ema_fast_vec.last(), ema_slow_vec.last())
         {
             let overext = params.trend_veto_overextension_pct.max(0.0);
+            let exhaustion_atr_mult = (params.trend_veto_4h_atr_mult * 0.5).max(1.25);
             match side {
                 PondSide::Short => {
                     // Veto when 4H close > EMA_64 * (1 + 0.08) or extreme structural uptrend
@@ -300,6 +322,14 @@ pub fn evaluate_asset_gates_1_to_6(
                     {
                         return Err("GATE6_4H_STRUCTURAL_UPTREND_VETO");
                     }
+                    // Also veto shorting into an oversold structural bottom / mean-reversion bounce
+                    if close_4h < ema_slow * (1.0 - overext)
+                        || (close_4h < ema_fast
+                            && ema_fast < ema_slow
+                            && (ema_fast - close_4h) / atr_4h.max(1e-8) > exhaustion_atr_mult)
+                    {
+                        return Err("GATE6_4H_OVERSOLD_BOTTOM_VETO");
+                    }
                 }
                 PondSide::Long => {
                     // Veto when 4H close < EMA_64 * (1 - 0.08) or extreme structural downtrend
@@ -310,6 +340,14 @@ pub fn evaluate_asset_gates_1_to_6(
                                 > params.trend_veto_4h_atr_mult)
                     {
                         return Err("GATE6_4H_STRUCTURAL_DOWNTREND_VETO");
+                    }
+                    // Also veto longing into an overbought structural top / mean-reversion pullback
+                    if close_4h > ema_slow * (1.0 + overext)
+                        || (close_4h > ema_fast
+                            && ema_fast > ema_slow
+                            && (close_4h - ema_fast) / atr_4h.max(1e-8) > exhaustion_atr_mult)
+                    {
+                        return Err("GATE6_4H_OVERBOUGHT_TOP_VETO");
                     }
                 }
             }

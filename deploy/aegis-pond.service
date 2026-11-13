@@ -2,6 +2,7 @@
 Description=AEGIS-QUANT PP-50 Book B (The Pond — NPS-01 Bi-Directional Naked-Option Perp Scanner)
 After=network-online.target chronyd.service
 Wants=network-online.target chronyd.service
+Conflicts=aegis-quant.service
 
 [Service]
 Type=simple

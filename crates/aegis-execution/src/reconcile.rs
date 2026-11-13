@@ -326,6 +326,31 @@ impl ExecutionEngine {
         let mut seen_coins: HashSet<String> = HashSet::new();
         let mut open_pos_coins: HashSet<String> = HashSet::new();
         let mut known_resting_oids: HashSet<u64> = HashSet::new();
+        for lt in &local_trades {
+            if let Ok(Some(stop_oid_str)) = self.db.get_trade_protective_stop_oid(lt.trade_id) {
+                if let Some(oid) = stop_oid_str
+                    .strip_prefix("hl-")
+                    .or(Some(stop_oid_str.as_str()))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&id| id > 0)
+                {
+                    known_resting_oids.insert(oid);
+                }
+            }
+        }
+        for cell in &local_pond_cells {
+            if let Ok(Some(stop_oid_str)) = self.db.get_pond_cell_protective_stop_oid(cell.cell_id)
+            {
+                if let Some(oid) = stop_oid_str
+                    .strip_prefix("hl-")
+                    .or(Some(stop_oid_str.as_str()))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&id| id > 0)
+                {
+                    known_resting_oids.insert(oid);
+                }
+            }
+        }
         for rt in &resting_trades {
             seen_coins.insert(rt.base_asset.to_uppercase());
             if let Some(oid) = rt
@@ -391,10 +416,42 @@ impl ExecutionEngine {
             match ex_positions.get(&coin) {
                 None => {
                     if !open_order_coins.contains(&coin) {
+                        // ME-7: Resolve exit price from latest mark/bar price and compute realized PnL
+                        let latest_bar_px = self
+                            .db
+                            .get_ohlcv_bars(&lt.symbol, "1h", 1, None)
+                            .ok()
+                            .and_then(|b| b.last().map(|bar| bar.close))
+                            .unwrap_or(0.0);
+                        let exit_px = if lt.current_price > 0.0
+                            && (lt.current_price - lt.entry_price).abs() > 1e-9
+                        {
+                            lt.current_price
+                        } else if latest_bar_px > 0.0 {
+                            latest_bar_px
+                        } else {
+                            lt.current_price
+                        };
+                        let gross_pnl = if exit_px > 0.0 && lt.entry_price > 0.0 {
+                            if lt.side.eq_ignore_ascii_case("LONG")
+                                || lt.side.eq_ignore_ascii_case("BUY")
+                            {
+                                (exit_px - lt.entry_price) * lt.quantity.abs()
+                            } else {
+                                (lt.entry_price - exit_px) * lt.quantity.abs()
+                            }
+                        } else {
+                            0.0
+                        };
+                        let net_pnl = round_dp(
+                            lt.realized_pnl_usdc + gross_pnl - lt.fees_paid_usdc
+                                + lt.funding_accrued_usdc,
+                            4,
+                        );
                         if let Err(e) = self.db.close_trade(
                             lt.trade_id,
-                            lt.current_price,
-                            lt.realized_pnl_usdc,
+                            exit_px,
+                            net_pnl,
                             lt.fees_paid_usdc,
                             "RECONCILED_CLOSED_ON_EXCHANGE",
                         ) {
@@ -410,6 +467,8 @@ impl ExecutionEngine {
                             "type": "PHANTOM_LOCAL_CLOSED",
                             "base_asset": coin,
                             "trade_id": lt.trade_id,
+                            "exit_price": exit_px,
+                            "realized_pnl_usdc": net_pnl,
                         }));
                     }
                 }
@@ -583,9 +642,18 @@ impl ExecutionEngine {
             match ex_positions.get(&coin) {
                 None => {
                     if !open_order_coins.contains(&coin) {
+                        // ME-7: Resolve latest 1h bar close so reconcile_close_phantom_pond_cell computes actual realized PnL
+                        let latest_bar_px = self
+                            .db
+                            .get_ohlcv_bars(&cell.symbol, "1h", 1, None)
+                            .ok()
+                            .and_then(|b| b.last().map(|bar| bar.close))
+                            .filter(|&px| px > 0.0);
+                        let exit_px =
+                            latest_bar_px.unwrap_or_else(|| cell.entry_price.unwrap_or(0.0));
                         if let Err(e) = self.db.reconcile_close_phantom_pond_cell(
                             cell.cell_id,
-                            cell.entry_price.unwrap_or(0.0),
+                            exit_px,
                             "RECONCILED_CLOSED_ON_EXCHANGE",
                         ) {
                             tracing::error!(
@@ -600,6 +668,7 @@ impl ExecutionEngine {
                             "type": "PHANTOM_POND_CELL_CLOSED",
                             "base_asset": coin,
                             "cell_id": cell.cell_id,
+                            "exit_price": exit_px,
                         }));
                     }
                 }
@@ -733,52 +802,59 @@ impl ExecutionEngine {
             }
         }
 
-        if let Some(open_orders) = open_orders_slice {
-            for ord in open_orders {
-                let coin = ord
-                    .get("coin")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_uppercase();
-                let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
-                    ord.get("oid")
+        let cancel_unknown_open_orders = cfg.get_bool("cancel_unknown_open_orders", true);
+        if cancel_unknown_open_orders {
+            if let Some(open_orders) = open_orders_slice {
+                for ord in open_orders {
+                    let coin = ord
+                        .get("coin")
                         .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<u64>().ok())
-                });
-                let is_known_resting_oid = ord_oid
-                    .map(|oid| known_resting_oids.contains(&oid))
-                    .unwrap_or(false);
-                if !is_known_resting_oid
-                    && (!open_pos_coins.contains(&coin) || ex_positions.contains_key(&coin))
-                {
-                    if simulated_open_orders.is_none() {
-                        if let Some(oid) = ord_oid {
-                            let oid_str = format!("hl-{oid}");
-                            match self.cancel_resting_order(&coin, &oid_str) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    tracing::warn!(
-                                        coin = %coin,
-                                        oid = %oid_str,
-                                        "Dangling open order cancel returned false during exchange reconciliation (R10-N3)"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        coin = %coin,
-                                        oid = %oid_str,
-                                        error = %e,
-                                        "Dangling open order cancel failed during exchange reconciliation (R10-N3)"
-                                    );
+                        .unwrap_or("")
+                        .to_uppercase();
+                    let ord_oid = ord.get("oid").and_then(Value::as_u64).or_else(|| {
+                        ord.get("oid")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    });
+                    let is_known_resting_oid = ord_oid
+                        .map(|oid| known_resting_oids.contains(&oid))
+                        .unwrap_or(false);
+                    let is_reduce_only_trigger_on_open_pos = ex_positions.contains_key(&coin)
+                        && ord.get("isTrigger").and_then(Value::as_bool).unwrap_or(false)
+                        && ord.get("reduceOnly").and_then(Value::as_bool).unwrap_or(false);
+                    if !is_known_resting_oid
+                        && !is_reduce_only_trigger_on_open_pos
+                        && (!open_pos_coins.contains(&coin) || ex_positions.contains_key(&coin))
+                    {
+                        if simulated_open_orders.is_none() {
+                            if let Some(oid) = ord_oid {
+                                let oid_str = format!("hl-{oid}");
+                                match self.cancel_resting_order(&coin, &oid_str) {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            coin = %coin,
+                                            oid = %oid_str,
+                                            "Dangling open order cancel returned false during exchange reconciliation (R10-N3)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            coin = %coin,
+                                            oid = %oid_str,
+                                            error = %e,
+                                            "Dangling open order cancel failed during exchange reconciliation (R10-N3)"
+                                        );
+                                    }
                                 }
                             }
                         }
+                        discrepancies.push(json!({
+                            "type": "DANGLING_OPEN_ORDER_CANCELLED",
+                            "base_asset": coin,
+                            "oid": ord.get("oid"),
+                        }));
                     }
-                    discrepancies.push(json!({
-                        "type": "DANGLING_OPEN_ORDER_CANCELLED",
-                        "base_asset": coin,
-                        "oid": ord.get("oid"),
-                    }));
                 }
             }
         }

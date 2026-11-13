@@ -88,6 +88,39 @@ pub fn compute_wick_context(
     active_stop: Option<f64>,
     wick_buffer_atr_mult: f64,
 ) -> WickContext {
+    compute_wick_context_with_stops(
+        bars_1h,
+        side,
+        opened_at_ms,
+        stored_high,
+        stored_low,
+        entry_price,
+        atr_period,
+        active_stop,
+        wick_buffer_atr_mult,
+        2.5,
+        0.005,
+        0.06,
+    )
+}
+
+/// Computes post-entry price watermarks, post-watermark adverse wick extremes, the index
+/// of the extreme adverse bar, and the crash-bar-excluded 1H ATR using configured stop parameters.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_wick_context_with_stops(
+    bars_1h: &[OhlcvBar],
+    side: &str,
+    opened_at_ms: i64,
+    stored_high: Option<f64>,
+    stored_low: Option<f64>,
+    entry_price: f64,
+    atr_period: usize,
+    active_stop: Option<f64>,
+    wick_buffer_atr_mult: f64,
+    initial_stop_atr_mult: f64,
+    min_stop_pct_floor: f64,
+    max_stop_distance_pct: f64,
+) -> WickContext {
     let is_long = side.eq_ignore_ascii_case("LONG");
     let last_1h = bars_1h.last();
     let mark_px = last_1h
@@ -100,8 +133,10 @@ pub fn compute_wick_context(
         bars_1h
     };
     let pre_open_atr_1h = compute_atr_from_bars(pre_open_slice, atr_period.max(1)).max(0.01);
-    let default_stop_dist =
-        (2.5 * pre_open_atr_1h).clamp(entry_price * 0.005, entry_price * 0.06);
+    let min_pct = min_stop_pct_floor.max(0.0001);
+    let max_pct = max_stop_distance_pct.max(min_pct);
+    let default_stop_dist = (initial_stop_atr_mult.max(0.5) * pre_open_atr_1h)
+        .clamp(entry_price * min_pct, entry_price * max_pct);
     let wick_buf = wick_buffer_atr_mult.max(0.0) * pre_open_atr_1h;
     let cell_stop_dist = active_stop
         .filter(|&s| s > 0.0)
@@ -651,7 +686,7 @@ impl PondOrchestrator {
             } else {
                 prev_chand
             };
-            let wick_ctx = compute_wick_context(
+            let wick_ctx = compute_wick_context_with_stops(
                 &bars_1h,
                 &cell.side,
                 opened_at_ms.unwrap_or(0),
@@ -661,6 +696,9 @@ impl PondOrchestrator {
                 cfg.pond_atr_period.max(1),
                 (prev_stop > 0.0).then_some(prev_stop),
                 wick_mult,
+                cfg.pond_initial_stop_atr_mult,
+                cfg.pond_min_stop_pct_floor,
+                cfg.pond_max_stop_distance_pct,
             );
             let watermark_high = wick_ctx.watermark_high;
             let watermark_low = wick_ctx.watermark_low;
@@ -702,16 +740,36 @@ impl PondOrchestrator {
             // R3-B1 & R3-H1: Atomic hourly funding accrual guarded by last_funding_hour_bucket
             if effective_1h_boundary {
                 let delta = compute_cell_hourly_funding_delta(&cell, mark_px, cur_funding);
-                if self.scoped_db.accrue_pond_cell_funding_for_hour(
+                match self.scoped_db.accrue_pond_cell_funding_for_hour(
                     cell.cell_id,
                     now_hour_bucket,
                     delta,
-                )? {
-                    cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
+                ) {
+                    Ok(true) => {
+                        cell.funding_accrued_usdc = round_dp(cell.funding_accrued_usdc + delta, 4);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            cell_id = cell.cell_id,
+                            symbol = %cell.symbol,
+                            error = %e,
+                            "accrue_pond_cell_funding_for_hour failed; continuing cell evaluation (ME-10)"
+                        );
+                        let _ = self.scoped_db.log_telemetry(
+                            "ERROR",
+                            "pond.orchestrator",
+                            &format!(
+                                "accrue_pond_cell_funding_for_hour failed for {} (cell #{}): {e}",
+                                cell.symbol, cell.cell_id
+                            ),
+                            None,
+                        );
+                    }
                 }
             }
             let prev_chandelier_stop = cell.chandelier_stop;
-            let _price_pnl = update_cell_mark_and_chandelier(
+            let price_pnl = update_cell_mark_and_chandelier(
                 &mut cell,
                 mark_px,
                 watermark_high,
@@ -740,13 +798,25 @@ impl PondOrchestrator {
                 (high_px, low_px)
             };
 
-            let hold_hours = cell
-                .opened_at
-                .as_deref()
-                .and_then(parse_utc_timestamp)
-                .map(|dt| (now.naive_utc() - dt).num_minutes() as f64 / 60.0)
-                .unwrap_or(1.0)
-                .max(0.0);
+            let hold_hours = match cell.opened_at.as_deref().and_then(parse_utc_timestamp) {
+                Some(dt) => ((now.naive_utc() - dt).num_minutes() as f64 / 60.0).max(0.0),
+                None => {
+                    tracing::warn!(
+                        cell_id = cell.cell_id,
+                        symbol = %cell.symbol,
+                        opened_at = ?cell.opened_at,
+                        "Open Pond cell has missing or unparseable opened_at timestamp; defaulting hold_hours to max_hold ({max_hold}h) for fail-closed timeout (ME-11)"
+                    );
+                    max_hold
+                }
+            };
+
+            let qty_abs = cell.quantity.unwrap_or(0.0).abs();
+            let est_exit_fee = round_dp(qty_abs * mark_px * 0.00015, 4);
+            let net_pnl_usdc = round_dp(
+                price_pnl + cell.funding_accrued_usdc - cell.fees_paid_usdc - est_exit_fee,
+                4,
+            );
 
             let eval_input = CellExitEvalInput {
                 mark_price: mark_px,
@@ -768,6 +838,8 @@ impl PondOrchestrator {
                 max_hold_hours: max_hold,
                 cooldown_stop_hours: cd_stop,
                 cooldown_normal_hours: cd_norm,
+                min_norm_hold_hours: cfg.pond_min_norm_hold_hours,
+                net_pnl_usdc,
             };
 
             let decision = evaluate_exit_priority(&cell, &eval_input);
@@ -776,6 +848,7 @@ impl PondOrchestrator {
                 let close_side = if cell.side == "LONG" { "SELL" } else { "BUY" };
                 let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
                 let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
+                let min_notional = univ_row.map(|u| u.min_notional_usdc).unwrap_or(10.0).max(1.0);
 
                 // Escalate maker exit to market/IOC on retry, Testnet, or overdue max-hold timeout (NM-7)
                 let prev_attempts = self
@@ -804,31 +877,38 @@ impl PondOrchestrator {
                     true,
                     None,
                 );
-                if is_live_or_testnet && fill.fsm_state != "FILLED" {
+                let raw_rem = (qty - fill.filled_units).max(0.0);
+                let rem_qty = aegis_core::round_step(raw_rem, lot_sz.max(1e-6), true);
+                let rem_notional = round_dp(rem_qty * entry_px, 2);
+                let has_tradeable_remainder = fill.filled_units > 0.0
+                    && fill.filled_units + 1e-8 < qty
+                    && rem_qty >= lot_sz.max(1e-6)
+                    && rem_notional >= min_notional;
+
+                if fill.fsm_state != "FILLED" {
                     *self
                         .exit_attempt_count
                         .lock()
                         .entry(cell.cell_id)
                         .or_insert(0) += 1;
                     tracing::warn!(
-                        "Book B (POND) live exit order for {} (cell #{}, attempt {}) did not fill (state={}); keeping cell OPEN for retry",
+                        "Book B (POND) exit order for {} (cell #{}, attempt {}) did not fill (state={}); keeping cell OPEN for retry (HI-6)",
                         cell.symbol,
                         cell.cell_id,
                         prev_attempts + 1,
                         fill.fsm_state
                     );
-                    self.scoped_db.update_open_pond_cell_watermarks(
+                    if let Err(e) = self.scoped_db.update_open_pond_cell_watermarks(
                         cell.cell_id,
                         &cell.state,
                         cell.chandelier_stop,
                         cell.highest_price_seen,
                         cell.lowest_price_seen,
-                    )?;
-                } else if is_live_or_testnet
-                    && fill.filled_units > 0.0
-                    && fill.filled_units + 1e-8 < qty
-                {
-                    // Partial live exit fill (NH-8, R3-H1): atomic SQL reduction of cell quantity & notional
+                    ) {
+                        tracing::error!(cell_id = cell.cell_id, error = %e, "update_open_pond_cell_watermarks failed (ME-10)");
+                    }
+                } else if has_tradeable_remainder {
+                    // Partial exit fill (NH-8, R3-H1, HI-6, HI-7): atomic SQL reduction of cell quantity & notional
                     let exit_px = if fill.avg_fill_price > 0.0 {
                         fill.avg_fill_price
                     } else {
@@ -839,9 +919,7 @@ impl PondOrchestrator {
                     } else {
                         (entry_px - exit_px) * fill.filled_units
                     };
-                    let rem_qty = round_dp((qty - fill.filled_units).max(0.0), 6);
-                    let rem_notional = round_dp(rem_qty * entry_px, 2);
-                    let _ = self.scoped_db.reduce_open_pond_cell_partial_exit(
+                    if let Err(e) = self.scoped_db.reduce_open_pond_cell_partial_exit(
                         cell.cell_id,
                         &cell.state,
                         cell.chandelier_stop,
@@ -851,7 +929,41 @@ impl PondOrchestrator {
                         rem_notional,
                         partial_gross,
                         fill.fees_paid_usdc,
-                    )?;
+                    ) {
+                        tracing::error!(cell_id = cell.cell_id, error = %e, "reduce_open_pond_cell_partial_exit failed (ME-10)");
+                    } else if is_live_or_testnet && cfg.exchange_protective_stops_enabled {
+                        if let Some(stop_px) = cell
+                            .chandelier_stop
+                            .or(cell.initial_stop)
+                            .filter(|&p| p > 0.0)
+                        {
+                            let mut asset = self
+                                .execution
+                                .resolve_trade_asset(&cell.symbol, "", mark_px);
+                            asset.tick_size = tick_sz;
+                            asset.lot_step_size = lot_sz;
+                            let existing_stop_oid = self
+                                .scoped_db
+                                .get_pond_cell_protective_stop_oid(cell.cell_id)
+                                .ok()
+                                .flatten();
+                            if let Ok(Some(new_stop_oid)) = self
+                                .execution
+                                .submit_or_refresh_protective_stop_order(
+                                    &asset,
+                                    &cell.side,
+                                    rem_qty,
+                                    stop_px,
+                                    existing_stop_oid.as_deref(),
+                                )
+                            {
+                                let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
+                                    cell.cell_id,
+                                    Some(&new_stop_oid),
+                                );
+                            }
+                        }
+                    }
                     *self
                         .exit_attempt_count
                         .lock()
@@ -859,15 +971,28 @@ impl PondOrchestrator {
                         .or_insert(0) += 1;
                 } else {
                     self.exit_attempt_count.lock().remove(&cell.cell_id);
+                    let existing_stop_oid = if is_live_or_testnet {
+                        self.scoped_db
+                            .get_pond_cell_protective_stop_oid(cell.cell_id)
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
                     let exit_px = if fill.avg_fill_price > 0.0 {
                         fill.avg_fill_price
                     } else {
                         mark_px
                     };
-                    let gross_pnl = if cell.side == "LONG" {
-                        (exit_px - entry_px) * qty
+                    let closed_units = if fill.filled_units > 0.0 {
+                        fill.filled_units
                     } else {
-                        (entry_px - exit_px) * qty
+                        qty
+                    };
+                    let gross_pnl = if cell.side == "LONG" {
+                        (exit_px - entry_px) * closed_units
+                    } else {
+                        (entry_px - exit_px) * closed_units
                     };
                     let exit_reason_str = decision
                         .exit_reason
@@ -876,10 +1001,14 @@ impl PondOrchestrator {
                     let cooldown_str = (now + ChronoDuration::hours(decision.cooldown_hours))
                         .format("%Y-%m-%dT%H:%M:%SZ")
                         .to_string();
-                    transition_cell_state(&mut cell, PondCellState::Closed)?;
-                    transition_cell_state(&mut cell, PondCellState::Cooldown)?;
+                    if let Err(e) = transition_cell_state(&mut cell, PondCellState::Closed)
+                        .and_then(|_| transition_cell_state(&mut cell, PondCellState::Cooldown))
+                    {
+                        tracing::error!(cell_id = cell.cell_id, error = %e, "Pond cell transition to CLOSED->COOLDOWN failed (ME-10)");
+                        continue;
+                    }
                     // R3-H1: Atomic SQL close reading current DB funding_accrued_usdc and fees_paid_usdc
-                    if self.scoped_db.close_open_pond_cell(
+                    match self.scoped_db.close_open_pond_cell(
                         cell.cell_id,
                         &cell.state,
                         cell.chandelier_stop,
@@ -891,19 +1020,72 @@ impl PondOrchestrator {
                         Some(&exit_reason_str),
                         &now_str,
                         &cooldown_str,
-                    )? {
-                        exits_triggered += 1;
+                    ) {
+                        Ok(true) => {
+                            exits_triggered += 1;
+                            if let Some(ref stop_oid) = existing_stop_oid {
+                                let _ = self.execution.cancel_resting_order(&cell.symbol, stop_oid);
+                                let _ = self
+                                    .scoped_db
+                                    .set_pond_cell_protective_stop_oid(cell.cell_id, None);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::error!(cell_id = cell.cell_id, error = %e, "close_open_pond_cell failed (ME-10)");
+                            let _ = self.scoped_db.log_telemetry(
+                                "ERROR",
+                                "pond.orchestrator",
+                                &format!("close_open_pond_cell failed for {} (cell #{}): {e}", cell.symbol, cell.cell_id),
+                                None,
+                            );
+                        }
                     }
                 }
             } else {
                 // R3-H1: Targeted watermark & Chandelier update without overwriting funding/fees/size
-                self.scoped_db.update_open_pond_cell_watermarks(
+                if let Err(e) = self.scoped_db.update_open_pond_cell_watermarks(
                     cell.cell_id,
                     &cell.state,
                     cell.chandelier_stop,
                     cell.highest_price_seen,
                     cell.lowest_price_seen,
-                )?;
+                ) {
+                    tracing::error!(cell_id = cell.cell_id, error = %e, "update_open_pond_cell_watermarks failed (ME-10)");
+                } else if is_live_or_testnet
+                    && cfg.exchange_protective_stops_enabled
+                    && cell.chandelier_stop != prev_chandelier_stop
+                {
+                    if let Some(stop_px) = cell.chandelier_stop.filter(|&p| p > 0.0) {
+                        let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
+                        let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
+                        let mut asset = self
+                            .execution
+                            .resolve_trade_asset(&cell.symbol, "", mark_px);
+                        asset.tick_size = tick_sz;
+                        asset.lot_step_size = lot_sz;
+                        let existing_stop_oid = self
+                            .scoped_db
+                            .get_pond_cell_protective_stop_oid(cell.cell_id)
+                            .ok()
+                            .flatten();
+                        if let Ok(Some(new_stop_oid)) = self
+                            .execution
+                            .submit_or_refresh_protective_stop_order(
+                                &asset,
+                                &cell.side,
+                                qty_abs,
+                                stop_px,
+                                existing_stop_oid.as_deref(),
+                            )
+                        {
+                            let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
+                                cell.cell_id,
+                                Some(&new_stop_oid),
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -1156,6 +1338,7 @@ impl PondOrchestrator {
             conviction_scale_min: cfg.pond_conviction_scale_min,
             conviction_scale_max: cfg.pond_conviction_scale_max,
             reject_synthetic_volume: is_live_or_testnet,
+            require_2h_funding_persistence: cfg.pond_require_2h_persistence,
         };
 
         // 4. Build scan inputs across all universe coins (reusing cached bars from evaluate_open_cells, NL-11)
@@ -1272,7 +1455,10 @@ impl PondOrchestrator {
                 false,
                 None,
             );
-            if fill.fsm_state == "OPEN_ON_BOOK" || (is_live_or_testnet && fill.filled_units <= 0.0 && fill.fsm_state == "FILLED") {
+            if fill.fsm_state == "OPEN_ON_BOOK"
+                || fill.fsm_state == "AMBIGUOUS_POST_SEND"
+                || (is_live_or_testnet && fill.filled_units <= 0.0 && fill.fsm_state == "FILLED")
+            {
                 // B8 + R4-N11: Resting order is NOT an open position. Keep cell in ARMED state and track resting OID in resting_order_id.
                 let resting_oid = if !fill.exchange_order_id.trim().is_empty() {
                     fill.exchange_order_id.as_str()
@@ -1382,47 +1568,76 @@ impl PondOrchestrator {
             new_cell.opened_at = Some(now_str.clone());
             transition_cell_state(&mut new_cell, PondCellState::Open)?;
 
-            if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
-                let _ = self.scoped_db.log_telemetry(
-                    "CRITICAL",
-                    "engine.pond",
-                    &format!(
-                        "Failed to persist OPEN Pond cell for {} ({} {} @ {:.4}, oid={}) after order fill: {e}",
-                        cand.symbol,
-                        cand.side,
-                        actual_qty,
-                        fill_px,
-                        fill.exchange_order_id
-                    ),
-                    Some(json!({
-                        "symbol": cand.symbol,
-                        "side": cand.side,
-                        "quantity": actual_qty,
-                        "entry_price": fill_px,
-                        "exchange_order_id": fill.exchange_order_id,
-                        "error": e.to_string(),
-                    })),
-                );
-                let _ = self.execution.alerts.notify_critical_event(
-                    "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
-                    &format!(
-                        "Pond order for {} ({} {} @ {:.4}, oid={}) filled, but upsert_pond_cell failed: {e}",
-                        cand.symbol,
-                        cand.side,
-                        actual_qty,
-                        fill_px,
-                        fill.exchange_order_id
-                    ),
-                    Some(json!({
-                        "symbol": cand.symbol,
-                        "side": cand.side,
-                        "quantity": actual_qty,
-                        "entry_price": fill_px,
-                        "exchange_order_id": fill.exchange_order_id,
-                        "error": e.to_string(),
-                    })),
-                );
-                return Err(e);
+            let inserted_cell_id = match self.scoped_db.upsert_pond_cell(&new_cell) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = self.scoped_db.log_telemetry(
+                        "CRITICAL",
+                        "engine.pond",
+                        &format!(
+                            "Failed to persist OPEN Pond cell for {} ({} {} @ {:.4}, oid={}) after order fill: {e}",
+                            cand.symbol,
+                            cand.side,
+                            actual_qty,
+                            fill_px,
+                            fill.exchange_order_id
+                        ),
+                        Some(json!({
+                            "symbol": cand.symbol,
+                            "side": cand.side,
+                            "quantity": actual_qty,
+                            "entry_price": fill_px,
+                            "exchange_order_id": fill.exchange_order_id,
+                            "error": e.to_string(),
+                        })),
+                    );
+                    let _ = self.execution.alerts.notify_critical_event(
+                        "POND_CELL_UPSERT_FAILED_AFTER_ORDER",
+                        &format!(
+                            "Pond order for {} ({} {} @ {:.4}, oid={}) filled, but upsert_pond_cell failed: {e}",
+                            cand.symbol,
+                            cand.side,
+                            actual_qty,
+                            fill_px,
+                            fill.exchange_order_id
+                        ),
+                        Some(json!({
+                            "symbol": cand.symbol,
+                            "side": cand.side,
+                            "quantity": actual_qty,
+                            "entry_price": fill_px,
+                            "exchange_order_id": fill.exchange_order_id,
+                            "error": e.to_string(),
+                        })),
+                    );
+                    return Err(e);
+                }
+            };
+            if is_live_or_testnet && cfg.exchange_protective_stops_enabled {
+                if let Some(stop_px) = new_cell
+                    .chandelier_stop
+                    .or(new_cell.initial_stop)
+                    .filter(|&p| p > 0.0)
+                {
+                    let mut asset =
+                        self.execution.resolve_trade_asset(&cand.symbol, "", fill_px);
+                    asset.tick_size = cand.tick_size;
+                    asset.lot_step_size = cand.lot_step_size;
+                    if let Ok(Some(new_stop_oid)) = self
+                        .execution
+                        .submit_or_refresh_protective_stop_order(
+                            &asset,
+                            cand.side.as_str(),
+                            actual_qty,
+                            stop_px,
+                            None,
+                        )
+                    {
+                        let _ = self
+                            .scoped_db
+                            .set_pond_cell_protective_stop_oid(inserted_cell_id, Some(&new_stop_oid));
+                    }
+                }
             }
             entries_opened += 1;
             open_heat = round_dp(open_heat + cand.risk_budget_usdc, 2);
@@ -2336,7 +2551,10 @@ mod tests {
         let orch = PondOrchestrator::new(db.clone(), None);
         let _ = orch.initialize_or_refresh_universe().unwrap();
 
-        let base_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let anchor_13_ts = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000
+            - 2 * 3_600_000;
+        let anchor_14_ts = anchor_13_ts + 3_600_000;
+        let base_ts = anchor_13_ts - 180 * 3_600_000;
         let mut bars_1h: Vec<OhlcvBar> = (0..179)
             .map(|i| OhlcvBar {
                 symbol: "ETH/USDC:USDC".to_string(),
@@ -2355,7 +2573,7 @@ mod tests {
         bars_1h.push(OhlcvBar {
             symbol: "ETH/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_315_600_000,
+            timestamp_ms: anchor_13_ts,
             open: 2094.2,
             high: 2096.2,
             low: 1970.2,
@@ -2368,7 +2586,7 @@ mod tests {
         bars_1h.push(OhlcvBar {
             symbol: "ETH/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_319_200_000,
+            timestamp_ms: anchor_14_ts,
             open: 1992.9,
             high: 1993.0,
             low: 1988.9,
@@ -2386,6 +2604,16 @@ mod tests {
         );
         *orch.cycle_bars_cache.lock() = Some(cache);
 
+        let opened_at_iso = chrono::DateTime::from_timestamp_millis(
+            anchor_13_ts - 4 * 3_600_000 + 696_000,
+        )
+        .unwrap()
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+        let updated_at_iso = chrono::DateTime::from_timestamp_millis(anchor_13_ts + 304_000)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let cell = PondCell {
             cell_id: 0,
             symbol: "ETH/USDC:USDC".to_string(),
@@ -2411,10 +2639,10 @@ mod tests {
             exit_price: None,
             exit_reason: None,
             resting_order_id: None,
-            opened_at: Some("2026-11-10T09:11:36Z".to_string()),
+            opened_at: Some(opened_at_iso),
             closed_at: None,
             cooldown_until: None,
-            updated_at: "2026-11-10T13:05:04Z".to_string(),
+            updated_at: updated_at_iso,
         };
         let cid = orch.scoped_db.upsert_pond_cell(&cell).unwrap();
 
@@ -2442,7 +2670,10 @@ mod tests {
         let orch = PondOrchestrator::new(db.clone(), None);
         let _ = orch.initialize_or_refresh_universe().unwrap();
 
-        let base_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let rally_ts =
+            (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000 - 3_600_000;
+        let entry_ts = rally_ts - 3_600_000;
+        let base_ts = rally_ts - 180 * 3_600_000;
         let mut bars_1h: Vec<OhlcvBar> = (0..178)
             .map(|i| OhlcvBar {
                 symbol: "SOL/USDC:USDC".to_string(),
@@ -2461,7 +2692,7 @@ mod tests {
         bars_1h.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_312_000_000,
+            timestamp_ms: entry_ts,
             open: 100.0,
             high: 105.0,
             low: 99.0,
@@ -2474,7 +2705,7 @@ mod tests {
         bars_1h.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_315_600_000,
+            timestamp_ms: rally_ts,
             open: 104.0,
             high: 130.0,
             low: 124.0,
@@ -2492,6 +2723,10 @@ mod tests {
         );
         *orch.cycle_bars_cache.lock() = Some(cache);
 
+        let open_iso = chrono::DateTime::from_timestamp_millis(entry_ts)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let cell = PondCell {
             cell_id: 0,
             symbol: "SOL/USDC:USDC".to_string(),
@@ -2517,10 +2752,10 @@ mod tests {
             exit_price: None,
             exit_reason: None,
             resting_order_id: None,
-            opened_at: Some("2026-11-10T12:00:00Z".to_string()),
+            opened_at: Some(open_iso.clone()),
             closed_at: None,
             cooldown_until: None,
-            updated_at: "2026-11-10T12:00:00Z".to_string(),
+            updated_at: open_iso,
         };
         let cid = orch.scoped_db.upsert_pond_cell(&cell).unwrap();
 
@@ -2904,7 +3139,18 @@ mod tests {
         let orch = PondOrchestrator::new(db.clone(), None);
         let _ = orch.initialize_or_refresh_universe().unwrap();
 
-        let base_180_ts = 1_794_315_600_000i64 - 180 * 3_600_000;
+        let anchor_13_ts =
+            (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000 - 3_600_000;
+        let anchor_12_ts = anchor_13_ts - 3_600_000;
+        let anchor_12_iso = chrono::DateTime::from_timestamp_millis(anchor_12_ts)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let anchor_1339_iso = chrono::DateTime::from_timestamp_millis(anchor_13_ts + 2_347_000)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let base_180_ts = anchor_13_ts - 180 * 3_600_000;
         let mut bars_breached: Vec<OhlcvBar> = (0..178)
             .map(|i| OhlcvBar {
                 symbol: "SOL/USDC:USDC".to_string(),
@@ -2923,7 +3169,7 @@ mod tests {
         bars_breached.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_312_000_000,
+            timestamp_ms: anchor_12_ts,
             open: 100.0,
             high: 130.0,
             low: 85.0,
@@ -2936,7 +3182,7 @@ mod tests {
         bars_breached.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_315_600_000,
+            timestamp_ms: anchor_13_ts,
             open: 120.0,
             high: 128.0,
             low: 125.0,
@@ -2979,10 +3225,10 @@ mod tests {
             exit_price: None,
             exit_reason: None,
             resting_order_id: None,
-            opened_at: Some("2026-11-10T12:00:00Z".to_string()),
+            opened_at: Some(anchor_12_iso.clone()),
             closed_at: None,
             cooldown_until: None,
-            updated_at: "2026-11-10T12:00:00Z".to_string(),
+            updated_at: anchor_12_iso,
         };
         let cid_b = orch.scoped_db.upsert_pond_cell(&cell_breached).unwrap();
         // When breached_prev_stop is true (85.0 <= 95.0 - wick_buf), even though Chandelier ratchets on 4H close,
@@ -3022,7 +3268,7 @@ mod tests {
         bars_same_hour_beyond.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_315_600_000,
+            timestamp_ms: anchor_13_ts,
             open: 92.0,
             high: 100.4,
             low: 91.8,
@@ -3066,10 +3312,10 @@ mod tests {
             exit_price: None,
             exit_reason: None,
             resting_order_id: None,
-            opened_at: Some("2026-11-10T13:39:07Z".to_string()),
+            opened_at: Some(anchor_1339_iso.clone()),
             closed_at: None,
             cooldown_until: None,
-            updated_at: "2026-11-10T13:39:07Z".to_string(),
+            updated_at: anchor_1339_iso,
         };
         let cid_beyond = orch
             .scoped_db
@@ -3110,7 +3356,7 @@ mod tests {
         bars_same_hour_in_band.push(OhlcvBar {
             symbol: "SOL/USDC:USDC".to_string(),
             timeframe: "1h".to_string(),
-            timestamp_ms: 1_794_315_600_000,
+            timestamp_ms: anchor_13_ts,
             open: 92.0,
             high: 97.5,
             low: 86.5,
@@ -3346,5 +3592,232 @@ mod tests {
             "Under 10% cap, SHORT initial_stop must widen to uncapped 2.5*ATR = 109.0 (got {})",
             out_10pct.selected_entries[0].initial_stop_price
         );
+    }
+
+    #[test]
+    fn test_round14_sui_postmortem_4_improvements_and_review_fixes() {
+        let univ_sui = PondUniverseRow {
+            symbol: "SUI/USDC:USDC".to_string(),
+            rank: 7,
+            median_daily_volume_usdc: 450_000.0,
+            tick_size: 0.0001,
+            lot_step_size: 0.1,
+            min_notional_usdc: 10.0,
+            max_leverage: 5.0,
+            reference_price: 0.90,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        };
+        let bars_1h = make_test_bars("SUI/USDC:USDC", "1h", 180, 0.90);
+        let bars_4h = make_test_bars("SUI/USDC:USDC", "4h", 65, 0.90);
+
+        // 1. Improvement 1 (Gate 3): SUI Cell #24 (0.000017) & Cell #13 (0.000033) rejected below 0.000050 floor
+        let mut f_cell24 = vec![0.000005; 179];
+        f_cell24.push(0.000017);
+        let input_cell24 = PondAssetScanInput {
+            universe_row: univ_sui.clone(),
+            funding_series_168h: f_cell24.clone(),
+            bars_1h: bars_1h.clone(),
+            bars_4h: bars_4h.clone(),
+            tick_size: 0.0001,
+            lot_step_size: 0.1,
+        };
+        let default_params = PondScannerParams::default();
+        assert_eq!(
+            crate::scanner::evaluate_asset_gates_1_to_6(
+                &input_cell24,
+                &default_params,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            "GATE3_FUNDING_BELOW_ABS_FLOOR"
+        );
+
+        // 2. Improvement 2 (Gate 4): Even with custom lower min_funding_abs=0.000015, quiet std=0.000005
+        // does not inflate r_t=0.000017 or r_t=0.000033 past z >= 2.2 due to std_floor
+        let low_floor_params = PondScannerParams {
+            min_funding_abs: 0.000015,
+            z_entry_threshold: 2.2,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::scanner::evaluate_asset_gates_1_to_6(
+                &input_cell24,
+                &low_floor_params,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            "GATE4_Z_SCORE_BELOW_THRESHOLD"
+        );
+
+        // 3. Improvement 1b (Gate 3 2h persistence): 1-hour transient spike rejected when require_2h_funding_persistence=true
+        let mut f_1h_transient = vec![0.000005; 179];
+        f_1h_transient.push(0.000090);
+        let input_transient = PondAssetScanInput {
+            funding_series_168h: f_1h_transient,
+            ..input_cell24.clone()
+        };
+        let persist_params = PondScannerParams {
+            require_2h_funding_persistence: true,
+            z_entry_threshold: 2.2,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::scanner::evaluate_asset_gates_1_to_6(
+                &input_transient,
+                &persist_params,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            "GATE3_FUNDING_NOT_PERSISTENT_2H"
+        );
+        // 2-hour persistent spike passes Gate 3 & Gate 4
+        let mut f_2h_persist = vec![0.000005; 178];
+        f_2h_persist.push(0.000065);
+        f_2h_persist.push(0.000090);
+        let input_persist = PondAssetScanInput {
+            funding_series_168h: f_2h_persist.clone(),
+            ..input_cell24.clone()
+        };
+        assert!(crate::scanner::evaluate_asset_gates_1_to_6(
+            &input_persist,
+            &persist_params,
+            &HashSet::new()
+        )
+        .is_ok());
+
+        // 4. Improvement 3 (Gate 6 two-sided structural exhaustion veto):
+        // Oversold 4H bottom blocks SHORT with GATE6_4H_OVERSOLD_BOTTOM_VETO
+        let mut oversold_4h = bars_4h.clone();
+        if let Some(last) = oversold_4h.last_mut() {
+            last.close = 0.78; // >8% below EMA_64 (~0.90)
+            last.low = 0.77;
+        }
+        let input_oversold_short = PondAssetScanInput {
+            bars_4h: oversold_4h,
+            ..input_persist.clone()
+        };
+        assert_eq!(
+            crate::scanner::evaluate_asset_gates_1_to_6(
+                &input_oversold_short,
+                &persist_params,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            "GATE6_4H_OVERSOLD_BOTTOM_VETO"
+        );
+
+        // Overbought 4H top blocks LONG with GATE6_4H_OVERBOUGHT_TOP_VETO
+        let mut f_neg_2h = vec![-0.000005; 178];
+        f_neg_2h.push(-0.000065);
+        f_neg_2h.push(-0.000090);
+        let mut overbought_4h = bars_4h.clone();
+        if let Some(last) = overbought_4h.last_mut() {
+            last.close = 1.02; // >8% above EMA_64 (~0.90)
+            last.high = 1.03;
+        }
+        let input_overbought_long = PondAssetScanInput {
+            funding_series_168h: f_neg_2h,
+            bars_4h: overbought_4h,
+            ..input_cell24
+        };
+        assert_eq!(
+            crate::scanner::evaluate_asset_gates_1_to_6(
+                &input_overbought_long,
+                &persist_params,
+                &HashSet::new()
+            )
+            .unwrap_err(),
+            "GATE6_4H_OVERBOUGHT_TOP_VETO"
+        );
+
+        // 5. Improvement 4 (Tier 3 min-hold & net-PnL guard):
+        let sui_cell = PondCell {
+            cell_id: 13,
+            symbol: "SUI/USDC:USDC".to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: Some(1),
+            side: "SHORT".to_string(),
+            option_analogue: "SHORT_CALL".to_string(),
+            entry_price: Some(0.9001),
+            quantity: Some(1388.8),
+            notional_usdc: Some(1250.06),
+            risk_budget_usdc: Some(46.5),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(2.65),
+            funding_rate_entry: Some(0.000033),
+            initial_stop: Some(0.9336),
+            chandelier_stop: Some(0.9500),
+            highest_price_seen: Some(0.9130),
+            lowest_price_seen: Some(0.9001),
+            funding_accrued_usdc: 0.0176,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.1875,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some("2026-04-02T17:44:05Z".to_string()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: "2026-04-02T18:45:00Z".to_string(),
+        };
+        // At hold_hours=1.0 (< 6.0) and net_pnl_usdc=-18.29 (<= 0.0), Tier 3 MUST NOT fire
+        let d_blocked = evaluate_exit_priority(
+            &sui_cell,
+            &CellExitEvalInput {
+                mark_price: 0.9130,
+                intrabar_high: 0.9130,
+                intrabar_low: 0.9001,
+                is_1h_boundary: true,
+                current_funding_z: 0.20,
+                hold_hours: 1.0,
+                min_norm_hold_hours: 6.0,
+                net_pnl_usdc: -18.29,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !d_blocked.should_exit,
+            "Tier 3 must not close a 1h-old cell at a net loss on funding z-score normalisation"
+        );
+        // At hold_hours=1.5 (< 6.0) with positive net_pnl_usdc=+2.10 (> 0.0), Tier 3 harvests profit
+        let d_profit = evaluate_exit_priority(
+            &sui_cell,
+            &CellExitEvalInput {
+                mark_price: 0.8980,
+                intrabar_high: 0.9001,
+                intrabar_low: 0.8980,
+                is_1h_boundary: true,
+                current_funding_z: 0.20,
+                hold_hours: 1.5,
+                min_norm_hold_hours: 6.0,
+                net_pnl_usdc: 2.10,
+                ..Default::default()
+            },
+        );
+        assert!(d_profit.should_exit);
+        assert_eq!(d_profit.tier, Some(3));
+        // At hold_hours=6.5 (>= 6.0), Tier 3 is allowed even if net_pnl_usdc <= 0.0
+        let d_mature = evaluate_exit_priority(
+            &sui_cell,
+            &CellExitEvalInput {
+                mark_price: 0.9050,
+                intrabar_high: 0.9050,
+                intrabar_low: 0.9001,
+                is_1h_boundary: true,
+                current_funding_z: 0.20,
+                hold_hours: 6.5,
+                min_norm_hold_hours: 6.0,
+                net_pnl_usdc: -3.50,
+                ..Default::default()
+            },
+        );
+        assert!(d_mature.should_exit);
+        assert_eq!(d_mature.tier, Some(3));
     }
 }

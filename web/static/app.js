@@ -310,6 +310,8 @@ document.addEventListener('DOMContentLoaded', () => {
   bindClick('btn-settle-live', () => triggerSettleRun(false));
   bindClick('btn-calibrate', triggerCalibration);
   bindClick('btn-backtest', triggerBacktest);
+  bindClick('btn-backup-db', triggerDbBackup);
+  bindClick('btn-backup-db-settings', triggerDbBackup);
   bindClick('btn-auth-login', submitAuthLogin);
   bindClick('btn-close-report', () => {
     const rp = document.getElementById('report-panel');
@@ -1291,20 +1293,132 @@ async function triggerPondScan() {
 }
 
 async function triggerSettleRun(dryRun) {
-  const btn = document.getElementById('btn-settle-dry');
-  if (btn) { btn.disabled = true; btn.textContent = 'Settling...'; }
+  const isDry = Boolean(dryRun);
+  if (!isDry) {
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.confirm === 'function' &&
+      !window.confirm('Execute LIVE 50/50 capital settling across Pit (Book A) and Pond (Book B)?')
+    ) {
+      return;
+    }
+  }
+  const btn = document.getElementById(isDry ? 'btn-settle-dry' : 'btn-settle-live');
+  if (btn) {
+    btn.setAttribute('aria-disabled', 'true');
+    btn.textContent = 'Settling...';
+  }
   try {
+    const payload = isDry
+      ? { dry_run: true }
+      : { dry_run: false, confirm_live_settle: 'CONFIRM_LIVE_SETTLE' };
     const res = await apiFetch('/api/v1/settle/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dry_run: Boolean(dryRun) })
+      body: JSON.stringify(payload)
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert('Settle run failed: ' + (data.detail || data.error || res.statusText));
+      return;
+    }
     if (data.dashboard) renderDashboard(data.dashboard);
   } finally {
     if (btn) {
-      btn.disabled = false;
-      btn.textContent = `Dry-Run ${formatUtcTimeOfDayToLocal(latestSettlingTimeUtc)} Settle`;
+      btn.removeAttribute('aria-disabled');
+      btn.textContent = isDry
+        ? `Dry-Run ${formatUtcTimeOfDayToLocal(latestSettlingTimeUtc)} Settle`
+        : 'Execute Live Settle';
+    }
+  }
+}
+
+let dbBackupInFlight = false;
+async function triggerDbBackup() {
+  if (dbBackupInFlight) return;
+  dbBackupInFlight = true;
+  const hdrBtn = document.getElementById('btn-backup-db');
+  const setBtn = document.getElementById('btn-backup-db-settings');
+  const statusEl = document.getElementById('db-backup-status');
+  const settingsBadgeEl = document.getElementById('db-backup-settings-badge');
+  const settingsDetailEl = document.getElementById('db-backup-settings-detail');
+  if (hdrBtn) {
+    hdrBtn.setAttribute('aria-disabled', 'true');
+    hdrBtn.textContent = 'Backing up DB...';
+  }
+  if (setBtn) {
+    setBtn.setAttribute('aria-disabled', 'true');
+    setBtn.textContent = 'Backing up...';
+  }
+  try {
+    const res = await apiFetch('/api/v1/db/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'dashboard_manual' })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const errMsg = data.detail || data.error || res.statusText || 'Backup failed';
+      if (statusEl) {
+        statusEl.style.display = 'inline-block';
+        statusEl.className = 'badge badge-bear';
+        statusEl.textContent = `BACKUP ERR: ${errMsg}`;
+      }
+      if (settingsBadgeEl) {
+        settingsBadgeEl.className = 'badge badge-bear';
+        settingsBadgeEl.textContent = 'BACKUP FAILED';
+      }
+      if (settingsDetailEl) {
+        settingsDetailEl.textContent = `Backup error: ${errMsg}`;
+      }
+      return;
+    }
+    const b = data.backup || {};
+    const fullPath = String(b.backup_path || '');
+    const fileName = fullPath.split(/[\\/]/).pop() || fullPath || 'snapshot.db';
+    const sizeKb = ((Number(b.size_bytes || 0)) / 1024).toFixed(1);
+    const retained = Number(b.retained_count || 1);
+    if (statusEl) {
+      statusEl.style.display = 'inline-block';
+      statusEl.className = 'badge badge-bull';
+      statusEl.textContent = `BACKUP OK: ${sizeKb} KB (${retained} kept)`;
+      statusEl.title = fullPath;
+    }
+    if (settingsBadgeEl) {
+      settingsBadgeEl.className = 'badge badge-bull';
+      settingsBadgeEl.textContent = `OK (${sizeKb} KB)`;
+    }
+    if (settingsDetailEl) {
+      settingsDetailEl.textContent = `Saved ${fileName} (${sizeKb} KB, ${retained} backups retained, ${Number(b.pruned_count || 0)} pruned)`;
+    }
+    if (data.dashboard) {
+      renderDashboard(data.dashboard);
+    } else {
+      await fetchInitialDashboard();
+    }
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (statusEl) {
+      statusEl.style.display = 'inline-block';
+      statusEl.className = 'badge badge-bear';
+      statusEl.textContent = 'BACKUP ERR';
+    }
+    if (settingsBadgeEl) {
+      settingsBadgeEl.className = 'badge badge-bear';
+      settingsBadgeEl.textContent = 'BACKUP FAILED';
+    }
+    if (settingsDetailEl) {
+      settingsDetailEl.textContent = `Backup error: ${msg}`;
+    }
+  } finally {
+    dbBackupInFlight = false;
+    if (hdrBtn) {
+      hdrBtn.removeAttribute('aria-disabled');
+      hdrBtn.textContent = 'Backup DB';
+    }
+    if (setBtn) {
+      setBtn.removeAttribute('aria-disabled');
+      setBtn.textContent = 'Backup Database Now';
     }
   }
 }

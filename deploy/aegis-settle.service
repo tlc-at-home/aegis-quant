@@ -10,7 +10,7 @@ Group=fedora
 WorkingDirectory=/home/fedora/aegis
 Environment="RUST_LOG=info"
 LoadCredential=aegis_master_key:/home/fedora/aegis/data/.aegis_master_key
-ExecStart=/home/fedora/aegis/bin/aegis-quant settle --execute
+ExecStart=/home/fedora/aegis/bin/aegis-quant settle --db /home/fedora/aegis/data/aegis_quant.db
 StandardOutput=journal
 StandardError=journal
 

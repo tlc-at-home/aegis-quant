@@ -138,11 +138,26 @@ impl ExecutionEngine {
             )
             .max(1);
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
 
         let now_ms = evaluations
             .first()
             .map(|e| e.timestamp_ms)
             .unwrap_or_else(|| self.db.now_ms());
+
+        if !is_backtest {
+            let mut cd_map = self.stop_cooldown_until_ms.lock();
+            if cd_map.is_empty() {
+                let raw = cfg.get_str("pit_stop_cooldowns_json", "{}");
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, i64>>(&raw) {
+                    for (sym, until_ms) in parsed {
+                        if until_ms > now_ms {
+                            cd_map.insert(sym, until_ms);
+                        }
+                    }
+                }
+            }
+        }
 
         let _ = self.sync_funding_payments(Some(now_ms), is_backtest);
 
@@ -207,13 +222,53 @@ impl ExecutionEngine {
                 continue;
             }
             let last_bar = &bars[bars.len() - 1];
-            if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && last_bar.is_synthetic != 0 {
-                tracing::warn!(
-                    "Skipping stop/exit evaluation for {} on synthetic bar (ts={})",
-                    trade.symbol,
-                    last_bar.timestamp_ms
-                );
-                continue;
+            if (mode == "LIVE" || mode == "TESTNET") && !is_backtest {
+                if last_bar.is_synthetic != 0 {
+                    tracing::warn!(
+                        "Skipping stop/exit evaluation for {} on synthetic bar (ts={})",
+                        trade.symbol,
+                        last_bar.timestamp_ms
+                    );
+                    let _ = self.db.log_telemetry(
+                        "WARN",
+                        "engine.execution",
+                        &format!(
+                            "PIT_STALE_BAR_STOP_EVAL_SKIPPED: synthetic bar for {} (ts={})",
+                            trade.symbol, last_bar.timestamp_ms
+                        ),
+                        Some(json!({
+                            "event": "PIT_STALE_BAR_STOP_EVAL_SKIPPED",
+                            "symbol": trade.symbol,
+                            "timestamp_ms": last_bar.timestamp_ms,
+                            "is_synthetic": last_bar.is_synthetic,
+                        })),
+                    );
+                    continue;
+                }
+                if now_ms.saturating_sub(last_bar.timestamp_ms) > max_staleness_ms {
+                    let age_ms = now_ms.saturating_sub(last_bar.timestamp_ms);
+                    tracing::warn!(
+                        symbol = %trade.symbol,
+                        age_ms = age_ms,
+                        max_staleness_ms = max_staleness_ms,
+                        "Skipping Book A stop/exit evaluation on stale bar in LIVE/TESTNET mode (HI-2)"
+                    );
+                    let _ = self.db.log_telemetry(
+                        "WARN",
+                        "engine.execution",
+                        &format!(
+                            "PIT_STALE_BAR_STOP_EVAL_SKIPPED: stale bar for {} (age_ms={} > max_staleness_ms={})",
+                            trade.symbol, age_ms, max_staleness_ms
+                        ),
+                        Some(json!({
+                            "event": "PIT_STALE_BAR_STOP_EVAL_SKIPPED",
+                            "symbol": trade.symbol,
+                            "age_ms": age_ms,
+                            "max_staleness_ms": max_staleness_ms,
+                        })),
+                    );
+                    continue;
+                }
             }
             let atr_period = cfg
                 .get_usize("atr_period", cfg.get_usize("atr_default_period", 14))
@@ -355,27 +410,60 @@ impl ExecutionEngine {
                         && exec_close.avg_fill_price > 0.0
                     {
                         if exec_close.filled_units + 1e-8 < trade.quantity.abs() {
-                            // Partial live exit fill (`NH-8`): reduce open trade and keep remaining units open
-                            let remaining_qty =
-                                (trade.quantity.abs() - exec_close.filled_units).max(0.0);
+                            // Partial live exit fill (`NH-8`, `HI-7`): floor remainder to lot_step_size
+                            let step = asset.lot_step_size.max(1e-6);
+                            let remaining_qty = RiskEngine::round_step(
+                                (trade.quantity.abs() - exec_close.filled_units).max(0.0),
+                                step,
+                                true,
+                            );
                             let remaining_notional = round_dp(remaining_qty * trade.entry_price, 4);
-                            let partial_gross_pnl = if trade.side == "LONG" {
-                                (exec_close.avg_fill_price - trade.entry_price)
-                                    * exec_close.filled_units
-                            } else {
-                                (trade.entry_price - exec_close.avg_fill_price)
-                                    * exec_close.filled_units
-                            };
-                            self.db.reduce_open_trade_partial_exit(
-                                trade.trade_id,
-                                remaining_qty,
-                                remaining_notional,
-                                round_dp(partial_gross_pnl, 4),
-                                round_dp(exec_close.fees_paid_usdc, 4),
-                                round_dp(exec_close.slippage_paid_usd, 4),
-                                last_bar.close,
-                            )?;
-                            continue;
+                            if remaining_qty >= step
+                                && remaining_notional >= asset.min_notional_usdc.max(10.0)
+                            {
+                                let partial_gross_pnl = if trade.side == "LONG" {
+                                    (exec_close.avg_fill_price - trade.entry_price)
+                                        * exec_close.filled_units
+                                } else {
+                                    (trade.entry_price - exec_close.avg_fill_price)
+                                        * exec_close.filled_units
+                                };
+                                self.db.reduce_open_trade_partial_exit(
+                                    trade.trade_id,
+                                    remaining_qty,
+                                    remaining_notional,
+                                    round_dp(partial_gross_pnl, 4),
+                                    round_dp(exec_close.fees_paid_usdc, 4),
+                                    round_dp(exec_close.slippage_paid_usd, 4),
+                                    last_bar.close,
+                                )?;
+                                if cfg.get_bool(
+                                    "exchange_protective_stops_enabled",
+                                    cfg.get_bool("enable_exchange_trigger_stops", true),
+                                ) && stop_eval.chandelier_stop_price > 0.0
+                                {
+                                    let existing_stop_oid = self
+                                        .db
+                                        .get_trade_protective_stop_oid(trade.trade_id)
+                                        .ok()
+                                        .flatten();
+                                    if let Ok(Some(new_stop_oid)) = self
+                                        .submit_or_refresh_protective_stop_order(
+                                            asset,
+                                            &trade.side,
+                                            remaining_qty,
+                                            stop_eval.chandelier_stop_price,
+                                            existing_stop_oid.as_deref(),
+                                        )
+                                    {
+                                        let _ = self.db.set_trade_protective_stop_oid(
+                                            trade.trade_id,
+                                            Some(&new_stop_oid),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                         }
                         actual_exit_px = exec_close.avg_fill_price;
                         actual_fees =
@@ -427,6 +515,14 @@ impl ExecutionEngine {
                     4,
                 );
                 // R8-N4: Check bool returned by close_trade; if already closed concurrently, skip cooldown & duplicate alert
+                let existing_stop_oid = if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && !is_paper_trade {
+                    self.db
+                        .get_trade_protective_stop_oid(trade.trade_id)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
                 let closed = self.db.close_trade(
                     trade.trade_id,
                     actual_exit_px,
@@ -437,15 +533,28 @@ impl ExecutionEngine {
                 if !closed {
                     continue;
                 }
+                if let Some(ref stop_oid) = existing_stop_oid {
+                    let _ = self.cancel_resting_order(&trade.symbol, stop_oid);
+                    let _ = self.db.set_trade_protective_stop_oid(trade.trade_id, None);
+                }
                 if stop_eval.triggered {
                     let tf_ms = match asset.exec_timeframe.as_str() {
                         "1h" => 3_600_000,
                         "2h" => 7_200_000,
                         _ => 14_400_000,
                     };
-                    self.stop_cooldown_until_ms
-                        .lock()
-                        .insert(trade.symbol.clone(), now_ms + cooldown_bars * tf_ms);
+                    {
+                        let mut guard = self.stop_cooldown_until_ms.lock();
+                        guard.insert(trade.symbol.clone(), now_ms + cooldown_bars * tf_ms);
+                        guard.retain(|_, &mut until| until > now_ms);
+                        if !is_backtest {
+                            if let Ok(serialized) = serde_json::to_string(&*guard) {
+                                let _ = self
+                                    .db
+                                    .set_config_value("pit_stop_cooldowns_json", &json!(serialized));
+                            }
+                        }
+                    }
                     if !is_backtest {
                         let _ = self.alerts.notify_stop_out(
                             &trade.symbol,
@@ -472,6 +581,31 @@ impl ExecutionEngine {
                     round_dp(upnl, 4),
                     trade.funding_accrued_usdc,
                 )?;
+                if !is_backtest
+                    && (mode == "LIVE" || mode == "TESTNET")
+                    && cfg.get_bool(
+                        "exchange_protective_stops_enabled",
+                        cfg.get_bool("enable_exchange_trigger_stops", true),
+                    )
+                    && (stop_eval.chandelier_stop_price - trade.chandelier_stop_price).abs() > 1e-8
+                {
+                    let existing_stop_oid = self
+                        .db
+                        .get_trade_protective_stop_oid(trade.trade_id)
+                        .ok()
+                        .flatten();
+                    if let Ok(Some(new_stop_oid)) = self.submit_or_refresh_protective_stop_order(
+                        asset,
+                        &trade.side,
+                        trade.quantity.abs(),
+                        stop_eval.chandelier_stop_price,
+                        existing_stop_oid.as_deref(),
+                    ) {
+                        let _ = self
+                            .db
+                            .set_trade_protective_stop_oid(trade.trade_id, Some(&new_stop_oid));
+                    }
+                }
             }
         }
 
@@ -596,6 +730,43 @@ impl ExecutionEngine {
                     continue;
                 }
                 let last_bar = &bars[bars.len() - 1];
+                if !is_backtest && (mode == "LIVE" || mode == "TESTNET") {
+                    let tf_ms = match asset.exec_timeframe.as_str() {
+                        "1h" => 3_600_000i64,
+                        "2h" => 7_200_000i64,
+                        _ => 14_400_000i64,
+                    };
+                    let max_staleness_ms = tf_ms * 2 + 120_000;
+                    if last_bar.is_synthetic != 0
+                        || now_ms.saturating_sub(last_bar.timestamp_ms) > max_staleness_ms
+                    {
+                        tracing::warn!(
+                            symbol = %asset.symbol,
+                            last_bar_ts_ms = last_bar.timestamp_ms,
+                            is_synthetic = last_bar.is_synthetic,
+                            now_ms = now_ms,
+                            "Skipping Book A entry on stale or synthetic OHLCV bar in LIVE/TESTNET (HI-3)"
+                        );
+                        let _ = self.db.log_telemetry(
+                            "WARN",
+                            "engine.execution",
+                            &format!(
+                                "PIT_SYNTHETIC_OR_STALE_BAR_ENTRY_SKIPPED: {} (is_synthetic={}, age_ms={})",
+                                asset.symbol,
+                                last_bar.is_synthetic,
+                                now_ms.saturating_sub(last_bar.timestamp_ms)
+                            ),
+                            Some(json!({
+                                "event": "PIT_SYNTHETIC_OR_STALE_BAR_ENTRY_SKIPPED",
+                                "symbol": asset.symbol,
+                                "is_synthetic": last_bar.is_synthetic,
+                                "age_ms": now_ms.saturating_sub(last_bar.timestamp_ms),
+                                "max_staleness_ms": max_staleness_ms,
+                            })),
+                        );
+                        continue;
+                    }
+                }
                 let atr = self.risk.compute_atr(&bars, atr_period);
 
                 let mut sizing = self.risk.evaluate_order_risk(
@@ -647,7 +818,8 @@ impl ExecutionEngine {
                     false,
                 );
                 let is_filled = exec_res.fsm_state == "FILLED" && exec_res.filled_units > 0.0;
-                let is_open_book = exec_res.fsm_state == "OPEN_ON_BOOK";
+                let is_open_book = exec_res.fsm_state == "OPEN_ON_BOOK"
+                    || exec_res.fsm_state == "AMBIGUOUS_POST_SEND";
                 if !is_filled && !is_open_book {
                     continue;
                 }
@@ -668,6 +840,11 @@ impl ExecutionEngine {
                 } else {
                     "PENDING".to_string()
                 };
+                let db_fsm_state = if is_filled {
+                    "FILLED".to_string()
+                } else {
+                    "OPEN_ON_BOOK".to_string()
+                };
                 let new_trade = TradeRecord {
                     trade_id: 0,
                     client_order_id: exec_res.client_order_id,
@@ -675,7 +852,7 @@ impl ExecutionEngine {
                     base_asset: asset.base_asset.clone(),
                     side: ev.signal_action.clone(),
                     status: trade_status,
-                    fsm_state: exec_res.fsm_state.clone(),
+                    fsm_state: db_fsm_state,
                     entry_price: fill_px,
                     current_price: fill_px,
                     exit_price: None,
@@ -814,6 +991,25 @@ impl ExecutionEngine {
                 };
                 let mut inserted = new_trade;
                 inserted.trade_id = tid;
+                if is_filled
+                    && !is_backtest
+                    && (mode == "LIVE" || mode == "TESTNET")
+                    && cfg.get_bool(
+                        "exchange_protective_stops_enabled",
+                        cfg.get_bool("enable_exchange_trigger_stops", true),
+                    )
+                    && inserted.chandelier_stop_price > 0.0
+                {
+                    if let Ok(Some(new_stop_oid)) = self.submit_or_refresh_protective_stop_order(
+                        asset,
+                        &inserted.side,
+                        inserted.quantity.abs(),
+                        inserted.chandelier_stop_price,
+                        None,
+                    ) {
+                        let _ = self.db.set_trade_protective_stop_oid(tid, Some(&new_stop_oid));
+                    }
+                }
                 open_symbols.insert(asset.symbol.clone());
                 total_wallet_deployed = round_dp(total_wallet_deployed + filled_notional, 2);
                 if is_filled {

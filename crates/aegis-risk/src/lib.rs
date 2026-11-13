@@ -2,9 +2,9 @@
 //!
 //! 1:1 port of `engine/risk.py`:
 //! - Conviction-scaled position sizing (`0.50%` to `1.50%` equity risk per trade)
-//! - Two-Tier Chandelier Stop evaluation (Tier 1 Intrabar Wick with `0.85x` ATR buffer,
-//!   Tier 2 Confirmed Bar-Close ratchet with `3.0x`/`3.8x` ATR and short profit-lock)
-//! - Portfolio heat cap (`4%`), single-asset cap (`25%`), and gross leverage cap (`1.5x`)
+//! - Two-Tier Chandelier Stop evaluation (Tier 1 Intrabar Wick with `0.35x` ATR buffer,
+//!   Tier 2 Confirmed Bar-Close ratchet with `2.2x`/`2.6x` ATR and break-even profit-lock)
+//! - Portfolio heat cap (`6%`), single-asset cap (`25%`), correlation-cluster cap (`35%`), and gross leverage cap (`2.0x`)
 //! - Lot-step and tick-size rounding delegated to `aegis-core`
 
 use aegis_core::{
@@ -484,6 +484,24 @@ impl RiskEngine {
         }
     }
 
+    /// Maps a base asset ticker to its correlation cluster (`ME-3`, matching Book B Pond clusters).
+    pub fn correlation_cluster_for_base_asset(base_asset: &str) -> &'static str {
+        let base = base_asset
+            .split('/')
+            .next()
+            .unwrap_or(base_asset)
+            .trim()
+            .to_ascii_uppercase();
+        match base.as_str() {
+            "BTC" | "ETH" => "L1_MAJORS",
+            "SOL" | "JUP" | "WIF" | "BONK" | "PYTH" => "SOL_ECOSYSTEM",
+            "AVAX" | "SUI" | "APT" | "SEI" | "TIA" | "NEAR" | "ARB" | "OP" => "EVM_ALT_L1",
+            "FET" | "RENDER" | "TAO" | "RNDR" | "WLD" => "AI_DEPIN",
+            "DOGE" | "PEPE" | "SHIB" | "FLOKI" => "MEME_BETA",
+            _ => "OTHER",
+        }
+    }
+
     /// Evaluates whether a proposed order satisfies all institutional risk guardrails.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_order_risk(
@@ -523,9 +541,14 @@ impl RiskEngine {
         let max_single_notional = Usdc(
             cfg.get_f64("max_single_asset_notional_usdc", ref_equity * 0.25) * equity_scale,
         );
+        let max_cluster_pct = cfg
+            .get_f64("max_correlation_cluster_pct", 0.35)
+            .clamp(0.10, 1.0);
+        let max_cluster_notional = Usdc(ref_equity * max_cluster_pct * equity_scale);
         let max_gross_notional = Usdc(
             cfg.get_f64("max_gross_leverage_notional_usdc", ref_equity * 1.50) * equity_scale,
         );
+        let target_cluster = Self::correlation_cluster_for_base_asset(&asset.base_asset);
 
         let mult_long = cfg.get_f64(
             "chandelier_atr_multiplier_long",
@@ -559,6 +582,7 @@ impl RiskEngine {
         let mut current_heat_usdc = Usdc::ZERO;
         let mut current_gross_notional_usdc = Usdc(basis_harvest_notional_usdc.max(0.0));
         let mut existing_asset_notional_usdc = Usdc::ZERO;
+        let mut existing_cluster_notional_usdc = Usdc::ZERO;
 
         for t in active_trades {
             // NH-4: Unfilled resting limit orders (`OPEN_ON_BOOK` with zero filled units or `PENDING`)
@@ -585,6 +609,11 @@ impl RiskEngine {
             current_heat_usdc += t_risk;
             if t.symbol == asset.symbol || t.base_asset == asset.base_asset {
                 existing_asset_notional_usdc += t_notional;
+            }
+            if target_cluster != "OTHER"
+                && Self::correlation_cluster_for_base_asset(&t.base_asset) == target_cluster
+            {
+                existing_cluster_notional_usdc += t_notional;
             }
         }
 
@@ -652,6 +681,31 @@ impl RiskEngine {
             };
         }
 
+        let remaining_cluster_notional = if target_cluster != "OTHER" {
+            max_cluster_notional - existing_cluster_notional_usdc
+        } else {
+            max_gross_notional
+        };
+        if remaining_cluster_notional < min_notional {
+            return PositionSizeResult {
+                approved: false,
+                reason: format!(
+                    "CORRELATION_CLUSTER_CAP_EXCEEDED ({target_cluster}): existing_cluster_notional={:.2} >= max_cluster={:.2}",
+                    existing_cluster_notional_usdc.as_f64(),
+                    max_cluster_notional.as_f64()
+                ),
+                symbol: asset.symbol.clone(),
+                side: side.to_string(),
+                entry_price: entry_px.as_f64(),
+                quantity: 0.0,
+                notional_usdc: 0.0,
+                risk_budget_usdc: 0.0,
+                conviction_multiplier: conviction_mult,
+                initial_stop_price: entry_px.as_f64(),
+                atr_value,
+            };
+        }
+
         let effective_atr = atr_value.max(entry_px.as_f64() * min_atr_pct).max(1e-8);
         let raw_stop_dist = chandelier_mult * effective_atr;
         let stop_price = Price(if side == "LONG" {
@@ -669,7 +723,9 @@ impl RiskEngine {
         let allowed_risk_usdc = max_risk_per_trade.min(remaining_heat);
         let size_by_risk = allowed_risk_usdc.as_f64() / stop_distance;
 
-        let allowed_notional_usdc = remaining_asset_notional.min(remaining_gross);
+        let allowed_notional_usdc = remaining_asset_notional
+            .min(remaining_cluster_notional)
+            .min(remaining_gross);
         let size_by_notional = allowed_notional_usdc.as_f64() / entry_px.as_f64().max(1e-8);
 
         let raw_size = size_by_risk.min(size_by_notional);
@@ -1088,5 +1144,60 @@ mod tests {
             "At exact 1.0x ATR excursion (102.0), tight-trail must activate (~101.18), got {}",
             boundary_long.chandelier_stop_price
         );
+    }
+
+    #[test]
+    fn test_me3_correlation_cluster_cap_enforcement() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let risk = RiskEngine::new(db.clone());
+        let assets = db.get_usdc_perp_universe().unwrap();
+        let sui = assets.iter().find(|a| a.symbol == "SUI/USDC:USDC").unwrap();
+
+        // Book equity = $5,000 -> 35% cluster cap = $1,750 across EVM_ALT_L1 (AVAX, SUI, APT, etc.)
+        let open_avax = TradeRecord {
+            trade_id: 1,
+            client_order_id: "avax-1".to_string(),
+            symbol: "AVAX/USDC:USDC".to_string(),
+            base_asset: "AVAX".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 25.0,
+            current_price: 25.0,
+            exit_price: None,
+            quantity: 70.0, // $1,750 notional (hits 35% EVM_ALT_L1 cluster cap)
+            filled_units: 70.0,
+            avg_fill_price: Some(25.0),
+            notional_usdc: 1_750.0,
+            risk_budget_usdc: 50.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 24.3,
+            chandelier_stop_price: 24.3,
+            current_stop_price: 24.3,
+            highest_price_seen: 25.0,
+            lowest_price_seen: 25.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("oid-avax".to_string()),
+            opened_at: String::new(),
+            closed_at: None,
+            exit_reason: None,
+        };
+        let sized = risk.evaluate_order_risk(
+            sui,
+            "LONG",
+            2.0,
+            0.05,
+            5_000.0,
+            Some(&[open_avax]),
+            0.8,
+            0.0,
+        );
+        assert!(!sized.approved);
+        assert!(sized.reason.contains("CORRELATION_CLUSTER_CAP_EXCEEDED"));
     }
 }

@@ -692,7 +692,20 @@ impl SignalEngine {
                 if let Some(hmm) = &cache.hmm {
                     let base_alpha = cache.alpha_prev.as_ref().or(cache.alpha.as_ref());
                     let prev_close = cache.prev_close.max(1e-8);
-                    let raw_r = (tick_px.max(1e-8) / prev_close).ln();
+                    let bar_dur_ms = if n_bars >= 2 {
+                        (btc_bars[n_bars - 1].timestamp_ms - btc_bars[n_bars - 2].timestamp_ms)
+                            .max(3_600_000) as f64
+                    } else {
+                        14_400_000.0
+                    };
+                    let elapsed_ms = (self.db.now_ms() - last_bar_ts).max(0) as f64;
+                    let elapsed_frac = if elapsed_ms > 0.0 && elapsed_ms <= bar_dur_ms {
+                        (elapsed_ms / bar_dur_ms).clamp(0.15, 1.0)
+                    } else {
+                        1.0
+                    };
+                    // ME-20: Scale intrabar partial-bar log return by sqrt(elapsed_frac) to match 4H emission variance
+                    let raw_r = (tick_px.max(1e-8) / prev_close).ln() * elapsed_frac.sqrt();
                     let alpha_f = 2.0 / (span_r_fast + 1.0);
                     let alpha_s = 2.0 / (span_r_slow + 1.0);
                     let ema_r_f = alpha_f * raw_r + (1.0 - alpha_f) * cache.prev_ema_r_fast;
@@ -700,7 +713,14 @@ impl SignalEngine {
                     let smooth_r = scfg.hmm_ret_fast_weight * ema_r_f
                         + scfg.hmm_ret_slow_weight * ema_r_s;
                     let r_z = ((smooth_r - cache.r_mean) / cache.r_std).clamp(-3.5, 3.5);
-                    let v_z = ((cache.last_ema_v - cache.v_mean) / cache.v_std).clamp(-3.5, 3.5);
+                    let last_bar = &btc_bars[n_bars - 1];
+                    let intrabar_high = last_bar.high.max(tick_px);
+                    let intrabar_low = last_bar.low.min(tick_px);
+                    let raw_v =
+                        ((intrabar_high - intrabar_low) / tick_px.max(1e-8)) * elapsed_frac.sqrt();
+                    let alpha_v = 2.0 / (span_vol + 1.0);
+                    let ema_v = alpha_v * raw_v + (1.0 - alpha_v) * cache.last_ema_v;
+                    let v_z = ((ema_v - cache.v_mean) / cache.v_std).clamp(-3.5, 3.5);
                     let a_z = ((cache.last_ema_a - cache.a_mean) / cache.a_std).clamp(-3.5, 3.5);
                     let obs = [r_z, v_z, a_z];
                     let post = hmm.step_forward(&obs, base_alpha);

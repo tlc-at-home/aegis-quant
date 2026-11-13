@@ -73,6 +73,28 @@ pub fn format_hl_wire_size(size: f64, lot_step_size: f64, sz_decimals: u32) -> S
     float_to_wire(round_dp(s, dec as i32))
 }
 
+/// Formats a perpetual order size (`s`) floored to `lot_step_size` (`HI-7`) so `reduce_only`
+/// orders never round above the remaining position quantity on the exchange.
+pub fn format_hl_wire_size_floor(size: f64, lot_step_size: f64, sz_decimals: u32) -> String {
+    if !size.is_finite() || size <= 0.0 {
+        return "0".to_string();
+    }
+    let s = if lot_step_size.is_finite() && lot_step_size > 0.0 {
+        ((size / lot_step_size) + 1e-9).floor() * lot_step_size
+    } else {
+        size
+    };
+    let dec = (sz_decimals as usize).min(8);
+    float_to_wire(round_dp(s.max(0.0), dec as i32))
+}
+
+/// Derives a deterministic 128-bit `0x`-prefixed 32-hex-character Hyperliquid client order ID (`cloid`)
+/// from an internal `coid` string (`HI-1`, `ME-6`).
+pub fn derive_hl_cloid_hex(coid: &str) -> String {
+    let hash = Keccak256::digest(coid.as_bytes());
+    format!("0x{}", hex::encode(&hash[..16]))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LimitOrderType {
     pub tif: String,

@@ -1893,4 +1893,35 @@ impl DatabaseManager {
 
         Ok(mem_db)
     }
+
+    pub fn get_trade_protective_stop_oid(&self, trade_id: i64) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            let oid: Option<String> = conn
+                .query_row(
+                    "SELECT protective_stop_oid FROM trades WHERE trade_id = ?1;",
+                    params![trade_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+                .flatten();
+            Ok(oid.filter(|s| !s.trim().is_empty()))
+        })
+    }
+
+    pub fn set_trade_protective_stop_oid(
+        &self,
+        trade_id: i64,
+        protective_stop_oid: Option<&str>,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            let _ = conn
+                .execute(
+                    "UPDATE trades SET protective_stop_oid = ?1 WHERE trade_id = ?2;",
+                    params![protective_stop_oid, trade_id],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
 }
