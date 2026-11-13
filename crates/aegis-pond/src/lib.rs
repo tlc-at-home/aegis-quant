@@ -1146,7 +1146,13 @@ impl PondOrchestrator {
                             .as_deref()
                             .map(|s| s.trim().is_empty())
                             .unwrap_or(true);
-                        if stop_moved || missing_stop_oid {
+                        let heal_key = format!("pond:{}", cell.cell_id);
+                        if stop_moved
+                            || (missing_stop_oid
+                                && self
+                                    .execution
+                                    .should_attempt_protective_stop_self_heal(&heal_key, now_ms))
+                        {
                             let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
                             let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
                             let mut asset =
@@ -1162,12 +1168,17 @@ impl PondOrchestrator {
                                 existing_stop_oid.as_deref(),
                             ) {
                                 Ok(Some(new_stop_oid)) => {
+                                    self.execution
+                                        .clear_protective_stop_self_heal_cooldown(&heal_key);
                                     let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
                                         cell.cell_id,
                                         Some(&new_stop_oid),
                                     );
                                 }
                                 Ok(None) => {
+                                    self.execution.record_protective_stop_self_heal_failure(
+                                        &heal_key, now_ms, 300_000,
+                                    );
                                     tracing::warn!(
                                         cell_id = cell.cell_id,
                                         symbol = %cell.symbol,
@@ -1191,6 +1202,9 @@ impl PondOrchestrator {
                                     );
                                 }
                                 Err(e) => {
+                                    self.execution.record_protective_stop_self_heal_failure(
+                                        &heal_key, now_ms, 300_000,
+                                    );
                                     tracing::warn!(
                                         cell_id = cell.cell_id,
                                         symbol = %cell.symbol,

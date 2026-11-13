@@ -102,10 +102,10 @@ pub struct LimitOrderType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TriggerOrderTypeWire {
-    #[serde(rename = "triggerPx")]
-    pub trigger_px: String,
     #[serde(rename = "isMarket")]
     pub is_market: bool,
+    #[serde(rename = "triggerPx")]
+    pub trigger_px: String,
     pub tpsl: String,
 }
 

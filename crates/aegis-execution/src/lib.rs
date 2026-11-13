@@ -421,6 +421,8 @@ pub struct ExecutionEngine {
     pub(crate) pending_fix4_fill_trueups: PendingFix4TrueupMap,
     /// Per-symbol missing funding warn rate-limit timestamps (`R15-N12`).
     pub(crate) missing_funding_warn_ms: Arc<Mutex<HashMap<String, i64>>>,
+    /// Per-position protective stop self-heal cooldown deadline timestamps (`now_ms < retry_after_ms`).
+    pub(crate) protective_stop_retry_after_ms: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl ExecutionEngine {
@@ -447,7 +449,34 @@ impl ExecutionEngine {
             resolved_asset_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_fix4_fill_trueups: Arc::new(Mutex::new(HashMap::new())),
             missing_funding_warn_ms: Arc::new(Mutex::new(HashMap::new())),
+            protective_stop_retry_after_ms: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Returns `true` if a self-heal protective stop submission should be attempted for `key` at `now_ms`.
+    pub fn should_attempt_protective_stop_self_heal(&self, key: &str, now_ms: i64) -> bool {
+        let guard = self.protective_stop_retry_after_ms.lock();
+        guard
+            .get(key)
+            .map(|&retry_after| now_ms >= retry_after)
+            .unwrap_or(true)
+    }
+
+    /// Records a protective stop self-heal failure for `key`, suppressing retries until `now_ms + cooldown_ms`.
+    pub fn record_protective_stop_self_heal_failure(
+        &self,
+        key: &str,
+        now_ms: i64,
+        cooldown_ms: i64,
+    ) {
+        let mut guard = self.protective_stop_retry_after_ms.lock();
+        guard.insert(key.to_string(), now_ms.saturating_add(cooldown_ms.max(0)));
+    }
+
+    /// Clears any protective stop self-heal cooldown for `key` after a successful sync.
+    pub fn clear_protective_stop_self_heal_cooldown(&self, key: &str) {
+        let mut guard = self.protective_stop_retry_after_ms.lock();
+        guard.remove(key);
     }
 
     pub(crate) fn load_config_logged(&self, caller: &str) -> ConfigMap {

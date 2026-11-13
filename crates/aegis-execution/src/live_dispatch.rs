@@ -101,12 +101,24 @@ pub fn parse_hyperliquid_order_ack(
 ) -> OrderExecutionResult {
     let status_str = resp.get("status").and_then(Value::as_str).unwrap_or("err");
     if status_str != "ok" {
+        let detail = resp
+            .get("response")
+            .and_then(|v| {
+                v.as_str().map(|s| s.trim().to_string()).or_else(|| {
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                })
+            })
+            .filter(|s| !s.is_empty());
+        let fill_type = match detail {
+            Some(msg) => format!("HL_EXCHANGE_STATUS_ERR:{msg}"),
+            None => "HL_EXCHANGE_STATUS_ERR".to_string(),
+        };
         return OrderExecutionResult::rejected_with_type(
-            coid,
-            symbol,
-            norm_side,
-            quantity,
-            "HL_EXCHANGE_STATUS_ERR",
+            coid, symbol, norm_side, quantity, fill_type,
         );
     }
 

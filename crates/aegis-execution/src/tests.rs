@@ -3338,3 +3338,80 @@ fn test_r15_qa_c_me12_subaccount_transfer_journals_ambiguous_before_leg1() {
     assert_eq!(leg1_ref.as_deref(), Some("AMBIGUOUS_IN_FLIGHT_LEG1"));
     assert_eq!(leg2_ref, None);
 }
+
+#[test]
+fn test_trigger_order_wire_msgpack_field_order_and_ack_error_detail() {
+    use crate::signing::{
+        LimitOrderType, OrderAction, OrderTypeWire, OrderWire, TriggerOrderTypeWire,
+    };
+
+    let action = OrderAction {
+        action_type: "order".to_string(),
+        orders: vec![OrderWire {
+            a: 5,
+            b: true,
+            p: "96.73".to_string(),
+            s: "1.14".to_string(),
+            r: true,
+            t: OrderTypeWire {
+                limit: None::<LimitOrderType>,
+                trigger: Some(TriggerOrderTypeWire {
+                    is_market: true,
+                    trigger_px: "93.052".to_string(),
+                    tpsl: "sl".to_string(),
+                }),
+            },
+            c: None,
+        }],
+        grouping: "na".to_string(),
+    };
+    let encoded = rmp_serde::encode::to_vec_named(&action).unwrap();
+    let find_subseq = |needle: &[u8]| -> usize {
+        encoded
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap_or_else(|| panic!("missing msgpack field {:?}", std::str::from_utf8(needle)))
+    };
+    let pos_is_market = find_subseq(b"isMarket");
+    let pos_trigger_px = find_subseq(b"triggerPx");
+    let pos_tpsl = find_subseq(b"tpsl");
+    assert!(
+        pos_is_market < pos_trigger_px && pos_trigger_px < pos_tpsl,
+        "Hyperliquid trigger msgpack requires isMarket ({pos_is_market}) < triggerPx ({pos_trigger_px}) < tpsl ({pos_tpsl})"
+    );
+
+    let err_resp = json!({
+        "status": "err",
+        "response": "User or API Wallet 0x1234 does not exist."
+    });
+    let ack = parse_hyperliquid_order_ack(
+        &err_resp,
+        "SOL/USDC:USDC",
+        "LONG",
+        1.14,
+        93.05,
+        false,
+        4.5,
+        "protective-sl",
+    );
+    assert_eq!(ack.fsm_state, "REJECTED");
+    assert_eq!(
+        ack.fill_type,
+        "HL_EXCHANGE_STATUS_ERR:User or API Wallet 0x1234 does not exist."
+    );
+}
+
+#[test]
+fn test_protective_stop_self_heal_cooldown() {
+    let db = DatabaseManager::memory();
+    db.initialize_schema(false).unwrap();
+    let exec = ExecutionEngine::new(db);
+
+    assert!(exec.should_attempt_protective_stop_self_heal("pond:38", 1_000));
+    exec.record_protective_stop_self_heal_failure("pond:38", 1_000, 300_000);
+    assert!(!exec.should_attempt_protective_stop_self_heal("pond:38", 100_000));
+    assert!(exec.should_attempt_protective_stop_self_heal("pond:38", 301_000));
+    assert!(exec.should_attempt_protective_stop_self_heal("pond:39", 100_000));
+    exec.clear_protective_stop_self_heal_cooldown("pond:38");
+    assert!(exec.should_attempt_protective_stop_self_heal("pond:38", 100_000));
+}

@@ -650,7 +650,11 @@ impl ExecutionEngine {
                         .as_deref()
                         .map(|s| s.trim().is_empty())
                         .unwrap_or(true);
-                    if stop_moved || missing_stop_oid {
+                    let heal_key = format!("pit:{}", trade.trade_id);
+                    if stop_moved
+                        || (missing_stop_oid
+                            && self.should_attempt_protective_stop_self_heal(&heal_key, now_ms))
+                    {
                         match self.submit_or_refresh_protective_stop_order(
                             asset,
                             &trade.side,
@@ -659,12 +663,16 @@ impl ExecutionEngine {
                             existing_stop_oid.as_deref(),
                         ) {
                             Ok(Some(new_stop_oid)) => {
+                                self.clear_protective_stop_self_heal_cooldown(&heal_key);
                                 let _ = self.db.set_trade_protective_stop_oid(
                                     trade.trade_id,
                                     Some(&new_stop_oid),
                                 );
                             }
                             Ok(None) => {
+                                self.record_protective_stop_self_heal_failure(
+                                    &heal_key, now_ms, 300_000,
+                                );
                                 tracing::warn!(
                                     trade_id = trade.trade_id,
                                     symbol = %asset.symbol,
@@ -688,6 +696,9 @@ impl ExecutionEngine {
                                 );
                             }
                             Err(e) => {
+                                self.record_protective_stop_self_heal_failure(
+                                    &heal_key, now_ms, 300_000,
+                                );
                                 tracing::warn!(
                                     trade_id = trade.trade_id,
                                     symbol = %asset.symbol,
