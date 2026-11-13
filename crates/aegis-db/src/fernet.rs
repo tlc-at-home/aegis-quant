@@ -110,7 +110,10 @@ pub fn ensure_master_key_for_db(db_path: &Path) -> Result<String> {
 /// 3. Environment variable (`AEGIS_MASTER_KEY` or `FERNET_MASTER_KEY`)
 /// 4. Local keyfile (`<db_dir>/.aegis_master_key`, chmod 0600)
 /// 5. Ephemeral per-process CSPRNG key (only for `:memory:` test instances; marked `external = false`)
-pub fn resolve_fernet_master_key(master_key: Option<&str>, db_path: Option<&Path>) -> (String, bool) {
+pub fn resolve_fernet_master_key(
+    master_key: Option<&str>,
+    db_path: Option<&Path>,
+) -> (String, bool) {
     if let Some(explicit) = master_key {
         if !explicit.trim().is_empty() {
             let norm = normalize_fernet_key(explicit.as_bytes());
@@ -256,7 +259,11 @@ impl FernetCipher {
     }
 
     /// Decrypt a URL-safe base64 Fernet token (`gAAAAAB...`), verifying HMAC-SHA256 and optional TTL (`NL-5`).
-    pub fn decrypt_str_with_ttl(&self, token_str: &str, max_age_secs: Option<u64>) -> Result<String> {
+    pub fn decrypt_str_with_ttl(
+        &self,
+        token_str: &str,
+        max_age_secs: Option<u64>,
+    ) -> Result<String> {
         let clean = token_str.trim();
         let raw_token = clean.strip_prefix("ENC:").unwrap_or(clean);
         let data = URL_SAFE
@@ -265,7 +272,9 @@ impl FernetCipher {
 
         // Minimum length: 1 (ver) + 8 (ts) + 16 (iv) + 16 (1 block) + 32 (hmac) = 73 bytes
         if data.len() < 73 || data[0] != 0x80 {
-            return Err(AegisError::Crypto("Malformed Fernet token header".to_string()));
+            return Err(AegisError::Crypto(
+                "Malformed Fernet token header".to_string(),
+            ));
         }
         let body_end = data.len() - 32;
         let signed_portion = &data[..body_end];
@@ -290,7 +299,8 @@ impl FernetCipher {
                 .as_secs();
             if token_ts > now_secs.saturating_add(60) {
                 return Err(AegisError::Crypto(
-                    "Fernet token timestamp is in the future beyond clock skew tolerance".to_string(),
+                    "Fernet token timestamp is in the future beyond clock skew tolerance"
+                        .to_string(),
                 ));
             }
             if now_secs.saturating_sub(token_ts) > ttl {

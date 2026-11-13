@@ -20,9 +20,24 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Cargo Registry & Target
         uses: Swatinem/rust-cache@v2
+      - name: Check Code Formatting
+        run: cargo fmt --all -- --check
       - name: Run Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Workspace Unit & Integration Tests
-        run: cargo test --workspace
+      - name: Run Workspace Unit & Integration Tests (Enforce >= 155 Tests)
+        run: |
+          set -o pipefail
+          cargo test --workspace | tee /tmp/aegis_test_output.txt
+          TOTAL=$(python3 -c '
+          import re
+          with open("/tmp/aegis_test_output.txt") as f:
+              text = f.read()
+          counts = [int(m.group(1)) for m in re.finditer(r"test result: ok\. (\d+) passed; 0 failed", text)]
+          total = sum(counts)
+          print(total)
+          if total < 155:
+              raise SystemExit(f"Expected >= 155 passing workspace tests, observed {total}")
+          ')
+          echo "Verified ${TOTAL} passing workspace tests"
       - name: Build Optimized Release Binary
         run: cargo build --release --workspace

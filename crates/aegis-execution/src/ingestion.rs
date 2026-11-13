@@ -1,9 +1,7 @@
 //! Market Data Ingestion & `ALT/BTC:SYNTH` Synthesis Engine (`aegis-execution::ingestion`).
 
 use crate::http_client::{http_post_json, resolve_info_url, shared_blocking_client};
-use aegis_core::{
-    now_iso8601_utc, round_dp, timeframe_seconds, OhlcvBar, PondUniverseRow, Result,
-};
+use aegis_core::{now_iso8601_utc, round_dp, timeframe_seconds, OhlcvBar, PondUniverseRow, Result};
 use aegis_db::{ConfigMap, DatabaseManager};
 use chrono::Utc;
 use reqwest::blocking::Client;
@@ -117,11 +115,13 @@ impl MarketIngestionEngine {
                 "endTime": now_ms,
             }
         });
-        let raw = self.http_post_json(&self.info_url(), &payload).ok_or_else(|| {
-            aegis_core::AegisError::Execution(format!(
-                "Hyperliquid candleSnapshot HTTP request failed for {coin} ({interval})"
-            ))
-        })?;
+        let raw = self
+            .http_post_json(&self.info_url(), &payload)
+            .ok_or_else(|| {
+                aegis_core::AegisError::Execution(format!(
+                    "Hyperliquid candleSnapshot HTTP request failed for {coin} ({interval})"
+                ))
+            })?;
         let list = raw.as_array().ok_or_else(|| {
             aegis_core::AegisError::Execution(format!(
                 "Hyperliquid candleSnapshot response is not an array for {coin} ({interval})"
@@ -240,8 +240,7 @@ impl MarketIngestionEngine {
 
             let shock = if let Some(b_bars) = btc_bars {
                 if i > 0 && i < b_bars.len() {
-                    let btc_ret =
-                        (b_bars[i].close.max(1e-8) / b_bars[i - 1].close.max(1e-8)).ln();
+                    let btc_ret = (b_bars[i].close.max(1e-8) / b_bars[i - 1].close.max(1e-8)).ln();
                     let beta = 1.05 + ((seed_offset % 5) as f64) * 0.08;
                     beta * btc_ret + next_norm() * (vol * 0.55) + alpha_tilt
                 } else {
@@ -257,8 +256,7 @@ impl MarketIngestionEngine {
             let wick_dn = next_norm().abs() * vol * 0.65;
             let high_px = open_px.max(close_px) * (1.0 + wick_up);
             let low_px = (open_px.min(close_px) * (1.0 - wick_dn)).max(1e-8);
-            let volume =
-                (150_000.0 / base_price.max(0.01)) * (1.0 + (shock / vol.max(1e-6)).abs());
+            let volume = (150_000.0 / base_price.max(0.01)) * (1.0 + (shock / vol.max(1e-6)).abs());
             let funding = base_funding + next_norm() * 0.00003;
 
             bars.push(OhlcvBar {
@@ -392,7 +390,9 @@ impl MarketIngestionEngine {
         let mut sorted_tfs: Vec<String> = timeframes.into_iter().collect();
         sorted_tfs.sort();
 
-        let fallback_btc_px = cfg.get_f64("btc_fallback_base_price_usdc", 95_000.0).max(1.0);
+        let fallback_btc_px = cfg
+            .get_f64("btc_fallback_base_price_usdc", 95_000.0)
+            .max(1.0);
         let btc_ref_px = self
             .resolve_reference_price_logged("BTC/USDC:USDC")
             .unwrap_or(fallback_btc_px);
@@ -442,8 +442,9 @@ impl MarketIngestionEngine {
                         Vec::new()
                     };
                     if is_live_or_testnet {
-                        let max_staleness_ms =
-                            cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+                        let max_staleness_ms = cfg
+                            .get_i64("max_bar_staleness_ms", 28_800_000)
+                            .max(3_600_000);
                         let now_ms = Utc::now().timestamp_millis();
                         if let Some(last_b) = existing.last() {
                             if now_ms.saturating_sub(last_b.timestamp_ms) > max_staleness_ms {
@@ -551,8 +552,9 @@ impl MarketIngestionEngine {
                             Vec::new()
                         };
                         if is_live_or_testnet {
-                            let max_staleness_ms =
-                                cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+                            let max_staleness_ms = cfg
+                                .get_i64("max_bar_staleness_ms", 28_800_000)
+                                .max(3_600_000);
                             let now_ms = Utc::now().timestamp_millis();
                             if let Some(last_b) = existing.last() {
                                 if now_ms.saturating_sub(last_b.timestamp_ms) > max_staleness_ms {
@@ -598,7 +600,9 @@ impl MarketIngestionEngine {
                 .get_ohlcv_bars(&pair.exec_symbol, tf, lookback_bars, None)?;
             let btc_bars = match btc_bars_by_tf.get(tf) {
                 Some(b) => b.clone(),
-                None => self.db.get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)?,
+                None => self
+                    .db
+                    .get_ohlcv_bars("BTC/USDC:USDC", tf, lookback_bars, None)?,
             };
             let synth_bars =
                 Self::synthesize_alt_btc_candles(&alt_bars, &btc_bars, &pair.synth_symbol, tf);
@@ -750,129 +754,130 @@ impl MarketIngestionEngine {
             {
                 if let Some(arr) = resp.as_array() {
                     if arr.len() >= 2 {
-                    let universe = arr[0]
-                        .get("universe")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let ctxs = arr[1].as_array().cloned().unwrap_or_default();
-                    let mut live_items: Vec<(String, f64, u32, f64, f64)> = Vec::new();
-                    for (u, c) in universe.iter().zip(ctxs.iter()) {
-                        let is_delisted = u
-                            .get("isDelisted")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        if is_delisted {
-                            continue;
-                        }
-                        if let Some(name) = u.get("name").and_then(Value::as_str) {
-                            let coin_upper = name.to_uppercase();
-                            let symbol_full = format!("{coin_upper}/USDC:USDC");
-                            let day_vlm = c
-                                .get("dayNtlVlm")
-                                .and_then(|v| {
-                                    v.as_f64()
-                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                                })
-                                .unwrap_or(0.0);
-                            let median_vlm = self.compute_median_daily_volume_from_bars(
-                                &symbol_full,
-                                day_vlm,
-                                median_window_days,
-                            );
-                            if median_vlm >= effective_min_vol {
-                                let sz_decimals = u
-                                    .get("szDecimals")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(3)
-                                    .min(6) as u32;
-                                let max_lev = u
-                                    .get("maxLeverage")
-                                    .and_then(|v| {
-                                        v.as_f64().or_else(|| {
-                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
-                                        })
-                                    })
-                                    .unwrap_or(3.0)
-                                    .clamp(1.0, 50.0);
-                                let mark_px = c
-                                    .get("markPx")
-                                    .or_else(|| c.get("midPx"))
+                        let universe = arr[0]
+                            .get("universe")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let ctxs = arr[1].as_array().cloned().unwrap_or_default();
+                        let mut live_items: Vec<(String, f64, u32, f64, f64)> = Vec::new();
+                        for (u, c) in universe.iter().zip(ctxs.iter()) {
+                            let is_delisted = u
+                                .get("isDelisted")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            if is_delisted {
+                                continue;
+                            }
+                            if let Some(name) = u.get("name").and_then(Value::as_str) {
+                                let coin_upper = name.to_uppercase();
+                                let symbol_full = format!("{coin_upper}/USDC:USDC");
+                                let day_vlm = c
+                                    .get("dayNtlVlm")
                                     .and_then(|v| {
                                         v.as_f64().or_else(|| {
                                             v.as_str().and_then(|s| s.parse::<f64>().ok())
                                         })
                                     })
                                     .unwrap_or(0.0);
-                                live_items.push((
-                                    coin_upper,
-                                    median_vlm,
-                                    sz_decimals,
-                                    max_lev,
-                                    mark_px,
-                                ));
+                                let median_vlm = self.compute_median_daily_volume_from_bars(
+                                    &symbol_full,
+                                    day_vlm,
+                                    median_window_days,
+                                );
+                                if median_vlm >= effective_min_vol {
+                                    let sz_decimals =
+                                        u.get("szDecimals")
+                                            .and_then(Value::as_u64)
+                                            .unwrap_or(3)
+                                            .min(6) as u32;
+                                    let max_lev = u
+                                        .get("maxLeverage")
+                                        .and_then(|v| {
+                                            v.as_f64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                            })
+                                        })
+                                        .unwrap_or(3.0)
+                                        .clamp(1.0, 50.0);
+                                    let mark_px = c
+                                        .get("markPx")
+                                        .or_else(|| c.get("midPx"))
+                                        .and_then(|v| {
+                                            v.as_f64().or_else(|| {
+                                                v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                            })
+                                        })
+                                        .unwrap_or(0.0);
+                                    live_items.push((
+                                        coin_upper,
+                                        median_vlm,
+                                        sz_decimals,
+                                        max_lev,
+                                        mark_px,
+                                    ));
+                                }
                             }
                         }
-                    }
-                    live_items
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    if !live_items.is_empty() {
-                        return live_items
-                            .into_iter()
-                            .take(target_size)
-                            .enumerate()
-                            .map(|(idx, (coin, vol, sz_dec, max_lev, mark_px))| {
-                                let symbol = format!("{coin}/USDC:USDC");
-                                let ref_px = if mark_px > 0.0 {
-                                    mark_px
-                                } else {
-                                    self.resolve_reference_price_logged(&symbol)
-                                        .unwrap_or(0.0)
-                                };
-                                let lot_step = round_dp(10f64.powi(-(sz_dec as i32)), 8).max(1e-6);
-                                let max_dec = (6 - sz_dec as i32).max(0);
-                                let mag = if ref_px > 0.0 {
-                                    ref_px.log10().floor() as i32
-                                } else {
-                                    0
-                                };
-                                let dec = (4 - mag).max(0).min(max_dec);
-                                let tick_size = round_dp(10f64.powi(-dec), 8).max(1e-6);
-                                PondUniverseRow {
-                                    symbol,
-                                    rank: (idx + 1) as i64,
-                                    median_daily_volume_usdc: round_dp(vol, 2),
-                                    tick_size,
-                                    lot_step_size: lot_step,
-                                    min_notional_usdc: 10.0,
-                                    max_leverage: max_lev,
-                                    status: "ACTIVE".to_string(),
-                                    warmup_until: Some(warmup_ready.clone()),
-                                    delist_streak: 0,
-                                    added_at: now_str.clone(),
-                                    delisted_at: None,
-                                    is_synthetic_volume: 0,
-                                    reference_price: ref_px,
-                                }
-                            })
-                            .collect();
+                        live_items.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        if !live_items.is_empty() {
+                            return live_items
+                                .into_iter()
+                                .take(target_size)
+                                .enumerate()
+                                .map(|(idx, (coin, vol, sz_dec, max_lev, mark_px))| {
+                                    let symbol = format!("{coin}/USDC:USDC");
+                                    let ref_px = if mark_px > 0.0 {
+                                        mark_px
+                                    } else {
+                                        self.resolve_reference_price_logged(&symbol).unwrap_or(0.0)
+                                    };
+                                    let lot_step =
+                                        round_dp(10f64.powi(-(sz_dec as i32)), 8).max(1e-6);
+                                    let max_dec = (6 - sz_dec as i32).max(0);
+                                    let mag = if ref_px > 0.0 {
+                                        ref_px.log10().floor() as i32
+                                    } else {
+                                        0
+                                    };
+                                    let dec = (4 - mag).max(0).min(max_dec);
+                                    let tick_size = round_dp(10f64.powi(-dec), 8).max(1e-6);
+                                    PondUniverseRow {
+                                        symbol,
+                                        rank: (idx + 1) as i64,
+                                        median_daily_volume_usdc: round_dp(vol, 2),
+                                        tick_size,
+                                        lot_step_size: lot_step,
+                                        min_notional_usdc: 10.0,
+                                        max_leverage: max_lev,
+                                        status: "ACTIVE".to_string(),
+                                        warmup_until: Some(warmup_ready.clone()),
+                                        delist_streak: 0,
+                                        added_at: now_str.clone(),
+                                        delisted_at: None,
+                                        is_synthetic_volume: 0,
+                                        reference_price: ref_px,
+                                    }
+                                })
+                                .collect();
+                        }
                     }
                 }
             }
         }
-        }
 
         // Deterministic 85-coin Hyperliquid universe fallback (sorted by realistic daily volume >= $50k)
         const POND_COINS: [&str; 85] = [
-            "BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "SUI", "AVAX", "LINK", "ADA",
-            "BNB", "DOT", "NEAR", "ARB", "OP", "LTC", "APT", "TIA", "INJ", "UNI",
-            "AAVE", "ATOM", "FIL", "RENDER", "TAO", "WIF", "PEPE", "BONK", "FET", "SEI",
-            "JUP", "ONDO", "PENDLE", "ENA", "WLD", "STX", "IMX", "KAS", "RUNE", "AR",
-            "PYTH", "STRK", "ORDI", "GALA", "SAND", "MANA", "AXS", "CRV", "LDO", "MKR",
-            "SNX", "COMP", "DYDX", "GMX", "BLUR", "ENS", "APE", "CHZ", "ALGO", "VET",
-            "ICP", "EGLD", "FLOW", "THETA", "NEO", "KAVA", "MINA", "ROSE", "ZIL", "IOTA",
-            "JASMY", "FLOKI", "MEME", "BOME", "POPCAT", "BRETT", "MEW", "NOT", "TON", "TRUMP",
-            "VIRTUAL", "AI16Z", "FARTCOIN", "PENGU", "ZRO",
+            "BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "SUI", "AVAX", "LINK", "ADA", "BNB", "DOT",
+            "NEAR", "ARB", "OP", "LTC", "APT", "TIA", "INJ", "UNI", "AAVE", "ATOM", "FIL",
+            "RENDER", "TAO", "WIF", "PEPE", "BONK", "FET", "SEI", "JUP", "ONDO", "PENDLE", "ENA",
+            "WLD", "STX", "IMX", "KAS", "RUNE", "AR", "PYTH", "STRK", "ORDI", "GALA", "SAND",
+            "MANA", "AXS", "CRV", "LDO", "MKR", "SNX", "COMP", "DYDX", "GMX", "BLUR", "ENS", "APE",
+            "CHZ", "ALGO", "VET", "ICP", "EGLD", "FLOW", "THETA", "NEO", "KAVA", "MINA", "ROSE",
+            "ZIL", "IOTA", "JASMY", "FLOKI", "MEME", "BOME", "POPCAT", "BRETT", "MEW", "NOT",
+            "TON", "TRUMP", "VIRTUAL", "AI16Z", "FARTCOIN", "PENGU", "ZRO",
         ];
 
         POND_COINS
@@ -990,7 +995,10 @@ impl MarketIngestionEngine {
         let raw = self.http_post_json(&self.info_url(), &payload)?;
         let list = raw.as_array()?;
         if list.is_empty() {
-            tracing::warn!(coin = coin, "Hyperliquid fundingHistory returned empty array (NL-8)");
+            tracing::warn!(
+                coin = coin,
+                "Hyperliquid fundingHistory returned empty array (NL-8)"
+            );
             return None;
         }
         let mut out = Vec::with_capacity(list.len());
@@ -1012,7 +1020,10 @@ impl MarketIngestionEngine {
             }
         }
         if out.is_empty() {
-            tracing::warn!(coin = coin, "Hyperliquid fundingHistory contained no finite fundingRate values (NL-8)");
+            tracing::warn!(
+                coin = coin,
+                "Hyperliquid fundingHistory contained no finite fundingRate values (NL-8)"
+            );
             return None;
         }
         if out.len() < 24 {
@@ -1099,7 +1110,9 @@ impl MarketIngestionEngine {
             .to_uppercase();
         let live_f = live_funding_map.and_then(|m| m.get(&coin).copied());
         let min_fund_floor = cfg.get_f64("pond_funding_floor_hourly", 0.000015);
-        let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+        let max_staleness_ms = cfg
+            .get_i64("max_bar_staleness_ms", 28_800_000)
+            .max(3_600_000);
         let now_ms = Utc::now().timestamp_millis();
 
         let mut bars_1h: Vec<OhlcvBar> = self
@@ -1123,12 +1136,8 @@ impl MarketIngestionEngine {
         };
 
         if allow_network_fetch && passes_floor_or_single {
-            let f_rate = live_f.unwrap_or_else(|| {
-                bars_1h
-                    .last()
-                    .map(|b| b.funding_rate_hourly)
-                    .unwrap_or(0.0)
-            });
+            let f_rate = live_f
+                .unwrap_or_else(|| bars_1h.last().map(|b| b.funding_rate_hourly).unwrap_or(0.0));
 
             let now_hour_bucket = now_ms / 3_600_000;
             let now_4h_bucket = now_ms / 14_400_000;
@@ -1144,9 +1153,7 @@ impl MarketIngestionEngine {
                     bars_1h = fetched_1h;
                 }
             } else if live_funding_map.is_none() {
-                if let Some(recent_1h) =
-                    self.fetch_hyperliquid_candles(&coin, "1h", 4, f_rate)
-                {
+                if let Some(recent_1h) = self.fetch_hyperliquid_candles(&coin, "1h", 4, f_rate) {
                     self.merge_recent_bars(symbol, &mut bars_1h, recent_1h, "1h");
                 }
             }
@@ -1166,9 +1173,7 @@ impl MarketIngestionEngine {
                     bars_4h = fetched_4h;
                 }
             } else if live_funding_map.is_none() {
-                if let Some(recent_4h) =
-                    self.fetch_hyperliquid_candles(&coin, "4h", 2, f_rate)
-                {
+                if let Some(recent_4h) = self.fetch_hyperliquid_candles(&coin, "4h", 2, f_rate) {
                     self.merge_recent_bars(symbol, &mut bars_4h, recent_4h, "4h");
                 }
             }
@@ -1264,8 +1269,7 @@ impl MarketIngestionEngine {
             }
         }
 
-        let mut funding_series: Vec<f64> =
-            bars_1h.iter().map(|b| b.funding_rate_hourly).collect();
+        let mut funding_series: Vec<f64> = bars_1h.iter().map(|b| b.funding_rate_hourly).collect();
         if let Some(lf) = live_f {
             if funding_series.is_empty() {
                 funding_series.push(lf);

@@ -138,7 +138,9 @@ impl ExecutionEngine {
             )
             .max(1);
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(3_600_000);
+        let max_staleness_ms = cfg
+            .get_i64("max_bar_staleness_ms", 28_800_000)
+            .max(3_600_000);
 
         let now_ms = evaluations
             .first()
@@ -200,11 +202,8 @@ impl ExecutionEngine {
         let open_trades = self.db.get_open_trades()?;
         for trade in open_trades {
             if !asset_by_symbol.contains_key(&trade.symbol) {
-                let resolved = self.resolve_trade_asset(
-                    &trade.symbol,
-                    &trade.base_asset,
-                    trade.entry_price,
-                );
+                let resolved =
+                    self.resolve_trade_asset(&trade.symbol, &trade.base_asset, trade.entry_price);
                 asset_by_symbol.insert(trade.symbol.clone(), resolved);
             }
             let asset = asset_by_symbol
@@ -278,7 +277,9 @@ impl ExecutionEngine {
             let opened_at_ms = aegis_core::parse_utc_timestamp(&trade.opened_at)
                 .map(|dt| dt.and_utc().timestamp_millis())
                 .unwrap_or(0);
-            let (eval_bar_high, eval_bar_low) = if !is_backtest && opened_at_ms > last_bar.timestamp_ms {
+            let (eval_bar_high, eval_bar_low) = if !is_backtest
+                && opened_at_ms > last_bar.timestamp_ms
+            {
                 let recent_1h = if !asset.exec_timeframe.eq_ignore_ascii_case("1h") {
                     self.db
                         .get_ohlcv_bars(&trade.symbol, "1h", 6, Some(now_ms))
@@ -447,27 +448,73 @@ impl ExecutionEngine {
                                         .get_trade_protective_stop_oid(trade.trade_id)
                                         .ok()
                                         .flatten();
-                                    if let Ok(Some(new_stop_oid)) = self
-                                        .submit_or_refresh_protective_stop_order(
-                                            asset,
-                                            &trade.side,
-                                            remaining_qty,
-                                            stop_eval.chandelier_stop_price,
-                                            existing_stop_oid.as_deref(),
-                                        )
-                                    {
-                                        let _ = self.db.set_trade_protective_stop_oid(
-                                            trade.trade_id,
-                                            Some(&new_stop_oid),
-                                        );
+                                    match self.submit_or_refresh_protective_stop_order(
+                                        asset,
+                                        &trade.side,
+                                        remaining_qty,
+                                        stop_eval.chandelier_stop_price,
+                                        existing_stop_oid.as_deref(),
+                                    ) {
+                                        Ok(Some(new_stop_oid)) => {
+                                            let _ = self.db.set_trade_protective_stop_oid(
+                                                trade.trade_id,
+                                                Some(&new_stop_oid),
+                                            );
+                                        }
+                                        Ok(None) => {
+                                            tracing::warn!(
+                                                trade_id = trade.trade_id,
+                                                symbol = %asset.symbol,
+                                                "PROTECTIVE_STOP_SYNC_FAILED: exchange returned no protective stop oid on partial exit"
+                                            );
+                                            let _ = self.db.log_telemetry(
+                                                "WARNING",
+                                                "engine.execution",
+                                                &format!(
+                                                    "PROTECTIVE_STOP_SYNC_FAILED: partial exit {} ({}) returned no protective stop oid",
+                                                    trade.trade_id, asset.symbol
+                                                ),
+                                                Some(json!({
+                                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                                    "book": "PIT",
+                                                    "phase": "partial_exit",
+                                                    "trade_id": trade.trade_id,
+                                                    "symbol": asset.symbol,
+                                                    "existing_stop_oid": existing_stop_oid,
+                                                })),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                trade_id = trade.trade_id,
+                                                symbol = %asset.symbol,
+                                                error = %e,
+                                                "PROTECTIVE_STOP_SYNC_FAILED on partial exit"
+                                            );
+                                            let _ = self.db.log_telemetry(
+                                                "WARNING",
+                                                "engine.execution",
+                                                &format!(
+                                                    "PROTECTIVE_STOP_SYNC_FAILED: partial exit {} ({}): {e}",
+                                                    trade.trade_id, asset.symbol
+                                                ),
+                                                Some(json!({
+                                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                                    "book": "PIT",
+                                                    "phase": "partial_exit",
+                                                    "trade_id": trade.trade_id,
+                                                    "symbol": asset.symbol,
+                                                    "existing_stop_oid": existing_stop_oid,
+                                                })),
+                                            );
+                                        }
                                     }
                                 }
                                 continue;
                             }
                         }
                         actual_exit_px = exec_close.avg_fill_price;
-                        actual_fees =
-                            round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
+                        actual_fees = round_dp(trade.fees_paid_usdc + exec_close.fees_paid_usdc, 4);
                     } else {
                         let wallet = cfg.get_str("wallet_address", "").trim().to_string();
                         let is_testnet =
@@ -515,14 +562,15 @@ impl ExecutionEngine {
                     4,
                 );
                 // R8-N4: Check bool returned by close_trade; if already closed concurrently, skip cooldown & duplicate alert
-                let existing_stop_oid = if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && !is_paper_trade {
-                    self.db
-                        .get_trade_protective_stop_oid(trade.trade_id)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
+                let existing_stop_oid =
+                    if (mode == "LIVE" || mode == "TESTNET") && !is_backtest && !is_paper_trade {
+                        self.db
+                            .get_trade_protective_stop_oid(trade.trade_id)
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
                 let closed = self.db.close_trade(
                     trade.trade_id,
                     actual_exit_px,
@@ -549,9 +597,10 @@ impl ExecutionEngine {
                         guard.retain(|_, &mut until| until > now_ms);
                         if !is_backtest {
                             if let Ok(serialized) = serde_json::to_string(&*guard) {
-                                let _ = self
-                                    .db
-                                    .set_config_value("pit_stop_cooldowns_json", &json!(serialized));
+                                let _ = self.db.set_config_value(
+                                    "pit_stop_cooldowns_json",
+                                    &json!(serialized),
+                                );
                             }
                         }
                     }
@@ -587,23 +636,82 @@ impl ExecutionEngine {
                         "exchange_protective_stops_enabled",
                         cfg.get_bool("enable_exchange_trigger_stops", true),
                     )
-                    && (stop_eval.chandelier_stop_price - trade.chandelier_stop_price).abs() > 1e-8
+                    && stop_eval.chandelier_stop_price > 0.0
                 {
                     let existing_stop_oid = self
                         .db
                         .get_trade_protective_stop_oid(trade.trade_id)
                         .ok()
                         .flatten();
-                    if let Ok(Some(new_stop_oid)) = self.submit_or_refresh_protective_stop_order(
-                        asset,
-                        &trade.side,
-                        trade.quantity.abs(),
-                        stop_eval.chandelier_stop_price,
-                        existing_stop_oid.as_deref(),
-                    ) {
-                        let _ = self
-                            .db
-                            .set_trade_protective_stop_oid(trade.trade_id, Some(&new_stop_oid));
+                    let stop_moved =
+                        (stop_eval.chandelier_stop_price - trade.chandelier_stop_price).abs()
+                            > 1e-8;
+                    let missing_stop_oid = existing_stop_oid
+                        .as_deref()
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if stop_moved || missing_stop_oid {
+                        match self.submit_or_refresh_protective_stop_order(
+                            asset,
+                            &trade.side,
+                            trade.quantity.abs(),
+                            stop_eval.chandelier_stop_price,
+                            existing_stop_oid.as_deref(),
+                        ) {
+                            Ok(Some(new_stop_oid)) => {
+                                let _ = self.db.set_trade_protective_stop_oid(
+                                    trade.trade_id,
+                                    Some(&new_stop_oid),
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    trade_id = trade.trade_id,
+                                    symbol = %asset.symbol,
+                                    "PROTECTIVE_STOP_SYNC_FAILED: trailing stop refresh returned no oid"
+                                );
+                                let _ = self.db.log_telemetry(
+                                    "WARNING",
+                                    "engine.execution",
+                                    &format!(
+                                        "PROTECTIVE_STOP_SYNC_FAILED: trade {} ({}) returned no protective stop oid",
+                                        trade.trade_id, asset.symbol
+                                    ),
+                                    Some(json!({
+                                        "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                        "book": "PIT",
+                                        "phase": if missing_stop_oid { "self_heal" } else { "trail_refresh" },
+                                        "trade_id": trade.trade_id,
+                                        "symbol": asset.symbol,
+                                        "existing_stop_oid": existing_stop_oid,
+                                    })),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    trade_id = trade.trade_id,
+                                    symbol = %asset.symbol,
+                                    error = %e,
+                                    "PROTECTIVE_STOP_SYNC_FAILED during trailing stop sync"
+                                );
+                                let _ = self.db.log_telemetry(
+                                    "WARNING",
+                                    "engine.execution",
+                                    &format!(
+                                        "PROTECTIVE_STOP_SYNC_FAILED: trade {} ({}): {e}",
+                                        trade.trade_id, asset.symbol
+                                    ),
+                                    Some(json!({
+                                        "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                        "book": "PIT",
+                                        "phase": if missing_stop_oid { "self_heal" } else { "trail_refresh" },
+                                        "trade_id": trade.trade_id,
+                                        "symbol": asset.symbol,
+                                        "existing_stop_oid": existing_stop_oid,
+                                    })),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -631,7 +739,9 @@ impl ExecutionEngine {
             cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)
         };
         let net_pit_transfers = if !is_backtest && (risk_scope != "PLATFORM" || two_book_active) {
-            self.db.get_net_book_transfer_adjustment("PIT").unwrap_or(0.0)
+            self.db
+                .get_net_book_transfer_adjustment("PIT")
+                .unwrap_or(0.0)
         } else {
             0.0
         };
@@ -669,9 +779,12 @@ impl ExecutionEngine {
 
         let (_wallet_tot_eq, perps_trading_eq, vault_eq, mut total_wallet_deployed) =
             if !is_backtest {
-                self.db
-                    .get_wallet_perps_margin_state()
-                    .unwrap_or((initial_equity, initial_equity, 0.0, 0.0))
+                self.db.get_wallet_perps_margin_state().unwrap_or((
+                    initial_equity,
+                    initial_equity,
+                    0.0,
+                    0.0,
+                ))
             } else {
                 (initial_equity, initial_equity, 0.0, 0.0)
             };
@@ -784,7 +897,9 @@ impl ExecutionEngine {
                 }
 
                 if !is_backtest && vault_eq > 0.0 {
-                    let remaining_perps_cap = (perps_trading_eq - total_wallet_deployed).max(0.0);
+                    let max_gross_leverage = cfg.get_f64("max_gross_leverage", 1.5).clamp(1.0, 5.0);
+                    let perps_notional_cap = perps_trading_eq * max_gross_leverage;
+                    let remaining_perps_cap = (perps_notional_cap - total_wallet_deployed).max(0.0);
                     if remaining_perps_cap < asset.min_notional_usdc.max(10.0) {
                         continue;
                     }
@@ -857,7 +972,11 @@ impl ExecutionEngine {
                     current_price: fill_px,
                     exit_price: None,
                     quantity: order_qty,
-                    filled_units: if is_filled { exec_res.filled_units } else { 0.0 },
+                    filled_units: if is_filled {
+                        exec_res.filled_units
+                    } else {
+                        0.0
+                    },
                     avg_fill_price: if is_filled && exec_res.avg_fill_price > 0.0 {
                         Some(exec_res.avg_fill_price)
                     } else {
@@ -874,8 +993,7 @@ impl ExecutionEngine {
                             )
                         } else if sizing.quantity > 0.0 {
                             round_dp(
-                                sizing.risk_budget_usdc
-                                    * (order_qty.abs() / sizing.quantity.abs()),
+                                sizing.risk_budget_usdc * (order_qty.abs() / sizing.quantity.abs()),
                                 4,
                             )
                         } else {
@@ -1000,14 +1118,63 @@ impl ExecutionEngine {
                     )
                     && inserted.chandelier_stop_price > 0.0
                 {
-                    if let Ok(Some(new_stop_oid)) = self.submit_or_refresh_protective_stop_order(
+                    match self.submit_or_refresh_protective_stop_order(
                         asset,
                         &inserted.side,
                         inserted.quantity.abs(),
                         inserted.chandelier_stop_price,
                         None,
                     ) {
-                        let _ = self.db.set_trade_protective_stop_oid(tid, Some(&new_stop_oid));
+                        Ok(Some(new_stop_oid)) => {
+                            let _ = self
+                                .db
+                                .set_trade_protective_stop_oid(tid, Some(&new_stop_oid));
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                trade_id = tid,
+                                symbol = %asset.symbol,
+                                "PROTECTIVE_STOP_SYNC_FAILED: initial stop returned no oid"
+                            );
+                            let _ = self.db.log_telemetry(
+                                "WARNING",
+                                "engine.execution",
+                                &format!(
+                                    "PROTECTIVE_STOP_SYNC_FAILED: initial entry trade {} ({}) returned no protective stop oid",
+                                    tid, asset.symbol
+                                ),
+                                Some(json!({
+                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                    "book": "PIT",
+                                    "phase": "initial_entry",
+                                    "trade_id": tid,
+                                    "symbol": asset.symbol,
+                                })),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                trade_id = tid,
+                                symbol = %asset.symbol,
+                                error = %e,
+                                "PROTECTIVE_STOP_SYNC_FAILED on initial entry"
+                            );
+                            let _ = self.db.log_telemetry(
+                                "WARNING",
+                                "engine.execution",
+                                &format!(
+                                    "PROTECTIVE_STOP_SYNC_FAILED: initial entry trade {} ({}): {e}",
+                                    tid, asset.symbol
+                                ),
+                                Some(json!({
+                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                    "book": "PIT",
+                                    "phase": "initial_entry",
+                                    "trade_id": tid,
+                                    "symbol": asset.symbol,
+                                })),
+                            );
+                        }
                     }
                 }
                 open_symbols.insert(asset.symbol.clone());
@@ -1033,12 +1200,15 @@ impl ExecutionEngine {
 
         for t in &active_trades {
             let notional = t.quantity.abs() * t.current_price;
-            let stop_px = if t.chandelier_stop_price > 0.0 {
-                t.chandelier_stop_price
-            } else {
-                t.initial_stop_price
-            };
-            let risk = (t.entry_price - stop_px).abs() * t.quantity.abs();
+            let risk = aegis_core::effective_position_open_heat_usdc(
+                t.side.as_str(),
+                t.entry_price,
+                t.initial_stop_price,
+                (t.chandelier_stop_price > 0.0).then_some(t.chandelier_stop_price),
+                t.quantity,
+                t.risk_budget_usdc,
+                t.funding_accrued_usdc,
+            );
             deployed_notional += notional;
             portfolio_heat += risk;
             total_upnl += t.unrealized_pnl_usdc + t.funding_accrued_usdc;
@@ -1117,9 +1287,7 @@ impl ExecutionEngine {
                     .get("accrued_yield_usdc")
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
-                let perp_eq_now = vault_state
-                    .get("perp_equity_usdc")
-                    .and_then(Value::as_f64);
+                let perp_eq_now = vault_state.get("perp_equity_usdc").and_then(Value::as_f64);
 
                 basis_notional = round_dp(vault_eq_now, 2);
                 accrued_yield_usdc = round_dp(vault_yield_now, 4);
@@ -1146,9 +1314,10 @@ impl ExecutionEngine {
                 total_equity = prev_snap.total_equity_usdc.min(accounting_eq);
             }
         } else {
-            let available_cash = (initial_equity + realized_after + total_upnl + accrued_yield_usdc
-                - deployed_notional)
-                .max(0.0);
+            let available_cash =
+                (initial_equity + realized_after + total_upnl + accrued_yield_usdc
+                    - deployed_notional)
+                    .max(0.0);
             let basis_rates: Vec<f64> = evaluations
                 .iter()
                 .filter(|e| e.signal_action == "BASIS_HARVEST")
@@ -1173,8 +1342,10 @@ impl ExecutionEngine {
                     accrued_yield_usdc = round_dp(accrued_yield_usdc + yield_delta, 4);
                 }
             }
-            total_equity =
-                round_dp(initial_equity + realized_after + total_upnl + accrued_yield_usdc, 2);
+            total_equity = round_dp(
+                initial_equity + realized_after + total_upnl + accrued_yield_usdc,
+                2,
+            );
         }
 
         let pond_deployed_now: f64 = if !is_backtest && (mode == "LIVE" || mode == "TESTNET") {
@@ -1226,9 +1397,12 @@ impl ExecutionEngine {
         self.db.save_portfolio_snapshot(&snap)?;
 
         if !is_backtest {
-            let _ = self
-                .alerts
-                .check_and_alert_regime_flip(&hmm_regime, prob_bull, prob_bear, prob_chop);
+            let _ = self.alerts.check_and_alert_regime_flip(
+                &hmm_regime,
+                prob_bull,
+                prob_bear,
+                prob_chop,
+            );
             let _ = self.alerts.check_and_alert_daily_drawdown(total_equity);
         }
 

@@ -241,7 +241,10 @@ impl SignalEngine {
             }
         }
 
-        let k = scfg.mace_target_horizon_bars.max(1).min(n.saturating_sub(1));
+        let k = scfg
+            .mace_target_horizon_bars
+            .max(1)
+            .min(n.saturating_sub(1));
         let mut y_target = vec![0.0; n];
         for i in 0..(n - k) {
             y_target[i] = scfg.snr_synth_weight * (s_close[i + k] / s_close[i]).ln()
@@ -383,8 +386,14 @@ impl SignalEngine {
                 let x_train = &x_raw[train_start..train_end];
                 let y_train = &y_target[train_start..train_end];
                 let (rw, rb) = fit_ridge_l2(x_train, y_train, ridge_alpha);
-                let trees =
-                    fit_random_forest(x_train, y_train, rf_trees, rf_max_depth, rf_min_leaf, rf_seed);
+                let trees = fit_random_forest(
+                    x_train,
+                    y_train,
+                    rf_trees,
+                    rf_max_depth,
+                    rf_min_leaf,
+                    rf_seed,
+                );
                 let y_sd = sample_std(y_train, 0);
                 active_ridge_w = rw;
                 active_ridge_b = rb;

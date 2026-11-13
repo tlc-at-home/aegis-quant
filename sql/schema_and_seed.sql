@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Aegis Quant (v0.3.0-rc1) — Consolidated Canonical SQLite WAL Schema & Seed Build Script
 -- Target DB Path: /home/fedora/aegis/data/aegis_quant.db
--- Consolidates base schema + migrations 001..014 into one idempotent build script.
+-- Consolidates base schema + migrations 001..015 into one idempotent build script.
 -- =============================================================================
 
 PRAGMA busy_timeout = 15000;
@@ -558,7 +558,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('environment', 'sandbox', 'string', 'platform', 'Deployment target environment (sandbox or production)'),
     ('execution_mode', 'PAPER', 'string', 'platform', 'Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing'),
     ('exchange_id', 'hyperliquid', 'string', 'platform', 'CCXT async exchange identifier (Hyperliquid L1 CLOB)'),
-    ('schema_version', '14', 'int', 'platform', 'Current SQLite schema migration version'),
+    ('schema_version', '15', 'int', 'platform', 'Current SQLite schema migration version'),
 
     -- Web3 DEX & AI Credentials
     ('wallet_address', '', 'string', 'credentials', 'Main Arbitrum Wallet Address holding USDC collateral'),
@@ -959,7 +959,24 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('alert_max_queue_size', '256', 'int', 'alerts', 'Bounded channel capacity for background alert dispatch worker'),
     ('alert_worker_queue_capacity', '256', 'int', 'alerts', 'Bounded channel capacity alias for background alert dispatch worker'),
     ('alerts_retry_queue_capacity', '64', 'int', 'alerts', 'Bounded retry queue capacity for failed webhook alert deliveries'),
-    ('telemetry_queue_capacity', '2048', 'int', 'telemetry', 'Bounded channel capacity for background SQLite telemetry log writer');
+    ('telemetry_queue_capacity', '2048', 'int', 'telemetry', 'Bounded channel capacity for background SQLite telemetry log writer'),
+    -- Round 15 Telemetry & Remediation Defaults (`v15`)
+    ('hmm_intrabar_enter_margin', '0.03', 'float', 'hmm', 'Additional posterior probability margin required for intrabar HMM regime hysteresis switches (LT-5)'),
+    ('alert_regime_flip_confirm_cycles', '2', 'int', 'alerts', 'Consecutive cycles required before dispatching a RegimeFlip alert unless posterior >= 0.70 (LT-5)'),
+    ('hlp_vault_auto_rebalance_enabled', 'true', 'bool', 'execution', 'Automatically withdraw unlocked excess HLP vault equity back to Perps margin when above allocation cap (LT-3)'),
+    ('hlp_vault_max_equity_pct', '0.20', 'float', 'execution', 'Maximum fraction of total live wallet equity allowed in the HLP vault before auto-rebalancing excess back to Perps margin (LT-3)'),
+    ('hlp_vault_last_rebalance_ms', '0', 'int', 'execution', 'Epoch timestamp (ms) of the last automated HLP vault rebalance withdrawal (LT-3)'),
+    ('hlp_vault_locked_until_ms', '0', 'int', 'execution', 'Epoch timestamp (ms) until which Hyperliquid HLP vault shares remain locked (LT-3)'),
+    ('backtest_entry_slippage_bps', '2.0', 'float', 'system', 'Adverse entry execution slippage in basis points modeled by default in Book A backtest (ME-1)'),
+    ('backtest_prefer_maker_entries', 'false', 'bool', 'system', 'Opt-in to simulate Book A backtest entries as passive maker orders instead of taker IOCs (ME-1)'),
+    ('backtest_scale_4h_stops', 'true', 'bool', 'system', 'Scale tight intraday Chandelier trailing stops to 4H candle resolution in Book A backtest (ME-2)'),
+    ('backtest_use_calibrated_stop_profile', 'false', 'bool', 'system', 'Opt-in to substitute the calibrated 2.0x/3.0x ATR stop profile in backtest runs (ME-2)'),
+    ('risk_max_other_cluster_pct', '0.25', 'float', 'risk', 'Maximum same-direction notional fraction of book equity for unmapped OTHER-cluster assets (R15-QA(e))'),
+    ('web_trust_proxy_headers', 'false', 'bool', 'security', 'Trust X-Forwarded-For / X-Real-IP headers for login rate-limiting only when explicitly behind a reverse proxy (ME-14)'),
+    ('web_allow_query_token_sse', 'false', 'bool', 'security', 'Allow legacy ?token= query-string authentication on /api/v1/stream SSE endpoint (Table 3 #6)'),
+    ('backup_max_age_hours', '36', 'int', 'system', 'Maximum allowed age in hours of the newest SQLite backup for DEPLOY-03 readiness (ME-19)'),
+    ('last_sqlite_backup_ms', '0', 'int', 'system', 'Epoch timestamp (ms) of the most recent automated or manual SQLite backup (R15-N10)'),
+    ('pond_exit_attempt_counts_json', '{}', 'json', 'pond', 'Persisted per-cell exit retry counters surviving daemon restarts (Table 3 #13)');
 
 DELETE FROM system_config WHERE config_key IN (
     'discord_webhook_url',
@@ -1167,11 +1184,23 @@ WHERE state IN ('OPEN', 'TRAILED')
       OR chandelier_stop IS NULL
   );
 
+-- 6f. Round 15 Remediation & Testnet Volume Floor Delivery (`R15-S2`)
+UPDATE system_config
+SET config_value = '1000.0',
+    description = 'Minimum 24h USDC volume floor for Pond universe admission on Hyperliquid Testnet',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE config_key = 'pond_testnet_min_vol_cap_usdc'
+  AND (
+      CAST(config_value AS REAL) < 1000.0
+      OR ABS(CAST(config_value AS REAL) - 5000.0) < 1e-6
+  )
+  AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 15);
+
 -- -----------------------------------------------------------------------------
--- 7. Record Consolidated Schema Versions (1..14)
+-- 7. Record Consolidated Schema Versions (1..15)
 -- -----------------------------------------------------------------------------
 UPDATE system_config
-SET config_value = '14',
+SET config_value = '15',
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE config_key = 'schema_version';
 
@@ -1189,4 +1218,5 @@ INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description) V
     (11, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v11: Chandelier Tight-Trail & Break-Even Lock'),
     (12, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v12: Testnet Faucet Offset Config'),
     (13, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v13: Two-Tier Chandelier 2.2x ATR & Pond 6% Stop Cap'),
-    (14, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v14: Pond NPS-01 Post-Mortem & Round 14 Remediation');
+    (14, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v14: Pond NPS-01 Post-Mortem & Round 14 Remediation'),
+    (15, CAST(strftime('%s', 'now') AS INTEGER), 'v15_round15_remediation_and_testnet_vol_floor');

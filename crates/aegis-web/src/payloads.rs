@@ -376,7 +376,6 @@ pub struct DbBackupRequestPayload {
 pub struct DbBackupTriggerResponse {
     pub status: &'static str,
     pub backup: Value,
-    pub dashboard: FullDashboardPayload,
 }
 
 pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
@@ -442,8 +441,9 @@ pub fn map_err_response(err: anyhow::Error) -> Response {
                     StatusCode::NOT_FOUND
                 }
             }
-            aegis_core::AegisError::SecurityViolation(_)
-            | aegis_core::AegisError::Firewall(_) => StatusCode::FORBIDDEN,
+            aegis_core::AegisError::SecurityViolation(_) | aegis_core::AegisError::Firewall(_) => {
+                StatusCode::FORBIDDEN
+            }
             aegis_core::AegisError::Crypto(_)
             | aegis_core::AegisError::Database(_)
             | aegis_core::AegisError::Provenance(_)
@@ -499,27 +499,25 @@ pub fn build_portfolio_payload(db: &DatabaseManager) -> Result<PortfolioDashboar
     let fallback_pit_init =
         cfg.get_f64("pit_initial_capital_usdc", round_dp(init_eq * split_pct, 2));
 
-    let pit_pnl = db
-        .compute_pit_pnl_components()
-        .unwrap_or(PitPnlComponents {
-            initial_capital_usdc: fallback_pit_init,
-            closed_realized_pnl_usdc: 0.0,
-            partial_realized_pnl_usdc: 0.0,
-            realized_pnl_usdc: 0.0,
-            unrealized_pnl_usdc: 0.0,
-            funding_pnl_usdc: 0.0,
-            open_fees_usdc: 0.0,
-            yield_pnl_usdc: 0.0,
-            total_net_pnl_usdc: 0.0,
-            transfer_adj_usdc: 0.0,
-            book_equity_usdc: fallback_pit_init,
-            idle_usdc: fallback_pit_init,
-            deployed_notional_usdc: 0.0,
-            resting_notional_usdc: 0.0,
-            heat_usdc: 0.0,
-            open_positions_count: 0,
-            resting_positions_count: 0,
-        });
+    let pit_pnl = db.compute_pit_pnl_components().unwrap_or(PitPnlComponents {
+        initial_capital_usdc: fallback_pit_init,
+        closed_realized_pnl_usdc: 0.0,
+        partial_realized_pnl_usdc: 0.0,
+        realized_pnl_usdc: 0.0,
+        unrealized_pnl_usdc: 0.0,
+        funding_pnl_usdc: 0.0,
+        open_fees_usdc: 0.0,
+        yield_pnl_usdc: 0.0,
+        total_net_pnl_usdc: 0.0,
+        transfer_adj_usdc: 0.0,
+        book_equity_usdc: fallback_pit_init,
+        idle_usdc: fallback_pit_init,
+        deployed_notional_usdc: 0.0,
+        resting_notional_usdc: 0.0,
+        heat_usdc: 0.0,
+        open_positions_count: 0,
+        resting_positions_count: 0,
+    });
     let pit_init = pit_pnl.initial_capital_usdc;
     let pit_eq = pit_pnl.book_equity_usdc;
     let pit_idle = pit_pnl.idle_usdc;
@@ -711,32 +709,32 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
     let pond_orch = PondOrchestrator::new(db.clone(), None);
     let pond_cfg = pond_orch.load_pond_config()?;
     let fallback_init_cap = round_dp(pond_cfg.pond_baseline_equity_usdc.max(1.0), 2);
-    let (pond_pnl, mut mark_cache) = db
-        .compute_pond_pnl_components_with_marks()
-        .unwrap_or_else(|_| {
-            (
-                PondPnlComponents {
-                    initial_capital_usdc: fallback_init_cap,
-                    closed_realized_pnl_usdc: 0.0,
-                    partial_realized_pnl_usdc: 0.0,
-                    realized_pnl_usdc: 0.0,
-                    unrealized_pnl_usdc: 0.0,
-                    funding_pnl_usdc: 0.0,
-                    open_fees_usdc: 0.0,
-                    yield_pnl_usdc: 0.0,
-                    total_net_pnl_usdc: 0.0,
-                    transfer_adj_usdc: 0.0,
-                    book_equity_usdc: fallback_init_cap,
-                    idle_usdc: fallback_init_cap,
-                    deployed_notional_usdc: 0.0,
-                    resting_notional_usdc: 0.0,
-                    heat_usdc: 0.0,
-                    open_positions_count: 0,
-                    resting_positions_count: 0,
-                },
-                HashMap::new(),
-            )
-        });
+    let (pond_pnl, mut mark_cache) =
+        db.compute_pond_pnl_components_with_marks()
+            .unwrap_or_else(|_| {
+                (
+                    PondPnlComponents {
+                        initial_capital_usdc: fallback_init_cap,
+                        closed_realized_pnl_usdc: 0.0,
+                        partial_realized_pnl_usdc: 0.0,
+                        realized_pnl_usdc: 0.0,
+                        unrealized_pnl_usdc: 0.0,
+                        funding_pnl_usdc: 0.0,
+                        open_fees_usdc: 0.0,
+                        yield_pnl_usdc: 0.0,
+                        total_net_pnl_usdc: 0.0,
+                        transfer_adj_usdc: 0.0,
+                        book_equity_usdc: fallback_init_cap,
+                        idle_usdc: fallback_init_cap,
+                        deployed_notional_usdc: 0.0,
+                        resting_notional_usdc: 0.0,
+                        heat_usdc: 0.0,
+                        open_positions_count: 0,
+                        resting_positions_count: 0,
+                    },
+                    HashMap::new(),
+                )
+            });
     let init_cap = pond_pnl.initial_capital_usdc;
     let pond_eq = pond_pnl.book_equity_usdc;
     let pond_idle = pond_pnl.idle_usdc;
@@ -747,7 +745,9 @@ pub fn build_pond_payload(db: &DatabaseManager) -> Result<PondDashboardPayload> 
 
     let mut universe = db.get_pond_universe(false)?;
     if universe.is_empty() {
-        universe = pond_orch.initialize_or_refresh_universe().unwrap_or_default();
+        universe = pond_orch
+            .initialize_or_refresh_universe()
+            .unwrap_or_default();
     }
     let universe_active_count = universe.iter().filter(|u| u.status == "ACTIVE").count();
     let scan_cycles = db.get_recent_pond_scan_cycles(20)?;
@@ -840,27 +840,23 @@ pub fn build_pp50_payload_with_books(
     let total_eq = round_dp(pit_eq + pond_eq, 2);
     let drift_bps = round_dp(compute_drift_bps(pit_eq, total_eq, split_pct), 2);
 
-    let latest_snapshot = db
-        .get_latest_pp50_platform_snapshot()
-        .ok()
-        .map(|mut snap| {
-            if snap.snapshot_id.is_none() {
-                snap.platform_equity_usdc = total_eq;
-                snap.pit_equity_usdc = pit_eq;
-                snap.pond_equity_usdc = pond_eq;
-                snap.drift_bps = drift_bps;
-                snap.pit_open_count = pit_portfolio.open_positions_count as i64;
-                snap.pond_open_cells = pond_status.open_cells.len() as i64;
-                if settling_in_progress {
-                    snap.settling_status = "IN_PROGRESS".to_string();
-                } else if let Some(last_tx) = transfers.first() {
-                    snap.settling_status = last_tx.status.clone();
-                }
+    let latest_snapshot = db.get_latest_pp50_platform_snapshot().ok().map(|mut snap| {
+        if snap.snapshot_id.is_none() {
+            snap.platform_equity_usdc = total_eq;
+            snap.pit_equity_usdc = pit_eq;
+            snap.pond_equity_usdc = pond_eq;
+            snap.drift_bps = drift_bps;
+            snap.pit_open_count = pit_portfolio.open_positions_count as i64;
+            snap.pond_open_cells = pond_status.open_cells.len() as i64;
+            if settling_in_progress {
+                snap.settling_status = "IN_PROGRESS".to_string();
+            } else if let Some(last_tx) = transfers.first() {
+                snap.settling_status = last_tx.status.clone();
             }
-            snap
-        });
-    let recent_snapshots: Vec<Pp50PlatformSnapshot> =
-        latest_snapshot.clone().into_iter().collect();
+        }
+        snap
+    });
+    let recent_snapshots: Vec<Pp50PlatformSnapshot> = latest_snapshot.clone().into_iter().collect();
 
     let total_pnl = round_dp(pit_portfolio.total_pnl_usdc + pond_status.total_pnl_usdc, 4);
     let total_pnl_pct = if platform_init > 0.0 {

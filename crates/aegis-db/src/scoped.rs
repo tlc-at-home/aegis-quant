@@ -145,7 +145,8 @@ impl PondConfig {
             pond_execution_mode: cfg.get_str("pond_execution_mode", "PAPER"),
             pond_direction_policy: policy,
             pond_universe_target_size: cfg.get_usize("pond_universe_target_size", 80),
-            pond_universe_refresh_weekday: cfg.get_i64("pond_universe_refresh_weekday", 0).max(0) as u32,
+            pond_universe_refresh_weekday: cfg.get_i64("pond_universe_refresh_weekday", 0).max(0)
+                as u32,
             pond_universe_delist_rank: cfg.get_usize("pond_universe_delist_rank", 95),
             pond_universe_warmup_hours: cfg.get_i64("pond_universe_warmup_hours", 168),
             pond_min_daily_volume_usdc: cfg.get_f64("pond_min_daily_volume_usdc", 50_000.0),
@@ -164,14 +165,16 @@ impl PondConfig {
             pond_min_norm_hold_hours: cfg.get_f64("pond_min_norm_hold_hours", 6.0),
             pond_trend_veto_ema_fast: cfg.get_usize("pond_trend_veto_ema_fast", 16),
             pond_trend_veto_ema_slow: cfg.get_usize("pond_trend_veto_ema_slow", 64),
-            pond_trend_veto_overextension_pct: cfg.get_f64("pond_trend_veto_overextension_pct", 0.08),
+            pond_trend_veto_overextension_pct: cfg
+                .get_f64("pond_trend_veto_overextension_pct", 0.08),
             pond_liquidity_score_ref_usdc: cfg.get_f64("pond_liquidity_score_ref_usdc", 250_000.0),
             pond_max_concurrent_cells: cfg.get_usize("pond_max_concurrent_cells", 8),
             pond_max_opens_per_cycle: cfg.get_usize("pond_max_opens_per_cycle", 3),
             pond_max_hold_hours: cfg.get_i64("pond_max_hold_hours", 72),
             pond_cooldown_hours: cfg.get_i64("pond_cooldown_hours", 24),
             pond_stop_cooldown_hours: cfg.get_i64("pond_stop_cooldown_hours", 56),
-            pond_baseline_equity_usdc: initial_eq * (1.0 - cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)),
+            pond_baseline_equity_usdc: initial_eq
+                * (1.0 - cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90)),
             pond_baseline_risk_usdc: cfg.get_f64("pond_baseline_risk_usdc", 50.0),
             pond_min_risk_usdc: cfg.get_f64("pond_min_risk_usdc", 25.0),
             pond_max_risk_usdc: cfg.get_f64("pond_max_risk_usdc", 75.0),
@@ -187,7 +190,8 @@ impl PondConfig {
             pond_ohlcv_retention_days: cfg.get_i64("pond_ohlcv_retention_days", 30),
             pond_champion_active: cfg.get_str("pond_champion_active", "NPS-01"),
             pond_champion_recrown_margin_pct: cfg.get_f64("pond_champion_recrown_margin_pct", 10.0),
-            pond_universe_refresh_interval_hours: cfg.get_i64("pond_universe_refresh_interval_hours", 24),
+            pond_universe_refresh_interval_hours: cfg
+                .get_i64("pond_universe_refresh_interval_hours", 24),
             pond_atr_period: cfg.get_usize("pond_atr_period", 14),
             pond_gate5_parabolic_3h_atr_mult: cfg.get_f64("pond_gate5_parabolic_3h_atr_mult", 2.2),
             pond_gate6_atr_4h_floor_mult: cfg.get_f64("pond_gate6_atr_4h_floor_mult", 1.8),
@@ -275,7 +279,10 @@ impl BookScopedDb {
     }
 
     /// Enforces configuration key namespace isolation (Invariant F4).
-    pub fn check_config_key_access(&self, config_key: &str) -> std::result::Result<(), FirewallError> {
+    pub fn check_config_key_access(
+        &self,
+        config_key: &str,
+    ) -> std::result::Result<(), FirewallError> {
         let normalized = config_key.trim().to_ascii_lowercase();
         match self.book {
             BookType::Pit => {
@@ -384,7 +391,8 @@ impl BookScopedDb {
             BookType::Pit => self.check_table_access("trades")?,
             BookType::Pond => self.check_table_access("pond_cells")?,
         }
-        self.pool.get_net_book_transfer_adjustment(self.book.as_str())
+        self.pool
+            .get_net_book_transfer_adjustment(self.book.as_str())
     }
 
     // --- Book A (Pit) Scoped Methods ---

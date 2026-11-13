@@ -8,8 +8,8 @@ use aegis_alerts::AlertEngine;
 use aegis_backtest::BacktestEngine;
 use aegis_core::{
     resolve_project_root, round_dp, validate_evm_address, validate_private_key,
-    verify_data_provenance, AegisError, CheckResult, PortfolioSnapshot, Result,
-    PLATFORM_VERSION, SENSITIVE_CONFIG_KEYS,
+    verify_data_provenance, AegisError, CheckResult, PortfolioSnapshot, Result, PLATFORM_VERSION,
+    SENSITIVE_CONFIG_KEYS,
 };
 use aegis_db::{
     fernet::{
@@ -120,7 +120,7 @@ enum Commands {
         /// Force drop and recreate schema tables during `--init`
         #[arg(long)]
         force: bool,
-        /// Apply pending versioned SQL migrations (`sql/migrations/001..010_*.sql`)
+        /// Apply pending compiled Rust migrations & align schema to canonical `sql/schema_and_seed.sql` (v15) (`R15-N11`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -151,6 +151,12 @@ enum Commands {
         /// Create an online atomic SQLite backup via `VACUUM INTO` and prune expired backups (`ME-19`)
         #[arg(long)]
         backup: bool,
+        /// Restore active SQLite database from an existing verified `.db` backup file (`ME-19`)
+        #[arg(long)]
+        restore: Option<PathBuf>,
+        /// Required confirmation flag for destructive `--restore` operations (`ME-19`)
+        #[arg(long)]
+        confirm: bool,
     },
     /// Run isolated `:memory:` point-in-time historical backtest and print Tear Sheet
     Backtest {
@@ -197,14 +203,14 @@ pub fn parse_and_validate_initial_split(raw: &str) -> Result<(f64, f64)> {
             "Invalid --initial-split '{raw}': expected '<PIT_USDC>:<POND_USDC>' (e.g. 5000:5000)"
         )));
     }
-    let pit = parts[0]
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| AegisError::Validation(format!("Invalid PIT value in --initial-split '{raw}': {e}")))?;
-    let pond = parts[1]
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| AegisError::Validation(format!("Invalid POND value in --initial-split '{raw}': {e}")))?;
+    let pit = parts[0].trim().parse::<f64>().map_err(|e| {
+        AegisError::Validation(format!("Invalid PIT value in --initial-split '{raw}': {e}"))
+    })?;
+    let pond = parts[1].trim().parse::<f64>().map_err(|e| {
+        AegisError::Validation(format!(
+            "Invalid POND value in --initial-split '{raw}': {e}"
+        ))
+    })?;
     if !pit.is_finite() || !pond.is_finite() || pit <= 0.0 || pond <= 0.0 {
         return Err(AegisError::Validation(format!(
             "Invalid --initial-split '{raw}': PIT and POND values must both be finite positive numbers (> 0.0)"
@@ -252,6 +258,30 @@ pub fn validate_bind_host(
     }
 }
 
+fn latest_disk_backup_mtime_ms(backup_dir: &std::path::Path) -> Option<i64> {
+    let entries = fs::read_dir(backup_dir).ok()?;
+    let mut newest_ms: Option<i64> = None;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if !name.starts_with("aegis_quant_") || !name.ends_with(".db") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    let ms = dur.as_millis() as i64;
+                    newest_ms = Some(newest_ms.map(|cur| cur.max(ms)).unwrap_or(ms));
+                }
+            }
+        }
+    }
+    newest_ms
+}
+
 /// Top-level orchestrator coordinating SQLite WAL, Book A (`PIT`), Book B (`POND`), and WebUI.
 pub struct AegisOrchestrator {
     pub db: DatabaseManager,
@@ -282,6 +312,27 @@ impl AegisOrchestrator {
         let pit = PitOrchestrator::new(db.clone(), Some(telemetry.clone()));
         let pond = PondOrchestrator::new(db.clone(), Some(telemetry.clone()));
         let now_ms = db.now_ms();
+        let initial_last_backup_ms = if db.is_memory {
+            None
+        } else {
+            let cfg_last = db
+                .load_config_opts(false)
+                .ok()
+                .map(|c| c.get_i64("last_sqlite_backup_ms", 0))
+                .unwrap_or(0);
+            let backup_dir = db
+                .db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("data"))
+                .join("backups");
+            let disk_last = latest_disk_backup_mtime_ms(&backup_dir).unwrap_or(0);
+            let eff = cfg_last.max(disk_last);
+            if eff > 0 {
+                Some(eff)
+            } else {
+                None
+            }
+        };
         Self {
             db,
             telemetry,
@@ -297,7 +348,7 @@ impl AegisOrchestrator {
             last_pond_4h_bucket: None,
             last_reconcile_ms: Some(now_ms),
             last_retention_prune_ms: Some(now_ms),
-            last_backup_ms: Some(now_ms),
+            last_backup_ms: initial_last_backup_ms,
             reconcile_error_streak: 0,
         }
     }
@@ -310,20 +361,26 @@ impl AegisOrchestrator {
     pub fn spawn_async_book_tasks(
         &self,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> (tokio::task::JoinHandle<Value>, tokio::task::JoinHandle<Value>) {
+    ) -> (
+        tokio::task::JoinHandle<Value>,
+        tokio::task::JoinHandle<Value>,
+    ) {
         let cfg = self
             .db
             .load_config_or_log_default("aegis-cli.spawn_async_book_tasks");
         let pit_sec = cfg.get_i64("pit_tick_interval_seconds", 900).max(1) as u64;
         let pond_sec = cfg.get_i64("pond_tick_interval_seconds", 15).max(1) as u64;
-        let pit_handle =
-            aegis_pit::spawn_pit_task(self.pit.clone(), pit_sec, shutdown_rx.clone());
-        let pond_handle =
-            aegis_pond::spawn_pond_task(self.pond.clone(), pond_sec, shutdown_rx);
+        let pit_handle = aegis_pit::spawn_pit_task(self.pit.clone(), pit_sec, shutdown_rx.clone());
+        let pond_handle = aegis_pond::spawn_pond_task(self.pond.clone(), pond_sec, shutdown_rx);
         (pit_handle, pond_handle)
     }
 
     pub fn initialize(&self, run_calibration: bool) -> Result<()> {
+        if !self.db.is_memory {
+            if let Err(e) = self.db.check_and_heal_wal_split_brain() {
+                tracing::warn!("WAL split-brain pre-init check warning: {e}");
+            }
+        }
         self.db.initialize_schema(false)?;
         if let Err(e) = self.db.prune_retention_data() {
             tracing::warn!("Startup retention pruning warning: {e}");
@@ -419,7 +476,9 @@ impl AegisOrchestrator {
                     &msg,
                     serde_json::to_value(&recon).ok(),
                 );
-                if self.reconcile_error_streak == 3 || self.reconcile_error_streak.is_multiple_of(20) {
+                if self.reconcile_error_streak == 3
+                    || self.reconcile_error_streak.is_multiple_of(20)
+                {
                     let _ = self.execution.alerts.notify_critical_event(
                         "EXCHANGE_RECONCILE_DEGRADED",
                         &msg,
@@ -459,17 +518,32 @@ impl AegisOrchestrator {
             self.last_retention_prune_ms = Some(now_ms);
         }
 
-        // ME-19: Automated daily SQLite VACUUM INTO backup & retention pruning (every 24h on disk DBs).
+        // ME-19 / R15-N10 / LT-4: Continuous WAL split-brain self-heal + shared daily SQLite VACUUM INTO backup across pit/pond restarts.
         if !self.db.is_memory {
-            let backup_due = self
-                .last_backup_ms
+            if let Err(e) = self.db.check_and_heal_wal_split_brain() {
+                tracing::warn!("WAL split-brain maintenance check warning: {e}");
+            }
+            let db_last_backup_ms = self
+                .db
+                .load_config_opts(false)
+                .ok()
+                .map(|c| c.get_i64("last_sqlite_backup_ms", 0))
+                .unwrap_or(0);
+            let eff_last = match (self.last_backup_ms, db_last_backup_ms > 0) {
+                (Some(local_ms), true) => Some(local_ms.max(db_last_backup_ms)),
+                (Some(local_ms), false) => Some(local_ms),
+                (None, true) => Some(db_last_backup_ms),
+                (None, false) => None,
+            };
+            self.last_backup_ms = eff_last;
+            let backup_due = eff_last
                 .map(|last| (now_ms - last) >= 86_400_000)
                 .unwrap_or(true);
             if backup_due {
                 if let Err(e) = self.db.create_sqlite_backup(None, None) {
                     tracing::warn!("Periodic SQLite VACUUM INTO backup warning: {e}");
                 }
-                self.last_backup_ms = Some(now_ms);
+                self.last_backup_ms = Some(self.db.now_ms());
             }
         }
     }
@@ -492,9 +566,9 @@ impl AegisOrchestrator {
         let ingest_stats = self.ingestion.ingest_universe(lookback_bars, false)?;
         let evaluations = self.signals.evaluate_universe(true)?;
         self.last_pit_cycle_ms = Some(self.db.now_ms());
-        let snapshot =
-            self.execution
-                .reconcile_cycle_with_options(&evaluations, false, frozen)?;
+        let snapshot = self
+            .execution
+            .reconcile_cycle_with_options(&evaluations, false, frozen)?;
         self.last_pit_cycle_ms = Some(self.db.now_ms());
         let pond_summary = self.run_pond_scheduled_step().ok().flatten();
         let split_pct = cfg.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
@@ -503,7 +577,9 @@ impl AegisOrchestrator {
             .compute_pit_equity_and_idle_usdc()
             .ok()
             .map(|(eq, _)| eq)
-            .unwrap_or_else(|| round_dp(cfg.get_f64("initial_equity_usdc", 10000.0) * split_pct, 2));
+            .unwrap_or_else(|| {
+                round_dp(cfg.get_f64("initial_equity_usdc", 10000.0) * split_pct, 2)
+            });
         let pond_eq_now = pond_summary
             .as_ref()
             .map(|s| s.pond_equity_usdc)
@@ -513,7 +589,12 @@ impl AegisOrchestrator {
                     .ok()
                     .map(|(eq, _)| eq)
             })
-            .unwrap_or_else(|| round_dp(cfg.get_f64("initial_equity_usdc", 10000.0) * (1.0 - split_pct), 2));
+            .unwrap_or_else(|| {
+                round_dp(
+                    cfg.get_f64("initial_equity_usdc", 10000.0) * (1.0 - split_pct),
+                    2,
+                )
+            });
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let mut actions_summary = std::collections::HashMap::<String, usize>::new();
@@ -752,13 +833,16 @@ pub fn run_readiness_suite(
         gate: "Gate 1: Database & Schema".to_string(),
         check_id: "DB-02".to_string(),
         name: "Schema Migration Version".to_string(),
-        status: if schema_ver >= 14 {
+        status: if schema_ver >= aegis_db::CANONICAL_SCHEMA_VERSION {
             "PASS".to_string()
         } else {
             "FAIL".to_string()
         },
         observed: format!("schema_version={schema_ver}"),
-        requirement: "schema_version >= 14 (canonical sql/schema_and_seed.sql applied)".to_string(),
+        requirement: format!(
+            "schema_version >= {} (canonical sql/schema_and_seed.sql applied)",
+            aegis_db::CANONICAL_SCHEMA_VERSION
+        ),
         remediation: "Run: aegis-quant db --init or aegis-quant db --migrate".to_string(),
     });
 
@@ -900,8 +984,9 @@ pub fn run_readiness_suite(
     let sha_path = project_root
         .join("data")
         .join("real_4h_backfill.json.sha256");
-    let prov_ok =
-        backfill_path.exists() && sha_path.exists() && verify_data_provenance(&backfill_path).unwrap_or(false);
+    let prov_ok = backfill_path.exists()
+        && sha_path.exists()
+        && verify_data_provenance(&backfill_path).unwrap_or(false);
     checks.push(CheckResult {
         gate: "Gate 2: Security & Key Mgmt".to_string(),
         check_id: "SEC-04".to_string(),
@@ -926,7 +1011,8 @@ pub fn run_readiness_suite(
     let single_usdc = cfg.get_f64("max_single_asset_notional_usdc", 2500.0);
     let gross_usdc = cfg.get_f64("max_gross_leverage_notional_usdc", 15000.0);
     let pit_book_eq = round_dp(init_eq * split_pct, 2);
-    let is_book_scaled = (heat_usdc - pit_book_eq * 0.04).abs() < (heat_usdc - init_eq * 0.04).abs();
+    let is_book_scaled =
+        (heat_usdc - pit_book_eq * 0.04).abs() < (heat_usdc - init_eq * 0.04).abs();
     let pit_ref_eq = if is_book_scaled { pit_book_eq } else { init_eq };
     let heat_ratio = heat_usdc / pit_ref_eq.max(1e-9);
     let single_ratio = single_usdc / pit_ref_eq.max(1e-9);
@@ -1071,8 +1157,7 @@ pub fn run_readiness_suite(
             "NormalOrder={}, SaturatedHeatOrder={} ({})",
             res_ok.approved, res_heat.approved, res_heat.reason
         ),
-        requirement: "Approves valid order <= 25% cap; rejects order when heat >= 4.0%"
-            .to_string(),
+        requirement: "Approves valid order <= 25% cap; rejects order when heat >= 4.0%".to_string(),
         remediation: "Inspect crates/aegis-risk/src/lib.rs evaluate_order_risk".to_string(),
     });
 
@@ -1082,7 +1167,8 @@ pub fn run_readiness_suite(
     let tg_tok = cfg.get_str("telegram_bot_token", "");
     let tg_chat = cfg.get_str("telegram_chat_id", "");
     let disc_url = cfg.get_str("discord_webhook_url", "");
-    let live_alerts_configured = (!tg_tok.is_empty() && !tg_chat.is_empty()) || !disc_url.is_empty();
+    let live_alerts_configured =
+        (!tg_tok.is_empty() && !tg_chat.is_empty()) || !disc_url.is_empty();
 
     let mut test_alert_engine = AlertEngine::new(mem_db.clone());
     let alert_res = test_alert_engine.run_test_alert(true)?;
@@ -1137,8 +1223,9 @@ pub fn run_readiness_suite(
             fsm_res.fsm_state,
             audit_rows.len()
         ),
-        requirement: "PENDING -> OPEN_ON_BOOK -> PARTIALLY_FILLED -> FILLED logged in order_state_audit"
-            .to_string(),
+        requirement:
+            "PENDING -> OPEN_ON_BOOK -> PARTIALLY_FILLED -> FILLED logged in order_state_audit"
+                .to_string(),
         remediation: "Inspect crates/aegis-execution/src/lib.rs execute_maker_limit_chaser"
             .to_string(),
     });
@@ -1158,9 +1245,7 @@ pub fn run_readiness_suite(
         check_id: "OPS-03".to_string(),
         name: "Exchange Position Drift Reconciliation".to_string(),
         status: if recon_ok { "PASS" } else { "FAIL" }.to_string(),
-        observed: format!(
-            "status={recon_status}, discrepancies_reconciled={recon_disc}",
-        ),
+        observed: format!("status={recon_status}, discrepancies_reconciled={recon_disc}",),
         requirement: "Automatically detects and reconciles orphan/phantom/size-drift positions"
             .to_string(),
         remediation: "Inspect crates/aegis-execution/src/lib.rs reconcile_exchange_state"
@@ -1187,14 +1272,15 @@ pub fn run_readiness_suite(
         let post_trades = db.get_recent_trades(1000)?.len();
         let isolation_ok = pre_trades == post_trades;
 
+        let stop_subs_disclosure = BacktestEngine::format_4h_stop_substitutions(&cfg);
         checks.push(CheckResult {
             gate: "Gate 5: Quant Acceptance".to_string(),
             check_id: "QUANT-01".to_string(),
             name: "Out-of-Sample Annualized Sharpe Ratio".to_string(),
             status: if ts.gate_sharpe_pass { "PASS" } else { "FAIL" }.to_string(),
             observed: format!(
-                "Sharpe = {:.2} (4H backtest replay uses 3.5x/3.8x ATR stop profile)",
-                ts.annualized_sharpe
+                "Sharpe = {:.2} (stop overrides: {})",
+                ts.annualized_sharpe, stop_subs_disclosure
             ),
             requirement: "Annualized Sharpe >= 1.20".to_string(),
             remediation: "Run walk-forward calibration: aegis-quant run --once --calibrate"
@@ -1257,8 +1343,9 @@ pub fn run_readiness_suite(
         } else {
             "deploy/aegis-settle.service missing or contains invalid --execute flag".to_string()
         },
-        requirement: "ExecStart invokes `aegis-quant settle` without invalid `--execute` flag (CR-1)"
-            .to_string(),
+        requirement:
+            "ExecStart invokes `aegis-quant settle` without invalid `--execute` flag (CR-1)"
+                .to_string(),
         remediation: "Update deploy/aegis-settle.service ExecStart".to_string(),
     });
 
@@ -1278,8 +1365,9 @@ pub fn run_readiness_suite(
         } else {
             "Missing Conflicts= directive on deploy/aegis-quant.service".to_string()
         },
-        requirement: "Systemd units prevent concurrent aegis-quant and aegis-pit/aegis-pond execution (HI-4)"
-            .to_string(),
+        requirement:
+            "Systemd units prevent concurrent aegis-quant and aegis-pit/aegis-pond execution (HI-4)"
+                .to_string(),
         remediation: "Add Conflicts= directives to deploy/aegis-*.service".to_string(),
     });
 
@@ -1291,19 +1379,46 @@ pub fn run_readiness_suite(
             .unwrap_or_else(|| std::path::Path::new("data"))
             .join("backups")
     };
-    let deploy03_ok = fs::create_dir_all(&backup_dir).is_ok();
+    let backup_dir_writable = fs::create_dir_all(&backup_dir).is_ok();
+    let max_age_hours = cfg.get_i64("backup_max_age_hours", 36).max(1);
+    let mut disk_latest_ms = latest_disk_backup_mtime_ms(&backup_dir).unwrap_or(0);
+    if backup_dir_writable && disk_latest_ms == 0 && !db.is_memory {
+        let _ = db.create_sqlite_backup(Some(&backup_dir), None);
+        disk_latest_ms = latest_disk_backup_mtime_ms(&backup_dir).unwrap_or(0);
+    }
+    let cfg_latest_ms = cfg.get_i64("last_sqlite_backup_ms", 0);
+    let newest_backup_ms = disk_latest_ms.max(cfg_latest_ms);
+    let now_ms = db.now_ms();
+    let backup_age_hours = if newest_backup_ms > 0 {
+        Some((now_ms.saturating_sub(newest_backup_ms) as f64) / 3_600_000.0)
+    } else {
+        None
+    };
+    let deploy03_ok = if db.is_memory {
+        backup_dir_writable
+    } else {
+        backup_dir_writable
+            && newest_backup_ms > 0
+            && now_ms.saturating_sub(newest_backup_ms) <= max_age_hours * 3_600_000
+    };
     checks.push(CheckResult {
         gate: "Gate 6: Deployment & Backup".to_string(),
         check_id: "DEPLOY-03".to_string(),
-        name: "SQLite VACUUM INTO Backup Directory".to_string(),
+        name: "SQLite VACUUM INTO Backup Freshness".to_string(),
         status: if deploy03_ok { "PASS" } else { "FAIL" }.to_string(),
         observed: format!(
-            "backup_dir={}, writable={deploy03_ok}",
-            backup_dir.display()
+            "backup_dir={}, writable={}, newest_age_hours={}, max_age_hours={}",
+            backup_dir.display(),
+            backup_dir_writable,
+            backup_age_hours
+                .map(|h| format!("{h:.2}"))
+                .unwrap_or_else(|| "none".to_string()),
+            max_age_hours
         ),
-        requirement: "Writable backup directory for automated/dashboard VACUUM INTO snapshots (ME-19)"
-            .to_string(),
-        remediation: format!("Ensure {} is writable", backup_dir.display()),
+        requirement: format!(
+            "Writable backup directory with verified snapshot <= {max_age_hours}h old (ME-19)"
+        ),
+        remediation: "Run: aegis-quant db --backup".to_string(),
     });
 
     let fail_count = checks.iter().filter(|c| c.status == "FAIL").count();
@@ -1320,9 +1435,7 @@ pub fn run_readiness_suite(
     let verdict = if is_go {
         format!("GO FOR {target_mode}")
     } else {
-        format!(
-            "NO-GO FOR {target_mode} ({fail_count} FAIL, {warn_count} WARN)"
-        )
+        format!("NO-GO FOR {target_mode} ({fail_count} FAIL, {warn_count} WARN)")
     };
 
     Ok((is_go, verdict, checks))
@@ -1360,6 +1473,21 @@ fn print_readiness_report(target_mode: &str, verdict: &str, checks: &[CheckResul
     println!("{}", "=".repeat(100));
 }
 
+fn execute_db_restore_cli(
+    db: &DatabaseManager,
+    restore_path: &std::path::Path,
+    confirm: bool,
+) -> anyhow::Result<PathBuf> {
+    if !confirm {
+        return Err(AegisError::Validation(
+            "Database restore overwrites active database; pass --confirm to proceed (ME-19)"
+                .to_string(),
+        )
+        .into());
+    }
+    Ok(db.restore_sqlite_backup(restore_path)?)
+}
+
 fn main() -> anyhow::Result<()> {
     aegis_telemetry::init_tracing();
 
@@ -1385,8 +1513,26 @@ fn main() -> anyhow::Result<()> {
             audit_dry_run_residue,
             reclassify_dry_run_before,
             backup,
+            restore,
+            confirm,
         }) => {
+            if let Some(restore_path) = restore {
+                let pre_snap = execute_db_restore_cli(&db, &restore_path, confirm)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "restored_from": restore_path.display().to_string(),
+                        "pre_restore_snapshot": pre_snap.display().to_string(),
+                        "target_db": db.db_path.display().to_string(),
+                    }))?
+                );
+                return Ok(());
+            }
             if backup {
+                if !db.is_memory {
+                    let _ = db.check_and_heal_wal_split_brain();
+                }
                 db.initialize_schema(false)?;
                 let res = db.create_sqlite_backup(None, None)?;
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -1679,7 +1825,10 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             }
         }
-        Some(Commands::Readiness { mode, skip_backtest }) => {
+        Some(Commands::Readiness {
+            mode,
+            skip_backtest,
+        }) => {
             let (is_go, verdict, checks) =
                 run_readiness_suite(&db, mode.as_deref(), skip_backtest)?;
             let target_mode = mode.unwrap_or_else(|| {
@@ -1876,10 +2025,7 @@ mod tests {
         assert!(validate_bind_host(&db, "0.0.0.0", false).is_err());
 
         // Non-loopback bind succeeds with explicit --allow-remote-bind flag or DB config
-        assert_eq!(
-            validate_bind_host(&db, "0.0.0.0", true).unwrap(),
-            "0.0.0.0"
-        );
+        assert_eq!(validate_bind_host(&db, "0.0.0.0", true).unwrap(), "0.0.0.0");
         db.set_config_value("web_allow_remote_bind", &json!(true))
             .unwrap();
         assert_eq!(
@@ -1908,7 +2054,9 @@ mod tests {
         assert_eq!(sec01.status, "PASS");
         let expected_keyfile = tmp_dir.join(".aegis_master_key");
         assert!(expected_keyfile.exists());
-        assert!(sec01.remediation.contains(&expected_keyfile.display().to_string()));
+        assert!(sec01
+            .remediation
+            .contains(&expected_keyfile.display().to_string()));
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -1988,10 +2136,7 @@ mod tests {
             "get_existing_web_api_token must not create or mutate an empty web_api_token (R4-N8)"
         );
         let generated = db.get_or_create_web_api_token().unwrap();
-        assert_eq!(
-            db.get_existing_web_api_token().unwrap(),
-            Some(generated)
-        );
+        assert_eq!(db.get_existing_web_api_token().unwrap(), Some(generated));
 
         // --initial-split validation (R3-H22: both halves must be finite and > 0.0)
         assert_eq!(
@@ -2086,8 +2231,7 @@ mod tests {
         orch.last_reconcile_ms = Some(t0 - 305_000);
         orch.maybe_run_maintenance(false);
         assert!(
-            orch.last_reconcile_ms.unwrap() > t0 - 305_000
-                && orch.last_reconcile_ms.unwrap() >= t0,
+            orch.last_reconcile_ms.unwrap() > t0 - 305_000 && orch.last_reconcile_ms.unwrap() >= t0,
             "Reconcile must trigger after 5 minutes elapsed wall-clock (R6-N1)"
         );
         assert_eq!(orch.last_retention_prune_ms.unwrap(), p0);
@@ -2107,8 +2251,7 @@ mod tests {
         orch.last_reconcile_ms = Some(t0 - 1_000);
         orch.maybe_run_maintenance(true);
         assert!(
-            orch.last_reconcile_ms.unwrap() > t0 - 1_000
-                && orch.last_reconcile_ms.unwrap() >= t0
+            orch.last_reconcile_ms.unwrap() > t0 - 1_000 && orch.last_reconcile_ms.unwrap() >= t0
         );
         let logs = db.get_recent_logs(20).unwrap();
         assert!(
@@ -2162,13 +2305,103 @@ mod tests {
         db.set_config_value("chandelier_trail_max_pct", &json!(0.20))
             .unwrap();
         let (_ok, _verdict, checks) = run_readiness_suite(&db, Some("PAPER"), true).unwrap();
-        let risk02_bad = checks
-            .iter()
-            .find(|c| c.check_id == "RISK-02")
-            .unwrap();
+        let risk02_bad = checks.iter().find(|c| c.check_id == "RISK-02").unwrap();
         assert_eq!(
             risk02_bad.status, "FAIL",
             "RISK-02 must FAIL when chandelier_atr_multiplier_long < 2.0 in classic trail mode (R7-N8)"
         );
+    }
+
+    #[test]
+    fn test_me19_r15_n10_n11_qa_c_deploy_checks_restore_cli_and_shared_backup_cadence() {
+        // 1. ME-19: --restore <PATH> --confirm CLI parsing & R15-N11 help string
+        let cli_restore = Cli::try_parse_from([
+            "aegis-quant",
+            "db",
+            "--restore",
+            "/tmp/snap.db",
+            "--confirm",
+        ])
+        .expect("parse --restore --confirm");
+        assert!(matches!(
+            cli_restore.command,
+            Some(Commands::Db {
+                restore: Some(_),
+                confirm: true,
+                ..
+            })
+        ));
+
+        // 2. R15-N10 & R15-QA(c): Disk DB shared backup cadence + auto-seed & freshness gate in DEPLOY-01..03
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_cli_r15_backup_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(false).unwrap();
+
+        // Cold orchestrator with zero backups starts with last_backup_ms == None so initial backup runs promptly
+        let mut orch_pit = AegisOrchestrator::new(db.clone());
+        assert_eq!(orch_pit.last_backup_ms, None);
+
+        // Readiness on disk DB auto-seeds initial backup & verifies DEPLOY-01..03 PASS + DB-02 PASS (schema >= 15)
+        let (_is_ok, _verdict, checks) = run_readiness_suite(&db, Some("PAPER"), true).unwrap();
+        let d1 = checks.iter().find(|c| c.check_id == "DEPLOY-01").unwrap();
+        let d2 = checks.iter().find(|c| c.check_id == "DEPLOY-02").unwrap();
+        let d3 = checks.iter().find(|c| c.check_id == "DEPLOY-03").unwrap();
+        let db02 = checks.iter().find(|c| c.check_id == "DB-02").unwrap();
+        assert_eq!(d1.status, "PASS");
+        assert_eq!(d2.status, "PASS");
+        assert_eq!(d3.status, "PASS");
+        assert_eq!(db02.status, "PASS");
+
+        // Second orchestrator (e.g. pond daemon) picks up `last_sqlite_backup_ms` from DB & does not duplicate backup
+        let orch_pond = AegisOrchestrator::new(db.clone());
+        assert!(orch_pond.last_backup_ms.is_some());
+        let db_backup_ts = db
+            .load_config_opts(false)
+            .unwrap()
+            .get_i64("last_sqlite_backup_ms", 0);
+        assert!(db_backup_ts > 0);
+        orch_pit.last_backup_ms = None;
+        orch_pit.maybe_run_maintenance(false);
+        assert_eq!(
+            orch_pit.last_backup_ms,
+            Some(db_backup_ts),
+            "R15-N10: shared SQLite timestamp prevents duplicate backups across pit/pond restarts"
+        );
+        let backup_count = std::fs::read_dir(tmp_dir.join("backups"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|s| s.starts_with("aegis_quant_") && s.ends_with(".db"))
+            })
+            .count();
+        assert_eq!(backup_count, 1);
+
+        // ME-19 CLI restore guard: --restore without --confirm must be rejected, and --confirm must restore
+        let backup_file = std::fs::read_dir(tmp_dir.join("backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with("aegis_quant_") && s.ends_with(".db"))
+            })
+            .unwrap();
+        let err = execute_db_restore_cli(&db, &backup_file, false).unwrap_err();
+        assert!(err.to_string().contains("--confirm"));
+        let pre_snap = execute_db_restore_cli(&db, &backup_file, true).unwrap();
+        assert!(pre_snap.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

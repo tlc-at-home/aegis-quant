@@ -230,9 +230,7 @@ mod tests {
 
         // Seed synthetic bars first so SOL/USDC:USDC has valid OHLCV bars
         let _ = orch.ingestion.ingest_universe(60, true).unwrap();
-        let bars = db
-            .get_ohlcv_bars("SOL/USDC:USDC", "4h", 5, None)
-            .unwrap();
+        let bars = db.get_ohlcv_bars("SOL/USDC:USDC", "4h", 5, None).unwrap();
         let last_bar = bars.last().unwrap();
 
         // Insert an open LONG trade whose Chandelier stop is above current bar low so it must trigger a stop exit

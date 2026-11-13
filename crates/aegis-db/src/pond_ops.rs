@@ -3,8 +3,9 @@
 
 use crate::DatabaseManager;
 use aegis_core::{
-    round_dp, AegisError, BookRow, BookTransfer, BookTransferStatus, PondCell, PondCellState,
-    PondChampion, PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, Result,
+    effective_pond_cell_open_heat_usdc, effective_position_open_heat_usdc, round_dp, AegisError,
+    BookRow, BookTransfer, BookTransferStatus, PondCell, PondCellState, PondChampion,
+    PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, Result,
 };
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
@@ -159,7 +160,11 @@ impl DatabaseManager {
                         added_at: r.get(10)?,
                         delisted_at: r.get(11)?,
                         reference_price: r.get::<_, Option<f64>>(12).ok().flatten().unwrap_or(0.0),
-                        is_synthetic_volume: r.get::<_, Option<i64>>(13).ok().flatten().unwrap_or(0),
+                        is_synthetic_volume: r
+                            .get::<_, Option<i64>>(13)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
                     })
                 })
                 .map_err(|e| AegisError::Database(e.to_string()))?;
@@ -322,7 +327,10 @@ impl DatabaseManager {
             closed_at: r.get("closed_at")?,
             cooldown_until: r.get("cooldown_until")?,
             updated_at: r.get("updated_at")?,
-            resting_order_id: r.get::<_, Option<String>>("resting_order_id").ok().flatten(),
+            resting_order_id: r
+                .get::<_, Option<String>>("resting_order_id")
+                .ok()
+                .flatten(),
         })
     }
 
@@ -893,7 +901,8 @@ impl DatabaseManager {
         fill_price: f64,
         fee_usdc: f64,
     ) -> Result<bool> {
-        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite() {
+        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite()
+        {
             return Ok(false);
         }
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -939,7 +948,8 @@ impl DatabaseManager {
         actual_fee_usdc: f64,
         estimated_fee_usdc: f64,
     ) -> Result<bool> {
-        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite() {
+        if fill_qty <= 0.0 || fill_price <= 0.0 || !fill_qty.is_finite() || !fill_price.is_finite()
+        {
             return Ok(false);
         }
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -978,11 +988,7 @@ impl DatabaseManager {
         })
     }
 
-    pub fn update_pond_cell_funding(
-        &self,
-        cell_id: i64,
-        funding_accrued_usdc: f64,
-    ) -> Result<()> {
+    pub fn update_pond_cell_funding(&self, cell_id: i64, funding_accrued_usdc: f64) -> Result<()> {
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         self.with_conn(|conn| {
             conn.execute(
@@ -1358,7 +1364,9 @@ impl DatabaseManager {
     /// `legs_completed > 0`, or stale `PENDING` rows exceeding `pending_transfer_stale_ttl_ms` (`R4-H1`, `R4-QB`).
     pub fn get_stranded_or_unresolved_book_transfers(&self) -> Result<Vec<BookTransfer>> {
         let cfg = self.load_config_opts(false).unwrap_or_default();
-        let stale_ttl_ms = cfg.get_i64("pending_transfer_stale_ttl_ms", 120_000).max(1_000);
+        let stale_ttl_ms = cfg
+            .get_i64("pending_transfer_stale_ttl_ms", 120_000)
+            .max(1_000);
         let cutoff_iso = chrono::DateTime::from_timestamp_millis(self.now_ms() - stale_ttl_ms)
             .unwrap_or_else(Utc::now)
             .format("%Y-%m-%dT%H:%M:%SZ")
@@ -1693,16 +1701,15 @@ impl DatabaseManager {
             raw_partial_realized += t.realized_pnl_usdc;
             raw_funding += t.funding_accrued_usdc;
             raw_fees += t.fees_paid_usdc;
-            let stop_px = if t.chandelier_stop_price > 0.0 {
-                t.chandelier_stop_price
-            } else {
-                t.initial_stop_price
-            };
-            if stop_px > 0.0 {
-                heat += (t.entry_price - stop_px).abs() * t.quantity.abs();
-            } else {
-                heat += t.risk_budget_usdc.max(0.0);
-            }
+            heat += effective_position_open_heat_usdc(
+                &t.side,
+                t.entry_price,
+                t.initial_stop_price,
+                (t.chandelier_stop_price > 0.0).then_some(t.chandelier_stop_price),
+                t.quantity,
+                t.risk_budget_usdc,
+                t.funding_accrued_usdc,
+            );
         }
         for rt in &resting_trades {
             resting_notional += rt.notional_usdc.max(rt.quantity.abs() * rt.entry_price);
@@ -1792,7 +1799,10 @@ impl DatabaseManager {
                 0.0
             };
             open_deployed += c.notional_usdc.unwrap_or(0.0);
-            heat += c.risk_budget_usdc.unwrap_or(0.0);
+            heat += effective_pond_cell_open_heat_usdc(
+                c.risk_budget_usdc.unwrap_or(0.0),
+                c.funding_accrued_usdc,
+            );
             raw_upnl += round_dp(price_pnl, 4);
             // R3-H17 (NH-8): Include partial-exit realized_pnl_usdc on open/trailed cells
             raw_partial_realized += c.realized_pnl_usdc;

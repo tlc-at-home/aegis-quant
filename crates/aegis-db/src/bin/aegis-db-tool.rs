@@ -1,7 +1,7 @@
-//! Standalone SQLite WAL Schema v13 Migration & Verification CLI (`aegis-db-tool`).
+//! Standalone SQLite WAL Schema v15 Initialization & Verification CLI (`aegis-db-tool`).
 //!
 //! Usage:
-//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/migrations/013_v030_round12_remediation.sql`
+//!   `cargo run --bin aegis-db-tool -- --apply-migration sql/schema_and_seed.sql`
 
 use aegis_core::AegisError;
 use aegis_db::DatabaseManager;

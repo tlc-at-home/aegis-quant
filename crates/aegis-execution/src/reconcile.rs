@@ -316,10 +316,7 @@ impl ExecutionEngine {
                 .to_uppercase();
             *pond_qty_by_coin.entry(coin.clone()).or_insert(0.0) +=
                 cell.quantity.unwrap_or(0.0).abs();
-            pond_ids_by_coin
-                .entry(coin)
-                .or_default()
-                .push(cell.cell_id);
+            pond_ids_by_coin.entry(coin).or_default().push(cell.cell_id);
         }
         let initial_pond_qty_by_coin = pond_qty_by_coin.clone();
 
@@ -416,22 +413,57 @@ impl ExecutionEngine {
             match ex_positions.get(&coin) {
                 None => {
                     if !open_order_coins.contains(&coin) {
-                        // ME-7: Resolve exit price from latest mark/bar price and compute realized PnL
+                        // ME-7: Query recent `userFills` for actual closing fill & fee first, then
+                        // fall back to 1H close -> current_price -> stop -> entry_price, deducting
+                        // taker exit fee whenever actual fee is unavailable.
+                        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5).max(0.0);
+                        let exchange_exit =
+                            if simulated_exchange_positions.is_none() && mode != "PAPER" {
+                                self.query_recent_exit_fill_for_symbol(
+                                    &lt.symbol,
+                                    &lt.side,
+                                    &lt.opened_at,
+                                )
+                            } else {
+                                None
+                            };
                         let latest_bar_px = self
                             .db
                             .get_ohlcv_bars(&lt.symbol, "1h", 1, None)
                             .ok()
                             .and_then(|b| b.last().map(|bar| bar.close))
                             .unwrap_or(0.0);
-                        let exit_px = if lt.current_price > 0.0
-                            && (lt.current_price - lt.entry_price).abs() > 1e-9
-                        {
-                            lt.current_price
-                        } else if latest_bar_px > 0.0 {
-                            latest_bar_px
-                        } else {
-                            lt.current_price
-                        };
+                        let (exit_px, actual_or_est_exit_fee) =
+                            if let Some((fill_px, fill_fee)) = exchange_exit {
+                                let fee = if fill_fee > 0.0 {
+                                    fill_fee
+                                } else {
+                                    round_dp(
+                                        fill_px * lt.quantity.abs() * (taker_fee_bps / 10_000.0),
+                                        4,
+                                    )
+                                };
+                                (fill_px, fee)
+                            } else {
+                                let fallback_px = if latest_bar_px > 0.0 {
+                                    latest_bar_px
+                                } else if lt.current_price > 0.0 {
+                                    lt.current_price
+                                } else if lt.chandelier_stop_price > 0.0 {
+                                    lt.chandelier_stop_price
+                                } else if lt.initial_stop_price > 0.0 {
+                                    lt.initial_stop_price
+                                } else {
+                                    lt.entry_price
+                                };
+                                let est_fee = round_dp(
+                                    fallback_px.max(0.0)
+                                        * lt.quantity.abs()
+                                        * (taker_fee_bps / 10_000.0),
+                                    4,
+                                );
+                                (fallback_px, est_fee)
+                            };
                         let gross_pnl = if exit_px > 0.0 && lt.entry_price > 0.0 {
                             if lt.side.eq_ignore_ascii_case("LONG")
                                 || lt.side.eq_ignore_ascii_case("BUY")
@@ -443,16 +475,16 @@ impl ExecutionEngine {
                         } else {
                             0.0
                         };
+                        let total_fees = round_dp(lt.fees_paid_usdc + actual_or_est_exit_fee, 4);
                         let net_pnl = round_dp(
-                            lt.realized_pnl_usdc + gross_pnl - lt.fees_paid_usdc
-                                + lt.funding_accrued_usdc,
+                            lt.realized_pnl_usdc + gross_pnl - total_fees + lt.funding_accrued_usdc,
                             4,
                         );
                         if let Err(e) = self.db.close_trade(
                             lt.trade_id,
                             exit_px,
                             net_pnl,
-                            lt.fees_paid_usdc,
+                            total_fees,
                             "RECONCILED_CLOSED_ON_EXCHANGE",
                         ) {
                             tracing::error!(
@@ -462,12 +494,14 @@ impl ExecutionEngine {
                             );
                         }
                         let cur_qty = pit_qty_by_coin.get(&coin).copied().unwrap_or(0.0);
-                        pit_qty_by_coin.insert(coin.clone(), (cur_qty - lt.quantity.abs()).max(0.0));
+                        pit_qty_by_coin
+                            .insert(coin.clone(), (cur_qty - lt.quantity.abs()).max(0.0));
                         discrepancies.push(json!({
                             "type": "PHANTOM_LOCAL_CLOSED",
                             "base_asset": coin,
                             "trade_id": lt.trade_id,
                             "exit_price": exit_px,
+                            "exit_fee_usdc": actual_or_est_exit_fee,
                             "realized_pnl_usdc": net_pnl,
                         }));
                     }
@@ -556,10 +590,8 @@ impl ExecutionEngine {
                         ) {
                             Ok(true) => {
                                 size_reconciled = true;
-                                pit_qty_by_coin.insert(
-                                    coin.clone(),
-                                    other_pit_qty_on_coin + expected_pit_qty,
-                                );
+                                pit_qty_by_coin
+                                    .insert(coin.clone(), other_pit_qty_on_coin + expected_pit_qty);
                                 discrepancies.push(json!({
                                     "type": "SIZE_DRIFT_RECONCILED",
                                     "base_asset": coin,
@@ -820,8 +852,14 @@ impl ExecutionEngine {
                         .map(|oid| known_resting_oids.contains(&oid))
                         .unwrap_or(false);
                     let is_reduce_only_trigger_on_open_pos = ex_positions.contains_key(&coin)
-                        && ord.get("isTrigger").and_then(Value::as_bool).unwrap_or(false)
-                        && ord.get("reduceOnly").and_then(Value::as_bool).unwrap_or(false);
+                        && ord
+                            .get("isTrigger")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        && ord
+                            .get("reduceOnly")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                     if !is_known_resting_oid
                         && !is_reduce_only_trigger_on_open_pos
                         && (!open_pos_coins.contains(&coin) || ex_positions.contains_key(&coin))
@@ -865,6 +903,12 @@ impl ExecutionEngine {
                 &discrepancies,
                 &wallet,
             );
+        }
+
+        if simulated_exchange_positions.is_none() && simulated_open_orders.is_none() {
+            if let Err(e) = self.rebalance_hlp_vault_margin_if_needed() {
+                tracing::warn!(error = %e, "HLP vault margin auto-rebalance check failed (LT-3)");
+            }
         }
 
         ReconcileReport {
@@ -912,10 +956,7 @@ impl ExecutionEngine {
                 ),
                 Some(Value::Object(details.clone())),
             );
-            details.insert(
-                "type".to_string(),
-                json!("DUPLICATE_SAME_COIN_OPEN_ROWS"),
-            );
+            details.insert("type".to_string(), json!("DUPLICATE_SAME_COIN_OPEN_ROWS"));
             discrepancies.push(Value::Object(details));
         }
     }
@@ -932,15 +973,14 @@ impl ExecutionEngine {
     ) -> (f64, f64, f64) {
         let other_book_qty_on_coin = (current_book_coin_qty - row_qty).max(0.0);
         let residual_book_qty = (ex_qty - co_book_qty).max(0.0);
-        let expected_row_qty = if (current_book_coin_qty - residual_book_qty).abs() <= 1e-6
-            || is_last_on_coin
-        {
-            round_dp((residual_book_qty - other_book_qty_on_coin).max(0.0), 6)
-        } else if initial_book_coin_qty > 1e-9 {
-            round_dp(residual_book_qty * (row_qty / initial_book_coin_qty), 6)
-        } else {
-            0.0
-        };
+        let expected_row_qty =
+            if (current_book_coin_qty - residual_book_qty).abs() <= 1e-6 || is_last_on_coin {
+                round_dp((residual_book_qty - other_book_qty_on_coin).max(0.0), 6)
+            } else if initial_book_coin_qty > 1e-9 {
+                round_dp(residual_book_qty * (row_qty / initial_book_coin_qty), 6)
+            } else {
+                0.0
+            };
         (other_book_qty_on_coin, residual_book_qty, expected_row_qty)
     }
 }

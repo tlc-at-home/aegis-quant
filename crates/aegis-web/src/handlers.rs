@@ -1,5 +1,6 @@
 //! HTTP and SSE route handlers for `aegis-web`.
 
+pub use crate::payloads::validate_config_update;
 use crate::{
     constant_time_eq, extract_cookie_token, generate_ephemeral_session_token,
     payloads::{
@@ -18,8 +19,7 @@ use crate::{
 };
 use aegis_alerts::AlertEngine;
 use aegis_backtest::BacktestEngine;
-pub use crate::payloads::validate_config_update;
-use aegis_core::PLATFORM_VERSION;
+use aegis_core::{now_iso8601_utc, PLATFORM_VERSION};
 use aegis_execution::ExecutionEngine;
 use aegis_pit::PitOrchestrator;
 use aegis_pond::PondOrchestrator;
@@ -35,6 +35,8 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{convert::Infallible, time::Duration};
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 
@@ -75,24 +77,77 @@ pub async fn serve_app_js(State(state): State<AppState>) -> Response {
     resp
 }
 
+pub(crate) fn extract_client_ip_key(
+    headers: &axum::http::HeaderMap,
+    trust_proxy_headers: bool,
+) -> String {
+    if trust_proxy_headers {
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+    "local-direct".to_string()
+}
+
+pub(crate) fn prune_and_cap_login_failures(
+    failures: &mut std::collections::HashMap<String, (u32, std::time::Instant)>,
+    now: std::time::Instant,
+    window: Duration,
+    max_entries: usize,
+) {
+    failures.retain(|_, (_, ts)| now.saturating_duration_since(*ts) < window);
+    while failures.len() >= max_entries {
+        if let Some(oldest_key) = failures
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| k.clone())
+        {
+            failures.remove(&oldest_key);
+        } else {
+            break;
+        }
+    }
+}
+
 pub async fn api_auth_login(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<AuthLoginPayload>,
 ) -> Response {
-    let client_key = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("local").trim().to_string())
-        .unwrap_or_else(|| "local".to_string());
-
-    // ME-14: Rate-limit login failures (>= 5 failures within 60s -> 429 Too Many Requests)
+    let mut db_cfg = state.db.load_config_opts(false).unwrap_or_default();
+    if ["web_api_token", "dashboard_api_token"]
+        .iter()
+        .any(|k| db_cfg.get_str(k, "").trim().starts_with("enc:v1:"))
     {
+        db_cfg = state.db.load_config_opts(true).unwrap_or(db_cfg);
+    }
+    let trust_proxy_headers = db_cfg.get_bool("web_trust_proxy_headers", false);
+    let client_key = extract_client_ip_key(&headers, trust_proxy_headers);
+
+    // ME-14 / R15-N6: Prune expired windows & cap at 4,096 keys; block >= 5 failures within 60s
+    let window = Duration::from_secs(60);
+    {
+        let now = std::time::Instant::now();
         let mut failures = state.login_failures.lock();
+        prune_and_cap_login_failures(&mut failures, now, window, 4_096);
         if let Some((count, window_start)) = failures.get_mut(&client_key) {
-            if window_start.elapsed() > Duration::from_secs(60) {
+            if window_start.elapsed() > window {
                 *count = 0;
-                *window_start = std::time::Instant::now();
+                *window_start = now;
             } else if *count >= 5 {
                 let body = ApiErrorBody {
                     error: "Too Many Requests".to_string(),
@@ -106,12 +161,12 @@ pub async fn api_auth_login(
 
     let candidate = payload.token.trim().to_string();
     if candidate.is_empty() {
+        let now = std::time::Instant::now();
         let mut failures = state.login_failures.lock();
-        let entry = failures
-            .entry(client_key)
-            .or_insert_with(|| (0, std::time::Instant::now()));
-        if entry.1.elapsed() > Duration::from_secs(60) {
-            *entry = (1, std::time::Instant::now());
+        prune_and_cap_login_failures(&mut failures, now, window, 4_096);
+        let entry = failures.entry(client_key).or_insert_with(|| (0, now));
+        if entry.1.elapsed() > window {
+            *entry = (1, now);
         } else {
             entry.0 = entry.0.saturating_add(1);
         }
@@ -127,7 +182,6 @@ pub async fn api_auth_login(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let db_cfg = state.db.load_config_logged("aegis-web.api_auth_login");
     let db_token = ["web_api_token", "dashboard_api_token"]
         .into_iter()
         .map(|k| db_cfg.get_str(k, ""))
@@ -146,12 +200,12 @@ pub async fn api_auth_login(
         .any(|expected| constant_time_eq(&candidate, expected));
 
     if !is_valid {
+        let now = std::time::Instant::now();
         let mut failures = state.login_failures.lock();
-        let entry = failures
-            .entry(client_key)
-            .or_insert_with(|| (0, std::time::Instant::now()));
-        if entry.1.elapsed() > Duration::from_secs(60) {
-            *entry = (1, std::time::Instant::now());
+        prune_and_cap_login_failures(&mut failures, now, window, 4_096);
+        let entry = failures.entry(client_key).or_insert_with(|| (0, now));
+        if entry.1.elapsed() > window {
+            *entry = (1, now);
         } else {
             entry.0 = entry.0.saturating_add(1);
         }
@@ -180,9 +234,8 @@ pub async fn api_auth_login(
             .trim()
             .eq_ignore_ascii_case("production");
 
-    let mut cookie = format!(
-        "aegis_session={session_nonce}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400"
-    );
+    let mut cookie =
+        format!("aegis_session={session_nonce}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400");
     if cookie_secure {
         cookie.push_str("; Secure");
     }
@@ -233,7 +286,7 @@ pub async fn api_auth_logout(
 
 pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
     let schema_version = state.db.get_schema_version().unwrap_or(-1);
-    let cfg = state.db.load_config_logged("aegis-web.api_health");
+    let cfg = state.db.load_config_opts(false).unwrap_or_default();
     let exec_mode = cfg
         .get_str("execution_mode", "PAPER")
         .trim()
@@ -244,15 +297,15 @@ pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
         .to_ascii_uppercase();
     let is_live_or_testnet = matches!(exec_mode.as_str(), "LIVE" | "TESTNET")
         || matches!(pond_mode.as_str(), "LIVE" | "TESTNET");
-    let max_bar_staleness_ms = cfg
-        .get_i64("max_bar_staleness_ms", 21_600_000)
-        .max(60_000);
+    let max_bar_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(60_000);
     let now_ms = state.db.now_ms();
     let last_ms: i64 = state
         .db
         .with_conn(|conn| {
             let ts: Option<i64> = conn
-                .query_row("SELECT MAX(timestamp_ms) FROM market_ohlcv;", [], |r| r.get(0))
+                .query_row("SELECT MAX(timestamp_ms) FROM market_ohlcv;", [], |r| {
+                    r.get(0)
+                })
                 .unwrap_or(None);
             Ok(ts.unwrap_or(0))
         })
@@ -286,17 +339,18 @@ pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn api_status(State(state): State<AppState>) -> Response {
     match run_db_blocking(state.db.clone(), |db| {
-        let cfg = db.load_config_logged("aegis-web.api_status");
+        let cfg = db.load_config_opts(false).unwrap_or_default();
         let schema_version = db.get_schema_version()?;
         let settle_gate_active = db.is_settle_gate_active().unwrap_or(false);
         let pp50 = build_pp50_payload(&db)?;
+        let exec_mode = cfg.get_str("execution_mode", "PAPER");
         Ok(StatusPayload {
             status: "ok",
             service: "aegis-quant-pp50-rust",
             version: PLATFORM_VERSION,
             schema_version,
-            execution_mode: cfg.get_str("execution_mode", "PAPER"),
-            pond_execution_mode: cfg.get_str("pond_execution_mode", "PAPER"),
+            execution_mode: exec_mode.clone(),
+            pond_execution_mode: cfg.get_str("pond_execution_mode", &exec_mode),
             environment: cfg.get_str("environment", "sandbox"),
             settle_gate_active,
             total_platform_equity_usdc: pp50.total_platform_equity_usdc,
@@ -411,9 +465,9 @@ pub async fn api_settle_run(
                 .into(),
             );
         }
-        let cfg = state.db.load_config_logged("aegis-web.api_settle_run");
+        let cfg = state.db.load_config_opts(false).unwrap_or_default();
         let exec_mode = cfg.get_str("execution_mode", "PAPER");
-        let pond_mode = cfg.get_str("pond_execution_mode", "PAPER");
+        let pond_mode = cfg.get_str("pond_execution_mode", &exec_mode);
         if (!exec_mode.eq_ignore_ascii_case("PAPER") || !pond_mode.eq_ignore_ascii_case("PAPER"))
             && req.confirm_live_settle.as_deref() != Some("CONFIRM_LIVE_SETTLE")
         {
@@ -430,13 +484,13 @@ pub async fn api_settle_run(
     let _guard = state.cycle_lock.lock().await;
 
     match run_db_blocking(state.db.clone(), move |db| {
-        let rich_idle = req.rich_idle_usdc.or_else(|| {
-            match (req.pit_equity_usdc, req.pond_equity_usdc) {
-                (Some(pit), Some(pond)) if pit >= pond => req.pit_idle_usdc,
-                (Some(_), Some(_)) => req.pond_idle_usdc,
-                _ => req.pit_idle_usdc.or(req.pond_idle_usdc),
-            }
-        });
+        let rich_idle =
+            req.rich_idle_usdc
+                .or_else(|| match (req.pit_equity_usdc, req.pond_equity_usdc) {
+                    (Some(pit), Some(pond)) if pit >= pond => req.pit_idle_usdc,
+                    (Some(_), Some(_)) => req.pond_idle_usdc,
+                    _ => req.pit_idle_usdc.or(req.pond_idle_usdc),
+                });
         let settle_ctrl = SettleController::new(db.clone(), None);
         let report = settle_ctrl.run_settling(SettleOverrideInput {
             pit_equity_usdc: req.pit_equity_usdc,
@@ -461,7 +515,7 @@ pub async fn api_settle_run(
 
 pub async fn api_signals(State(state): State<AppState>) -> Response {
     match run_db_blocking(state.db.clone(), |db| {
-        let cfg = db.load_config_logged("aegis-web.api_signals");
+        let cfg = db.load_config_opts(false).unwrap_or_default();
         let entry_thresh = cfg.get_f64("ensemble_entry_threshold", 0.65);
         Ok(enrich_signals(db.get_latest_signals(30)?, entry_thresh))
     })
@@ -481,7 +535,12 @@ pub async fn api_trades(State(state): State<AppState>, Query(q): Query<LimitQuer
 }
 
 pub async fn api_config(State(state): State<AppState>) -> Response {
-    match run_db_blocking(state.db.clone(), |db| Ok(db.get_config_rows(true)?)).await {
+    match run_db_blocking(
+        state.db.clone(),
+        |db| Ok(db.get_config_rows_readonly(true)?),
+    )
+    .await
+    {
         Ok(cfg) => Json(cfg).into_response(),
         Err(e) => map_err_response(e),
     }
@@ -712,7 +771,8 @@ pub async fn api_update_alerts(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         let cid = payload.telegram_chat_id.as_deref().map(str::trim);
-        let status = db.configure_telegram_alerts(tok, cid, payload.max_daily_drawdown_alert_pct)?;
+        let status =
+            db.configure_telegram_alerts(tok, cid, payload.max_daily_drawdown_alert_pct)?;
         Ok(AlertsUpdateResponse {
             status: "ok",
             alerts: status,
@@ -887,19 +947,32 @@ pub async fn api_trigger_db_backup(
     State(state): State<AppState>,
     payload: Option<Json<DbBackupRequestPayload>>,
 ) -> Response {
+    {
+        let guard = state.last_manual_backup_at.lock();
+        if let Some(last) = *guard {
+            if last.elapsed() < Duration::from_secs(60) {
+                let body = ApiErrorBody {
+                    error: "Too Many Requests".to_string(),
+                    detail: "SQLite backup endpoint is limited to once per 60 seconds".to_string(),
+                };
+                return (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+            }
+        }
+    }
     let retention_days = payload.and_then(|p| p.0.retention_days);
     match run_db_blocking(state.db.clone(), move |db| {
         let backup = db.create_sqlite_backup(None, retention_days)?;
-        let dashboard = build_dashboard_payload(&db)?;
         Ok(DbBackupTriggerResponse {
             status: "ok",
             backup,
-            dashboard,
         })
     })
     .await
     {
-        Ok(res) => Json(res).into_response(),
+        Ok(res) => {
+            *state.last_manual_backup_at.lock() = Some(std::time::Instant::now());
+            Json(res).into_response()
+        }
         Err(e) => map_err_response(e),
     }
 }
@@ -951,38 +1024,82 @@ pub async fn api_trigger_calibrate(State(state): State<AppState>) -> Response {
     }
 }
 
+pub(crate) fn compute_sse_core_hash(d: &crate::payloads::FullDashboardPayload) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(s) = serde_json::to_string(&(
+        &d.portfolio,
+        &d.pond,
+        &d.pp50,
+        &d.open_trades,
+        &d.recent_trades,
+        d.schema_version,
+    )) {
+        s.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub async fn api_stream(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let interval = tokio::time::interval(Duration::from_secs(3));
     let db = state.db.clone();
     let sse_cache = state.sse_payload_cache.clone();
+    let per_conn_state = std::sync::Arc::new(parking_lot::Mutex::new((None::<u64>, 0u8)));
     let stream = IntervalStream::new(interval).then(move |_| {
         let db_inner = db.clone();
         let cache_inner = sse_cache.clone();
+        let conn_inner = per_conn_state.clone();
         async move {
             // ME-17: Share cached SSE snapshot across concurrent subscribers within 2s window
-            if let Some((cached_at, ref payload_str)) = *cache_inner.lock() {
-                if cached_at.elapsed() < Duration::from_secs(2) {
-                    return Ok::<Event, Infallible>(Event::default().data(payload_str.clone()));
-                }
-            }
-            let data = match run_db_blocking(db_inner, |pool| build_dashboard_payload(&pool)).await
-            {
-                Ok(d) => {
-                    let s = serde_json::to_string(&d).unwrap_or_else(|_| "{}".to_string());
-                    *cache_inner.lock() = Some((std::time::Instant::now(), s.clone()));
-                    s
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "SSE stream payload error");
-                    serde_json::to_string(&ApiErrorBody {
-                        error: "Internal server error".to_string(),
-                        detail: "Stream snapshot error".to_string(),
-                    })
-                    .unwrap_or_else(|_| "{}".to_string())
+            let cached_opt = {
+                let guard = cache_inner.lock();
+                guard
+                    .as_ref()
+                    .filter(|(cached_at, _, _)| cached_at.elapsed() < Duration::from_secs(2))
+                    .map(|(_, hash, s)| (*hash, s.clone()))
+            };
+
+            let (core_hash, data, is_ok) = if let Some((h, s)) = cached_opt {
+                (Some(h), s, true)
+            } else {
+                match run_db_blocking(db_inner, |pool| build_dashboard_payload(&pool)).await {
+                    Ok(d) => {
+                        let h = compute_sse_core_hash(&d);
+                        let s = serde_json::to_string(&d).unwrap_or_else(|_| "{}".to_string());
+                        *cache_inner.lock() = Some((std::time::Instant::now(), h, s.clone()));
+                        (Some(h), s, true)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "SSE stream payload error");
+                        let err_s = serde_json::to_string(&ApiErrorBody {
+                            error: "Internal server error".to_string(),
+                            detail: "Stream snapshot error".to_string(),
+                        })
+                        .unwrap_or_else(|_| "{}".to_string());
+                        (None, err_s, false)
+                    }
                 }
             };
+
+            if is_ok {
+                if let Some(h) = core_hash {
+                    let mut st = conn_inner.lock();
+                    if st.0 == Some(h) && st.1 < 5 {
+                        st.1 = st.1.saturating_add(1);
+                        let hb = serde_json::json!({
+                            "unchanged": true,
+                            "timestamp": now_iso8601_utc(),
+                        })
+                        .to_string();
+                        return Ok::<Event, Infallible>(
+                            Event::default().event("heartbeat").data(hb),
+                        );
+                    }
+                    st.0 = Some(h);
+                    st.1 = 0;
+                }
+            }
             Ok::<Event, Infallible>(Event::default().data(data))
         }
     });

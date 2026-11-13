@@ -60,6 +60,10 @@ pub struct QueuedAlertTask {
     pub details: Option<Value>,
     pub attempt: usize,
     pub next_attempt_ms: i64,
+    #[serde(default)]
+    pub telegram_sent: bool,
+    #[serde(default)]
+    pub webhook_sent: bool,
 }
 
 #[derive(Clone)]
@@ -106,6 +110,7 @@ impl AlertRetryQueue {
         self.dropped_count.load(Ordering::SeqCst)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         engine: AlertEngine,
@@ -114,6 +119,8 @@ impl AlertRetryQueue {
         severity: String,
         details: Option<Value>,
         attempt: usize,
+        telegram_sent: bool,
+        webhook_sent: bool,
     ) -> bool {
         if attempt > self.max_retries {
             self.failed_permanently_count.fetch_add(1, Ordering::SeqCst);
@@ -152,6 +159,8 @@ impl AlertRetryQueue {
                 details,
                 attempt,
                 next_attempt_ms: next_ms,
+                telegram_sent,
+                webhook_sent,
             });
         }
         self.ensure_worker(engine);
@@ -181,11 +190,7 @@ impl AlertRetryQueue {
                     {
                         (q.remove(ready_idx), None)
                     } else {
-                        let min_next = q
-                            .iter()
-                            .map(|t| t.next_attempt_ms)
-                            .min()
-                            .unwrap_or(now_ms);
+                        let min_next = q.iter().map(|t| t.next_attempt_ms).min().unwrap_or(now_ms);
                         (None, Some((min_next - now_ms).clamp(5, 50) as u64))
                     }
                 };
@@ -197,22 +202,29 @@ impl AlertRetryQueue {
                     break;
                 };
                 queue_ref.in_flight.fetch_add(1, Ordering::SeqCst);
-                let res = engine.send_alert(
+                let res = engine.send_alert_with_channels(
                     &task.title,
                     &task.message,
                     &task.severity,
                     task.details.clone(),
                     false,
                     false,
+                    task.telegram_sent,
+                    task.webhook_sent,
                 );
+                let tg_ok_now = task.telegram_sent || res.telegram_sent;
+                let wh_ok_now = task.webhook_sent
+                    || res.channels.iter().any(|c| {
+                        c.get("channel").and_then(Value::as_str) == Some("DISCORD")
+                            && c.get("ok").and_then(Value::as_bool) == Some(true)
+                    });
                 let all_ok = res.status == "DELIVERED" && res.error_detail.is_none();
                 if all_ok {
                     queue_ref.delivered_count.fetch_add(1, Ordering::SeqCst);
                 } else if task.attempt < queue_ref.max_retries {
-                    let delay_ms = (queue_ref.base_backoff_sec
-                        * 1000.0
-                        * (2_f64.powi(task.attempt as i32)))
-                        as i64;
+                    let delay_ms =
+                        (queue_ref.base_backoff_sec * 1000.0 * (2_f64.powi(task.attempt as i32)))
+                            as i64;
                     let next_ms = Utc::now().timestamp_millis() + delay_ms;
                     let mut q = queue_ref.queue.lock();
                     if q.len() < queue_ref.max_queue_size {
@@ -223,6 +235,8 @@ impl AlertRetryQueue {
                             details: task.details,
                             attempt: task.attempt + 1,
                             next_attempt_ms: next_ms,
+                            telegram_sent: tg_ok_now,
+                            webhook_sent: wh_ok_now,
                         });
                     } else {
                         let dropped = queue_ref.dropped_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -295,6 +309,7 @@ pub struct AlertEngine {
     http_client: Client,
     loopback_client: Client,
     last_regime: Arc<Mutex<Option<String>>>,
+    pending_regime_flip: Arc<Mutex<Option<(String, u32)>>>,
     last_drawdown_alert_date: Arc<Mutex<Option<String>>>,
     chat_id_discovery_attempted: Arc<AtomicBool>,
 }
@@ -330,8 +345,7 @@ impl AlertEngine {
             Mutex<std::collections::HashMap<(u64, bool), Client>>,
         > = std::sync::OnceLock::new();
         let get_client = |t: u64, no_proxy: bool| -> Client {
-            let map = ALERT_CLIENTS
-                .get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+            let map = ALERT_CLIENTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
             if let Some(c) = map.lock().get(&(t, no_proxy)) {
                 return c.clone();
             }
@@ -357,6 +371,7 @@ impl AlertEngine {
             http_client,
             loopback_client,
             last_regime: Arc::new(Mutex::new(None)),
+            pending_regime_flip: Arc::new(Mutex::new(None)),
             last_drawdown_alert_date: Arc::new(Mutex::new(None)),
             chat_id_discovery_attempted: Arc::new(AtomicBool::new(false)),
         }
@@ -368,7 +383,16 @@ impl AlertEngine {
 
     /// Queries Telegram `/getUpdates` to automatically discover the most recent user or group
     /// `chat.id` that has interacted with this bot (excluding the bot's own user ID prefix).
+    /// Table 3 #11: Only executes and persists when `telegram_chat_id` is currently empty/unconfigured.
     pub fn discover_telegram_chat_id(&self, tg_token: &str) -> Option<String> {
+        let existing_cid = self
+            .db
+            .load_config_opts(false)
+            .map(|c| c.get_str("telegram_chat_id", "").trim().to_string())
+            .unwrap_or_default();
+        if !existing_cid.is_empty() {
+            return None;
+        }
         let token = tg_token.trim();
         if token.is_empty() {
             return None;
@@ -408,7 +432,14 @@ impl AlertEngine {
                     continue;
                 };
                 if !cid.is_empty() && cid != bot_id_prefix {
-                    let _ = self.db.set_config_value("telegram_chat_id", &json!(cid));
+                    let latest_cid = self
+                        .db
+                        .load_config_opts(false)
+                        .map(|c| c.get_str("telegram_chat_id", "").trim().to_string())
+                        .unwrap_or_default();
+                    if latest_cid.is_empty() {
+                        let _ = self.db.set_config_value("telegram_chat_id", &json!(cid));
+                    }
                     let masked_cid = mask_identifier(&cid);
                     let _ = self.db.log_telemetry(
                         "INFO",
@@ -429,8 +460,32 @@ impl AlertEngine {
         message: &str,
         severity: &str,
         details: Option<Value>,
+        throw_on_error: bool,
+        allow_retry_queue: bool,
+    ) -> AlertDispatchResult {
+        self.send_alert_with_channels(
+            title,
+            message,
+            severity,
+            details,
+            throw_on_error,
+            allow_retry_queue,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_alert_with_channels(
+        &self,
+        title: &str,
+        message: &str,
+        severity: &str,
+        details: Option<Value>,
         _throw_on_error: bool,
         allow_retry_queue: bool,
+        skip_telegram: bool,
+        skip_discord: bool,
     ) -> AlertDispatchResult {
         let cfg = self.load_config_logged();
         let tg_token = cfg.get_str("telegram_bot_token", "").trim().to_string();
@@ -461,6 +516,8 @@ impl AlertEngine {
         let mut any_error = false;
         let mut retriable_error = false;
         let mut error_detail: Option<String> = None;
+        let mut tg_delivered = skip_telegram && !tg_token.is_empty();
+        let mut wh_delivered = skip_discord && !discord_url.is_empty();
         let is_loopback = self.telegram_api_base.contains("127.0.0.1")
             || self.telegram_api_base.contains("localhost");
         let client = if is_loopback {
@@ -469,16 +526,18 @@ impl AlertEngine {
             &self.http_client
         };
 
-        if !tg_token.is_empty() {
+        if !tg_token.is_empty() && !skip_telegram {
             let bot_id_prefix = tg_token.split(':').next().unwrap_or("").trim().to_string();
-            if (tg_chat_id.is_empty()
-                || (!bot_id_prefix.is_empty() && tg_chat_id == bot_id_prefix && !is_loopback))
+            if tg_chat_id.is_empty()
                 && allow_retry_queue
-                && !self.chat_id_discovery_attempted.swap(true, Ordering::SeqCst)
+                && !self
+                    .chat_id_discovery_attempted
+                    .swap(true, Ordering::SeqCst)
             {
                 if let Some(discovered) = self.discover_telegram_chat_id(&tg_token) {
                     tg_chat_id = discovered;
-                    self.chat_id_discovery_attempted.store(false, Ordering::SeqCst);
+                    self.chat_id_discovery_attempted
+                        .store(false, Ordering::SeqCst);
                 }
             }
 
@@ -542,11 +601,17 @@ impl AlertEngine {
                 match resp_res {
                     Ok(resp) if resp.status().is_success() => {
                         let body: Value = resp.json().unwrap_or_else(|_| json!({}));
+                        let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                        if ok {
+                            tg_delivered = true;
+                        } else {
+                            any_error = true;
+                        }
                         results.push(json!({
                             "channel": "TELEGRAM",
                             "http_status": 200,
                             "chat_id": masked_chat_id,
-                            "ok": body.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                            "ok": ok,
                         }));
                     }
                     Ok(resp) => {
@@ -582,11 +647,18 @@ impl AlertEngine {
                                 if fb_resp.status().is_success() {
                                     let fb_body: Value =
                                         fb_resp.json().unwrap_or_else(|_| json!({}));
+                                    let ok =
+                                        fb_body.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                                    if ok {
+                                        tg_delivered = true;
+                                    } else {
+                                        any_error = true;
+                                    }
                                     results.push(json!({
                                         "channel": "TELEGRAM",
                                         "http_status": 200,
                                         "chat_id": masked_chat_id,
-                                        "ok": fb_body.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                                        "ok": ok,
                                     }));
                                     plain_fallback_succeeded = true;
                                 }
@@ -615,9 +687,7 @@ impl AlertEngine {
                         any_error = true;
                         retriable_error = true;
                         // R3-B2: Strip request URL (which embeds /bot<token>) before formatting or persisting.
-                        let err_str = sanitize_telemetry_message(
-                            &e.without_url().to_string(),
-                        );
+                        let err_str = sanitize_telemetry_message(&e.without_url().to_string());
                         error_detail = Some(err_str.clone());
                         results.push(json!({
                             "channel": "TELEGRAM",
@@ -628,13 +698,14 @@ impl AlertEngine {
             }
         }
 
-        if !discord_url.is_empty() {
+        if !discord_url.is_empty() && !skip_discord {
             let payload = json!({
                 "username": "Aegis Quant Alert Engine",
                 "content": format!("**[{severity}] {title}** ({ts_utc})\n{message}"),
             });
             match client.post(&discord_url).json(&payload).send() {
                 Ok(resp) if resp.status().is_success() => {
+                    wh_delivered = true;
                     results.push(json!({
                         "channel": "DISCORD",
                         "http_status": resp.status().as_u16(),
@@ -646,18 +717,23 @@ impl AlertEngine {
                     if resp.status().as_u16() == 429 || resp.status().is_server_error() {
                         retriable_error = true;
                     }
+                    let err_str = format!("Discord HTTP {}", resp.status());
+                    if error_detail.is_none() {
+                        error_detail = Some(err_str.clone());
+                    }
                     results.push(json!({
                         "channel": "DISCORD",
-                        "error": format!("HTTP {}", resp.status()),
+                        "error": err_str,
                     }));
                 }
                 Err(e) => {
                     any_error = true;
                     retriable_error = true;
                     // R3-B2: Strip Discord webhook URL before formatting or persisting.
-                    let err_str = sanitize_telemetry_message(
-                        &e.without_url().to_string(),
-                    );
+                    let err_str = sanitize_telemetry_message(&e.without_url().to_string());
+                    if error_detail.is_none() {
+                        error_detail = Some(err_str.clone());
+                    }
                     results.push(json!({
                         "channel": "DISCORD",
                         "error": err_str,
@@ -666,10 +742,19 @@ impl AlertEngine {
             }
         }
 
-        let delivered = results
+        let attempted_ok = results
             .iter()
             .any(|r| r.get("ok").and_then(Value::as_bool) == Some(true));
-        let mut status = if delivered { "DELIVERED" } else { "ERROR" }.to_string();
+        let all_required_ok = (tg_token.is_empty() || tg_delivered)
+            && (discord_url.is_empty() || wh_delivered)
+            && !any_error;
+        let mut status = if all_required_ok && (attempted_ok || skip_telegram || skip_discord) {
+            "DELIVERED".to_string()
+        } else if attempted_ok && any_error {
+            "PARTIAL".to_string()
+        } else {
+            "ERROR".to_string()
+        };
         let mut queued_for_retry = false;
 
         if any_error && retriable_error && allow_retry_queue {
@@ -680,6 +765,8 @@ impl AlertEngine {
                 severity.to_string(),
                 details.clone(),
                 1,
+                tg_delivered,
+                wh_delivered,
             );
             if queued_for_retry && status == "ERROR" {
                 status = "QUEUED_FOR_RETRY".to_string();
@@ -690,8 +777,9 @@ impl AlertEngine {
         let report = AlertDispatchResult {
             status: status.clone(),
             reason: None,
-            telegram_sent: delivered,
-            webhook_payload_verified: delivered,
+            telegram_sent: tg_delivered,
+            webhook_payload_verified: (!discord_url.is_empty() && wh_delivered)
+                || (discord_url.is_empty() && attempted_ok),
             queued_for_retry,
             chat_id: masked_cid,
             error_detail,
@@ -704,7 +792,7 @@ impl AlertEngine {
             loopback_payload_captured: None,
         };
         let _ = self.db.log_telemetry(
-            if delivered { "INFO" } else { "WARNING" },
+            if all_required_ok { "INFO" } else { "WARNING" },
             "engine.alerts",
             &format!("Alert dispatch [{severity}] {title}: {status}"),
             Some(report.to_value()),
@@ -764,6 +852,16 @@ impl AlertEngine {
         prob_bear: f64,
         prob_chop: f64,
     ) -> Option<AlertDispatchResult> {
+        let confirm_cycles = self
+            .db
+            .load_config_opts(false)
+            .map(|c| {
+                c.get_usize("alert_regime_flip_confirm_cycles", 2)
+                    .clamp(1, 10) as u32
+            })
+            .unwrap_or(2);
+        let max_prob = prob_bull.max(prob_bear).max(prob_chop);
+
         let mut prior_guard = self.last_regime.lock();
         if prior_guard.is_none() {
             if let Ok(snap) = self.db.get_latest_portfolio_snapshot() {
@@ -771,31 +869,59 @@ impl AlertEngine {
             }
         }
         let prior = prior_guard.clone();
+        let Some(prev) = prior else {
+            *prior_guard = Some(new_regime.to_string());
+            *self.pending_regime_flip.lock() = None;
+            return None;
+        };
+
+        if prev == new_regime {
+            *self.pending_regime_flip.lock() = None;
+            return None;
+        }
+
+        // LT-5: Require `alert_regime_flip_confirm_cycles` consecutive cycles in the new regime
+        // unless posterior dominance >= 0.70 (decisive transition).
+        let confirmed = if max_prob >= 0.70 || confirm_cycles <= 1 {
+            *self.pending_regime_flip.lock() = None;
+            true
+        } else {
+            let mut pending_guard = self.pending_regime_flip.lock();
+            let next_count = match pending_guard.as_ref() {
+                Some((cand, count)) if cand == new_regime => count.saturating_add(1),
+                _ => 1,
+            };
+            if next_count >= confirm_cycles {
+                *pending_guard = None;
+                true
+            } else {
+                *pending_guard = Some((new_regime.to_string(), next_count));
+                false
+            }
+        };
+
+        if !confirmed {
+            return None;
+        }
+
         *prior_guard = Some(new_regime.to_string());
         drop(prior_guard);
 
-        if let Some(prev) = prior {
-            if prev != new_regime {
-                let msg = format!(
-                    "3-State Gaussian HMM transitioned from *{prev}* to *{new_regime}*."
-                );
-                return Some(self.send_alert(
-                    &format!("HMM Regime Flip: {prev} -> {new_regime}"),
-                    &msg,
-                    "INFO",
-                    Some(json!({
-                        "previous_regime": prev,
-                        "new_regime": new_regime,
-                        "prob_bull": format!("{:.1}%", prob_bull * 100.0),
-                        "prob_bear": format!("{:.1}%", prob_bear * 100.0),
-                        "prob_chop": format!("{:.1}%", prob_chop * 100.0),
-                    })),
-                    false,
-                    true,
-                ));
-            }
-        }
-        None
+        let msg = format!("3-State Gaussian HMM transitioned from *{prev}* to *{new_regime}*.");
+        Some(self.send_alert(
+            &format!("HMM Regime Flip: {prev} -> {new_regime}"),
+            &msg,
+            "INFO",
+            Some(json!({
+                "previous_regime": prev,
+                "new_regime": new_regime,
+                "prob_bull": format!("{:.1}%", prob_bull * 100.0),
+                "prob_bear": format!("{:.1}%", prob_bear * 100.0),
+                "prob_chop": format!("{:.1}%", prob_chop * 100.0),
+            })),
+            false,
+            true,
+        ))
     }
 
     pub fn notify_reconciliation_mismatch(
@@ -1013,8 +1139,12 @@ mod tests {
         let db = DatabaseManager::memory();
         db.initialize_schema(false).unwrap();
         // Configure only telegram_bot_token (leaving chat_id empty so loopback self-test runs)
-        db.configure_telegram_alerts(Some("real_production_bot_token_secret"), Some(""), Some(0.03))
-            .unwrap();
+        db.configure_telegram_alerts(
+            Some("real_production_bot_token_secret"),
+            Some(""),
+            Some(0.03),
+        )
+        .unwrap();
 
         let mut alerts = AlertEngine::new(db.clone());
         let res = alerts.run_test_alert(true).unwrap();
@@ -1062,5 +1192,163 @@ mod tests {
             assert!(!row_str.contains("SUPER_SECRET_DISCORD_WEBHOOK_R3_B2"));
         }
     }
-}
 
+    #[test]
+    fn test_lt5_regime_flip_requires_two_cycles_unless_high_confidence() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let alerts = AlertEngine::new(db);
+
+        // Seed initial state = CHOP
+        assert!(alerts
+            .check_and_alert_regime_flip("CHOP", 0.30, 0.20, 0.50)
+            .is_none());
+
+        // Single marginal flip (0.56 BULL < 0.70) must be suppressed on cycle 1
+        assert!(alerts
+            .check_and_alert_regime_flip("BULL", 0.56, 0.14, 0.30)
+            .is_none());
+        // Reverting back to CHOP clears pending counter
+        assert!(alerts
+            .check_and_alert_regime_flip("CHOP", 0.40, 0.15, 0.45)
+            .is_none());
+
+        // Two consecutive marginal cycles (BULL, BULL) confirm and fire alert on cycle 2
+        assert!(alerts
+            .check_and_alert_regime_flip("BULL", 0.56, 0.14, 0.30)
+            .is_none());
+        let fired = alerts.check_and_alert_regime_flip("BULL", 0.58, 0.12, 0.30);
+        assert!(fired.is_some());
+        assert!(fired.unwrap().title.contains("CHOP -> BULL"));
+
+        // Decisive transition (>= 0.70 posterior) fires immediately on cycle 1
+        let fast_fired = alerts.check_and_alert_regime_flip("BEAR", 0.10, 0.75, 0.15);
+        assert!(fast_fired.is_some());
+        assert!(fast_fired.unwrap().title.contains("BULL -> BEAR"));
+    }
+
+    #[test]
+    fn test_table3_10_partial_delivery_and_per_channel_retry_skips_delivered_channel() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tg_hits = Arc::new(AtomicUsize::new(0));
+        let dc_hits = Arc::new(AtomicUsize::new(0));
+        let tg_hits_srv = Arc::clone(&tg_hits);
+        let dc_hits_srv = Arc::clone(&dc_hits);
+
+        let srv = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let is_tg = req.contains("/sendMessage");
+                        let (status_line, body) = if is_tg {
+                            tg_hits_srv.fetch_add(1, Ordering::SeqCst);
+                            ("200 OK", r#"{"ok":true}"#)
+                        } else {
+                            let hit = dc_hits_srv.fetch_add(1, Ordering::SeqCst);
+                            if hit == 0 {
+                                ("503 Service Unavailable", r#"{"error":"upstream_down"}"#)
+                            } else {
+                                ("200 OK", r#"{"ok":true}"#)
+                            }
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        if dc_hits_srv.load(Ordering::SeqCst) >= 2 {
+                            break;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.set_config_value("alert_retry_base_backoff_sec", &json!(0.05))
+            .unwrap();
+        db.configure_telegram_alerts(Some("123456:TEST_TOKEN"), Some("-100999888"), Some(0.03))
+            .unwrap();
+        db.set_config_value(
+            "discord_webhook_url",
+            &json!(format!("http://127.0.0.1:{port}/discord_webhook")),
+        )
+        .unwrap();
+
+        let mut alerts = AlertEngine::new(db);
+        alerts.telegram_api_base = format!("http://127.0.0.1:{port}");
+        let res = alerts.send_alert("Partial Check", "Body", "WARNING", None, false, true);
+        assert_eq!(res.status, "PARTIAL");
+        assert!(res.telegram_sent);
+        assert!(!res.webhook_payload_verified);
+        assert!(res.queued_for_retry);
+
+        assert!(alerts.retry_queue.drain_for_test(4.0));
+        let _ = srv.join();
+        assert_eq!(
+            tg_hits.load(Ordering::SeqCst),
+            1,
+            "Telegram succeeded on first attempt and must NOT be re-sent on Discord retry"
+        );
+        assert_eq!(dc_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(alerts.retry_queue.delivered_count(), 1);
+    }
+
+    #[test]
+    fn test_table3_11_discover_telegram_chat_id_does_not_overwrite_configured_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let get_updates_hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&get_updates_hits);
+
+        let srv = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    hits_srv.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"ok":true,"result":[{"message":{"chat":{"id":999999999}}}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.configure_telegram_alerts(Some("123456:TEST_TOKEN"), Some("111222333"), Some(0.03))
+            .unwrap();
+
+        let mut alerts = AlertEngine::new(db.clone());
+        alerts.telegram_api_base = format!("http://127.0.0.1:{port}");
+        assert!(alerts
+            .discover_telegram_chat_id("123456:TEST_TOKEN")
+            .is_none());
+        let _ = srv.join();
+
+        assert_eq!(get_updates_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.load_config().unwrap().get_str("telegram_chat_id", ""),
+            "111222333"
+        );
+    }
+}

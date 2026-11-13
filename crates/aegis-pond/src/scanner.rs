@@ -64,6 +64,8 @@ pub struct PondScannerParams {
     pub reject_synthetic_volume: bool,
     #[serde(default)]
     pub require_2h_funding_persistence: bool,
+    #[serde(default)]
+    pub allow_single_sample_bootstrap: bool,
 }
 
 impl Default for PondScannerParams {
@@ -105,6 +107,7 @@ impl Default for PondScannerParams {
             conviction_scale_max: 1.5,
             reject_synthetic_volume: false,
             require_2h_funding_persistence: false,
+            allow_single_sample_bootstrap: false,
         }
     }
 }
@@ -201,15 +204,21 @@ pub fn evaluate_asset_gates_1_to_6(
     if r_hourly.abs() < params.min_funding_abs {
         return Err("GATE3_FUNDING_BELOW_ABS_FLOOR");
     }
-    if params.require_2h_funding_persistence && input.funding_series_168h.len() >= 2 {
-        let r_prev = input.funding_series_168h[input.funding_series_168h.len() - 2];
-        let same_sign = r_prev.signum() == r_hourly.signum() && r_prev.abs() > 0.0;
-        let avg_2h_abs = 0.5 * (r_hourly.abs() + r_prev.abs());
-        if !same_sign
-            || avg_2h_abs < params.min_funding_abs
-            || r_prev.abs() < 0.5 * params.min_funding_abs
-        {
-            return Err("GATE3_FUNDING_NOT_PERSISTENT_2H");
+    if params.require_2h_funding_persistence {
+        if input.funding_series_168h.len() < 2 {
+            if params.reject_synthetic_volume || !params.allow_single_sample_bootstrap {
+                return Err("GATE3_FUNDING_NOT_PERSISTENT_2H");
+            }
+        } else {
+            let r_prev = input.funding_series_168h[input.funding_series_168h.len() - 2];
+            let same_sign = r_prev.signum() == r_hourly.signum() && r_prev.abs() > 0.0;
+            let avg_2h_abs = 0.5 * (r_hourly.abs() + r_prev.abs());
+            if !same_sign
+                || avg_2h_abs < params.min_funding_abs
+                || r_prev.abs() < 0.5 * params.min_funding_abs
+            {
+                return Err("GATE3_FUNDING_NOT_PERSISTENT_2H");
+            }
         }
     }
 
@@ -226,7 +235,8 @@ pub fn evaluate_asset_gates_1_to_6(
         return Err("GATE4_Z_SCORE_BELOW_THRESHOLD");
     }
 
-    let (side, analogue) = if r_hourly >= params.min_funding_abs && z_t >= params.z_entry_threshold {
+    let (side, analogue) = if r_hourly >= params.min_funding_abs && z_t >= params.z_entry_threshold
+    {
         if !params.direction_policy.allows_short_call() {
             return Err("GATE4_DIRECTION_POLICY_BLOCKS_SHORT_CALL");
         }
@@ -475,7 +485,8 @@ pub fn run_nps01_scan(
         } else {
             0.06_f64.max(floor_pct)
         };
-        let raw_stop_dist = (params.initial_stop_atr_mult * atr_1h).max(ref_px.as_f64() * floor_pct);
+        let raw_stop_dist =
+            (params.initial_stop_atr_mult * atr_1h).max(ref_px.as_f64() * floor_pct);
         let stop_distance = Price::new_clamped(raw_stop_dist.min(ref_px.as_f64() * cap_pct));
 
         // Conviction-scaled cell risk budget [conviction_scale_min, conviction_scale_max] of baseline risk
@@ -491,7 +502,8 @@ pub fn run_nps01_scan(
             min_cell_risk + (max_cell_risk.saturating_sub(min_cell_risk)) * conviction_scale;
         let risk_budget = desired_risk.min(remaining_heat).round_cents();
 
-        let raw_units = Quantity::new_clamped(risk_budget.as_f64() / stop_distance.as_f64().max(1e-8));
+        let raw_units =
+            Quantity::new_clamped(risk_budget.as_f64() / stop_distance.as_f64().max(1e-8));
         let max_notional_for_cell = max_cell_notional.min(remaining_notional_cap);
         let max_units_by_notional =
             Quantity::new_clamped(max_notional_for_cell.as_f64() / ref_px.as_f64().max(1e-8));

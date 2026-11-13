@@ -344,7 +344,12 @@ pub fn build_orphan_or_pond_universe_asset(
     tier_name: &str,
 ) -> UniverseAsset {
     let base = if base_asset.trim().is_empty() {
-        symbol.split('/').next().unwrap_or(symbol).trim().to_string()
+        symbol
+            .split('/')
+            .next()
+            .unwrap_or(symbol)
+            .trim()
+            .to_string()
     } else {
         base_asset.trim().to_string()
     };
@@ -393,6 +398,9 @@ pub fn build_orphan_or_pond_universe_asset(
     }
 }
 
+pub const MAINNET_IOC_INITIAL_SLIP_PCT: f64 = 0.005;
+pub const TESTNET_IOC_INITIAL_SLIP_PCT: f64 = 0.015;
+
 #[derive(Clone)]
 pub struct ExecutionEngine {
     pub db: DatabaseManager,
@@ -411,6 +419,8 @@ pub struct ExecutionEngine {
     /// Pending `userFills` true-up queue `(is_pond_cell, row_id) -> (order_id, estimated_fee_usdc)`
     /// for rows race-promoted via `clearinghouseState` during indexer lag (`R13-N1`, `R13-N4(b)`).
     pub(crate) pending_fix4_fill_trueups: PendingFix4TrueupMap,
+    /// Per-symbol missing funding warn rate-limit timestamps (`R15-N12`).
+    pub(crate) missing_funding_warn_ms: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl ExecutionEngine {
@@ -436,6 +446,7 @@ impl ExecutionEngine {
             asset_index_cache: Arc::new(Mutex::new(HashMap::new())),
             resolved_asset_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_fix4_fill_trueups: Arc::new(Mutex::new(HashMap::new())),
+            missing_funding_warn_ms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -515,7 +526,10 @@ impl ExecutionEngine {
         let impact_bps = impact_coeff * participation.sqrt();
         let range_pct = ((bar_high - bar_low).max(0.0) / close).clamp(0.0, 0.25);
         let vol_bps = range_pct * vol_coeff;
-        round_dp((base_bps + impact_bps + vol_bps).clamp(min_slip, max_slip), 2)
+        round_dp(
+            (base_bps + impact_bps + vol_bps).clamp(min_slip, max_slip),
+            2,
+        )
     }
 
     /// Simulates a realistic paper-trading fill with tick/lot rounding, dynamic slippage, and fees (`Q1`).
@@ -535,6 +549,43 @@ impl ExecutionEngine {
         prefer_maker: bool,
         force_partial_ratio: Option<f64>,
         client_order_id: Option<&str>,
+    ) -> OrderExecutionResult {
+        self.simulate_paper_fill_with_base_slippage(
+            symbol,
+            side,
+            requested_units,
+            reference_price,
+            tick_size,
+            lot_step_size,
+            bar_high,
+            bar_low,
+            bar_volume,
+            is_stop_exit,
+            prefer_maker,
+            force_partial_ratio,
+            client_order_id,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::simulate_paper_fill`] allowing an explicit base slippage override in bps (`ME-1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn simulate_paper_fill_with_base_slippage(
+        &self,
+        symbol: &str,
+        side: &str,
+        requested_units: f64,
+        reference_price: f64,
+        tick_size: f64,
+        lot_step_size: f64,
+        bar_high: f64,
+        bar_low: f64,
+        bar_volume: f64,
+        is_stop_exit: bool,
+        prefer_maker: bool,
+        force_partial_ratio: Option<f64>,
+        client_order_id: Option<&str>,
+        base_slippage_bps_override: Option<f64>,
     ) -> OrderExecutionResult {
         let cfg = self.load_config_logged("simulate_paper_fill");
         let coid = client_order_id
@@ -567,7 +618,7 @@ impl ExecutionEngine {
             bar_low,
             bar_volume,
             is_maker,
-            None,
+            base_slippage_bps_override,
         );
         let slip_mult = slip_bps / 10_000.0;
         let raw_fill_px = if norm_side == "LONG" {
@@ -576,20 +627,14 @@ impl ExecutionEngine {
             reference_price * (1.0 - slip_mult)
         };
         let avg_fill_price = RiskEngine::round_step(raw_fill_px, tick_size.max(1e-8), false);
-        let slip_usd = round_dp(
-            (avg_fill_price - reference_price).abs() * filled_units,
-            4,
-        );
+        let slip_usd = round_dp((avg_fill_price - reference_price).abs() * filled_units, 4);
 
         let fee_bps = if is_maker {
             cfg.get_f64("maker_fee_bps", 1.5)
         } else {
             cfg.get_f64("taker_fee_bps", 4.5)
         };
-        let fees_usdc = round_dp(
-            (filled_units * avg_fill_price) * (fee_bps / 10_000.0),
-            4,
-        );
+        let fees_usdc = round_dp((filled_units * avg_fill_price) * (fee_bps / 10_000.0), 4);
 
         let mut history = vec!["CREATED".to_string(), "SUBMITTED".to_string()];
         if ratio < 0.9999 {
@@ -686,13 +731,28 @@ impl ExecutionEngine {
         if let Some(scenario) = simulate_book_scenario {
             match scenario.to_uppercase().as_str() {
                 "CANCELLED" => {
-                    return OrderExecutionResult::cancelled(&coid, &asset.symbol, norm_side, quantity);
+                    return OrderExecutionResult::cancelled(
+                        &coid,
+                        &asset.symbol,
+                        norm_side,
+                        quantity,
+                    );
                 }
                 "EXPIRED" => {
-                    return OrderExecutionResult::expired(&coid, &asset.symbol, norm_side, quantity);
+                    return OrderExecutionResult::expired(
+                        &coid,
+                        &asset.symbol,
+                        norm_side,
+                        quantity,
+                    );
                 }
                 "REJECTED" => {
-                    return OrderExecutionResult::rejected(&coid, &asset.symbol, norm_side, quantity);
+                    return OrderExecutionResult::rejected(
+                        &coid,
+                        &asset.symbol,
+                        norm_side,
+                        quantity,
+                    );
                 }
                 _ => {}
             }
@@ -706,12 +766,17 @@ impl ExecutionEngine {
 
         if mode == "LIVE" || mode == "TESTNET" {
             let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+            let initial_slip_pct = if is_testnet {
+                TESTNET_IOC_INITIAL_SLIP_PCT
+            } else {
+                MAINNET_IOC_INITIAL_SLIP_PCT
+            };
             let chase_bps = cfg.get_f64("maker_chaser_offset_bps", 1.5);
             let limit_px = if is_reduce_only {
                 if norm_side == "LONG" {
-                    reference_price * 1.005
+                    reference_price * (1.0 + initial_slip_pct)
                 } else {
-                    reference_price * 0.995
+                    reference_price * (1.0 - initial_slip_pct)
                 }
             } else if norm_side == "LONG" {
                 reference_price * (1.0 - chase_bps / 10_000.0)
@@ -808,6 +873,11 @@ impl ExecutionEngine {
                 updated_at: String::new(),
                 reference_price,
             };
+            let initial_slip_pct = if is_testnet {
+                TESTNET_IOC_INITIAL_SLIP_PCT
+            } else {
+                MAINNET_IOC_INITIAL_SLIP_PCT
+            };
             let limit_px = if prefer_maker && !is_stop_exit {
                 let chase_bps = cfg.get_f64("maker_chaser_offset_bps", 1.5);
                 if norm_side == "LONG" {
@@ -816,9 +886,9 @@ impl ExecutionEngine {
                     reference_price * (1.0 + chase_bps / 10_000.0)
                 }
             } else if norm_side == "LONG" {
-                reference_price * 1.005
+                reference_price * (1.0 + initial_slip_pct)
             } else {
-                reference_price * 0.995
+                reference_price * (1.0 - initial_slip_pct)
             };
             return self.submit_hyperliquid_order_live(
                 &temp_asset,
@@ -851,7 +921,6 @@ impl ExecutionEngine {
         )
     }
 }
-
 
 #[cfg(test)]
 mod tests;

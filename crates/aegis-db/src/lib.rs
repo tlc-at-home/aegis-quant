@@ -285,7 +285,10 @@ impl DatabaseManager {
             conn: Some(conn),
         };
 
-        f(guard.conn.as_ref().expect("conn present in PooledConnGuard"))
+        f(guard
+            .conn
+            .as_ref()
+            .expect("conn present in PooledConnGuard"))
     }
 
     /// Execute a closure inside a `BEGIN IMMEDIATE;` write transaction with automatic rollback and recycling (`R6-N3`).
@@ -424,7 +427,9 @@ impl DatabaseManager {
     /// Return the decrypted wallet `private_key` wrapped in `Zeroizing<String>` so secret bytes
     /// are wiped from memory on drop (`S10`).
     pub fn get_signing_private_key(&self) -> Result<Zeroizing<String>> {
-        let raw = self.get_raw_config_value("private_key")?.unwrap_or_default();
+        let raw = self
+            .get_raw_config_value("private_key")?
+            .unwrap_or_default();
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(Zeroizing::new(String::new()));
@@ -577,7 +582,9 @@ impl DatabaseManager {
         iso_db.set_config_value("private_key", &json!(sample_priv))?;
         iso_db.set_config_value("gemini_api_key", &json!(sample_gemini))?;
 
-        let raw_priv_on_disk = iso_db.get_raw_config_value("private_key")?.unwrap_or_default();
+        let raw_priv_on_disk = iso_db
+            .get_raw_config_value("private_key")?
+            .unwrap_or_default();
         let raw_gemini_on_disk = iso_db
             .get_raw_config_value("gemini_api_key")?
             .unwrap_or_default();
@@ -617,6 +624,172 @@ impl DatabaseManager {
             Some(report.clone()),
         );
         Ok(report)
+    }
+
+    /// Detects and self-heals a SQLite WAL split-brain condition on Linux where `-wal` or `-shm`
+    /// sidecar files were unlinked while open file descriptors remain held by this process (`LT-4`).
+    ///
+    /// Returns `Ok(true)` if a split-brain was detected and healed, `Ok(false)` otherwise.
+    pub fn check_and_heal_wal_split_brain(&self) -> Result<bool> {
+        if self.is_memory || self.db_path == Path::new(":memory:") || !self.db_path.exists() {
+            return Ok(false);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Ok(false);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let db_name = self
+                .db_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if db_name.is_empty() {
+                return Ok(false);
+            }
+            let canon_path =
+                fs::canonicalize(&self.db_path).unwrap_or_else(|_| self.db_path.clone());
+            let wal_disk_path = PathBuf::from(format!("{}-wal", self.db_path.display()));
+            let shm_disk_path = PathBuf::from(format!("{}-shm", self.db_path.display()));
+
+            let wal_del_raw = format!("{}-wal (deleted)", self.db_path.display());
+            let wal_del_canon = format!("{}-wal (deleted)", canon_path.display());
+            let shm_del_raw = format!("{}-shm (deleted)", self.db_path.display());
+            let shm_del_canon = format!("{}-shm (deleted)", canon_path.display());
+            let wal_live_raw = format!("{}-wal", self.db_path.display());
+            let wal_live_canon = format!("{}-wal", canon_path.display());
+
+            let mut detected = false;
+            let mut wal_fd_path: Option<PathBuf> = None;
+
+            if let Ok(entries) = fs::read_dir("/proc/self/fd") {
+                for entry in entries.flatten() {
+                    let fd_path = entry.path();
+                    if let Ok(target) = fs::read_link(&fd_path) {
+                        let t = target.to_string_lossy();
+                        if t == wal_del_raw || t == wal_del_canon {
+                            detected = true;
+                            if wal_fd_path.is_none() {
+                                wal_fd_path = Some(fd_path);
+                            }
+                        } else if t == shm_del_raw || t == shm_del_canon {
+                            detected = true;
+                        } else if (t == wal_live_raw || t == wal_live_canon)
+                            && !wal_disk_path.exists()
+                        {
+                            detected = true;
+                            if wal_fd_path.is_none() {
+                                wal_fd_path = Some(fd_path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !detected {
+                return Ok(false);
+            }
+
+            tracing::error!(
+                db_path = %self.db_path.display(),
+                wal_fd = ?wal_fd_path,
+                "Detected SQLite WAL split-brain (unlinked -wal/-shm with open FD); initiating self-heal (LT-4)"
+            );
+
+            let tmp_db = PathBuf::from(format!("{}.heal_tmp", self.db_path.display()));
+            let tmp_wal = PathBuf::from(format!("{}-wal", tmp_db.display()));
+            let tmp_shm = PathBuf::from(format!("{}-shm", tmp_db.display()));
+            let _ = fs::remove_file(&tmp_db);
+            let _ = fs::remove_file(&tmp_wal);
+            let _ = fs::remove_file(&tmp_shm);
+
+            fs::copy(&self.db_path, &tmp_db).map_err(|e| {
+                AegisError::Database(format!("WAL split-brain heal failed copying main DB: {e}"))
+            })?;
+            if let Some(ref fd_src) = wal_fd_path {
+                fs::copy(fd_src, &tmp_wal).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_db);
+                    AegisError::Database(format!(
+                        "WAL split-brain heal failed copying unlinked WAL fd {}: {e}",
+                        fd_src.display()
+                    ))
+                })?;
+            } else if wal_disk_path.exists() {
+                fs::copy(&wal_disk_path, &tmp_wal).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_db);
+                    AegisError::Database(format!(
+                        "WAL split-brain heal failed copying WAL sidecar: {e}"
+                    ))
+                })?;
+            }
+
+            {
+                let heal_conn = Connection::open(&tmp_db).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_db);
+                    let _ = fs::remove_file(&tmp_wal);
+                    AegisError::Database(format!(
+                        "WAL split-brain heal failed opening {}: {e}",
+                        tmp_db.display()
+                    ))
+                })?;
+                heal_conn
+                    .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_checkpoint(TRUNCATE);")
+                    .map_err(|e| {
+                        AegisError::Database(format!("WAL split-brain heal checkpoint failed: {e}"))
+                    })?;
+                let qc: String = heal_conn
+                    .query_row("PRAGMA quick_check;", [], |r| r.get(0))
+                    .map_err(|e| {
+                        AegisError::Database(format!(
+                            "WAL split-brain heal quick_check failed: {e}"
+                        ))
+                    })?;
+                if !qc.trim().eq_ignore_ascii_case("ok") {
+                    let _ = fs::remove_file(&tmp_db);
+                    let _ = fs::remove_file(&tmp_wal);
+                    let _ = fs::remove_file(&tmp_shm);
+                    return Err(AegisError::Database(format!(
+                        "WAL split-brain heal quick_check returned '{qc}'"
+                    )));
+                }
+            }
+
+            // Drop all pooled connections holding stale/deleted WAL/SHM FDs before atomic swap
+            {
+                let mut pool = self.conn_pool.lock();
+                pool.clear();
+            }
+            if wal_disk_path.exists() {
+                let _ = fs::remove_file(&wal_disk_path);
+            }
+            if shm_disk_path.exists() {
+                let _ = fs::remove_file(&shm_disk_path);
+            }
+            if tmp_wal.exists() {
+                let _ = fs::remove_file(&tmp_wal);
+            }
+            if tmp_shm.exists() {
+                let _ = fs::remove_file(&tmp_shm);
+            }
+
+            fs::rename(&tmp_db, &self.db_path).map_err(|e| {
+                AegisError::Database(format!("WAL split-brain heal atomic rename failed: {e}"))
+            })?;
+
+            let _ = self.log_telemetry(
+                "CRITICAL",
+                "engine.database",
+                "SQLITE_WAL_SPLIT_BRAIN_SELF_HEALED",
+                Some(json!({
+                    "db_path": self.db_path.display().to_string(),
+                    "recovered_from_fd": wal_fd_path.as_ref().map(|p| p.display().to_string()),
+                })),
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -686,7 +859,8 @@ mod tests {
         assert_eq!(cfg.get_str("environment", ""), "sandbox");
 
         // 4. Transition to LIVE (Mainnet) via set_config_value("execution_mode", "LIVE")
-        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
         let st_live = db.get_credentials_status().unwrap();
         assert_eq!(st_live["execution_mode"], "LIVE");
         assert_eq!(st_live["hyperliquid_testnet"], false);
@@ -945,7 +1119,9 @@ mod tests {
 
         // Ensure private_key is empty initially
         assert_eq!(
-            db.get_raw_config_value("private_key").unwrap().unwrap_or_default(),
+            db.get_raw_config_value("private_key")
+                .unwrap()
+                .unwrap_or_default(),
             ""
         );
 
@@ -955,7 +1131,9 @@ mod tests {
 
         // Live DB must still have empty private_key and gemini_api_key
         assert_eq!(
-            db.get_raw_config_value("private_key").unwrap().unwrap_or_default(),
+            db.get_raw_config_value("private_key")
+                .unwrap()
+                .unwrap_or_default(),
             ""
         );
         assert_eq!(
@@ -974,12 +1152,15 @@ mod tests {
 
         let db = DatabaseManager::with_paths(
             ":memory:",
-            resolve_project_root().join("sql").join("schema_and_seed.sql"),
+            resolve_project_root()
+                .join("sql")
+                .join("schema_and_seed.sql"),
             Some(key1.clone()),
         );
         db.initialize_schema(true).unwrap();
 
-        db.set_config_value("private_key", &json!(VALID_PK)).unwrap();
+        db.set_config_value("private_key", &json!(VALID_PK))
+            .unwrap();
         let raw_before = db.get_raw_config_value("private_key").unwrap().unwrap();
         assert!(is_encrypted_value(&raw_before));
 
@@ -989,9 +1170,7 @@ mod tests {
             .is_err());
 
         // Rotating with correct old_master_key succeeds and re-encrypts
-        let rot = db
-            .rotate_master_key_with_old(Some(&key1), &key2)
-            .unwrap();
+        let rot = db.rotate_master_key_with_old(Some(&key1), &key2).unwrap();
         assert_eq!(rot["status"], "ROTATED");
         assert_eq!(rot["rotated_count"], 1);
 
@@ -1099,7 +1278,9 @@ mod tests {
         let mismatched_wallet = "0xef377c1d5444786236aa34fa72e5879372e0eaec";
         assert_eq!(derived_addr, VALID_WALLET);
         assert!(aegis_core::verify_signer_matches_wallet(VALID_PK, &derived_addr, None).is_ok());
-        assert!(aegis_core::verify_signer_matches_wallet(VALID_PK, mismatched_wallet, None).is_err());
+        assert!(
+            aegis_core::verify_signer_matches_wallet(VALID_PK, mismatched_wallet, None).is_err()
+        );
         assert!(aegis_core::verify_signer_matches_wallet(
             VALID_PK,
             mismatched_wallet,
@@ -1200,14 +1381,8 @@ mod tests {
         assert!(next_hour_accrual);
 
         // R3-H1: Targeted watermark update preserves accrued funding (-0.10)
-        db.update_open_pond_cell_watermarks(
-            cid,
-            "TRAILED",
-            Some(145.0),
-            Some(160.0),
-            Some(150.0),
-        )
-        .unwrap();
+        db.update_open_pond_cell_watermarks(cid, "TRAILED", Some(145.0), Some(160.0), Some(150.0))
+            .unwrap();
         let active = db.get_open_pond_cells().unwrap();
         assert_eq!(active.len(), 1);
         assert!((active[0].funding_accrued_usdc - (-0.10)).abs() < 1e-9);
@@ -1293,14 +1468,17 @@ mod tests {
         assert_eq!(cfg.get_str("gemini_api_key", ""), "AIzaRealSecretKey123456");
 
         // R3-H15: resolve_reference_price returns Ok(None) when no market data exists
-        assert_eq!(db.resolve_reference_price("UNKNOWN/USDC:USDC").unwrap(), None);
+        assert_eq!(
+            db.resolve_reference_price("UNKNOWN/USDC:USDC").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn test_r4_remediation_db_invariants() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 14);
+        assert_eq!(db.get_schema_version().unwrap(), CANONICAL_SCHEMA_VERSION);
 
         // R4-N8: get_existing_web_api_token is strictly read-only when unset
         assert_eq!(db.get_existing_web_api_token().unwrap(), None);
@@ -1323,7 +1501,9 @@ mod tests {
         );
 
         // R3-N13 & R4-M1: Timeframe and tick interval validation at config write boundary
-        assert!(db.set_config_value("hmm_timeframe", &json!("invalid_tf")).is_err());
+        assert!(db
+            .set_config_value("hmm_timeframe", &json!("invalid_tf"))
+            .is_err());
         assert!(db
             .set_config_value("calibration_timeframes_csv", &json!("1h,badtf"))
             .is_err());
@@ -1422,10 +1602,7 @@ mod tests {
         let armed_id = db.upsert_pond_cell(&armed_cell).unwrap();
         let armed_list = db.get_armed_pond_cells().unwrap();
         assert_eq!(armed_list.len(), 1);
-        assert_eq!(
-            armed_list[0].resting_order_id.as_deref(),
-            Some("987654321")
-        );
+        assert_eq!(armed_list[0].resting_order_id.as_deref(), Some("987654321"));
         assert_eq!(armed_list[0].exit_reason, None);
         // R4-N10: update_open_pond_cell_watermarks and reduce_open_pond_cell_partial_exit must return Err without panicking when passed CLOSED
         assert!(db
@@ -1528,11 +1705,12 @@ mod tests {
     }
 
     #[test]
-    fn test_r5_m1_m2_n2_transactional_migration_crash_recovery_and_paper_dry_run_reclassification() {
+    fn test_r5_m1_m2_n2_transactional_migration_crash_recovery_and_paper_dry_run_reclassification()
+    {
         use rusqlite::OptionalExtension;
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 14);
+        assert_eq!(db.get_schema_version().unwrap(), CANONICAL_SCHEMA_VERSION);
 
         // 1. R5-M1: Transactional migration rollback on mid-script failure preserves existing tables
         db.with_conn(|conn| {
@@ -1752,7 +1930,10 @@ mod tests {
 
         // Ensure the recycled connection is clean and usable
         let check_res = db.with_conn(|conn| {
-            assert!(conn.is_autocommit(), "Connection must be back in autocommit mode");
+            assert!(
+                conn.is_autocommit(),
+                "Connection must be back in autocommit mode"
+            );
             Ok(42)
         });
         assert_eq!(check_res.unwrap(), 42);
@@ -1834,7 +2015,9 @@ mod tests {
         .unwrap();
 
         // Invalid timestamp should return validation error
-        assert!(db.reclassify_dry_run_transfers_before("not-a-timestamp").is_err());
+        assert!(db
+            .reclassify_dry_run_transfers_before("not-a-timestamp")
+            .is_err());
 
         // Reclassify cutoff between id1 and id2
         let count1 = db
@@ -1855,7 +2038,10 @@ mod tests {
         assert_eq!(count2, 1, "id2 should now be reclassified");
 
         let transfers_after = db.get_recent_book_transfers(10).unwrap();
-        let t2_after = transfers_after.iter().find(|t| t.transfer_id == id2).unwrap();
+        let t2_after = transfers_after
+            .iter()
+            .find(|t| t.transfer_id == id2)
+            .unwrap();
         assert_eq!(t2_after.status, "DRY_RUN");
     }
 
@@ -1863,7 +2049,7 @@ mod tests {
     fn test_r7_b1_s2_s3_n4_config_read_purity_and_migration_011_stop_tightening() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 14);
+        assert_eq!(db.get_schema_version().unwrap(), CANONICAL_SCHEMA_VERSION);
 
         // 1. R7-B1 & R7-QA: Operator sets custom chandelier_atr_multiplier_long = 2.0
         // and inserts an OPEN trade with a wide 4H stop (e.g. $86,000 on a $90,000 BTC LONG).
@@ -1946,10 +2132,8 @@ mod tests {
             .find(|t| t.symbol == "ETH/USDC:USDC")
             .unwrap()
             .trade_id;
-        db.update_open_trade(
-            eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0,
-        )
-        .unwrap();
+        db.update_open_trade(eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0)
+            .unwrap();
         db.with_conn(|conn| {
             conn.execute_batch(
                 "UPDATE system_config SET config_value = '10' WHERE config_key = 'schema_version';
@@ -1992,10 +2176,8 @@ mod tests {
         );
         // R8-S1: If an operator widens the ETH stop at v12 and calls apply_migration(011) directly,
         // target_num (11) <= max_applied_ver (12), so the SQL script must NOT re-execute!
-        db.update_open_trade(
-            eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0,
-        )
-        .unwrap();
+        db.update_open_trade(eth_tid, 3_000.0, 2_760.0, 3_000.0, 3_000.0, 0.0, 0.0)
+            .unwrap();
         let rep_011 = db
             .apply_migration("sql/migrations/011_v030_round7_stop_tightening.sql")
             .unwrap();
@@ -2191,9 +2373,9 @@ mod tests {
         pending_trade.lowest_price_seen = 3.612;
         pending_trade.exchange_order_id = Some("hl-64920976942".to_string());
 
-        let pending_id = db
-            .insert_trade(&pending_trade)
-            .expect("insert_trade must auto-upgrade legacy trades CHECK constraint with FK rows and views");
+        let pending_id = db.insert_trade(&pending_trade).expect(
+            "insert_trade must auto-upgrade legacy trades CHECK constraint with FK rows and views",
+        );
         assert!(pending_id > open_id);
 
         // R9-QA: Verify telemetry_logs recorded the schema self-heal rebuild under component `db.schema_self_heal`
@@ -2212,13 +2394,23 @@ mod tests {
         // Verify child FK rows and dependent view survived the table rebuild
         db.with_conn(|conn| {
             let fk_funding: i64 = conn
-                .query_row("SELECT COUNT(*) FROM funding_payments WHERE trade_id = ?1;", rusqlite::params![open_id], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM funding_payments WHERE trade_id = ?1;",
+                    rusqlite::params![open_id],
+                    |r| r.get(0),
+                )
                 .unwrap();
             let fk_events: i64 = conn
-                .query_row("SELECT COUNT(*) FROM order_events WHERE trade_id = ?1;", rusqlite::params![open_id], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM order_events WHERE trade_id = ?1;",
+                    rusqlite::params![open_id],
+                    |r| r.get(0),
+                )
                 .unwrap();
             let view_open_cnt: i64 = conn
-                .query_row("SELECT open_count FROM v_portfolio_summary;", [], |r| r.get(0))
+                .query_row("SELECT open_count FROM v_portfolio_summary;", [], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(fk_funding, 1);
             assert_eq!(fk_events, 1);
@@ -2276,7 +2468,9 @@ mod tests {
             (resized_some.risk_budget_usdc - 1.5).abs() < 1e-4,
             "reconcile_open_trade_size(Some(3.60)) must rescale risk_budget_usdc to |3.60 - 3.75| * 10 = 1.50 (R9-N5)"
         );
-        assert!(db.reconcile_open_trade_size(pending_id, 20.0, None).unwrap());
+        assert!(db
+            .reconcile_open_trade_size(pending_id, 20.0, None)
+            .unwrap());
         let resized_none = db
             .get_open_trades()
             .unwrap()
@@ -2315,7 +2509,9 @@ mod tests {
             "cancel_resting_trade must cancel resting trades with fsm_state IN ('OPEN_ON_BOOK', 'PENDING') (R9-N1)"
         );
 
-        let audit_rows = db.get_order_state_audit(Some("hl-pending-near"), 10).unwrap();
+        let audit_rows = db
+            .get_order_state_audit(Some("hl-pending-near"), 10)
+            .unwrap();
         assert!(audit_rows.iter().any(|r| {
             r.get("client_order_id").and_then(|v| v.as_str()) == Some("hl-pending-near")
                 && r.get("from_state").and_then(|v| v.as_str()) == Some("OPEN_ON_BOOK")
@@ -2452,7 +2648,9 @@ mod tests {
 
         // 3. reconcile_open_pond_cell_size None branch (3.0 -> 1.0, entry_price stays 101.0):
         // risk_budget_usdc recomputes as ROUND(ABS(101.0 - 95.0) * 1.0, 4) = 6.0
-        assert!(db.reconcile_open_pond_cell_size(cell_id, 1.0, None).unwrap());
+        assert!(db
+            .reconcile_open_pond_cell_size(cell_id, 1.0, None)
+            .unwrap());
         let after_none = db
             .get_open_pond_cells()
             .unwrap()
@@ -2588,7 +2786,10 @@ mod tests {
         let assert_pnl_equity_heat_parity = |pit: &BookPnlComponents, pond: &BookPnlComponents| {
             assert_eq!(pit.initial_capital_usdc, pond.initial_capital_usdc);
             assert_eq!(pit.closed_realized_pnl_usdc, pond.closed_realized_pnl_usdc);
-            assert_eq!(pit.partial_realized_pnl_usdc, pond.partial_realized_pnl_usdc);
+            assert_eq!(
+                pit.partial_realized_pnl_usdc,
+                pond.partial_realized_pnl_usdc
+            );
             assert_eq!(pit.realized_pnl_usdc, pond.realized_pnl_usdc);
             assert_eq!(pit.unrealized_pnl_usdc, pond.unrealized_pnl_usdc);
             assert_eq!(pit.funding_pnl_usdc, pond.funding_pnl_usdc);
@@ -2663,9 +2864,7 @@ mod tests {
 
         // 6. Close remaining 6.0 units at 110.0 (+60.0 gross, 0.21 final fee; total fees = 0.35 + 0.15 + 0.21 = 0.71,
         // total net PnL = 40.0 + 60.0 - 0.71 - 0.25 = 99.04)
-        assert!(db
-            .close_trade(tid, 110.0, 99.04, 0.71, "TP_FULL")
-            .unwrap());
+        assert!(db.close_trade(tid, 110.0, 99.04, 0.71, "TP_FULL").unwrap());
         assert!(db
             .close_open_pond_cell(
                 cid,
@@ -2887,7 +3086,9 @@ mod tests {
             .unwrap();
         assert_eq!(db.get_schema_version().unwrap(), 13);
         assert_eq!(
-            db.get_raw_config_value("max_bar_staleness_ms").unwrap().as_deref(),
+            db.get_raw_config_value("max_bar_staleness_ms")
+                .unwrap()
+                .as_deref(),
             Some("28800000"),
             "R13-N2: max_bar_staleness_ms must remain 28800000 (8h)"
         );
@@ -2942,7 +3143,7 @@ mod tests {
     fn test_round14_consolidated_schema_cycle_lock_backup_and_me12() {
         let db = DatabaseManager::memory();
         db.initialize_schema(true).unwrap();
-        assert_eq!(db.get_schema_version().unwrap(), 14);
+        assert_eq!(db.get_schema_version().unwrap(), CANONICAL_SCHEMA_VERSION);
 
         let cfg = db.load_config().unwrap();
         assert!(
@@ -2987,7 +3188,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_backup_dir);
 
         // ME-12: Zero-leg stale PENDING transfer in LIVE/TESTNET mode transitions to AMBIGUOUS
-        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
         let tid_live = db
             .insert_book_transfer_with_mode(
                 &aegis_core::BookTransfer {
@@ -3023,5 +3225,144 @@ mod tests {
             "ME-12: Zero-leg PENDING transfer in LIVE mode must quarantine as AMBIGUOUS"
         );
     }
-}
 
+    #[test]
+    fn test_r15_s2_v13_and_v14_testnet_volume_floor_migrates_to_1000_on_v15() {
+        for start_ver in [12i64, 13i64, 14i64] {
+            let db = DatabaseManager::memory();
+            db.initialize_schema(true).unwrap();
+            db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE system_config SET config_value = '5000.0' WHERE config_key = 'pond_testnet_min_vol_cap_usdc';",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE system_config SET config_value = ?1 WHERE config_key = 'schema_version';",
+                    params![start_ver.to_string()],
+                )
+                .unwrap();
+                conn.execute(
+                    "DELETE FROM schema_migrations WHERE version > ?1;",
+                    params![start_ver],
+                )
+                .unwrap();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(db.get_schema_version().unwrap(), start_ver);
+
+            let applied = db.run_migrations().unwrap();
+            assert!(!applied.is_empty());
+            assert_eq!(db.get_schema_version().unwrap(), 15);
+            let cfg = db.load_config().unwrap();
+            assert!(
+                (cfg.get_f64("pond_testnet_min_vol_cap_usdc", 0.0) - 1000.0).abs() < 1e-6,
+                "R15-S2: v{start_ver} DB stuck at 5000.0 must migrate to 1000.0 on v15"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lt4_wal_split_brain_detection_and_self_heal() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_lt4_wal_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        // Write a row without truncating WAL so the -wal sidecar holds uncheckpointed frames
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO system_config (config_key, config_value, value_type, category, description)
+                 VALUES ('lt4_split_brain_probe', 'survives_unlink', 'string', 'test', 'probe');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                wal_path.exists(),
+                "LT-4: WAL sidecar must exist after non-truncated write"
+            );
+            fs::remove_file(&wal_path).unwrap();
+            let healed = db.check_and_heal_wal_split_brain().unwrap();
+            assert!(
+                healed,
+                "LT-4: check_and_heal_wal_split_brain must detect and heal unlinked -wal FD"
+            );
+            let val = db
+                .get_raw_config_value("lt4_split_brain_probe")
+                .unwrap()
+                .unwrap_or_default();
+            assert_eq!(val, "survives_unlink");
+            let logs = db.get_recent_logs(20).unwrap();
+            assert!(logs.iter().any(|l| l
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|m| m.contains("SQLITE_WAL_SPLIT_BRAIN_SELF_HEALED"))
+                .unwrap_or(false)));
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_me19_r15_n9_backup_retention_clamp_and_restore_sqlite_backup() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_restore_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO system_config (config_key, config_value, value_type, category, description)
+                 VALUES ('restore_probe_key', 'before_backup', 'string', 'test', 'probe');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // R15-N9: passing Some(0) retention_days must clamp to 1..=90 (not delete everything)
+        let backup_res = db.create_sqlite_backup(None, Some(0)).unwrap();
+        assert_eq!(backup_res["retention_days"].as_u64().unwrap(), 1);
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+        assert!(backup_path.exists());
+        assert!(
+            db.get_raw_config_value("last_sqlite_backup_ms")
+                .unwrap()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+                > 0
+        );
+
+        // Mutate DB after backup, then restore from backup_path
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'after_backup' WHERE config_key = 'restore_probe_key';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let pre_restore_snap = db.restore_sqlite_backup(&backup_path).unwrap();
+        assert!(pre_restore_snap.exists());
+        assert_eq!(
+            db.get_raw_config_value("restore_probe_key")
+                .unwrap()
+                .as_deref(),
+            Some("before_backup")
+        );
+        assert_eq!(db.get_schema_version().unwrap(), 15);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}

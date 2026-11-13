@@ -118,17 +118,26 @@ impl ExecutionEngine {
                 .or_else(|| bars.last().map(|b| b.funding_rate_hourly))
             else {
                 skipped_missing += 1;
-                tracing::warn!(
-                    trade_id = trade.trade_id,
-                    symbol = %trade.symbol,
-                    "Skipping hourly funding accrual: no on-chain or 1h bar funding rate available (ME-8: will retry this hour)"
-                );
+                let should_warn = {
+                    let mut guard = self.missing_funding_warn_ms.lock();
+                    let prev = guard.get(&coin).copied().unwrap_or(0);
+                    if prev == 0 || now_ms.saturating_sub(prev) >= 3_600_000 {
+                        guard.insert(coin.clone(), now_ms);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_warn {
+                    tracing::warn!(
+                        trade_id = trade.trade_id,
+                        symbol = %trade.symbol,
+                        "Skipping hourly funding accrual: no on-chain or 1h bar funding rate available (ME-8: will retry this hour)"
+                    );
+                }
                 continue;
             };
-            let mark_px = bars
-                .last()
-                .map(|b| b.close)
-                .unwrap_or(trade.current_price);
+            let mark_px = bars.last().map(|b| b.close).unwrap_or(trade.current_price);
             let notional = trade.quantity.abs() * mark_px;
             let delta = round_dp(
                 if trade.side == "LONG" {
@@ -353,10 +362,10 @@ impl ExecutionEngine {
                 };
                 if ok {
                     trued_up += 1;
+                    self.pending_fix4_fill_trueups
+                        .lock()
+                        .remove(&(is_pond, row_id));
                 }
-                self.pending_fix4_fill_trueups
-                    .lock()
-                    .remove(&(is_pond, row_id));
             }
         }
         trued_up
@@ -496,19 +505,21 @@ impl ExecutionEngine {
                     resting_promoted_or_cancelled = true;
                 }
             } else if r_status.state == "GONE" {
-                if let Some((fill_qty, fill_px, fee_usdc)) = self.try_promote_gone_via_clearinghouse(
-                    &coin,
-                    &rt.side,
-                    rt.quantity,
-                    rt.entry_price,
-                    maker_fee_bps,
-                    ex_positions,
-                    existing_open_qty_by_coin,
-                    |q, p, fee| {
-                        self.db
-                            .promote_resting_trade_to_open(rt.trade_id, q, p, fee, 0.0)
-                    },
-                ) {
+                if let Some((fill_qty, fill_px, fee_usdc)) = self
+                    .try_promote_gone_via_clearinghouse(
+                        &coin,
+                        &rt.side,
+                        rt.quantity,
+                        rt.entry_price,
+                        maker_fee_bps,
+                        ex_positions,
+                        existing_open_qty_by_coin,
+                        |q, p, fee| {
+                            self.db
+                                .promote_resting_trade_to_open(rt.trade_id, q, p, fee, 0.0)
+                        },
+                    )
+                {
                     self.register_pending_fix4_pit_trueup(
                         rt.trade_id,
                         rt.exchange_order_id.as_deref(),
@@ -551,7 +562,9 @@ impl ExecutionEngine {
     /// `OPEN_ON_BOOK` resting PIT orders so delayed/blended resting fills cannot push heat above cap.
     pub fn enforce_post_promotion_heat_cap(&self, is_simulated: bool) -> usize {
         let cfg = self.load_config_logged("enforce_post_promotion_heat_cap");
-        let max_heat_pct = cfg.get_f64("max_portfolio_heat_pct", 0.06).clamp(0.01, 0.50);
+        let max_heat_pct = cfg
+            .get_f64("max_portfolio_heat_pct", 0.04)
+            .clamp(0.01, 0.50);
         let initial_equity = cfg.get_f64("initial_equity_usdc", 10_000.0).max(50.0);
         let pit_equity = self
             .db
@@ -563,16 +576,15 @@ impl ExecutionEngine {
         let open_trades = self.db.get_open_trades().unwrap_or_default();
         let mut open_heat_usdc = 0.0;
         for t in &open_trades {
-            let stop_px = if t.chandelier_stop_price > 0.0 {
-                t.chandelier_stop_price
-            } else {
-                t.initial_stop_price
-            };
-            let trade_heat = if stop_px > 0.0 && (t.entry_price - stop_px).abs() > 1e-12 {
-                (t.entry_price - stop_px).abs() * t.quantity.abs()
-            } else {
-                t.risk_budget_usdc.max(0.0)
-            };
+            let trade_heat = aegis_core::effective_position_open_heat_usdc(
+                t.side.as_str(),
+                t.entry_price,
+                t.initial_stop_price,
+                (t.chandelier_stop_price > 0.0).then_some(t.chandelier_stop_price),
+                t.quantity,
+                t.risk_budget_usdc,
+                t.funding_accrued_usdc,
+            );
             open_heat_usdc += trade_heat;
         }
         if open_heat_usdc <= max_heat_usdc + 1e-6 {
@@ -713,19 +725,21 @@ impl ExecutionEngine {
                     armed_promoted = true;
                 }
             } else if r_status.state == "GONE" {
-                if let Some((fill_qty, fill_px, fee_usdc)) = self.try_promote_gone_via_clearinghouse(
-                    &coin,
-                    &cell.side,
-                    cell_qty,
-                    cell_limit_px,
-                    maker_fee_bps,
-                    ex_positions,
-                    existing_open_qty_by_coin,
-                    |q, p, fee| {
-                        self.db
-                            .promote_armed_pond_cell_to_open(cell.cell_id, q, p, fee)
-                    },
-                ) {
+                if let Some((fill_qty, fill_px, fee_usdc)) = self
+                    .try_promote_gone_via_clearinghouse(
+                        &coin,
+                        &cell.side,
+                        cell_qty,
+                        cell_limit_px,
+                        maker_fee_bps,
+                        ex_positions,
+                        existing_open_qty_by_coin,
+                        |q, p, fee| {
+                            self.db
+                                .promote_armed_pond_cell_to_open(cell.cell_id, q, p, fee)
+                        },
+                    )
+                {
                     self.register_pending_fix4_pond_trueup(cell.cell_id, resting_oid, fee_usdc);
                     tracing::info!(
                         cell_id = cell.cell_id,
@@ -752,8 +766,7 @@ impl ExecutionEngine {
         side: &str,
         resting_limit_px: f64,
     ) -> Option<(f64, f64)> {
-        let cfg = self
-            .load_config_logged("check_unattributed_onchain_position_for_symbol");
+        let cfg = self.load_config_logged("check_unattributed_onchain_position_for_symbol");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
         if mode == "PAPER" {
             return None;
@@ -849,20 +862,20 @@ impl ExecutionEngine {
                 self.check_resting_order_status(r_trade.exchange_order_id.as_deref());
             if r_status.state == "OPEN_ON_BOOK" && !freeze_entries && !is_backtest {
                 if let Some(oid_str) = r_trade.exchange_order_id.as_deref() {
-                    let cancel_confirmed =
-                        match self.cancel_resting_order(&r_trade.symbol, oid_str) {
-                            Ok(confirmed) => confirmed,
-                            Err(e) => {
-                                tracing::warn!(
-                                    symbol = %r_trade.symbol,
-                                    trade_id = r_trade.trade_id,
-                                    oid = %oid_str,
-                                    error = %e,
-                                    "cancel_resting_order returned Err during resting PIT trade reconciliation (R10-N3)"
-                                );
-                                false
-                            }
-                        };
+                    let cancel_confirmed = match self.cancel_resting_order(&r_trade.symbol, oid_str)
+                    {
+                        Ok(confirmed) => confirmed,
+                        Err(e) => {
+                            tracing::warn!(
+                                symbol = %r_trade.symbol,
+                                trade_id = r_trade.trade_id,
+                                oid = %oid_str,
+                                error = %e,
+                                "cancel_resting_order returned Err during resting PIT trade reconciliation (R10-N3)"
+                            );
+                            false
+                        }
+                    };
                     r_status = self.verify_post_cancel_resting_order(
                         &r_trade.symbol,
                         oid_str,

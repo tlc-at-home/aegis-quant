@@ -48,12 +48,8 @@ impl TelemetryBus {
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
                 while let Some(ev) = event_rx.recv().await {
-                    let _ = writer_db.log_telemetry(
-                        &ev.level,
-                        &ev.component,
-                        &ev.message,
-                        ev.details,
-                    );
+                    let _ =
+                        writer_db.log_telemetry(&ev.level, &ev.component, &ev.message, ev.details);
                 }
             });
         } else {

@@ -32,16 +32,8 @@ impl DiagonalGaussianHMM {
             max_iter,
             tol,
             pi: [1.0 / 3.0; 3],
-            trans: [
-                [0.90, 0.08, 0.02],
-                [0.08, 0.84, 0.08],
-                [0.02, 0.08, 0.90],
-            ],
-            means: [
-                [-0.55, 0.0, -0.35],
-                [0.0, 0.0, 0.0],
-                [0.55, 0.0, 0.35],
-            ],
+            trans: [[0.90, 0.08, 0.02], [0.08, 0.84, 0.08], [0.02, 0.08, 0.90]],
+            means: [[-0.55, 0.0, -0.35], [0.0, 0.0, 0.0], [0.55, 0.0, 0.35]],
             vars: [[1.0; 3]; 3],
             last_alpha: None,
         }
@@ -156,12 +148,7 @@ impl DiagonalGaussianHMM {
             let n = subset.len() as f64;
             for d in 0..3 {
                 let mean = subset.iter().map(|r| r[d]).sum::<f64>() / n;
-                let var = subset
-                    .iter()
-                    .map(|r| (r[d] - mean).powi(2))
-                    .sum::<f64>()
-                    / n
-                    + 1e-2;
+                let var = subset.iter().map(|r| (r[d] - mean).powi(2)).sum::<f64>() / n + 1e-2;
                 self.means[state_idx][d] = mean;
                 self.vars[state_idx][d] = var.max(0.08);
             }
@@ -169,11 +156,7 @@ impl DiagonalGaussianHMM {
 
         let prior_means_col0 = [-0.55, 0.0, 0.55];
         let prior_weight = 18.0;
-        let trans_prior = [
-            [48.0, 1.2, 0.05],
-            [1.0, 40.0, 1.0],
-            [0.05, 1.2, 48.0],
-        ];
+        let trans_prior = [[48.0, 1.2, 0.05], [1.0, 40.0, 1.0], [0.05, 1.2, 48.0]];
 
         let mut prev_ll = f64::NEG_INFINITY;
         for _ in 0..self.max_iter {
@@ -332,10 +315,7 @@ impl DiagonalGaussianHMM {
     /// Performs a single-step forward Bayesian update from `base_alpha` (or `self.last_alpha`)
     /// without mutating stored HMM parameters (`alpha_{T+1} \propto (alpha_T A) \odot B(x_{T+1})`).
     pub fn step_forward(&self, obs: &[f64; 3], base_alpha: Option<&[f64; 3]>) -> [f64; 3] {
-        let alpha_prev = base_alpha
-            .copied()
-            .or(self.last_alpha)
-            .unwrap_or(self.pi);
+        let alpha_prev = base_alpha.copied().or(self.last_alpha).unwrap_or(self.pi);
         let mut prior_next = [0.0; 3];
         for j in 0..3 {
             let mut acc = 0.0;
@@ -406,6 +386,7 @@ pub(crate) struct HmmCacheState {
     pub last_vol_raw: f64,
     pub prev_ema_r_fast: f64,
     pub prev_ema_r_slow: f64,
+    pub prev_ema_v: f64,
     pub last_ema_r_fast: f64,
     pub last_ema_r_slow: f64,
     pub last_ema_v: f64,
@@ -436,6 +417,7 @@ impl Default for HmmCacheState {
             last_vol_raw: 0.0,
             prev_ema_r_fast: 0.0,
             prev_ema_r_slow: 0.0,
+            prev_ema_v: 0.0,
             last_ema_r_fast: 0.0,
             last_ema_r_slow: 0.0,
             last_ema_v: 0.0,
@@ -662,12 +644,15 @@ impl SignalEngine {
                 cfg.get_f64("hmm_exit_prob_gate", 0.45),
             )
             .clamp(0.25, 0.65);
+        let intrabar_enter_margin = cfg
+            .get_f64("hmm_intrabar_enter_margin", 0.03)
+            .clamp(0.0, 0.25);
 
         let last_bar_ts = btc_bars.last().map(|b| b.timestamp_ms).unwrap_or(0);
         let last_bar_close = btc_bars.last().map(|b| b.close).unwrap_or(0.0);
         let alt_fp = compute_alt_pc1_fingerprint(alt_pc1_series);
         {
-            let cache = self.hmm_cache.lock();
+            let mut cache = self.hmm_cache.lock();
             if cache.bar_ts == Some(last_bar_ts)
                 && cache.bar_len == n_bars
                 && cache.window == window
@@ -675,15 +660,14 @@ impl SignalEngine {
                 && cache.states.len() == n_bars
                 && cache.hmm.is_some()
             {
-                let eff_tick = live_tick_close
-                    .filter(|&p| p > 0.0 && (p - cache.last_bar_close).abs() > 1e-9)
-                    .or_else(|| {
-                        if (last_bar_close - cache.last_bar_close).abs() > 1e-9 {
-                            Some(last_bar_close)
-                        } else {
-                            None
-                        }
-                    });
+                let target_px = live_tick_close
+                    .filter(|&p| p > 0.0)
+                    .unwrap_or(last_bar_close);
+                let eff_tick = if (target_px - cache.last_bar_close).abs() > 1e-9 {
+                    Some(target_px)
+                } else {
+                    None
+                };
                 let Some(tick_px) = eff_tick else {
                     return Arc::clone(&cache.states);
                 };
@@ -710,8 +694,8 @@ impl SignalEngine {
                     let alpha_s = 2.0 / (span_r_slow + 1.0);
                     let ema_r_f = alpha_f * raw_r + (1.0 - alpha_f) * cache.prev_ema_r_fast;
                     let ema_r_s = alpha_s * raw_r + (1.0 - alpha_s) * cache.prev_ema_r_slow;
-                    let smooth_r = scfg.hmm_ret_fast_weight * ema_r_f
-                        + scfg.hmm_ret_slow_weight * ema_r_s;
+                    let smooth_r =
+                        scfg.hmm_ret_fast_weight * ema_r_f + scfg.hmm_ret_slow_weight * ema_r_s;
                     let r_z = ((smooth_r - cache.r_mean) / cache.r_std).clamp(-3.5, 3.5);
                     let last_bar = &btc_bars[n_bars - 1];
                     let intrabar_high = last_bar.high.max(tick_px);
@@ -719,7 +703,7 @@ impl SignalEngine {
                     let raw_v =
                         ((intrabar_high - intrabar_low) / tick_px.max(1e-8)) * elapsed_frac.sqrt();
                     let alpha_v = 2.0 / (span_vol + 1.0);
-                    let ema_v = alpha_v * raw_v + (1.0 - alpha_v) * cache.last_ema_v;
+                    let ema_v = alpha_v * raw_v + (1.0 - alpha_v) * cache.prev_ema_v;
                     let v_z = ((ema_v - cache.v_mean) / cache.v_std).clamp(-3.5, 3.5);
                     let a_z = ((cache.last_ema_a - cache.a_mean) / cache.a_std).clamp(-3.5, 3.5);
                     let obs = [r_z, v_z, a_z];
@@ -728,12 +712,8 @@ impl SignalEngine {
                     let p_bull = post[bull_idx];
                     let p_bear = post[bear_idx];
                     let p_chop = post[chop_idx];
-                    let prev_regime = if states.len() >= 2 {
-                        states[states.len() - 2].regime.as_str()
-                    } else {
-                        "CHOP"
-                    };
-                    let next_regime = apply_hysteresis_with_gates(
+                    let prev_regime = states.last().map(|s| s.regime.as_str()).unwrap_or("CHOP");
+                    let candidate_regime = apply_hysteresis_with_gates(
                         prev_regime,
                         p_bull,
                         p_bear,
@@ -741,9 +721,23 @@ impl SignalEngine {
                         enter_gate,
                         exit_gate,
                     );
+                    let regime_prob = |r: &str| match r {
+                        "BULL" => p_bull,
+                        "BEAR" => p_bear,
+                        _ => p_chop,
+                    };
+                    let next_regime = if candidate_regime != prev_regime
+                        && regime_prob(candidate_regime)
+                            < regime_prob(prev_regime) + intrabar_enter_margin
+                    {
+                        prev_regime
+                    } else {
+                        candidate_regime
+                    }
+                    .to_string();
                     if let Some(last_state) = states.last_mut() {
                         *last_state = RegimeState {
-                            regime: next_regime.to_string(),
+                            regime: next_regime,
                             prob_bull: round_dp(p_bull, 4),
                             prob_bear: round_dp(p_bear, 4),
                             prob_chop: round_dp(p_chop, 4),
@@ -751,7 +745,10 @@ impl SignalEngine {
                         };
                     }
                 }
-                return Arc::from(states);
+                let shared: Arc<[RegimeState]> = Arc::from(states);
+                cache.last_bar_close = tick_px;
+                cache.states = Arc::clone(&shared);
+                return shared;
             }
         }
 
@@ -780,12 +777,10 @@ impl SignalEngine {
             if let Ok(usdc_assets) = self.db.get_usdc_perp_universe() {
                 for a in usdc_assets {
                     if a.base_asset != "BTC" {
-                        if let Ok(abars) = self.db.get_ohlcv_bars(
-                            &a.symbol,
-                            &a.exec_timeframe,
-                            n_bars + 5,
-                            None,
-                        ) {
+                        if let Ok(abars) =
+                            self.db
+                                .get_ohlcv_bars(&a.symbol, &a.exec_timeframe, n_bars + 5, None)
+                        {
                             alt_map.insert(a.symbol, abars);
                         }
                     }
@@ -800,8 +795,7 @@ impl SignalEngine {
         let mut smooth_ret = Vec::with_capacity(w_total);
         for i in 0..w_total {
             smooth_ret.push(
-                scfg.hmm_ret_fast_weight * ema_r_fast[i]
-                    + scfg.hmm_ret_slow_weight * ema_r_slow[i],
+                scfg.hmm_ret_fast_weight * ema_r_fast[i] + scfg.hmm_ret_slow_weight * ema_r_slow[i],
             );
         }
         let smooth_vol = Self::causal_ema(&vol_raw, span_vol);
@@ -954,6 +948,11 @@ impl SignalEngine {
             } else {
                 *ema_r_slow.first().unwrap_or(&0.0)
             };
+            cache.prev_ema_v = if smooth_vol.len() >= 2 {
+                smooth_vol[smooth_vol.len() - 2]
+            } else {
+                *smooth_vol.first().unwrap_or(&0.0)
+            };
             cache.last_ema_r_fast = *ema_r_fast.last().unwrap_or(&0.0);
             cache.last_ema_r_slow = *ema_r_slow.last().unwrap_or(&0.0);
             cache.last_ema_v = *smooth_vol.last().unwrap_or(&0.0);
@@ -992,12 +991,8 @@ impl SignalEngine {
         alt_pc1_series: Option<&[f64]>,
         live_tick_close: Option<f64>,
     ) -> RegimeState {
-        let states = self.decode_hmm_regime_states_shared(
-            btc_bars,
-            window,
-            alt_pc1_series,
-            live_tick_close,
-        );
+        let states =
+            self.decode_hmm_regime_states_shared(btc_bars, window, alt_pc1_series, live_tick_close);
         states.last().cloned().unwrap_or_default()
     }
 }

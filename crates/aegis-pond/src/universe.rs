@@ -57,8 +57,7 @@ impl PondUniverseManager {
             .collect();
 
         let open_cells = self.scoped_db.get_open_pond_cells()?;
-        let open_cell_symbols: HashSet<String> =
-            open_cells.into_iter().map(|c| c.symbol).collect();
+        let open_cell_symbols: HashSet<String> = open_cells.into_iter().map(|c| c.symbol).collect();
 
         let has_override = candidates_override.is_some();
         let discovered = match candidates_override {
@@ -74,18 +73,13 @@ impl PondUniverseManager {
         let mut final_rows = Vec::new();
 
         let is_live_discovery = discovered.iter().any(|c| c.is_synthetic_volume == 0);
-        let is_live_or_testnet = cfg.pond_execution_mode.eq_ignore_ascii_case("LIVE")
-            || cfg.pond_execution_mode.eq_ignore_ascii_case("TESTNET");
         let has_existing_live_active = existing_map
             .values()
             .any(|r| r.status != "RETIRED" && r.is_synthetic_volume == 0);
-        if is_live_or_testnet
-            && !has_override
-            && !is_live_discovery
-            && has_existing_live_active
-        {
+        if !has_override && !is_live_discovery && has_existing_live_active {
             tracing::warn!(
-                "Live/Testnet Pond universe discovery returned synthetic fallback while live universe rows exist; preserving existing universe"
+                pond_execution_mode = %cfg.pond_execution_mode,
+                "Pond universe discovery returned synthetic fallback while live universe rows exist; preserving existing live universe (R15-QA(d))"
             );
             let mut preserved: Vec<PondUniverseRow> = existing_map.into_values().collect();
             preserved.sort_by_key(|r| r.rank);
@@ -100,9 +94,8 @@ impl PondUniverseManager {
 
         for cand in discovered {
             let prev = existing_map.get(&cand.symbol);
-            let is_existing_live = prev
-                .map(|p| !(is_live_discovery && p.is_synthetic_volume != 0))
-                .unwrap_or(false);
+            let is_existing_live =
+                is_live_discovery && prev.map(|p| p.is_synthetic_volume == 0).unwrap_or(false);
             if cand.median_daily_volume_usdc < min_vol && !is_existing_live {
                 continue;
             }

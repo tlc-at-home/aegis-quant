@@ -151,6 +151,19 @@ pub struct CancelAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelByCloidWire {
+    pub asset: u32,
+    pub cloid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelByCloidAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub cancels: Vec<CancelByCloidWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultTransferAction {
     #[serde(rename = "type")]
@@ -255,7 +268,9 @@ pub fn sign_l1_action<T: Serialize>(
 
     // 2. Struct Hash for Agent(string source,bytes32 connectionId)
     let mut agent_buf = Vec::with_capacity(32 * 3);
-    agent_buf.extend_from_slice(&Keccak256::digest(b"Agent(string source,bytes32 connectionId)"));
+    agent_buf.extend_from_slice(&Keccak256::digest(
+        b"Agent(string source,bytes32 connectionId)",
+    ));
     let source_str = if is_mainnet { "a" } else { "b" };
     agent_buf.extend_from_slice(&Keccak256::digest(source_str.as_bytes()));
     agent_buf.extend_from_slice(&action_h);

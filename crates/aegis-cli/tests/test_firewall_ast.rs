@@ -250,7 +250,9 @@ fn test_invariants_f2_f3_f4_scoped_db_and_config_isolation() {
         Err(FirewallError::UnauthorizedConfigAccess { .. })
     ));
 
-    assert!(pond_db.check_config_key_access("pond_direction_policy").is_ok());
+    assert!(pond_db
+        .check_config_key_access("pond_direction_policy")
+        .is_ok());
     assert!(matches!(
         pond_db.check_config_key_access("mace_weight"),
         Err(FirewallError::UnauthorizedConfigAccess { .. })

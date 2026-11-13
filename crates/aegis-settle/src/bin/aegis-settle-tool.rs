@@ -39,14 +39,12 @@ fn parse_split(s: &str) -> aegis_core::Result<(f64, f64)> {
             "Invalid --initial-split '{s}': expected '<PIT_USDC>:<POND_USDC>' (e.g. 5000:5000)"
         )));
     }
-    let pit = parts[0]
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| aegis_core::AegisError::Validation(format!("Invalid PIT equity in --initial-split: {e}")))?;
-    let pond = parts[1]
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| aegis_core::AegisError::Validation(format!("Invalid POND equity in --initial-split: {e}")))?;
+    let pit = parts[0].trim().parse::<f64>().map_err(|e| {
+        aegis_core::AegisError::Validation(format!("Invalid PIT equity in --initial-split: {e}"))
+    })?;
+    let pond = parts[1].trim().parse::<f64>().map_err(|e| {
+        aegis_core::AegisError::Validation(format!("Invalid POND equity in --initial-split: {e}"))
+    })?;
     if !pit.is_finite() || !pond.is_finite() || pit < 0.0 || pond < 0.0 || (pit + pond) <= 0.0 {
         return Err(aegis_core::AegisError::Validation(format!(
             "Invalid --initial-split '{s}': values must be finite non-negative numbers with positive sum"

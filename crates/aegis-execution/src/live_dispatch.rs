@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::signing::{
     derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, format_hl_wire_size_floor,
-    infer_sz_decimals_from_lot_step, sign_l1_action, CancelAction, CancelWire, LimitOrderType,
-    OrderAction, OrderTypeWire, OrderWire, SubAccountTransferAction, TriggerOrderTypeWire,
-    VaultTransferAction,
+    infer_sz_decimals_from_lot_step, sign_l1_action, CancelAction, CancelByCloidAction,
+    CancelByCloidWire, CancelWire, LimitOrderType, OrderAction, OrderTypeWire, OrderWire,
+    SubAccountTransferAction, TriggerOrderTypeWire, VaultTransferAction,
 };
 use crate::{
     ExecutionEngine, RestingOrderStatus, SubaccountTransferResult, SubaccountTransferStatus,
@@ -34,6 +34,49 @@ pub const HL_NO_MATCH_RETRY_SLIP_PCT: f64 = 0.05;
 /// Tight IOC retry slippage (`0.3%`) applied around `live_mid` when an IOC order is
 /// rejected with `"Order price too far from oracle"`, before clamping to [`HL_ORACLE_BAND_PCT`] (`R11-S1`).
 pub const HL_ORACLE_RETRY_SLIP_PCT: f64 = 0.003;
+
+/// Computes the marketable IOC retry limit price around `live_mid`, guarding against
+/// stale or wildly divergent Testnet `oraclePx` values (`LT-1`, `R11-S1`).
+///
+/// Only treats `oracle_px` as a valid band anchor when `live_mid` lies within
+/// `HL_ORACLE_BAND_PCT` (`3.95%`) of `oracle_px`. When valid, clamps `BUY` limits to
+/// `raw_limit.min(opx * (1.0 + HL_ORACLE_BAND_PCT)).max(live_mid)` and `SELL` limits to
+/// `raw_limit.max(opx * (1.0 - HL_ORACLE_BAND_PCT)).min(live_mid)` so a below-mid oracle
+/// can never pull a `BUY` limit below `live_mid` (nor an above-mid oracle pull a `SELL`
+/// limit above `live_mid`). When `oracle_px` diverges beyond the band (e.g., stale Testnet
+/// `HYPE` oracle), ignores `oracle_px` and anchors strictly to `live_mid * (1.0 ± slip_mult)`.
+pub(crate) fn compute_ioc_retry_limit_price(
+    live_mid: f64,
+    oracle_px_opt: Option<f64>,
+    is_buy: bool,
+    slip_mult: f64,
+) -> f64 {
+    let raw_limit = if is_buy {
+        live_mid * (1.0 + slip_mult)
+    } else {
+        live_mid * (1.0 - slip_mult)
+    };
+    let valid_oracle = oracle_px_opt.filter(|&opx| {
+        opx.is_finite()
+            && opx > 0.0
+            && live_mid.is_finite()
+            && live_mid > 0.0
+            && ((live_mid - opx).abs() / opx) <= HL_ORACLE_BAND_PCT
+    });
+    if let Some(opx) = valid_oracle {
+        if is_buy {
+            raw_limit
+                .min(opx * (1.0 + HL_ORACLE_BAND_PCT))
+                .max(live_mid)
+        } else {
+            raw_limit
+                .max(opx * (1.0 - HL_ORACLE_BAND_PCT))
+                .min(live_mid)
+        }
+    } else {
+        raw_limit
+    }
+}
 
 /// Parses a Hyperliquid `/exchange` order response into an `OrderExecutionResult` (`NH-7`, `NM-9`, `Q1`).
 ///
@@ -169,9 +212,8 @@ pub fn parse_hyperliquid_order_ack(
             };
         }
 
-        let fees_paid_usdc = fee_opt.unwrap_or_else(|| {
-            round_dp(total_sz * avg_px * (fee_bps.max(0.0) / 10_000.0), 4)
-        });
+        let fees_paid_usdc = fee_opt
+            .unwrap_or_else(|| round_dp(total_sz * avg_px * (fee_bps.max(0.0) / 10_000.0), 4));
         let slip_usd = round_dp((avg_px - reference_price).abs() * total_sz, 4);
         let eff_slip_bps = if reference_price > 0.0 {
             round_dp(
@@ -349,18 +391,14 @@ impl ExecutionEngine {
             || mode == "TESTNET"
             || pond_mode == "TESTNET";
 
-        if let Some(old_oid) = prev_stop_oid.filter(|s| !s.trim().is_empty()) {
-            let _ = self.cancel_resting_order(&asset.symbol, old_oid);
-        }
-
         let Some(asset_idx) =
             self.fetch_hyperliquid_universe_asset_index(&asset.base_asset, is_testnet)
         else {
             return Ok(None);
         };
         let sz_decimals = infer_sz_decimals_from_lot_step(asset.lot_step_size);
-        let is_long_pos = position_side.eq_ignore_ascii_case("LONG")
-            || position_side.eq_ignore_ascii_case("BUY");
+        let is_long_pos =
+            position_side.eq_ignore_ascii_case("LONG") || position_side.eq_ignore_ascii_case("BUY");
         // Protective stop closes the position: SELL (b=false) for LONG, BUY (b=true) for SHORT
         let stop_is_buy = !is_long_pos;
         let trigger_px_str = format_hl_wire_price(trigger_price, asset.tick_size, sz_decimals);
@@ -401,24 +439,51 @@ impl ExecutionEngine {
             orders: vec![order_wire],
             grouping: "na".to_string(),
         };
+        // R15-S1: Submit-then-cancel — only cancel `prev_stop_oid` AFTER the replacement stop
+        // order is accepted by Hyperliquid with a non-empty `exchange_order_id`.
         let (_, resp_opt) =
             self.post_signed_l1_action_with_nonce_retry(&priv_key, &action, &cfg, is_testnet)?;
-        if let Some(resp) = resp_opt {
-            let ack = parse_hyperliquid_order_ack(
-                &resp,
-                &asset.symbol,
-                if stop_is_buy { "LONG" } else { "SHORT" },
-                quantity,
-                trigger_price,
-                false,
-                cfg.get_f64("taker_fee_bps", 4.5),
-                "protective-sl",
+        let Some(resp) = resp_opt else {
+            tracing::warn!(
+                symbol = %asset.symbol,
+                prev_stop_oid = ?prev_stop_oid,
+                "Replacement protective stop returned empty HTTP response; preserving previous stop order (R15-S1)"
             );
-            if !ack.exchange_order_id.trim().is_empty() {
-                return Ok(Some(ack.exchange_order_id));
+            return Err(AegisError::Execution(format!(
+                "PROTECTIVE_STOP_SYNC_FAILED ({}): empty exchange response",
+                asset.symbol
+            )));
+        };
+        let ack = parse_hyperliquid_order_ack(
+            &resp,
+            &asset.symbol,
+            if stop_is_buy { "LONG" } else { "SHORT" },
+            quantity,
+            trigger_price,
+            false,
+            cfg.get_f64("taker_fee_bps", 4.5),
+            "protective-sl",
+        );
+        let new_oid = ack.exchange_order_id.trim().to_string();
+        if ack.fsm_state == "REJECTED" || new_oid.is_empty() {
+            tracing::warn!(
+                symbol = %asset.symbol,
+                fsm_state = %ack.fsm_state,
+                fill_type = %ack.fill_type,
+                prev_stop_oid = ?prev_stop_oid,
+                "Replacement protective stop rejected or returned empty OID; preserving previous stop order (R15-S1)"
+            );
+            return Err(AegisError::Execution(format!(
+                "PROTECTIVE_STOP_SYNC_FAILED ({}): {} ({})",
+                asset.symbol, ack.fsm_state, ack.fill_type
+            )));
+        }
+        if let Some(old_oid) = prev_stop_oid.filter(|s| !s.trim().is_empty()) {
+            if old_oid.trim() != new_oid {
+                let _ = self.cancel_resting_order(&asset.symbol, old_oid);
             }
         }
-        Ok(None)
+        Ok(Some(new_oid))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -542,10 +607,15 @@ impl ExecutionEngine {
                 let fees_paid_usdc = if status.fee_usdc > 0.0 {
                     round_dp(status.fee_usdc, 4)
                 } else {
-                    round_dp(status.filled_units * status.entry_price * (fee_bps / 10_000.0), 4)
+                    round_dp(
+                        status.filled_units * status.entry_price * (fee_bps / 10_000.0),
+                        4,
+                    )
                 };
-                let slip_usd =
-                    round_dp((status.entry_price - reference_price).abs() * status.filled_units, 4);
+                let slip_usd = round_dp(
+                    (status.entry_price - reference_price).abs() * status.filled_units,
+                    4,
+                );
                 let eff_slip_bps = if reference_price > 0.0 {
                     round_dp(
                         ((status.entry_price - reference_price).abs() / reference_price) * 10_000.0,
@@ -617,7 +687,9 @@ impl ExecutionEngine {
             }
             let fill_lower = ack_res.fill_type.to_ascii_lowercase();
             let is_no_match = fill_lower.contains("could not immediately match");
-            let is_oracle_band = fill_lower.contains("price too far from oracle");
+            let is_oracle_band = fill_lower.contains("price too far from oracle")
+                || fill_lower.contains("away from the reference price")
+                || fill_lower.contains("reference price");
             if !prefer_maker && (is_no_match || is_oracle_band) {
                 let info_endpoint = self.info_url(cfg, is_testnet);
                 let coin_key = asset.base_asset.trim().to_uppercase();
@@ -665,9 +737,8 @@ impl ExecutionEngine {
                         .and_then(|mids| {
                             mids.get(&coin_key)
                                 .and_then(|v| {
-                                    v.as_f64().or_else(|| {
-                                        v.as_str().and_then(|s| s.parse::<f64>().ok())
-                                    })
+                                    v.as_f64()
+                                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                                 })
                                 .filter(|&p| p.is_finite() && p > 0.0)
                         });
@@ -678,21 +749,8 @@ impl ExecutionEngine {
                 } else {
                     HL_ORACLE_RETRY_SLIP_PCT
                 };
-                let retry_limit_px = if is_buy {
-                    let cand = live_mid * (1.0 + slip_mult);
-                    if let Some(opx) = oracle_px_opt {
-                        cand.min(opx * (1.0 + HL_ORACLE_BAND_PCT))
-                    } else {
-                        cand
-                    }
-                } else {
-                    let cand = live_mid * (1.0 - slip_mult);
-                    if let Some(opx) = oracle_px_opt {
-                        cand.max(opx * (1.0 - HL_ORACLE_BAND_PCT))
-                    } else {
-                        cand
-                    }
-                };
+                let retry_limit_px =
+                    compute_ioc_retry_limit_price(live_mid, oracle_px_opt, is_buy, slip_mult);
                 let retry_px_str =
                     format_hl_wire_price(retry_limit_px, asset.tick_size, sz_decimals);
                 let retry_sz_str = if is_reduce_only {
@@ -822,10 +880,15 @@ impl ExecutionEngine {
                 let fees_paid_usdc = if status.fee_usdc > 0.0 {
                     round_dp(status.fee_usdc, 4)
                 } else {
-                    round_dp(status.filled_units * status.entry_price * (fee_bps / 10_000.0), 4)
+                    round_dp(
+                        status.filled_units * status.entry_price * (fee_bps / 10_000.0),
+                        4,
+                    )
                 };
-                let slip_usd =
-                    round_dp((status.entry_price - reference_price).abs() * status.filled_units, 4);
+                let slip_usd = round_dp(
+                    (status.entry_price - reference_price).abs() * status.filled_units,
+                    4,
+                );
                 let eff_slip_bps = if reference_price > 0.0 {
                     round_dp(
                         ((status.entry_price - reference_price).abs() / reference_price) * 10_000.0,
@@ -967,6 +1030,191 @@ impl ExecutionEngine {
         .1
     }
 
+    /// Queries Hyperliquid `userFills` matching a specific `0x...` `cloid` (`R15-N4`).
+    pub fn query_hyperliquid_fills_for_cloid_with_reachability(
+        &self,
+        wallet_address: &str,
+        target_cloid: &str,
+        is_testnet: bool,
+    ) -> (bool, Option<(f64, f64, f64)>) {
+        let clean_cloid = target_cloid.trim();
+        if wallet_address.trim().is_empty() || clean_cloid.is_empty() {
+            return (false, None);
+        }
+        let cfg = self.load_config_logged("query_hyperliquid_fills_for_cloid");
+        let url = self.info_url(&cfg, is_testnet);
+        let Some(val) = self.http_post_json(
+            &url,
+            &json!({
+                "type": "userFills",
+                "user": wallet_address.trim(),
+            }),
+        ) else {
+            return (false, None);
+        };
+        let Some(arr) = val.as_array() else {
+            return (true, None);
+        };
+        let mut total_sz = 0.0_f64;
+        let mut total_notional = 0.0_f64;
+        let mut total_fee = 0.0_f64;
+        for fill in arr {
+            let f_cloid = fill.get("cloid").and_then(Value::as_str).unwrap_or("");
+            if !f_cloid.eq_ignore_ascii_case(clean_cloid) {
+                continue;
+            }
+            let sz = fill
+                .get("sz")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            let px = fill
+                .get("px")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            let fee = fill
+                .get("fee")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            if sz > 0.0 && px > 0.0 {
+                total_sz += sz;
+                total_notional += sz * px;
+                total_fee += fee;
+            }
+        }
+        if total_sz > 0.0 {
+            (true, Some((total_sz, total_notional / total_sz, total_fee)))
+        } else {
+            (true, None)
+        }
+    }
+
+    /// Queries Hyperliquid `userFills` for a recent closing fill on `symbol` after `opened_at` (`ME-7`).
+    /// Returns `Some((weighted_avg_exit_px, total_exit_fee_usdc))` when matching closing fills exist.
+    pub fn query_recent_exit_fill_for_symbol(
+        &self,
+        symbol: &str,
+        position_side: &str,
+        opened_at: &str,
+    ) -> Option<(f64, f64)> {
+        let cfg = self.load_config_logged("query_recent_exit_fill_for_symbol");
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        if mode == "PAPER" {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+        if wallet.is_empty() {
+            return None;
+        }
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+        let url = self.info_url(&cfg, is_testnet);
+        let val = self.http_post_json(
+            &url,
+            &json!({
+                "type": "userFills",
+                "user": wallet,
+            }),
+        )?;
+        let arr = val.as_array()?;
+        let target_coin = symbol
+            .split('/')
+            .next()
+            .unwrap_or(symbol)
+            .trim()
+            .to_uppercase();
+        let opened_ms = chrono::DateTime::parse_from_rfc3339(opened_at.trim())
+            .map(|dt| dt.timestamp_millis())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(opened_at.trim(), "%Y-%m-%d %H:%M:%S")
+                    .map(|ndt| ndt.and_utc().timestamp_millis())
+            })
+            .unwrap_or(0);
+        let is_long_pos =
+            position_side.eq_ignore_ascii_case("LONG") || position_side.eq_ignore_ascii_case("BUY");
+
+        let mut total_sz = 0.0_f64;
+        let mut total_notional = 0.0_f64;
+        let mut total_fee = 0.0_f64;
+        for fill in arr {
+            let coin = fill
+                .get("coin")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_uppercase();
+            if coin != target_coin {
+                continue;
+            }
+            let fill_time = fill.get("time").and_then(Value::as_i64).unwrap_or(0);
+            if opened_ms > 0 && fill_time > 0 && fill_time < opened_ms {
+                continue;
+            }
+            let dir = fill
+                .get("dir")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let side = fill
+                .get("side")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            let is_closing = if !dir.is_empty() {
+                (is_long_pos && dir.contains("close long"))
+                    || (!is_long_pos && dir.contains("close short"))
+            } else if is_long_pos {
+                side == "A" || side == "SELL"
+            } else {
+                side == "B" || side == "BUY"
+            };
+            if !is_closing {
+                continue;
+            }
+            let sz = fill
+                .get("sz")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            let px = fill
+                .get("px")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            let fee = fill
+                .get("fee")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .unwrap_or(0.0);
+            if sz > 0.0 && px > 0.0 {
+                total_sz += sz;
+                total_notional += sz * px;
+                total_fee += fee;
+            }
+        }
+        if total_sz > 0.0 {
+            Some((
+                round_dp(total_notional / total_sz, 6),
+                round_dp(total_fee, 4),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Checks whether a resting ALO order (`OPEN_ON_BOOK`) is still resting on `openOrders`,
     /// has filled (`userFills` / `orderStatus` by `oid`), was cancelled/expired (`GONE`), or
     /// could not be verified because all `/info` calls failed (`UNKNOWN`) (`NH-6`, `R3-H4`, `R3-H16`, `R9-N3`, `R9-N4`).
@@ -1067,6 +1315,20 @@ impl ExecutionEngine {
                     fee_usdc: round_dp(fee, 4),
                 };
             }
+        } else if let Some(cloid) = target_cloid {
+            let (fills_reachable, fills_opt) = self
+                .query_hyperliquid_fills_for_cloid_with_reachability(&wallet, cloid, is_testnet);
+            if fills_reachable {
+                any_info_reachable = true;
+            }
+            if let Some((filled_sz, avg_px, fee)) = fills_opt {
+                return RestingOrderStatus {
+                    state: "FILLED".to_string(),
+                    filled_units: round_dp(filled_sz, 6),
+                    entry_price: round_dp(avg_px, 6),
+                    fee_usdc: round_dp(fee, 4),
+                };
+            }
         }
 
         let url = self.info_url(&cfg, is_testnet);
@@ -1099,6 +1361,32 @@ impl ExecutionEngine {
             }
             if ord_status.eq_ignore_ascii_case("filled") {
                 if let Some(order_inner) = os_val.get("order").and_then(|o| o.get("order")) {
+                    // R15-N4 / Table 3 #3: Prefer actual `userFills` by oid (discovered via
+                    // orderStatus even when lookup began from a 0x cloid); otherwise compute
+                    // filled_sz avoiding `origSz - sz == 0` when Hyperliquid leaves `sz == origSz`.
+                    let resolved_oid = target_oid.or_else(|| {
+                        order_inner.get("oid").and_then(Value::as_u64).or_else(|| {
+                            order_inner
+                                .get("oid")
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse::<u64>().ok())
+                        })
+                    });
+                    if let Some(oid) = resolved_oid {
+                        if let (_, Some((filled_sz, avg_px, fee))) = self
+                            .query_hyperliquid_fills_for_oid_with_reachability(
+                                &wallet, oid, is_testnet,
+                            )
+                        {
+                            return RestingOrderStatus {
+                                state: "FILLED".to_string(),
+                                filled_units: round_dp(filled_sz, 6),
+                                entry_price: round_dp(avg_px, 6),
+                                fee_usdc: round_dp(fee, 4),
+                            };
+                        }
+                    }
+
                     let orig_sz = order_inner
                         .get("origSz")
                         .or_else(|| order_inner.get("sz"))
@@ -1107,19 +1395,33 @@ impl ExecutionEngine {
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                         })
                         .unwrap_or(0.0);
-                    let limit_px = order_inner
-                        .get("limitPx")
+                    let rem_sz = order_inner
+                        .get("sz")
                         .and_then(|v| {
                             v.as_f64()
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
                         })
                         .unwrap_or(0.0);
-                    if orig_sz > 0.0 && limit_px > 0.0 {
+                    let filled_sz = if rem_sz > 0.0 && rem_sz < orig_sz {
+                        orig_sz - rem_sz
+                    } else {
+                        orig_sz
+                    };
+                    let limit_px = order_inner
+                        .get("limitPx")
+                        .or_else(|| order_inner.get("px"))
+                        .and_then(|v| {
+                            v.as_f64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+                        })
+                        .unwrap_or(0.0);
+                    if filled_sz > 0.0 && limit_px > 0.0 {
                         let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5).max(0.0);
-                        let est_fee = round_dp(orig_sz * limit_px * (maker_fee_bps / 10_000.0), 4);
+                        let est_fee =
+                            round_dp(filled_sz * limit_px * (maker_fee_bps / 10_000.0), 4);
                         return RestingOrderStatus {
                             state: "FILLED".to_string(),
-                            filled_units: round_dp(orig_sz, 6),
+                            filled_units: round_dp(filled_sz, 6),
                             entry_price: round_dp(limit_px, 6),
                             fee_usdc: est_fee,
                         };
@@ -1145,7 +1447,7 @@ impl ExecutionEngine {
         }
     }
 
-    /// Cancels a resting order on Hyperliquid by `exchange_order_id` (`hl-<oid>`) (`R9-N6`).
+    /// Cancels a resting order on Hyperliquid by `exchange_order_id` (`hl-<oid>` or `0x...` `cloid`) (`R9-N6`, `R15-N3`).
     pub fn cancel_resting_order(&self, symbol: &str, exchange_order_id: &str) -> Result<bool> {
         let cfg = self.db.load_config()?;
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
@@ -1155,14 +1457,24 @@ impl ExecutionEngine {
         if mode == "PAPER" && pond_mode == "PAPER" {
             return Ok(true);
         }
-        let Some(oid) = exchange_order_id
+        let clean = exchange_order_id.trim();
+        let parsed_oid = clean
             .strip_prefix("hl-")
-            .or(Some(exchange_order_id))
+            .or(Some(clean))
             .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&id| id > 0)
-        else {
-            return Ok(false);
+            .filter(|&id| id > 0);
+        let parsed_cloid = if parsed_oid.is_none()
+            && clean.starts_with("0x")
+            && clean.len() == 34
+            && clean[2..].chars().all(|c| c.is_ascii_hexdigit())
+        {
+            Some(clean.to_ascii_lowercase())
+        } else {
+            None
         };
+        if parsed_oid.is_none() && parsed_cloid.is_none() {
+            return Ok(false);
+        }
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false)
             || mode == "TESTNET"
             || pond_mode == "TESTNET";
@@ -1179,12 +1491,26 @@ impl ExecutionEngine {
         if priv_key.is_empty() {
             return Ok(false);
         }
-        let action = CancelAction {
-            action_type: "cancel".to_string(),
-            cancels: vec![CancelWire { a: asset_idx, o: oid }],
+        let (_, resp_opt) = if let Some(oid) = parsed_oid {
+            let action = CancelAction {
+                action_type: "cancel".to_string(),
+                cancels: vec![CancelWire {
+                    a: asset_idx,
+                    o: oid,
+                }],
+            };
+            self.post_signed_l1_action_with_nonce_retry(&priv_key, &action, &cfg, is_testnet)?
+        } else {
+            let cloid_hex = parsed_cloid.unwrap_or_default();
+            let action = CancelByCloidAction {
+                action_type: "cancelByCloid".to_string(),
+                cancels: vec![CancelByCloidWire {
+                    asset: asset_idx,
+                    cloid: cloid_hex,
+                }],
+            };
+            self.post_signed_l1_action_with_nonce_retry(&priv_key, &action, &cfg, is_testnet)?
         };
-        let (_, resp_opt) =
-            self.post_signed_l1_action_with_nonce_retry(&priv_key, &action, &cfg, is_testnet)?;
         if let Some(resp) = resp_opt {
             if resp.get("status").and_then(Value::as_str) != Some("ok") {
                 return Ok(false);
@@ -1205,7 +1531,8 @@ impl ExecutionEngine {
                         || err_lower.contains("already cancelled")
                         || err_lower.contains("never placed")
                         || err_lower.contains("filled")
-                        || err_lower.contains("unknown oid"));
+                        || err_lower.contains("unknown oid")
+                        || err_lower.contains("unknown cloid"));
                 }
             }
             tracing::warn!(
@@ -1247,9 +1574,7 @@ impl ExecutionEngine {
                 let wallet = cfg.get_str("wallet_address", "").trim().to_string();
                 let (fills_reachable, fill_opt) = self
                     .query_hyperliquid_fills_for_oid_with_reachability(
-                        &wallet,
-                        target_oid,
-                        is_testnet,
+                        &wallet, target_oid, is_testnet,
                     );
                 if let Some((filled_sz, avg_px, total_fee)) = fill_opt {
                     r_status = RestingOrderStatus {
@@ -1274,15 +1599,13 @@ impl ExecutionEngine {
         coin: &str,
         is_testnet: bool,
     ) -> Option<u32> {
-        let norm_coin = coin
-            .split('/')
-            .next()
-            .unwrap_or(coin)
-            .trim()
-            .to_uppercase();
+        let norm_coin = coin.split('/').next().unwrap_or(coin).trim().to_uppercase();
         let cfg = self.load_config_logged("fetch_live_hyperliquid_universe_asset_index");
         let ttl_sec = cfg
-            .get_i64("asset_index_cache_ttl_secs", cfg.get_i64("hyperliquid_asset_index_cache_ttl_sec", 3600))
+            .get_i64(
+                "asset_index_cache_ttl_secs",
+                cfg.get_i64("hyperliquid_asset_index_cache_ttl_sec", 3600),
+            )
             .max(1);
         let now_ms = self.db.now_ms();
 
@@ -2095,10 +2418,7 @@ impl ExecutionEngine {
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
 
         let master_wallet = cfg.get_str("wallet_address", "").trim().to_lowercase();
-        let pit_sub = cfg
-            .get_str("pit_subaccount_address", "")
-            .trim()
-            .to_string();
+        let pit_sub = cfg.get_str("pit_subaccount_address", "").trim().to_string();
         let pond_sub = cfg
             .get_str("pond_subaccount_address", "")
             .trim()
@@ -2315,5 +2635,114 @@ impl ExecutionEngine {
             dry_run,
             exchange_response: None,
         })
+    }
+
+    /// Rebalances excess unlocked HLP Vault equity back into the perps margin account when vault
+    /// allocation drifts above `basis_max_idle_cash_allocation_pct` (default `0.20`) plus a `$10`
+    /// buffer (`LT-3`). Respects lockup timestamps (`hlp_vault_locked_until_ms`) and a 1-hour
+    /// rebalance cooldown (`hlp_vault_last_rebalance_ms`).
+    pub fn rebalance_hlp_vault_margin_if_needed(&self) -> Result<Option<f64>> {
+        let cfg = self.load_config_logged("rebalance_hlp_vault_margin_if_needed");
+        let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        if mode == "PAPER" || !cfg.get_bool("hlp_vault_auto_rebalance_enabled", true) {
+            return Ok(None);
+        }
+        let wallet = cfg.get_str("wallet_address", "").trim().to_string();
+        if wallet.is_empty() {
+            return Ok(None);
+        }
+        let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
+        let vault = Self::resolve_hlp_vault_address(&cfg, is_testnet);
+        if vault.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let now_ms = self.db.now_ms();
+        let last_rebalance_ms = cfg
+            .get_str("hlp_vault_last_rebalance_ms", "0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+        if last_rebalance_ms > 0 && now_ms.saturating_sub(last_rebalance_ms) < 3_600_000 {
+            return Ok(None);
+        }
+
+        let vault_state = self.fetch_hlp_vault_state(Some(&wallet), Some(&vault), Some(is_testnet));
+        if !vault_state
+            .get("live_queried")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+
+        let vault_eq = vault_state
+            .get("vault_equity_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let Some(perp_eq) = vault_state.get("perp_equity_usdc").and_then(Value::as_f64) else {
+            return Ok(None);
+        };
+        let total_eq = round_dp(perp_eq + vault_eq, 2);
+        if total_eq <= 0.0 || vault_eq <= 0.0 {
+            return Ok(None);
+        }
+
+        let exchange_lockup_ms = vault_state
+            .get("locked_until_timestamp_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let cfg_lockup_ms = cfg
+            .get_str("hlp_vault_locked_until_ms", "0")
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+        if exchange_lockup_ms > 0 && exchange_lockup_ms != cfg_lockup_ms {
+            let _ = self
+                .db
+                .set_config_value("hlp_vault_locked_until_ms", &json!(exchange_lockup_ms));
+        }
+        let effective_lockup_ms = exchange_lockup_ms.max(cfg_lockup_ms);
+        if effective_lockup_ms > 0 && now_ms < effective_lockup_ms {
+            return Ok(None);
+        }
+
+        let max_vault_pct = cfg
+            .get_f64("hlp_vault_max_equity_pct", 0.20)
+            .clamp(0.05, 0.90);
+        let target_vault_cap = total_eq * max_vault_pct;
+        if vault_eq <= target_vault_cap + 10.0 {
+            return Ok(None);
+        }
+
+        let excess_usdc = round_dp(vault_eq - target_vault_cap, 2);
+        if excess_usdc <= 0.0 {
+            return Ok(None);
+        }
+
+        let res = self.execute_hlp_vault_transfer(excess_usdc, false, Some(&vault));
+        if res.status == VaultTransferStatus::Submitted {
+            let _ = self
+                .db
+                .set_config_value("hlp_vault_last_rebalance_ms", &json!(now_ms));
+            let _ = self.db.log_telemetry(
+                "INFO",
+                "engine.execution",
+                &format!(
+                    "HLP_VAULT_AUTO_REBALANCED: withdrew ${excess_usdc:.2} from HLP vault to perps margin (vault=${vault_eq:.2}, cap=${target_vault_cap:.2}, total=${total_eq:.2})"
+                ),
+                Some(json!({
+                    "event": "HLP_VAULT_AUTO_REBALANCED",
+                    "vault_address": vault,
+                    "withdrawn_usdc": excess_usdc,
+                    "vault_equity_usdc": vault_eq,
+                    "target_vault_cap_usdc": round_dp(target_vault_cap, 2),
+                    "total_equity_usdc": total_eq,
+                })),
+            );
+            return Ok(Some(excess_usdc));
+        }
+
+        Ok(None)
     }
 }

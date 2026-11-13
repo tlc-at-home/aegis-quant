@@ -2,13 +2,13 @@
 //! telemetry logging (with automatic secret redaction), and retention pruning operations.
 
 use crate::DatabaseManager;
-use aegis_core::{
-    round_dp, AegisError, AltPairMetadata, OhlcvBar, OrderFsmState, PortfolioSnapshot, Result,
-    SignalEvaluation, TradeRecord, UniverseAsset,
-};
 pub use aegis_core::{
     redact_embedded_url_secrets, sanitize_telemetry_details, sanitize_telemetry_message,
     sanitize_telemetry_value,
+};
+use aegis_core::{
+    round_dp, AegisError, AltPairMetadata, OhlcvBar, OrderFsmState, PortfolioSnapshot, Result,
+    SignalEvaluation, TradeRecord, UniverseAsset,
 };
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
@@ -353,7 +353,11 @@ impl DatabaseManager {
             let iter = stmt
                 .query_map(params![ts, limit as i64], |r| {
                     let snr_score: f64 = r.get(9)?;
-                    let snr_synth: f64 = r.get::<_, Option<f64>>(10).ok().flatten().unwrap_or(snr_score);
+                    let snr_synth: f64 = r
+                        .get::<_, Option<f64>>(10)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(snr_score);
                     let rs_96: f64 = r.get::<_, Option<f64>>(11).ok().flatten().unwrap_or(0.0);
                     let r_usdc_8: f64 = r.get::<_, Option<f64>>(12).ok().flatten().unwrap_or(0.0);
                     Ok(SignalEvaluation {

@@ -16,8 +16,8 @@ use crate::cell::{
 use crate::scanner::{run_nps01_scan, PondAssetScanInput, PondScannerParams};
 use crate::universe::{parse_utc_timestamp, PondUniverseManager};
 use aegis_core::{
-    compute_atr_from_bars, compute_trailing_z_score, now_iso8601_utc, round_dp, BookType,
-    OhlcvBar, PondCell, PondCellState, PondScanCycle, PondUniverseRow, Result,
+    compute_atr_from_bars, compute_trailing_z_score, now_iso8601_utc, round_dp, BookType, OhlcvBar,
+    PondCell, PondCellState, PondScanCycle, PondUniverseRow, Result,
 };
 use aegis_db::{BookScopedDb, DatabaseManager, PondConfig};
 use aegis_execution::{ExecutionEngine, MarketIngestionEngine, RestingOrderStatus};
@@ -153,8 +153,7 @@ pub fn compute_wick_context_with_stops(
     let trigger_high = eff_stop_high + wick_buf;
     let in_band_low_threshold =
         (entry_price - (cell_stop_dist - wick_buf).max(pre_open_atr_1h)).max(1e-8);
-    let in_band_high_threshold =
-        entry_price + (cell_stop_dist - wick_buf).max(pre_open_atr_1h);
+    let in_band_high_threshold = entry_price + (cell_stop_dist - wick_buf).max(pre_open_atr_1h);
 
     let sanitize_bar_high = |b: &OhlcvBar| -> f64 {
         if opened_at_ms > 0 && b.timestamp_ms < opened_at_ms && entry_price > 0.0 {
@@ -320,8 +319,16 @@ impl PondOrchestrator {
     pub fn new(db: DatabaseManager, telemetry: Option<TelemetryBus>) -> Self {
         let scoped_db = BookScopedDb::new(db.clone(), BookType::Pond);
         let ingestion = MarketIngestionEngine::new(db.clone());
-        let execution = ExecutionEngine::new(db);
+        let execution = ExecutionEngine::new(db.clone());
         let universe_mgr = PondUniverseManager::new(scoped_db.clone(), ingestion.clone());
+        let initial_exit_attempts: HashMap<i64, u32> = db
+            .load_config_opts(false)
+            .ok()
+            .and_then(|c| {
+                let raw = c.get_str("pond_exit_attempt_counts_json", "{}");
+                serde_json::from_str::<HashMap<i64, u32>>(&raw).ok()
+            })
+            .unwrap_or_default();
         Self {
             scoped_db,
             ingestion,
@@ -329,8 +336,18 @@ impl PondOrchestrator {
             universe_mgr,
             telemetry,
             last_universe_refresh_ms: Arc::new(Mutex::new(None)),
-            exit_attempt_count: Arc::new(Mutex::new(HashMap::new())),
+            exit_attempt_count: Arc::new(Mutex::new(initial_exit_attempts)),
             cycle_bars_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn persist_exit_attempt_counts(&self) {
+        let snapshot = self.exit_attempt_count.lock().clone();
+        if let Ok(serialized) = serde_json::to_string(&snapshot) {
+            let _ = self
+                .scoped_db
+                .inner()
+                .set_config_value("pond_exit_attempt_counts_json", &json!(serialized));
         }
     }
 
@@ -391,15 +408,12 @@ impl PondOrchestrator {
         let mut promoted = 0usize;
 
         for mut cell in armed_cells {
-            let resting_oid = cell
-                .resting_order_id
-                .clone()
-                .or_else(|| {
-                    cell.exit_reason
-                        .as_deref()
-                        .and_then(|r| r.strip_prefix("RESTING_OID:"))
-                        .map(|s| s.to_string())
-                });
+            let resting_oid = cell.resting_order_id.clone().or_else(|| {
+                cell.exit_reason
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("RESTING_OID:"))
+                    .map(|s| s.to_string())
+            });
             let mut status: RestingOrderStatus = self
                 .execution
                 .check_resting_order_status(resting_oid.as_deref());
@@ -476,7 +490,10 @@ impl PondOrchestrator {
                     let entry_fee = if status.fee_usdc > 0.0 {
                         status.fee_usdc
                     } else {
-                        round_dp(status.filled_units * fill_px * (maker_fee_bps / 10_000.0), 4)
+                        round_dp(
+                            status.filled_units * fill_px * (maker_fee_bps / 10_000.0),
+                            4,
+                        )
                     };
                     match self.scoped_db.promote_armed_pond_cell_to_open(
                         cell.cell_id,
@@ -732,10 +749,8 @@ impl PondOrchestrator {
                 .last()
                 .copied()
                 .unwrap_or_else(|| cell.funding_rate_entry.unwrap_or(0.0));
-            let (cur_z, _, _) = compute_trailing_z_score(
-                &funding_series,
-                cfg.pond_funding_z_window_hours.max(1),
-            );
+            let (cur_z, _, _) =
+                compute_trailing_z_score(&funding_series, cfg.pond_funding_z_window_hours.max(1));
 
             // R3-B1 & R3-H1: Atomic hourly funding accrual guarded by last_funding_hour_bucket
             if effective_1h_boundary {
@@ -811,8 +826,14 @@ impl PondOrchestrator {
                 }
             };
 
+            let taker_fee_bps = self
+                .scoped_db
+                .inner()
+                .load_config_opts(false)
+                .map(|c| c.get_f64("taker_fee_bps", 4.5).max(0.0))
+                .unwrap_or(4.5);
             let qty_abs = cell.quantity.unwrap_or(0.0).abs();
-            let est_exit_fee = round_dp(qty_abs * mark_px * 0.00015, 4);
+            let est_exit_fee = round_dp(qty_abs * mark_px * (2.0 * taker_fee_bps / 10_000.0), 4);
             let net_pnl_usdc = round_dp(
                 price_pnl + cell.funding_accrued_usdc - cell.fees_paid_usdc - est_exit_fee,
                 4,
@@ -848,7 +869,10 @@ impl PondOrchestrator {
                 let close_side = if cell.side == "LONG" { "SELL" } else { "BUY" };
                 let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
                 let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
-                let min_notional = univ_row.map(|u| u.min_notional_usdc).unwrap_or(10.0).max(1.0);
+                let min_notional = univ_row
+                    .map(|u| u.min_notional_usdc)
+                    .unwrap_or(10.0)
+                    .max(1.0);
 
                 // Escalate maker exit to market/IOC on retry, Testnet, or overdue max-hold timeout (NM-7)
                 let prev_attempts = self
@@ -891,6 +915,7 @@ impl PondOrchestrator {
                         .lock()
                         .entry(cell.cell_id)
                         .or_insert(0) += 1;
+                    self.persist_exit_attempt_counts();
                     tracing::warn!(
                         "Book B (POND) exit order for {} (cell #{}, attempt {}) did not fill (state={}); keeping cell OPEN for retry (HI-6)",
                         cell.symbol,
@@ -937,9 +962,9 @@ impl PondOrchestrator {
                             .or(cell.initial_stop)
                             .filter(|&p| p > 0.0)
                         {
-                            let mut asset = self
-                                .execution
-                                .resolve_trade_asset(&cell.symbol, "", mark_px);
+                            let mut asset =
+                                self.execution
+                                    .resolve_trade_asset(&cell.symbol, "", mark_px);
                             asset.tick_size = tick_sz;
                             asset.lot_step_size = lot_sz;
                             let existing_stop_oid = self
@@ -947,20 +972,66 @@ impl PondOrchestrator {
                                 .get_pond_cell_protective_stop_oid(cell.cell_id)
                                 .ok()
                                 .flatten();
-                            if let Ok(Some(new_stop_oid)) = self
-                                .execution
-                                .submit_or_refresh_protective_stop_order(
-                                    &asset,
-                                    &cell.side,
-                                    rem_qty,
-                                    stop_px,
-                                    existing_stop_oid.as_deref(),
-                                )
-                            {
-                                let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
-                                    cell.cell_id,
-                                    Some(&new_stop_oid),
-                                );
+                            match self.execution.submit_or_refresh_protective_stop_order(
+                                &asset,
+                                &cell.side,
+                                rem_qty,
+                                stop_px,
+                                existing_stop_oid.as_deref(),
+                            ) {
+                                Ok(Some(new_stop_oid)) => {
+                                    let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
+                                        cell.cell_id,
+                                        Some(&new_stop_oid),
+                                    );
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        cell_id = cell.cell_id,
+                                        symbol = %cell.symbol,
+                                        "PROTECTIVE_STOP_SYNC_FAILED: Pond partial exit returned no stop oid"
+                                    );
+                                    let _ = self.scoped_db.inner().log_telemetry(
+                                        "WARNING",
+                                        "engine.pond",
+                                        &format!(
+                                            "PROTECTIVE_STOP_SYNC_FAILED: Pond cell {} ({}) partial exit returned no stop oid",
+                                            cell.cell_id, cell.symbol
+                                        ),
+                                        Some(json!({
+                                            "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                            "book": "POND",
+                                            "phase": "partial_exit",
+                                            "cell_id": cell.cell_id,
+                                            "symbol": cell.symbol,
+                                            "existing_stop_oid": existing_stop_oid,
+                                        })),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        cell_id = cell.cell_id,
+                                        symbol = %cell.symbol,
+                                        error = %e,
+                                        "PROTECTIVE_STOP_SYNC_FAILED on Pond partial exit"
+                                    );
+                                    let _ = self.scoped_db.inner().log_telemetry(
+                                        "WARNING",
+                                        "engine.pond",
+                                        &format!(
+                                            "PROTECTIVE_STOP_SYNC_FAILED: Pond cell {} ({}) partial exit: {e}",
+                                            cell.cell_id, cell.symbol
+                                        ),
+                                        Some(json!({
+                                            "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                            "book": "POND",
+                                            "phase": "partial_exit",
+                                            "cell_id": cell.cell_id,
+                                            "symbol": cell.symbol,
+                                            "existing_stop_oid": existing_stop_oid,
+                                        })),
+                                    );
+                                }
                             }
                         }
                     }
@@ -969,8 +1040,16 @@ impl PondOrchestrator {
                         .lock()
                         .entry(cell.cell_id)
                         .or_insert(0) += 1;
+                    self.persist_exit_attempt_counts();
                 } else {
-                    self.exit_attempt_count.lock().remove(&cell.cell_id);
+                    if self
+                        .exit_attempt_count
+                        .lock()
+                        .remove(&cell.cell_id)
+                        .is_some()
+                    {
+                        self.persist_exit_attempt_counts();
+                    }
                     let existing_stop_oid = if is_live_or_testnet {
                         self.scoped_db
                             .get_pond_cell_protective_stop_oid(cell.cell_id)
@@ -1036,7 +1115,10 @@ impl PondOrchestrator {
                             let _ = self.scoped_db.log_telemetry(
                                 "ERROR",
                                 "pond.orchestrator",
-                                &format!("close_open_pond_cell failed for {} (cell #{}): {e}", cell.symbol, cell.cell_id),
+                                &format!(
+                                    "close_open_pond_cell failed for {} (cell #{}): {e}",
+                                    cell.symbol, cell.cell_id
+                                ),
                                 None,
                             );
                         }
@@ -1052,37 +1134,87 @@ impl PondOrchestrator {
                     cell.lowest_price_seen,
                 ) {
                     tracing::error!(cell_id = cell.cell_id, error = %e, "update_open_pond_cell_watermarks failed (ME-10)");
-                } else if is_live_or_testnet
-                    && cfg.exchange_protective_stops_enabled
-                    && cell.chandelier_stop != prev_chandelier_stop
-                {
+                } else if is_live_or_testnet && cfg.exchange_protective_stops_enabled {
                     if let Some(stop_px) = cell.chandelier_stop.filter(|&p| p > 0.0) {
-                        let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
-                        let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
-                        let mut asset = self
-                            .execution
-                            .resolve_trade_asset(&cell.symbol, "", mark_px);
-                        asset.tick_size = tick_sz;
-                        asset.lot_step_size = lot_sz;
                         let existing_stop_oid = self
                             .scoped_db
                             .get_pond_cell_protective_stop_oid(cell.cell_id)
                             .ok()
                             .flatten();
-                        if let Ok(Some(new_stop_oid)) = self
-                            .execution
-                            .submit_or_refresh_protective_stop_order(
+                        let stop_moved = cell.chandelier_stop != prev_chandelier_stop;
+                        let missing_stop_oid = existing_stop_oid
+                            .as_deref()
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true);
+                        if stop_moved || missing_stop_oid {
+                            let tick_sz = univ_row.map(|u| u.tick_size).unwrap_or(0.0001);
+                            let lot_sz = univ_row.map(|u| u.lot_step_size).unwrap_or(0.001);
+                            let mut asset =
+                                self.execution
+                                    .resolve_trade_asset(&cell.symbol, "", mark_px);
+                            asset.tick_size = tick_sz;
+                            asset.lot_step_size = lot_sz;
+                            match self.execution.submit_or_refresh_protective_stop_order(
                                 &asset,
                                 &cell.side,
                                 qty_abs,
                                 stop_px,
                                 existing_stop_oid.as_deref(),
-                            )
-                        {
-                            let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
-                                cell.cell_id,
-                                Some(&new_stop_oid),
-                            );
+                            ) {
+                                Ok(Some(new_stop_oid)) => {
+                                    let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
+                                        cell.cell_id,
+                                        Some(&new_stop_oid),
+                                    );
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        cell_id = cell.cell_id,
+                                        symbol = %cell.symbol,
+                                        "PROTECTIVE_STOP_SYNC_FAILED: Pond watermark stop sync returned no oid"
+                                    );
+                                    let _ = self.scoped_db.inner().log_telemetry(
+                                        "WARNING",
+                                        "engine.pond",
+                                        &format!(
+                                            "PROTECTIVE_STOP_SYNC_FAILED: Pond cell {} ({}) returned no protective stop oid",
+                                            cell.cell_id, cell.symbol
+                                        ),
+                                        Some(json!({
+                                            "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                            "book": "POND",
+                                            "phase": if missing_stop_oid { "self_heal" } else { "trail_refresh" },
+                                            "cell_id": cell.cell_id,
+                                            "symbol": cell.symbol,
+                                            "existing_stop_oid": existing_stop_oid,
+                                        })),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        cell_id = cell.cell_id,
+                                        symbol = %cell.symbol,
+                                        error = %e,
+                                        "PROTECTIVE_STOP_SYNC_FAILED on Pond watermark refresh"
+                                    );
+                                    let _ = self.scoped_db.inner().log_telemetry(
+                                        "WARNING",
+                                        "engine.pond",
+                                        &format!(
+                                            "PROTECTIVE_STOP_SYNC_FAILED: Pond cell {} ({}): {e}",
+                                            cell.cell_id, cell.symbol
+                                        ),
+                                        Some(json!({
+                                            "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                            "book": "POND",
+                                            "phase": if missing_stop_oid { "self_heal" } else { "trail_refresh" },
+                                            "cell_id": cell.cell_id,
+                                            "symbol": cell.symbol,
+                                            "existing_stop_oid": existing_stop_oid,
+                                        })),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1269,7 +1401,12 @@ impl PondOrchestrator {
         let mut open_heat: f64 = open_cells
             .iter()
             .chain(armed_cells.iter())
-            .map(|c| c.risk_budget_usdc.unwrap_or(0.0))
+            .map(|c| {
+                aegis_core::effective_pond_cell_open_heat_usdc(
+                    c.risk_budget_usdc.unwrap_or(0.0),
+                    c.funding_accrued_usdc,
+                )
+            })
             .sum();
         let mut deployed_notional: f64 = open_cells
             .iter()
@@ -1283,8 +1420,15 @@ impl PondOrchestrator {
             self.scoped_db.get_wallet_perps_margin_state()
         {
             if vault_eq > 0.0 || total_wallet_deployed > deployed_notional {
+                let max_gross_leverage = self
+                    .scoped_db
+                    .inner()
+                    .load_config_opts(false)
+                    .map(|c| c.get_f64("max_gross_leverage", 1.5).clamp(1.0, 5.0))
+                    .unwrap_or(1.5);
+                let perps_notional_cap = perps_trading_eq * max_gross_leverage;
                 let other_book_deployed = (total_wallet_deployed - deployed_notional).max(0.0);
-                let avail_for_pond = (perps_trading_eq - other_book_deployed).max(0.0);
+                let avail_for_pond = (perps_notional_cap - other_book_deployed).max(0.0);
                 let perps_cap_lev = avail_for_pond / pond_eq.max(1.0);
                 effective_max_gross_leverage = effective_max_gross_leverage.min(perps_cap_lev);
             }
@@ -1339,6 +1483,7 @@ impl PondOrchestrator {
             conviction_scale_max: cfg.pond_conviction_scale_max,
             reject_synthetic_volume: is_live_or_testnet,
             require_2h_funding_persistence: cfg.pond_require_2h_persistence,
+            allow_single_sample_bootstrap: !is_live_or_testnet,
         };
 
         // 4. Build scan inputs across all universe coins (reusing cached bars from evaluate_open_cells, NL-11)
@@ -1468,7 +1613,10 @@ impl PondOrchestrator {
                 new_cell.entry_price = Some(cand.reference_price);
                 new_cell.resting_order_id = Some(resting_oid.to_string());
                 if let Err(e) = self.scoped_db.upsert_pond_cell(&new_cell) {
-                    match self.execution.cancel_resting_order(&cand.symbol, resting_oid) {
+                    match self
+                        .execution
+                        .cancel_resting_order(&cand.symbol, resting_oid)
+                    {
                         Ok(true) => {}
                         Ok(false) => {
                             tracing::warn!(
@@ -1619,23 +1767,69 @@ impl PondOrchestrator {
                     .or(new_cell.initial_stop)
                     .filter(|&p| p > 0.0)
                 {
-                    let mut asset =
-                        self.execution.resolve_trade_asset(&cand.symbol, "", fill_px);
+                    let mut asset = self
+                        .execution
+                        .resolve_trade_asset(&cand.symbol, "", fill_px);
                     asset.tick_size = cand.tick_size;
                     asset.lot_step_size = cand.lot_step_size;
-                    if let Ok(Some(new_stop_oid)) = self
-                        .execution
-                        .submit_or_refresh_protective_stop_order(
-                            &asset,
-                            cand.side.as_str(),
-                            actual_qty,
-                            stop_px,
-                            None,
-                        )
-                    {
-                        let _ = self
-                            .scoped_db
-                            .set_pond_cell_protective_stop_oid(inserted_cell_id, Some(&new_stop_oid));
+                    match self.execution.submit_or_refresh_protective_stop_order(
+                        &asset,
+                        cand.side.as_str(),
+                        actual_qty,
+                        stop_px,
+                        None,
+                    ) {
+                        Ok(Some(new_stop_oid)) => {
+                            let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
+                                inserted_cell_id,
+                                Some(&new_stop_oid),
+                            );
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                cell_id = inserted_cell_id,
+                                symbol = %cand.symbol,
+                                "PROTECTIVE_STOP_SYNC_FAILED: Pond initial entry returned no stop oid"
+                            );
+                            let _ = self.scoped_db.inner().log_telemetry(
+                                "WARNING",
+                                "engine.pond",
+                                &format!(
+                                    "PROTECTIVE_STOP_SYNC_FAILED: Pond initial cell {} ({}) returned no protective stop oid",
+                                    inserted_cell_id, cand.symbol
+                                ),
+                                Some(json!({
+                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                    "book": "POND",
+                                    "phase": "initial_entry",
+                                    "cell_id": inserted_cell_id,
+                                    "symbol": cand.symbol,
+                                })),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                cell_id = inserted_cell_id,
+                                symbol = %cand.symbol,
+                                error = %e,
+                                "PROTECTIVE_STOP_SYNC_FAILED on Pond initial entry"
+                            );
+                            let _ = self.scoped_db.inner().log_telemetry(
+                                "WARNING",
+                                "engine.pond",
+                                &format!(
+                                    "PROTECTIVE_STOP_SYNC_FAILED: Pond initial cell {} ({}): {e}",
+                                    inserted_cell_id, cand.symbol
+                                ),
+                                Some(json!({
+                                    "event": "PROTECTIVE_STOP_SYNC_FAILED",
+                                    "book": "POND",
+                                    "phase": "initial_entry",
+                                    "cell_id": inserted_cell_id,
+                                    "symbol": cand.symbol,
+                                })),
+                            );
+                        }
                     }
                 }
             }
@@ -2538,10 +2732,12 @@ mod tests {
         let rec = orch
             .execution
             .reconcile_exchange_state(Some(&sim_pos), Some(&[]));
-        assert!(rec
-            .discrepancies
-            .iter()
-            .any(|d| d["type"] == "DIRECTION_FLIP_POND_CELL_RECONCILED" && d["cell_id"] == open_id));
+        assert!(
+            rec.discrepancies
+                .iter()
+                .any(|d| d["type"] == "DIRECTION_FLIP_POND_CELL_RECONCILED"
+                    && d["cell_id"] == open_id)
+        );
     }
 
     #[test]
@@ -2551,8 +2747,8 @@ mod tests {
         let orch = PondOrchestrator::new(db.clone(), None);
         let _ = orch.initialize_or_refresh_universe().unwrap();
 
-        let anchor_13_ts = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000
-            - 2 * 3_600_000;
+        let anchor_13_ts =
+            (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000 - 2 * 3_600_000;
         let anchor_14_ts = anchor_13_ts + 3_600_000;
         let base_ts = anchor_13_ts - 180 * 3_600_000;
         let mut bars_1h: Vec<OhlcvBar> = (0..179)
@@ -2604,12 +2800,11 @@ mod tests {
         );
         *orch.cycle_bars_cache.lock() = Some(cache);
 
-        let opened_at_iso = chrono::DateTime::from_timestamp_millis(
-            anchor_13_ts - 4 * 3_600_000 + 696_000,
-        )
-        .unwrap()
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+        let opened_at_iso =
+            chrono::DateTime::from_timestamp_millis(anchor_13_ts - 4 * 3_600_000 + 696_000)
+                .unwrap()
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string();
         let updated_at_iso = chrono::DateTime::from_timestamp_millis(anchor_13_ts + 304_000)
             .unwrap()
             .format("%Y-%m-%dT%H:%M:%SZ")
@@ -2670,8 +2865,7 @@ mod tests {
         let orch = PondOrchestrator::new(db.clone(), None);
         let _ = orch.initialize_or_refresh_universe().unwrap();
 
-        let rally_ts =
-            (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000 - 3_600_000;
+        let rally_ts = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000 - 3_600_000;
         let entry_ts = rally_ts - 3_600_000;
         let base_ts = rally_ts - 180 * 3_600_000;
         let mut bars_1h: Vec<OhlcvBar> = (0..178)
@@ -2902,7 +3096,8 @@ mod tests {
             // Scenario 4: Stored high/low in DB is already more extreme than any bar in scan window
             // -> post_watermark_start falls back to start_idx (including >6 bars since open per R11-N5)
             Case {
-                name: "stored_watermark_more_extreme_falls_back_to_start_idx_across_full_open_window",
+                name:
+                    "stored_watermark_more_extreme_falls_back_to_start_idx_across_full_open_window",
                 bars: vec![
                     mk_bar(0, 100.0, 101.0, 99.0, 100.0),
                     mk_bar(1, 100.0, 103.0, 81.0, 98.0), // 8 bars before end, adverse wick after prior DB peak
@@ -2931,11 +3126,11 @@ mod tests {
             Case {
                 name: "mid_hour_opened_at_and_outage_longer_than_6h_catches_wick_8h_ago",
                 bars: vec![
-                    mk_bar(0, 100.0, 101.0, 70.0, 100.0), // before opened_at_ms
+                    mk_bar(0, 100.0, 101.0, 70.0, 100.0),  // before opened_at_ms
                     mk_bar(1, 100.0, 140.0, 72.0, 100.0), // bar 1 start < opened_at_ms (11m36s into bar 1) -> excluded
                     mk_bar(2, 100.0, 105.0, 99.0, 104.0), // first bar >= opened_at_ms
                     mk_bar(3, 104.0, 132.0, 103.0, 128.0), // peak 9h ago
-                    mk_bar(4, 128.0, 129.0, 82.0, 96.0),  // stop-breaching wick 8h ago (outside last 6 bars!)
+                    mk_bar(4, 128.0, 129.0, 82.0, 96.0), // stop-breaching wick 8h ago (outside last 6 bars!)
                     mk_bar(5, 96.0, 99.0, 95.0, 98.0),
                     mk_bar(6, 98.0, 100.0, 97.0, 99.0),
                     mk_bar(7, 99.0, 100.5, 98.0, 100.0),
@@ -3192,7 +3387,10 @@ mod tests {
             is_synthetic: 0,
         });
         db.upsert_ohlcv_batch(&bars_breached).unwrap();
-        let f_series: Vec<f64> = bars_breached.iter().map(|b| b.funding_rate_hourly).collect();
+        let f_series: Vec<f64> = bars_breached
+            .iter()
+            .map(|b| b.funding_rate_hourly)
+            .collect();
         let mut cache = HashMap::new();
         cache.insert(
             "SOL/USDC:USDC".to_string(),
@@ -3408,7 +3606,10 @@ mod tests {
         let first_step = orch
             .run_scheduled_step(&mut scan_bucket, &mut close_bucket)
             .unwrap();
-        assert!(first_step.is_some(), "Initial step on empty DB should run scan cycle");
+        assert!(
+            first_step.is_some(),
+            "Initial step on empty DB should run scan cycle"
+        );
         assert!(scan_bucket.is_some());
         assert!(close_bucket.is_some());
         let cycles_after_first = orch.scoped_db.get_recent_pond_scan_cycles(10).unwrap();
@@ -3819,5 +4020,168 @@ mod tests {
         );
         assert!(d_mature.should_exit);
         assert_eq!(d_mature.tier, Some(3));
+    }
+
+    #[test]
+    fn test_r15_n12_gate3_single_sample_fails_closed_live_vs_paper() {
+        let univ_sui = PondUniverseRow {
+            symbol: "SUI/USDC:USDC".to_string(),
+            rank: 7,
+            median_daily_volume_usdc: 450_000.0,
+            tick_size: 0.0001,
+            lot_step_size: 0.1,
+            min_notional_usdc: 10.0,
+            max_leverage: 5.0,
+            reference_price: 0.90,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        };
+        let mut bars_1h = make_test_bars("SUI/USDC:USDC", "1h", 180, 0.90);
+        let mut bars_4h = make_test_bars("SUI/USDC:USDC", "4h", 65, 0.90);
+        for b in &mut bars_1h {
+            b.is_synthetic = 0;
+        }
+        for b in &mut bars_4h {
+            b.is_synthetic = 0;
+        }
+
+        let input_single = PondAssetScanInput {
+            universe_row: univ_sui,
+            funding_series_168h: vec![0.0002],
+            bars_1h,
+            bars_4h,
+            tick_size: 0.0001,
+            lot_step_size: 0.1,
+        };
+
+        // Live/Testnet strict default (`allow_single_sample_bootstrap = false`): must fail closed on < 2 samples
+        let live_params = PondScannerParams {
+            funding_z_window_hours: 1,
+            require_2h_funding_persistence: true,
+            reject_synthetic_volume: true,
+            allow_single_sample_bootstrap: false,
+            ..Default::default()
+        };
+        let err = crate::scanner::evaluate_asset_gates_1_to_6(
+            &input_single,
+            &live_params,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "GATE3_FUNDING_NOT_PERSISTENT_2H");
+
+        // Paper explicit bootstrap (`!reject_synthetic_volume && allow_single_sample_bootstrap`): passes Gate 3, proceeds to Gate 4
+        let paper_params = PondScannerParams {
+            funding_z_window_hours: 1,
+            require_2h_funding_persistence: true,
+            reject_synthetic_volume: false,
+            allow_single_sample_bootstrap: true,
+            ..Default::default()
+        };
+        let err_paper = crate::scanner::evaluate_asset_gates_1_to_6(
+            &input_single,
+            &paper_params,
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert_ne!(err_paper, "GATE3_FUNDING_NOT_PERSISTENT_2H");
+    }
+
+    #[test]
+    fn test_r15_qa_d_paper_synthetic_refresh_preserves_existing_live_rows() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("PAPER"))
+            .unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+
+        // Seed 1 existing non-synthetic (live) active row
+        let live_row = PondUniverseRow {
+            symbol: "XRP/USDC:USDC".to_string(),
+            rank: 1,
+            median_daily_volume_usdc: 5_000_000.0,
+            tick_size: 0.0001,
+            lot_step_size: 1.0,
+            min_notional_usdc: 10.0,
+            max_leverage: 10.0,
+            reference_price: 0.60,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        };
+        db.upsert_pond_universe_batch(&[live_row]).unwrap();
+
+        // Synthetic-only fallback refresh in PAPER mode must preserve the existing live XRP row
+        let synthetic_cands = vec![PondUniverseRow {
+            symbol: "BTC/USDC:USDC".to_string(),
+            rank: 1,
+            median_daily_volume_usdc: 10_000_000.0,
+            tick_size: 1.0,
+            lot_step_size: 0.001,
+            min_notional_usdc: 10.0,
+            max_leverage: 20.0,
+            reference_price: 90_000.0,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 1,
+        }];
+        let refreshed = orch
+            .universe_mgr
+            .refresh_universe(Some(synthetic_cands))
+            .unwrap();
+        let xrp = refreshed
+            .into_iter()
+            .find(|r| r.symbol == "XRP/USDC:USDC")
+            .expect(
+            "R15-QA(d): synthetic fallback refresh in PAPER mode must preserve existing live rows",
+        );
+        assert_eq!(xrp.is_synthetic_volume, 0);
+        assert_eq!(xrp.status, "ACTIVE");
+    }
+
+    #[test]
+    fn test_table3_13_lt2_r15_n12_pond_restart_exit_attempts_heat_and_est_exit_fee() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("taker_fee_bps", &json!(4.5)).unwrap();
+
+        let orch1 = PondOrchestrator::new(db.clone(), None);
+        orch1.exit_attempt_count.lock().insert(42, 2);
+        orch1.persist_exit_attempt_counts();
+
+        let orch2 = PondOrchestrator::new(db.clone(), None);
+        assert_eq!(
+            orch2.exit_attempt_count.lock().get(&42).copied(),
+            Some(2),
+            "Table 3 #13: exit_attempt_count must survive PondOrchestrator restart via SQLite"
+        );
+
+        // LT-2: Positive funding offsets open risk budget via effective_pond_cell_open_heat_usdc
+        let net_heat = aegis_core::effective_pond_cell_open_heat_usdc(50.0, 12.5);
+        assert!((net_heat - 37.5).abs() < 1e-6);
+        assert_eq!(
+            aegis_core::effective_pond_cell_open_heat_usdc(50.0, 60.0),
+            0.0
+        );
+
+        // R15-N12: Double-taker exit fee buffer used in net PnL check (1000 * 2 * 4.5 / 10_000 = 0.90)
+        let taker_fee_bps = db
+            .load_config_opts(false)
+            .unwrap()
+            .get_f64("taker_fee_bps", 4.5);
+        let est_exit_fee = round_dp(10.0 * 100.0 * (2.0 * taker_fee_bps / 10_000.0), 4);
+        assert!((est_exit_fee - 0.90).abs() < 1e-6);
     }
 }

@@ -4,12 +4,13 @@
 //! - Conviction-scaled position sizing (`0.50%` to `1.50%` equity risk per trade)
 //! - Two-Tier Chandelier Stop evaluation (Tier 1 Intrabar Wick with `0.35x` ATR buffer,
 //!   Tier 2 Confirmed Bar-Close ratchet with `2.2x`/`2.6x` ATR and break-even profit-lock)
-//! - Portfolio heat cap (`6%`), single-asset cap (`25%`), correlation-cluster cap (`35%`), and gross leverage cap (`2.0x`)
+//! - Portfolio heat cap (`4%`), single-asset cap (`25%`), correlation-cluster cap (`35%`), and gross leverage cap (`1.5x`)
 //! - Lot-step and tick-size rounding delegated to `aegis-core`
 
 use aegis_core::{
-    compute_atr_from_bars, round_dp, round_step as core_round_step, ChandelierStopEvaluation,
-    OhlcvBar, PositionSizeResult, Price, Quantity, TradeRecord, UniverseAsset, Usdc,
+    compute_atr_from_bars, effective_position_open_heat_usdc, round_dp,
+    round_step as core_round_step, ChandelierStopEvaluation, OhlcvBar, PositionSizeResult, Price,
+    Quantity, TradeRecord, UniverseAsset, Usdc,
 };
 use aegis_db::{ConfigMap, DatabaseManager};
 
@@ -37,7 +38,9 @@ impl RiskEngine {
     /// rather than a fragile `0.04` equality heuristic.
     pub fn resolve_book_reference_equity(cfg_ref: &ConfigMap) -> f64 {
         let initial_equity = cfg_ref.get_f64("initial_equity_usdc", 10000.0).max(50.0);
-        let split_pct = cfg_ref.get_f64("settling_split_pct", 0.50).clamp(0.10, 0.90);
+        let split_pct = cfg_ref
+            .get_f64("settling_split_pct", 0.50)
+            .clamp(0.10, 0.90);
         let pit_book_eq = (initial_equity * split_pct).max(50.0);
         let scope = cfg_ref
             .get_str("risk_caps_reference_scope", "BOOK")
@@ -149,10 +152,7 @@ impl RiskEngine {
             )
             .max(0.3);
         let mult_short = cfg_ref
-            .get_f64(
-                "chandelier_atr_multiplier_short",
-                mult_long.max(2.2),
-            )
+            .get_f64("chandelier_atr_multiplier_short", mult_long.max(2.2))
             .max(0.3);
 
         let min_atr_pct = cfg_ref.get_f64(
@@ -167,11 +167,9 @@ impl RiskEngine {
         );
         let wick_overshoot_frac = cfg_ref.get_f64("wick_overshoot_slippage_fraction", 0.15);
         let stop_slippage_bps = cfg_ref.get_f64("stop_slippage_bps", 8.0);
-        let long_break_even_trigger_atr =
-            cfg_ref.get_f64("long_break_even_trigger_atr", 0.8);
+        let long_break_even_trigger_atr = cfg_ref.get_f64("long_break_even_trigger_atr", 0.8);
         let long_break_even_lock_atr = cfg_ref.get_f64("long_break_even_lock_atr", 0.25);
-        let short_break_even_trigger_atr =
-            cfg_ref.get_f64("short_break_even_trigger_atr", 0.8);
+        let short_break_even_trigger_atr = cfg_ref.get_f64("short_break_even_trigger_atr", 0.8);
         let short_break_even_lock_atr = cfg_ref.get_f64("short_break_even_lock_atr", 0.25);
         let trail_atr_mult = cfg_ref
             .get_f64("chandelier_trail_atr_multiplier", 0.45)
@@ -207,8 +205,7 @@ impl RiskEngine {
                 let overshoot = (wick_trigger_price - bar_low).max(0.0);
                 let raw_fill = (wick_trigger_price - wick_overshoot_frac * overshoot)
                     * (1.0 - stop_slippage_bps / 10000.0);
-                let fill_price =
-                    Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
+                let fill_price = Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
                 let exit_slippage_usdc =
                     round_dp((wick_trigger_price - fill_price).max(0.0) * qty, 4);
                 return ChandelierStopEvaluation {
@@ -276,8 +273,7 @@ impl RiskEngine {
 
             if bar_close <= trigger_stop {
                 let raw_fill = bar_close * (1.0 - stop_slippage_bps / 10000.0);
-                let fill_price =
-                    Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
+                let fill_price = Self::round_step(raw_fill.max(bar_low * 0.999), tick_size, true);
                 let exit_slippage_usdc = round_dp((bar_close - fill_price).max(0.0) * qty, 4);
                 return ChandelierStopEvaluation {
                     triggered: true,
@@ -357,8 +353,7 @@ impl RiskEngine {
                 let overshoot = (bar_high - wick_trigger_price).max(0.0);
                 let raw_fill = (wick_trigger_price + wick_overshoot_frac * overshoot)
                     * (1.0 + stop_slippage_bps / 10000.0);
-                let fill_price =
-                    Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
+                let fill_price = Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
                 let exit_slippage_usdc =
                     round_dp((fill_price - wick_trigger_price).max(0.0) * qty, 4);
                 return ChandelierStopEvaluation {
@@ -422,8 +417,7 @@ impl RiskEngine {
 
             if bar_close >= trigger_stop {
                 let raw_fill = bar_close * (1.0 + stop_slippage_bps / 10000.0);
-                let fill_price =
-                    Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
+                let fill_price = Self::round_step(raw_fill.min(bar_high * 1.001), tick_size, false);
                 let exit_slippage_usdc = round_dp((fill_price - bar_close).max(0.0) * qty, 4);
                 return ChandelierStopEvaluation {
                     triggered: true,
@@ -457,8 +451,8 @@ impl RiskEngine {
                 && new_lowest > 0.0
                 && favorable_excursion >= short_break_even_trigger_atr * eff_atr
             {
-                let be_lock = (entry_price - short_break_even_lock_atr * eff_atr)
-                    .max(bar_close + min_step);
+                let be_lock =
+                    (entry_price - short_break_even_lock_atr * eff_atr).max(bar_close + min_step);
                 cand_stop = cand_stop.min(be_lock);
             }
             let new_stop = Self::round_step(
@@ -496,6 +490,8 @@ impl RiskEngine {
             "BTC" | "ETH" => "L1_MAJORS",
             "SOL" | "JUP" | "WIF" | "BONK" | "PYTH" => "SOL_ECOSYSTEM",
             "AVAX" | "SUI" | "APT" | "SEI" | "TIA" | "NEAR" | "ARB" | "OP" => "EVM_ALT_L1",
+            "ADA" | "DOT" | "XRP" => "ALT_L1",
+            "LINK" | "INJ" | "HYPE" => "DEFI",
             "FET" | "RENDER" | "TAO" | "RNDR" | "WLD" => "AI_DEPIN",
             "DOGE" | "PEPE" | "SHIB" | "FLOKI" => "MEME_BETA",
             _ => "OTHER",
@@ -529,7 +525,9 @@ impl RiskEngine {
         let max_risk_per_trade = Usdc(max_risk_per_trade_raw);
 
         let configured_heat_usdc = cfg.get_f64("max_portfolio_heat_usdc", ref_equity * 0.04);
-        let configured_heat_pct = cfg.get_f64("max_portfolio_heat_pct", 0.04).clamp(0.005, 0.50);
+        let configured_heat_pct = cfg
+            .get_f64("max_portfolio_heat_pct", 0.04)
+            .clamp(0.005, 0.50);
         let base_heat_usdc = if (configured_heat_pct - 0.04).abs() > 1e-6
             && (configured_heat_usdc - ref_equity * 0.04).abs() <= 1e-3
         {
@@ -538,31 +536,30 @@ impl RiskEngine {
             configured_heat_usdc
         };
         let max_heat = Usdc(base_heat_usdc * equity_scale);
-        let max_single_notional = Usdc(
-            cfg.get_f64("max_single_asset_notional_usdc", ref_equity * 0.25) * equity_scale,
-        );
+        let max_single_notional =
+            Usdc(cfg.get_f64("max_single_asset_notional_usdc", ref_equity * 0.25) * equity_scale);
         let max_cluster_pct = cfg
             .get_f64("max_correlation_cluster_pct", 0.35)
             .clamp(0.10, 1.0);
         let max_cluster_notional = Usdc(ref_equity * max_cluster_pct * equity_scale);
-        let max_gross_notional = Usdc(
-            cfg.get_f64("max_gross_leverage_notional_usdc", ref_equity * 1.50) * equity_scale,
-        );
+        let max_gross_notional =
+            Usdc(cfg.get_f64("max_gross_leverage_notional_usdc", ref_equity * 1.50) * equity_scale);
         let target_cluster = Self::correlation_cluster_for_base_asset(&asset.base_asset);
 
         let mult_long = cfg.get_f64(
             "chandelier_atr_multiplier_long",
             cfg.get_f64("chandelier_atr_multiplier", 2.2),
         );
-        let mult_short = cfg.get_f64(
-            "chandelier_atr_multiplier_short",
-            mult_long.max(2.2),
-        );
+        let mult_short = cfg.get_f64("chandelier_atr_multiplier_short", mult_long.max(2.2));
         let min_atr_pct = cfg.get_f64(
             "chandelier_min_atr_pct",
             cfg.get_f64("risk_min_stop_pct_floor", 0.004),
         );
-        let chandelier_mult = if side == "LONG" { mult_long } else { mult_short };
+        let chandelier_mult = if side == "LONG" {
+            mult_long
+        } else {
+            mult_short
+        };
 
         let owned_trades;
         let active_trades: &[TradeRecord] = match open_trades {
@@ -592,27 +589,24 @@ impl RiskEngine {
             }
             let t_size = Quantity(t.quantity.abs());
             let t_entry = Price(t.entry_price);
-            let t_stop = Price(if t.chandelier_stop_price > 0.0 {
-                t.chandelier_stop_price
-            } else {
-                t.initial_stop_price
-            });
             let t_mark = Price(t.current_price.max(t_entry.as_f64()));
             let t_notional = t_size.notional_at(t_mark);
-            let t_risk = if t.side == "LONG" {
-                t_size.notional_at(Price((t_entry - t_stop).as_f64().max(0.0)))
-            } else {
-                t_size.notional_at(Price((t_stop - t_entry).as_f64().max(0.0)))
-            };
+            let t_risk = Usdc(effective_position_open_heat_usdc(
+                t.side.as_str(),
+                t_entry.as_f64(),
+                t.initial_stop_price,
+                (t.chandelier_stop_price > 0.0).then_some(t.chandelier_stop_price),
+                t_size.as_f64(),
+                t.risk_budget_usdc,
+                t.funding_accrued_usdc,
+            ));
 
             current_gross_notional_usdc += t_notional;
             current_heat_usdc += t_risk;
             if t.symbol == asset.symbol || t.base_asset == asset.base_asset {
                 existing_asset_notional_usdc += t_notional;
             }
-            if target_cluster != "OTHER"
-                && Self::correlation_cluster_for_base_asset(&t.base_asset) == target_cluster
-            {
+            if Self::correlation_cluster_for_base_asset(&t.base_asset) == target_cluster {
                 existing_cluster_notional_usdc += t_notional;
             }
         }
@@ -681,18 +675,22 @@ impl RiskEngine {
             };
         }
 
-        let remaining_cluster_notional = if target_cluster != "OTHER" {
-            max_cluster_notional - existing_cluster_notional_usdc
+        let effective_cluster_cap = if target_cluster == "OTHER" {
+            let other_pct = cfg
+                .get_f64("risk_max_other_cluster_pct", 0.25)
+                .clamp(0.05, 1.0);
+            Usdc(ref_equity * other_pct * equity_scale).min(max_cluster_notional)
         } else {
-            max_gross_notional
+            max_cluster_notional
         };
+        let remaining_cluster_notional = effective_cluster_cap - existing_cluster_notional_usdc;
         if remaining_cluster_notional < min_notional {
             return PositionSizeResult {
                 approved: false,
                 reason: format!(
                     "CORRELATION_CLUSTER_CAP_EXCEEDED ({target_cluster}): existing_cluster_notional={:.2} >= max_cluster={:.2}",
                     existing_cluster_notional_usdc.as_f64(),
-                    max_cluster_notional.as_f64()
+                    effective_cluster_cap.as_f64()
                 ),
                 symbol: asset.symbol.clone(),
                 side: side.to_string(),
@@ -780,16 +778,8 @@ mod tests {
         let assets = db.get_usdc_perp_universe().unwrap();
         let sol = assets.iter().find(|a| a.symbol == "SOL/USDC:USDC").unwrap();
 
-        let sized = risk.evaluate_order_risk(
-            sol,
-            "LONG",
-            185.0,
-            4.5,
-            10_000.0,
-            Some(&[]),
-            0.75,
-            0.0,
-        );
+        let sized =
+            risk.evaluate_order_risk(sol, "LONG", 185.0, 4.5, 10_000.0, Some(&[]), 0.75, 0.0);
         assert!(sized.approved);
         assert!(sized.notional_usdc <= 2500.0);
         assert!(sized.risk_budget_usdc <= 150.0);
@@ -876,7 +866,10 @@ mod tests {
             0.75,
             0.0,
         );
-        assert!(sized.approved, "Unfilled resting order should not consume filled heat/notional");
+        assert!(
+            sized.approved,
+            "Unfilled resting order should not consume filled heat/notional"
+        );
     }
 
     #[test]
@@ -916,8 +909,7 @@ mod tests {
         // Even if current_chandelier_stop started very wide (e.g. 476.78 from orphan reconciliation),
         // evaluate_two_tier_chandelier_stop must ratchet it tightly above current price (~0.8% = ~301.49).
         let short_eval = risk.evaluate_two_tier_chandelier_stop(
-            "SHORT",
-            317.85,  // entry_price
+            "SHORT", 317.85,  // entry_price
             0.39,    // quantity
             476.775, // current_stop
             317.85,  // highest_price
@@ -943,16 +935,16 @@ mod tests {
         // Next tick: price bounces above the tight trailed stop (e.g. bar_close = 302.50 > ~301.49)
         let short_trig = risk.evaluate_two_tier_chandelier_stop(
             "SHORT",
-            317.85,                          // entry_price
-            0.39,                            // quantity
+            317.85,                           // entry_price
+            0.39,                             // quantity
             short_eval.chandelier_stop_price, // current_stop
-            317.85,                          // highest_price
-            299.10,                          // lowest_price
-            303.00,                          // bar_high
-            298.00,                          // bar_low
-            302.50,                          // bar_close
-            5.50,                            // atr_value
-            0.01,                            // tick_size
+            317.85,                           // highest_price
+            299.10,                           // lowest_price
+            303.00,                           // bar_high
+            298.00,                           // bar_low
+            302.50,                           // bar_close
+            5.50,                             // atr_value
+            0.01,                             // tick_size
             None,
         );
         assert!(
@@ -962,8 +954,7 @@ mod tests {
 
         // 2. LONG position: entry=100.0, current=108.0, prior stop=98.0
         let long_eval = risk.evaluate_two_tier_chandelier_stop(
-            "LONG",
-            100.0, // entry_price
+            "LONG", 100.0, // entry_price
             10.0,  // quantity
             98.0,  // current_stop
             108.5, // highest_price
@@ -1008,8 +999,7 @@ mod tests {
         // Even though lowest_price + 1.2 * atr = 86.96 < bar_close (86.97), bar_close is safely
         // below current_stop (87.60), so it must NOT falsely trigger and must NOT clamp stop to 1 tick.
         let sol_eval = risk.evaluate_two_tier_chandelier_stop(
-            "SHORT",
-            90.32,  // entry_price
+            "SHORT", 90.32,  // entry_price
             0.23,   // quantity
             87.60,  // current_stop
             92.009, // highest_price
@@ -1036,8 +1026,7 @@ mod tests {
         // LONG: entry=100.0, atr=2.0, highest=101.80 (>= 101.60 trigger), bar_close=100.70.
         // tight_floor = 100.70 * (1 - 0.008) = 99.8944, while break-even lock = 100.0 + 0.25 * 2.0 = 100.50.
         let long_be = risk.evaluate_two_tier_chandelier_stop(
-            "LONG",
-            100.0,  // entry_price
+            "LONG", 100.0,  // entry_price
             10.0,   // quantity
             98.0,   // current_stop
             101.80, // highest_price
@@ -1059,8 +1048,7 @@ mod tests {
         // SHORT: entry=100.0, atr=2.0, lowest=98.20 (<= 98.40 trigger), bar_close=99.30.
         // tight_ceil = 99.30 * (1 + 0.008) = 100.0944, while break-even lock = 100.0 - 0.25 * 2.0 = 99.50.
         let short_be = risk.evaluate_two_tier_chandelier_stop(
-            "SHORT",
-            100.0,  // entry_price
+            "SHORT", 100.0,  // entry_price
             10.0,   // quantity
             102.0,  // current_stop
             100.20, // highest_price
@@ -1082,8 +1070,7 @@ mod tests {
         // 5. Fix 1: Newly opened trade with < 1.0 ATR excursion must preserve its 2.2x ATR
         // initial stop band (~4.4%) and NEVER be crushed to 0.8% (tight_trail_dist) on tick 1!
         let fresh_short = risk.evaluate_two_tier_chandelier_stop(
-            "SHORT",
-            100.0,  // entry_price
+            "SHORT", 100.0,  // entry_price
             10.0,   // quantity
             104.4,  // current_stop (initial stop = 100.0 + 2.2 * 2.0)
             100.0,  // highest_price
@@ -1103,8 +1090,7 @@ mod tests {
         );
 
         let fresh_long = risk.evaluate_two_tier_chandelier_stop(
-            "LONG",
-            100.0,  // entry_price
+            "LONG", 100.0,  // entry_price
             10.0,   // quantity
             95.6,   // current_stop (initial stop = 100.0 - 2.2 * 2.0)
             100.0,  // highest_price (0 excursion)
@@ -1125,17 +1111,16 @@ mod tests {
 
         // 6. Exact 1.0x ATR boundary: once favorable_excursion == 1.0 * eff_atr, tight-trail activates
         let boundary_long = risk.evaluate_two_tier_chandelier_stop(
-            "LONG",
-            100.0,  // entry_price
-            10.0,   // quantity
-            95.6,   // current_stop
-            102.0,  // highest_price (exactly +1.0 * ATR)
-            100.0,  // lowest_price
-            102.0,  // bar_high
-            101.5,  // bar_low
-            102.0,  // bar_close
-            2.0,    // atr_value
-            0.01,   // tick_size
+            "LONG", 100.0, // entry_price
+            10.0,  // quantity
+            95.6,  // current_stop
+            102.0, // highest_price (exactly +1.0 * ATR)
+            100.0, // lowest_price
+            102.0, // bar_high
+            101.5, // bar_low
+            102.0, // bar_close
+            2.0,   // atr_value
+            0.01,  // tick_size
             None,
         );
         assert!(!boundary_long.triggered);
@@ -1199,5 +1184,174 @@ mod tests {
         );
         assert!(!sized.approved);
         assert!(sized.reason.contains("CORRELATION_CLUSTER_CAP_EXCEEDED"));
+    }
+
+    #[test]
+    fn test_me3_all_seeded_universe_assets_have_explicit_cluster() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let assets = db.get_usdc_perp_universe().unwrap();
+        assert!(!assets.is_empty());
+        for asset in &assets {
+            let cluster = RiskEngine::correlation_cluster_for_base_asset(&asset.base_asset);
+            assert_ne!(
+                cluster, "OTHER",
+                "Seeded asset {} ({}) fell into fallback OTHER cluster",
+                asset.symbol, asset.base_asset
+            );
+        }
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("ADA"),
+            "ALT_L1"
+        );
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("DOT"),
+            "ALT_L1"
+        );
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("XRP"),
+            "ALT_L1"
+        );
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("LINK"),
+            "DEFI"
+        );
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("INJ"),
+            "DEFI"
+        );
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset("HYPE"),
+            "DEFI"
+        );
+    }
+
+    #[test]
+    fn test_r15_qa_e_other_cluster_enforces_cap() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let risk = RiskEngine::new(db.clone());
+        let assets = db.get_usdc_perp_universe().unwrap();
+        let mut unknown_asset = assets[0].clone();
+        unknown_asset.symbol = "NEWTOKEN/USDC:USDC".to_string();
+        unknown_asset.base_asset = "NEWTOKEN".to_string();
+        assert_eq!(
+            RiskEngine::correlation_cluster_for_base_asset(&unknown_asset.base_asset),
+            "OTHER"
+        );
+
+        // Book equity = $5,000 -> default 25% OTHER cluster cap = $1,250.
+        let open_other = TradeRecord {
+            trade_id: 11,
+            client_order_id: "other-1".to_string(),
+            symbol: "UNLISTED1/USDC:USDC".to_string(),
+            base_asset: "UNLISTED1".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 10.0,
+            current_price: 10.0,
+            exit_price: None,
+            quantity: 125.0, // $1,250 notional -> fills 25% OTHER cap
+            filled_units: 125.0,
+            avg_fill_price: Some(10.0),
+            notional_usdc: 1_250.0,
+            risk_budget_usdc: 25.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 9.8,
+            chandelier_stop_price: 9.8,
+            current_stop_price: 9.8,
+            highest_price_seen: 10.0,
+            lowest_price_seen: 10.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("oid-other-1".to_string()),
+            opened_at: String::new(),
+            closed_at: None,
+            exit_reason: None,
+        };
+
+        let sized = risk.evaluate_order_risk(
+            &unknown_asset,
+            "LONG",
+            10.0,
+            0.2,
+            5_000.0,
+            Some(&[open_other]),
+            0.8,
+            0.0,
+        );
+        assert!(!sized.approved);
+        assert!(
+            sized
+                .reason
+                .contains("CORRELATION_CLUSTER_CAP_EXCEEDED (OTHER)"),
+            "Expected OTHER cluster cap rejection, got: {}",
+            sized.reason
+        );
+    }
+
+    #[test]
+    fn test_lt2_evaluate_order_risk_reclaims_trailed_stop_and_funding_heat() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).unwrap();
+        let risk = RiskEngine::new(db.clone());
+        let assets = db.get_usdc_perp_universe().unwrap();
+        let eth = assets.iter().find(|a| a.symbol == "ETH/USDC:USDC").unwrap();
+
+        // Book equity = $1,000 -> default 4% portfolio heat cap = $40.
+        // Trailed stop ABOVE entry + positive accrued funding on SOL => effective heat is $0,
+        // so opening ETH should NOT be blocked by stale initial entry-to-stop risk.
+        let risk_free_sol = TradeRecord {
+            trade_id: 21,
+            client_order_id: "sol-trailed".to_string(),
+            symbol: "SOL/USDC:USDC".to_string(),
+            base_asset: "SOL".to_string(),
+            side: "LONG".to_string(),
+            status: "OPEN".to_string(),
+            fsm_state: "FILLED".to_string(),
+            entry_price: 100.0,
+            current_price: 115.0,
+            exit_price: None,
+            quantity: 3.0,
+            filled_units: 3.0,
+            avg_fill_price: Some(100.0),
+            notional_usdc: 345.0,
+            risk_budget_usdc: 40.0,
+            conviction_multiplier: 1.0,
+            initial_stop_price: 85.0,
+            chandelier_stop_price: 108.0, // trailed above entry -> 0 stop risk
+            current_stop_price: 108.0,
+            highest_price_seen: 115.0,
+            lowest_price_seen: 100.0,
+            realized_pnl_usdc: 0.0,
+            unrealized_pnl_usdc: 45.0,
+            fees_paid_usdc: 0.0,
+            funding_accrued_usdc: 5.0, // positive funding further reduces residual risk
+            slippage_paid_usd: 0.0,
+            exchange_order_id: Some("oid-sol-21".to_string()),
+            opened_at: String::new(),
+            closed_at: None,
+            exit_reason: None,
+        };
+
+        let sized = risk.evaluate_order_risk(
+            eth,
+            "LONG",
+            2_500.0,
+            25.0,
+            1_000.0,
+            Some(&[risk_free_sol]),
+            0.8,
+            0.0,
+        );
+        assert!(
+            sized.approved,
+            "Expected trailed-stop + positive-funding trade to reclaim heat; got rejection: {}",
+            sized.reason
+        );
     }
 }

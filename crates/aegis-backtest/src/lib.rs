@@ -75,9 +75,8 @@ impl BacktestEngine {
         raw_json: &str,
         fallback_funding_hourly: f64,
     ) -> Result<HashMap<String, Vec<OhlcvBar>>> {
-        let root_val: Value = serde_json::from_str(raw_json).map_err(|e| {
-            AegisError::Validation(format!("Invalid backfill JSON syntax: {e}"))
-        })?;
+        let root_val: Value = serde_json::from_str(raw_json)
+            .map_err(|e| AegisError::Validation(format!("Invalid backfill JSON syntax: {e}")))?;
         let Value::Object(root) = root_val else {
             return Err(AegisError::Validation(
                 "Backfill JSON root must be an object".to_string(),
@@ -116,11 +115,7 @@ impl BacktestEngine {
                         low: parse_f("low", "l", 0.0),
                         close: parse_f("close", "c", 0.0),
                         volume: parse_f("volume", "v", 1000.0),
-                        funding_rate_hourly: parse_f(
-                            "funding_rate_hourly",
-                            "f",
-                            default_funding,
-                        ),
+                        funding_rate_hourly: parse_f("funding_rate_hourly", "f", default_funding),
                         is_synthetic: 0,
                     });
                 }
@@ -290,10 +285,8 @@ impl BacktestEngine {
                 )));
             }
             let raw_json = fs::read_to_string(&backfill_file)?;
-            loaded_real = Self::parse_backfill_json_with_default_funding(
-                &raw_json,
-                default_funding_hourly,
-            )?;
+            loaded_real =
+                Self::parse_backfill_json_with_default_funding(&raw_json, default_funding_hourly)?;
             if loaded_real.is_empty() || !loaded_real.contains_key("BTC/USDC:USDC") {
                 return Err(AegisError::Validation(format!(
                     "Real historical dataset {} yielded zero usable BTC/USDC:USDC bars (refusing synthetic fallback when use_real_history=true)",
@@ -310,8 +303,7 @@ impl BacktestEngine {
                 real_btc[real_btc.len() - total_needed..].to_vec()
             } else {
                 let missing = total_needed - real_btc.len();
-                let mut warm =
-                    Self::generate_warmup_bars(btc_sym, "4h", &real_btc[0], missing, 1);
+                let mut warm = Self::generate_warmup_bars(btc_sym, "4h", &real_btc[0], missing, 1);
                 warm.extend_from_slice(real_btc);
                 warm
             }
@@ -396,6 +388,70 @@ impl BacktestEngine {
         Ok((btc_bars, usdc_map, synth_map))
     }
 
+    /// Enumerates every `key: old -> new` 4H-horizon stop profile substitution that
+    /// [`Self::execute_pit_replay`] applies when 4H stop scaling is enabled (`ME-2`).
+    pub fn collect_4h_stop_substitutions(
+        cfg: &aegis_core::ConfigMap,
+    ) -> Vec<(&'static str, f64, f64)> {
+        let enabled = cfg.get_bool("backtest_scale_4h_stops", true)
+            || cfg.get_bool("backtest_use_calibrated_stop_profile", false);
+        if !enabled {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let long_mult = cfg.get_f64("chandelier_atr_multiplier_long", 1.2);
+        if long_mult < 3.0 {
+            out.push(("chandelier_atr_multiplier_long", long_mult, 3.5));
+        }
+        let short_mult = cfg.get_f64("chandelier_atr_multiplier_short", 1.2);
+        if short_mult < 3.0 {
+            out.push(("chandelier_atr_multiplier_short", short_mult, 3.8));
+        }
+        let min_atr = cfg.get_f64("chandelier_min_atr_pct", 0.004);
+        if min_atr < 0.02 {
+            out.push(("chandelier_min_atr_pct", min_atr, 0.022));
+        }
+        let wick_buf = cfg.get_f64("chandelier_wick_buffer_atr", 0.35);
+        if wick_buf < 0.75 {
+            out.push(("chandelier_wick_buffer_atr", wick_buf, 0.85));
+            let wick_over = cfg.get_f64("chandelier_wick_overshoot_atr", wick_buf);
+            out.push(("chandelier_wick_overshoot_atr", wick_over, 0.85));
+        }
+        let trail_mult = cfg.get_f64("chandelier_trail_atr_multiplier", 0.45);
+        if trail_mult < 3.0 {
+            out.push(("chandelier_trail_atr_multiplier", trail_mult, 10.0));
+        }
+        let trail_cap = cfg.get_f64("chandelier_trail_max_pct", 0.008);
+        if trail_cap < 0.10 {
+            out.push(("chandelier_trail_max_pct", trail_cap, 0.50));
+        }
+        let long_be = cfg.get_f64("long_break_even_trigger_atr", 0.8);
+        if long_be < 1.5 {
+            out.push(("long_break_even_trigger_atr", long_be, 100.0));
+            let long_lock = cfg.get_f64("long_break_even_lock_atr", 0.0);
+            out.push(("long_break_even_lock_atr", long_lock, 0.0));
+        }
+        let short_be = cfg.get_f64("short_break_even_trigger_atr", 0.8);
+        if short_be < 1.2 {
+            out.push(("short_break_even_trigger_atr", short_be, 1.6));
+            let short_lock = cfg.get_f64("short_break_even_lock_atr", 0.0);
+            out.push(("short_break_even_lock_atr", short_lock, 0.45));
+        }
+        out
+    }
+
+    /// Formats all 4H stop substitutions as `key: old -> new` pairs for Tear Sheet & QUANT-01 disclosure (`ME-2`).
+    pub fn format_4h_stop_substitutions(cfg: &aegis_core::ConfigMap) -> String {
+        let subs = Self::collect_4h_stop_substitutions(cfg);
+        if subs.is_empty() {
+            return "none (raw live stops)".to_string();
+        }
+        subs.into_iter()
+            .map(|(k, old_v, new_v)| format!("{k}: {old_v} -> {new_v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Runs the full point-in-time historical simulation in an isolated `:memory:` SQLite database.
     pub fn run_backtest(
         &self,
@@ -438,38 +494,18 @@ impl BacktestEngine {
         // Operators or tests can disable this 4H horizon scaling by setting
         // `backtest_scale_4h_stops = false` in `system_config` (R7-N1).
         let cur_cfg = bt_db.load_config()?;
-        if cur_cfg.get_bool("backtest_scale_4h_stops", true) {
+        let stop_subs = Self::collect_4h_stop_substitutions(&cur_cfg);
+        if !stop_subs.is_empty() {
+            let subs_summary = Self::format_4h_stop_substitutions(&cur_cfg);
             tracing::info!(
                 component = "engine.backtest",
-                backtest_scale_4h_stops = true,
+                backtest_scale_4h_stops = cur_cfg.get_bool("backtest_scale_4h_stops", true),
+                backtest_use_calibrated_stop_profile = cur_cfg.get_bool("backtest_use_calibrated_stop_profile", false),
+                substitutions = %subs_summary,
                 "Applying 4H horizon sqrt(16)=4x stop scaling in isolated backtest memory DB (ME-2; set backtest_scale_4h_stops=false to replay raw intraday stops)"
             );
-            if cur_cfg.get_f64("chandelier_atr_multiplier_long", 1.2) < 3.0 {
-                let _ = bt_db.set_config_value("chandelier_atr_multiplier_long", &serde_json::json!(3.5));
-            }
-            if cur_cfg.get_f64("chandelier_atr_multiplier_short", 1.2) < 3.0 {
-                let _ = bt_db.set_config_value("chandelier_atr_multiplier_short", &serde_json::json!(3.8));
-            }
-            if cur_cfg.get_f64("chandelier_min_atr_pct", 0.004) < 0.02 {
-                let _ = bt_db.set_config_value("chandelier_min_atr_pct", &serde_json::json!(0.022));
-            }
-            if cur_cfg.get_f64("chandelier_wick_buffer_atr", 0.35) < 0.75 {
-                let _ = bt_db.set_config_value("chandelier_wick_buffer_atr", &serde_json::json!(0.85));
-                let _ = bt_db.set_config_value("chandelier_wick_overshoot_atr", &serde_json::json!(0.85));
-            }
-            if cur_cfg.get_f64("chandelier_trail_atr_multiplier", 0.45) < 3.0 {
-                let _ = bt_db.set_config_value("chandelier_trail_atr_multiplier", &serde_json::json!(10.0));
-            }
-            if cur_cfg.get_f64("chandelier_trail_max_pct", 0.008) < 0.10 {
-                let _ = bt_db.set_config_value("chandelier_trail_max_pct", &serde_json::json!(0.50));
-            }
-            if cur_cfg.get_f64("long_break_even_trigger_atr", 0.8) < 1.5 {
-                let _ = bt_db.set_config_value("long_break_even_trigger_atr", &serde_json::json!(100.0));
-                let _ = bt_db.set_config_value("long_break_even_lock_atr", &serde_json::json!(0.0));
-            }
-            if cur_cfg.get_f64("short_break_even_trigger_atr", 0.8) < 1.2 {
-                let _ = bt_db.set_config_value("short_break_even_trigger_atr", &serde_json::json!(1.6));
-                let _ = bt_db.set_config_value("short_break_even_lock_atr", &serde_json::json!(0.45));
+            for (k, _, new_val) in stop_subs {
+                let _ = bt_db.set_config_value(k, &serde_json::json!(new_val));
             }
         }
 
@@ -531,10 +567,11 @@ impl BacktestEngine {
         let max_shorts = cfg.get_usize("max_concurrent_short_positions", 2);
         let initial_equity = cfg.get_f64("initial_equity_usdc", 10000.0);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
+        let entry_slippage_bps = cfg.get_f64("backtest_entry_slippage_bps", 2.0).max(0.0);
+        let prefer_maker_entries = cfg.get_bool("backtest_prefer_maker_entries", false);
 
         let btc_ts: Vec<i64> = btc_bars.iter().map(|b| b.timestamp_ms).collect();
-        let alt_pc1_series =
-            SignalEngine::compute_alt_pc1_series(usdc_map, &btc_ts, hmm_window);
+        let alt_pc1_series = SignalEngine::compute_alt_pc1_series(usdc_map, &btc_ts, hmm_window);
         let regime_states: Vec<RegimeState> =
             signals.decode_hmm_regime_states(btc_bars, hmm_window, Some(&alt_pc1_series), None);
 
@@ -560,8 +597,9 @@ impl BacktestEngine {
                         &s_bars, &u_bars, snr_fast, snr_slow, &scfg,
                     );
                 let (mace_series, ic_series) = if let Some((x_raw, y_target, k)) =
-                    SignalEngine::build_mace_features_and_target_with_config(&s_bars, &u_bars, &scfg)
-                {
+                    SignalEngine::build_mace_features_and_target_with_config(
+                        &s_bars, &u_bars, &scfg,
+                    ) {
                     let local_sig = SignalEngine::new(bt_db.clone());
                     local_sig.fit_predict_mace_series_from_xy(&x_raw, &y_target, k, None)
                 } else {
@@ -587,8 +625,10 @@ impl BacktestEngine {
                     );
                     let snr_s = snr_synth_series.get(t).copied().unwrap_or(0.0);
                     rs_composite_series[t] = scfg.rs_composite_snr_weight * snr_s
-                        + scfg.rs_composite_fast_weight * (rs_24 * scfg.rs_composite_fast_scale).tanh()
-                        + scfg.rs_composite_mid_weight * (rs_72 * scfg.rs_composite_mid_scale).tanh();
+                        + scfg.rs_composite_fast_weight
+                            * (rs_24 * scfg.rs_composite_fast_scale).tanh()
+                        + scfg.rs_composite_mid_weight
+                            * (rs_72 * scfg.rs_composite_mid_scale).tanh();
                     rs_96_series[t] = rs_96;
                     r_usdc_8_series[t] = r_u8;
                 }
@@ -711,7 +751,9 @@ impl BacktestEngine {
             // 1. Update & evaluate stops on open trades
             let open_trades = bt_db.get_open_trades()?;
             for trade in open_trades {
-                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == trade.symbol)
+                let Some(p) = precomputed
+                    .iter()
+                    .find(|x| x.pair.exec_symbol == trade.symbol)
                 else {
                     continue;
                 };
@@ -762,7 +804,8 @@ impl BacktestEngine {
                         } else if trade.side == "SHORT" && ev.snr_synth > rs_reversal_short_snr {
                             exit_reason = Some("RS_SYNTH_REVERSAL_SHORT".to_string());
                             exit_px = bar.close;
-                        } else if ev.prob_chop >= (chop_thresh + chop_prob_offset).min(chop_prob_cap)
+                        } else if ev.prob_chop
+                            >= (chop_thresh + chop_prob_offset).min(chop_prob_cap)
                             && ev.blended_conviction.abs() < chop_conv_max
                         {
                             exit_reason = Some("HIGH_CHOP_DELEVERAGE".to_string());
@@ -863,7 +906,9 @@ impl BacktestEngine {
                         continue;
                     }
                 }
-                let Some(p) = precomputed.iter().find(|x| x.pair.exec_symbol == ev.exec_symbol)
+                let Some(p) = precomputed
+                    .iter()
+                    .find(|x| x.pair.exec_symbol == ev.exec_symbol)
                 else {
                     continue;
                 };
@@ -886,7 +931,7 @@ impl BacktestEngine {
                 }
 
                 let det_cid = format!("bt-{}-{}-{}", p.asset.base_asset, t, ev_idx);
-                let fill = exec.simulate_paper_fill(
+                let fill = exec.simulate_paper_fill_with_base_slippage(
                     &p.asset.symbol,
                     &ev.signal_action,
                     sizing.quantity,
@@ -897,9 +942,10 @@ impl BacktestEngine {
                     bar.low,
                     bar.volume,
                     false,
-                    true,
+                    prefer_maker_entries,
                     None,
                     Some(&det_cid),
+                    Some(entry_slippage_bps),
                 );
                 if fill.fsm_state != "FILLED" || fill.filled_units <= 0.0 {
                     continue;
@@ -1363,9 +1409,7 @@ mod tests {
         let bt = BacktestEngine::new(db.clone(), 30);
 
         let bt_db_a = db.clone_to_memory().unwrap();
-        let (btc_a, usdc_a, synth_a) = bt
-            .load_historical_dataset(&bt_db_a, 80, 70, true)
-            .unwrap();
+        let (btc_a, usdc_a, synth_a) = bt.load_historical_dataset(&bt_db_a, 80, 70, true).unwrap();
         assert!(btc_a.iter().all(|b| b.is_synthetic == 0));
 
         let n_total = btc_a.len();
@@ -1492,5 +1536,54 @@ mod tests {
         let formatted = BacktestEngine::format_tear_sheet(&ts);
         assert!(formatted.contains("POINT-IN-TIME HISTORICAL BACKTEST TEAR SHEET"));
         assert!(formatted.contains("VERDICT:"));
+    }
+
+    #[test]
+    fn test_me1_me2_backtest_entry_slippage_taker_default_and_stop_substitution_disclosure() {
+        let db_taker = DatabaseManager::memory();
+        db_taker.initialize_schema(false).unwrap();
+        // Default: backtest_prefer_maker_entries=false, backtest_entry_slippage_bps=2.0
+        let bt_taker = BacktestEngine::new(db_taker.clone(), 30);
+        let ts_taker = bt_taker.run_backtest(Some(90), Some(70), true).unwrap();
+
+        let db_maker = DatabaseManager::memory();
+        db_maker.initialize_schema(false).unwrap();
+        db_maker
+            .set_config_value("backtest_prefer_maker_entries", &serde_json::json!(true))
+            .unwrap();
+        let bt_maker = BacktestEngine::new(db_maker, 30);
+        let ts_maker = bt_maker.run_backtest(Some(90), Some(70), true).unwrap();
+
+        if ts_taker.total_trades > 0 && ts_maker.total_trades > 0 {
+            assert!(
+                ts_taker.total_fees_usdc > ts_maker.total_fees_usdc,
+                "ME-1: default taker entries (4.5 bps) must pay higher fees than opt-in maker entries (1.5 bps)"
+            );
+            assert!(
+                ts_taker.total_slippage_usdc >= ts_maker.total_slippage_usdc,
+                "ME-1: default taker entries (>= 2 bps) must model non-negative entry slippage vs maker rebate"
+            );
+        }
+
+        // ME-2: Verify exact old -> new disclosure formatting and clean disable
+        let cfg_scaled = db_taker.load_config().unwrap();
+        let disclosure = BacktestEngine::format_4h_stop_substitutions(&cfg_scaled);
+        assert!(disclosure.contains("chandelier_atr_multiplier_long:"));
+        assert!(disclosure.contains("-> 3.5"));
+
+        db_taker
+            .set_config_value("backtest_scale_4h_stops", &serde_json::json!(false))
+            .unwrap();
+        db_taker
+            .set_config_value(
+                "backtest_use_calibrated_stop_profile",
+                &serde_json::json!(false),
+            )
+            .unwrap();
+        let cfg_raw = db_taker.load_config().unwrap();
+        assert_eq!(
+            BacktestEngine::format_4h_stop_substitutions(&cfg_raw),
+            "none (raw live stops)"
+        );
     }
 }

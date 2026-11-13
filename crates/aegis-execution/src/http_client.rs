@@ -53,13 +53,19 @@ pub fn validate_hyperliquid_endpoint_url(url: &str, cfg: &ConfigMap) -> bool {
     } else if let Some(r) = trimmed.strip_prefix("http://") {
         (false, r)
     } else {
-        tracing::warn!(url = trimmed, "Rejected Hyperliquid URL without http/https scheme");
+        tracing::warn!(
+            url = trimmed,
+            "Rejected Hyperliquid URL without http/https scheme"
+        );
         return false;
     };
 
     let authority = rest.split('/').next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
-        tracing::warn!(url = trimmed, "Rejected Hyperliquid URL with invalid authority");
+        tracing::warn!(
+            url = trimmed,
+            "Rejected Hyperliquid URL with invalid authority"
+        );
         return false;
     }
 

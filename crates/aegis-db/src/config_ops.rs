@@ -496,7 +496,11 @@ impl DatabaseManager {
         }
         if cfg.get("settling_drift_deadband_pct").is_some() {
             let pct = cfg.get_f64("settling_drift_deadband_pct", 0.005).max(0.0);
-            return if pct <= 1.0 { pct * 10_000.0 } else { pct * 100.0 };
+            return if pct <= 1.0 {
+                pct * 10_000.0
+            } else {
+                pct * 100.0
+            };
         }
         50.0
     }
@@ -767,8 +771,7 @@ pub fn is_masked_secret_echo(s: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.eq_ignore_ascii_case("[REDACTED]") || trimmed == "********" || trimmed == "****"
-    {
+    if trimmed.eq_ignore_ascii_case("[REDACTED]") || trimmed == "********" || trimmed == "****" {
         return true;
     }
     let chars: Vec<char> = trimmed.chars().collect();
@@ -785,8 +788,14 @@ pub fn is_masked_secret_echo(s: &str) -> bool {
 }
 
 impl DatabaseManager {
-    pub fn get_config_rows(&self, _mask_secrets: bool) -> Result<Vec<Value>> {
+    pub fn get_config_rows(&self, mask_secrets: bool) -> Result<Vec<Value>> {
         self.reconcile_routing_config();
+        self.get_config_rows_readonly(mask_secrets)
+    }
+
+    /// Read-only variant of [`Self::get_config_rows`] that never runs `reconcile_routing_config()`
+    /// write paths on `GET /api/v1/config` (`Table 3 #9`).
+    pub fn get_config_rows_readonly(&self, _mask_secrets: bool) -> Result<Vec<Value>> {
         let sensitive: HashSet<&str> = SENSITIVE_CONFIG_KEYS.iter().copied().collect();
         let immutable: HashSet<&str> = IMMUTABLE_SECURITY_CONFIG_KEYS.iter().copied().collect();
         let rows: Vec<(String, String, String, String, String, String)> =
@@ -974,7 +983,9 @@ impl DatabaseManager {
                     )));
                 }
                 let cur_cfg = self.load_config_opts(false)?;
-                let cur_mode = cur_cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+                let cur_mode = cur_cfg
+                    .get_str("execution_mode", "PAPER")
+                    .to_ascii_uppercase();
                 let expected_env =
                     if cur_mode == "LIVE" && !cur_cfg.get_bool("hyperliquid_testnet", false) {
                         "production"
@@ -1291,9 +1302,18 @@ impl DatabaseManager {
         let pairs = [
             ("initial_equity_usdc", round_dp(initial_equity_usdc, 2)),
             ("baseline_risk_per_trade_usdc", baseline_risk),
-            ("min_risk_per_trade_usdc", round_dp(baseline_risk * scale_min, 2)),
-            ("max_risk_per_trade_usdc", round_dp(baseline_risk * scale_max, 2)),
-            ("max_portfolio_heat_usdc", round_dp(pit_book_eq * heat_pct, 2)),
+            (
+                "min_risk_per_trade_usdc",
+                round_dp(baseline_risk * scale_min, 2),
+            ),
+            (
+                "max_risk_per_trade_usdc",
+                round_dp(baseline_risk * scale_max, 2),
+            ),
+            (
+                "max_portfolio_heat_usdc",
+                round_dp(pit_book_eq * heat_pct, 2),
+            ),
             (
                 "max_single_asset_notional_usdc",
                 round_dp(pit_book_eq * single_pct, 2),
@@ -1311,7 +1331,10 @@ impl DatabaseManager {
                 "pond_max_risk_usdc",
                 round_dp(pond_baseline_risk * pond_scale_max, 2),
             ),
-            ("pond_max_heat_usdc", round_dp(pond_book_eq * pond_heat_pct, 2)),
+            (
+                "pond_max_heat_usdc",
+                round_dp(pond_book_eq * pond_heat_pct, 2),
+            ),
             (
                 "pond_max_cell_notional_usdc",
                 round_dp(pond_book_eq * pond_cell_pct, 2),
@@ -1404,7 +1427,9 @@ impl DatabaseManager {
                     _ => 1,
                 }
             };
-            prio(a.as_str()).cmp(&prio(b.as_str())).then_with(|| a.cmp(b))
+            prio(a.as_str())
+                .cmp(&prio(b.as_str()))
+                .then_with(|| a.cmp(b))
         });
 
         let mut updated_keys = Vec::new();
@@ -1491,8 +1516,8 @@ impl DatabaseManager {
             None => self.get_signing_private_key().unwrap_or_default(),
         };
         let mut eff_agent = cfg.get_str("hyperliquid_agent_address", "");
-        let valid_w = !eff_wallet.is_empty()
-            && validate_evm_address(&eff_wallet, "wallet_address").is_ok();
+        let valid_w =
+            !eff_wallet.is_empty() && validate_evm_address(&eff_wallet, "wallet_address").is_ok();
         let valid_p = !eff_priv.is_empty() && validate_private_key(&eff_priv).is_ok();
         if !(valid_w && valid_p) {
             return Err(AegisError::Validation(
@@ -1762,7 +1787,9 @@ impl DatabaseManager {
             }
         } else if let Some(tn) = hyperliquid_testnet {
             let cur_cfg = self.load_config_opts(false)?;
-            let cur_mode = cur_cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+            let cur_mode = cur_cfg
+                .get_str("execution_mode", "PAPER")
+                .to_ascii_uppercase();
             if tn && cur_mode == "LIVE" {
                 updates.insert("execution_mode", "TESTNET".to_string());
                 updates.insert("pond_execution_mode", "TESTNET".to_string());
@@ -1837,15 +1864,51 @@ impl DatabaseManager {
                 v
             };
             let (vtype, cat, desc) = match k {
-                "hyperliquid_testnet" => ("bool", "credentials", "Route orders to Hyperliquid testnet when true"),
-                "execution_mode" => ("string", "platform", "Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing"),
-                "pond_execution_mode" => ("string", "platform", "Pond execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing"),
-                "environment" => ("string", "platform", "Deployment target environment (sandbox or production)"),
-                "wallet_address" => ("string", "credentials", "Main Arbitrum Wallet Address holding USDC collateral"),
-                "private_key" => ("string", "credentials", "Trade-Only API Agent Wallet Private Key (no withdrawal permissions)"),
-                "hyperliquid_agent_address" => ("string", "credentials", "Delegated Hyperliquid API Agent address derived from private_key"),
-                "hyperliquid_vault_address" => ("string", "credentials", "Optional Hyperliquid sub-account or HLP vault address"),
-                "gemini_api_key" => ("string", "credentials", "Google Gemini API key for quantitative telemetry diagnostics"),
+                "hyperliquid_testnet" => (
+                    "bool",
+                    "credentials",
+                    "Route orders to Hyperliquid testnet when true",
+                ),
+                "execution_mode" => (
+                    "string",
+                    "platform",
+                    "Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing",
+                ),
+                "pond_execution_mode" => (
+                    "string",
+                    "platform",
+                    "Pond execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing",
+                ),
+                "environment" => (
+                    "string",
+                    "platform",
+                    "Deployment target environment (sandbox or production)",
+                ),
+                "wallet_address" => (
+                    "string",
+                    "credentials",
+                    "Main Arbitrum Wallet Address holding USDC collateral",
+                ),
+                "private_key" => (
+                    "string",
+                    "credentials",
+                    "Trade-Only API Agent Wallet Private Key (no withdrawal permissions)",
+                ),
+                "hyperliquid_agent_address" => (
+                    "string",
+                    "credentials",
+                    "Delegated Hyperliquid API Agent address derived from private_key",
+                ),
+                "hyperliquid_vault_address" => (
+                    "string",
+                    "credentials",
+                    "Optional Hyperliquid sub-account or HLP vault address",
+                ),
+                "gemini_api_key" => (
+                    "string",
+                    "credentials",
+                    "Google Gemini API key for quantitative telemetry diagnostics",
+                ),
                 _ => ("string", "credentials", ""),
             };
             self.with_conn(|conn| {

@@ -147,7 +147,10 @@ impl Usdc {
 
     #[inline]
     pub fn new(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Usdc::new called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Usdc::new called with non-finite value: {val}"
+        );
         if val.is_finite() {
             Self(round_dp(val, 4))
         } else {
@@ -158,7 +161,10 @@ impl Usdc {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Usdc::new_clamped called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Usdc::new_clamped called with non-finite value: {val}"
+        );
         if val.is_finite() && val > 0.0 {
             Self(round_dp(val, 4))
         } else {
@@ -298,7 +304,10 @@ impl Price {
 
     #[inline]
     pub fn new(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Price::new called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Price::new called with non-finite value: {val}"
+        );
         if val.is_finite() {
             Self(val)
         } else {
@@ -309,7 +318,10 @@ impl Price {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Price::new_clamped called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Price::new_clamped called with non-finite value: {val}"
+        );
         if val.is_finite() && val > 0.0 {
             Self(val)
         } else {
@@ -389,7 +401,10 @@ impl Quantity {
 
     #[inline]
     pub fn new(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Quantity::new called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Quantity::new called with non-finite value: {val}"
+        );
         if val.is_finite() {
             Self(val)
         } else {
@@ -399,7 +414,10 @@ impl Quantity {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Quantity::new_clamped called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Quantity::new_clamped called with non-finite value: {val}"
+        );
         if val.is_finite() && val > 0.0 {
             Self(val)
         } else {
@@ -474,7 +492,10 @@ impl Leverage {
 
     #[inline]
     pub fn new(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Leverage::new called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Leverage::new called with non-finite value: {val}"
+        );
         if val.is_finite() {
             Self(val)
         } else {
@@ -484,7 +505,10 @@ impl Leverage {
 
     #[inline]
     pub fn new_clamped(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Leverage::new_clamped called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Leverage::new_clamped called with non-finite value: {val}"
+        );
         if val.is_finite() && val >= 0.0 {
             Self(val)
         } else {
@@ -508,7 +532,10 @@ impl Bps {
 
     #[inline]
     pub fn new(val: f64) -> Self {
-        debug_assert!(val.is_finite(), "Bps::new called with non-finite value: {val}");
+        debug_assert!(
+            val.is_finite(),
+            "Bps::new called with non-finite value: {val}"
+        );
         if val.is_finite() {
             Self(val)
         } else {
@@ -523,7 +550,10 @@ impl Bps {
 
     #[inline]
     pub fn from_fraction(frac: f64) -> Self {
-        debug_assert!(frac.is_finite(), "Bps::from_fraction called with non-finite value: {frac}");
+        debug_assert!(
+            frac.is_finite(),
+            "Bps::from_fraction called with non-finite value: {frac}"
+        );
         if frac.is_finite() {
             Self(frac * 10_000.0)
         } else {
@@ -543,7 +573,10 @@ pub fn compute_drift_bps(book_a_equity: f64, total_equity: f64, target_split_pct
         return 0.0;
     }
     let target_a = total_equity * target_split_pct;
-    round_dp(((book_a_equity - target_a).abs() / total_equity) * 10_000.0, 2)
+    round_dp(
+        ((book_a_equity - target_a).abs() / total_equity) * 10_000.0,
+        2,
+    )
 }
 
 /// Strictly parse a timeframe string into its duration in seconds (`R3-N13`).
@@ -1058,7 +1091,11 @@ pub enum BookTransferStatus {
     Partial,
     #[serde(rename = "AMBIGUOUS")]
     Ambiguous,
-    #[serde(rename = "SKIPPED_DEADBAND", alias = "SKIPPED_WITHIN_BAND", alias = "NO_ACTION_WITHIN_DEADBAND")]
+    #[serde(
+        rename = "SKIPPED_DEADBAND",
+        alias = "SKIPPED_WITHIN_BAND",
+        alias = "NO_ACTION_WITHIN_DEADBAND"
+    )]
     SkippedWithinBand,
     #[serde(rename = "BLOCKED_ZERO_IDLE", alias = "SKIPPED_NO_IDLE")]
     SkippedNoIdle,
@@ -1916,9 +1953,8 @@ pub fn validate_private_key(value: &str) -> Result<String> {
             raw_hex.len()
         )));
     }
-    let bytes = hex::decode(raw_hex).map_err(|e| {
-        AegisError::Validation(format!("Invalid private_key hex encoding: {e}"))
-    })?;
+    let bytes = hex::decode(raw_hex)
+        .map_err(|e| AegisError::Validation(format!("Invalid private_key hex encoding: {e}")))?;
     // Verify scalar is within secp256k1 range [1, n-1]
     if k256::SecretKey::from_slice(&bytes).is_err() {
         return Err(AegisError::Validation(
@@ -1936,12 +1972,10 @@ pub fn derive_evm_address_from_private_key(private_key: &str) -> Result<String> 
             "Cannot derive EVM address from empty private_key.".to_string(),
         ));
     }
-    let pk_bytes = hex::decode(&norm_pk[2..]).map_err(|e| {
-        AegisError::Validation(format!("Invalid private_key hex encoding: {e}"))
-    })?;
-    let signing_key = k256::ecdsa::SigningKey::from_slice(&pk_bytes).map_err(|e| {
-        AegisError::Validation(format!("Invalid secp256k1 signing key: {e}"))
-    })?;
+    let pk_bytes = hex::decode(&norm_pk[2..])
+        .map_err(|e| AegisError::Validation(format!("Invalid private_key hex encoding: {e}")))?;
+    let signing_key = k256::ecdsa::SigningKey::from_slice(&pk_bytes)
+        .map_err(|e| AegisError::Validation(format!("Invalid secp256k1 signing key: {e}")))?;
     let verifying_key = signing_key.verifying_key();
     let encoded_pt = verifying_key.to_encoded_point(false);
     let pub_bytes = encoded_pt.as_bytes();
@@ -2023,7 +2057,11 @@ pub fn mask_identifier(raw_val: &str) -> String {
 }
 
 fn is_url_token_delimiter(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '/' | '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']')
+    c.is_whitespace()
+        || matches!(
+            c,
+            '/' | '?' | '&' | '"' | '\'' | ',' | ';' | ')' | '}' | ']'
+        )
 }
 
 fn is_webhook_path_delimiter(c: char) -> bool {
@@ -2046,9 +2084,7 @@ pub fn redact_embedded_url_secrets(input: &str) -> String {
             break;
         }
         let rest = &out[token_start..];
-        let token_len = rest
-            .find(is_url_token_delimiter)
-            .unwrap_or(rest.len());
+        let token_len = rest.find(is_url_token_delimiter).unwrap_or(rest.len());
         let token_candidate = &rest[..token_len];
         let looks_like_bot_token = token_candidate != "[REDACTED]"
             && !token_candidate.is_empty()
@@ -2076,9 +2112,7 @@ pub fn redact_embedded_url_secrets(input: &str) -> String {
             break;
         }
         let rest = &out[path_start..];
-        let path_len = rest
-            .find(is_webhook_path_delimiter)
-            .unwrap_or(rest.len());
+        let path_len = rest.find(is_webhook_path_delimiter).unwrap_or(rest.len());
         let candidate = &rest[..path_len];
         if candidate != "[REDACTED]" && !candidate.is_empty() {
             out.replace_range(path_start..path_start + path_len, "[REDACTED]");
@@ -2091,10 +2125,26 @@ pub fn redact_embedded_url_secrets(input: &str) -> String {
     out
 }
 
-/// Redacts standalone keyless secret literals (`0x` + 64 hex private keys, `<digits>:<30+ chars>`
-/// Telegram bot tokens, and `AIza...` Gemini API keys) even when no key name is present (`ME-15`).
+/// Redacts standalone keyless secret literals (`0x` + 64 hex private keys, bare 64 hex private keys,
+/// `<digits>:<28-50 chars>` Telegram bot tokens, and `AIza...` Gemini API keys) even when no key name is present (`ME-15`, `R15-N8`).
 pub fn redact_keyless_secret_patterns(input: &str) -> String {
     let mut out = input.to_string();
+
+    let is_public_hash_context_fn = |prefix: &str| -> bool {
+        let trimmed = prefix.trim_end().to_ascii_lowercase();
+        trimmed.ends_with("hash=")
+            || trimmed.ends_with("hash:")
+            || trimmed.ends_with("action_hash=")
+            || trimmed.ends_with("action_hash:")
+            || trimmed.ends_with("tx_hash=")
+            || trimmed.ends_with("tx_hash:")
+            || trimmed.ends_with("sha256=")
+            || trimmed.ends_with("sha256:")
+            || trimmed.ends_with("tx_ref=")
+            || trimmed.ends_with("tx_ref:")
+            || trimmed.ends_with("digest=")
+            || trimmed.ends_with("digest:")
+    };
 
     // 1. Standalone 0x + 64 hex characters (not preceded by hash/tx/digest/sha256)
     let mut pos = 0;
@@ -2118,14 +2168,12 @@ pub fn redact_keyless_secret_patterns(input: &str) -> String {
                 .next_back()
                 .map(|c| c.is_ascii_alphanumeric())
                 .unwrap_or(false);
-        let prefix_lower = out[..start].to_ascii_lowercase();
-        let is_public_hash_context = prefix_lower.ends_with("hash=")
-            || prefix_lower.ends_with("hash: ")
-            || prefix_lower.ends_with("sha256=")
-            || prefix_lower.ends_with("sha256: ")
-            || prefix_lower.ends_with("tx_ref=")
-            || prefix_lower.ends_with("digest=");
-        if prev_ok && hex_len == 64 && !is_public_hash_context {
+        let next_ok = out
+            .get(hex_start + hex_len..)
+            .and_then(|s| s.chars().next())
+            .map(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(true);
+        if prev_ok && next_ok && hex_len == 64 && !is_public_hash_context_fn(&out[..start]) {
             out.replace_range(start..hex_start + 64, "[REDACTED]");
             pos = start + "[REDACTED]".len();
         } else {
@@ -2133,7 +2181,37 @@ pub fn redact_keyless_secret_patterns(input: &str) -> String {
         }
     }
 
-    // 2. Standalone Telegram bot token `<8-11 digits>:<28-50 token chars>`
+    // 2. Bare 64-character hex private keys without `0x` prefix (`R15-N8`)
+    let mut h_pos = 0;
+    while h_pos < out.len() {
+        let Some(rel) = out[h_pos..].find(|c: char| c.is_ascii_hexdigit()) else {
+            break;
+        };
+        let start = h_pos + rel;
+        let hex_len = out[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .count();
+        let prev_ok = start == 0
+            || !out[..start]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let next_ok = out
+            .get(start + hex_len..)
+            .and_then(|s| s.chars().next())
+            .map(|c| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(true);
+        if prev_ok && next_ok && hex_len == 64 && !is_public_hash_context_fn(&out[..start]) {
+            out.replace_range(start..start + 64, "[REDACTED]");
+            h_pos = start + "[REDACTED]".len();
+        } else {
+            h_pos = start + hex_len.max(1);
+        }
+    }
+
+    // 3. Standalone Telegram bot token `<8-12 digits>:<28-50 token chars>`
     let mut t_pos = 0;
     while t_pos < out.len() {
         let Some(rel_colon) = out[t_pos..].find(':') else {
@@ -2164,6 +2242,32 @@ pub fn redact_keyless_secret_patterns(input: &str) -> String {
             t_pos = start_idx + "[REDACTED]".len();
         } else {
             t_pos = colon_idx + 1;
+        }
+    }
+
+    // 4. Google Gemini API key literals matching `AIza[0-9A-Za-z_-]{35}` (`R15-N8`)
+    let mut g_pos = 0;
+    while g_pos < out.len() {
+        let Some(rel) = out[g_pos..].find("AIza") else {
+            break;
+        };
+        let start = g_pos + rel;
+        let suffix_start = start + 4;
+        let prev_ok = start == 0
+            || !out[..start]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let suffix_len = out[suffix_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if prev_ok && suffix_len == 35 {
+            out.replace_range(start..suffix_start + suffix_len, "AIza[REDACTED]");
+            g_pos = start + "AIza[REDACTED]".len();
+        } else {
+            g_pos = suffix_start + suffix_len.max(1);
         }
     }
 
@@ -2264,23 +2368,23 @@ pub fn sanitize_telemetry_message(message: &str) -> String {
                 break;
             }
             let rest = &sanitized[val_start..];
-            let (replace_start, replace_end) =
-                if let Some(quote) = rest.chars().next().filter(|&c| c == '"' || c == '\'') {
-                    let inner = &rest[quote.len_utf8()..];
-                    let end_rel = inner.find(quote).unwrap_or(inner.len());
-                    (
-                        val_start + quote.len_utf8(),
-                        val_start + quote.len_utf8() + end_rel,
-                    )
-                } else {
-                    let end_rel = rest
-                        .find(|c: char| {
-                            c.is_whitespace()
-                                || matches!(c, ',' | ';' | ')' | '}' | ']' | '"' | '\'')
-                        })
-                        .unwrap_or(rest.len());
-                    (val_start, val_start + end_rel)
-                };
+            let (replace_start, replace_end) = if let Some(quote) =
+                rest.chars().next().filter(|&c| c == '"' || c == '\'')
+            {
+                let inner = &rest[quote.len_utf8()..];
+                let end_rel = inner.find(quote).unwrap_or(inner.len());
+                (
+                    val_start + quote.len_utf8(),
+                    val_start + quote.len_utf8() + end_rel,
+                )
+            } else {
+                let end_rel = rest
+                    .find(|c: char| {
+                        c.is_whitespace() || matches!(c, ',' | ';' | ')' | '}' | ']' | '"' | '\'')
+                    })
+                    .unwrap_or(rest.len());
+                (val_start, val_start + end_rel)
+            };
             let current_val = &sanitized[replace_start..replace_end];
             if current_val != "[REDACTED]" && !current_val.is_empty() {
                 sanitized.replace_range(replace_start..replace_end, "[REDACTED]");
@@ -2444,11 +2548,7 @@ impl ConfigMap {
                 .as_i64()
                 .or_else(|| n.as_f64().map(|f| f as i64))
                 .unwrap_or(default),
-            Some(Value::String(s)) => s
-                .trim()
-                .parse::<f64>()
-                .map(|f| f as i64)
-                .unwrap_or(default),
+            Some(Value::String(s)) => s.trim().parse::<f64>().map(|f| f as i64).unwrap_or(default),
             _ => default,
         }
     }
@@ -2487,8 +2587,8 @@ pub fn compute_basis_harvest_accrual(
     if !accrue_yield {
         return (basis_notional, 0.0);
     }
-    let avg_funding =
-        (basis_rates_hourly.iter().sum::<f64>() / (basis_rates_hourly.len() as f64)).max(basis_floor);
+    let avg_funding = (basis_rates_hourly.iter().sum::<f64>() / (basis_rates_hourly.len() as f64))
+        .max(basis_floor);
     let yield_delta = round_dp(basis_notional * avg_funding * 4.0, 4);
     (basis_notional, yield_delta)
 }
@@ -2584,6 +2684,81 @@ pub fn normalize_manual_exit_reason(reason: Option<&str>) -> String {
         .unwrap_or_else(|| "MANUAL_TAKE_PROFIT".to_string())
 }
 
+/// Computes effective open stop-loss risk ("heat") in USDC for a Book A (`PIT`) position (`LT-2`).
+///
+/// Reclaims open heat whenever:
+/// 1. `chandelier_stop` has trailed toward or past `entry_price` (locking in profit), and/or
+/// 2. Net positive `funding_accrued_usdc` offsets remaining downside stop risk.
+pub fn effective_position_open_heat_usdc(
+    action: &str,
+    entry_price: f64,
+    initial_stop: f64,
+    chandelier_stop: Option<f64>,
+    quantity: f64,
+    risk_budget_usdc: f64,
+    funding_accrued_usdc: f64,
+) -> f64 {
+    let qty = quantity.abs();
+    let clean_budget = if risk_budget_usdc.is_finite() {
+        risk_budget_usdc.max(0.0)
+    } else {
+        0.0
+    };
+    let positive_funding = if funding_accrued_usdc.is_finite() {
+        funding_accrued_usdc.max(0.0)
+    } else {
+        0.0
+    };
+    if !entry_price.is_finite() || entry_price <= 0.0 || !qty.is_finite() || qty <= 0.0 {
+        return clean_budget;
+    }
+
+    let is_short = action.eq_ignore_ascii_case("SHORT") || action.eq_ignore_ascii_case("SELL");
+    let init_s = if initial_stop.is_finite() && initial_stop > 0.0 {
+        initial_stop
+    } else {
+        0.0
+    };
+    let chand_s = chandelier_stop.filter(|&s| s.is_finite() && s > 0.0);
+    let active_stop = match (is_short, init_s > 0.0, chand_s) {
+        (false, true, Some(cs)) => init_s.max(cs),
+        (false, false, Some(cs)) => cs,
+        (true, true, Some(cs)) => init_s.min(cs),
+        (true, false, Some(cs)) => cs,
+        (_, true, None) => init_s,
+        (_, false, None) => 0.0,
+    };
+
+    let base_heat = if active_stop > 0.0 {
+        let price_loss_usdc = if is_short {
+            (active_stop - entry_price).max(0.0) * qty
+        } else {
+            (entry_price - active_stop).max(0.0) * qty
+        };
+        price_loss_usdc.min(risk_budget_usdc.max(price_loss_usdc))
+    } else {
+        clean_budget
+    };
+    (base_heat - positive_funding).max(0.0)
+}
+
+/// Computes effective open stop-loss risk ("heat") in USDC for a Book B (`POND`) cell (`LT-2`).
+///
+/// Offsets static `risk_budget_usdc` by positive `funding_accrued_usdc`, floored at `0.0`.
+pub fn effective_pond_cell_open_heat_usdc(risk_budget_usdc: f64, funding_accrued_usdc: f64) -> f64 {
+    let clean_budget = if risk_budget_usdc.is_finite() {
+        risk_budget_usdc.max(0.0)
+    } else {
+        0.0
+    };
+    let positive_funding = if funding_accrued_usdc.is_finite() {
+        funding_accrued_usdc.max(0.0)
+    } else {
+        0.0
+    };
+    (clean_budget - positive_funding).max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2611,7 +2786,10 @@ mod tests {
         assert_eq!(mask_secret("short"), "********");
         assert_eq!(mask_secret(""), "");
         // Multi-byte UTF-8 character safety (R3-H14)
-        assert_eq!(mask_secret("🔑🔑🔑🔑🔑🔑abcdef🔒🔒🔒🔒"), "🔑🔑🔑🔑🔑🔑...🔒🔒🔒🔒");
+        assert_eq!(
+            mask_secret("🔑🔑🔑🔑🔑🔑abcdef🔒🔒🔒🔒"),
+            "🔑🔑🔑🔑🔑🔑...🔒🔒🔒🔒"
+        );
         assert_eq!(mask_identifier("🔑🔑🔑🔑🔑🔑🔑"), "🔑🔑🔑...🔑🔑🔑");
 
         assert_eq!(mask_identifier("-100123456789"), "-10...789");
@@ -2688,7 +2866,9 @@ mod tests {
         );
         assert!(is_immutable_security_config_key("web_auth_enabled"));
         assert!(is_immutable_security_config_key("telegram_api_base_url"));
-        assert!(is_immutable_security_config_key("hyperliquid_info_url_override"));
+        assert!(is_immutable_security_config_key(
+            "hyperliquid_info_url_override"
+        ));
         assert!(is_immutable_security_config_key("pit_subaccount_address"));
 
         assert_eq!(normalize_manual_exit_reason(None), "MANUAL_TAKE_PROFIT");
@@ -2702,7 +2882,9 @@ mod tests {
         );
         let long_reason = "X".repeat(100);
         assert_eq!(
-            normalize_manual_exit_reason(Some(&long_reason)).chars().count(),
+            normalize_manual_exit_reason(Some(&long_reason))
+                .chars()
+                .count(),
             64
         );
     }
@@ -2726,7 +2908,10 @@ mod tests {
         let keyless = sanitize_telemetry_message(
             "Signer init error for 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 and bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
         );
-        assert_eq!(keyless, "Signer init error for [REDACTED] and bot [REDACTED]");
+        assert_eq!(
+            keyless,
+            "Signer init error for [REDACTED] and bot [REDACTED]"
+        );
 
         // JSON details sanitization
         let details = sanitize_telemetry_details(Some(serde_json::json!({
@@ -2818,6 +3003,93 @@ mod tests {
         assert_eq!((acc / 0.0).as_f64(), 0.0);
         assert_eq!((acc / f64::NAN).as_f64(), 0.0);
     }
+
+    #[test]
+    fn test_lt2_effective_open_heat_reclaims_trailed_stop_and_positive_funding() {
+        // LONG: entry=100, initial_stop=95, qty=10 => base heat = 50
+        assert!(
+            (effective_position_open_heat_usdc("LONG", 100.0, 95.0, None, 10.0, 50.0, 0.0) - 50.0)
+                .abs()
+                < 1e-9
+        );
+        // Chandelier trails halfway toward entry (97.5) => heat drops to 25.0
+        assert!(
+            (effective_position_open_heat_usdc("LONG", 100.0, 95.0, Some(97.5), 10.0, 50.0, 0.0)
+                - 25.0)
+                .abs()
+                < 1e-9
+        );
+        // Chandelier trails past entry (102.0) => heat reclaims to 0.0
+        assert!(
+            (effective_position_open_heat_usdc("LONG", 100.0, 95.0, Some(102.0), 10.0, 50.0, 0.0)
+                - 0.0)
+                .abs()
+                < 1e-9
+        );
+        // Positive funding (+12.0) offsets remaining heat (25 - 12 = 13); negative funding does NOT inflate heat
+        assert!(
+            (effective_position_open_heat_usdc("LONG", 100.0, 95.0, Some(97.5), 10.0, 50.0, 12.0)
+                - 13.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (effective_position_open_heat_usdc("LONG", 100.0, 95.0, Some(97.5), 10.0, 50.0, -5.0)
+                - 25.0)
+                .abs()
+                < 1e-9
+        );
+
+        // SHORT: entry=100, initial_stop=105, qty=10 => base heat = 50; trailed to 98 => 0.0
+        assert!(
+            (effective_position_open_heat_usdc(
+                "SHORT",
+                100.0,
+                105.0,
+                Some(102.0),
+                10.0,
+                50.0,
+                4.0
+            ) - 16.0)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (effective_position_open_heat_usdc("SHORT", 100.0, 105.0, Some(98.0), 10.0, 50.0, 0.0)
+                - 0.0)
+                .abs()
+                < 1e-9
+        );
+
+        // Pond cell open heat
+        assert!((effective_pond_cell_open_heat_usdc(50.0, 15.0) - 35.0).abs() < 1e-9);
+        assert!((effective_pond_cell_open_heat_usdc(50.0, 80.0) - 0.0).abs() < 1e-9);
+        assert!((effective_pond_cell_open_heat_usdc(50.0, -5.0) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_r15_n8_redacts_bare_64_hex_and_gemini_aiza_keys() {
+        let bare_pk = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let gemini_key = "AIzaSyDummyKeyForUnitTest1234567890abcd";
+        let msg = format!("bad signer {bare_pk} with gemini {gemini_key}");
+        let scrubbed = sanitize_telemetry_message(&msg);
+        assert!(
+            !scrubbed.contains(bare_pk),
+            "Bare 64-hex private key must be redacted: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains(gemini_key),
+            "Gemini AIza key must be redacted: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("AIza[REDACTED]"),
+            "Gemini key must redact to AIza[REDACTED]: {scrubbed}"
+        );
+        // Idempotent on second pass
+        assert_eq!(sanitize_telemetry_message(&scrubbed), scrubbed);
+
+        // Public hash contexts must remain intact
+        let hash_msg = format!("action_hash: {bare_pk} sha256={bare_pk}");
+        assert_eq!(sanitize_telemetry_message(&hash_msg), hash_msg);
+    }
 }
-
-

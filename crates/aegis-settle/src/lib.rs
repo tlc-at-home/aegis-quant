@@ -5,8 +5,8 @@
 //! Zero Forced Liquidation) and Invariant F1 (Zero dependency on book strategy crates).
 
 use aegis_core::{
-    compute_drift_bps, now_iso8601_utc, round_dp, AegisError, BookTransfer, BookTransferStatus,
-    Bps, Pp50PlatformSnapshot, Result, Usdc,
+    compute_drift_bps, effective_pond_cell_open_heat_usdc, now_iso8601_utc, round_dp, AegisError,
+    BookTransfer, BookTransferStatus, Bps, Pp50PlatformSnapshot, Result, Usdc,
 };
 use aegis_db::DatabaseManager;
 use aegis_execution::ExecutionEngine;
@@ -41,9 +41,8 @@ impl<'a> SettleGateGuard<'a> {
                 bus.set_settling_in_progress(false);
             }
             if let Err(e) = self.db.release_settle_lock() {
-                let msg = format!(
-                    "CRITICAL: Failed to release settle lock in SettleGateGuard: {e}"
-                );
+                let msg =
+                    format!("CRITICAL: Failed to release settle lock in SettleGateGuard: {e}");
                 eprintln!("{msg}");
                 let _ = self
                     .db
@@ -149,6 +148,7 @@ impl SettleController {
         let deadband_bps = Bps(DatabaseManager::resolve_settling_deadband_bps(&cfg));
         let settling_enabled = cfg.get_bool("settling_enabled", true);
         let settling_kill_switch = cfg.get_bool("settling_kill_switch", false);
+        let platform_pp50_halt = cfg.get_bool("platform_pp50_halt", false);
         let max_retries = cfg.get_i64("settling_max_retries", 3).max(1) as usize;
         let initial_platform_eq = Usdc(cfg.get_f64("initial_equity_usdc", 10000.0).max(1.0));
         let champion_id = cfg.get_str("pond_champion_active", "NPS-01");
@@ -174,8 +174,10 @@ impl SettleController {
         }
 
         let (db_pit_eq, db_pit_idle, db_pond_eq, db_pond_idle) = self.inspect_books_state()?;
-        let pit_before = Usdc(overrides.pit_equity_usdc.unwrap_or(db_pit_eq).max(0.0)).round_cents();
-        let pond_before = Usdc(overrides.pond_equity_usdc.unwrap_or(db_pond_eq).max(0.0)).round_cents();
+        let pit_before =
+            Usdc(overrides.pit_equity_usdc.unwrap_or(db_pit_eq).max(0.0)).round_cents();
+        let pond_before =
+            Usdc(overrides.pond_equity_usdc.unwrap_or(db_pond_eq).max(0.0)).round_cents();
         let total_equity = (pit_before + pond_before).round_cents();
 
         // Phase 2: Drift & Dead-Band Evaluation (Q3, R3-N15, R3-QA)
@@ -236,7 +238,11 @@ impl SettleController {
         let mut attempts_count = 0i64;
         let mut pending_transfer_id: Option<i64> = None;
 
-        if !settling_enabled || settling_kill_switch {
+        if platform_pp50_halt {
+            status = BookTransferStatus::HaltedPp50;
+            executed_transfer = Usdc::ZERO;
+            blocked_remainder = required_transfer;
+        } else if !settling_enabled || settling_kill_switch {
             status = BookTransferStatus::SkippedNoIdle;
             executed_transfer = Usdc::ZERO;
             blocked_remainder = required_transfer;
@@ -258,7 +264,7 @@ impl SettleController {
                 status = if overrides.dry_run {
                     BookTransferStatus::DryRun
                 } else {
-                    BookTransferStatus::PartialIdleCapped
+                    BookTransferStatus::SkippedNoIdle
                 };
             } else {
                 // Q2 & NQ-3: Crash-safe pre-transfer ledger persistence in PENDING state before network call
@@ -502,7 +508,12 @@ impl SettleController {
         let pond_heat = Usdc(
             open_cells
                 .iter()
-                .map(|c| c.risk_budget_usdc.unwrap_or(0.0))
+                .map(|c| {
+                    effective_pond_cell_open_heat_usdc(
+                        c.risk_budget_usdc.unwrap_or(0.0),
+                        c.funding_accrued_usdc,
+                    )
+                })
                 .sum::<f64>()
                 .max(0.0),
         );
@@ -522,8 +533,7 @@ impl SettleController {
         };
 
         let day_idx = overrides.day_index.unwrap_or(1);
-        let pct_return =
-            ((total_equity.0 - initial_platform_eq.0) / initial_platform_eq.0) * 100.0;
+        let pct_return = ((total_equity.0 - initial_platform_eq.0) / initial_platform_eq.0) * 100.0;
         let report_line = format!(
             "PP-50 D+{:02} | platform ${:.2} ({:+.2}%) | PIT ${:.2} | POND ${:.2} | drift {:.1} bps | settle: {} | cells: {}/{} (heat ${:.0}) | champion {}",
             day_idx,
@@ -886,7 +896,9 @@ mod tests {
             tx_ref: None,
             created_at: "2026-11-08T00:05:00Z".to_string(),
         };
-        let tid_stale = db.insert_book_transfer_with_mode(&stale_row, "LIVE").unwrap();
+        let tid_stale = db
+            .insert_book_transfer_with_mode(&stale_row, "LIVE")
+            .unwrap();
 
         // 2. Insert a PENDING row with 2 legs completed (crash after leg 2 confirmed on-chain)
         let confirmed_row = BookTransfer {
@@ -987,7 +999,8 @@ mod tests {
             }
         });
 
-        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
         let pk = "0x0123456789012345678901234567890123456789012345678901234567890123";
         let derived_wallet = aegis_core::derive_evm_address_from_private_key(pk).unwrap();
         db.set_config_value("wallet_address", &json!(derived_wallet))
@@ -1003,11 +1016,8 @@ mod tests {
             &json!("0x2222222222222222222222222222222222222222"),
         )
         .unwrap();
-        db.set_config_value(
-            "hyperliquid_mainnet_url",
-            &json!(format!("http://{addr}")),
-        )
-        .unwrap();
+        db.set_config_value("hyperliquid_mainnet_url", &json!(format!("http://{addr}")))
+            .unwrap();
 
         let res_partial = ctrl
             .run_settling(SettleOverrideInput {
@@ -1092,12 +1102,83 @@ mod tests {
 
         // All three (res_partial, res_ambig, tid_partial) are surfaced as stranded/unresolved
         let stranded = db.get_stranded_or_unresolved_book_transfers().unwrap();
-        assert!(stranded.iter().any(|r| r.transfer_id == res_partial.transfer_id));
-        assert!(stranded.iter().any(|r| r.transfer_id == res_ambig.transfer_id));
+        assert!(stranded
+            .iter()
+            .any(|r| r.transfer_id == res_partial.transfer_id));
+        assert!(stranded
+            .iter()
+            .any(|r| r.transfer_id == res_ambig.transfer_id));
         assert!(stranded.iter().any(|r| r.transfer_id == tid_partial));
 
         // Neither AMBIGUOUS nor PARTIAL row counts toward net book transfer adjustment (only the earlier $600 PAPER transfer)
         assert!((db.get_net_book_transfer_adjustment("PIT").unwrap() - 600.0).abs() < 1e-6);
         assert!((db.get_net_book_transfer_adjustment("POND").unwrap() - (-600.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_table3_halted_pp50_and_zero_idle_distinction() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let ctrl = SettleController::new(db.clone(), None);
+
+        // Zero idle cash in non-dry-run mode records BLOCKED_ZERO_IDLE
+        let zero_idle = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: Some(5300.0),
+                pond_equity_usdc: Some(4700.0),
+                rich_idle_usdc: Some(0.0),
+                day_index: Some(1),
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(zero_idle.status, "BLOCKED_ZERO_IDLE");
+
+        // platform_pp50_halt = true records HALTED_PP50 (distinguishable from BLOCKED_ZERO_IDLE)
+        db.set_config_value("platform_pp50_halt", &json!(true))
+            .unwrap();
+        let halted = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: Some(5300.0),
+                pond_equity_usdc: Some(4700.0),
+                rich_idle_usdc: Some(1500.0),
+                day_index: Some(2),
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(halted.status, "HALTED_PP50");
+        assert!((halted.executed_transfer_usdc - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lt2_settle_pond_heat_applies_positive_funding_offset() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO pond_cells (
+                    symbol, champion_id, state, side, option_analogue, entry_price, quantity, notional_usdc,
+                    risk_budget_usdc, funding_accrued_usdc, opened_at
+                 ) VALUES ('ETH', (SELECT champion_id FROM pond_champions LIMIT 1), 'OPEN', 'LONG', 'SHORT_PUT', 2000.0, 0.5, 1000.0, 100.0, 25.0, '2026-11-13T00:00:00Z');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let ctrl = SettleController::new(db, None);
+        let res = ctrl
+            .run_settling(SettleOverrideInput {
+                pit_equity_usdc: Some(5000.0),
+                pond_equity_usdc: Some(5000.0),
+                rich_idle_usdc: Some(1000.0),
+                day_index: Some(1),
+                dry_run: true,
+            })
+            .unwrap();
+        assert!(
+            res.report_line.contains("(heat $75)"),
+            "LT-2: settle PP-50 pond_heat must apply positive funding offset (100 - 25 = 75), got: {}",
+            res.report_line
+        );
     }
 }

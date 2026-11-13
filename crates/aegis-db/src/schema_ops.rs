@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Canonical unified schema version built by `sql/schema_and_seed.sql`.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 14;
+pub const CANONICAL_SCHEMA_VERSION: i64 = 15;
 
 /// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
 pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
@@ -63,7 +63,9 @@ impl DatabaseManager {
                  CREATE VIEW IF NOT EXISTS v_book_transfers_recent AS
                  SELECT * FROM book_transfers ORDER BY transfer_id DESC LIMIT 30;",
             )
-            .map_err(|e| AegisError::Database(format!("Failed to recover book_transfers_v9: {e}")))?;
+            .map_err(|e| {
+                AegisError::Database(format!("Failed to recover book_transfers_v9: {e}"))
+            })?;
         } else if has_v9 && has_main {
             conn.execute_batch("DROP TABLE IF EXISTS book_transfers_v9;")
                 .map_err(|e| {
@@ -157,7 +159,11 @@ impl DatabaseManager {
                         && !lower_rem.starts_with("pragma synchronous"))
                 {
                     if let Err(e) = conn.execute_batch(rem) {
-                        if !e.to_string().to_ascii_lowercase().contains("duplicate column name") {
+                        if !e
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("duplicate column name")
+                        {
                             return Err(AegisError::Database(format!("SQL error: {e}")));
                         }
                     }
@@ -182,7 +188,8 @@ impl DatabaseManager {
         self.with_conn(|conn| {
             let _ = conn.execute_batch("PRAGMA busy_timeout = 15000; PRAGMA foreign_keys = ON;");
             if !is_mem {
-                let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+                let _ =
+                    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
             }
             Self::execute_sql_transactional(conn, &sql_script)
                 .map_err(|e| AegisError::Database(format!("Failed to init_db: {e}")))?;
@@ -488,6 +495,15 @@ impl DatabaseManager {
             || req_path.to_string_lossy().contains("sql/migrations/"))
             && self.schema_path.exists()
         {
+            if req_path.to_string_lossy().contains("sql/migrations/")
+                || req_file_name != "schema_and_seed.sql"
+            {
+                tracing::warn!(
+                    legacy_path = %req_path.display(),
+                    redirected_to = %self.schema_path.display(),
+                    "Deprecated migration path passed to apply_migration; redirecting to canonical sql/schema_and_seed.sql (R15-QA(a))"
+                );
+            }
             self.schema_path.clone()
         } else {
             return Err(AegisError::NotFound(format!(
@@ -783,7 +799,7 @@ impl DatabaseManager {
         }
     }
 
-    /// Create an atomic online SQLite backup via `VACUUM INTO` and prune backups older than `retention_days` (`ME-19`).
+    /// Create an atomic online SQLite backup via `VACUUM INTO` and prune backups older than `retention_days` (`ME-19`, `R15-N9`).
     pub fn create_sqlite_backup(
         &self,
         backup_dir: Option<&Path>,
@@ -791,7 +807,8 @@ impl DatabaseManager {
     ) -> Result<Value> {
         let cfg = self.load_config().unwrap_or_default();
         let ret_days = retention_days
-            .unwrap_or_else(|| cfg.get_i64("backup_retention_days", 7).max(1) as u64);
+            .unwrap_or_else(|| cfg.get_i64("backup_retention_days", 7).max(1) as u64)
+            .clamp(1, 90);
 
         let target_dir: PathBuf = match backup_dir {
             Some(d) => d.to_path_buf(),
@@ -831,9 +848,7 @@ impl DatabaseManager {
             Ok(())
         })?;
 
-        let size_bytes = fs::metadata(&backup_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let size_bytes = fs::metadata(&backup_path).map(|m| m.len()).unwrap_or(0);
         if size_bytes == 0 {
             return Err(AegisError::Database(format!(
                 "Backup file {} is empty after VACUUM INTO",
@@ -843,7 +858,9 @@ impl DatabaseManager {
 
         // Prune backup snapshots older than retention_days
         let cutoff = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(ret_days.saturating_mul(86_400)))
+            .checked_sub(std::time::Duration::from_secs(
+                ret_days.saturating_mul(86_400),
+            ))
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let mut pruned_count = 0usize;
         let mut retained_count = 1usize;
@@ -853,10 +870,7 @@ impl DatabaseManager {
                 if p == backup_path {
                     continue;
                 }
-                let fname = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
+                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
                 if fname.starts_with("aegis_quant_") && fname.ends_with(".db") {
                     let mut pruned = false;
                     if let Ok(meta) = entry.metadata() {
@@ -874,6 +888,20 @@ impl DatabaseManager {
             }
         }
 
+        let now_ms = now_dt.timestamp_millis();
+        let _ = self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('last_sqlite_backup_ms', ?1, 'int', 'system', 'Epoch timestamp (ms) of the most recent automated or manual SQLite backup (R15-N10)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                 ON CONFLICT(config_key) DO UPDATE SET
+                    config_value = excluded.config_value,
+                    updated_at = excluded.updated_at;",
+                params![now_ms.to_string()],
+            )
+            .map_err(|e| AegisError::Database(e.to_string()))?;
+            Ok(())
+        });
+
         let summary = json!({
             "status": "OK",
             "backup_path": backup_path.display().to_string(),
@@ -884,6 +912,7 @@ impl DatabaseManager {
             "pruned_count": pruned_count,
             "pruned_files": pruned_count,
             "created_at": now_dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "last_sqlite_backup_ms": now_ms,
         });
         let _ = self.log_telemetry(
             "INFO",
@@ -895,6 +924,134 @@ impl DatabaseManager {
             Some(summary.clone()),
         );
         Ok(summary)
+    }
+
+    /// Restore the active SQLite database from an existing backup file after verifying
+    /// `PRAGMA integrity_check;`, taking a pre-restore safety snapshot, running `rusqlite::backup::Backup`,
+    /// re-running canonical migrations, and verifying `PRAGMA quick_check;` (`ME-19`).
+    ///
+    /// Returns the path of the pre-restore safety snapshot.
+    pub fn restore_sqlite_backup(&self, backup_path: &Path) -> Result<PathBuf> {
+        if self.is_memory {
+            return Err(AegisError::Validation(
+                "Cannot restore a file backup into an :memory: SQLite database".to_string(),
+            ));
+        }
+        if !backup_path.exists() {
+            return Err(AegisError::NotFound(format!(
+                "Backup file not found: {}",
+                backup_path.display()
+            )));
+        }
+        let meta = fs::metadata(backup_path)?;
+        if meta.len() == 0 {
+            return Err(AegisError::Database(format!(
+                "Backup file {} is empty",
+                backup_path.display()
+            )));
+        }
+
+        // 1. Verify backup integrity on a read-only connection before touching the live DB
+        let ro_flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let src_conn = Connection::open_with_flags(backup_path, ro_flags).map_err(|e| {
+            AegisError::Database(format!(
+                "Failed to open backup {}: {e}",
+                backup_path.display()
+            ))
+        })?;
+        let integrity: String = src_conn
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .map_err(|e| AegisError::Database(format!("Backup integrity_check failed: {e}")))?;
+        if !integrity.trim().eq_ignore_ascii_case("ok") {
+            return Err(AegisError::Database(format!(
+                "Backup {} failed integrity_check: {integrity}",
+                backup_path.display()
+            )));
+        }
+
+        // 2. Create a pre-restore safety snapshot of the live DB
+        let backup_dir = self
+            .db_path
+            .parent()
+            .unwrap_or_else(|| Path::new("data"))
+            .join("backups");
+        fs::create_dir_all(&backup_dir)?;
+        let now_dt = chrono::Utc::now();
+        let pre_restore_path = backup_dir.join(format!(
+            "aegis_quant_pre_restore_{}_{:03}.db",
+            now_dt.format("%Y%m%d_%H%M%S"),
+            now_dt.timestamp_subsec_millis()
+        ));
+        if pre_restore_path.exists() {
+            let _ = fs::remove_file(&pre_restore_path);
+        }
+        if self.db_path.exists() {
+            let pre_str = pre_restore_path.to_string_lossy().to_string();
+            self.with_conn(|conn| {
+                conn.execute("VACUUM INTO ?1;", params![pre_str])
+                    .map_err(|e| {
+                        AegisError::Database(format!(
+                            "Failed to create pre-restore safety snapshot: {e}"
+                        ))
+                    })?;
+                Ok(())
+            })?;
+        }
+
+        // 3. Drop pooled connections and stale sidecars, then restore via rusqlite::backup::Backup
+        {
+            let mut pool = self.conn_pool.lock();
+            pool.clear();
+        }
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", self.db_path.display(), suffix));
+            if sidecar.exists() {
+                let _ = fs::remove_file(&sidecar);
+            }
+        }
+        {
+            let mut dst_conn = Connection::open(&self.db_path).map_err(|e| {
+                AegisError::Database(format!(
+                    "Failed to open target DB {} for restore: {e}",
+                    self.db_path.display()
+                ))
+            })?;
+            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).map_err(|e| {
+                AegisError::Database(format!("Failed to initialize SQLite Backup: {e}"))
+            })?;
+            backup
+                .run_to_completion(256, std::time::Duration::from_millis(5), None)
+                .map_err(|e| AegisError::Database(format!("SQLite backup restore failed: {e}")))?;
+        }
+        drop(src_conn);
+
+        // 4. Ensure schema parity and verify quick_check on the restored DB
+        self.run_migrations()?;
+        let quick: String = self.with_conn(|conn| {
+            conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))
+                .map_err(|e| AegisError::Database(format!("Post-restore quick_check failed: {e}")))
+        })?;
+        if !quick.trim().eq_ignore_ascii_case("ok") {
+            return Err(AegisError::Database(format!(
+                "Post-restore quick_check returned '{quick}'"
+            )));
+        }
+
+        let _ = self.log_telemetry(
+            "WARN",
+            "engine.backup",
+            &format!(
+                "SQLITE_BACKUP_RESTORED from {} (pre_restore_snapshot={})",
+                backup_path.display(),
+                pre_restore_path.display()
+            ),
+            Some(json!({
+                "backup_path": backup_path.display().to_string(),
+                "pre_restore_snapshot": pre_restore_path.display().to_string(),
+            })),
+        );
+        Ok(pre_restore_path)
     }
 
     pub fn verify_integrity(&self) -> Result<Value> {
@@ -974,6 +1131,8 @@ impl DatabaseManager {
 
     pub fn get_schema_version(&self) -> Result<i64> {
         let v = self.verify_integrity()?;
-        Ok(v.get("schema_version").and_then(|x| x.as_i64()).unwrap_or(0))
+        Ok(v.get("schema_version")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0))
     }
 }

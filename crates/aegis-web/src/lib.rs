@@ -38,6 +38,7 @@ pub struct CachedWebAuthConfig {
     pub fetched_at_ms: i64,
     pub ttl_ms: i64,
     pub web_auth_enabled: bool,
+    pub web_allow_query_token_sse: bool,
     pub db_token: Option<String>,
     pub web_cors_allowed_origins: Option<String>,
     pub web_allowed_hosts: String,
@@ -53,7 +54,8 @@ pub struct AppState {
     pub active_sessions: Arc<parking_lot::Mutex<std::collections::HashMap<String, i64>>>,
     pub login_failures:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
-    pub sse_payload_cache: Arc<parking_lot::Mutex<Option<(std::time::Instant, String)>>>,
+    pub sse_payload_cache: Arc<parking_lot::Mutex<Option<(std::time::Instant, u64, String)>>>,
+    pub last_manual_backup_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AppState {
@@ -67,11 +69,40 @@ impl AppState {
                 }
             }
         }
-        let db_cfg = self.db.load_config_logged("aegis-web.auth_cache");
+        let mut db_cfg = self.db.load_config_opts(false).unwrap_or_default();
+        if ["web_api_token", "dashboard_api_token"]
+            .iter()
+            .any(|k| db_cfg.get_str(k, "").trim().starts_with("enc:v1:"))
+        {
+            db_cfg = self.db.load_config_opts(true).unwrap_or(db_cfg);
+        }
         let ttl_ms = db_cfg
             .get_i64("web_auth_cache_ttl_ms", 2000)
             .clamp(0, 60_000);
-        let web_auth_enabled = db_cfg.get_bool("web_auth_enabled", true);
+        let exec_mode = db_cfg
+            .get_str("execution_mode", "PAPER")
+            .trim()
+            .to_ascii_uppercase();
+        let pond_mode = db_cfg
+            .get_str("pond_execution_mode", &exec_mode)
+            .trim()
+            .to_ascii_uppercase();
+        let force_auth = matches!(exec_mode.as_str(), "LIVE" | "TESTNET")
+            || matches!(pond_mode.as_str(), "LIVE" | "TESTNET");
+        let raw_auth_enabled = db_cfg.get_bool("web_auth_enabled", true);
+        let web_auth_enabled = if force_auth {
+            if !raw_auth_enabled {
+                tracing::warn!(
+                    execution_mode = %exec_mode,
+                    pond_execution_mode = %pond_mode,
+                    "Ignoring web_auth_enabled=false while execution_mode or pond_execution_mode is LIVE/TESTNET (Table 3 #8)"
+                );
+            }
+            true
+        } else {
+            raw_auth_enabled
+        };
+        let web_allow_query_token_sse = db_cfg.get_bool("web_allow_query_token_sse", false);
         let db_token = ["web_api_token", "dashboard_api_token"]
             .into_iter()
             .map(|k| db_cfg.get_str(k, ""))
@@ -93,6 +124,7 @@ impl AppState {
             fetched_at_ms: now,
             ttl_ms,
             web_auth_enabled,
+            web_allow_query_token_sse,
             db_token,
             web_cors_allowed_origins,
             web_allowed_hosts,
@@ -185,8 +217,6 @@ pub fn is_allowed_cors_origin(origin: &str, configured_origins: Option<&str>) ->
         "https://localhost",
         "http://aegis-quant-sandbox",
         "https://aegis-quant-sandbox",
-        "http://192.168.122.254",
-        "https://192.168.122.254",
     ] {
         if trimmed == prefix || trimmed.starts_with(&format!("{prefix}:")) {
             return true;
@@ -308,17 +338,11 @@ fn is_request_authorized_with_config(
     let cookie_tok = extract_cookie_token(req.headers(), "aegis_session");
     let has_valid_cookie_token = cookie_tok.as_ref().is_some_and(|cand| {
         let now_ms = state.db.now_ms();
-        let in_active_sessions = {
-            let mut sessions = state.active_sessions.lock();
-            sessions.retain(|_, exp| *exp > now_ms);
-            sessions
-                .keys()
-                .any(|active_nonce| constant_time_eq(cand, active_nonce))
-        };
-        in_active_sessions
-            || valid_tokens
-                .iter()
-                .any(|expected| constant_time_eq(cand, expected))
+        let mut sessions = state.active_sessions.lock();
+        sessions.retain(|_, exp| *exp > now_ms);
+        sessions
+            .keys()
+            .any(|active_nonce| constant_time_eq(cand, active_nonce))
     });
 
     let is_mutating = matches!(
@@ -369,7 +393,7 @@ fn is_request_authorized_with_config(
         return true;
     }
 
-    if path == "/api/v1/stream" || path == "/api/stream" {
+    if auth_cfg.web_allow_query_token_sse && (path == "/api/v1/stream" || path == "/api/stream") {
         if let Some(q_tok) = extract_query_param(req.uri().query(), "token") {
             return valid_tokens
                 .iter()
@@ -495,6 +519,7 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         active_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         login_failures: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         sse_payload_cache: Arc::new(parking_lot::Mutex::new(None)),
+        last_manual_backup_at: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     Router::new()
@@ -668,7 +693,10 @@ mod tests {
             "switchDashboardPage",
             "formatPnlPillHtml",
         ] {
-            assert!(html.contains(id), "index.html missing expected marker: {id}");
+            assert!(
+                html.contains(id),
+                "index.html missing expected marker: {id}"
+            );
         }
 
         assert!(
@@ -687,7 +715,7 @@ mod tests {
         db.initialize_schema(true).expect("seed schema");
 
         let payload = build_dashboard_payload(&db).expect("dashboard payload");
-        assert_eq!(payload.schema_version, 14);
+        assert_eq!(payload.schema_version, aegis_db::CANONICAL_SCHEMA_VERSION);
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pond.universe.len(), 80);
 
@@ -707,7 +735,7 @@ mod tests {
         db.initialize_schema(true).expect("init schema");
 
         let payload = build_dashboard_payload(&db).expect("build dashboard payload");
-        assert_eq!(payload.schema_version, 14);
+        assert_eq!(payload.schema_version, aegis_db::CANONICAL_SCHEMA_VERSION);
 
         assert_eq!(payload.pp50.total_platform_equity_usdc, 10000.0);
         assert_eq!(payload.pp50.pit.equity_usdc, 5000.0);
@@ -776,10 +804,7 @@ mod tests {
             !csp.contains("script-src 'self' 'unsafe-inline'"),
             "CSP script-src must not allow 'unsafe-inline' (NL-1): {csp}"
         );
-        assert_eq!(
-            idx_resp.headers().get("x-frame-options").unwrap(),
-            "DENY"
-        );
+        assert_eq!(idx_resp.headers().get("x-frame-options").unwrap(), "DENY");
         assert_eq!(
             idx_resp.headers().get("x-content-type-options").unwrap(),
             "nosniff"
@@ -1154,7 +1179,10 @@ mod tests {
             .unwrap();
         let close_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(close_json["status"], "ok");
-        assert_eq!(close_json["close_result"]["exit_reason"], "MANUAL_TAKE_PROFIT");
+        assert_eq!(
+            close_json["close_result"]["exit_reason"],
+            "MANUAL_TAKE_PROFIT"
+        );
 
         // 3. Close open Pond cell via POST /api/v1/pond/cells/close
         let close_cell_req = axum::http::Request::builder()
@@ -1171,7 +1199,10 @@ mod tests {
             .unwrap();
         let cell_json: serde_json::Value = serde_json::from_slice(&cell_bytes).unwrap();
         assert_eq!(cell_json["status"], "ok");
-        assert_eq!(cell_json["close_result"]["exit_reason"], "MANUAL_TAKE_PROFIT");
+        assert_eq!(
+            cell_json["close_result"]["exit_reason"],
+            "MANUAL_TAKE_PROFIT"
+        );
 
         // 4. Edge cases: empty payload and already-closed trade return 400 Bad Request
         let empty_req = axum::http::Request::builder()
@@ -1435,12 +1466,30 @@ mod tests {
         let assert_step_pnl_heat_parity = |db_ref: &DatabaseManager, step: &str| {
             let pit_c = db_ref.compute_pit_pnl_components().unwrap();
             let pond_c = db_ref.compute_pond_pnl_components().unwrap();
-            assert_eq!(pit_c.realized_pnl_usdc, pond_c.realized_pnl_usdc, "{step}: realized_pnl_usdc");
-            assert_eq!(pit_c.unrealized_pnl_usdc, pond_c.unrealized_pnl_usdc, "{step}: unrealized_pnl_usdc");
-            assert_eq!(pit_c.funding_pnl_usdc, pond_c.funding_pnl_usdc, "{step}: funding_pnl_usdc");
-            assert_eq!(pit_c.open_fees_usdc, pond_c.open_fees_usdc, "{step}: open_fees_usdc");
-            assert_eq!(pit_c.total_net_pnl_usdc, pond_c.total_net_pnl_usdc, "{step}: total_net_pnl_usdc");
-            assert_eq!(pit_c.book_equity_usdc, pond_c.book_equity_usdc, "{step}: book_equity_usdc");
+            assert_eq!(
+                pit_c.realized_pnl_usdc, pond_c.realized_pnl_usdc,
+                "{step}: realized_pnl_usdc"
+            );
+            assert_eq!(
+                pit_c.unrealized_pnl_usdc, pond_c.unrealized_pnl_usdc,
+                "{step}: unrealized_pnl_usdc"
+            );
+            assert_eq!(
+                pit_c.funding_pnl_usdc, pond_c.funding_pnl_usdc,
+                "{step}: funding_pnl_usdc"
+            );
+            assert_eq!(
+                pit_c.open_fees_usdc, pond_c.open_fees_usdc,
+                "{step}: open_fees_usdc"
+            );
+            assert_eq!(
+                pit_c.total_net_pnl_usdc, pond_c.total_net_pnl_usdc,
+                "{step}: total_net_pnl_usdc"
+            );
+            assert_eq!(
+                pit_c.book_equity_usdc, pond_c.book_equity_usdc,
+                "{step}: book_equity_usdc"
+            );
             assert_eq!(pit_c.heat_usdc, pond_c.heat_usdc, "{step}: heat_usdc");
         };
         assert_step_pnl_heat_parity(&db1, "step 1a (40% partial exit)");
@@ -1508,11 +1557,18 @@ mod tests {
         let final_fee_delta = 0.08;
         let total_pit_fees = round_dp(t_none.fees_paid_usdc + final_fee_delta, 4); // 0.72 + 0.08 = 0.80
         let total_pit_net_pnl = round_dp(
-            final_gross_delta + t_none.realized_pnl_usdc - total_pit_fees + t_none.funding_accrued_usdc,
+            final_gross_delta + t_none.realized_pnl_usdc - total_pit_fees
+                + t_none.funding_accrued_usdc,
             4,
         ); // 6.0 + 12.0 - 0.80 + 1.25 = 18.45
         assert!(db1
-            .close_trade(pit_trade_id, 105.0, total_pit_net_pnl, total_pit_fees, "TEST_CLOSE")
+            .close_trade(
+                pit_trade_id,
+                105.0,
+                total_pit_net_pnl,
+                total_pit_fees,
+                "TEST_CLOSE"
+            )
             .unwrap());
         assert!(db1
             .close_open_pond_cell(
@@ -1986,8 +2042,7 @@ mod tests {
                 .recent_trades
                 .iter()
                 .filter(|t| {
-                    t.status == "CLOSED"
-                        && t.closed_at.as_deref().unwrap_or("") >= min_closed_ts
+                    t.status == "CLOSED" && t.closed_at.as_deref().unwrap_or("") >= min_closed_ts
                 })
                 .map(|t| t.realized_pnl_usdc)
                 .sum();
@@ -2055,10 +2110,9 @@ mod tests {
         );
         verify_family_2_and_3(&db2, "");
 
-        let app_js_src = std::fs::read_to_string(
-            aegis_core::resolve_project_root().join("web/static/app.js"),
-        )
-        .expect("read web/static/app.js");
+        let app_js_src =
+            std::fs::read_to_string(aegis_core::resolve_project_root().join("web/static/app.js"))
+                .expect("read web/static/app.js");
         assert!(
             app_js_src.contains(
                 "function computeRowPnl(row, isOpen = true) {\n  if (!row) return 0;\n  return isOpen\n    ? ((row.unrealized_pnl_usdc || 0) + (row.realized_pnl_usdc || 0) + (row.funding_accrued_usdc || 0) - (row.fees_paid_usdc || 0))\n    : (row.realized_pnl_usdc || 0);\n}"
@@ -2352,5 +2406,225 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
-}
 
+    #[tokio::test]
+    async fn test_me13_r15_n7_cookie_rejects_raw_master_token_and_table3_web_security() {
+        let root = resolve_project_root();
+        let db = DatabaseManager::memory();
+        db.initialize_schema(false).expect("init schema");
+        db.set_config_value("web_api_token", &json!("master-web-secret-123456"))
+            .unwrap();
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // ME-13 / R15-N7: Raw master token inside `aegis_session` cookie MUST be rejected (401)
+        let raw_cookie_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/status")
+            .header(header::HOST, "localhost")
+            .header(header::COOKIE, "aegis_session=master-web-secret-123456")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(raw_cookie_req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Table 3 #7: 192.168.122.254 removed from hardcoded CORS allowlist, allowed only when configured
+        assert!(!is_allowed_cors_origin("http://192.168.122.254:8080", None));
+        assert!(is_allowed_cors_origin(
+            "http://192.168.122.254:8080",
+            Some("http://192.168.122.254:8080")
+        ));
+
+        // Table 3 #6: ?token= on /api/v1/stream is disabled by default and gated behind web_allow_query_token_sse
+        let sse_state = AppState {
+            db: db.clone(),
+            static_dir: root.join("web/static"),
+            cycle_lock: Arc::new(Mutex::new(())),
+            session_token: "master-web-secret-123456".to_string(),
+            auth_cache: Arc::new(parking_lot::Mutex::new(None)),
+            active_sessions: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            login_failures: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            sse_payload_cache: Arc::new(parking_lot::Mutex::new(None)),
+            last_manual_backup_at: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        let sse_req_denied = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?token=master-web-secret-123456")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(!is_request_authorized(&sse_state, &sse_req_denied));
+
+        db.set_config_value("web_allow_query_token_sse", &json!(true))
+            .unwrap();
+        sse_state.invalidate_auth_cache();
+        let sse_req_allowed = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/stream?token=master-web-secret-123456")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(is_request_authorized(&sse_state, &sse_req_allowed));
+
+        // Table 3 #8: web_auth_enabled=false is ignored while execution_mode or pond_execution_mode is LIVE/TESTNET
+        db.set_config_value("web_auth_enabled", &json!(false))
+            .unwrap();
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        let unauth_testnet_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/v1/status")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(unauth_testnet_req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn test_me14_me17_r15_n1_n6_n12_table3_web_handlers() {
+        // ME-14 / R15-N6: Proxy header trust gate + failure map pruning & 4096 cap
+        let mut hdrs = axum::http::HeaderMap::new();
+        hdrs.insert("x-forwarded-for", "203.0.113.5, 10.0.0.1".parse().unwrap());
+        assert_eq!(extract_client_ip_key(&hdrs, false), "local-direct");
+        assert_eq!(extract_client_ip_key(&hdrs, true), "203.0.113.5");
+
+        let mut map = std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        for i in 0..4100 {
+            map.insert(format!("ip-{i}"), (1u32, now));
+        }
+        prune_and_cap_login_failures(&mut map, now, std::time::Duration::from_secs(60), 4096);
+        assert!(map.len() < 4096);
+
+        // R15-N1, R15-N12, Table 3 #9, ME-17
+        let root = resolve_project_root();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_web_r15_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db = DatabaseManager::new(tmp_dir.join("web_r15.db"));
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("web_api_token", &json!("r15-web-test-token-123"))
+            .unwrap();
+        // Delete pond_execution_mode to test R15-N1 fallback to execution_mode
+        db.with_conn(|c| {
+            c.execute(
+                "DELETE FROM system_config WHERE config_key = 'pond_execution_mode';",
+                [],
+            )
+            .map_err(|e| aegis_core::AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        let health_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let health_bytes = axum::body::to_bytes(health_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health_json: serde_json::Value = serde_json::from_slice(&health_bytes).unwrap();
+        assert_eq!(health_json["max_bar_staleness_ms"], 28_800_000);
+
+        let status_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/status")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r15-web-test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let status_bytes = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+        assert_eq!(status_json["pond_execution_mode"], "TESTNET");
+
+        // Table 3 #9: GET /api/v1/config succeeds via readonly query
+        let cfg_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/config")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r15-web-test-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cfg_resp.status(), StatusCode::OK);
+
+        // R15-N12: 1st POST /api/v1/db/backup returns lightweight payload; 2nd within 60s returns 429
+        let b1 = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/backup")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r15-web-test-token-123")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"r15_test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b1.status(), StatusCode::OK);
+        let b1_bytes = axum::body::to_bytes(b1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let b1_json: serde_json::Value = serde_json::from_slice(&b1_bytes).unwrap();
+        assert!(b1_json.get("dashboard").is_none());
+
+        let b2 = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/backup")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r15-web-test-token-123")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"r15_test_2"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(b2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // ME-17: Core SSE payload hash stability
+        let mut p1 = build_dashboard_payload(&db).unwrap();
+        let h1 = compute_sse_core_hash(&p1);
+        assert_eq!(h1, compute_sse_core_hash(&p1));
+        p1.portfolio.total_equity_usdc += 123.45;
+        assert_ne!(h1, compute_sse_core_hash(&p1));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}

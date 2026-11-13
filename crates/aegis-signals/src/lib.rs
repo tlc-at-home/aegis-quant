@@ -151,10 +151,8 @@ impl SignalConfig {
             hmm_ret_fast_weight: cfg.get_f64("hmm_ret_fast_weight", d.hmm_ret_fast_weight),
             hmm_ret_slow_weight: cfg.get_f64("hmm_ret_slow_weight", d.hmm_ret_slow_weight),
             snr_synth_weight,
-            snr_usdc_weight: cfg.get_f64(
-                "snr_usdc_weight",
-                (1.0 - snr_synth_weight).clamp(0.0, 1.0),
-            ),
+            snr_usdc_weight: cfg
+                .get_f64("snr_usdc_weight", (1.0 - snr_synth_weight).clamp(0.0, 1.0)),
             snr_mad_multiplier: cfg.get_f64("snr_mad_multiplier", d.snr_mad_multiplier),
             snr_tanh_scale: cfg.get_f64(
                 "snr_tanh_scale",
@@ -167,57 +165,32 @@ impl SignalConfig {
                 "mace_target_horizon_bars",
                 cfg.get_usize("mace_forward_horizon_bars", d.mace_target_horizon_bars),
             ),
-            mace_train_window_bars: cfg.get_usize(
-                "mace_train_window_bars",
-                d.mace_train_window_bars,
-            ),
+            mace_train_window_bars: cfg
+                .get_usize("mace_train_window_bars", d.mace_train_window_bars),
             mace_ic_window_bars: cfg.get_usize("mace_ic_window_bars", d.mace_ic_window_bars),
-            mace_dynamic_weight_min: cfg.get_f64(
-                "mace_dynamic_weight_min",
-                d.mace_dynamic_weight_min,
-            ),
-            mace_dynamic_weight_max: cfg.get_f64(
-                "mace_dynamic_weight_max",
-                d.mace_dynamic_weight_max,
-            ),
+            mace_dynamic_weight_min: cfg
+                .get_f64("mace_dynamic_weight_min", d.mace_dynamic_weight_min),
+            mace_dynamic_weight_max: cfg
+                .get_f64("mace_dynamic_weight_max", d.mace_dynamic_weight_max),
             mace_ic_neg_slope: cfg.get_f64("mace_ic_neg_slope", d.mace_ic_neg_slope),
             mace_ic_pos_slope: cfg.get_f64("mace_ic_pos_slope", d.mace_ic_pos_slope),
-            btc_macro_ema_fast_span: cfg.get_f64(
-                "btc_macro_ema_fast_span",
-                d.btc_macro_ema_fast_span,
-            ),
-            btc_macro_ema_slow_span: cfg.get_f64(
-                "btc_macro_ema_slow_span",
-                d.btc_macro_ema_slow_span,
-            ),
-            btc_macro_ret_slow_bars: cfg.get_usize(
-                "btc_macro_ret_slow_bars",
-                d.btc_macro_ret_slow_bars,
-            ),
-            btc_macro_ret_fast_bars: cfg.get_usize(
-                "btc_macro_ret_fast_bars",
-                d.btc_macro_ret_fast_bars,
-            ),
-            rs_composite_snr_weight: cfg.get_f64(
-                "rs_composite_snr_weight",
-                d.rs_composite_snr_weight,
-            ),
-            rs_composite_fast_weight: cfg.get_f64(
-                "rs_composite_fast_weight",
-                d.rs_composite_fast_weight,
-            ),
-            rs_composite_mid_weight: cfg.get_f64(
-                "rs_composite_mid_weight",
-                d.rs_composite_mid_weight,
-            ),
-            rs_composite_fast_scale: cfg.get_f64(
-                "rs_composite_fast_scale",
-                d.rs_composite_fast_scale,
-            ),
-            rs_composite_mid_scale: cfg.get_f64(
-                "rs_composite_mid_scale",
-                d.rs_composite_mid_scale,
-            ),
+            btc_macro_ema_fast_span: cfg
+                .get_f64("btc_macro_ema_fast_span", d.btc_macro_ema_fast_span),
+            btc_macro_ema_slow_span: cfg
+                .get_f64("btc_macro_ema_slow_span", d.btc_macro_ema_slow_span),
+            btc_macro_ret_slow_bars: cfg
+                .get_usize("btc_macro_ret_slow_bars", d.btc_macro_ret_slow_bars),
+            btc_macro_ret_fast_bars: cfg
+                .get_usize("btc_macro_ret_fast_bars", d.btc_macro_ret_fast_bars),
+            rs_composite_snr_weight: cfg
+                .get_f64("rs_composite_snr_weight", d.rs_composite_snr_weight),
+            rs_composite_fast_weight: cfg
+                .get_f64("rs_composite_fast_weight", d.rs_composite_fast_weight),
+            rs_composite_mid_weight: cfg
+                .get_f64("rs_composite_mid_weight", d.rs_composite_mid_weight),
+            rs_composite_fast_scale: cfg
+                .get_f64("rs_composite_fast_scale", d.rs_composite_fast_scale),
+            rs_composite_mid_scale: cfg.get_f64("rs_composite_mid_scale", d.rs_composite_mid_scale),
             action_top_k_leaders: cfg.get_usize(
                 "action_top_k_leaders",
                 cfg.get_usize("max_concurrent_long_positions", d.action_top_k_leaders),
@@ -230,18 +203,11 @@ impl SignalConfig {
                 "action_bull_min_prob",
                 cfg.get_f64("bull_prob_entry_gate", d.action_bull_min_prob),
             ),
-            action_bull_min_btc_trend: cfg.get_f64(
-                "action_bull_min_btc_trend",
-                d.action_bull_min_btc_trend,
-            ),
-            action_bull_min_btc_r24: cfg.get_f64(
-                "action_bull_min_btc_r24",
-                d.action_bull_min_btc_r24,
-            ),
-            action_bull_min_btc_r8: cfg.get_f64(
-                "action_bull_min_btc_r8",
-                d.action_bull_min_btc_r8,
-            ),
+            action_bull_min_btc_trend: cfg
+                .get_f64("action_bull_min_btc_trend", d.action_bull_min_btc_trend),
+            action_bull_min_btc_r24: cfg
+                .get_f64("action_bull_min_btc_r24", d.action_bull_min_btc_r24),
+            action_bull_min_btc_r8: cfg.get_f64("action_bull_min_btc_r8", d.action_bull_min_btc_r8),
             action_bull_min_snr: cfg.get_f64("action_bull_min_snr", d.action_bull_min_snr),
             action_bull_min_snr_synth: cfg.get_f64(
                 "action_bull_min_snr_synth",
@@ -255,30 +221,19 @@ impl SignalConfig {
                 "action_bull_min_rs96",
                 cfg.get_f64("bull_rs_96_gate", d.action_bull_min_rs96),
             ),
-            action_bull_min_r_usdc_8: cfg.get_f64(
-                "action_bull_min_r_usdc_8",
-                d.action_bull_min_r_usdc_8,
-            ),
-            action_bull_max_funding: cfg.get_f64(
-                "action_bull_max_funding",
-                d.action_bull_max_funding,
-            ),
+            action_bull_min_r_usdc_8: cfg
+                .get_f64("action_bull_min_r_usdc_8", d.action_bull_min_r_usdc_8),
+            action_bull_max_funding: cfg
+                .get_f64("action_bull_max_funding", d.action_bull_max_funding),
             action_bear_min_prob: cfg.get_f64(
                 "action_bear_min_prob",
                 cfg.get_f64("bear_prob_entry_gate", d.action_bear_min_prob),
             ),
-            action_bear_max_btc_trend: cfg.get_f64(
-                "action_bear_max_btc_trend",
-                d.action_bear_max_btc_trend,
-            ),
-            action_bear_max_btc_r24: cfg.get_f64(
-                "action_bear_max_btc_r24",
-                d.action_bear_max_btc_r24,
-            ),
-            action_bear_max_btc_r8: cfg.get_f64(
-                "action_bear_max_btc_r8",
-                d.action_bear_max_btc_r8,
-            ),
+            action_bear_max_btc_trend: cfg
+                .get_f64("action_bear_max_btc_trend", d.action_bear_max_btc_trend),
+            action_bear_max_btc_r24: cfg
+                .get_f64("action_bear_max_btc_r24", d.action_bear_max_btc_r24),
+            action_bear_max_btc_r8: cfg.get_f64("action_bear_max_btc_r8", d.action_bear_max_btc_r8),
             action_bear_max_snr: cfg.get_f64("action_bear_max_snr", d.action_bear_max_snr),
             action_bear_max_snr_synth: cfg.get_f64(
                 "action_bear_max_snr_synth",
@@ -298,7 +253,10 @@ impl SignalConfig {
             ),
             action_bear_min_funding: cfg.get_f64(
                 "action_bear_min_funding",
-                cfg.get_f64("short_max_adverse_funding_rate_hourly", d.action_bear_min_funding),
+                cfg.get_f64(
+                    "short_max_adverse_funding_rate_hourly",
+                    d.action_bear_min_funding,
+                ),
             ),
         }
     }
@@ -471,8 +429,8 @@ impl SignalEngine {
             } else {
                 s_tail[i]
             };
-            let c = (scfg.snr_synth_weight * s_val + scfg.snr_usdc_weight * u_tail[i])
-                .clamp(-1.0, 1.0);
+            let c =
+                (scfg.snr_synth_weight * s_val + scfg.snr_usdc_weight * u_tail[i]).clamp(-1.0, 1.0);
             composite.push(round_dp(c, 4));
             synth_only.push(round_dp(s_val.clamp(-1.0, 1.0), 4));
         }
@@ -657,14 +615,8 @@ impl SignalEngine {
         let max_staleness_ms = cfg.get_i64("max_bar_staleness_ms", 28_800_000).max(60_000);
         // R3-H8: Unified HMM lookback window resolution
         let hmm_window = Self::resolve_hmm_window(&cfg);
-        let snr_fast = cfg.get_usize(
-            "snr_ema_fast_period",
-            cfg.get_usize("snr_fast_span", 16),
-        );
-        let snr_slow = cfg.get_usize(
-            "snr_ema_slow_period",
-            cfg.get_usize("snr_slow_span", 64),
-        );
+        let snr_fast = cfg.get_usize("snr_ema_fast_period", cfg.get_usize("snr_fast_span", 16));
+        let snr_slow = cfg.get_usize("snr_ema_slow_period", cfg.get_usize("snr_slow_span", 64));
         let base_mace_w = cfg.get_f64(
             "mace_conviction_weight",
             cfg.get_f64("mace_blend_weight", 0.35),
@@ -744,9 +696,7 @@ impl SignalEngine {
                 self.db
                     .get_ohlcv_bars(&pair.exec_symbol, &pair.exec_timeframe, 260, None)?;
             if usdc_bars.len() < 20 && pair.exec_timeframe != "4h" {
-                usdc_bars = self
-                    .db
-                    .get_ohlcv_bars(&pair.exec_symbol, "4h", 260, None)?;
+                usdc_bars = self.db.get_ohlcv_bars(&pair.exec_symbol, "4h", 260, None)?;
             }
             let synth_bars =
                 self.db
@@ -768,8 +718,8 @@ impl SignalEngine {
                 _ => true,
             };
             // R3-H9: Misaligned synth/USDC bars are invalid in ALL execution modes (PAPER, TESTNET, LIVE).
-            let is_stale_live =
-                bars_misaligned || (is_live_mode && is_wall_clock && (btc_stale_live || usdc_stale || synth_stale));
+            let is_stale_live = bars_misaligned
+                || (is_live_mode && is_wall_clock && (btc_stale_live || usdc_stale || synth_stale));
             let is_unsupported_live = is_stale_live
                 || (is_live_mode
                     && usdc_bars
@@ -777,14 +727,13 @@ impl SignalEngine {
                         .map(|b| b.is_synthetic == 1)
                         .unwrap_or(false));
 
-            let (snr_series, snr_synth_series) =
-                Self::compute_continuous_snr_series_with_config(
-                    &synth_bars,
-                    &usdc_bars,
-                    snr_fast,
-                    snr_slow,
-                    &scfg,
-                );
+            let (snr_series, snr_synth_series) = Self::compute_continuous_snr_series_with_config(
+                &synth_bars,
+                &usdc_bars,
+                snr_fast,
+                snr_slow,
+                &scfg,
+            );
             let snr = snr_series.last().copied().unwrap_or(0.0);
             let snr_synth = snr_synth_series.last().copied().unwrap_or(0.0);
             let (mace, _ic, dyn_mace_w) = self.compute_mace_and_ic(
@@ -867,14 +816,16 @@ impl SignalEngine {
         }
 
         // Rank tradable live assets ahead of unsupported/stale assets
-        raw_metrics.sort_by(|a, b| match (a.is_unsupported_live, b.is_unsupported_live) {
-            (false, true) => std::cmp::Ordering::Less,
-            (true, false) => std::cmp::Ordering::Greater,
-            _ => b
-                .rs_composite
-                .partial_cmp(&a.rs_composite)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        });
+        raw_metrics.sort_by(
+            |a, b| match (a.is_unsupported_live, b.is_unsupported_live) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => b
+                    .rs_composite
+                    .partial_cmp(&a.rs_composite)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            },
+        );
         let tradable_assets = raw_metrics
             .iter()
             .filter(|m| !m.is_unsupported_live)
@@ -966,8 +917,7 @@ impl SignalEngine {
             || (atr_pct >= 0.015 && r_1bar_max > atr_pct.max(bounce_veto_pct * 0.75));
         let long_crash_veto = r_short_min < -crash_veto_pct
             || (atr_pct >= 0.015 && r_1bar_min < -atr_pct.max(crash_veto_pct * 0.75));
-        if (raw_action == "SHORT" && short_bounce_veto)
-            || (raw_action == "LONG" && long_crash_veto)
+        if (raw_action == "SHORT" && short_bounce_veto) || (raw_action == "LONG" && long_crash_veto)
         {
             "FLAT".to_string()
         } else {
@@ -1049,7 +999,11 @@ impl WalkForwardCalibrator {
     /// and sample standard deviation (`ddof = 1`).
     pub fn compute_annualized_sharpe(bar_returns: &[f64], timeframe: &str) -> Result<f64> {
         let dt_hours = Self::resolve_timeframe_hours(timeframe)?;
-        let clean: Vec<f64> = bar_returns.iter().copied().filter(|x| x.is_finite()).collect();
+        let clean: Vec<f64> = bar_returns
+            .iter()
+            .copied()
+            .filter(|x| x.is_finite())
+            .collect();
         if clean.len() < 2 {
             return Ok(0.0);
         }
@@ -1071,14 +1025,8 @@ impl WalkForwardCalibrator {
     ) -> (f64, f64, usize) {
         let cfg = self.db.load_config_opts(false).unwrap_or_default();
         let scfg = SignalConfig::from_config_map(&cfg);
-        let snr_fast = cfg.get_usize(
-            "snr_ema_fast_period",
-            cfg.get_usize("snr_fast_span", 16),
-        );
-        let snr_slow = cfg.get_usize(
-            "snr_ema_slow_period",
-            cfg.get_usize("snr_slow_span", 64),
-        );
+        let snr_fast = cfg.get_usize("snr_ema_fast_period", cfg.get_usize("snr_fast_span", 16));
+        let snr_slow = cfg.get_usize("snr_ema_slow_period", cfg.get_usize("snr_slow_span", 64));
         let bull_snr_thresh = scfg.action_bull_min_snr;
         let bear_snr_thresh = scfg.action_bear_max_snr;
 
@@ -1098,11 +1046,7 @@ impl WalkForwardCalibrator {
         let u_tail = &usdc_bars[usdc_bars.len() - n..];
         let s_tail = &synth_bars[synth_bars.len() - n..];
         let (snr_series, _) = SignalEngine::compute_continuous_snr_series_with_config(
-            s_tail,
-            u_tail,
-            snr_fast,
-            snr_slow,
-            &scfg,
+            s_tail, u_tail, snr_fast, snr_slow, &scfg,
         );
 
         let split = (n as f64 * 0.65) as usize;
@@ -1118,8 +1062,7 @@ impl WalkForwardCalibrator {
             } else {
                 0.0
             };
-            let fwd_ret =
-                (u_tail[t + 1].close.max(1e-12) / u_tail[t].close.max(1e-12)).ln();
+            let fwd_ret = (u_tail[t + 1].close.max(1e-12) / u_tail[t].close.max(1e-12)).ln();
             positions.push(snr);
             realized_rets.push(pos * fwd_ret);
         }
@@ -1310,13 +1253,24 @@ mod tests {
         let states_a = engine_a.decode_hmm_regime_states(&btc_a, 90, None, None);
         let states_b = engine_b.decode_hmm_regime_states(&btc_b, 90, None, None);
         for t in 0..=100 {
-            assert_eq!(states_a[t].regime, states_b[t].regime, "Regime mismatch at bar {t}");
-            assert_eq!(states_a[t].prob_bull, states_b[t].prob_bull, "prob_bull mismatch at bar {t}");
-            assert_eq!(states_a[t].prob_bear, states_b[t].prob_bear, "prob_bear mismatch at bar {t}");
+            assert_eq!(
+                states_a[t].regime, states_b[t].regime,
+                "Regime mismatch at bar {t}"
+            );
+            assert_eq!(
+                states_a[t].prob_bull, states_b[t].prob_bull,
+                "prob_bull mismatch at bar {t}"
+            );
+            assert_eq!(
+                states_a[t].prob_bear, states_b[t].prob_bear,
+                "prob_bear mismatch at bar {t}"
+            );
         }
 
-        let (x_a, y_a, k) = SignalEngine::build_mace_features_and_target(&synth_a, &usdc_a).unwrap();
-        let (x_b, y_b, _) = SignalEngine::build_mace_features_and_target(&synth_b, &usdc_b).unwrap();
+        let (x_a, y_a, k) =
+            SignalEngine::build_mace_features_and_target(&synth_a, &usdc_a).unwrap();
+        let (x_b, y_b, _) =
+            SignalEngine::build_mace_features_and_target(&synth_b, &usdc_b).unwrap();
         for t in 0..=100 {
             assert_eq!(x_a[t], x_b[t], "MACE feature lookahead detected at bar {t}");
         }
@@ -1397,7 +1351,8 @@ mod tests {
     fn test_live_stale_candles_forced_flat_nm8() {
         let db = DatabaseManager::memory();
         db.initialize_schema(false).unwrap();
-        db.set_config_value("execution_mode", &json!("LIVE")).unwrap();
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
 
         // Insert ancient candles from year 2023 (far older than max_bar_staleness_ms)
         let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 120, 68_000.0, 0.005);
@@ -1438,7 +1393,9 @@ mod tests {
         let engine = SignalEngine::new(db);
         let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 80, 60_000.0, 0.001);
         let s_none = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, None);
-        let custom_pc1: Vec<f64> = (0..80).map(|i| if i % 2 == 0 { 2.5 } else { -2.5 }).collect();
+        let custom_pc1: Vec<f64> = (0..80)
+            .map(|i| if i % 2 == 0 { 2.5 } else { -2.5 })
+            .collect();
         let s_custom =
             engine.decode_hmm_regime_states_shared(&btc_bars, 60, Some(&custom_pc1), None);
         assert!(!Arc::ptr_eq(&s_none, &s_custom));
@@ -1490,5 +1447,73 @@ mod tests {
             "LONG"
         );
     }
-}
 
+    #[test]
+    fn test_lt5_me20_intrabar_hysteresis_margin_prev_ema_v_and_cache_persistence() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let engine = SignalEngine::new(db.clone());
+        let btc_bars = make_synthetic_bars("BTC/USDC:USDC", 80, 60_000.0, 0.002);
+        let base_close = btc_bars.last().unwrap().close;
+
+        // 1. Warm up bar-close HMM cache and verify prev_ema_v + last_bar_close are populated.
+        let s0 = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, None);
+        assert_eq!(s0.len(), 80);
+        {
+            let cache = engine.hmm_cache.lock();
+            assert!((cache.last_bar_close - base_close).abs() < 1e-9);
+            assert!(cache.prev_ema_v.is_finite() && cache.prev_ema_v >= 0.0);
+        }
+
+        // 2. Intrabar tick updates cache.last_bar_close & cache.states atomically, and repeating
+        //    the identical live_tick_close hits the O(1) Arc cache without reverting to bar close.
+        let tick1 = base_close * 1.003;
+        let s1 = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, Some(tick1));
+        {
+            let cache = engine.hmm_cache.lock();
+            assert!((cache.last_bar_close - tick1).abs() < 1e-9);
+            assert!(Arc::ptr_eq(&cache.states, &s1));
+        }
+        let s1_repeat = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, Some(tick1));
+        assert!(
+            Arc::ptr_eq(&s1, &s1_repeat),
+            "Repeated identical live_tick_close must stay on cached Arc state"
+        );
+
+        // 3. Margin guard: if candidate wins by only 0.01 (< default 0.03 margin), keep prev regime.
+        {
+            let mut cache = engine.hmm_cache.lock();
+            let mut states = cache.states.to_vec();
+            states.last_mut().unwrap().regime = "BULL".to_string();
+            let shared: Arc<[aegis_core::RegimeState]> = Arc::from(states);
+            cache.states = shared;
+            cache.mapping = (0, 1, 2); // (bear, chop, bull)
+            let mut hmm = DiagonalGaussianHMM::new(3, 10, 1e-4);
+            hmm.means = [[0.0; 3]; 3];
+            hmm.vars = [[1.0; 3]; 3];
+            hmm.trans = [[0.33, 0.34, 0.33]; 3];
+            cache.hmm = Some(hmm);
+            cache.alpha_prev = Some([0.33, 0.34, 0.33]);
+            cache.prev_ema_v = 0.01;
+        }
+        let tick_noise = base_close * 1.004;
+        let s_held = engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, Some(tick_noise));
+        assert_eq!(
+            s_held.last().unwrap().regime,
+            "BULL",
+            "Intrabar hysteresis margin must suppress flip on 0.34 vs 0.33 noise"
+        );
+
+        // 4. Decisive flip (p_chop = 0.60 >> p_bull + 0.03) transitions cleanly to CHOP.
+        {
+            let mut cache = engine.hmm_cache.lock();
+            if let Some(hmm) = cache.hmm.as_mut() {
+                hmm.trans = [[0.20, 0.60, 0.20]; 3];
+            }
+        }
+        let tick_decisive = base_close * 1.005;
+        let s_flipped =
+            engine.decode_hmm_regime_states_shared(&btc_bars, 60, None, Some(tick_decisive));
+        assert_eq!(s_flipped.last().unwrap().regime, "CHOP");
+    }
+}

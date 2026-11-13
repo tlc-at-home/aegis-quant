@@ -44,7 +44,7 @@ serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }

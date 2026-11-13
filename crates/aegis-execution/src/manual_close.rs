@@ -63,7 +63,13 @@ impl ExecutionEngine {
             .get_raw_config_value("asset_index_cache_ttl_secs")
             .ok()
             .flatten()
-            .and_then(|v| v.trim().trim_matches('"').parse::<f64>().ok().map(|f| f as i64))
+            .and_then(|v| {
+                v.trim()
+                    .trim_matches('"')
+                    .parse::<f64>()
+                    .ok()
+                    .map(|f| f as i64)
+            })
             .unwrap_or(3600)
             .max(60)
             * 1000;
@@ -108,11 +114,7 @@ impl ExecutionEngine {
             }
         }
         let orphan = crate::build_orphan_or_pond_universe_asset(
-            symbol,
-            base_asset,
-            ref_price,
-            None,
-            "ORPHAN",
+            symbol, base_asset, ref_price, None, "ORPHAN",
         );
         self.resolved_asset_cache
             .lock()
@@ -189,14 +191,13 @@ impl ExecutionEngine {
                 .unwrap_or_default();
         }
         let last_bar = bars.last();
-        let ref_px = last_bar
-            .map(|b| b.close)
-            .filter(|&p| p > 0.0)
-            .unwrap_or(if trade.current_price > 0.0 {
+        let ref_px = last_bar.map(|b| b.close).filter(|&p| p > 0.0).unwrap_or(
+            if trade.current_price > 0.0 {
                 trade.current_price
             } else {
                 trade.entry_price
-            });
+            },
+        );
         let bar_high = last_bar.map(|b| b.high).unwrap_or(ref_px);
         let bar_low = last_bar.map(|b| b.low).unwrap_or(ref_px);
         let bar_vol = last_bar.map(|b| b.volume).unwrap_or(50_000.0);
@@ -318,13 +319,9 @@ impl ExecutionEngine {
         } else {
             None
         };
-        let closed = self.db.close_trade(
-            trade.trade_id,
-            actual_exit_px,
-            net_pnl,
-            actual_fees,
-            reason,
-        )?;
+        let closed =
+            self.db
+                .close_trade(trade.trade_id, actual_exit_px, net_pnl, actual_fees, reason)?;
         if !closed {
             return Err(AegisError::Validation(format!(
                 "Open trade #{trade_id} is already closed"
@@ -413,9 +410,9 @@ impl ExecutionEngine {
                 }
             }
             let ref_px = armed.entry_price.unwrap_or(0.0);
-            let closed_armed = self
-                .db
-                .reconcile_close_phantom_pond_cell(armed.cell_id, ref_px, reason)?;
+            let closed_armed =
+                self.db
+                    .reconcile_close_phantom_pond_cell(armed.cell_id, ref_px, reason)?;
             if !closed_armed {
                 return Err(AegisError::Validation(format!(
                     "Armed Pond cell #{cell_id} is already closed"
@@ -498,13 +495,9 @@ impl ExecutionEngine {
         );
         if (pond_mode == "LIVE" || pond_mode == "TESTNET") && fill.fsm_state != "FILLED" {
             let wallet = cfg.get_str("wallet_address", "").trim().to_string();
-            let is_testnet =
-                cfg.get_bool("hyperliquid_testnet", false) || pond_mode == "TESTNET";
-            let confirmed_absent_on_exchange = self.is_coin_confirmed_absent_on_exchange(
-                &wallet,
-                is_testnet,
-                &asset.base_asset,
-            );
+            let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || pond_mode == "TESTNET";
+            let confirmed_absent_on_exchange =
+                self.is_coin_confirmed_absent_on_exchange(&wallet, is_testnet, &asset.base_asset);
             if !confirmed_absent_on_exchange {
                 return Err(AegisError::Validation(format!(
                     "Exchange reduce-only close order for Pond cell #{} ({}) did not fill (state={}) and exchange position absence could not be confirmed",
