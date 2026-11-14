@@ -654,7 +654,8 @@ impl DatabaseManager {
                          closed_at = ?9,
                          cooldown_until = ?10,
                          updated_at = ?11,
-                         resting_order_id = NULL
+                         resting_order_id = NULL,
+                         protective_stop_oid = NULL
                      WHERE cell_id = ?12 AND state IN ('OPEN', 'TRAILED');",
                     params![
                         target_state,

@@ -276,6 +276,8 @@ pub struct HealthPayload {
     pub data_fresh: bool,
     pub last_bar_timestamp_ms: i64,
     pub max_bar_staleness_ms: i64,
+    pub pool_generation: u64,
+    pub discarded_stale_connections: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

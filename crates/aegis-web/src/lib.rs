@@ -48,6 +48,7 @@ pub struct CachedWebAuthConfig {
 pub struct PendingRestoreToken {
     pub filename: String,
     pub sha256: String,
+    pub client_ip: String,
     pub created_at: std::time::Instant,
 }
 
@@ -2967,6 +2968,203 @@ mod tests {
         assert!(EMBEDDED_APP_JS.contains("es.addEventListener('heartbeat'"));
         assert!(EMBEDDED_APP_JS.contains("/api/v1/db/backups"));
         assert!(EMBEDDED_APP_JS.contains("/api/v1/db/restore"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_r17_m1_n1_n2_web_restore_cycle_lock_per_ip_token_cap_and_health_pool_metrics() {
+        let root = resolve_project_root();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_web_r17_m1_n1_n2_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db = DatabaseManager::new(tmp_dir.join("web_r17.db"));
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("web_api_token", &json!("r17-web-test-token-1234"))
+            .unwrap();
+        db.set_config_value("settling_deadband_bps", &json!(70))
+            .unwrap();
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 1. Verify GET /api/v1/health exposes pool_generation >= 1 and discarded_stale_connections == 0 (R17-N1)
+        let health_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+        let health_bytes = axum::body::to_bytes(health_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health_json: serde_json::Value = serde_json::from_slice(&health_bytes).unwrap();
+        assert!(health_json["pool_generation"].as_u64().unwrap() >= 1);
+        assert_eq!(health_json["discarded_stale_connections"].as_u64(), Some(0));
+
+        // 2. Create a backup via POST /api/v1/db/backup and retrieve its bare filename
+        let create_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/backup")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r17-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"r17_snapshot"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let list_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/db/backups")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r17-web-test-token-1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+        assert!(
+            list_json["preconditions"]["pool_generation"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(
+            list_json["preconditions"]["discarded_stale_connections"].as_u64(),
+            Some(0)
+        );
+        let backup_filename = list_json["backups"][0]["filename"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 3. Mint 4 Step 1 preview tokens from the same IP and verify oldest (#1) is evicted while #4 succeeds (R17-N2)
+        let mut minted_tokens = Vec::new();
+        for _ in 0..4 {
+            let step1_resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/db/restore")
+                        .header(header::HOST, "localhost")
+                        .header(header::AUTHORIZATION, "Bearer r17-web-test-token-1234")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"filename":"{backup_filename}","confirm":false}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(step1_resp.status(), StatusCode::OK);
+            let step1_bytes = axum::body::to_bytes(step1_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let step1_json: serde_json::Value = serde_json::from_slice(&step1_bytes).unwrap();
+            minted_tokens.push(step1_json["restore_token"].as_str().unwrap().to_string());
+        }
+        assert_eq!(minted_tokens.len(), 4);
+
+        // Token #1 was evicted when token #4 was minted from the same IP (per-IP cap = 3)
+        let evicted_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r17-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{}","confirm_text":"RESTORE"}}"#,
+                        minted_tokens[0]
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evicted_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 4. Verify DB-level cycle lock "web.restore" blocks external daemon cycle lock acquisition (R17-M1)
+        {
+            let guard = db
+                .acquire_cycle_lock_guard("web.restore", 120_000)
+                .unwrap()
+                .expect("web.restore cycle lock must be acquired");
+            assert!(
+                !db.try_acquire_cycle_lock("daemon.pit.pid999", 120_000)
+                    .unwrap(),
+                "daemon.pit.pid999 must be blocked while web.restore holds engine_cycle_lock"
+            );
+            drop(guard);
+        }
+
+        // 5. Mutate config and run Step 2 restore using token #4
+        db.set_config_value("settling_deadband_bps", &json!(115))
+            .unwrap();
+        let step2_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r17-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{}","confirm_text":"RESTORE"}}"#,
+                        minted_tokens[3]
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step2_resp.status(), StatusCode::OK);
+        let step2_bytes = axum::body::to_bytes(step2_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let step2_json: serde_json::Value = serde_json::from_slice(&step2_bytes).unwrap();
+        assert_eq!(step2_json["status"], "restored");
+        assert_eq!(
+            db.load_config()
+                .unwrap()
+                .get_i64("settling_deadband_bps", 0),
+            70
+        );
+
+        // Verify daemon.pit.pid999 can acquire engine_cycle_lock after Step 2 restore finishes
+        assert!(
+            db.try_acquire_cycle_lock("daemon.pit.pid999", 120_000)
+                .unwrap(),
+            "daemon.pit.pid999 must be able to acquire engine_cycle_lock after Step 2 restore finishes"
+        );
+        db.release_cycle_lock("daemon.pit.pid999").unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

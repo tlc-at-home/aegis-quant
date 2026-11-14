@@ -869,7 +869,34 @@ impl DatabaseManager {
         }
     }
 
-    /// Lists available `.db` backup files in `backup_directory()` sorted newest-first (`R16-U1`).
+    /// Resolves the CLI binary display path for operator-facing restore hints (`R17-N3`).
+    pub(crate) fn resolve_cli_binary_display() -> String {
+        if let Ok(exe) = std::env::current_exe() {
+            if exe.file_stem().and_then(|s| s.to_str()) == Some("aegis-quant") {
+                return exe.display().to_string();
+            }
+        }
+        "./bin/aegis-quant".to_string()
+    }
+
+    /// Computes a lower-case hex SHA-256 digest of `path` by streaming in 1 MiB chunks (`R17-L2`).
+    pub fn compute_file_sha256_streaming(path: &Path) -> Result<String> {
+        use std::io::Read;
+        let mut file = fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1_048_576];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let digest = hasher.finalize();
+        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// Lists available `.db` backup files in `backup_directory()` sorted newest-first (`R16-U1`, `R17-N3`).
     pub fn list_sqlite_backups(&self) -> Result<Vec<Value>> {
         let backup_dir = self.backup_directory();
         if !backup_dir.exists() {
@@ -878,6 +905,7 @@ impl DatabaseManager {
         let cfg = self.load_config_opts(false).unwrap_or_default();
         let ret_days = cfg.get_i64("backup_retention_days", 7).clamp(1, 90);
         let retention_ms = ret_days.saturating_mul(86_400_000);
+        let cli_bin = Self::resolve_cli_binary_display();
 
         let mut rows: Vec<(i64, String, Value)> = Vec::new();
         let entries = fs::read_dir(&backup_dir)?;
@@ -911,7 +939,7 @@ impl DatabaseManager {
             let expires_at = aegis_core::format_ms_iso8601_utc(expires_at_ms);
             let is_pre_restore_snapshot = fname.starts_with("aegis_quant_pre_restore_");
             let restore_cli_command = format!(
-                "./bin/aegis-quant --db {} db --restore {} --confirm",
+                "{cli_bin} --db {} db --restore {} --confirm",
                 self.db_path.display(),
                 p.display()
             );
@@ -1006,7 +1034,7 @@ impl DatabaseManager {
     }
 
     /// Inspects a whitelisted backup file read-only, computing its SHA-256 hex digest, verifying
-    /// `PRAGMA integrity_check;`, and returning table row counts for Step 1 restore preview (`R16-U1`).
+    /// `PRAGMA integrity_check;`, and returning table row counts for Step 1 restore preview (`R16-U1`, `R17-L2`).
     pub fn inspect_sqlite_backup_preview(&self, bare_filename: &str) -> Result<Value> {
         let canon_path = self.resolve_whitelisted_backup_path(bare_filename)?;
         let fname = canon_path
@@ -1028,9 +1056,7 @@ impl DatabaseManager {
             .unwrap_or(0);
         let created_at = aegis_core::format_ms_iso8601_utc(created_at_ms);
 
-        let raw_bytes = fs::read(&canon_path)?;
-        let digest = Sha256::digest(&raw_bytes);
-        let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let sha256 = Self::compute_file_sha256_streaming(&canon_path)?;
 
         let ro_flags =
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
@@ -1081,9 +1107,27 @@ impl DatabaseManager {
         }))
     }
 
-    /// Evaluates all safety preconditions required before a WebUI database restore (`R16-U1`).
+    /// Evaluates optional backup preview inspection and WebUI restore preconditions in a single gate (`R16-U1`, `R17-M1`).
+    #[allow(clippy::type_complexity)]
+    pub fn evaluate_web_restore_gate(
+        &self,
+        preview_filename: Option<&str>,
+    ) -> Result<(Option<Result<Value>>, bool, Vec<String>, Value)> {
+        let preview_res = preview_filename.map(|fname| self.inspect_sqlite_backup_preview(fname));
+        let (restore_allowed, disabled_reasons, preconditions) =
+            self.check_web_restore_preconditions()?;
+        Ok((
+            preview_res,
+            restore_allowed,
+            disabled_reasons,
+            preconditions,
+        ))
+    }
+
+    /// Evaluates all safety preconditions required before a WebUI database restore (`R16-U1`, `R17-M1`, `R17-L1`, `R17-N1`).
     pub fn check_web_restore_preconditions(&self) -> Result<(bool, Vec<String>, Value)> {
         let now_ms = self.now_ms();
+        let ext_pid_reason = self.detect_external_pid_holding_db();
         self.with_conn(|conn| {
             let exec_mode: String = conn
                 .query_row(
@@ -1127,14 +1171,14 @@ impl DatabaseManager {
 
             let pit_stop_oids: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM trades WHERE TRIM(COALESCE(protective_stop_oid, '')) != '';",
+                    "SELECT COUNT(*) FROM trades WHERE status IN ('OPEN', 'PENDING') AND TRIM(COALESCE(protective_stop_oid, '')) != '';",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
             let pond_stop_oids: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM pond_cells WHERE TRIM(COALESCE(protective_stop_oid, '')) != '';",
+                    "SELECT COUNT(*) FROM pond_cells WHERE state IN ('ARMED', 'OPEN', 'TRAILED') AND TRIM(COALESCE(protective_stop_oid, '')) != '';",
                     [],
                     |r| r.get(0),
                 )
@@ -1176,6 +1220,11 @@ impl DatabaseManager {
                     "Active db_cycle_lock held by '{owner}' (expires_ms={exp_ms}); wait for active cycle to finish before restoring (R16-U1)"
                 ));
             }
+            if let Some(ref ext_reason) = ext_pid_reason {
+                disabled_reasons.push(format!(
+                    "External process holds open descriptor to database ({ext_reason}); stop external aegis-quant / aegis-pit / aegis-pond daemons before restoring via WebUI (R17-M1)"
+                ));
+            }
 
             let restore_allowed = disabled_reasons.is_empty();
             let preconditions = json!({
@@ -1188,27 +1237,23 @@ impl DatabaseManager {
                 "active_cycle_lock": active_lock.is_some(),
                 "cycle_lock_owner": active_lock.as_ref().map(|(o, _)| o.clone()),
                 "cycle_lock_expires_ms": active_lock.as_ref().map(|(_, exp)| *exp),
+                "external_process_detected": ext_pid_reason.is_some(),
+                "external_process_detail": ext_pid_reason,
+                "pool_generation": self.pool_generation(),
+                "discarded_stale_connections": self.discarded_stale_connections_count(),
             });
 
             Ok((restore_allowed, disabled_reasons, preconditions))
         })
     }
 
-    /// Detects whether any external process or active cycle is currently using this SQLite database (`R16-M2`).
-    ///
-    /// Checks:
-    /// (a) External PID in `/proc` holding DB, `-wal`, or `-shm` open;
-    /// (b) Unexpired row/lease in `db_cycle_lock` (`engine_cycle_lock_owner` / `engine_cycle_lock_expires_ms`);
-    /// (c) When `self.conn_pool.lock().is_empty()`, `<db>-shm` existing on disk with `len() > 0`
-    ///     and modified within the last `120` seconds.
-    pub fn detect_live_database_activity(&self) -> Result<Option<String>> {
+    /// Scans `/proc/<pid>/fd` on Linux to detect whether any external OS process (`pid != self`)
+    /// holds an open file descriptor to `<db>`, `<db>-wal`, or `<db>-shm` (`R16-M2`, `R17-M1`).
+    pub fn detect_external_pid_holding_db(&self) -> Option<String> {
         if self.is_memory || self.db_path == Path::new(":memory:") || !self.db_path.exists() {
-            return Ok(None);
+            return None;
         }
 
-        let pool_is_empty = self.conn_pool.lock().is_empty();
-
-        // (a) External PID in /proc holding DB / WAL / SHM open
         #[cfg(target_os = "linux")]
         {
             let self_pid = std::process::id();
@@ -1243,9 +1288,9 @@ impl DatabaseManager {
                             let clean_link =
                                 link_str.strip_suffix(" (deleted)").unwrap_or(&link_str);
                             if target_paths.iter().any(|tp| tp == clean_link) {
-                                return Ok(Some(format!(
-                                    "external process PID {pid} holds open descriptor to {link_str} (R16-M2)"
-                                )));
+                                return Some(format!(
+                                    "external process PID {pid} holds open descriptor to {link_str} (R16-M2 / R17-M1)"
+                                ));
                             }
                         }
                     }
@@ -1253,16 +1298,64 @@ impl DatabaseManager {
             }
         }
 
-        // (b) Unexpired cycle lock in db_cycle_lock / system_config
-        let now_ms = self.now_ms();
-        let ro_flags =
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        if let Ok(ro_conn) = Connection::open_with_flags(&self.db_path, ro_flags) {
-            let _ = ro_conn.busy_timeout(std::time::Duration::from_millis(2000));
-            if let Some((owner, exp_ms)) = Self::query_active_cycle_lock(&ro_conn, now_ms) {
-                return Ok(Some(format!(
-                    "unexpired db_cycle_lock held by '{owner}' until {exp_ms} ms (R16-M2)"
-                )));
+        None
+    }
+
+    /// Detects whether any external process or active cycle is currently using this SQLite database (`R16-M2`, `R17-M1`, `R17-L3`).
+    ///
+    /// Checks:
+    /// (a) External PID in `/proc` holding DB, `-wal`, or `-shm` open;
+    /// (b) Unexpired row/lease in `db_cycle_lock` (`engine_cycle_lock_owner` / `engine_cycle_lock_expires_ms`),
+    ///     failing closed on non-empty DB open failure after a 25ms retry (`R17-L3`);
+    /// (c) When `self.conn_pool.lock().is_empty()`, `<db>-shm` existing on disk with `len() > 0`
+    ///     and modified within the last `120` seconds.
+    pub fn detect_live_database_activity(&self) -> Result<Option<String>> {
+        if self.is_memory || self.db_path == Path::new(":memory:") || !self.db_path.exists() {
+            return Ok(None);
+        }
+
+        let pool_is_empty = self.conn_pool.lock().is_empty();
+
+        // (a) External PID in /proc holding DB / WAL / SHM open
+        if let Some(ext_reason) = self.detect_external_pid_holding_db() {
+            return Ok(Some(ext_reason));
+        }
+
+        // (b) Unexpired cycle lock in db_cycle_lock / system_config (R17-L3: retry once, then fail closed)
+        if fs::metadata(&self.db_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            let now_ms = self.now_ms();
+            let ro_flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let ro_conn_res = match Connection::open_with_flags(&self.db_path, ro_flags) {
+                Ok(c) => Ok(c),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    Connection::open_with_flags(&self.db_path, ro_flags)
+                }
+            };
+            match ro_conn_res {
+                Ok(ro_conn) => {
+                    let _ = ro_conn.busy_timeout(std::time::Duration::from_millis(2000));
+                    if let Some((owner, exp_ms)) = Self::query_active_cycle_lock(&ro_conn, now_ms) {
+                        return Ok(Some(format!(
+                            "unexpired db_cycle_lock held by '{owner}' until {exp_ms} ms (R16-M2)"
+                        )));
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        db_path = %self.db_path.display(),
+                        error = %err,
+                        "Failed to open read-only connection to probe db_cycle_lock; failing closed (R17-L3)"
+                    );
+                    return Ok(Some(format!(
+                        "failed to open read-only connection to probe db_cycle_lock on {}: {err} (R17-L3)",
+                        self.db_path.display()
+                    )));
+                }
             }
         }
 
@@ -1428,7 +1521,7 @@ impl DatabaseManager {
     }
 
     /// Restore the active SQLite database from an existing backup file with explicit live-activity
-    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `P2-C`).
+    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `R17-M1`, `P2-C`).
     ///
     /// Returns the path of the pre-restore safety snapshot.
     pub fn restore_sqlite_backup_with_options(
@@ -1456,8 +1549,14 @@ impl DatabaseManager {
             )));
         }
 
-        if !in_service_quiesced && !allow_live_override {
-            if let Some(reason) = self.detect_live_database_activity()? {
+        if !allow_live_override {
+            if in_service_quiesced {
+                if let Some(ext_reason) = self.detect_external_pid_holding_db() {
+                    return Err(AegisError::Validation(format!(
+                        "Refusing to restore SQLite backup while external process holds database open ({ext_reason}); stop external daemons or pass --force to override (R17-M1)"
+                    )));
+                }
+            } else if let Some(reason) = self.detect_live_database_activity()? {
                 return Err(AegisError::Validation(format!(
                     "Refusing to restore SQLite backup while live database activity is detected ({reason}); stop all running daemons or pass --force to override (R16-M2)"
                 )));
@@ -1537,6 +1636,21 @@ impl DatabaseManager {
         // 4. Heal any split-brain sidecars, ensure schema parity, and verify quick_check on the restored DB
         let _ = self.check_and_heal_wal_split_brain();
         self.run_migrations()?;
+        if in_service_quiesced {
+            // Clear any stale cycle lock inherited from the restored backup so caller's
+            // DbCycleLockGuard ("web.restore") drops cleanly without leaving a phantom lock.
+            let _ = self.with_conn(|conn| {
+                let _ = conn.execute(
+                    "UPDATE system_config SET config_value = '' WHERE config_key = 'engine_cycle_lock_owner';",
+                    [],
+                );
+                let _ = conn.execute(
+                    "UPDATE system_config SET config_value = '0' WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                    [],
+                );
+                Ok(())
+            });
+        }
         let quick: String = self.with_conn(|conn| {
             conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))
                 .map_err(|e| AegisError::Database(format!("Post-restore quick_check failed: {e}")))

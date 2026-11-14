@@ -3655,4 +3655,210 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_r17_m1_l1_l2_l3_n1_n3_restore_preconditions_and_streaming_sha256() {
+        use sha2::{Digest, Sha256};
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_r17_restore_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        // 1. R17-L1: Historical CLOSED trades/pond_cells with non-null protective_stop_oid must NOT block restore,
+        //    AND close_trade / cancel_resting_trade / close_open_pond_cell must clear protective_stop_oid = NULL.
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO trades (
+                    trade_id, symbol, base_asset, side, status, fsm_state,
+                    entry_price, current_price, quantity, notional_usdc, risk_budget_usdc,
+                    initial_stop_price, chandelier_stop_price, highest_price_seen, lowest_price_seen,
+                    protective_stop_oid
+                 ) VALUES
+                    (101, 'BTC-USDC', 'BTC', 'LONG', 'OPEN', 'FILLED', 50000.0, 50000.0, 0.1, 5000.0, 100.0, 48000.0, 48000.0, 50000.0, 50000.0, 'oid-open-1'),
+                    (102, 'ETH-USDC', 'ETH', 'LONG', 'PENDING', 'OPEN_ON_BOOK', 3000.0, 3000.0, 1.0, 3000.0, 100.0, 2800.0, 2800.0, 3000.0, 3000.0, 'oid-pend-1'),
+                    (103, 'SOL-USDC', 'SOL', 'LONG', 'CLOSED', 'FILLED', 100.0, 100.0, 1.0, 100.0, 10.0, 90.0, 90.0, 100.0, 100.0, 'oid-legacy-closed');",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pond_cells (
+                    cell_id, symbol, champion_id, state, side, option_analogue, protective_stop_oid
+                 ) VALUES
+                    (201, 'BTC-USDC', 1, 'OPEN', 'LONG', 'SHORT_PUT', 'oid-pond-open'),
+                    (202, 'SOL-USDC', 1, 'CLOSED', 'LONG', 'SHORT_PUT', 'oid-pond-legacy-closed');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let (allowed_active, _, pre_active) = db.check_web_restore_preconditions().unwrap();
+        assert!(!allowed_active);
+        // Only the 2 active trades + 1 active pond cell should count toward working_protective_stop_orders (not the 2 legacy CLOSED rows)
+        assert_eq!(pre_active["working_protective_stop_orders"], 3);
+
+        // Closing/cancelling the active rows must clear protective_stop_oid = NULL (R17-L1)
+        assert!(db.close_trade(101, 51000.0, 99.0, 1.0, "TP").unwrap());
+        assert!(db.cancel_resting_trade(102, "TEST_CANCEL").unwrap());
+        assert!(db
+            .close_open_pond_cell(
+                201,
+                "CLOSED",
+                Some(48000.0),
+                Some(51000.0),
+                Some(50000.0),
+                51000.0,
+                10.0,
+                0.5,
+                Some("TEST_CLOSE"),
+                "2026-01-01T01:00:00Z",
+                "2026-01-01T02:00:00Z",
+            )
+            .unwrap());
+
+        db.with_conn(|conn| {
+            let open_oid: Option<String> = conn
+                .query_row(
+                    "SELECT protective_stop_oid FROM trades WHERE trade_id = 101;",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let pend_oid: Option<String> = conn
+                .query_row(
+                    "SELECT protective_stop_oid FROM trades WHERE trade_id = 102;",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let pond_oid: Option<String> = conn
+                .query_row(
+                    "SELECT protective_stop_oid FROM pond_cells WHERE cell_id = 201;",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                open_oid.is_none(),
+                "R17-L1: close_trade must clear protective_stop_oid"
+            );
+            assert!(
+                pend_oid.is_none(),
+                "R17-L1: cancel_resting_trade must clear protective_stop_oid"
+            );
+            assert!(
+                pond_oid.is_none(),
+                "R17-L1: close_open_pond_cell must clear protective_stop_oid"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // Even with legacy CLOSED rows still holding protective_stop_oid strings, restore is now allowed!
+        let (allowed_after, reasons_after, pre_after) =
+            db.check_web_restore_preconditions().unwrap();
+        assert!(
+            allowed_after,
+            "R17-L1: legacy CLOSED rows with protective_stop_oid must not block restore: {reasons_after:?}"
+        );
+        assert_eq!(pre_after["working_protective_stop_orders"], 0);
+        // R17-N1: pool_generation and discarded_stale_connections must be present in preconditions
+        assert_eq!(pre_after["pool_generation"], 1);
+        assert_eq!(pre_after["discarded_stale_connections"], 0);
+        assert_eq!(pre_after["external_process_detected"], false);
+
+        // 2. R17-L2 & R17-N3 & Section 8: streaming SHA-256, CLI binary display, and evaluate_web_restore_gate
+        let backup_res = db.create_sqlite_backup(None, Some(7)).unwrap();
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+        let backup_fname = backup_res["file_name"].as_str().unwrap().to_string();
+
+        let streamed_sha = DatabaseManager::compute_file_sha256_streaming(&backup_path).unwrap();
+        let expected_sha: String = Sha256::digest(fs::read(&backup_path).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(streamed_sha, expected_sha);
+
+        let (preview_opt, gate_allowed, gate_reasons, gate_pre) =
+            db.evaluate_web_restore_gate(Some(&backup_fname)).unwrap();
+        assert!(gate_allowed, "gate_reasons={gate_reasons:?}");
+        assert_eq!(gate_pre["pool_generation"], 1);
+        let preview_val = preview_opt.unwrap().unwrap();
+        assert_eq!(preview_val["sha256"], streamed_sha);
+        assert!(
+            DatabaseManager::resolve_cli_binary_display().ends_with("aegis-quant"),
+            "R17-N3: resolve_cli_binary_display must end with aegis-quant"
+        );
+
+        // 3. R17-M1: External OS process holding open FD to DB must block both check_web_restore_preconditions
+        //    and restore_sqlite_backup_with_options(..., allow_live_override=false, in_service_quiesced=true).
+        #[cfg(target_os = "linux")]
+        {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("exec 3< '{}' && sleep 30", db_path.display()))
+                .spawn()
+                .expect("spawn external holder process");
+
+            let mut ext_detected = None;
+            for _ in 0..40 {
+                ext_detected = db.detect_external_pid_holding_db();
+                if ext_detected.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(
+                ext_detected.is_some(),
+                "R17-M1: detect_external_pid_holding_db must detect child process holding DB FD"
+            );
+
+            let (ext_allowed, ext_reasons, ext_pre) = db.check_web_restore_preconditions().unwrap();
+            assert!(!ext_allowed);
+            assert_eq!(ext_pre["external_process_detected"], true);
+            assert!(
+                ext_reasons.iter().any(|r| r.contains("R17-M1")),
+                "R17-M1 reason missing from {ext_reasons:?}"
+            );
+
+            let err_quiesced = db
+                .restore_sqlite_backup_with_options(&backup_path, false, true)
+                .unwrap_err();
+            assert!(
+                err_quiesced.to_string().contains("R17-M1"),
+                "R17-M1: in_service_quiesced restore must still refuse external PID: {err_quiesced}"
+            );
+
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(db.detect_external_pid_holding_db().is_none());
+        }
+
+        // 4. R17-L3: Fail-closed if read-only open of non-empty DB fails during detect_live_database_activity
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked_dir = tmp_dir.join("unreadable_dir");
+            fs::create_dir_all(&locked_dir).unwrap();
+            let bad_db_path = locked_dir.join("corrupt_or_unreadable.db");
+            // Create a directory at a child path so opening bad_db_path as a SQLite file after making it a directory with content > 0 bytes fails
+            fs::create_dir_all(&bad_db_path).unwrap();
+            fs::write(bad_db_path.join("dummy"), b"not-a-sqlite-file").unwrap();
+            let bad_db = DatabaseManager::new(&bad_db_path);
+            let res = bad_db.detect_live_database_activity().unwrap();
+            assert!(
+                res.as_deref()
+                    .map(|s| s.contains("R17-L3"))
+                    .unwrap_or(false),
+                "R17-L3: unreadable/invalid non-empty DB target must fail closed: {res:?}"
+            );
+            let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }

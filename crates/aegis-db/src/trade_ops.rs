@@ -631,7 +631,8 @@ impl DatabaseManager {
                      SET status = 'CANCELLED',
                          fsm_state = 'CANCELLED',
                          closed_at = ?1,
-                         exit_reason = ?2
+                         exit_reason = ?2,
+                         protective_stop_oid = NULL
                      WHERE trade_id = ?3
                        AND status IN ('PENDING', 'OPEN')
                        AND COALESCE(fsm_state, '') IN ('OPEN_ON_BOOK', 'PENDING');",
@@ -841,6 +842,7 @@ impl DatabaseManager {
             "filled_units",
             "slippage_paid_usd",
             "last_funding_hour_bucket",
+            "protective_stop_oid",
         ];
 
         let mut stmt = conn
@@ -913,7 +915,8 @@ impl DatabaseManager {
                  avg_fill_price REAL,
                  filled_units REAL DEFAULT 0.0,
                  slippage_paid_usd REAL DEFAULT 0.0,
-                 last_funding_hour_bucket INTEGER NOT NULL DEFAULT 0
+                 last_funding_hour_bucket INTEGER NOT NULL DEFAULT 0,
+                 protective_stop_oid TEXT
              );
              INSERT INTO trades_v11_rebuild ({col_list}) SELECT {col_list} FROM trades;
              DROP TABLE trades;
@@ -1354,7 +1357,8 @@ impl DatabaseManager {
                          unrealized_pnl_usdc = 0.0,
                          fees_paid_usdc = ?3,
                          closed_at = ?4,
-                         exit_reason = ?5
+                         exit_reason = ?5,
+                         protective_stop_oid = NULL
                      WHERE trade_id = ?6
                        AND status = 'OPEN';",
                     params![

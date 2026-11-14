@@ -135,12 +135,12 @@ Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashb
 
 ## Workspace Test Suite Inventory (`cargo test --workspace`)
 
-All **161** tests across all 13 workspace crates pass with zero ignored or skipped cases (`R15-QA(b)`, `R16`):
+All **163** tests across all 13 workspace crates pass with zero ignored or skipped cases (`R15-QA(b)`, `R16`, `R17`):
 
 | Crate / Target | Tests | Coverage Highlights |
 | --- | ---: | --- |
 | `aegis-core` (lib) | 10 | Domain types, step/tick rounding, dynamic open-heat helpers, bare-hex & Gemini key redaction |
-| `aegis-db` (lib + `aegis-db-tool`) | 30 | Fernet AES encryption, schema `v16` upgrades, WAL split-brain pool generation epochs (`R16-M1`), live-activity restore guard (`R16-M2`), backup retention & preview |
+| `aegis-db` (lib + `aegis-db-tool`) | 31 | Fernet AES encryption, schema `v16` upgrades, WAL split-brain pool generation epochs (`R16-M1`), live-activity & `/proc` restore guards (`R16-M2`, `R17-M1`), streaming SHA-256 & backup preview (`R17-L2`) |
 | `aegis-signals` (lib) | 9 | Causal HMM, MACE, SNR, intrabar hysteresis margin & `prev_ema_v` cache persistence |
 | `aegis-risk` (lib) | 8 | Dynamic open heat, Chandelier stops, 20-asset cluster map & `OTHER` cluster cap |
 | `aegis-alerts` (lib) | 5 | Token redaction, 2-cycle RegimeFlip confirmation, per-channel retry, chat-id preservation |
@@ -150,6 +150,6 @@ All **161** tests across all 13 workspace crates pass with zero ignored or skipp
 | `aegis-pond` (lib) | 20 | `NPS-01` 6-gate scanner, 6-tier exits, synthetic-refresh guard, persisted exit retry counters |
 | `aegis-settle` (lib) | 12 | PP-50 idle-only settling, `HaltedPp50` vs `SkippedNoIdle`, funding-offset `pond_heat`, transfer quarantine |
 | `aegis-backtest` (lib) | 4 | Zero-lookahead replay, taker default + entry slippage parity, `old -> new` stop disclosure |
-| `aegis-web` (lib) | 16 | Session-nonce cookie auth, SSE `DefaultHasher` heartbeat, backup cooldown, two-step guarded WebUI restore (`R16-U1`), proxy trust gate |
+| `aegis-web` (lib) | 17 | Session-nonce cookie auth, SSE `DefaultHasher` heartbeat, backup cooldown, two-step guarded WebUI restore & per-IP token cap (`R16-U1`, `R17-M1`, `R17-N2`), proxy trust gate |
 | `aegis-cli` (`aegis-quant` + `test_firewall_ast`) | 12 | CLI args, firewall F1-F6 AST & WAL concurrency, `R16-U2` secret hygiene scan, readiness `DEPLOY-01..03`, shared backup cadence & `--force` restore |
-| **Total Workspace** | **161** | Enforced as minimum floor (`>= 159`) in `.github/workflows/ci.yml` |
+| **Total Workspace** | **163** | Enforced as minimum floor (`>= 163`) in `.github/workflows/ci.yml` |

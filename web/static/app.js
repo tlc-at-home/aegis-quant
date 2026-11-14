@@ -1725,14 +1725,16 @@ function renderDbBackupsList(data) {
   const restoreAllowed = Boolean(data.restore_allowed);
   const reasons = Array.isArray(data.disabled_reasons) ? data.disabled_reasons : [];
   const runbookNotice = data.runbook_notice || '';
+  const precond = data.preconditions || {};
+  const poolStatsText = `[Pool Gen #${precond.pool_generation ?? 1}, Discarded Stale Conns: ${precond.discarded_stale_connections ?? 0}]`;
 
   if (bannerEl) {
     if (restoreAllowed) {
       bannerEl.className = 'text-green';
-      bannerEl.textContent = `Restore Preconditions: READY (PAPER/TESTNET, 0 open PIT trades, 0 open Pond cells, no active cycle lock). ${runbookNotice}`;
+      bannerEl.textContent = `Restore Preconditions: READY (PAPER/TESTNET, 0 open PIT trades, 0 open Pond cells, no active cycle lock) ${poolStatsText}. ${runbookNotice}`;
     } else {
       bannerEl.className = 'text-amber';
-      bannerEl.textContent = `Restore Preconditions BLOCKED: ${reasons.join(' | ') || 'Preconditions not satisfied'}. ${runbookNotice}`;
+      bannerEl.textContent = `Restore Preconditions BLOCKED: ${reasons.join(' | ') || 'Preconditions not satisfied'} ${poolStatsText}. ${runbookNotice}`;
     }
   }
 
@@ -1758,7 +1760,7 @@ function renderDbBackupsList(data) {
         <td>${escapeHtml(sizeKb)}</td>
         <td class="text-muted">${escapeHtml(createdUtc)}</td>
         <td class="text-muted">${escapeHtml(expiresUtc)}</td>
-        <td><button type="button" data-copy-restore-cli="${escapeHtml(cliCmd)}">Copy CLI Command</button></td>
+        <td><button type="button" title="Copies the CLI restore command using the active binary and --db path" data-copy-restore-cli="${escapeHtml(cliCmd)}">Copy CLI Command</button></td>
         <td><button type="button" class="primary" data-open-restore-modal="${escapeHtml(fname)}" ${restoreDisabledAttr}>Restore…</button></td>
       </tr>
     `;
