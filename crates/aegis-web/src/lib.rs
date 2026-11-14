@@ -542,6 +542,13 @@ fn attach_security_and_cors_headers(
 }
 
 pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router {
+    build_router_with_state(db, static_dir).0
+}
+
+pub fn build_router_with_state(
+    db: DatabaseManager,
+    static_dir: impl AsRef<Path>,
+) -> (Router, AppState) {
     let session_token = resolve_initial_session_token(&db);
     let state = AppState {
         db,
@@ -557,7 +564,7 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         pending_restore_tokens: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     };
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(serve_index))
         .route("/static/app.js", get(serve_app_js))
         .route("/app.js", get(serve_app_js))
@@ -632,7 +639,8 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
             state.clone(),
             security_and_auth_middleware,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    (router, state)
 }
 
 pub async fn run_web_server(
@@ -3165,6 +3173,168 @@ mod tests {
             "daemon.pit.pid999 must be able to acquire engine_cycle_lock after Step 2 restore finishes"
         );
         db.release_cycle_lock("daemon.pit.pid999").unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_r18_n3_step2_lock_conflict_preserves_restore_token_for_retry() {
+        let root = resolve_project_root();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_web_r18_n3_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db = DatabaseManager::new(tmp_dir.join("web_r18_n3.db"));
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("web_api_token", &json!("r18-n3-web-test-token-1234"))
+            .unwrap();
+        db.set_config_value("settling_deadband_bps", &json!(75))
+            .unwrap();
+
+        let (app, state) = build_router_with_state(db.clone(), root.join("web/static"));
+
+        // 1. Create a backup via POST /api/v1/db/backup and retrieve its bare filename
+        let create_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/backup")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r18-n3-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"r18_n3_snapshot"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let list_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/db/backups")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r18-n3-web-test-token-1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+        let backup_filename = list_json["backups"][0]["filename"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 2. Mint Step 1 restore_token for the valid backup
+        let step1_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r18-n3-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step1_resp.status(), StatusCode::OK);
+        let step1_bytes = axum::body::to_bytes(step1_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let step1_json: serde_json::Value = serde_json::from_slice(&step1_bytes).unwrap();
+        let restore_token = step1_json["restore_token"].as_str().unwrap().to_string();
+        assert!(state
+            .pending_restore_tokens
+            .lock()
+            .contains_key(&restore_token));
+
+        // 3. Mutate config, then acquire "daemon.pit.pid999" cycle lock and invoke Step 2
+        db.set_config_value("settling_deadband_bps", &json!(125))
+            .unwrap();
+        assert!(db
+            .try_acquire_cycle_lock("daemon.pit.pid999", 120_000)
+            .unwrap());
+
+        let conflict_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r18-n3-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{restore_token}","confirm_text":"RESTORE"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_resp.status(), StatusCode::CONFLICT);
+        assert!(
+            state
+                .pending_restore_tokens
+                .lock()
+                .contains_key(&restore_token),
+            "R18-N3: 409 lock conflict must NOT burn the pending restore_token"
+        );
+
+        // 4. Release "daemon.pit.pid999" and retry the EXACT SAME Step 2 request with the SAME restore_token
+        db.release_cycle_lock("daemon.pit.pid999").unwrap();
+
+        let retry_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r18-n3-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{restore_token}","confirm_text":"RESTORE"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_resp.status(), StatusCode::OK);
+        let retry_bytes = axum::body::to_bytes(retry_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let retry_json: serde_json::Value = serde_json::from_slice(&retry_bytes).unwrap();
+        assert_eq!(retry_json["status"], "restored");
+        assert!(
+            !state
+                .pending_restore_tokens
+                .lock()
+                .contains_key(&restore_token),
+            "restore_token must be consumed after successful Step 2 restore"
+        );
+        assert_eq!(
+            db.load_config()
+                .unwrap()
+                .get_i64("settling_deadband_bps", 0),
+            75
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

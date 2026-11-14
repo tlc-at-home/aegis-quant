@@ -10,6 +10,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 /// Canonical unified schema version built by `sql/schema_and_seed.sql`.
 pub const CANONICAL_SCHEMA_VERSION: i64 = 16;
@@ -17,14 +21,21 @@ pub const CANONICAL_SCHEMA_VERSION: i64 = 16;
 /// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
 pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
 
-/// RAII guard for the cross-process SQLite advisory cycle lock (`HI-4`).
+/// RAII guard for the cross-process SQLite advisory cycle lock with background lease-renewal heartbeat (`HI-4`, `R18-L1`).
 pub struct DbCycleLockGuard {
     db: DatabaseManager,
     owner: String,
+    stop_flag: Arc<AtomicBool>,
+    renew_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for DbCycleLockGuard {
     fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.renew_handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
         let _ = self.db.release_cycle_lock(&self.owner);
     }
 }
@@ -644,7 +655,7 @@ impl DatabaseManager {
         } else {
             clean_owner
         };
-        let eff_ttl = ttl_ms.max(1_000);
+        let eff_ttl = ttl_ms.max(200);
         let expires_ms = now_ms.saturating_add(eff_ttl);
 
         self.with_conn(|conn| {
@@ -784,16 +795,120 @@ impl DatabaseManager {
         })
     }
 
-    /// Acquire the cross-process database advisory cycle lock and return an RAII guard (`HI-4`).
+    /// Renews an active cross-process database advisory cycle lock lease if still owned by `owner` (`R18-L1`).
+    pub fn renew_cycle_lock(&self, owner: &str, ttl_ms: i64) -> Result<bool> {
+        // Never block background renewal ticks on file_swap_lock.write() during Step 3 backup copy.
+        if self.file_swap_lock.try_read().is_none() {
+            return Ok(false);
+        }
+        let clean_owner = owner.trim();
+        let owner_val = if clean_owner.is_empty() {
+            "aegis-engine"
+        } else {
+            clean_owner
+        };
+        let eff_ttl = ttl_ms.max(200);
+        self.with_conn(|conn| {
+            let began_tx = conn.is_autocommit();
+            if began_tx {
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|e| AegisError::Database(e.to_string()))?;
+            }
+            let res: Result<bool> = (|| {
+                let cur_owner: String = conn
+                    .query_row(
+                        "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_owner';",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| AegisError::Database(e.to_string()))?
+                    .unwrap_or_default();
+                if cur_owner.trim() != owner_val {
+                    return Ok(false);
+                }
+                let expires_ms = self.now_ms().saturating_add(eff_ttl);
+                conn.execute(
+                    "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                     VALUES ('engine_cycle_lock_expires_ms', ?1, 'int', 'system', 'Epoch expiration timestamp (ms) of the cross-process database advisory cycle lock (HI-4)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     ON CONFLICT(config_key) DO UPDATE SET
+                        config_value = excluded.config_value,
+                        updated_at = excluded.updated_at;",
+                    params![expires_ms.to_string()],
+                )
+                .map_err(|e| AegisError::Database(e.to_string()))?;
+                Ok(true)
+            })();
+            match res {
+                Ok(renewed) => {
+                    if began_tx {
+                        conn.execute_batch("COMMIT;")
+                            .map_err(|e| AegisError::Database(e.to_string()))?;
+                    }
+                    Ok(renewed)
+                }
+                Err(e) => {
+                    if began_tx {
+                        let _ = conn.execute_batch("ROLLBACK;");
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Computes a size-proportional initial cycle lock lease TTL (ms) for database restore (`R18-L1`).
+    ///
+    /// Bounds: `[120_000, 3_600_000]` ms (`2 min` .. `60 min`), assuming a conservative
+    /// `10 MiB/s` copy/snapshot rate with a `4x` safety multiplier.
+    pub fn recommended_restore_lock_ttl_ms(&self, backup_path: Option<&Path>) -> i64 {
+        let live_db_bytes = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        let backup_bytes = backup_path
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let total_bytes = live_db_bytes.saturating_add(backup_bytes);
+        let estimated_ms = ((total_bytes as u128).saturating_mul(4_000) / 10_485_760) as i64;
+        estimated_ms.clamp(120_000, 3_600_000)
+    }
+
+    /// Acquire the cross-process database advisory cycle lock and return an RAII guard with background heartbeat renewal (`HI-4`, `R18-L1`).
     pub fn acquire_cycle_lock_guard(
         &self,
         owner: &str,
         ttl_ms: i64,
     ) -> Result<Option<DbCycleLockGuard>> {
-        if self.try_acquire_cycle_lock(owner, ttl_ms)? {
+        let eff_ttl = ttl_ms.max(200);
+        if self.try_acquire_cycle_lock(owner, eff_ttl)? {
+            let clean_owner = owner.trim();
+            let owner_val = if clean_owner.is_empty() {
+                "aegis-engine".to_string()
+            } else {
+                clean_owner.to_string()
+            };
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_bg = Arc::clone(&stop_flag);
+            let db_bg = self.clone();
+            let owner_bg = owner_val.clone();
+            let renew_interval =
+                std::time::Duration::from_millis((eff_ttl / 3).clamp(50, 30_000) as u64);
+            let renew_handle = std::thread::Builder::new()
+                .name(format!("aegis-cycle-lock-{}", owner_val))
+                .spawn(move || {
+                    while !stop_bg.load(Ordering::Acquire) {
+                        std::thread::park_timeout(renew_interval);
+                        if stop_bg.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let _ = db_bg.renew_cycle_lock(&owner_bg, eff_ttl);
+                    }
+                })
+                .ok();
             Ok(Some(DbCycleLockGuard {
                 db: self.clone(),
-                owner: owner.trim().to_string(),
+                owner: owner_val,
+                stop_flag,
+                renew_handle,
             }))
         } else {
             Ok(None)
@@ -1127,7 +1242,8 @@ impl DatabaseManager {
     /// Evaluates all safety preconditions required before a WebUI database restore (`R16-U1`, `R17-M1`, `R17-L1`, `R17-N1`).
     pub fn check_web_restore_preconditions(&self) -> Result<(bool, Vec<String>, Value)> {
         let now_ms = self.now_ms();
-        let ext_pid_reason = self.detect_external_pid_holding_db();
+        let ext_pid_reason =
+            self.detect_external_pid_holding_db_cached(std::time::Duration::from_millis(30));
         self.with_conn(|conn| {
             let exec_mode: String = conn
                 .query_row(
@@ -1299,6 +1415,28 @@ impl DatabaseManager {
         }
 
         None
+    }
+
+    /// Cached wrapper around `detect_external_pid_holding_db` for high-frequency read-only UI polling (`R18-S8`).
+    pub fn detect_external_pid_holding_db_cached(
+        &self,
+        ttl: std::time::Duration,
+    ) -> Option<String> {
+        let now = std::time::Instant::now();
+        {
+            let guard = self.ext_pid_scan_cache.lock();
+            if let Some((ts, ref cached)) = *guard {
+                if now.duration_since(ts) <= ttl {
+                    return cached.clone();
+                }
+            }
+        }
+        let fresh = self.detect_external_pid_holding_db();
+        {
+            let mut guard = self.ext_pid_scan_cache.lock();
+            *guard = Some((now, fresh.clone()));
+        }
+        fresh
     }
 
     /// Detects whether any external process or active cycle is currently using this SQLite database (`R16-M2`, `R17-M1`, `R17-L3`).
@@ -1520,8 +1658,71 @@ impl DatabaseManager {
         self.restore_sqlite_backup_with_options(backup_path, false, false)
     }
 
+    /// Applies post-copy `db_cycle_lock` invariants directly on a restored database connection (`R18-N1`, `R18-N2`).
+    ///
+    /// - When `preserve_web_restore_exp` is `Some(exp_ms)` (an in-service quiesced WebUI restore where
+    ///   `"web.restore"` held the active lease before Step 3), re-asserts `engine_cycle_lock_owner = 'web.restore'`
+    ///   and `engine_cycle_lock_expires_ms = exp_ms` before `file_swap_lock.write()` is released (`R18-N1`).
+    /// - When `preserve_web_restore_exp` is `None` (CLI restore or unheld lock), unconditionally clears any
+    ///   stale `engine_cycle_lock_owner` and `engine_cycle_lock_expires_ms` inherited from the backup snapshot (`R18-N2`).
+    fn apply_post_copy_cycle_lock_state(conn: &Connection, preserve_web_restore_exp: Option<i64>) {
+        let has_cfg: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_config';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if !has_cfg {
+            return;
+        }
+        if let Some(exp_ms) = preserve_web_restore_exp {
+            for (k, v, vt, desc) in [
+                (
+                    "engine_cycle_lock_owner",
+                    "web.restore".to_string(),
+                    "string",
+                    "Owner identifier of the cross-process database advisory cycle lock (HI-4)",
+                ),
+                (
+                    "engine_cycle_lock_expires_ms",
+                    exp_ms.to_string(),
+                    "int",
+                    "Epoch expiration timestamp (ms) of the cross-process database advisory cycle lock (HI-4)",
+                ),
+            ] {
+                let _ = conn.execute(
+                    "INSERT INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                     VALUES (?1, ?2, ?3, 'system', ?4, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                     ON CONFLICT(config_key) DO UPDATE SET
+                        config_value = excluded.config_value,
+                        updated_at = excluded.updated_at;",
+                    params![k, v, vt, desc],
+                );
+            }
+        } else {
+            let _ = conn.execute(
+                "UPDATE system_config
+                 SET config_value = '',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE config_key = 'engine_cycle_lock_owner';",
+                [],
+            );
+            let _ = conn.execute(
+                "UPDATE system_config
+                 SET config_value = '0',
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                [],
+            );
+        }
+    }
+
     /// Restore the active SQLite database from an existing backup file with explicit live-activity
-    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `R17-M1`, `P2-C`).
+    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `R17-M1`, `R18-N1`, `R18-N2`, `P2-C`).
     ///
     /// Returns the path of the pre-restore safety snapshot.
     pub fn restore_sqlite_backup_with_options(
@@ -1607,8 +1808,29 @@ impl DatabaseManager {
             })?;
         }
 
+        // Check whether caller ("web.restore") holds an active cycle lock prior to Step 3 overwrite (R18-N1)
+        let preserve_web_restore_exp: Option<i64> = if in_service_quiesced && self.db_path.exists()
+        {
+            let now_ms = self.now_ms();
+            self.with_conn(|conn| {
+                Ok(
+                    Self::query_active_cycle_lock(conn, now_ms).and_then(|(owner, exp)| {
+                        if owner == "web.restore" {
+                            Some(exp.max(now_ms.saturating_add(120_000)))
+                        } else {
+                            None
+                        }
+                    }),
+                )
+            })
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
         // 3. Hold file_swap_lock.write() while bumping pool generation, clearing pooled connections
-        // and WAL/SHM sidecars, and running rusqlite::backup::Backup; drop write guard before Step 4.
+        // and WAL/SHM sidecars, running rusqlite::backup::Backup, and enforcing post-copy lock state (R18-N1 / R18-N2).
         let (new_gen, cleared_pool) = {
             let _swap_guard = self.file_swap_lock.write();
             let (new_gen, cleared_pool) = self.bump_generation_and_clear_pool_sidecars();
@@ -1628,29 +1850,20 @@ impl DatabaseManager {
                     .map_err(|e| {
                         AegisError::Database(format!("SQLite backup restore failed: {e}"))
                     })?;
+                drop(backup);
+                Self::apply_post_copy_cycle_lock_state(&dst_conn, preserve_web_restore_exp);
             }
             (new_gen, cleared_pool)
         };
         drop(src_conn);
 
-        // 4. Heal any split-brain sidecars, ensure schema parity, and verify quick_check on the restored DB
+        // 4. Heal any split-brain sidecars, ensure schema parity, re-assert post-copy lock state, and verify quick_check
         let _ = self.check_and_heal_wal_split_brain();
         self.run_migrations()?;
-        if in_service_quiesced {
-            // Clear any stale cycle lock inherited from the restored backup so caller's
-            // DbCycleLockGuard ("web.restore") drops cleanly without leaving a phantom lock.
-            let _ = self.with_conn(|conn| {
-                let _ = conn.execute(
-                    "UPDATE system_config SET config_value = '' WHERE config_key = 'engine_cycle_lock_owner';",
-                    [],
-                );
-                let _ = conn.execute(
-                    "UPDATE system_config SET config_value = '0' WHERE config_key = 'engine_cycle_lock_expires_ms';",
-                    [],
-                );
-                Ok(())
-            });
-        }
+        let _ = self.with_conn(|conn| {
+            Self::apply_post_copy_cycle_lock_state(conn, preserve_web_restore_exp);
+            Ok(())
+        });
         let quick: String = self.with_conn(|conn| {
             conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))
                 .map_err(|e| AegisError::Database(format!("Post-restore quick_check failed: {e}")))

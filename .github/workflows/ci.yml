@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Workspace Unit & Integration Tests (Enforce >= 163 Tests)
+      - name: Run Workspace Unit & Integration Tests (Enforce >= 165 Tests)
         run: |
           set -o pipefail
           cargo test --workspace | tee /tmp/aegis_test_output.txt
@@ -61,8 +61,8 @@ jobs:
           counts = [int(m.group(1)) for m in re.finditer(r"test result: ok\. (\d+) passed; 0 failed", text)]
           total = sum(counts)
           print(total)
-          if total < 163:
-              raise SystemExit(f"Expected >= 163 passing workspace tests, observed {total}")
+          if total < 165:
+              raise SystemExit(f"Expected >= 165 passing workspace tests, observed {total}")
           ')
           echo "Verified ${TOTAL} passing workspace tests"
       - name: Build Optimized Release Binary

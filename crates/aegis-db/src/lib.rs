@@ -41,6 +41,8 @@ pub(crate) struct CachedFernetState {
     pub(crate) cipher: FernetCipher,
 }
 
+pub(crate) type ExtPidScanCache = Arc<Mutex<Option<(std::time::Instant, Option<String>)>>>;
+
 /// Thread-safe SQLite Write-Ahead Logging (WAL) and `:memory:` database manager.
 #[derive(Clone)]
 pub struct DatabaseManager {
@@ -52,6 +54,7 @@ pub struct DatabaseManager {
     pub(crate) pool_generation: Arc<AtomicU64>,
     pub(crate) discarded_stale_connections: Arc<AtomicU64>,
     pub(crate) file_swap_lock: Arc<RwLock<()>>,
+    pub(crate) ext_pid_scan_cache: ExtPidScanCache,
     pub(crate) pit_timestamp_ms: Arc<AtomicI64>,
     pub(crate) explicit_master_key: Arc<Mutex<Option<String>>>,
     pub(crate) cipher_cache: Arc<RwLock<Option<CachedFernetState>>>,
@@ -156,6 +159,7 @@ impl DatabaseManager {
             pool_generation: Arc::new(AtomicU64::new(1)),
             discarded_stale_connections: Arc::new(AtomicU64::new(0)),
             file_swap_lock: Arc::new(RwLock::new(())),
+            ext_pid_scan_cache: Arc::new(Mutex::new(None)),
             pit_timestamp_ms: Arc::new(AtomicI64::new(-1)),
             explicit_master_key: Arc::new(Mutex::new(master_key)),
             cipher_cache: Arc::new(RwLock::new(None)),
@@ -3858,6 +3862,92 @@ mod tests {
             );
             let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
         }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_r18_l1_n1_n2_cycle_lock_renewal_heartbeat_and_unconditional_inherited_lock_clear() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_r18_restore_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        // 1. R18-L1: Background heartbeat renewal on DbCycleLockGuard keeps short-TTL lease alive past initial expiry
+        let guard = db
+            .acquire_cycle_lock_guard("web.restore", 200)
+            .unwrap()
+            .expect("acquire 200ms cycle lock guard");
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!(
+            !db.try_acquire_cycle_lock("daemon.pit.pid999", 120_000)
+                .unwrap(),
+            "R18-L1: background heartbeat renewal must keep 200ms lease alive across 350ms sleep"
+        );
+        drop(guard);
+        assert!(
+            db.try_acquire_cycle_lock("daemon.pit.pid999", 120_000)
+                .unwrap(),
+            "R18-L1: dropping DbCycleLockGuard must stop renewal and release lease immediately"
+        );
+        db.release_cycle_lock("daemon.pit.pid999").unwrap();
+
+        // 2. R18-N2: Backup snapshot taken while 'daemon.pit.pid777' held a 1-hour cycle lock
+        //    must have its inherited lock unconditionally cleared upon CLI restore (in_service_quiesced = false).
+        assert!(db
+            .try_acquire_cycle_lock("daemon.pit.pid777", 3_600_000)
+            .unwrap());
+        let backup_res = db.create_sqlite_backup(None, Some(7)).unwrap();
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+        db.release_cycle_lock("daemon.pit.pid777").unwrap();
+
+        let _pre_snap_cli = db.restore_sqlite_backup(&backup_path).unwrap();
+        assert_eq!(
+            db.get_raw_config_value("engine_cycle_lock_owner")
+                .unwrap()
+                .unwrap_or_default(),
+            "",
+            "R18-N2: CLI restore must unconditionally clear inherited engine_cycle_lock_owner"
+        );
+        assert!(
+            db.try_acquire_cycle_lock("daemon.pit.pid888", 120_000)
+                .unwrap(),
+            "R18-N2: daemon must be able to acquire cycle lock immediately after CLI restore of locked backup"
+        );
+        db.release_cycle_lock("daemon.pit.pid888").unwrap();
+
+        // 3. R18-N1: When 'web.restore' holds the active cycle lock across restore_sqlite_backup_with_options(..., true),
+        //    Step 3 + Step 4 must preserve 'web.restore' on the restored DB until the guard drops.
+        let rec_ttl = db.recommended_restore_lock_ttl_ms(Some(&backup_path));
+        assert!((120_000..=3_600_000).contains(&rec_ttl));
+        let web_guard = db
+            .acquire_cycle_lock_guard("web.restore", rec_ttl)
+            .unwrap()
+            .expect("acquire web.restore lock");
+        let _pre_snap_web = db
+            .restore_sqlite_backup_with_options(&backup_path, false, true)
+            .unwrap();
+        assert_eq!(
+            db.get_raw_config_value("engine_cycle_lock_owner")
+                .unwrap()
+                .as_deref(),
+            Some("web.restore"),
+            "R18-N1: in_service_quiesced restore must preserve 'web.restore' lease across backup overwrite"
+        );
+        assert!(
+            !db.try_acquire_cycle_lock("daemon.pit.pid888", 120_000)
+                .unwrap(),
+            "R18-N1: external daemon must remain blocked while web_guard is still alive post-copy"
+        );
+        drop(web_guard);
+        assert!(
+            db.try_acquire_cycle_lock("daemon.pit.pid888", 120_000)
+                .unwrap(),
+            "R18-N1: dropping web_guard after restore must cleanly release 'web.restore'"
+        );
+        db.release_cycle_lock("daemon.pit.pid888").unwrap();
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

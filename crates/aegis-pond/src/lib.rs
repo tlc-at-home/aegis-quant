@@ -980,6 +980,7 @@ impl PondOrchestrator {
                                 existing_stop_oid.as_deref(),
                             ) {
                                 Ok(Some(new_stop_oid)) => {
+                                    // R17-L1 / Section 8: Explicit stop-oid sync paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_open_pond_cell`
                                     let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
                                         cell.cell_id,
                                         Some(&new_stop_oid),
@@ -1104,6 +1105,7 @@ impl PondOrchestrator {
                             exits_triggered += 1;
                             if let Some(ref stop_oid) = existing_stop_oid {
                                 let _ = self.execution.cancel_resting_order(&cell.symbol, stop_oid);
+                                // R17-L1 / Section 8: Explicit clear paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_open_pond_cell`
                                 let _ = self
                                     .scoped_db
                                     .set_pond_cell_protective_stop_oid(cell.cell_id, None);
@@ -1170,6 +1172,7 @@ impl PondOrchestrator {
                                 Ok(Some(new_stop_oid)) => {
                                     self.execution
                                         .clear_protective_stop_self_heal_cooldown(&heal_key);
+                                    // R17-L1 / Section 8: Explicit stop-oid sync paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_open_pond_cell`
                                     let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
                                         cell.cell_id,
                                         Some(&new_stop_oid),
@@ -1794,6 +1797,7 @@ impl PondOrchestrator {
                         None,
                     ) {
                         Ok(Some(new_stop_oid)) => {
+                            // R17-L1 / Section 8: Explicit stop-oid sync paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_open_pond_cell`
                             let _ = self.scoped_db.set_pond_cell_protective_stop_oid(
                                 inserted_cell_id,
                                 Some(&new_stop_oid),

@@ -456,6 +456,7 @@ impl ExecutionEngine {
                                         existing_stop_oid.as_deref(),
                                     ) {
                                         Ok(Some(new_stop_oid)) => {
+                                            // R17-L1 / Section 8: Explicit stop-oid sync paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_trade` / `cancel_resting_trade`
                                             let _ = self.db.set_trade_protective_stop_oid(
                                                 trade.trade_id,
                                                 Some(&new_stop_oid),
@@ -583,6 +584,7 @@ impl ExecutionEngine {
                 }
                 if let Some(ref stop_oid) = existing_stop_oid {
                     let _ = self.cancel_resting_order(&trade.symbol, stop_oid);
+                    // R17-L1 / Section 8: Explicit clear paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_trade` / `cancel_resting_trade`
                     let _ = self.db.set_trade_protective_stop_oid(trade.trade_id, None);
                 }
                 if stop_eval.triggered {
@@ -664,6 +666,7 @@ impl ExecutionEngine {
                         ) {
                             Ok(Some(new_stop_oid)) => {
                                 self.clear_protective_stop_self_heal_cooldown(&heal_key);
+                                // R17-L1 / Section 8: Explicit stop-oid sync paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_trade` / `cancel_resting_trade`
                                 let _ = self.db.set_trade_protective_stop_oid(
                                     trade.trade_id,
                                     Some(&new_stop_oid),

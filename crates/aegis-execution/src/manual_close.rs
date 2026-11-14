@@ -329,6 +329,7 @@ impl ExecutionEngine {
         }
         if let Some(ref stop_oid) = existing_stop_oid {
             let _ = self.cancel_resting_order(&trade.symbol, stop_oid);
+            // R17-L1 / Section 8: Explicit clear paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_trade` / `cancel_resting_trade`
             let _ = self.db.set_trade_protective_stop_oid(trade.trade_id, None);
         }
         let _ = self.db.log_telemetry(
@@ -585,6 +586,7 @@ impl ExecutionEngine {
         }
         if let Some(ref stop_oid) = existing_stop_oid {
             let _ = self.cancel_resting_order(&cell.symbol, stop_oid);
+            // R17-L1 / Section 8: Explicit clear paired belt-and-braces with SQL `protective_stop_oid = NULL` in `close_open_pond_cell`
             let _ = self
                 .db
                 .set_pond_cell_protective_stop_oid(cell.cell_id, None);

@@ -1222,6 +1222,7 @@ pub async fn api_restore_db_backup(
     let tokens_for_step2 = state.pending_restore_tokens.clone();
 
     let restore_outcome = run_db_blocking(state.db.clone(), move |db| {
+        // 1. Re-evaluate web restore gate preconditions
         let (_, recheck_allowed, recheck_reasons, recheck_precond) =
             db.evaluate_web_restore_gate(None)?;
         if !recheck_allowed {
@@ -1230,18 +1231,52 @@ pub async fn api_restore_db_backup(
                 preconditions: recheck_precond,
             });
         }
+        // 2. Resolve whitelisted backup path & compute streaming SHA-256
         let backup_path = match db.resolve_whitelisted_backup_path(&fname_step2) {
             Ok(p) => p,
             Err(e) => return Ok(RestoreStep2Outcome::PreviewErr(e)),
         };
         let current_sha256 =
             aegis_db::DatabaseManager::compute_file_sha256_streaming(&backup_path)?;
-        let token_valid = {
+
+        // 3. R18-N3 Non-Destructive Token Pre-Validation (peek without consuming yet)
+        let pre_valid = {
             let now = std::time::Instant::now();
             let mut tokens = tokens_for_step2.lock();
             tokens.retain(|_, v| {
                 now.saturating_duration_since(v.created_at) <= Duration::from_secs(60)
             });
+            if let Some(entry) = tokens.get(&raw_token_owned) {
+                now.saturating_duration_since(entry.created_at) <= Duration::from_secs(60)
+                    && entry.filename == fname_step2
+                    && entry.client_ip == client_ip_step2
+                    && constant_time_eq(&entry.sha256, &current_sha256)
+            } else {
+                false
+            }
+        };
+        if !pre_valid {
+            tokens_for_step2.lock().remove(&raw_token_owned);
+            return Ok(RestoreStep2Outcome::InvalidToken);
+        }
+
+        // 4. R18-L1 & R18-N3 Acquire Cycle Lock BEFORE Consuming Token
+        let restore_ttl_ms = db.recommended_restore_lock_ttl_ms(Some(&backup_path));
+        let Some(_db_cycle_guard) = db.acquire_cycle_lock_guard("web.restore", restore_ttl_ms)?
+        else {
+            return Ok(RestoreStep2Outcome::Conflict {
+                reasons: vec![
+                    "Active db_cycle_lock acquired by another process; retry Step 2 once cycle completes (R18-N3)"
+                        .to_string(),
+                ],
+                preconditions: recheck_precond,
+            });
+        };
+
+        // 5. Consume Token After Lock Acquisition
+        let consumed_valid = {
+            let now = std::time::Instant::now();
+            let mut tokens = tokens_for_step2.lock();
             if let Some(entry) = tokens.remove(&raw_token_owned) {
                 now.saturating_duration_since(entry.created_at) <= Duration::from_secs(60)
                     && entry.filename == fname_step2
@@ -1251,17 +1286,21 @@ pub async fn api_restore_db_backup(
                 false
             }
         };
-        if !token_valid {
+        if !consumed_valid {
             return Ok(RestoreStep2Outcome::InvalidToken);
         }
-        let Some(_db_cycle_guard) = db.acquire_cycle_lock_guard("web.restore", 120_000)? else {
-            return Ok(RestoreStep2Outcome::Conflict {
-                reasons: vec!["Active engine_cycle_lock prevents restore".to_string()],
-                preconditions: recheck_precond,
-            });
-        };
+
+        // 6. Execute Restore Under _db_cycle_guard (R18-L1 & R18-N1)
+        let restore_started = std::time::Instant::now();
         let pre_restore_path = db.restore_sqlite_backup_with_options(&backup_path, false, true)?;
-        let _ = db.release_cycle_lock("web.restore");
+        let elapsed_ms = restore_started.elapsed().as_millis() as i64;
+        if elapsed_ms.saturating_mul(2) >= restore_ttl_ms {
+            tracing::warn!(
+                elapsed_ms,
+                restore_ttl_ms,
+                "Web restore exceeded 50% of initial cycle lock TTL (R18-L1)"
+            );
+        }
         let schema_version = db.get_schema_version()?;
         let pre_restore_str = pre_restore_path.display().to_string();
         let restored_from_str = backup_path.display().to_string();
@@ -1282,6 +1321,7 @@ pub async fn api_restore_db_backup(
             ),
             Some(audit_meta),
         );
+        drop(_db_cycle_guard);
         Ok(RestoreStep2Outcome::Restored(json!({
             "status": "restored",
             "filename": fname_step2,

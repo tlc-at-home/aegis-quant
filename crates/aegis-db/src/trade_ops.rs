@@ -625,6 +625,7 @@ impl DatabaseManager {
         let now_ms = self.now_ms();
         let closed_iso = aegis_core::format_ms_iso8601_utc(now_ms);
         self.with_conn(|conn| {
+            // Belt-and-braces with set_trade_protective_stop_oid(..., None) in aegis-execution (R17-L1).
             let rows = conn
                 .execute(
                     "UPDATE trades
@@ -1347,6 +1348,7 @@ impl DatabaseManager {
             .to_string();
 
         self.with_conn(|conn| {
+            // Belt-and-braces with set_trade_protective_stop_oid(..., None) in aegis-execution (R17-L1).
             let rows = conn
                 .execute(
                     "UPDATE trades

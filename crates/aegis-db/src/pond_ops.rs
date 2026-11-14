@@ -640,6 +640,7 @@ impl DatabaseManager {
         let _ = PondCellState::parse(target_state)?;
         let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         self.with_conn(|conn| {
+            // Belt-and-braces with set_pond_cell_protective_stop_oid(..., None) in aegis-pond / aegis-execution (R17-L1).
             let rows = conn
                 .execute(
                     "UPDATE pond_cells
