@@ -10,7 +10,9 @@ pub mod trade_ops;
 
 pub use config_ops::{cast_config_value, ConfigMap};
 pub use pond_ops::{BookPnlComponents, PitPnlComponents, PondPnlComponents};
-pub use schema_ops::{DbCycleLockGuard, ALL_MIGRATION_FILES, CANONICAL_SCHEMA_VERSION};
+pub use schema_ops::{
+    DbCycleLockGuard, ALL_MIGRATION_FILES, CANONICAL_SCHEMA_VERSION, MAX_CYCLE_LOCK_RENEWAL_TICKS,
+};
 pub use scoped::{BookScopedDb, PitConfig, PondConfig};
 
 use crate::fernet::{
@@ -53,6 +55,7 @@ pub struct DatabaseManager {
     pub(crate) conn_pool: Arc<Mutex<Vec<Connection>>>,
     pub(crate) pool_generation: Arc<AtomicU64>,
     pub(crate) discarded_stale_connections: Arc<AtomicU64>,
+    pub cycle_lock_renew_failures: Arc<AtomicU64>,
     pub(crate) file_swap_lock: Arc<RwLock<()>>,
     pub(crate) ext_pid_scan_cache: ExtPidScanCache,
     pub(crate) pit_timestamp_ms: Arc<AtomicI64>,
@@ -158,6 +161,7 @@ impl DatabaseManager {
             conn_pool: Arc::new(Mutex::new(Vec::with_capacity(8))),
             pool_generation: Arc::new(AtomicU64::new(1)),
             discarded_stale_connections: Arc::new(AtomicU64::new(0)),
+            cycle_lock_renew_failures: Arc::new(AtomicU64::new(0)),
             file_swap_lock: Arc::new(RwLock::new(())),
             ext_pid_scan_cache: Arc::new(Mutex::new(None)),
             pit_timestamp_ms: Arc::new(AtomicI64::new(-1)),
@@ -172,6 +176,16 @@ impl DatabaseManager {
 
     pub fn discarded_stale_connections_count(&self) -> u64 {
         self.discarded_stale_connections.load(Ordering::Acquire)
+    }
+
+    pub fn cycle_lock_renew_failures(&self) -> u64 {
+        self.cycle_lock_renew_failures.load(Ordering::Acquire)
+    }
+
+    pub fn record_cycle_lock_renew_failure(&self) -> u64 {
+        self.cycle_lock_renew_failures
+            .fetch_add(1, Ordering::AcqRel)
+            + 1
     }
 
     /// Checks out a `PooledConnGuard` stamped with the current `pool_generation` without holding
@@ -3798,10 +3812,14 @@ mod tests {
             "R17-N3: resolve_cli_binary_display must end with aegis-quant"
         );
 
-        // 3. R17-M1: External OS process holding open FD to DB must block both check_web_restore_preconditions
-        //    and restore_sqlite_backup_with_options(..., allow_live_override=false, in_service_quiesced=true).
+        // 3. R17-M1 & R19-L1: External OS process holding open FD to DB must block both check_web_restore_preconditions
+        //    and restore_sqlite_backup_with_options(..., allow_live_override=false, in_service_quiesced=true),
+        //    and an uncached detect_external_pid_holding_db() scan must immediately refresh the 30ms UI cache (R19-L1).
         #[cfg(target_os = "linux")]
         {
+            let (_, _, pre_before_spawn) = db.check_web_restore_preconditions().unwrap();
+            assert_eq!(pre_before_spawn["external_process_detected"], false);
+
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!("exec 3< '{}' && exec sleep 30", db_path.display()))
@@ -3824,6 +3842,8 @@ mod tests {
                 "R17-M1: detect_external_pid_holding_db must detect child process holding DB FD"
             );
 
+            // R19-L1: Immediately calling check_web_restore_preconditions() within the 30ms TTL window
+            // must observe external_process_detected == true because detect_external_pid_holding_db() refreshed ext_pid_scan_cache.
             let (ext_allowed, ext_reasons, ext_pre) = db.check_web_restore_preconditions().unwrap();
             assert!(!ext_allowed);
             assert_eq!(ext_pre["external_process_detected"], true);
@@ -3962,6 +3982,156 @@ mod tests {
             "R18-N1: dropping web_guard after restore must cleanly release 'web.restore'"
         );
         db.release_cycle_lock("daemon.pit.pid888").unwrap();
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_r19_m1_n1_n2_cycle_lock_non_reentrant_and_heartbeat_telemetry() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_r19_cycle_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        // 1. R19-M1: Same-owner try_acquire_cycle_lock must be strictly non-reentrant while unexpired
+        assert!(
+            db.try_acquire_cycle_lock("web.restore", 60_000).unwrap(),
+            "first acquisition by web.restore must succeed"
+        );
+        assert!(
+            !db.try_acquire_cycle_lock("web.restore", 60_000).unwrap(),
+            "R19-M1: second concurrent acquisition with identical owner 'web.restore' must return Ok(false)"
+        );
+        assert!(
+            db.acquire_cycle_lock_guard("web.restore", 60_000)
+                .unwrap()
+                .is_none(),
+            "R19-M1: acquire_cycle_lock_guard with identical owner 'web.restore' must return Ok(None) while held"
+        );
+        db.release_cycle_lock("web.restore").unwrap();
+        assert!(
+            db.try_acquire_cycle_lock("web.restore", 60_000).unwrap(),
+            "R19-M1: after release_cycle_lock, 'web.restore' must be able to re-acquire"
+        );
+        db.release_cycle_lock("web.restore").unwrap();
+
+        // 2. R19-N1: Stale rows in dedicated db_cycle_lock table must be scrubbed during release_cycle_lock
+        //    and during backup restore (apply_post_copy_cycle_lock_state).
+        let stale_exp = db.now_ms() + 3_600_000;
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS db_cycle_lock (
+                    lock_id INTEGER PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    acquired_ms INTEGER,
+                    expires_at_ms INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO db_cycle_lock (lock_id, owner, acquired_ms, expires_at_ms)
+                 VALUES (1, 'legacy.daemon.pid42', ?1, ?2)
+                 ON CONFLICT(lock_id) DO UPDATE SET owner = excluded.owner, expires_at_ms = excluded.expires_at_ms;",
+                params![stale_exp - 1000, stale_exp],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            db.detect_live_database_activity().unwrap().is_some(),
+            "unexpired row in dedicated db_cycle_lock table must be detected by detect_live_database_activity"
+        );
+        let backup_res = db.create_sqlite_backup(None, Some(7)).unwrap();
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+
+        // Release via release_cycle_lock("legacy.daemon.pid42") must delete the row from db_cycle_lock (R19-N1)
+        db.release_cycle_lock("legacy.daemon.pid42").unwrap();
+        let lock_rows_after_release: i64 = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row("SELECT COUNT(*) FROM db_cycle_lock;", [], |r| r.get(0))
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            lock_rows_after_release, 0,
+            "R19-N1: release_cycle_lock must scrub matching owner row from dedicated db_cycle_lock table"
+        );
+        assert!(
+            db.detect_live_database_activity().unwrap().is_none(),
+            "R19-N1: after release_cycle_lock scrubs db_cycle_lock, detect_live_database_activity must be None"
+        );
+
+        // Restoring the backup (which contained the stale db_cycle_lock row) must scrub db_cycle_lock in apply_post_copy_cycle_lock_state (R19-N1)
+        let _pre_snap = db.restore_sqlite_backup(&backup_path).unwrap();
+        let lock_rows_after_restore: i64 = db
+            .with_conn(|conn| {
+                Ok(conn
+                    .query_row("SELECT COUNT(*) FROM db_cycle_lock;", [], |r| r.get(0))
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            lock_rows_after_restore, 0,
+            "R19-N1: restore_sqlite_backup must scrub inherited rows from dedicated db_cycle_lock table"
+        );
+        assert!(
+            db.detect_live_database_activity().unwrap().is_none(),
+            "R19-N1: after restore_sqlite_backup scrubs db_cycle_lock, detect_live_database_activity must be None"
+        );
+        assert!(
+            db.try_acquire_cycle_lock("web.restore", 60_000).unwrap(),
+            "R19-N1: cycle lock must be immediately acquirable after restoring backup that had a stale db_cycle_lock row"
+        );
+        db.release_cycle_lock("web.restore").unwrap();
+
+        // 3. R19-N2: Verify MAX_CYCLE_LOCK_RENEWAL_TICKS == 90 and verify cycle_lock_renew_failures telemetry
+        //    increments when background heartbeat renewal loses lock ownership.
+        assert_eq!(MAX_CYCLE_LOCK_RENEWAL_TICKS, 90);
+        assert_eq!(db.cycle_lock_renew_failures(), 0);
+        let (_, _, pre_init) = db.check_web_restore_preconditions().unwrap();
+        assert_eq!(pre_init["cycle_lock_renew_failures"], 0);
+
+        let guard = db
+            .acquire_cycle_lock_guard("web.restore", 180)
+            .unwrap()
+            .expect("acquire 180ms guard for heartbeat failure test");
+        // Forcibly overwrite engine_cycle_lock_owner in system_config to simulate lost ownership
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'hijacked.owner' WHERE config_key = 'engine_cycle_lock_owner';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Wait for at least one 60ms heartbeat tick to observe Ok(false) and record failure
+        let mut failures = 0;
+        for _ in 0..20 {
+            failures = db.cycle_lock_renew_failures();
+            if failures >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            failures >= 1,
+            "R19-N2: background heartbeat losing ownership must increment cycle_lock_renew_failures (got {failures})"
+        );
+        let (_, _, pre_after_fail) = db.check_web_restore_preconditions().unwrap();
+        assert!(
+            pre_after_fail["cycle_lock_renew_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1,
+            "R19-N2: check_web_restore_preconditions must expose cycle_lock_renew_failures >= 1"
+        );
+        drop(guard);
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

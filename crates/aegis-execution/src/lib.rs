@@ -39,8 +39,8 @@ pub use http_client::{
 };
 pub use ingestion::MarketIngestionEngine;
 pub use live_dispatch::{
-    parse_hyperliquid_order_ack, HL_NO_MATCH_RETRY_SLIP_PCT, HL_ORACLE_BAND_PCT,
-    HL_ORACLE_RETRY_SLIP_PCT,
+    parse_hl_rejection_bbo, parse_hyperliquid_order_ack, HL_NO_MATCH_RETRY_SLIP_PCT,
+    HL_ORACLE_BAND_PCT, HL_ORACLE_RETRY_SLIP_PCT,
 };
 pub use signing::*;
 

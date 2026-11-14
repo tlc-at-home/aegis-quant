@@ -3415,3 +3415,258 @@ fn test_protective_stop_self_heal_cooldown() {
     exec.clear_protective_stop_self_heal_cooldown("pond:38");
     assert!(exec.should_attempt_protective_stop_self_heal("pond:38", 100_000));
 }
+
+#[test]
+fn test_alo_immediate_match_bbo_retry_and_pit_rejection_telemetry() {
+    use crate::live_dispatch::{compute_alo_retry_passive_limit_price, parse_hl_rejection_bbo};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // (1) parse_hl_rejection_bbo (`2331.2@2331.3` & `0.08825@0.08826` with trailing `. asset=...`)
+    assert_eq!(
+        parse_hl_rejection_bbo(
+            "HL_REJECTED:Post only order would have immediately matched, bbo was 2331.2@2331.3. asset=1"
+        ),
+        Some((2331.2, 2331.3))
+    );
+    assert_eq!(
+        parse_hl_rejection_bbo(
+            "Post only order would have immediately matched, bbo was 0.08825@0.08826. asset=42"
+        ),
+        Some((0.08825, 0.08826))
+    );
+    assert_eq!(
+        parse_hl_rejection_bbo("Order price too far from oracle"),
+        None
+    );
+
+    // (5) oracle_px band-clamp edge cases (Section 7.1(d)(3))
+    let long_clamped = compute_alo_retry_passive_limit_price(
+        100.0,
+        100.1,
+        0.1,
+        1.5,
+        Some(105.0), // band_lo = 105.0 * 0.9605 = 100.8525 > passive_cap (100.0) -> must still enforce <= passive_cap (100.0)
+        true,
+    );
+    assert!(
+        long_clamped <= 100.0 && (long_clamped - 100.0).abs() < 1e-6,
+        "LONG Alo retry must never exceed passive_cap even when oracle band_lo is higher: {long_clamped}"
+    );
+    let short_clamped = compute_alo_retry_passive_limit_price(
+        100.0,
+        100.1,
+        0.1,
+        1.5,
+        Some(95.0), // band_hi = 95.0 * 1.0395 = 98.7525 < passive_floor (100.1) -> must still enforce >= passive_floor (100.1)
+        false,
+    );
+    assert!(
+        short_clamped >= 100.1 && (short_clamped - 100.1).abs() < 1e-6,
+        "SHORT Alo retry must never drop below passive_floor even when oracle band_hi is lower: {short_clamped}"
+    );
+
+    // Wire mock server for (2) LONG passive retry, (3) SHORT passive retry, and (4) -retry1 bounded-retry guard
+    let db = DatabaseManager::memory();
+    db.initialize_schema(true).unwrap();
+    let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+    let wallet = aegis_core::derive_evm_address_from_private_key(pk).unwrap();
+    db.set_config_value("execution_mode", &json!("TESTNET"))
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet", &json!(true))
+        .unwrap();
+    db.set_config_value("private_key", &json!(pk)).unwrap();
+    db.set_config_value("wallet_address", &json!(wallet))
+        .unwrap();
+
+    let exec = ExecutionEngine::new(db.clone());
+    exec.asset_index_cache
+        .lock()
+        .insert((true, "ETH".to_string()), (1_u32, db.now_ms()));
+
+    let mut eth_asset = db
+        .get_usdc_perp_universe()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.symbol == "ETH/USDC:USDC")
+        .unwrap();
+    eth_asset.tick_size = 0.1;
+    eth_asset.lot_step_size = 0.01;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let captured_orders =
+        std::sync::Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
+    let captured_clone = captured_orders.clone();
+
+    let responses = [
+        // (2) LONG Alo immediate match -> fast-path BBO parse (no /info call) -> retry Alo resting
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Post only order would have immediately matched, bbo was 2331.2@2331.3. asset=1"}]}}}"#,
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":8101}}]}}}"#,
+        // (3) SHORT Alo immediate match -> fast-path BBO parse (no /info call) -> retry Alo resting
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Post only order would have immediately matched, bbo was 2331.2@2331.3. asset=1"}]}}}"#,
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":8102}}]}}}"#,
+        // (4) Bounded retry guard: initial Alo rejects AND -retry1 Alo also rejects -> stops at 2 requests
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Post only order would have immediately matched, bbo was 2331.2@2331.3. asset=1"}]}}}"#,
+        r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Post only order would have immediately matched, bbo was 2331.0@2331.1. asset=1"}]}}}"#,
+    ];
+
+    let handle = std::thread::spawn(move || {
+        let mut idx = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
+            && std::time::Instant::now() < deadline
+            && idx < responses.len()
+        {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                    let mut buf = [0u8; 8192];
+                    let mut total = Vec::new();
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        total.extend_from_slice(&buf[..n]);
+                        if let Some(hdr_end) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let body_start = hdr_end + 4;
+                            let hdr_str = String::from_utf8_lossy(&total[..hdr_end]);
+                            let content_len = hdr_str
+                                .lines()
+                                .find_map(|l| {
+                                    let lower = l.to_ascii_lowercase();
+                                    lower
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if total.len() >= body_start + content_len {
+                                let req_body = &total[body_start..body_start + content_len];
+                                if let Ok(val) =
+                                    serde_json::from_slice::<serde_json::Value>(req_body)
+                                {
+                                    if val.get("action").is_some() {
+                                        captured_clone.lock().push(val);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    let body = responses[idx];
+                    idx += 1;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let _ = stream.read(&mut buf);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let endpoint = format!("http://{addr}");
+    db.set_config_value("hyperliquid_testnet_url", &json!(endpoint))
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_info_url", &json!(endpoint))
+        .unwrap();
+    let cfg = db.load_config().unwrap();
+
+    // (2) LONG passive retry
+    let res_long = exec.submit_hyperliquid_order_live(
+        &eth_asset,
+        "LONG",
+        0.10,
+        2331.4,
+        2331.25,
+        true,
+        false,
+        "alo-long-1",
+        &cfg,
+        true,
+    );
+    assert_eq!(res_long.fsm_state, "OPEN_ON_BOOK");
+    assert_eq!(res_long.exchange_order_id, "hl-8101");
+    assert_eq!(res_long.client_order_id, "alo-long-1");
+
+    // (3) SHORT passive retry (Section 7.1(d)(1))
+    let res_short = exec.submit_hyperliquid_order_live(
+        &eth_asset,
+        "SHORT",
+        0.10,
+        2331.1,
+        2331.25,
+        true,
+        false,
+        "alo-short-1",
+        &cfg,
+        true,
+    );
+    assert_eq!(res_short.fsm_state, "OPEN_ON_BOOK");
+    assert_eq!(res_short.exchange_order_id, "hl-8102");
+    assert_eq!(res_short.client_order_id, "alo-short-1");
+
+    // (4) -retry1 bounded-retry guard (Section 7.1(d)(2))
+    let res_bounded = exec.submit_hyperliquid_order_live(
+        &eth_asset,
+        "LONG",
+        0.10,
+        2331.4,
+        2331.25,
+        true,
+        false,
+        "alo-bounded-1",
+        &cfg,
+        true,
+    );
+    assert_eq!(res_bounded.fsm_state, "REJECTED");
+    assert_eq!(res_bounded.client_order_id, "alo-bounded-1");
+
+    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = handle.join();
+
+    let sent = captured_orders.lock();
+    assert_eq!(
+        sent.len(),
+        6,
+        "Expected exactly 6 /exchange order posts (2 per scenario, bounded at 1 retry)"
+    );
+    let long_retry_px: f64 = sent[1]["action"]["orders"][0]["p"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        long_retry_px <= 2331.2,
+        "LONG Alo retry price must be passive (<= bid 2331.2), got {long_retry_px}"
+    );
+    assert_eq!(
+        sent[1]["action"]["orders"][0]["t"]["limit"]["tif"].as_str(),
+        Some("Alo")
+    );
+    let short_retry_px: f64 = sent[3]["action"]["orders"][0]["p"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        short_retry_px >= 2331.3,
+        "SHORT Alo retry price must be passive (>= ask 2331.3), got {short_retry_px}"
+    );
+    assert_eq!(
+        sent[3]["action"]["orders"][0]["t"]["limit"]["tif"].as_str(),
+        Some("Alo")
+    );
+}

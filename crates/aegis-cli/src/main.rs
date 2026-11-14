@@ -1286,8 +1286,12 @@ pub fn run_readiness_suite(
             name: "Out-of-Sample Annualized Sharpe Ratio".to_string(),
             status: if ts.gate_sharpe_pass { "PASS" } else { "FAIL" }.to_string(),
             observed: format!(
-                "Sharpe = {:.2} (stop overrides: {})",
-                ts.annualized_sharpe, stop_subs_disclosure
+                "Sharpe = {:.2} (regime={}, active_stops={:?}, fired_subs={:?}, stop overrides: {})",
+                ts.annualized_sharpe,
+                ts.stop_regime_label,
+                ts.active_stop_set,
+                ts.fired_stop_substitutions,
+                stop_subs_disclosure
             ),
             requirement: "Annualized Sharpe >= 1.20".to_string(),
             remediation: "Run walk-forward calibration: aegis-quant run --once --calibrate"
@@ -1426,6 +1430,48 @@ pub fn run_readiness_suite(
             "Writable backup directory with verified snapshot <= {max_age_hours}h old (ME-19)"
         ),
         remediation: "Run: aegis-quant db --backup".to_string(),
+    });
+
+    let required_units = [
+        "aegis-quant.service",
+        "aegis-pit.service",
+        "aegis-pond.service",
+        "aegis-settle.service",
+        "aegis-settle.timer",
+    ];
+    let deploy_dir = project_root.join("deploy");
+    let all_repo_units_present = required_units.iter().all(|u| {
+        fs::metadata(deploy_dir.join(u))
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
+    });
+    let bootstrap_src = fs::read_to_string(deploy_dir.join("bootstrap_vm.sh")).unwrap_or_default();
+    let bootstrap_installs_all = required_units.iter().all(|u| bootstrap_src.contains(u))
+        && bootstrap_src.contains("enable --now aegis-settle.timer");
+    let host_quant_installed =
+        std::path::Path::new("/etc/systemd/system/aegis-quant.service").exists();
+    let host_settle_units_ok = !host_quant_installed
+        || (std::path::Path::new("/etc/systemd/system/aegis-settle.service").exists()
+            && std::path::Path::new("/etc/systemd/system/aegis-settle.timer").exists());
+    let deploy04_ok = all_repo_units_present && bootstrap_installs_all && host_settle_units_ok;
+    checks.push(CheckResult {
+        gate: "Gate 6: Deployment & Backup".to_string(),
+        check_id: "DEPLOY-04".to_string(),
+        name: "Systemd Settle Timer & 5-Unit Bootstrap".to_string(),
+        status: if deploy04_ok { "PASS" } else { "FAIL" }.to_string(),
+        observed: format!(
+            "repo_units_5={}, bootstrap_timer_enable={}, host_quant_installed={}, host_settle_units_ok={}",
+            all_repo_units_present,
+            bootstrap_installs_all,
+            host_quant_installed,
+            host_settle_units_ok
+        ),
+        requirement:
+            "All 5 systemd units present in deploy/ and installed + enabled by deploy/bootstrap_vm.sh (R19-L4)"
+                .to_string(),
+        remediation:
+            "Install all 5 deploy/aegis-*.{service,timer} units and enable aegis-settle.timer"
+                .to_string(),
     });
 
     let fail_count = checks.iter().filter(|c| c.status == "FAIL").count();
@@ -1758,7 +1804,10 @@ fn main() -> anyhow::Result<()> {
                 let _lock_guard = pond
                     .scoped_db
                     .inner()
-                    .acquire_cycle_lock_guard("cli-pond-scan", 120_000)?
+                    .acquire_cycle_lock_guard(
+                        &format!("cli-pond-scan.pid{}", std::process::id()),
+                        120_000,
+                    )?
                     .ok_or_else(|| {
                         AegisError::Validation(
                             "Another Aegis cycle or daemon currently holds the database advisory cycle lock (HI-4)"
@@ -1972,7 +2021,10 @@ fn run_orchestrator(
     let book_mode = book.trim().to_ascii_lowercase();
     if once {
         let _lock_guard = db
-            .acquire_cycle_lock_guard("cli-run-once", 120_000)?
+            .acquire_cycle_lock_guard(
+                &format!("cli-run-once.pid{}", std::process::id()),
+                120_000,
+            )?
             .ok_or_else(|| {
                 AegisError::Validation(
                     "Another Aegis cycle or daemon currently holds the database advisory cycle lock (HI-4)"
@@ -2360,15 +2412,17 @@ mod tests {
         let mut orch_pit = AegisOrchestrator::new(db.clone());
         assert_eq!(orch_pit.last_backup_ms, None);
 
-        // Readiness on disk DB auto-seeds initial backup & verifies DEPLOY-01..03 PASS + DB-02 PASS (schema >= 15)
+        // Readiness on disk DB auto-seeds initial backup & verifies DEPLOY-01..04 PASS + DB-02 PASS (schema >= 16)
         let (_is_ok, _verdict, checks) = run_readiness_suite(&db, Some("PAPER"), true).unwrap();
         let d1 = checks.iter().find(|c| c.check_id == "DEPLOY-01").unwrap();
         let d2 = checks.iter().find(|c| c.check_id == "DEPLOY-02").unwrap();
         let d3 = checks.iter().find(|c| c.check_id == "DEPLOY-03").unwrap();
+        let d4 = checks.iter().find(|c| c.check_id == "DEPLOY-04").unwrap();
         let db02 = checks.iter().find(|c| c.check_id == "DB-02").unwrap();
         assert_eq!(d1.status, "PASS");
         assert_eq!(d2.status, "PASS");
         assert_eq!(d3.status, "PASS");
+        assert_eq!(d4.status, "PASS");
         assert_eq!(db02.status, "PASS");
 
         // Second orchestrator (e.g. pond daemon) picks up `last_sqlite_backup_ms` from DB & does not duplicate backup

@@ -78,6 +78,71 @@ pub(crate) fn compute_ioc_retry_limit_price(
     }
 }
 
+/// Extracts `(bid, ask)` from Hyperliquid rejection strings containing `bbo was <bid>@<ask>` (`R19-M2`).
+pub fn parse_hl_rejection_bbo(msg: &str) -> Option<(f64, f64)> {
+    let lower = msg.to_ascii_lowercase();
+    let idx = lower.find("bbo was ")?;
+    let after = msg[idx + "bbo was ".len()..].trim_start();
+    let token_end = after
+        .find(|c: char| {
+            !(c.is_ascii_digit()
+                || c == '.'
+                || c == '@'
+                || c == '+'
+                || c == '-'
+                || c == 'e'
+                || c == 'E')
+        })
+        .unwrap_or(after.len());
+    let bbo_token = after[..token_end].trim_end_matches('.');
+    let (bid_str, ask_str) = bbo_token.split_once('@')?;
+    let bid = bid_str.trim().parse::<f64>().ok()?;
+    let ask = ask_str.trim().parse::<f64>().ok()?;
+    if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && bid <= ask {
+        Some((bid, ask))
+    } else {
+        None
+    }
+}
+
+/// Computes a strictly passive (`Alo` post-only safe) retry limit price from the exchange's
+/// reported `bid`/`ask` BBO (`R19-M2`).
+pub(crate) fn compute_alo_retry_passive_limit_price(
+    bid: f64,
+    ask: f64,
+    tick_size: f64,
+    chase_bps: f64,
+    oracle_px_opt: Option<f64>,
+    is_buy: bool,
+) -> f64 {
+    let mid = 0.5 * (bid + ask);
+    let tick = if tick_size > 0.0 && tick_size.is_finite() {
+        tick_size
+    } else {
+        1e-6
+    };
+    let chase_frac = chase_bps.max(0.0) / 10_000.0;
+    if is_buy {
+        let passive_cap = (ask - tick).min(bid);
+        let mut raw_px = (mid * (1.0 - chase_frac)).min(passive_cap);
+        if let Some(oracle_px) = oracle_px_opt.filter(|v| *v > 0.0 && v.is_finite()) {
+            let band_lo = oracle_px * (1.0 - HL_ORACLE_BAND_PCT);
+            let band_hi = oracle_px * (1.0 + HL_ORACLE_BAND_PCT);
+            raw_px = raw_px.clamp(band_lo, band_hi).min(passive_cap);
+        }
+        ((raw_px / tick) + 1e-9).floor() * tick
+    } else {
+        let passive_floor = (bid + tick).max(ask);
+        let mut raw_px = (mid * (1.0 + chase_frac)).max(passive_floor);
+        if let Some(oracle_px) = oracle_px_opt.filter(|v| *v > 0.0 && v.is_finite()) {
+            let band_lo = oracle_px * (1.0 - HL_ORACLE_BAND_PCT);
+            let band_hi = oracle_px * (1.0 + HL_ORACLE_BAND_PCT);
+            raw_px = raw_px.clamp(band_lo, band_hi).max(passive_floor);
+        }
+        ((raw_px / tick) - 1e-9).ceil() * tick
+    }
+}
+
 /// Parses a Hyperliquid `/exchange` order response into an `OrderExecutionResult` (`NH-7`, `NM-9`, `Q1`).
 ///
 /// Key safety invariants:
@@ -694,15 +759,21 @@ impl ExecutionEngine {
         );
 
         if ack_res.fsm_state == "REJECTED" {
-            let resp_lower = resp.to_string().to_ascii_lowercase();
-            if resp_lower.contains("asset") || resp_lower.contains("invalid") {
-                self.asset_index_cache.lock().clear();
-            }
-            let fill_lower = ack_res.fill_type.to_ascii_lowercase();
+            let err_msg = ack_res.fill_type.clone();
+            let fill_lower = err_msg.to_ascii_lowercase();
             let is_no_match = fill_lower.contains("could not immediately match");
+            let is_alo_immediate_match = err_msg
+                .contains("Post only order would have immediately matched")
+                || fill_lower.contains("would have immediately matched");
             let is_oracle_band = fill_lower.contains("price too far from oracle")
                 || fill_lower.contains("away from the reference price")
                 || fill_lower.contains("reference price");
+            let resp_lower = resp.to_string().to_ascii_lowercase();
+            if !(is_no_match || is_alo_immediate_match || is_oracle_band)
+                && (resp_lower.contains("asset") || resp_lower.contains("invalid"))
+            {
+                self.asset_index_cache.lock().clear();
+            }
             if !prefer_maker && (is_no_match || is_oracle_band) {
                 let info_endpoint = self.info_url(cfg, is_testnet);
                 let coin_key = asset.base_asset.trim().to_uppercase();
@@ -882,6 +953,115 @@ impl ExecutionEngine {
                     }
                     Err(_) => {}
                 }
+            } else if prefer_maker
+                && !coid.ends_with("-retry1")
+                && (is_alo_immediate_match || is_oracle_band)
+            {
+                // Section 7.1(c) / R19-M2: Fast path extracts `<bid>@<ask>` directly from the
+                // Hyperliquid Alo rejection message (`parse_hl_rejection_bbo(&err_msg)`) without a
+                // redundant `metaAndAssetCtxs` HTTP round-trip; falls back to `metaAndAssetCtxs` /
+                // `allMids` only when `parse_hl_rejection_bbo` returns `None` or `is_oracle_band` is true.
+                let parsed_bbo = parse_hl_rejection_bbo(&err_msg);
+                let mut oracle_px_opt: Option<f64> = None;
+                let mut fallback_mid_opt: Option<f64> = None;
+                if parsed_bbo.is_none() || is_oracle_band {
+                    let info_endpoint = self.info_url(cfg, is_testnet);
+                    let coin_key = asset.base_asset.trim().to_uppercase();
+                    if let Some(meta_ctxs) =
+                        self.http_post_json(&info_endpoint, &json!({ "type": "metaAndAssetCtxs" }))
+                    {
+                        if let Some(arr) = meta_ctxs.as_array() {
+                            if arr.len() >= 2 {
+                                if let (Some(univ), Some(ctxs)) = (
+                                    arr[0].get("universe").and_then(Value::as_array),
+                                    arr[1].as_array(),
+                                ) {
+                                    for (m, c) in univ.iter().zip(ctxs.iter()) {
+                                        let name =
+                                            m.get("name").and_then(Value::as_str).unwrap_or("");
+                                        if name.eq_ignore_ascii_case(&coin_key) {
+                                            oracle_px_opt = c
+                                                .get("oraclePx")
+                                                .and_then(|v| {
+                                                    v.as_f64().or_else(|| {
+                                                        v.as_str()
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                    })
+                                                })
+                                                .filter(|&p| p.is_finite() && p > 0.0);
+                                            fallback_mid_opt = c
+                                                .get("midPx")
+                                                .or_else(|| c.get("markPx"))
+                                                .and_then(|v| {
+                                                    v.as_f64().or_else(|| {
+                                                        v.as_str()
+                                                            .and_then(|s| s.parse::<f64>().ok())
+                                                    })
+                                                })
+                                                .filter(|&p| p.is_finite() && p > 0.0);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if fallback_mid_opt.is_none() && parsed_bbo.is_none() {
+                        fallback_mid_opt = self
+                            .http_post_json(&info_endpoint, &json!({ "type": "allMids" }))
+                            .and_then(|mids| {
+                                mids.get(&coin_key)
+                                    .and_then(|v| {
+                                        v.as_f64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<f64>().ok())
+                                        })
+                                    })
+                                    .filter(|&p| p.is_finite() && p > 0.0)
+                            });
+                    }
+                }
+                let tick = asset.tick_size.max(1e-6);
+                let (bid, ask) = parsed_bbo.unwrap_or_else(|| {
+                    let mid = fallback_mid_opt.unwrap_or(reference_price);
+                    ((mid - 0.5 * tick).max(tick), mid + 0.5 * tick)
+                });
+                let chase_bps = cfg.get_f64("maker_chaser_offset_bps", 1.5);
+                let retry_limit_px = compute_alo_retry_passive_limit_price(
+                    bid,
+                    ask,
+                    asset.tick_size,
+                    chase_bps,
+                    oracle_px_opt,
+                    is_buy,
+                );
+                let retry_px_str =
+                    format_hl_wire_price(retry_limit_px, asset.tick_size, sz_decimals);
+                let retry_coid = format!("{coid}-retry1");
+                tracing::warn!(
+                    symbol = %asset.symbol,
+                    side = norm_side,
+                    coid = coid,
+                    retry_coid = %retry_coid,
+                    bid = bid,
+                    ask = ask,
+                    prev_limit_px = limit_price,
+                    retry_limit_px = %retry_px_str,
+                    "ALO_IMMEDIATE_MATCH_PASSIVE_RETRY: repricing post-only maker order to passive BBO (R19-M2)"
+                );
+                let mut retry_res = self.submit_hyperliquid_order_live(
+                    asset,
+                    norm_side,
+                    quantity,
+                    retry_limit_px,
+                    0.5 * (bid + ask),
+                    true,
+                    is_reduce_only,
+                    &retry_coid,
+                    cfg,
+                    is_testnet,
+                );
+                retry_res.client_order_id = coid.to_string();
+                ack_res = retry_res;
             }
         }
 

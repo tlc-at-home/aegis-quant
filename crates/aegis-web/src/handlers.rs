@@ -335,6 +335,7 @@ pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
             max_bar_staleness_ms,
             pool_generation: state.db.pool_generation(),
             discarded_stale_connections: state.db.discarded_stale_connections_count(),
+            cycle_lock_renew_failures: state.db.cycle_lock_renew_failures(),
         }),
     )
 }

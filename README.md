@@ -135,21 +135,21 @@ Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashb
 
 ## Workspace Test Suite Inventory (`cargo test --workspace`)
 
-All **165** tests across all 13 workspace crates pass with zero ignored or skipped cases (`R15-QA(b)`, `R16`, `R17`, `R18`):
+All **167** tests across all 13 workspace crates pass with zero ignored or skipped cases (`R15-QA(b)`, `R16`, `R17`, `R18`, `R19`):
 
 | Crate / Target | Tests | Coverage Highlights |
 | --- | ---: | --- |
 | `aegis-core` (lib) | 10 | Domain types, step/tick rounding, dynamic open-heat helpers, bare-hex & Gemini key redaction |
-| `aegis-db` (lib + `aegis-db-tool`) | 32 | Fernet AES encryption, schema `v16` upgrades, WAL split-brain pool generation epochs (`R16-M1`), live-activity & `/proc` restore guards (`R16-M2`, `R17-M1`), cycle-lock renewal heartbeat & post-copy lock hygiene (`R18-L1`, `R18-N1`, `R18-N2`), streaming SHA-256 & backup preview (`R17-L2`) |
+| `aegis-db` (lib + `aegis-db-tool`) | 33 | Fernet AES encryption, schema `v16` upgrades, WAL split-brain pool generation epochs (`R16-M1`), live-activity & `/proc` restore guards (`R16-M2`, `R17-M1`), non-reentrant cycle lock & renewal heartbeat telemetry (`R18-L1`, `R19-M1`, `R19-N1`, `R19-N2`), streaming SHA-256 & backup preview (`R17-L2`) |
 | `aegis-signals` (lib) | 9 | Causal HMM, MACE, SNR, intrabar hysteresis margin & `prev_ema_v` cache persistence |
 | `aegis-risk` (lib) | 8 | Dynamic open heat, Chandelier stops, 20-asset cluster map & `OTHER` cluster cap |
 | `aegis-alerts` (lib) | 5 | Token redaction, 2-cycle RegimeFlip confirmation, per-channel retry, chat-id preservation |
 | `aegis-telemetry` (lib) | 2 | Bounded async SQLite log queue & broadcast bus |
-| `aegis-execution` (lib) | 30 | EIP-712 signing, stale-oracle IOC clamping, submit-before-cancel & trigger field order stops, `cancelByCloid`, HLP rebalance (`R16-L3`), `ME-12` leg-1 journal |
+| `aegis-execution` (lib) | 31 | EIP-712 signing, stale-oracle IOC clamping, post-only `Alo` BBO passive retry (`R19-M2`), Pit rejection telemetry (`R19-L3`), submit-before-cancel & trigger field order stops, `cancelByCloid`, HLP rebalance (`R16-L3`), `ME-12` leg-1 journal |
 | `aegis-pit` (lib) | 3 | Scoped DB execution cycle, freeze-window Chandelier trailing |
 | `aegis-pond` (lib) | 20 | `NPS-01` 6-gate scanner, 6-tier exits, synthetic-refresh guard, persisted exit retry counters |
 | `aegis-settle` (lib) | 12 | PP-50 idle-only settling, `HaltedPp50` vs `SkippedNoIdle`, funding-offset `pond_heat`, transfer quarantine |
-| `aegis-backtest` (lib) | 4 | Zero-lookahead replay, taker default + entry slippage parity, `old -> new` stop disclosure |
+| `aegis-backtest` (lib) | 4 | Zero-lookahead replay, taker default + entry slippage parity, `old -> new` stop disclosure & substitution counters (`R19-N3`) |
 | `aegis-web` (lib) | 18 | Session-nonce cookie auth, SSE `DefaultHasher` heartbeat, backup cooldown, two-step guarded WebUI restore, per-IP token cap & lock-conflict token preservation (`R16-U1`, `R17-M1`, `R17-N2`, `R18-N3`), proxy trust gate |
-| `aegis-cli` (`aegis-quant` + `test_firewall_ast`) | 12 | CLI args, firewall F1-F6 AST & WAL concurrency, `R16-U2` secret hygiene scan, readiness `DEPLOY-01..03`, shared backup cadence & `--force` restore |
-| **Total Workspace** | **165** | Enforced as minimum floor (`>= 165`) in `.github/workflows/ci.yml` |
+| `aegis-cli` (`aegis-quant` + `test_firewall_ast`) | 12 | CLI args, firewall F1-F6 AST & WAL concurrency, `R16-U2` secret hygiene scan, readiness `DEPLOY-01..04` (`R19-L4`), shared backup cadence & `--force` restore |
+| **Total Workspace** | **167** | Enforced as minimum floor (`>= 167`) in `.github/workflows/ci.yml` |

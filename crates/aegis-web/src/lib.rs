@@ -3020,6 +3020,7 @@ mod tests {
         let health_json: serde_json::Value = serde_json::from_slice(&health_bytes).unwrap();
         assert!(health_json["pool_generation"].as_u64().unwrap() >= 1);
         assert_eq!(health_json["discarded_stale_connections"].as_u64(), Some(0));
+        assert_eq!(health_json["cycle_lock_renew_failures"].as_u64(), Some(0));
 
         // 2. Create a backup via POST /api/v1/db/backup and retrieve its bare filename
         let create_resp = app

@@ -494,6 +494,8 @@ impl BacktestEngine {
         // Operators or tests can disable this 4H horizon scaling by setting
         // `backtest_scale_4h_stops = false` in `system_config` (R7-N1).
         let cur_cfg = bt_db.load_config()?;
+        let scale_4h_enabled = cur_cfg.get_bool("backtest_scale_4h_stops", true)
+            || cur_cfg.get_bool("backtest_use_calibrated_stop_profile", false);
         let stop_subs = Self::collect_4h_stop_substitutions(&cur_cfg);
         if !stop_subs.is_empty() {
             let subs_summary = Self::format_4h_stop_substitutions(&cur_cfg);
@@ -663,6 +665,9 @@ impl BacktestEngine {
         let mut bear_bars = 0usize;
         let mut chop_bars = 0usize;
         let mut cooldown_until_bar: HashMap<String, usize> = HashMap::new();
+        let mut subst_breakeven_count = 0usize;
+        let mut subst_profit_lock_count = 0usize;
+        let mut subst_rmultiple_trail_count = 0usize;
 
         for t in eval_start..n_total {
             let now_ms = btc_bars[t].timestamp_ms;
@@ -822,6 +827,21 @@ impl BacktestEngine {
                 let new_funding = round_dp(trade.funding_accrued_usdc + funding_4h, 4);
 
                 if let Some(reason) = exit_reason {
+                    if stop_eval.triggered && scale_4h_enabled {
+                        let fav_excursion = if trade.side == "LONG" {
+                            (stop_eval.highest_price_seen - trade.entry_price).max(0.0)
+                        } else {
+                            (trade.entry_price - stop_eval.lowest_price_seen).max(0.0)
+                        };
+                        let eff_atr = stop_eval.effective_atr.max(1e-8);
+                        if fav_excursion >= 1.5 * eff_atr {
+                            subst_rmultiple_trail_count += 1;
+                        } else if fav_excursion >= 1.0 * eff_atr {
+                            subst_profit_lock_count += 1;
+                        } else if fav_excursion >= 0.8 * eff_atr {
+                            subst_breakeven_count += 1;
+                        }
+                    }
                     if stop_eval.is_wick_stop {
                         wick_stop_outs += 1;
                     }
@@ -1227,6 +1247,46 @@ impl BacktestEngine {
         let gate_profit_factor_pass = trade_pf >= min_pf;
         let all_gates_passed = gate_sharpe_pass && gate_mdd_pass && gate_profit_factor_pass;
 
+        let (stop_regime_label, active_stop_set, fired_stop_substitutions) = if scale_4h_enabled {
+            let mut subs = std::collections::BTreeMap::new();
+            subs.insert(
+                "Breakeven->ATRChandelier".to_string(),
+                subst_breakeven_count,
+            );
+            subs.insert(
+                "ProfitLock->ATRChandelier".to_string(),
+                subst_profit_lock_count,
+            );
+            subs.insert(
+                "RMultipleTrail->ATRChandelier".to_string(),
+                subst_rmultiple_trail_count,
+            );
+            (
+                "Compressed4Stop_v16_Baseline".to_string(),
+                vec![
+                    "HardSL".to_string(),
+                    "ATRChandelier".to_string(),
+                    "StructureSwing".to_string(),
+                    "TimeDecay".to_string(),
+                ],
+                subs,
+            )
+        } else {
+            (
+                "Full7Stop_v15_DynamicATR".to_string(),
+                vec![
+                    "HardSL".to_string(),
+                    "Breakeven".to_string(),
+                    "ProfitLock".to_string(),
+                    "ATRChandelier".to_string(),
+                    "RMultipleTrail".to_string(),
+                    "StructureSwing".to_string(),
+                    "TimeDecay".to_string(),
+                ],
+                std::collections::BTreeMap::new(),
+            )
+        };
+
         Ok((
             BacktestTearSheet {
                 start_date,
@@ -1265,6 +1325,9 @@ impl BacktestEngine {
                 gate_mdd_pass,
                 gate_profit_factor_pass,
                 all_gates_passed,
+                stop_regime_label,
+                active_stop_set,
+                fired_stop_substitutions,
             },
             per_bar_evals,
             per_bar_open_trades,
@@ -1585,5 +1648,27 @@ mod tests {
             BacktestEngine::format_4h_stop_substitutions(&cfg_raw),
             "none (raw live stops)"
         );
+
+        // R19-N3: Verify explicit stop_regime_label, active_stop_set, and fired_stop_substitutions on both regimes
+        assert_eq!(ts_taker.stop_regime_label, "Compressed4Stop_v16_Baseline");
+        assert_eq!(
+            ts_taker.active_stop_set,
+            vec!["HardSL", "ATRChandelier", "StructureSwing", "TimeDecay"]
+        );
+        assert!(ts_taker
+            .fired_stop_substitutions
+            .contains_key("Breakeven->ATRChandelier"));
+        assert!(ts_taker
+            .fired_stop_substitutions
+            .contains_key("ProfitLock->ATRChandelier"));
+        assert!(ts_taker
+            .fired_stop_substitutions
+            .contains_key("RMultipleTrail->ATRChandelier"));
+
+        let bt_raw = BacktestEngine::new(db_taker, 30);
+        let ts_raw = bt_raw.run_backtest(Some(90), Some(70), true).unwrap();
+        assert_eq!(ts_raw.stop_regime_label, "Full7Stop_v15_DynamicATR");
+        assert_eq!(ts_raw.active_stop_set.len(), 7);
+        assert!(ts_raw.fired_stop_substitutions.is_empty());
     }
 }

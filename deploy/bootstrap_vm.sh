@@ -11,8 +11,15 @@ LOG_DIR="${AEGIS_ROOT}/logs"
 BIN_DIR="${AEGIS_ROOT}/bin"
 DB_PATH="${DATA_DIR}/aegis_quant.db"
 KEY_PATH="${DATA_DIR}/.aegis_master_key"
-SERVICE_SRC="${AEGIS_ROOT}/deploy/aegis-quant.service"
-SERVICE_DST="/etc/systemd/system/aegis-quant.service"
+DEPLOY_DIR="${AEGIS_ROOT}/deploy"
+SYSTEMD_DIR="/etc/systemd/system"
+SYSTEMD_UNITS=(
+    "aegis-quant.service"
+    "aegis-pit.service"
+    "aegis-pond.service"
+    "aegis-settle.service"
+    "aegis-settle.timer"
+)
 
 echo "[1/6] Verifying system dependencies & chronyd time synchronization on Fedora..."
 sudo dnf install -y --skip-unavailable sqlite chrony curl firewalld
@@ -52,13 +59,29 @@ chmod 600 "${KEY_PATH}"
 "${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --init --migrate
 chmod 600 "${DB_PATH}"
 
-echo "[6/6] Installing and starting hardened systemd service (aegis-quant.service)..."
-sudo cp "${SERVICE_SRC}" "${SERVICE_DST}"
-sudo chmod 644 "${SERVICE_DST}"
-sudo restorecon -v "${SERVICE_DST}" 2>/dev/null || true
+echo "[6/6] Installing and starting hardened systemd units (${SYSTEMD_UNITS[*]}) (R19-L4)..."
+for unit in "${SYSTEMD_UNITS[@]}"; do
+    src="${DEPLOY_DIR}/${unit}"
+    dst="${SYSTEMD_DIR}/${unit}"
+    if [ ! -s "${src}" ]; then
+        echo "ERROR: Missing required systemd unit ${src}" >&2
+        exit 1
+    fi
+    sudo cp "${src}" "${dst}"
+    sudo chmod 644 "${dst}"
+    sudo restorecon -v "${dst}" 2>/dev/null || true
+done
 sudo systemctl daemon-reload
+sudo systemctl enable --now aegis-settle.timer
 sudo systemctl enable aegis-quant.service
 sudo systemctl restart aegis-quant.service
+
+for unit in "${SYSTEMD_UNITS[@]}"; do
+    if [ ! -s "${SYSTEMD_DIR}/${unit}" ]; then
+        echo "ERROR: Installed systemd unit missing at ${SYSTEMD_DIR}/${unit}" >&2
+        exit 1
+    fi
+done
 
 echo "Waiting for Aegis Quant Axum WebUI server on http://127.0.0.1:8000/api/v1/health..."
 for _ in $(seq 1 30); do
@@ -70,6 +93,7 @@ done
 
 echo "=== Bootstrap Complete ==="
 systemctl is-active aegis-quant.service
+systemctl is-active aegis-settle.timer
 chronyc tracking
 curl -fsS http://127.0.0.1:8000/api/v1/health
 echo ""

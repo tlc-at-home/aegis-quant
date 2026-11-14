@@ -907,6 +907,32 @@ impl ExecutionEngine {
                     0.0,
                 );
                 if !sizing.approved {
+                    if !is_backtest {
+                        tracing::warn!(
+                            symbol = %asset.symbol,
+                            side = %ev.signal_action,
+                            reason = %sizing.reason,
+                            equity_usdc = current_equity,
+                            conviction = ev.blended_conviction,
+                            "PIT_ENTRY_RISK_REJECTED: Book A entry rejected by risk sizing guardrail (R19-L3)"
+                        );
+                        let _ = self.db.log_telemetry(
+                            "WARN",
+                            "engine.execution",
+                            &format!(
+                                "PIT_ENTRY_RISK_REJECTED: {} {} rejected ({}) (R19-L3)",
+                                asset.symbol, ev.signal_action, sizing.reason
+                            ),
+                            Some(json!({
+                                "event": "PIT_ENTRY_RISK_REJECTED",
+                                "symbol": asset.symbol,
+                                "side": ev.signal_action,
+                                "reason": sizing.reason,
+                                "equity_usdc": current_equity,
+                                "blended_conviction": ev.blended_conviction,
+                            })),
+                        );
+                    }
                     continue;
                 }
 
@@ -915,6 +941,32 @@ impl ExecutionEngine {
                     let perps_notional_cap = perps_trading_eq * max_gross_leverage;
                     let remaining_perps_cap = (perps_notional_cap - total_wallet_deployed).max(0.0);
                     if remaining_perps_cap < asset.min_notional_usdc.max(10.0) {
+                        tracing::warn!(
+                            symbol = %asset.symbol,
+                            side = %ev.signal_action,
+                            remaining_perps_cap_usdc = remaining_perps_cap,
+                            min_notional_usdc = asset.min_notional_usdc.max(10.0),
+                            vault_equity_usdc = vault_eq,
+                            "PIT_ENTRY_VAULT_MARGIN_CAPPED: Book A entry skipped due to remaining perps margin cap below min notional (R19-L3)"
+                        );
+                        let _ = self.db.log_telemetry(
+                            "WARN",
+                            "engine.execution",
+                            &format!(
+                                "PIT_ENTRY_VAULT_MARGIN_CAPPED: {} {} skipped (remaining_perps_cap=${remaining_perps_cap:.2} < min_notional=${:.2}) (R19-L3)",
+                                asset.symbol,
+                                ev.signal_action,
+                                asset.min_notional_usdc.max(10.0)
+                            ),
+                            Some(json!({
+                                "event": "PIT_ENTRY_VAULT_MARGIN_CAPPED",
+                                "symbol": asset.symbol,
+                                "side": ev.signal_action,
+                                "remaining_perps_cap_usdc": remaining_perps_cap,
+                                "min_notional_usdc": asset.min_notional_usdc.max(10.0),
+                                "vault_equity_usdc": vault_eq,
+                            })),
+                        );
                         continue;
                     }
                     if sizing.notional_usdc > remaining_perps_cap {
@@ -926,6 +978,34 @@ impl ExecutionEngine {
                         let capped_notional = round_dp(capped_qty * last_bar.close, 2);
                         if capped_qty <= 0.0 || capped_notional < asset.min_notional_usdc.max(10.0)
                         {
+                            tracing::warn!(
+                                symbol = %asset.symbol,
+                                side = %ev.signal_action,
+                                capped_qty = capped_qty,
+                                capped_notional_usdc = capped_notional,
+                                remaining_perps_cap_usdc = remaining_perps_cap,
+                                min_notional_usdc = asset.min_notional_usdc.max(10.0),
+                                "PIT_ENTRY_VAULT_MARGIN_CAPPED: Book A entry skipped after lot-step rounding under perps margin cap (R19-L3)"
+                            );
+                            let _ = self.db.log_telemetry(
+                                "WARN",
+                                "engine.execution",
+                                &format!(
+                                    "PIT_ENTRY_VAULT_MARGIN_CAPPED: {} {} skipped after lot rounding (capped_notional=${capped_notional:.2} < min_notional=${:.2}) (R19-L3)",
+                                    asset.symbol,
+                                    ev.signal_action,
+                                    asset.min_notional_usdc.max(10.0)
+                                ),
+                                Some(json!({
+                                    "event": "PIT_ENTRY_VAULT_MARGIN_CAPPED",
+                                    "symbol": asset.symbol,
+                                    "side": ev.signal_action,
+                                    "capped_qty": capped_qty,
+                                    "capped_notional_usdc": capped_notional,
+                                    "remaining_perps_cap_usdc": remaining_perps_cap,
+                                    "min_notional_usdc": asset.min_notional_usdc.max(10.0),
+                                })),
+                            );
                             continue;
                         }
                         sizing.quantity = capped_qty;
@@ -950,6 +1030,34 @@ impl ExecutionEngine {
                 let is_open_book = exec_res.fsm_state == "OPEN_ON_BOOK"
                     || exec_res.fsm_state == "AMBIGUOUS_POST_SEND";
                 if !is_filled && !is_open_book {
+                    if !is_backtest {
+                        tracing::warn!(
+                            symbol = %asset.symbol,
+                            side = %ev.signal_action,
+                            fsm_state = %exec_res.fsm_state,
+                            fill_type = %exec_res.fill_type,
+                            quantity = sizing.quantity,
+                            notional_usdc = sizing.notional_usdc,
+                            "PIT_ENTRY_EXECUTION_REJECTED: Book A entry order did not fill or rest on book (R19-L3)"
+                        );
+                        let _ = self.db.log_telemetry(
+                            "WARN",
+                            "engine.execution",
+                            &format!(
+                                "PIT_ENTRY_EXECUTION_REJECTED: {} {} failed execution (state={}, fill_type={}) (R19-L3)",
+                                asset.symbol, ev.signal_action, exec_res.fsm_state, exec_res.fill_type
+                            ),
+                            Some(json!({
+                                "event": "PIT_ENTRY_EXECUTION_REJECTED",
+                                "symbol": asset.symbol,
+                                "side": ev.signal_action,
+                                "fsm_state": exec_res.fsm_state,
+                                "fill_type": exec_res.fill_type,
+                                "quantity": sizing.quantity,
+                                "notional_usdc": sizing.notional_usdc,
+                            })),
+                        );
+                    }
                     continue;
                 }
 

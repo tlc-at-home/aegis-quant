@@ -21,6 +21,10 @@ pub const CANONICAL_SCHEMA_VERSION: i64 = 16;
 /// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
 pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
 
+/// Maximum background lease-renewal heartbeat ticks (`90` ticks = `30x` initial TTL) before
+/// allowing a hung cycle lock to expire naturally (`R19-N2`).
+pub const MAX_CYCLE_LOCK_RENEWAL_TICKS: u32 = 90;
+
 /// RAII guard for the cross-process SQLite advisory cycle lock with background lease-renewal heartbeat (`HI-4`, `R18-L1`).
 pub struct DbCycleLockGuard {
     db: DatabaseManager,
@@ -641,12 +645,16 @@ impl DatabaseManager {
         Ok(out)
     }
 
-    /// Cross-process database advisory cycle lock (`HI-4`).
+    /// Cross-process database advisory cycle lock (`HI-4`, `R19-M1`).
     ///
     /// Acquires an exclusive lease in `system_config` (`engine_cycle_lock_owner`, `engine_cycle_lock_expires_ms`)
-    /// inside an atomic `BEGIN IMMEDIATE` transaction so concurrent CLI (`run`, `daemon`) and Web UI
+    /// inside an atomic `BEGIN IMMEDIATE` transaction so concurrent CLI (`run`, `daemon`, `pond-scan`) and Web UI
     /// (`api_trigger_cycle`, `api_trigger_pond_scan`, `api_close_trade`) processes never execute
     /// overlapping strategy cycles against the same SQLite database.
+    ///
+    /// Acquisition is strictly non-reentrant while unexpired (`R19-M1`): any non-empty unexpired
+    /// `engine_cycle_lock_owner` (including the same owner string) rejects re-acquisition (`Ok(false)`),
+    /// and lease renewal is exclusively performed by `DbCycleLockGuard`'s background heartbeat (`renew_cycle_lock`).
     pub fn try_acquire_cycle_lock(&self, owner: &str, ttl_ms: i64) -> Result<bool> {
         let now_ms = self.now_ms();
         let clean_owner = owner.trim();
@@ -685,7 +693,7 @@ impl DatabaseManager {
                     .and_then(|s| s.trim().parse::<i64>().ok())
                     .unwrap_or(0);
 
-                if !cur_owner.trim().is_empty() && cur_owner.trim() != owner_val && cur_exp > now_ms {
+                if !cur_owner.trim().is_empty() && cur_exp > now_ms {
                     return Ok(false);
                 }
 
@@ -786,6 +794,22 @@ impl DatabaseManager {
                      WHERE config_key = 'engine_cycle_lock_expires_ms';",
                     [],
                 );
+                let has_lock_table: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_cycle_lock';",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if has_lock_table {
+                    let _ = conn.execute(
+                        "DELETE FROM db_cycle_lock WHERE owner = ?1;",
+                        params![owner_val],
+                    );
+                }
             }
             if began_tx {
                 conn.execute_batch("COMMIT;")
@@ -872,7 +896,11 @@ impl DatabaseManager {
         estimated_ms.clamp(120_000, 3_600_000)
     }
 
-    /// Acquire the cross-process database advisory cycle lock and return an RAII guard with background heartbeat renewal (`HI-4`, `R18-L1`).
+    /// Acquire the cross-process database advisory cycle lock and return an RAII guard with background heartbeat renewal (`HI-4`, `R18-L1`, `R19-M1`, `R19-N2`).
+    ///
+    /// Acquisition is strictly non-reentrant while unexpired (`R19-M1`); lease renewal is exclusively
+    /// handled by `DbCycleLockGuard`'s background heartbeat (`renew_cycle_lock`), capped at
+    /// `MAX_CYCLE_LOCK_RENEWAL_TICKS` (`90` ticks = `30x` initial TTL).
     pub fn acquire_cycle_lock_guard(
         &self,
         owner: &str,
@@ -895,12 +923,46 @@ impl DatabaseManager {
             let renew_handle = std::thread::Builder::new()
                 .name(format!("aegis-cycle-lock-{}", owner_val))
                 .spawn(move || {
+                    let mut ticks: u32 = 0;
                     while !stop_bg.load(Ordering::Acquire) {
                         std::thread::park_timeout(renew_interval);
                         if stop_bg.load(Ordering::Acquire) {
                             break;
                         }
-                        let _ = db_bg.renew_cycle_lock(&owner_bg, eff_ttl);
+                        if ticks >= MAX_CYCLE_LOCK_RENEWAL_TICKS {
+                            tracing::warn!(
+                                owner = %owner_bg,
+                                ticks,
+                                max_ticks = MAX_CYCLE_LOCK_RENEWAL_TICKS,
+                                "CYCLE_LOCK_RENEWAL_BUDGET_EXHAUSTED: stopping background lease renewal so stuck cycle lock can expire"
+                            );
+                            break;
+                        }
+                        if db_bg.file_swap_lock.try_read().is_none() {
+                            continue;
+                        }
+                        ticks = ticks.saturating_add(1);
+                        match db_bg.renew_cycle_lock(&owner_bg, eff_ttl) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let failures = db_bg.record_cycle_lock_renew_failure();
+                                tracing::warn!(
+                                    owner = %owner_bg,
+                                    failures,
+                                    "CYCLE_LOCK_RENEWAL_FAILED: lost cycle lock ownership during background heartbeat"
+                                );
+                                break;
+                            }
+                            Err(err) => {
+                                let failures = db_bg.record_cycle_lock_renew_failure();
+                                tracing::warn!(
+                                    owner = %owner_bg,
+                                    failures,
+                                    error = %err,
+                                    "CYCLE_LOCK_RENEWAL_FAILED: transient DB error renewing cycle lock"
+                                );
+                            }
+                        }
                     }
                 })
                 .ok();
@@ -1353,6 +1415,7 @@ impl DatabaseManager {
                 "active_cycle_lock": active_lock.is_some(),
                 "cycle_lock_owner": active_lock.as_ref().map(|(o, _)| o.clone()),
                 "cycle_lock_expires_ms": active_lock.as_ref().map(|(_, exp)| *exp),
+                "cycle_lock_renew_failures": self.cycle_lock_renew_failures(),
                 "external_process_detected": ext_pid_reason.is_some(),
                 "external_process_detail": ext_pid_reason,
                 "pool_generation": self.pool_generation(),
@@ -1396,8 +1459,16 @@ impl DatabaseManager {
                         continue;
                     }
                     let fd_dir = entry.path().join("fd");
-                    let Ok(fds) = fs::read_dir(&fd_dir) else {
-                        continue;
+                    let fds = match fs::read_dir(&fd_dir) {
+                        Ok(d) => d,
+                        Err(_) if entry.path().exists() => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            match fs::read_dir(&fd_dir) {
+                                Ok(d) => d,
+                                Err(_) => continue,
+                            }
+                        }
+                        Err(_) => continue,
                     };
                     for fd_entry in fds.flatten() {
                         if let Ok(link_target) = fs::read_link(fd_entry.path()) {
@@ -1659,14 +1730,29 @@ impl DatabaseManager {
         self.restore_sqlite_backup_with_options(backup_path, false, false)
     }
 
-    /// Applies post-copy `db_cycle_lock` invariants directly on a restored database connection (`R18-N1`, `R18-N2`).
+    /// Applies post-copy `db_cycle_lock` invariants directly on a restored database connection (`R18-N1`, `R18-N2`, `R19-N1`).
     ///
+    /// - Scrubs any legacy rows from dedicated `db_cycle_lock` table if present (`R19-N1`).
     /// - When `preserve_web_restore_exp` is `Some(exp_ms)` (an in-service quiesced WebUI restore where
     ///   `"web.restore"` held the active lease before Step 3), re-asserts `engine_cycle_lock_owner = 'web.restore'`
     ///   and `engine_cycle_lock_expires_ms = exp_ms` before `file_swap_lock.write()` is released (`R18-N1`).
     /// - When `preserve_web_restore_exp` is `None` (CLI restore or unheld lock), unconditionally clears any
     ///   stale `engine_cycle_lock_owner` and `engine_cycle_lock_expires_ms` inherited from the backup snapshot (`R18-N2`).
     fn apply_post_copy_cycle_lock_state(conn: &Connection, preserve_web_restore_exp: Option<i64>) {
+        let has_lock_tbl: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_cycle_lock';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if has_lock_tbl {
+            let _ = conn.execute("DELETE FROM db_cycle_lock;", []);
+        }
+
         let has_cfg: bool = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_config';",
@@ -1723,7 +1809,7 @@ impl DatabaseManager {
     }
 
     /// Restore the active SQLite database from an existing backup file with explicit live-activity
-    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `R17-M1`, `R18-N1`, `R18-N2`, `P2-C`).
+    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `R17-M1`, `R18-N1`, `R18-N2`, `R19-N2`, `P2-C`).
     ///
     /// Returns the path of the pre-restore safety snapshot.
     pub fn restore_sqlite_backup_with_options(
@@ -1810,28 +1896,28 @@ impl DatabaseManager {
         }
 
         // Check whether caller ("web.restore") holds an active cycle lock prior to Step 3 overwrite (R18-N1)
-        let preserve_web_restore_exp: Option<i64> = if in_service_quiesced && self.db_path.exists()
-        {
-            let now_ms = self.now_ms();
-            self.with_conn(|conn| {
-                Ok(
-                    Self::query_active_cycle_lock(conn, now_ms).and_then(|(owner, exp)| {
-                        if owner == "web.restore" {
-                            Some(exp.max(now_ms.saturating_add(120_000)))
-                        } else {
-                            None
-                        }
-                    }),
-                )
-            })
-            .ok()
-            .flatten()
-        } else {
-            None
-        };
+        let mut preserve_web_restore_exp: Option<i64> =
+            if in_service_quiesced && self.db_path.exists() {
+                let now_ms = self.now_ms();
+                self.with_conn(|conn| {
+                    Ok(
+                        Self::query_active_cycle_lock(conn, now_ms).and_then(|(owner, exp)| {
+                            if owner == "web.restore" {
+                                Some(exp.max(now_ms.saturating_add(120_000)))
+                            } else {
+                                None
+                            }
+                        }),
+                    )
+                })
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
 
         // 3. Hold file_swap_lock.write() while bumping pool generation, clearing pooled connections
-        // and WAL/SHM sidecars, running rusqlite::backup::Backup, and enforcing post-copy lock state (R18-N1 / R18-N2).
+        // and WAL/SHM sidecars, running chunked rusqlite::backup::Backup steps (R19-N2c), and enforcing post-copy lock state (R18-N1 / R18-N2 / R19-N1).
         let (new_gen, cleared_pool) = {
             let _swap_guard = self.file_swap_lock.write();
             let (new_gen, cleared_pool) = self.bump_generation_and_clear_pool_sidecars();
@@ -1846,11 +1932,21 @@ impl DatabaseManager {
                     rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).map_err(|e| {
                         AegisError::Database(format!("Failed to initialize SQLite Backup: {e}"))
                     })?;
-                backup
-                    .run_to_completion(256, std::time::Duration::from_millis(5), None)
-                    .map_err(|e| {
+                loop {
+                    let step_res = backup.step(256).map_err(|e| {
                         AegisError::Database(format!("SQLite backup restore failed: {e}"))
                     })?;
+                    if let Some(ref mut exp_ms) = preserve_web_restore_exp {
+                        let min_exp = chrono::Utc::now().timestamp_millis().saturating_add(60_000);
+                        if *exp_ms < min_exp {
+                            *exp_ms = min_exp;
+                        }
+                    }
+                    if matches!(step_res, rusqlite::backup::StepResult::Done) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 drop(backup);
                 Self::apply_post_copy_cycle_lock_state(&dst_conn, preserve_web_restore_exp);
             }

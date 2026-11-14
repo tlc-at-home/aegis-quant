@@ -1861,6 +1861,12 @@ pub struct BacktestTearSheet {
     pub gate_mdd_pass: bool,
     pub gate_profit_factor_pass: bool,
     pub all_gates_passed: bool,
+    #[serde(default)]
+    pub stop_regime_label: String,
+    #[serde(default)]
+    pub active_stop_set: Vec<String>,
+    #[serde(default)]
+    pub fired_stop_substitutions: std::collections::BTreeMap<String, usize>,
 }
 
 impl BacktestTearSheet {

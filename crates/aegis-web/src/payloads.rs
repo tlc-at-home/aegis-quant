@@ -278,6 +278,7 @@ pub struct HealthPayload {
     pub max_bar_staleness_ms: i64,
     pub pool_generation: u64,
     pub discarded_stale_connections: u64,
+    pub cycle_lock_renew_failures: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
