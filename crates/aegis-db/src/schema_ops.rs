@@ -1371,7 +1371,7 @@ impl DatabaseManager {
         }
 
         #[cfg(target_os = "linux")]
-        {
+        let found = {
             let self_pid = std::process::id();
             let canon_db = fs::canonicalize(&self.db_path).unwrap_or_else(|_| self.db_path.clone());
             let mut target_paths = Vec::with_capacity(6);
@@ -1382,8 +1382,9 @@ impl DatabaseManager {
                 target_paths.push(format!("{s}-shm"));
             }
 
+            let mut detected = None;
             if let Ok(proc_entries) = fs::read_dir("/proc") {
-                for entry in proc_entries.flatten() {
+                'proc_scan: for entry in proc_entries.flatten() {
                     let fname = entry.file_name();
                     let Some(pid_str) = fname.to_str() else {
                         continue;
@@ -1404,17 +1405,22 @@ impl DatabaseManager {
                             let clean_link =
                                 link_str.strip_suffix(" (deleted)").unwrap_or(&link_str);
                             if target_paths.iter().any(|tp| tp == clean_link) {
-                                return Some(format!(
+                                detected = Some(format!(
                                     "external process PID {pid} holds open descriptor to {link_str} (R16-M2 / R17-M1)"
                                 ));
+                                break 'proc_scan;
                             }
                         }
                     }
                 }
             }
-        }
+            detected
+        };
+        #[cfg(not(target_os = "linux"))]
+        let found: Option<String> = None;
 
-        None
+        *self.ext_pid_scan_cache.lock() = Some((std::time::Instant::now(), found.clone()));
+        found
     }
 
     /// Cached wrapper around `detect_external_pid_holding_db` for high-frequency read-only UI polling (`R18-S8`).
@@ -1431,12 +1437,7 @@ impl DatabaseManager {
                 }
             }
         }
-        let fresh = self.detect_external_pid_holding_db();
-        {
-            let mut guard = self.ext_pid_scan_cache.lock();
-            *guard = Some((now, fresh.clone()));
-        }
-        fresh
+        self.detect_external_pid_holding_db()
     }
 
     /// Detects whether any external process or active cycle is currently using this SQLite database (`R16-M2`, `R17-M1`, `R17-L3`).

@@ -3804,7 +3804,10 @@ mod tests {
         {
             let mut child = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(format!("exec 3< '{}' && sleep 30", db_path.display()))
+                .arg(format!("exec 3< '{}' && exec sleep 30", db_path.display()))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("spawn external holder process");
 
@@ -3839,7 +3842,18 @@ mod tests {
 
             let _ = child.kill();
             let _ = child.wait();
-            assert!(db.detect_external_pid_holding_db().is_none());
+            let mut post_kill_ext = None;
+            for _ in 0..20 {
+                post_kill_ext = db.detect_external_pid_holding_db();
+                if post_kill_ext.is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                post_kill_ext.is_none(),
+                "external holder process still detected after kill+wait: {post_kill_ext:?}"
+            );
         }
 
         // 4. R17-L3: Fail-closed if read-only open of non-empty DB fails during detect_live_database_activity
