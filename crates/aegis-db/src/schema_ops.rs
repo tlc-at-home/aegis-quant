@@ -7,11 +7,12 @@ use crate::DatabaseManager;
 use aegis_core::{resolve_project_root, AegisError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Canonical unified schema version built by `sql/schema_and_seed.sql`.
-pub const CANONICAL_SCHEMA_VERSION: i64 = 15;
+pub const CANONICAL_SCHEMA_VERSION: i64 = 16;
 
 /// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
 pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
@@ -799,6 +800,497 @@ impl DatabaseManager {
         }
     }
 
+    pub(crate) fn query_active_cycle_lock(conn: &Connection, now_ms: i64) -> Option<(String, i64)> {
+        let cur_owner: String = conn
+            .query_row(
+                "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_owner';",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let cur_exp: i64 = conn
+            .query_row(
+                "SELECT config_value FROM system_config WHERE config_key = 'engine_cycle_lock_expires_ms';",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        if !cur_owner.trim().is_empty() && cur_exp > now_ms {
+            return Some((cur_owner.trim().to_string(), cur_exp));
+        }
+
+        let has_lock_table: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='db_cycle_lock';",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        if has_lock_table {
+            if let Ok(Some((owner, exp))) = conn
+                .query_row(
+                    "SELECT COALESCE(owner, 'db_cycle_lock'), COALESCE(expires_at_ms, 0)
+                     FROM db_cycle_lock
+                     WHERE COALESCE(expires_at_ms, 0) > ?1
+                     LIMIT 1;",
+                    params![now_ms],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()
+            {
+                if !owner.trim().is_empty() {
+                    return Some((owner.trim().to_string(), exp));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the canonical backup directory for this database (`R16-U1`).
+    pub fn backup_directory(&self) -> PathBuf {
+        if self.is_memory {
+            std::env::temp_dir().join("aegis_backups")
+        } else {
+            self.db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("data"))
+                .join("backups")
+        }
+    }
+
+    /// Lists available `.db` backup files in `backup_directory()` sorted newest-first (`R16-U1`).
+    pub fn list_sqlite_backups(&self) -> Result<Vec<Value>> {
+        let backup_dir = self.backup_directory();
+        if !backup_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let cfg = self.load_config_opts(false).unwrap_or_default();
+        let ret_days = cfg.get_i64("backup_retention_days", 7).clamp(1, 90);
+        let retention_ms = ret_days.saturating_mul(86_400_000);
+
+        let mut rows: Vec<(i64, String, Value)> = Vec::new();
+        let entries = fs::read_dir(&backup_dir)?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(sym_meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+                continue;
+            }
+            let Some(fname) = p.file_name().and_then(|s| s.to_str()).map(str::to_string) else {
+                continue;
+            };
+            if !fname.ends_with(".db") {
+                continue;
+            }
+            let size_bytes = sym_meta.len();
+            if size_bytes == 0 {
+                continue;
+            }
+            let modified_sys = sym_meta
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let created_at_ms = modified_sys
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let created_at = aegis_core::format_ms_iso8601_utc(created_at_ms);
+            let expires_at_ms = created_at_ms.saturating_add(retention_ms);
+            let expires_at = aegis_core::format_ms_iso8601_utc(expires_at_ms);
+            let is_pre_restore_snapshot = fname.starts_with("aegis_quant_pre_restore_");
+            let restore_cli_command = format!(
+                "./bin/aegis-quant --db {} db --restore {} --confirm",
+                self.db_path.display(),
+                p.display()
+            );
+
+            rows.push((
+                created_at_ms,
+                fname.clone(),
+                json!({
+                    "filename": fname,
+                    "path": p.display().to_string(),
+                    "size_bytes": size_bytes,
+                    "created_at": created_at,
+                    "created_at_ms": created_at_ms,
+                    "expires_at": expires_at,
+                    "expires_at_ms": expires_at_ms,
+                    "is_pre_restore_snapshot": is_pre_restore_snapshot,
+                    "restore_cli_command": restore_cli_command,
+                }),
+            ));
+        }
+
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(rows.into_iter().map(|(_, _, val)| val).collect())
+    }
+
+    /// Resolves a bare `.db` filename inside `backup_directory()`, rejecting path traversal,
+    /// separators, symlinks, non-`.db` extensions, or paths outside the canonical backup directory (`R16-U1`).
+    pub fn resolve_whitelisted_backup_path(&self, bare_filename: &str) -> Result<PathBuf> {
+        let trimmed = bare_filename.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains("..")
+            || trimmed.contains(':')
+            || trimmed.contains('\0')
+            || !trimmed.ends_with(".db")
+            || trimmed == ".db"
+        {
+            return Err(AegisError::Validation(format!(
+                "Invalid backup filename '{trimmed}': must be a bare .db filename without path separators or '..' (R16-U1)"
+            )));
+        }
+        if Path::new(trimmed).file_name().and_then(|s| s.to_str()) != Some(trimmed) {
+            return Err(AegisError::Validation(format!(
+                "Invalid backup filename '{trimmed}': must not contain directory components (R16-U1)"
+            )));
+        }
+
+        let backup_dir = self.backup_directory();
+        fs::create_dir_all(&backup_dir)?;
+        let canon_dir = fs::canonicalize(&backup_dir).map_err(|e| {
+            AegisError::Database(format!(
+                "Failed to canonicalize backup directory {}: {e}",
+                backup_dir.display()
+            ))
+        })?;
+
+        let candidate = backup_dir.join(trimmed);
+        let sym_meta = match fs::symlink_metadata(&candidate) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AegisError::NotFound(format!(
+                    "Backup file not found: {trimmed}"
+                )));
+            }
+            Err(e) => return Err(AegisError::Io(e)),
+        };
+
+        if sym_meta.file_type().is_symlink() {
+            return Err(AegisError::Validation(format!(
+                "Refusing symlink backup file '{trimmed}' (R16-U1)"
+            )));
+        }
+        if !sym_meta.file_type().is_file() {
+            return Err(AegisError::Validation(format!(
+                "Backup path '{trimmed}' is not a regular file (R16-U1)"
+            )));
+        }
+
+        let canon_file = fs::canonicalize(&candidate).map_err(|e| {
+            AegisError::Validation(format!(
+                "Failed to canonicalize backup file '{trimmed}': {e}"
+            ))
+        })?;
+        if canon_file.parent() != Some(canon_dir.as_path()) || !canon_file.starts_with(&canon_dir) {
+            return Err(AegisError::Validation(format!(
+                "Backup file '{trimmed}' resolved outside whitelisted backup directory (R16-U1)"
+            )));
+        }
+
+        Ok(canon_file)
+    }
+
+    /// Inspects a whitelisted backup file read-only, computing its SHA-256 hex digest, verifying
+    /// `PRAGMA integrity_check;`, and returning table row counts for Step 1 restore preview (`R16-U1`).
+    pub fn inspect_sqlite_backup_preview(&self, bare_filename: &str) -> Result<Value> {
+        let canon_path = self.resolve_whitelisted_backup_path(bare_filename)?;
+        let fname = canon_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(bare_filename.trim())
+            .to_string();
+        let meta = fs::metadata(&canon_path)?;
+        let size_bytes = meta.len();
+        if size_bytes == 0 {
+            return Err(AegisError::Validation(format!(
+                "Backup file '{fname}' is empty (R16-U1)"
+            )));
+        }
+        let modified_sys = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let created_at_ms = modified_sys
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let created_at = aegis_core::format_ms_iso8601_utc(created_at_ms);
+
+        let raw_bytes = fs::read(&canon_path)?;
+        let digest = Sha256::digest(&raw_bytes);
+        let sha256: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+
+        let ro_flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&canon_path, ro_flags).map_err(|e| {
+            AegisError::Database(format!("Failed to open backup '{fname}' read-only: {e}"))
+        })?;
+        let integrity_check: String = conn
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .map_err(|e| AegisError::Database(format!("Backup integrity_check failed: {e}")))?;
+        if !integrity_check.trim().eq_ignore_ascii_case("ok") {
+            return Err(AegisError::Validation(format!(
+                "Backup '{fname}' failed PRAGMA integrity_check: {integrity_check}"
+            )));
+        }
+
+        let schema_version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations;",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let count_table = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table};"), [], |r| r.get(0))
+                .unwrap_or(0)
+        };
+        let trades_count = count_table("trades");
+        let pond_cells_count = count_table("pond_cells");
+        let snapshots_count = count_table("portfolio_snapshots");
+        let config_count = count_table("system_config");
+
+        Ok(json!({
+            "filename": fname,
+            "path": canon_path.display().to_string(),
+            "size_bytes": size_bytes,
+            "created_at": created_at,
+            "created_at_ms": created_at_ms,
+            "sha256": sha256,
+            "schema_version": schema_version,
+            "integrity_check": integrity_check,
+            "row_counts": {
+                "trades": trades_count,
+                "pond_cells": pond_cells_count,
+                "portfolio_snapshots": snapshots_count,
+                "system_config": config_count,
+            }
+        }))
+    }
+
+    /// Evaluates all safety preconditions required before a WebUI database restore (`R16-U1`).
+    pub fn check_web_restore_preconditions(&self) -> Result<(bool, Vec<String>, Value)> {
+        let now_ms = self.now_ms();
+        self.with_conn(|conn| {
+            let exec_mode: String = conn
+                .query_row(
+                    "SELECT config_value FROM system_config WHERE config_key = 'execution_mode';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+                .unwrap_or_else(|| "PAPER".to_string())
+                .trim()
+                .to_ascii_uppercase();
+
+            let pond_mode: String = conn
+                .query_row(
+                    "SELECT config_value FROM system_config WHERE config_key = 'pond_execution_mode';",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| AegisError::Database(e.to_string()))?
+                .unwrap_or_else(|| exec_mode.clone())
+                .trim()
+                .to_ascii_uppercase();
+
+            let active_pit_trades: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM trades WHERE status IN ('OPEN', 'PENDING');",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let active_pond_cells: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pond_cells WHERE state IN ('ARMED', 'OPEN', 'TRAILED');",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let pit_stop_oids: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM trades WHERE TRIM(COALESCE(protective_stop_oid, '')) != '';",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let pond_stop_oids: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pond_cells WHERE TRIM(COALESCE(protective_stop_oid, '')) != '';",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let working_protective_stops = pit_stop_oids + pond_stop_oids;
+
+            let active_lock = Self::query_active_cycle_lock(conn, now_ms);
+
+            let mut disabled_reasons = Vec::new();
+            if exec_mode == "LIVE" {
+                disabled_reasons.push(
+                    "Book A (PIT) execution_mode is LIVE; switch to PAPER or TESTNET before restoring via WebUI (R16-U1)"
+                        .to_string(),
+                );
+            }
+            if pond_mode == "LIVE" {
+                disabled_reasons.push(
+                    "Book B (POND) pond_execution_mode is LIVE; switch to PAPER or TESTNET before restoring via WebUI (R16-U1)"
+                        .to_string(),
+                );
+            }
+            if active_pit_trades > 0 {
+                disabled_reasons.push(format!(
+                    "{active_pit_trades} active Book A (PIT) trade(s) in OPEN/PENDING status; close or cancel all positions before restoring (R16-U1)"
+                ));
+            }
+            if active_pond_cells > 0 {
+                disabled_reasons.push(format!(
+                    "{active_pond_cells} active Book B (POND) cell(s) in ARMED/OPEN/TRAILED state; close all cells before restoring (R16-U1)"
+                ));
+            }
+            if working_protective_stops > 0 {
+                disabled_reasons.push(format!(
+                    "{working_protective_stops} working protective_stop_oid order(s) present; cancel all working stop orders before restoring (R16-U1)"
+                ));
+            }
+            if let Some((ref owner, exp_ms)) = active_lock {
+                disabled_reasons.push(format!(
+                    "Active db_cycle_lock held by '{owner}' (expires_ms={exp_ms}); wait for active cycle to finish before restoring (R16-U1)"
+                ));
+            }
+
+            let restore_allowed = disabled_reasons.is_empty();
+            let preconditions = json!({
+                "restore_allowed": restore_allowed,
+                "execution_mode": exec_mode,
+                "pond_execution_mode": pond_mode,
+                "active_pit_trades": active_pit_trades,
+                "active_pond_cells": active_pond_cells,
+                "working_protective_stop_orders": working_protective_stops,
+                "active_cycle_lock": active_lock.is_some(),
+                "cycle_lock_owner": active_lock.as_ref().map(|(o, _)| o.clone()),
+                "cycle_lock_expires_ms": active_lock.as_ref().map(|(_, exp)| *exp),
+            });
+
+            Ok((restore_allowed, disabled_reasons, preconditions))
+        })
+    }
+
+    /// Detects whether any external process or active cycle is currently using this SQLite database (`R16-M2`).
+    ///
+    /// Checks:
+    /// (a) External PID in `/proc` holding DB, `-wal`, or `-shm` open;
+    /// (b) Unexpired row/lease in `db_cycle_lock` (`engine_cycle_lock_owner` / `engine_cycle_lock_expires_ms`);
+    /// (c) When `self.conn_pool.lock().is_empty()`, `<db>-shm` existing on disk with `len() > 0`
+    ///     and modified within the last `120` seconds.
+    pub fn detect_live_database_activity(&self) -> Result<Option<String>> {
+        if self.is_memory || self.db_path == Path::new(":memory:") || !self.db_path.exists() {
+            return Ok(None);
+        }
+
+        let pool_is_empty = self.conn_pool.lock().is_empty();
+
+        // (a) External PID in /proc holding DB / WAL / SHM open
+        #[cfg(target_os = "linux")]
+        {
+            let self_pid = std::process::id();
+            let canon_db = fs::canonicalize(&self.db_path).unwrap_or_else(|_| self.db_path.clone());
+            let mut target_paths = Vec::with_capacity(6);
+            for base in [&self.db_path, &canon_db] {
+                let s = base.display().to_string();
+                target_paths.push(s.clone());
+                target_paths.push(format!("{s}-wal"));
+                target_paths.push(format!("{s}-shm"));
+            }
+
+            if let Ok(proc_entries) = fs::read_dir("/proc") {
+                for entry in proc_entries.flatten() {
+                    let fname = entry.file_name();
+                    let Some(pid_str) = fname.to_str() else {
+                        continue;
+                    };
+                    let Ok(pid) = pid_str.parse::<u32>() else {
+                        continue;
+                    };
+                    if pid == self_pid {
+                        continue;
+                    }
+                    let fd_dir = entry.path().join("fd");
+                    let Ok(fds) = fs::read_dir(&fd_dir) else {
+                        continue;
+                    };
+                    for fd_entry in fds.flatten() {
+                        if let Ok(link_target) = fs::read_link(fd_entry.path()) {
+                            let link_str = link_target.to_string_lossy();
+                            let clean_link =
+                                link_str.strip_suffix(" (deleted)").unwrap_or(&link_str);
+                            if target_paths.iter().any(|tp| tp == clean_link) {
+                                return Ok(Some(format!(
+                                    "external process PID {pid} holds open descriptor to {link_str} (R16-M2)"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // (b) Unexpired cycle lock in db_cycle_lock / system_config
+        let now_ms = self.now_ms();
+        let ro_flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if let Ok(ro_conn) = Connection::open_with_flags(&self.db_path, ro_flags) {
+            let _ = ro_conn.busy_timeout(std::time::Duration::from_millis(2000));
+            if let Some((owner, exp_ms)) = Self::query_active_cycle_lock(&ro_conn, now_ms) {
+                return Ok(Some(format!(
+                    "unexpired db_cycle_lock held by '{owner}' until {exp_ms} ms (R16-M2)"
+                )));
+            }
+        }
+
+        // (c) When conn_pool is empty, <db>-shm on disk with len() > 0 modified within 120s
+        if pool_is_empty {
+            let shm_path = PathBuf::from(format!("{}-shm", self.db_path.display()));
+            if let Ok(meta) = fs::metadata(&shm_path) {
+                if meta.len() > 0 {
+                    let recently_modified = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
+                        .map(|age| age <= std::time::Duration::from_secs(120))
+                        .unwrap_or(true);
+                    if recently_modified {
+                        return Ok(Some(format!(
+                            "active SQLite WAL shared-memory sidecar {} ({} bytes, modified within 120s) while local pool is empty (R16-M2)",
+                            shm_path.display(),
+                            meta.len()
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Create an atomic online SQLite backup via `VACUUM INTO` and prune backups older than `retention_days` (`ME-19`, `R15-N9`).
     pub fn create_sqlite_backup(
         &self,
@@ -928,10 +1420,23 @@ impl DatabaseManager {
 
     /// Restore the active SQLite database from an existing backup file after verifying
     /// `PRAGMA integrity_check;`, taking a pre-restore safety snapshot, running `rusqlite::backup::Backup`,
-    /// re-running canonical migrations, and verifying `PRAGMA quick_check;` (`ME-19`).
+    /// re-running canonical migrations, and verifying `PRAGMA quick_check;` (`ME-19`, `R16-M2`).
     ///
     /// Returns the path of the pre-restore safety snapshot.
     pub fn restore_sqlite_backup(&self, backup_path: &Path) -> Result<PathBuf> {
+        self.restore_sqlite_backup_with_options(backup_path, false, false)
+    }
+
+    /// Restore the active SQLite database from an existing backup file with explicit live-activity
+    /// override and in-service quiescence controls (`R16-M1`, `R16-M2`, `R16-U1`, `P2-C`).
+    ///
+    /// Returns the path of the pre-restore safety snapshot.
+    pub fn restore_sqlite_backup_with_options(
+        &self,
+        backup_path: &Path,
+        allow_live_override: bool,
+        in_service_quiesced: bool,
+    ) -> Result<PathBuf> {
         if self.is_memory {
             return Err(AegisError::Validation(
                 "Cannot restore a file backup into an :memory: SQLite database".to_string(),
@@ -949,6 +1454,14 @@ impl DatabaseManager {
                 "Backup file {} is empty",
                 backup_path.display()
             )));
+        }
+
+        if !in_service_quiesced && !allow_live_override {
+            if let Some(reason) = self.detect_live_database_activity()? {
+                return Err(AegisError::Validation(format!(
+                    "Refusing to restore SQLite backup while live database activity is detected ({reason}); stop all running daemons or pass --force to override (R16-M2)"
+                )));
+            }
         }
 
         // 1. Verify backup integrity on a read-only connection before touching the live DB
@@ -971,11 +1484,7 @@ impl DatabaseManager {
         }
 
         // 2. Create a pre-restore safety snapshot of the live DB
-        let backup_dir = self
-            .db_path
-            .parent()
-            .unwrap_or_else(|| Path::new("data"))
-            .join("backups");
+        let backup_dir = self.backup_directory();
         fs::create_dir_all(&backup_dir)?;
         let now_dt = chrono::Utc::now();
         let pre_restore_path = backup_dir.join(format!(
@@ -999,34 +1508,34 @@ impl DatabaseManager {
             })?;
         }
 
-        // 3. Drop pooled connections and stale sidecars, then restore via rusqlite::backup::Backup
-        {
-            let mut pool = self.conn_pool.lock();
-            pool.clear();
-        }
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = PathBuf::from(format!("{}{}", self.db_path.display(), suffix));
-            if sidecar.exists() {
-                let _ = fs::remove_file(&sidecar);
+        // 3. Hold file_swap_lock.write() while bumping pool generation, clearing pooled connections
+        // and WAL/SHM sidecars, and running rusqlite::backup::Backup; drop write guard before Step 4.
+        let (new_gen, cleared_pool) = {
+            let _swap_guard = self.file_swap_lock.write();
+            let (new_gen, cleared_pool) = self.bump_generation_and_clear_pool_sidecars();
+            {
+                let mut dst_conn = Connection::open(&self.db_path).map_err(|e| {
+                    AegisError::Database(format!(
+                        "Failed to open target DB {} for restore: {e}",
+                        self.db_path.display()
+                    ))
+                })?;
+                let backup =
+                    rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).map_err(|e| {
+                        AegisError::Database(format!("Failed to initialize SQLite Backup: {e}"))
+                    })?;
+                backup
+                    .run_to_completion(256, std::time::Duration::from_millis(5), None)
+                    .map_err(|e| {
+                        AegisError::Database(format!("SQLite backup restore failed: {e}"))
+                    })?;
             }
-        }
-        {
-            let mut dst_conn = Connection::open(&self.db_path).map_err(|e| {
-                AegisError::Database(format!(
-                    "Failed to open target DB {} for restore: {e}",
-                    self.db_path.display()
-                ))
-            })?;
-            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn).map_err(|e| {
-                AegisError::Database(format!("Failed to initialize SQLite Backup: {e}"))
-            })?;
-            backup
-                .run_to_completion(256, std::time::Duration::from_millis(5), None)
-                .map_err(|e| AegisError::Database(format!("SQLite backup restore failed: {e}")))?;
-        }
+            (new_gen, cleared_pool)
+        };
         drop(src_conn);
 
-        // 4. Ensure schema parity and verify quick_check on the restored DB
+        // 4. Heal any split-brain sidecars, ensure schema parity, and verify quick_check on the restored DB
+        let _ = self.check_and_heal_wal_split_brain();
         self.run_migrations()?;
         let quick: String = self.with_conn(|conn| {
             conn.query_row("PRAGMA quick_check;", [], |r| r.get(0))
@@ -1042,13 +1551,17 @@ impl DatabaseManager {
             "WARN",
             "engine.backup",
             &format!(
-                "SQLITE_BACKUP_RESTORED from {} (pre_restore_snapshot={})",
+                "SQLITE_BACKUP_RESTORED from {} (pre_restore_snapshot={}, pool_generation={new_gen})",
                 backup_path.display(),
                 pre_restore_path.display()
             ),
             Some(json!({
                 "backup_path": backup_path.display().to_string(),
                 "pre_restore_snapshot": pre_restore_path.display().to_string(),
+                "pool_generation": new_gen,
+                "cleared_idle_connections": cleared_pool,
+                "allow_live_override": allow_live_override,
+                "in_service_quiesced": in_service_quiesced,
             })),
         );
         Ok(pre_restore_path)

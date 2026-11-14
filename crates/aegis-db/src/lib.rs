@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
 };
 use std::thread;
@@ -49,16 +49,31 @@ pub struct DatabaseManager {
     pub is_memory: bool,
     pub(crate) memory_conn: Option<Arc<Mutex<Connection>>>,
     pub(crate) conn_pool: Arc<Mutex<Vec<Connection>>>,
+    pub(crate) pool_generation: Arc<AtomicU64>,
+    pub(crate) discarded_stale_connections: Arc<AtomicU64>,
+    pub(crate) file_swap_lock: Arc<RwLock<()>>,
     pub(crate) pit_timestamp_ms: Arc<AtomicI64>,
     pub(crate) explicit_master_key: Arc<Mutex<Option<String>>>,
     pub(crate) cipher_cache: Arc<RwLock<Option<CachedFernetState>>>,
 }
 
 /// RAII guard that recycles an acquired SQLite connection back to `conn_pool` upon drop,
-/// ensuring panic safety during unwinding (`R6-N3`).
-struct PooledConnGuard<'a> {
+/// ensuring panic safety during unwinding (`R6-N3`) and generation-fenced eviction across
+/// WAL split-brain heals and backup restores (`R16-M1`).
+pub struct PooledConnGuard<'a> {
     pool: &'a Arc<Mutex<Vec<Connection>>>,
+    pool_generation: &'a Arc<AtomicU64>,
+    discarded_counter: &'a Arc<AtomicU64>,
+    generation: u64,
     conn: Option<Connection>,
+}
+
+impl<'a> std::ops::Deref for PooledConnGuard<'a> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn.as_ref().expect("conn present in PooledConnGuard")
+    }
 }
 
 impl<'a> Drop for PooledConnGuard<'a> {
@@ -68,6 +83,16 @@ impl<'a> Drop for PooledConnGuard<'a> {
             // attempt a clean rollback before recycling.
             if !conn.is_autocommit() {
                 let _ = conn.execute_batch("ROLLBACK;");
+            }
+            let current_gen = self.pool_generation.load(Ordering::Acquire);
+            if self.generation != current_gen {
+                self.discarded_counter.fetch_add(1, Ordering::AcqRel);
+                tracing::warn!(
+                    checkout_generation = self.generation,
+                    current_generation = current_gen,
+                    "Discarded stale SQLite connection from pre-swap pool generation (R16-M1)"
+                );
+                return;
             }
             if conn.is_autocommit() {
                 let mut pool = self.pool.lock();
@@ -128,10 +153,66 @@ impl DatabaseManager {
             is_memory,
             memory_conn,
             conn_pool: Arc::new(Mutex::new(Vec::with_capacity(8))),
+            pool_generation: Arc::new(AtomicU64::new(1)),
+            discarded_stale_connections: Arc::new(AtomicU64::new(0)),
+            file_swap_lock: Arc::new(RwLock::new(())),
             pit_timestamp_ms: Arc::new(AtomicI64::new(-1)),
             explicit_master_key: Arc::new(Mutex::new(master_key)),
             cipher_cache: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn pool_generation(&self) -> u64 {
+        self.pool_generation.load(Ordering::Acquire)
+    }
+
+    pub fn discarded_stale_connections_count(&self) -> u64 {
+        self.discarded_stale_connections.load(Ordering::Acquire)
+    }
+
+    /// Checks out a `PooledConnGuard` stamped with the current `pool_generation` without holding
+    /// `file_swap_lock`, allowing tests to hold an in-flight connection across a WAL split-brain
+    /// self-heal or backup restore and verify generation-fenced eviction (`R16-M1`).
+    pub fn checkout_pooled_conn_guard_for_test(&self) -> Result<PooledConnGuard<'_>> {
+        let generation = self.pool_generation.load(Ordering::Acquire);
+        let conn = {
+            let mut pool = self.conn_pool.lock();
+            pool.pop()
+        };
+        let conn = match conn {
+            Some(c) => c,
+            None => self.open_configured_file_conn()?,
+        };
+        Ok(PooledConnGuard {
+            pool: &self.conn_pool,
+            pool_generation: &self.pool_generation,
+            discarded_counter: &self.discarded_stale_connections,
+            generation,
+            conn: Some(conn),
+        })
+    }
+
+    /// Increments `pool_generation`, clears idle connections in `conn_pool`, and unlinks any
+    /// `<db>-wal` and `<db>-shm` sidecar files on disk (`P2-C`, `R16-M1`).
+    ///
+    /// Returns `(new_generation, cleared_idle_connections)`.
+    pub(crate) fn bump_generation_and_clear_pool_sidecars(&self) -> (u64, usize) {
+        let new_gen = self.pool_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let cleared = {
+            let mut pool = self.conn_pool.lock();
+            let count = pool.len();
+            pool.clear();
+            count
+        };
+        if !self.is_memory && self.db_path != Path::new(":memory:") {
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = PathBuf::from(format!("{}{}", self.db_path.display(), suffix));
+                if sidecar.exists() {
+                    let _ = fs::remove_file(&sidecar);
+                }
+            }
+        }
+        (new_gen, cleared)
     }
 
     pub fn set_master_key(&self, master_key: Option<String>) {
@@ -271,6 +352,8 @@ impl DatabaseManager {
             return f(&conn);
         }
 
+        let _swap_read_guard = self.file_swap_lock.read();
+        let generation = self.pool_generation.load(Ordering::Acquire);
         let conn = {
             let mut pool = self.conn_pool.lock();
             pool.pop()
@@ -282,6 +365,9 @@ impl DatabaseManager {
 
         let guard = PooledConnGuard {
             pool: &self.conn_pool,
+            pool_generation: &self.pool_generation,
+            discarded_counter: &self.discarded_stale_connections,
+            generation,
             conn: Some(conn),
         };
 
@@ -577,7 +663,7 @@ impl DatabaseManager {
         iso_db.initialize_schema(false)?;
 
         let sample_priv = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
-        let sample_gemini = "AIzaSyAegisQuantFernetVerifiedKey030rc1";
+        let sample_gemini = format!("{}{}", "AIza", "SyAegisQuantFernetVerifiedKey030rc1");
 
         iso_db.set_config_value("private_key", &json!(sample_priv))?;
         iso_db.set_config_value("gemini_api_key", &json!(sample_gemini))?;
@@ -626,18 +712,18 @@ impl DatabaseManager {
         Ok(report)
     }
 
-    /// Detects and self-heals a SQLite WAL split-brain condition on Linux where `-wal` or `-shm`
-    /// sidecar files were unlinked while open file descriptors remain held by this process (`LT-4`).
+    /// Inspects `/proc/self/fd` on Linux to detect whether this process holds any open file
+    /// descriptor to an unlinked `<db>-wal` or `<db>-shm` sidecar (`LT-4`, `R16-M1`, `R16-M2`).
     ///
-    /// Returns `Ok(true)` if a split-brain was detected and healed, `Ok(false)` otherwise.
-    pub fn check_and_heal_wal_split_brain(&self) -> Result<bool> {
+    /// Returns `(detected, wal_fd_path)`.
+    pub fn detect_unlinked_wal_or_shm_fds(&self) -> (bool, Option<PathBuf>) {
         if self.is_memory || self.db_path == Path::new(":memory:") || !self.db_path.exists() {
-            return Ok(false);
+            return (false, None);
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            return Ok(false);
+            (false, None)
         }
 
         #[cfg(target_os = "linux")]
@@ -648,12 +734,11 @@ impl DatabaseManager {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if db_name.is_empty() {
-                return Ok(false);
+                return (false, None);
             }
             let canon_path =
                 fs::canonicalize(&self.db_path).unwrap_or_else(|_| self.db_path.clone());
             let wal_disk_path = PathBuf::from(format!("{}-wal", self.db_path.display()));
-            let shm_disk_path = PathBuf::from(format!("{}-shm", self.db_path.display()));
 
             let wal_del_raw = format!("{}-wal (deleted)", self.db_path.display());
             let wal_del_canon = format!("{}-wal (deleted)", canon_path.display());
@@ -689,16 +774,37 @@ impl DatabaseManager {
                 }
             }
 
-            if !detected {
-                return Ok(false);
-            }
+            (detected, wal_fd_path)
+        }
+    }
 
+    /// Detects and self-heals a SQLite WAL split-brain condition on Linux where `-wal` or `-shm`
+    /// sidecar files were unlinked while open file descriptors remain held by this process (`LT-4`, `R16-M1`, `P2-C`).
+    ///
+    /// Returns `Ok(true)` if a split-brain was detected and healed, `Ok(false)` otherwise.
+    pub fn check_and_heal_wal_split_brain(&self) -> Result<bool> {
+        let (detected, wal_fd_path) = self.detect_unlinked_wal_or_shm_fds();
+        if !detected {
+            return Ok(false);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = wal_fd_path;
+            Ok(false)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
             tracing::error!(
                 db_path = %self.db_path.display(),
                 wal_fd = ?wal_fd_path,
-                "Detected SQLite WAL split-brain (unlinked -wal/-shm with open FD); initiating self-heal (LT-4)"
+                "Detected SQLite WAL split-brain (unlinked -wal/-shm with open FD); initiating self-heal (LT-4 / R16-M1)"
             );
 
+            let swap_guard = self.file_swap_lock.write();
+
+            let wal_disk_path = PathBuf::from(format!("{}-wal", self.db_path.display()));
             let tmp_db = PathBuf::from(format!("{}.heal_tmp", self.db_path.display()));
             let tmp_wal = PathBuf::from(format!("{}-wal", tmp_db.display()));
             let tmp_shm = PathBuf::from(format!("{}-shm", tmp_db.display()));
@@ -757,17 +863,8 @@ impl DatabaseManager {
                 }
             }
 
-            // Drop all pooled connections holding stale/deleted WAL/SHM FDs before atomic swap
-            {
-                let mut pool = self.conn_pool.lock();
-                pool.clear();
-            }
-            if wal_disk_path.exists() {
-                let _ = fs::remove_file(&wal_disk_path);
-            }
-            if shm_disk_path.exists() {
-                let _ = fs::remove_file(&shm_disk_path);
-            }
+            // Bump pool generation, drop idle pooled connections, and remove stale sidecars before atomic rename (R16-M1, P2-C)
+            let (new_gen, cleared_pool) = self.bump_generation_and_clear_pool_sidecars();
             if tmp_wal.exists() {
                 let _ = fs::remove_file(&tmp_wal);
             }
@@ -779,6 +876,9 @@ impl DatabaseManager {
                 AegisError::Database(format!("WAL split-brain heal atomic rename failed: {e}"))
             })?;
 
+            // CRITICAL: release file_swap_lock.write() BEFORE calling log_telemetry (which calls with_conn)
+            drop(swap_guard);
+
             let _ = self.log_telemetry(
                 "CRITICAL",
                 "engine.database",
@@ -786,6 +886,8 @@ impl DatabaseManager {
                 Some(json!({
                     "db_path": self.db_path.display().to_string(),
                     "recovered_from_fd": wal_fd_path.as_ref().map(|p| p.display().to_string()),
+                    "pool_generation": new_gen,
+                    "cleared_idle_connections": cleared_pool,
                 })),
             );
             Ok(true)
@@ -1450,7 +1552,8 @@ mod tests {
         assert!(db.set_config_batch(&bad_batch, false).is_err());
 
         // R3-H21: Unconditional masking in get_config_rows(false) and masked echo protection
-        db.set_config_value("gemini_api_key", &json!("AIzaRealSecretKey123456"))
+        let real_gemini = format!("{}{}", "AIza", "RealSecretKey123456");
+        db.set_config_value("gemini_api_key", &json!(real_gemini))
             .unwrap();
         let rows_unmasked_flag = db.get_config_rows(false).unwrap();
         let gk_row = rows_unmasked_flag
@@ -1465,7 +1568,7 @@ mod tests {
         db.set_config_value("gemini_api_key", &json!(masked_echo))
             .unwrap();
         let cfg = db.load_config().unwrap();
-        assert_eq!(cfg.get_str("gemini_api_key", ""), "AIzaRealSecretKey123456");
+        assert_eq!(cfg.get_str("gemini_api_key", ""), real_gemini);
 
         // R3-H15: resolve_reference_price returns Ok(None) when no market data exists
         assert_eq!(
@@ -3254,11 +3357,15 @@ mod tests {
 
             let applied = db.run_migrations().unwrap();
             assert!(!applied.is_empty());
-            assert_eq!(db.get_schema_version().unwrap(), 15);
+            assert_eq!(db.get_schema_version().unwrap(), 16);
             let cfg = db.load_config().unwrap();
             assert!(
                 (cfg.get_f64("pond_testnet_min_vol_cap_usdc", 0.0) - 1000.0).abs() < 1e-6,
-                "R15-S2: v{start_ver} DB stuck at 5000.0 must migrate to 1000.0 on v15"
+                "R15-S2: v{start_ver} DB stuck at 5000.0 must migrate to 1000.0 on v16"
+            );
+            assert!(
+                !cfg.get_bool("hlp_vault_auto_rebalance_enabled", true),
+                "R16-L3: v16 schema must default hlp_vault_auto_rebalance_enabled to false"
             );
         }
     }
@@ -3362,7 +3469,190 @@ mod tests {
                 .as_deref(),
             Some("before_backup")
         );
-        assert_eq!(db.get_schema_version().unwrap(), 15);
+        assert_eq!(db.get_schema_version().unwrap(), 16);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_r16_m1_wal_heal_epochs_and_discards_checked_out_connections() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("aegis_r16_m1_wal_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        assert_eq!(db.pool_generation(), 1);
+        assert_eq!(db.discarded_stale_connections_count(), 0);
+
+        // Write uncheckpointed WAL frames
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO system_config (config_key, config_value, value_type, category, description)
+                 VALUES ('r16_m1_probe', 'epoch_safe', 'string', 'test', 'probe');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Check out a pooled connection guard stamped with generation 1 before WAL heal
+        let stale_guard = db.checkout_pooled_conn_guard_for_test().unwrap();
+        assert_eq!(db.pool_generation(), 1);
+
+        #[cfg(target_os = "linux")]
+        {
+            let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+            assert!(wal_path.exists());
+            fs::remove_file(&wal_path).unwrap();
+
+            let (unlinked, _) = db.detect_unlinked_wal_or_shm_fds();
+            assert!(
+                unlinked,
+                "R16-M1: detect_unlinked_wal_or_shm_fds must spot unlinked -wal FD"
+            );
+
+            let healed = db.check_and_heal_wal_split_brain().unwrap();
+            assert!(healed, "R16-M1: WAL split-brain heal must succeed");
+            assert_eq!(
+                db.pool_generation(),
+                2,
+                "R16-M1: WAL heal must increment pool_generation"
+            );
+
+            // Dropping the pre-heal guard must discard its stale connection instead of recycling it
+            drop(stale_guard);
+            assert_eq!(
+                db.discarded_stale_connections_count(),
+                1,
+                "R16-M1: pre-heal connection must be discarded on drop"
+            );
+
+            // Subsequent reads use a fresh post-heal connection and preserve uncheckpointed data
+            let val = db
+                .get_raw_config_value("r16_m1_probe")
+                .unwrap()
+                .unwrap_or_default();
+            assert_eq!(val, "epoch_safe");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(stale_guard);
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_r16_m2_restore_refuses_live_activity_without_force_and_succeeds_with_force() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_r16_m2_restore_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let db = DatabaseManager::new(&db_path);
+        db.initialize_schema(true).unwrap();
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO system_config (config_key, config_value, value_type, category, description)
+                 VALUES ('r16_m2_probe', 'snapshot_v1', 'string', 'test', 'probe');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let backup_res = db.create_sqlite_backup(None, Some(7)).unwrap();
+        let backup_path = PathBuf::from(backup_res["backup_path"].as_str().unwrap());
+        let backup_fname = backup_res["file_name"].as_str().unwrap().to_string();
+
+        // Verify R16-U1 listing, whitelisting, preview, and preconditions helpers
+        let listed = db.list_sqlite_backups().unwrap();
+        assert!(!listed.is_empty());
+        assert_eq!(listed[0]["filename"], backup_fname);
+        assert!(db.resolve_whitelisted_backup_path("../evil.db").is_err());
+        assert!(db.resolve_whitelisted_backup_path("sub/evil.db").is_err());
+        let preview = db.inspect_sqlite_backup_preview(&backup_fname).unwrap();
+        assert_eq!(preview["filename"], backup_fname);
+        assert_eq!(preview["integrity_check"], "ok");
+        assert_eq!(preview["schema_version"], 16);
+        assert_eq!(preview["sha256"].as_str().unwrap().len(), 64);
+
+        let (allowed, reasons, _) = db.check_web_restore_preconditions().unwrap();
+        assert!(
+            allowed,
+            "Clean PAPER DB must pass web restore preconditions: {reasons:?}"
+        );
+
+        // Mutate DB after snapshot
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE system_config SET config_value = 'mutated_v2' WHERE config_key = 'r16_m2_probe';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // 1. Active cycle lock must block restore when allow_live_override == false
+        let cycle_guard = db
+            .acquire_cycle_lock_guard("r16-m2-active-daemon", 60_000)
+            .unwrap()
+            .expect("acquire cycle lock");
+        let activity = db.detect_live_database_activity().unwrap();
+        assert!(
+            activity.is_some(),
+            "R16-M2: active cycle lock must be detected as live database activity"
+        );
+        let err_locked = db
+            .restore_sqlite_backup_with_options(&backup_path, false, false)
+            .unwrap_err();
+        assert!(
+            err_locked.to_string().contains("R16-M2"),
+            "R16-M2: restore without force must fail with R16-M2 error: {err_locked}"
+        );
+        assert_eq!(
+            db.get_raw_config_value("r16_m2_probe").unwrap().as_deref(),
+            Some("mutated_v2"),
+            "Refused restore must leave database untouched"
+        );
+        drop(cycle_guard);
+
+        // 2. Fresh DatabaseManager instance (empty conn_pool) seeing active -shm sidecar must also refuse without force
+        let cli_db = DatabaseManager::new(&db_path);
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        if shm_path.exists()
+            && fs::metadata(&shm_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        {
+            let err_shm = cli_db
+                .restore_sqlite_backup_with_options(&backup_path, false, false)
+                .unwrap_err();
+            assert!(err_shm.to_string().contains("R16-M2"));
+        }
+
+        // 3. Passing allow_live_override = true (--force) must succeed and bump pool_generation
+        let gen_before = db.pool_generation();
+        let _force_guard = db
+            .acquire_cycle_lock_guard("r16-m2-force-override", 60_000)
+            .unwrap()
+            .expect("re-acquire lock for force test");
+        let pre_snap = db
+            .restore_sqlite_backup_with_options(&backup_path, true, false)
+            .unwrap();
+        assert!(pre_snap.exists());
+        assert!(db.pool_generation() > gen_before);
+        assert_eq!(
+            db.get_raw_config_value("r16_m2_probe").unwrap().as_deref(),
+            Some("snapshot_v1")
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

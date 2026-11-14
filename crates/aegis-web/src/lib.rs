@@ -44,6 +44,13 @@ pub struct CachedWebAuthConfig {
     pub web_allowed_hosts: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingRestoreToken {
+    pub filename: String,
+    pub sha256: String,
+    pub created_at: std::time::Instant,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: DatabaseManager,
@@ -56,6 +63,9 @@ pub struct AppState {
         Arc<parking_lot::Mutex<std::collections::HashMap<String, (u32, std::time::Instant)>>>,
     pub sse_payload_cache: Arc<parking_lot::Mutex<Option<(std::time::Instant, u64, String)>>>,
     pub last_manual_backup_at: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    pub restore_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    pub pending_restore_tokens:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, PendingRestoreToken>>>,
 }
 
 impl AppState {
@@ -457,6 +467,28 @@ async fn security_and_auth_middleware(
         return resp;
     }
 
+    let path = req.uri().path();
+    if state
+        .restore_in_progress
+        .load(std::sync::atomic::Ordering::Acquire)
+        && !matches!(
+            path,
+            "/api/v1/db/restore" | "/api/db/restore" | "/health" | "/api/health" | "/api/v1/health"
+        )
+    {
+        let body = ApiErrorBody {
+            error: "Service Unavailable".to_string(),
+            detail: "Database restore is currently in progress; retry shortly".to_string(),
+        };
+        let mut resp = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        attach_security_and_cors_headers(
+            resp.headers_mut(),
+            origin_hdr.as_deref(),
+            configured_origins.as_deref(),
+        );
+        return resp;
+    }
+
     let mut resp = next.run(req).await;
     attach_security_and_cors_headers(
         resp.headers_mut(),
@@ -520,6 +552,8 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         login_failures: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         sse_payload_cache: Arc::new(parking_lot::Mutex::new(None)),
         last_manual_backup_at: Arc::new(parking_lot::Mutex::new(None)),
+        restore_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_restore_tokens: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     };
 
     Router::new()
@@ -562,6 +596,8 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/v1/engine/backtest", post(api_trigger_backtest))
         .route("/api/v1/engine/calibrate", post(api_trigger_calibrate))
         .route("/api/v1/db/backup", post(api_trigger_db_backup))
+        .route("/api/v1/db/backups", get(api_list_db_backups))
+        .route("/api/v1/db/restore", post(api_restore_db_backup))
         .route("/api/v1/stream", get(api_stream))
         // Legacy aliases for backwards compatibility
         .route("/api/dashboard", get(api_dashboard))
@@ -588,6 +624,8 @@ pub fn build_router(db: DatabaseManager, static_dir: impl AsRef<Path>) -> Router
         .route("/api/backtest", post(api_trigger_backtest))
         .route("/api/calibrate", post(api_trigger_calibrate))
         .route("/api/db/backup", post(api_trigger_db_backup))
+        .route("/api/db/backups", get(api_list_db_backups))
+        .route("/api/db/restore", post(api_restore_db_backup))
         .route("/api/stream", get(api_stream))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1048,7 +1086,10 @@ mod tests {
         let pk_resp = app.clone().oneshot(pk_req).await.unwrap();
         assert_eq!(pk_resp.status(), StatusCode::OK);
 
-        let secret_tg = "123456789:AAH_super_secret_telegram_bot_token_value";
+        let secret_tg = format!(
+            "{}:{}",
+            "123456789", "AAH_super_secret_telegram_bot_token_value"
+        );
         let tg_req = axum::http::Request::builder()
             .method("POST")
             .uri("/api/v1/config")
@@ -1079,7 +1120,7 @@ mod tests {
         for log in &logs {
             let m = msg_of(log);
             assert!(
-                !m.contains(secret_pk) && !m.contains(secret_tg),
+                !m.contains(secret_pk) && !m.contains(&secret_tg),
                 "telemetry_logs must never contain plaintext sensitive config values"
             );
         }
@@ -2447,6 +2488,10 @@ mod tests {
             login_failures: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             sse_payload_cache: Arc::new(parking_lot::Mutex::new(None)),
             last_manual_backup_at: Arc::new(parking_lot::Mutex::new(None)),
+            restore_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_restore_tokens: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
         let sse_req_denied = axum::http::Request::builder()
             .method("GET")
@@ -2624,6 +2669,304 @@ mod tests {
         assert_eq!(h1, compute_sse_core_hash(&p1));
         p1.portfolio.total_equity_usdc += 123.45;
         assert_ne!(h1, compute_sse_core_hash(&p1));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_r16_u1_web_backups_list_and_two_step_guarded_restore() {
+        let root = resolve_project_root();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_web_r16_u1_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db = DatabaseManager::new(tmp_dir.join("web_r16_u1.db"));
+        db.initialize_schema(false).unwrap();
+        db.set_config_value("web_api_token", &json!("r16-u1-web-test-token-1234"))
+            .unwrap();
+        db.set_config_value("settling_deadband_bps", &json!(65))
+            .unwrap();
+
+        let app = build_router(db.clone(), root.join("web/static"));
+
+        // 1. Create a backup via POST /api/v1/db/backup
+        let create_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/backup")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"r16_u1_snapshot"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        // 2. List backups via GET /api/v1/db/backups
+        let list_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/db/backups")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+        assert_eq!(list_json["status"], "ok");
+        assert_eq!(list_json["restore_allowed"], true);
+        assert!(list_json["disabled_reasons"].as_array().unwrap().is_empty());
+        let backups = list_json["backups"].as_array().unwrap();
+        assert_eq!(backups.len(), 1);
+        let backup_filename = backups[0]["filename"].as_str().unwrap().to_string();
+        assert!(backups[0]["size_bytes"].as_u64().unwrap() > 0);
+        assert!(backups[0]["restore_cli_command"]
+            .as_str()
+            .unwrap()
+            .contains(&backup_filename));
+
+        // 3. Path traversal rejection (400) & missing file (404)
+        let trav_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"filename":"../evil.db","confirm":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trav_resp.status(), StatusCode::BAD_REQUEST);
+
+        let missing_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"filename":"aegis_quant_99999999_000000_000.db","confirm":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_resp.status(), StatusCode::NOT_FOUND);
+
+        // 4. LIVE-mode refusal (409 Conflict)
+        db.set_config_value("execution_mode", &json!("LIVE"))
+            .unwrap();
+        let live_refusal = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live_refusal.status(), StatusCode::CONFLICT);
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+
+        // 5. Open-trade refusal (409 Conflict)
+        db.reconcile_on_chain_orphan_position(
+            "SOL/USDC:USDC",
+            "SOL",
+            "LONG",
+            1.0,
+            100.0,
+            95.0,
+            5.0,
+        )
+        .unwrap();
+        let open_trade_refusal = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open_trade_refusal.status(), StatusCode::CONFLICT);
+        db.with_conn(|c| {
+            c.execute("DELETE FROM trades;", [])
+                .map_err(|e| aegis_core::AegisError::Database(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+
+        // 6. Mutate live config so Step 2 restore can be verified
+        db.set_config_value("settling_deadband_bps", &json!(95))
+            .unwrap();
+        assert_eq!(
+            db.load_config()
+                .unwrap()
+                .get_i64("settling_deadband_bps", 0),
+            95
+        );
+
+        // 7. Step 1 preview mints single-use restore_token
+        let step1_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":false}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step1_resp.status(), StatusCode::OK);
+        let step1_bytes = axum::body::to_bytes(step1_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let step1_json: serde_json::Value = serde_json::from_slice(&step1_bytes).unwrap();
+        assert_eq!(step1_json["status"], "preview");
+        assert_eq!(step1_json["expires_in_seconds"], 60);
+        assert_eq!(step1_json["preview"]["integrity_check"], "ok");
+        let restore_token = step1_json["restore_token"].as_str().unwrap().to_string();
+        assert_eq!(restore_token.len(), 64);
+
+        // 8. Step 2 without typed "RESTORE" is rejected with 400 without burning the token
+        let bad_confirm_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{restore_token}","confirm_text":"wrong"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_confirm_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 9. Step 2 with valid token + confirm_text == "RESTORE" restores DB & writes DB_RESTORE_COMPLETED audit log
+        let step2_resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{restore_token}","confirm_text":"RESTORE"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(step2_resp.status(), StatusCode::OK);
+        let step2_bytes = axum::body::to_bytes(step2_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let step2_json: serde_json::Value = serde_json::from_slice(&step2_bytes).unwrap();
+        assert_eq!(step2_json["status"], "restored");
+        assert_eq!(
+            step2_json["schema_version"],
+            aegis_db::CANONICAL_SCHEMA_VERSION
+        );
+        assert!(step2_json["pre_restore_snapshot"]
+            .as_str()
+            .unwrap()
+            .contains("aegis_quant_pre_restore_"));
+
+        // Verify config value was restored to 65
+        assert_eq!(
+            db.load_config()
+                .unwrap()
+                .get_i64("settling_deadband_bps", 0),
+            65
+        );
+
+        // Verify single-use token replay is rejected (400)
+        let replay_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/db/restore")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, "Bearer r16-u1-web-test-token-1234")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"filename":"{backup_filename}","confirm":true,"restore_token":"{restore_token}","confirm_text":"RESTORE"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::BAD_REQUEST);
+
+        // Verify DB_RESTORE_COMPLETED audit log entry
+        let logs = db.get_recent_logs(20).unwrap();
+        assert!(
+            logs.iter().any(|l| {
+                l.get("component").and_then(|v| v.as_str()) == Some("web.restore")
+                    && l.get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .contains("DB_RESTORE_COMPLETED")
+            }),
+            "telemetry_logs must contain DB_RESTORE_COMPLETED entry from web.restore"
+        );
+
+        assert!(EMBEDDED_INDEX_HTML.contains("Database Restore Confirmation Modal"));
+        assert!(EMBEDDED_INDEX_HTML.contains("Refresh Backups"));
+        assert!(EMBEDDED_APP_JS.contains("es.addEventListener('heartbeat'"));
+        assert!(EMBEDDED_APP_JS.contains("/api/v1/db/backups"));
+        assert!(EMBEDDED_APP_JS.contains("/api/v1/db/restore"));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -378,6 +378,14 @@ pub struct DbBackupTriggerResponse {
     pub backup: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DbRestoreRequestPayload {
+    pub filename: String,
+    pub confirm: Option<bool>,
+    pub restore_token: Option<String>,
+    pub confirm_text: Option<String>,
+}
+
 pub fn validate_config_update(key: &str, val_str: &str) -> aegis_core::Result<()> {
     let trimmed_key = key.trim();
     if trimmed_key.is_empty() {

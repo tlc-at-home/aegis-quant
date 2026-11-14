@@ -1291,7 +1291,7 @@
               <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
                 <div>
                   <label class="text-muted" for="tg-token" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Bot Token (`@BotFather`)</label>
-                  <input type="password" id="tg-token" class="config-input" style="width:100%" placeholder="123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+                  <input type="password" id="tg-token" class="config-input" style="width:100%" placeholder="<bot_id>:<bot_secret_from_BotFather>" />
                 </div>
                 <div>
                   <label class="text-muted" for="tg-chat-id" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Chat ID / Channel ID</label>
@@ -1335,15 +1335,58 @@
 
           <div class="panel">
             <div class="panel-header">
-              <span class="panel-title">SQLite WAL Backup (`VACUUM INTO`) & Retention</span>
+              <span class="panel-title">SQLite WAL Backup (`VACUUM INTO`), Retention & Guarded Restore</span>
               <span class="badge badge-info" id="db-backup-settings-badge" role="status" aria-live="polite">READY</span>
             </div>
-            <div class="panel-body">
+            <div class="panel-body" style="display:flex; flex-direction:column; gap:10px;">
               <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
                 <span class="text-muted" id="db-backup-settings-detail" style="font-size:11px; font-family:var(--font-mono);">
                   Online atomic snapshot via SQLite VACUUM INTO (`data/backups/` — 7-day retention window)
                 </span>
-                <button type="button" class="primary" id="btn-backup-db-settings">Backup Database Now</button>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                  <button type="button" id="btn-refresh-backups">Refresh Backups</button>
+                  <button type="button" class="primary" id="btn-backup-db-settings">Backup Database Now</button>
+                </div>
+              </div>
+              <div id="db-restore-precondition-banner" class="text-muted" style="font-size:11px; font-family:var(--font-mono); padding:7px 10px; background:#06090f; border:1px solid var(--border); border-radius:5px;">
+                Restore Preconditions: Checking execution mode, open PIT/Pond positions, and cycle lock status...
+              </div>
+              <div class="table-wrapper" tabindex="0" role="region" aria-label="Available SQLite Backups">
+                <table id="db-backups-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Filename</th>
+                      <th scope="col">Size</th>
+                      <th scope="col">Created (UTC)</th>
+                      <th scope="col">Expires</th>
+                      <th scope="col">Copy CLI Command</th>
+                      <th scope="col">Restore…</th>
+                    </tr>
+                  </thead>
+                  <tbody id="db-backups-tbody">
+                    <tr><td colspan="6" class="text-muted">Click "Refresh Backups" to list available SQLite snapshots in `data/backups/`.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <!-- Two-Step Database Restore Confirmation Modal (R16-U1 Phase 2) -->
+              <div id="db-restore-modal" style="display:none; flex-direction:column; gap:10px; padding:12px; background:#05080d; border:1px solid var(--accent-amber); border-radius:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                  <strong style="font-family:var(--font-mono); color:var(--accent-amber); font-size:12px;">Database Restore Confirmation Modal (Two-Step Guarded Restore)</strong>
+                  <button type="button" id="btn-cancel-db-restore">Cancel</button>
+                </div>
+                <div id="db-restore-preview-meta" class="report-box" style="max-height:180px; color:var(--text-main);"></div>
+                <div id="db-restore-modal-preconditions" class="text-muted" style="font-size:11px; font-family:var(--font-mono);"></div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <label for="db-restore-confirm-input" class="text-muted" style="font-size:11px; font-family:var(--font-mono);">Type <code>RESTORE</code> to confirm:</label>
+                    <input type="text" id="db-restore-confirm-input" class="config-input" style="width:150px;" placeholder="RESTORE" autocomplete="off" />
+                  </div>
+                  <div style="display:flex; align-items:center; gap:8px;">
+                    <span id="db-restore-modal-status" class="text-muted" style="font-size:11px; font-family:var(--font-mono);"></span>
+                    <button type="button" class="primary" id="btn-confirm-db-restore" disabled>Confirm Restore</button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

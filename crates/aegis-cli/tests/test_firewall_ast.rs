@@ -369,3 +369,98 @@ fn test_concurrent_sqlite_wal_pit_pond_settle() {
     let _ = fs::remove_file(format!("{}-wal", db_path.display()));
     let _ = fs::remove_file(format!("{}-shm", db_path.display()));
 }
+
+fn collect_all_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_all_files(&path, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+}
+
+fn contains_contiguous_telegram_bot_token(line: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(":AA") {
+        let colon_idx = search_from + rel;
+        let digits_before = line[..colon_idx]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let after_aa = &line[colon_idx + 3..];
+        let token_tail_len = after_aa
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if (8..=10).contains(&digits_before) && token_tail_len >= 20 {
+            return true;
+        }
+        search_from = colon_idx + 3;
+    }
+    false
+}
+
+fn contains_contiguous_aiza_literal(line: &str) -> bool {
+    let prefix = ["AI", "za"].concat();
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(&prefix) {
+        let idx = search_from + rel;
+        let after = &line[idx + 4..];
+        let tail_len = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .count();
+        if tail_len >= 35 {
+            return true;
+        }
+        search_from = idx + 4;
+    }
+    false
+}
+
+#[test]
+fn test_r16_u2_no_contiguous_secret_literals_in_tracked_sources() {
+    let root = resolve_project_root();
+    let scan_dirs = ["crates", "web", "sql", "deploy", ".github"];
+    let mut files = Vec::new();
+    for dir in scan_dirs {
+        collect_all_files(&root.join(dir), &mut files);
+    }
+    assert!(
+        !files.is_empty(),
+        "R16-U2 secret scan must inspect tracked repository directories"
+    );
+
+    let mut violations = Vec::new();
+    for file in &files {
+        let Ok(content) = fs::read_to_string(file) else {
+            continue;
+        };
+        let rel = file.strip_prefix(&root).unwrap_or(file).display();
+        for (line_no, line) in content.lines().enumerate() {
+            if contains_contiguous_telegram_bot_token(line) {
+                violations.push(format!(
+                    "{rel}:{}: contiguous Telegram bot token literal ([REDACTED])",
+                    line_no + 1
+                ));
+            }
+            if contains_contiguous_aiza_literal(line) {
+                violations.push(format!(
+                    "{rel}:{}: contiguous AIza API key literal ([REDACTED])",
+                    line_no + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "R16-U2 secret hygiene violation(s) detected:\n{}",
+        violations.join("\n")
+    );
+}

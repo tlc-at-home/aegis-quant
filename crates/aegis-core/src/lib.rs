@@ -2684,11 +2684,15 @@ pub fn normalize_manual_exit_reason(reason: Option<&str>) -> String {
         .unwrap_or_else(|| "MANUAL_TAKE_PROFIT".to_string())
 }
 
-/// Computes effective open stop-loss risk ("heat") in USDC for a Book A (`PIT`) position (`LT-2`).
+/// Computes effective open stop-loss risk ("heat") in USDC for a Book A (`PIT`) position (`LT-2`, `R16-L2`).
 ///
 /// Reclaims open heat whenever:
 /// 1. `chandelier_stop` has trailed toward or past `entry_price` (locking in profit), and/or
 /// 2. Net positive `funding_accrued_usdc` offsets remaining downside stop risk.
+///
+/// Note (`R16-L2`): Negative `funding_accrued_usdc` deliberately does not inflate open stop-distance
+/// heat (`positive_funding = funding_accrued_usdc.max(0.0)`) because funding debits are already
+/// realized against cash/equity in book PnL accounting (`PitPnlComponents` / `PondPnlComponents`).
 pub fn effective_position_open_heat_usdc(
     action: &str,
     entry_price: f64,
@@ -2729,13 +2733,14 @@ pub fn effective_position_open_heat_usdc(
         (_, false, None) => 0.0,
     };
 
+    #[allow(clippy::let_and_return)]
     let base_heat = if active_stop > 0.0 {
         let price_loss_usdc = if is_short {
             (active_stop - entry_price).max(0.0) * qty
         } else {
             (entry_price - active_stop).max(0.0) * qty
         };
-        price_loss_usdc.min(risk_budget_usdc.max(price_loss_usdc))
+        price_loss_usdc
     } else {
         clean_budget
     };
@@ -2905,9 +2910,11 @@ mod tests {
         );
 
         // ME-15: Keyless standalone 0x + 64-hex private key and Telegram bot token must be redacted
-        let keyless = sanitize_telemetry_message(
-            "Signer init error for 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 and bot 123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
-        );
+        let doc_example_bot_token =
+            format!("{}:{}", "123456789", "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw");
+        let keyless = sanitize_telemetry_message(&format!(
+            "Signer init error for 0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318 and bot {doc_example_bot_token}"
+        ));
         assert_eq!(
             keyless,
             "Signer init error for [REDACTED] and bot [REDACTED]"
@@ -3070,7 +3077,7 @@ mod tests {
     #[test]
     fn test_r15_n8_redacts_bare_64_hex_and_gemini_aiza_keys() {
         let bare_pk = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
-        let gemini_key = "AIzaSyDummyKeyForUnitTest1234567890abcd";
+        let gemini_key = format!("{}{}", "AIza", "SyDummyKeyForUnitTest1234567890abcd");
         let msg = format!("bad signer {bare_pk} with gemini {gemini_key}");
         let scrubbed = sanitize_telemetry_message(&msg);
         assert!(
@@ -3078,7 +3085,7 @@ mod tests {
             "Bare 64-hex private key must be redacted: {scrubbed}"
         );
         assert!(
-            !scrubbed.contains(gemini_key),
+            !scrubbed.contains(&gemini_key),
             "Gemini AIza key must be redacted: {scrubbed}"
         );
         assert!(

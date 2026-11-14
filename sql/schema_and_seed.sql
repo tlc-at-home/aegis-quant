@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Aegis Quant (v0.3.0-rc1) — Consolidated Canonical SQLite WAL Schema & Seed Build Script
 -- Target DB Path: /home/fedora/aegis/data/aegis_quant.db
--- Consolidates base schema + migrations 001..015 into one idempotent build script.
+-- Consolidates base schema + migrations 001..016 into one idempotent build script.
 -- =============================================================================
 
 PRAGMA busy_timeout = 15000;
@@ -558,7 +558,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('environment', 'sandbox', 'string', 'platform', 'Deployment target environment (sandbox or production)'),
     ('execution_mode', 'PAPER', 'string', 'platform', 'Execution routing mode: PAPER, TESTNET, or LIVE Web3 DEX routing'),
     ('exchange_id', 'hyperliquid', 'string', 'platform', 'CCXT async exchange identifier (Hyperliquid L1 CLOB)'),
-    ('schema_version', '15', 'int', 'platform', 'Current SQLite schema migration version'),
+    ('schema_version', '16', 'int', 'platform', 'Current SQLite schema migration version'),
 
     -- Web3 DEX & AI Credentials
     ('wallet_address', '', 'string', 'credentials', 'Main Arbitrum Wallet Address holding USDC collateral'),
@@ -963,7 +963,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     -- Round 15 Telemetry & Remediation Defaults (`v15`)
     ('hmm_intrabar_enter_margin', '0.03', 'float', 'hmm', 'Additional posterior probability margin required for intrabar HMM regime hysteresis switches (LT-5)'),
     ('alert_regime_flip_confirm_cycles', '2', 'int', 'alerts', 'Consecutive cycles required before dispatching a RegimeFlip alert unless posterior >= 0.70 (LT-5)'),
-    ('hlp_vault_auto_rebalance_enabled', 'true', 'bool', 'execution', 'Automatically withdraw unlocked excess HLP vault equity back to Perps margin when above allocation cap (LT-3)'),
+    ('hlp_vault_auto_rebalance_enabled', 'false', 'bool', 'execution', 'Automatically withdraw unlocked excess HLP vault equity back to Perps margin when above allocation cap (LT-3)'),
     ('hlp_vault_max_equity_pct', '0.20', 'float', 'execution', 'Maximum fraction of total live wallet equity allowed in the HLP vault before auto-rebalancing excess back to Perps margin (LT-3)'),
     ('hlp_vault_last_rebalance_ms', '0', 'int', 'execution', 'Epoch timestamp (ms) of the last automated HLP vault rebalance withdrawal (LT-3)'),
     ('hlp_vault_locked_until_ms', '0', 'int', 'execution', 'Epoch timestamp (ms) until which Hyperliquid HLP vault shares remain locked (LT-3)'),
@@ -1196,11 +1196,19 @@ WHERE config_key = 'pond_testnet_min_vol_cap_usdc'
   )
   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 15);
 
+-- 6g. Round 16 Remediation: default `hlp_vault_auto_rebalance_enabled` to `false` on upgrade to v16 (`R16-L3`)
+UPDATE system_config
+SET config_value = 'false',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE config_key = 'hlp_vault_auto_rebalance_enabled'
+  AND config_value = 'true'
+  AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version >= 16);
+
 -- -----------------------------------------------------------------------------
--- 7. Record Consolidated Schema Versions (1..15)
+-- 7. Record Consolidated Schema Versions (1..16)
 -- -----------------------------------------------------------------------------
 UPDATE system_config
-SET config_value = '15',
+SET config_value = '16',
     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
 WHERE config_key = 'schema_version';
 
@@ -1219,4 +1227,5 @@ INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc, description) V
     (12, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v12: Testnet Faucet Offset Config'),
     (13, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v13: Two-Tier Chandelier 2.2x ATR & Pond 6% Stop Cap'),
     (14, CAST(strftime('%s', 'now') AS INTEGER), 'Consolidated Schema v14: Pond NPS-01 Post-Mortem & Round 14 Remediation'),
-    (15, CAST(strftime('%s', 'now') AS INTEGER), 'v15_round15_remediation_and_testnet_vol_floor');
+    (15, CAST(strftime('%s', 'now') AS INTEGER), 'v15_round15_remediation_and_testnet_vol_floor'),
+    (16, CAST(strftime('%s', 'now') AS INTEGER), 'v16_round16_remediation_and_mainnet_gate_hygiene');

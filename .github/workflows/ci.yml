@@ -20,11 +20,37 @@ jobs:
           components: rustfmt, clippy
       - name: Cache Cargo Registry & Target
         uses: Swatinem/rust-cache@v2
+      - name: Secret Hygiene Check (R16-U2)
+        run: |
+          python3 -c '
+          import pathlib, re, subprocess, sys
+          pat = re.compile(r"([0-9]{8,10}:AA[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35})")
+          files = subprocess.check_output(
+              ["git", "ls-files", "crates/", "web/", "sql/", "deploy/", ".github/"],
+              text=True,
+          ).splitlines()
+          hits = []
+          for rel in files:
+              p = pathlib.Path(rel)
+              if not p.is_file():
+                  continue
+              text = p.read_text(encoding="utf-8", errors="ignore")
+              for idx, line in enumerate(text.splitlines(), 1):
+                  if pat.search(line):
+                      redacted = pat.sub("[REDACTED_SECRET_LITERAL]", line.strip())
+                      hits.append(f"{rel}:{idx}: {redacted}")
+          if hits:
+              print("R16-U2 secret hygiene violation(s) detected (redacted):", file=sys.stderr)
+              for h in hits:
+                  print(f"  {h}", file=sys.stderr)
+              sys.exit(1)
+          print(f"R16-U2 secret hygiene check passed across {len(files)} tracked files.")
+          '
       - name: Check Code Formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Workspace Unit & Integration Tests (Enforce >= 155 Tests)
+      - name: Run Workspace Unit & Integration Tests (Enforce >= 159 Tests)
         run: |
           set -o pipefail
           cargo test --workspace | tee /tmp/aegis_test_output.txt
@@ -35,8 +61,8 @@ jobs:
           counts = [int(m.group(1)) for m in re.finditer(r"test result: ok\. (\d+) passed; 0 failed", text)]
           total = sum(counts)
           print(total)
-          if total < 155:
-              raise SystemExit(f"Expected >= 155 passing workspace tests, observed {total}")
+          if total < 159:
+              raise SystemExit(f"Expected >= 159 passing workspace tests, observed {total}")
           ')
           echo "Verified ${TOTAL} passing workspace tests"
       - name: Build Optimized Release Binary

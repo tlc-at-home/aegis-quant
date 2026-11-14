@@ -23,7 +23,7 @@ static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 /// Hyperliquid L1 oracle price band margin (`±3.95%`), safely inside the exchange's `±4.0%`
 /// (`Price too far from oracle`) rejection boundary (`1.0 + HL_ORACLE_BAND_PCT == 1.0395`,
-/// `1.0 - HL_ORACLE_BAND_PCT == 0.9605`) (`R11-S1`).
+/// `1.0 - HL_ORACLE_BAND_PCT == 0.9605`) (`R11-S1`, `R16-N1`).
 pub const HL_ORACLE_BAND_PCT: f64 = 0.0395;
 
 /// Aggressive IOC retry slippage (`5.0%`) applied around `live_mid` when an IOC order is
@@ -414,6 +414,7 @@ impl ExecutionEngine {
         // Protective stop closes the position: SELL (b=false) for LONG, BUY (b=true) for SHORT
         let stop_is_buy = !is_long_pos;
         let trigger_px_str = format_hl_wire_price(trigger_price, asset.tick_size, sz_decimals);
+        // Worst-case limit fallback within Hyperliquid's ±3.95% (`HL_ORACLE_BAND_PCT`) oracle band (`R16-N1`)
         let limit_fallback = if stop_is_buy {
             trigger_price * (1.0 + HL_ORACLE_BAND_PCT)
         } else {
@@ -2650,13 +2651,13 @@ impl ExecutionEngine {
     }
 
     /// Rebalances excess unlocked HLP Vault equity back into the perps margin account when vault
-    /// allocation drifts above `basis_max_idle_cash_allocation_pct` (default `0.20`) plus a `$10`
-    /// buffer (`LT-3`). Respects lockup timestamps (`hlp_vault_locked_until_ms`) and a 1-hour
-    /// rebalance cooldown (`hlp_vault_last_rebalance_ms`).
+    /// allocation drifts above `hlp_vault_max_equity_pct` (default `0.20`) plus a `$10`
+    /// buffer (`LT-3`, `R16-L3`). Respects lockup timestamps (`hlp_vault_locked_until_ms`) and a 1-hour
+    /// rebalance cooldown (`hlp_vault_last_rebalance_ms`). Disabled by default (`hlp_vault_auto_rebalance_enabled = false`, `R16-L3`).
     pub fn rebalance_hlp_vault_margin_if_needed(&self) -> Result<Option<f64>> {
         let cfg = self.load_config_logged("rebalance_hlp_vault_margin_if_needed");
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
-        if mode == "PAPER" || !cfg.get_bool("hlp_vault_auto_rebalance_enabled", true) {
+        if mode == "PAPER" || !cfg.get_bool("hlp_vault_auto_rebalance_enabled", false) {
             return Ok(None);
         }
         let wallet = cfg.get_str("wallet_address", "").trim().to_string();
@@ -2732,6 +2733,29 @@ impl ExecutionEngine {
             return Ok(None);
         }
 
+        tracing::warn!(
+            vault_address = %vault,
+            withdraw_usdc = excess_usdc,
+            vault_equity_usdc = vault_eq,
+            target_vault_cap_usdc = round_dp(target_vault_cap, 2),
+            total_equity_usdc = total_eq,
+            "HLP_VAULT_AUTO_REBALANCE_INITIATED: initiating automated HLP vault withdrawal to perps margin (R16-L3)"
+        );
+        let _ = self.db.log_telemetry(
+            "WARN",
+            "engine.execution",
+            &format!(
+                "HLP_VAULT_AUTO_REBALANCE_INITIATED: withdrawing ${excess_usdc:.2} from HLP vault to perps margin (vault=${vault_eq:.2}, cap=${target_vault_cap:.2}, total=${total_eq:.2}) (R16-L3)"
+            ),
+            Some(json!({
+                "event": "HLP_VAULT_AUTO_REBALANCE_INITIATED",
+                "vault_address": vault,
+                "withdraw_usdc": excess_usdc,
+                "vault_equity_usdc": vault_eq,
+                "target_vault_cap_usdc": round_dp(target_vault_cap, 2),
+                "total_equity_usdc": total_eq,
+            })),
+        );
         let res = self.execute_hlp_vault_transfer(excess_usdc, false, Some(&vault));
         if res.status == VaultTransferStatus::Submitted {
             let _ = self

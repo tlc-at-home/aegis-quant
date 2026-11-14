@@ -117,10 +117,10 @@ enum Commands {
         /// Initialize SQLite WAL schema and seed 31-instrument universe
         #[arg(long)]
         init: bool,
-        /// Force drop and recreate schema tables during `--init`
+        /// Force drop and recreate schema tables during `--init`, or override live-activity refusal during `--restore` (`R16-M2`)
         #[arg(long)]
         force: bool,
-        /// Apply pending compiled Rust migrations & align schema to canonical `sql/schema_and_seed.sql` (v15) (`R15-N11`)
+        /// Apply pending compiled Rust migrations & align schema to canonical `sql/schema_and_seed.sql` (v16) (`R15-N11`)
         #[arg(long)]
         migrate: bool,
         /// Verify Fernet AES-128-CBC + HMAC-SHA256 encryption at rest
@@ -377,6 +377,13 @@ impl AegisOrchestrator {
 
     pub fn initialize(&self, run_calibration: bool) -> Result<()> {
         if !self.db.is_memory {
+            let (unlinked_detected, unlinked_fd) = self.db.detect_unlinked_wal_or_shm_fds();
+            if unlinked_detected {
+                tracing::warn!(
+                    unlinked_fd = ?unlinked_fd,
+                    "Startup detected unlinked SQLite WAL/SHM file descriptor before split-brain heal (R16-M2)"
+                );
+            }
             if let Err(e) = self.db.check_and_heal_wal_split_brain() {
                 tracing::warn!("WAL split-brain pre-init check warning: {e}");
             }
@@ -1477,7 +1484,11 @@ fn execute_db_restore_cli(
     db: &DatabaseManager,
     restore_path: &std::path::Path,
     confirm: bool,
+    force: bool,
 ) -> anyhow::Result<PathBuf> {
+    eprintln!(
+        "WARNING: Stop all running aegis-quant / aegis-pit / aegis-pond daemons before running db --restore (R16-M2)."
+    );
     if !confirm {
         return Err(AegisError::Validation(
             "Database restore overwrites active database; pass --confirm to proceed (ME-19)"
@@ -1485,7 +1496,7 @@ fn execute_db_restore_cli(
         )
         .into());
     }
-    Ok(db.restore_sqlite_backup(restore_path)?)
+    Ok(db.restore_sqlite_backup_with_options(restore_path, force, false)?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1517,7 +1528,7 @@ fn main() -> anyhow::Result<()> {
             confirm,
         }) => {
             if let Some(restore_path) = restore {
-                let pre_snap = execute_db_restore_cli(&db, &restore_path, confirm)?;
+                let pre_snap = execute_db_restore_cli(&db, &restore_path, confirm, force)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
@@ -2386,7 +2397,8 @@ mod tests {
             .count();
         assert_eq!(backup_count, 1);
 
-        // ME-19 CLI restore guard: --restore without --confirm must be rejected, and --confirm must restore
+        // ME-19 & R16-M2 CLI restore guard: --restore without --confirm must be rejected,
+        // live activity without --force must be refused, and --force must override live activity.
         let backup_file = std::fs::read_dir(tmp_dir.join("backups"))
             .unwrap()
             .flatten()
@@ -2397,10 +2409,21 @@ mod tests {
                     .is_some_and(|s| s.starts_with("aegis_quant_") && s.ends_with(".db"))
             })
             .unwrap();
-        let err = execute_db_restore_cli(&db, &backup_file, false).unwrap_err();
+        let err = execute_db_restore_cli(&db, &backup_file, false, false).unwrap_err();
         assert!(err.to_string().contains("--confirm"));
-        let pre_snap = execute_db_restore_cli(&db, &backup_file, true).unwrap();
+
+        let lock_guard = db
+            .acquire_cycle_lock_guard("r16-m2-live-daemon", 60_000)
+            .unwrap()
+            .expect("acquire cycle lock");
+        let live_err = execute_db_restore_cli(&db, &backup_file, true, false).unwrap_err();
+        assert!(
+            live_err.to_string().contains("R16-M2"),
+            "Restore without --force must refuse when live database activity is detected: {live_err}"
+        );
+        let pre_snap = execute_db_restore_cli(&db, &backup_file, true, true).unwrap();
         assert!(pre_snap.exists());
+        drop(lock_guard);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

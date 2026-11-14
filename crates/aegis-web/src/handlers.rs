@@ -10,12 +10,12 @@ use crate::{
         BacktestRequestPayload, BacktestRunResponse, BatchConfigUpdateResponse,
         CalibrateRunResponse, CloseTradePayload, CloseTradeResponse, ConfigBatchUpdatePayload,
         ConfigUpdatePayload, CredentialsUpdatePayload, CredentialsUpdateResponse,
-        CycleTriggerResponse, DbBackupRequestPayload, DbBackupTriggerResponse, HealthPayload,
-        LimitQuery, PondScanTriggerResponse, PortfolioSummaryPayload, SettleRequestPayload,
-        SettleTriggerResponse, SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload,
-        WalletSyncResponse,
+        CycleTriggerResponse, DbBackupRequestPayload, DbBackupTriggerResponse,
+        DbRestoreRequestPayload, HealthPayload, LimitQuery, PondScanTriggerResponse,
+        PortfolioSummaryPayload, SettleRequestPayload, SettleTriggerResponse,
+        SingleConfigUpdateResponse, StatusPayload, WalletSyncPayload, WalletSyncResponse,
     },
-    AppState,
+    AppState, PendingRestoreToken,
 };
 use aegis_alerts::AlertEngine;
 use aegis_backtest::BacktestEngine;
@@ -972,6 +972,296 @@ pub async fn api_trigger_db_backup(
         Ok(res) => {
             *state.last_manual_backup_at.lock() = Some(std::time::Instant::now());
             Json(res).into_response()
+        }
+        Err(e) => map_err_response(e),
+    }
+}
+
+pub async fn api_list_db_backups(State(state): State<AppState>) -> Response {
+    match run_db_blocking(state.db.clone(), move |db| {
+        let backups = db.list_sqlite_backups()?;
+        let (restore_allowed, disabled_reasons, preconditions) =
+            db.check_web_restore_preconditions()?;
+        let runbook_notice = "Stop external aegis-quant / aegis-pit / aegis-pond daemons before restoring if running outside this web server process. Guarded web restore is permitted only in PAPER/TESTNET mode with zero open PIT positions, zero open Pond cells, and no active cycle lock (R16-U1 / R16-M2).";
+        Ok(json!({
+            "status": "ok",
+            "backups": backups,
+            "restore_allowed": restore_allowed,
+            "disabled_reasons": disabled_reasons,
+            "preconditions": preconditions,
+            "runbook_notice": runbook_notice,
+        }))
+    })
+    .await
+    {
+        Ok(res) => Json(res).into_response(),
+        Err(e) => map_err_response(e),
+    }
+}
+
+struct RestoreInProgressGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RestoreInProgressGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn map_restore_preview_err(err: aegis_core::AegisError) -> Response {
+    let msg = aegis_core::sanitize_telemetry_message(&err.to_string());
+    match err {
+        aegis_core::AegisError::NotFound(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorBody {
+                error: "Not Found".to_string(),
+                detail: msg,
+            }),
+        )
+            .into_response(),
+        aegis_core::AegisError::Validation(_)
+        | aegis_core::AegisError::Config(_)
+        | aegis_core::AegisError::SecurityViolation(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorBody {
+                error: "Bad Request".to_string(),
+                detail: msg,
+            }),
+        )
+            .into_response(),
+        other => map_err_response(other.into()),
+    }
+}
+
+pub async fn api_restore_db_backup(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<DbRestoreRequestPayload>,
+) -> Response {
+    let trust_proxy = state
+        .db
+        .load_config_opts(false)
+        .map(|c| c.get_bool("web_trust_proxy_headers", false))
+        .unwrap_or(false);
+    let client_ip = extract_client_ip_key(&headers, trust_proxy);
+    let auth_method = if extract_cookie_token(&headers, "aegis_session").is_some() {
+        "session_cookie"
+    } else if headers.get(header::AUTHORIZATION).is_some() {
+        "bearer_token"
+    } else if headers.get("x-aegis-token").is_some() {
+        "x_aegis_token"
+    } else {
+        "web_api"
+    };
+    let operator = format!("ip={client_ip} via={auth_method}");
+
+    let clean_filename = payload.filename.trim().to_string();
+    let db_for_preview = state.db.clone();
+    let fname_for_preview = clean_filename.clone();
+    let initial_check = run_db_blocking(db_for_preview, move |db| {
+        let preview_res = db.inspect_sqlite_backup_preview(&fname_for_preview);
+        let precond = db.check_web_restore_preconditions()?;
+        Ok((preview_res, precond))
+    })
+    .await;
+
+    let (preview_res, (restore_allowed, disabled_reasons, preconditions)) = match initial_check {
+        Ok(v) => v,
+        Err(e) => return map_err_response(e),
+    };
+
+    let preview = match preview_res {
+        Ok(p) => p,
+        Err(e) => return map_restore_preview_err(e),
+    };
+
+    if !restore_allowed {
+        let detail = if disabled_reasons.is_empty() {
+            "Web restore preconditions are not satisfied".to_string()
+        } else {
+            disabled_reasons.join("; ")
+        };
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Conflict",
+                "detail": detail,
+                "restore_allowed": false,
+                "disabled_reasons": disabled_reasons,
+                "preconditions": preconditions,
+            })),
+        )
+            .into_response();
+    }
+
+    let preview_sha256 = preview
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Step 1: Preview & mint a 60-second single-use restore_token
+    if payload.confirm != Some(true) {
+        let restore_token = generate_ephemeral_session_token();
+        {
+            let now = std::time::Instant::now();
+            let mut tokens = state.pending_restore_tokens.lock();
+            tokens.retain(|_, v| {
+                now.saturating_duration_since(v.created_at) <= Duration::from_secs(60)
+            });
+            tokens.insert(
+                restore_token.clone(),
+                PendingRestoreToken {
+                    filename: clean_filename,
+                    sha256: preview_sha256,
+                    created_at: now,
+                },
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "status": "preview",
+                "preview": preview,
+                "restore_token": restore_token,
+                "expires_in_seconds": 60,
+                "restore_allowed": true,
+                "disabled_reasons": Vec::<String>::new(),
+                "preconditions": preconditions,
+            })),
+        )
+            .into_response();
+    }
+
+    // Step 2: Require confirm_text == "RESTORE" and consume valid unexpired restore_token
+    if payload.confirm_text.as_deref().map(str::trim) != Some("RESTORE") {
+        let body = ApiErrorBody {
+            error: "Bad Request".to_string(),
+            detail: "Step 2 database restore requires confirm_text == 'RESTORE'".to_string(),
+        };
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+
+    let Some(raw_token) = payload
+        .restore_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        let body = ApiErrorBody {
+            error: "Bad Request".to_string(),
+            detail: "Missing single-use restore_token from Step 1 preview".to_string(),
+        };
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    };
+
+    let token_valid = {
+        let now = std::time::Instant::now();
+        let mut tokens = state.pending_restore_tokens.lock();
+        tokens
+            .retain(|_, v| now.saturating_duration_since(v.created_at) <= Duration::from_secs(60));
+        if let Some(entry) = tokens.remove(raw_token) {
+            now.saturating_duration_since(entry.created_at) <= Duration::from_secs(60)
+                && entry.filename == clean_filename
+                && constant_time_eq(&entry.sha256, &preview_sha256)
+        } else {
+            false
+        }
+    };
+    if !token_valid {
+        let body = ApiErrorBody {
+            error: "Bad Request".to_string(),
+            detail:
+                "Invalid, expired, or already-used restore_token; request a fresh Step 1 preview"
+                    .to_string(),
+        };
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+
+    let _cycle_guard = state.cycle_lock.lock().await;
+    if state
+        .restore_in_progress
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        let body = ApiErrorBody {
+            error: "Service Unavailable".to_string(),
+            detail: "Database restore is currently in progress; retry shortly".to_string(),
+        };
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+    let _restore_guard = RestoreInProgressGuard(state.restore_in_progress.clone());
+
+    let fname_step2 = clean_filename.clone();
+    let sha_step2 = preview_sha256.clone();
+    let op_step2 = operator.clone();
+
+    let restore_outcome = run_db_blocking(state.db.clone(), move |db| {
+        let (recheck_allowed, recheck_reasons, recheck_precond) =
+            db.check_web_restore_preconditions()?;
+        if !recheck_allowed {
+            return Ok(Err((recheck_reasons, recheck_precond)));
+        }
+        let backup_path = db.resolve_whitelisted_backup_path(&fname_step2)?;
+        let pre_restore_path = db.restore_sqlite_backup_with_options(&backup_path, false, true)?;
+        let schema_version = db.get_schema_version()?;
+        let pre_restore_str = pre_restore_path.display().to_string();
+        let restored_from_str = backup_path.display().to_string();
+        let audit_meta = json!({
+            "event": "DB_RESTORE_COMPLETED",
+            "operator": op_step2,
+            "filename": fname_step2,
+            "restored_from": restored_from_str,
+            "sha256": sha_step2,
+            "pre_restore_snapshot": pre_restore_str,
+            "schema_version": schema_version,
+        });
+        let _ = db.log_telemetry(
+            "WARN",
+            "web.restore",
+            &format!(
+                "DB_RESTORE_COMPLETED by {op_step2}: filename={fname_step2} sha256={sha_step2} pre_restore_snapshot={pre_restore_str} schema_version={schema_version}"
+            ),
+            Some(audit_meta),
+        );
+        Ok(Ok(json!({
+            "status": "restored",
+            "filename": fname_step2,
+            "restored_from": restored_from_str,
+            "sha256": sha_step2,
+            "pre_restore_snapshot": pre_restore_str,
+            "schema_version": schema_version,
+        })))
+    })
+    .await;
+
+    match restore_outcome {
+        Ok(Ok(resp_json)) => {
+            *state.sse_payload_cache.lock() = None;
+            state.invalidate_auth_cache();
+            (StatusCode::OK, Json(resp_json)).into_response()
+        }
+        Ok(Err((reasons, precond))) => {
+            let detail = if reasons.is_empty() {
+                "Web restore preconditions are not satisfied".to_string()
+            } else {
+                reasons.join("; ")
+            };
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "Conflict",
+                    "detail": detail,
+                    "restore_allowed": false,
+                    "disabled_reasons": reasons,
+                    "preconditions": precond,
+                })),
+            )
+                .into_response()
         }
         Err(e) => map_err_response(e),
     }

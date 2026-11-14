@@ -260,6 +260,9 @@ function switchDashboardPage(pageId) {
   if (history.replaceState) {
     history.replaceState(null, '', `#${pageId}`);
   }
+  if (pageId === 'settings' && typeof fetchDbBackups === 'function') {
+    fetchDbBackups();
+  }
 }
 
 // Keyboard Left/Right/Home/End navigation for ARIA tablist + DOM event bindings
@@ -312,6 +315,9 @@ document.addEventListener('DOMContentLoaded', () => {
   bindClick('btn-backtest', triggerBacktest);
   bindClick('btn-backup-db', triggerDbBackup);
   bindClick('btn-backup-db-settings', triggerDbBackup);
+  bindClick('btn-refresh-backups', fetchDbBackups);
+  bindClick('btn-cancel-db-restore', closeDbRestoreModal);
+  bindClick('btn-confirm-db-restore', confirmDbRestore);
   bindClick('btn-auth-login', submitAuthLogin);
   bindClick('btn-close-report', () => {
     const rp = document.getElementById('report-panel');
@@ -406,12 +412,47 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const dbBackupsTbody = document.getElementById('db-backups-tbody');
+  if (dbBackupsTbody) {
+    dbBackupsTbody.addEventListener('click', (e) => {
+      const copyBtn = e.target && e.target.closest ? e.target.closest('button[data-copy-restore-cli]') : null;
+      if (copyBtn) {
+        const cliCmd = copyBtn.getAttribute('data-copy-restore-cli') || '';
+        if (cliCmd && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          navigator.clipboard.writeText(cliCmd).then(() => {
+            copyBtn.textContent = 'Copied!';
+            setTimeout(() => { copyBtn.textContent = 'Copy CLI Command'; }, 1500);
+          }).catch(() => {});
+        }
+        return;
+      }
+      const restoreBtn = e.target && e.target.closest ? e.target.closest('button[data-open-restore-modal]') : null;
+      if (restoreBtn && !restoreBtn.disabled) {
+        const filename = restoreBtn.getAttribute('data-open-restore-modal') || '';
+        if (filename) {
+          openDbRestoreModal(filename);
+        }
+      }
+    });
+  }
+
+  const restoreConfirmInput = document.getElementById('db-restore-confirm-input');
+  if (restoreConfirmInput) {
+    restoreConfirmInput.addEventListener('input', (e) => {
+      const confirmBtn = document.getElementById('btn-confirm-db-restore');
+      if (confirmBtn) {
+        confirmBtn.disabled = !(e.target.value.trim() === 'RESTORE' && Boolean(pendingRestoreToken));
+      }
+    });
+  }
+
   const hash = (window.location.hash || '').replace('#', '').toLowerCase();
   if (['overall', 'pit', 'pond', 'settings'].includes(hash)) {
     switchDashboardPage(hash);
   }
 
   fetchInitialDashboard();
+  fetchDbBackups();
   connectSSE();
 });
 
@@ -1208,11 +1249,18 @@ function connectSSE() {
   const sseToken = resolveApiAuthToken();
   const sseUrl = sseToken ? `/api/v1/stream?token=${encodeURIComponent(sseToken)}` : '/api/v1/stream';
   const evtSource = new EventSource(sseUrl);
+  const es = evtSource;
   activeEventSource = evtSource;
   evtSource.onopen = () => {
     sseBadge.textContent = 'SSE: LIVE (3s)';
     sseBadge.className = 'badge badge-bull';
   };
+  es.addEventListener('heartbeat', () => {
+    if (sseBadge) {
+      sseBadge.textContent = 'SSE: LIVE (3s)';
+      sseBadge.className = 'badge badge-bull';
+    }
+  });
   evtSource.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
@@ -1396,6 +1444,7 @@ async function triggerDbBackup() {
     } else {
       await fetchInitialDashboard();
     }
+    await fetchDbBackups();
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     if (statusEl) {
@@ -1611,6 +1660,7 @@ async function triggerTakeProfit(tradeId, symbol, btnEl) {
     } else {
       await fetchInitialDashboard();
     }
+    await fetchDbBackups();
   } catch (err) {
     alert(`Failed to close ${symbol || '#' + tradeId}: ${err && err.message ? err.message : String(err)}`);
   } finally {
@@ -1642,12 +1692,194 @@ async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
     } else {
       await fetchInitialDashboard();
     }
+    await fetchDbBackups();
   } catch (err) {
     alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${err && err.message ? err.message : String(err)}`);
   } finally {
     if (btnEl) {
       btnEl.disabled = false;
       btnEl.textContent = 'Take Profit';
+    }
+  }
+}
+
+let pendingRestoreToken = null;
+let pendingRestoreFilename = null;
+
+async function fetchDbBackups() {
+  try {
+    const res = await apiFetch('/api/v1/db/backups');
+    if (!res.ok) return;
+    const data = await res.json().catch(() => ({}));
+    if (data && data.status === 'ok') {
+      renderDbBackupsList(data);
+    }
+  } catch (err) {
+    console.error('Failed to fetch SQLite backups:', err);
+  }
+}
+
+function renderDbBackupsList(data) {
+  const bannerEl = document.getElementById('db-restore-precondition-banner');
+  const tbody = document.getElementById('db-backups-tbody');
+  const restoreAllowed = Boolean(data.restore_allowed);
+  const reasons = Array.isArray(data.disabled_reasons) ? data.disabled_reasons : [];
+  const runbookNotice = data.runbook_notice || '';
+
+  if (bannerEl) {
+    if (restoreAllowed) {
+      bannerEl.className = 'text-green';
+      bannerEl.textContent = `Restore Preconditions: READY (PAPER/TESTNET, 0 open PIT trades, 0 open Pond cells, no active cycle lock). ${runbookNotice}`;
+    } else {
+      bannerEl.className = 'text-amber';
+      bannerEl.textContent = `Restore Preconditions BLOCKED: ${reasons.join(' | ') || 'Preconditions not satisfied'}. ${runbookNotice}`;
+    }
+  }
+
+  if (!tbody) return;
+  const backups = Array.isArray(data.backups) ? data.backups : [];
+  if (backups.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="text-muted">No SQLite backup snapshots found in `data/backups/`. Click "Backup Database Now" to create one.</td></tr>';
+    return;
+  }
+
+  const disabledReasonAttr = escapeHtml(reasons.join('; ') || 'Restore preconditions not satisfied');
+  tbody.innerHTML = backups.map((b) => {
+    const fname = b.filename || b.file_name || '';
+    const sizeKb = ((Number(b.size_bytes || 0)) / 1024).toFixed(1) + ' KB';
+    const createdUtc = b.created_at || '-';
+    const expiresUtc = b.expires_at || '-';
+    const cliCmd = b.restore_cli_command || `aegis-quant db --restore data/backups/${fname} --confirm`;
+    const preTag = b.is_pre_restore_snapshot ? ' <span class="badge badge-info">PRE-RESTORE</span>' : '';
+    const restoreDisabledAttr = restoreAllowed ? '' : `disabled title="${disabledReasonAttr}"`;
+    return `
+      <tr>
+        <td><strong>${escapeHtml(fname)}</strong>${preTag}</td>
+        <td>${escapeHtml(sizeKb)}</td>
+        <td class="text-muted">${escapeHtml(createdUtc)}</td>
+        <td class="text-muted">${escapeHtml(expiresUtc)}</td>
+        <td><button type="button" data-copy-restore-cli="${escapeHtml(cliCmd)}">Copy CLI Command</button></td>
+        <td><button type="button" class="primary" data-open-restore-modal="${escapeHtml(fname)}" ${restoreDisabledAttr}>Restore…</button></td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function closeDbRestoreModal() {
+  pendingRestoreToken = null;
+  pendingRestoreFilename = null;
+  const modal = document.getElementById('db-restore-modal');
+  if (modal) modal.style.display = 'none';
+  const input = document.getElementById('db-restore-confirm-input');
+  if (input) input.value = '';
+  const confirmBtn = document.getElementById('btn-confirm-db-restore');
+  if (confirmBtn) confirmBtn.disabled = true;
+  const statusEl = document.getElementById('db-restore-modal-status');
+  if (statusEl) statusEl.textContent = '';
+}
+
+async function openDbRestoreModal(filename) {
+  const modal = document.getElementById('db-restore-modal');
+  const metaEl = document.getElementById('db-restore-preview-meta');
+  const precondEl = document.getElementById('db-restore-modal-preconditions');
+  const inputEl = document.getElementById('db-restore-confirm-input');
+  const confirmBtn = document.getElementById('btn-confirm-db-restore');
+  const statusEl = document.getElementById('db-restore-modal-status');
+
+  pendingRestoreToken = null;
+  pendingRestoreFilename = filename;
+  if (inputEl) inputEl.value = '';
+  if (confirmBtn) confirmBtn.disabled = true;
+  if (statusEl) statusEl.textContent = 'Requesting Step 1 backup preview & integrity check...';
+  if (modal) modal.style.display = 'flex';
+
+  try {
+    const res = await apiFetch('/api/v1/db/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, confirm: false })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const reasons = Array.isArray(data.disabled_reasons) && data.disabled_reasons.length > 0
+        ? data.disabled_reasons.join('; ')
+        : (data.detail || data.error || res.statusText);
+      if (metaEl) metaEl.textContent = `Preview refused (${res.status}): ${reasons}`;
+      if (precondEl) precondEl.textContent = reasons;
+      if (statusEl) statusEl.textContent = 'Restore blocked';
+      return;
+    }
+
+    pendingRestoreToken = data.restore_token || null;
+    const p = data.preview || {};
+    const rc = p.row_counts || {};
+    if (metaEl) {
+      metaEl.textContent = [
+        `Filename:        ${p.filename || filename}`,
+        `SHA-256:         ${p.sha256 || '-'}`,
+        `Size:            ${((Number(p.size_bytes || 0)) / 1024).toFixed(1)} KB (${p.size_bytes || 0} bytes)`,
+        `Created (UTC):   ${p.created_at || '-'}`,
+        `Schema Version:  v${p.schema_version ?? '-'}`,
+        `Integrity Check: ${p.integrity_check || '-'}`,
+        `Row Counts:      trades=${rc.trades ?? 0}, pond_cells=${rc.pond_cells ?? 0}, portfolio_snapshots=${rc.portfolio_snapshots ?? 0}, system_config=${rc.system_config ?? 0}`,
+        `Token TTL:       ${data.expires_in_seconds || 60}s single-use token`
+      ].join('\n');
+    }
+    if (precondEl) {
+      precondEl.textContent = 'Preconditions verified: PAPER/TESTNET mode, 0 open positions/cells, no active cycle lock. A pre-restore snapshot will be created automatically before overwrite.';
+    }
+    if (statusEl) {
+      statusEl.textContent = 'Awaiting typed RESTORE confirmation';
+    }
+  } catch (err) {
+    if (metaEl) metaEl.textContent = `Failed to inspect backup: ${err && err.message ? err.message : String(err)}`;
+    if (statusEl) statusEl.textContent = 'Preview error';
+  }
+}
+
+async function confirmDbRestore() {
+  const inputEl = document.getElementById('db-restore-confirm-input');
+  const confirmBtn = document.getElementById('btn-confirm-db-restore');
+  const statusEl = document.getElementById('db-restore-modal-status');
+  const confirmText = inputEl ? inputEl.value.trim() : '';
+
+  if (confirmText !== 'RESTORE' || !pendingRestoreToken || !pendingRestoreFilename) {
+    return;
+  }
+
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = 'Restoring...';
+  }
+  if (statusEl) statusEl.textContent = 'Executing atomic backup restore...';
+
+  try {
+    const res = await apiFetch('/api/v1/db/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: pendingRestoreFilename,
+        confirm: true,
+        restore_token: pendingRestoreToken,
+        confirm_text: confirmText
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const errMsg = (Array.isArray(data.disabled_reasons) && data.disabled_reasons.join('; ')) || data.detail || data.error || res.statusText;
+      if (statusEl) statusEl.textContent = `Restore failed: ${errMsg}`;
+      alert('Database restore failed: ' + errMsg);
+      return;
+    }
+    closeDbRestoreModal();
+    await fetchDbBackups();
+    await fetchInitialDashboard();
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (statusEl) statusEl.textContent = `Restore error: ${msg}`;
+  } finally {
+    if (confirmBtn) {
+      confirmBtn.textContent = 'Confirm Restore';
     }
   }
 }
