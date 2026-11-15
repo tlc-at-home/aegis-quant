@@ -117,7 +117,14 @@ pub fn update_cell_mark_and_chandelier(
         (entry.0 - px.0) * qty.0
     });
 
-    // Chandelier trailing stop ratchets monotonically only on 4H bar closes
+    // Chandelier trailing stop ratchets monotonically only on 4H bar closes.
+    // `R20-N1`: Note the dead-zone geometry between `initial_stop = 2.5 * ATR_1H(entry)` and
+    // `chandelier_stop = 3.8 * ATR_4H(current)`: because `ATR_4H >= 1.8 * ATR_1H`, early gains
+    // keep `candidate` clamped below `initial_stop` until favorable excursion overcomes the gap.
+    // Unifying initial stop with `t=0` Chandelier (`Option (b)`) alters cell sizing
+    // (`risk_budget / stop_distance`) and stays gated behind `ME-2` backtest stop-fidelity closure
+    // plus walk-forward validation; the 4H-close ratchet cadence itself is intentionally preserved
+    // to prevent `R12-S1`/`R13-S1` intrabar watermark contamination.
     if is_4h_bar_close && atr_14_4h > 0.0 {
         let dist = chandelier_mult * atr_14_4h;
         let cur_chand = cell.chandelier_stop.unwrap_or(0.0);

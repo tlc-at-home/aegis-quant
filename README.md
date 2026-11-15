@@ -1,155 +1,285 @@
-# Aegis-Quant v0.3.0-rc1 — Institutional PP-50 Dual-Book Trading System (Rust Workspace)
+# Aegis Quant (`v0.3.0-rc1`) — PP-50 Two-Book Quantitative Trading Platform
 
-An autonomous, single-tenant quantitative perpetuals trading platform built in Rust (2021 edition, Tokio async runtime, Axum web server, rusqlite bundled SQLite WAL) for **Hyperliquid L1**.
-
----
-
-## Architecture Overview (PP-50 Dual-Book)
-
-1. **Workspace Layout (`crates/*`)**:
-   - `aegis-core`: Shared domain types (`BookId`, `Side`, `HmmRegime`, `SignalAction`, `PondCellState`, `BookTransferStatus`, `OhlcvBar`, `Usdc`, `Price`, `Quantity`, `Leverage`, `Bps`), telemetry secret redaction (`sanitize_telemetry_message`, `sanitize_telemetry_details`), timeframe validators, and financial math (`calculate_sharpe_sortino_calmar`, `compute_chandelier_stop`, `round_step`, `accrue_chop_basis_harvest_4h`).
-   - `aegis-db`: Bundled SQLite WAL manager (`rusqlite`), canonical single-script schema version v16 initialization (`sql/schema_and_seed.sql`), Fernet secret encryption (`AEGIS_MASTER_KEY`), advisory cycle lock (`DbCycleLockGuard`), generation-stamped connection pool & online `VACUUM INTO` / `rusqlite::backup` restore (`R16-M1`, `R16-M2`), and `BookScopedDb` compile-time book isolation.
-   - `aegis-signals`: 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, and Continuous Signal-to-Noise Ratio (SNR) ensemble.
-   - `aegis-risk`: Risk sizing (`0.50%`–`1.50%` dynamic risk per trade), `4.0%` portfolio heat cap, `1.50x` gross leverage cap, `25%` single-asset concentration cap, and `35%` correlation-cluster concentration cap.
-   - `aegis-execution`: Hyperliquid L1 REST/EIP-712 order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`, `cycle`, `resting_reconcile`), live mark-to-market synchronization, and config validator.
-   - `aegis-pit`: Book A (The Pit) directional BTC/Altcoin strategy engine.
-   - `aegis-pond`: Book B (The Pond) Champion `NPS-01` Naked-Option Perpetual Analogue Scanner across an 80-coin dynamic universe (10-state cell FSM, 6-tier exit priority engine, two-sided structural exhaustion gate, funding floor & 2h persistence gate).
-   - `aegis-settle`: Daily `00:05 UTC` 50/50 Cross-Book Settling Engine enforcing Invariant F5 (`available_idle_usdc` transfer cap), per-leg L1 progress tracking, `PARTIAL`/`AMBIGUOUS` quarantine, and atomic SQLite transactions.
-   - `aegis-backtest`: 365-Day Walk-Forward Backtest & Tear Sheet simulator (default `4.5 bps` taker fees + `2.0 bps` entry slippage + dynamic impact/volatility and `2.0 bps` non-stop exit slippage, optional `1.5 bps` maker mode via `backtest_prefer_maker_entries`, + 1H funding accrual).
-   - `aegis-alerts`: Telegram Bot API and Discord webhook alerting dispatcher with redacted error handling and bounded retry queue.
-   - `aegis-telemetry`: Inter-task communication bus (`TelemetryBus`) with background SQLite event writer and snapshot broadcasting.
-   - `aegis-web`: Axum REST API (`/api/v1/*`, including `/api/v1/db/backup`, `/api/v1/db/backups`, and two-step guarded `/api/v1/db/restore`), real-time Server-Sent Events (`/api/v1/stream` with named `heartbeat` events), and 4-page institutional dark-mode dashboard (`web/static/index.html` + `web/static/app.js`).
-   - `aegis-cli`: Unified binary (`aegis-quant`) supporting `run`, `pond`, `settle`, `db`, `backtest`, `alerts`, and `readiness` subcommands.
+**Aegis Quant** (`v0.3.0-rc1`, SQLite WAL Schema `v16`, hardened through Round 20) is an autonomous, self-custodial quantitative perpetuals trading and portfolio management platform written in pure Rust (`2021` edition, Tokio async runtime, Axum web server, `rusqlite` bundled SQLite WAL) for **Hyperliquid L1**.
 
 ---
 
-## Quick Start
+## 1. Overview & PP-50 Dual-Book Architecture
 
-### 1. Build & Test Workspace
+Aegis Quant partitions trading capital 50/50 across two orthogonal strategy books coordinated by a daily `00:05 UTC` cross-book settling protocol:
+
+1. **Book A — The Pit (`crates/aegis-pit`)**:
+   - Intraday / 4H multi-factor directional strategy operating across a seeded 31-instrument universe (`16 USDC_PERP` + `15 BTC_SYNTH` / `15 Alt Pairs`).
+   - Combines a causal 3-State Gaussian Hidden Markov Model (`BULL`, `BEAR`, `CHOP`) with intrabar hysteresis (`hmm_intrabar_enter_margin = 0.03`), MACE multi-grid momentum indicators, and a Continuous Signal-to-Noise Ratio (`SNR`) conviction ensemble.
+   - Executes via a Maker Limit Chaser (`Alo` post-only with passive BBO repricing and IOC fallback) protected by two-tier Chandelier ATR trailing stops and a 20-asset correlation-cluster risk engine.
+2. **Book B — The Pond (`crates/aegis-pond`)**:
+   - Champion `NPS-01` Naked-Option Perpetual Analogue S-Cycle scanner operating across an 80-coin dynamic Hyperliquid universe (`pond_universe_target_size = 80`).
+   - Screens for two-sided structural exhaustion and funding-rate extremes (`|z| >= 2.0` with `2h` persistence and hourly funding floor) across a 6-Gate scanner.
+   - Manages each active cell through a 10-state Finite State Machine (`DORMANT -> SCREENED -> CANDIDATE -> ARMED -> OPEN -> TRAILED -> CLOSED -> COOLDOWN`) governed by a deterministic 6-Tier Exit Priority Engine (Tier 1 Catastrophic Wick Stop down to Tier 6 Delisting Exit).
+3. **Daily `00:05 UTC` 50/50 Settling (`crates/aegis-settle`)**:
+   - Computes cross-book equity drift (`settling_split_pct = 0.50`, `settling_deadband_bps = 65`) and transfers only unlocked idle collateral (`available_idle_usdc`) from the rich book to the poor book without ever liquidating open positions.
+   - Persists a crash-safe `PENDING` ledger row before network dispatch, tracks 2-leg L1 progress (`legs_completed`, `leg1_tx_ref`), and quarantines interrupted transfers (`PARTIAL` / `AMBIGUOUS`) with operator alerting (`STRANDED_BOOK_TRANSFER`).
+
+### Six Non-Negotiable Two-Book Firewall Invariants (`F1`–`F6`)
+
+Enforced at compile time, via AST/source-token inspection, and at runtime by `crates/aegis-cli/tests/test_firewall_ast.rs`:
+
+| Invariant | Scope | Enforcement Mechanism |
+| --- | --- | --- |
+| **F1** | Crate Dependency Graph Isolation | `aegis-pit`, `aegis-pond`, and `aegis-settle` have zero mutual `Cargo.toml` dependencies (`aegis-pond` and `aegis-settle` also never depend on `aegis-signals`). |
+| **F2** | AST Source-Token & Table Whitelist Isolation | Static source scan forbids cross-book symbols in `aegis-pit`, `aegis-pond`, and `aegis-settle` (and forbids direct DML on `trades`, `pond_cells`, or `book_transfers` in `schema_ops.rs` / `config_ops.rs`); `BookScopedDb::check_table_access` enforces runtime SQL table whitelists. |
+| **F3** | Independent Book Row & Subaccount Isolation | `PIT` and `POND` maintain independent `books` rows (`equity_allocation_pct = 0.50`), separate trade/cell tables (`trades` vs `pond_cells`), and isolated PnL ledgers (`compute_pit_pnl_components` vs `compute_pond_pnl_components_with_marks`). |
+| **F4** | Config Namespace Isolation | `BookScopedDb::load_pit_config` (`PitConfig`) and `BookScopedDb::load_pond_config` (`PondConfig`) enforce per-book configuration key whitelists via `check_config_key_access`. |
+| **F5** | Idle-Only Settling Transfer (Zero Forced Liquidation) | `SettleController` caps every rebalance at `executed_transfer = required_transfer.min(available_idle)` and logs any shortfall as `blocked_remainder_usdc`. |
+| **F6** | Panic & Task Supervision Isolation | Daemon execution steps wrap Book A, Book B, and combined ticks in `std::panic::catch_unwind(AssertUnwindSafe(...))` so a panic in one book is isolated without terminating the sibling book or WebUI server. |
+
+---
+
+## 2. 13-Crate Workspace Layout (`crates/*`)
+
+| Crate | Type | Responsibility & Key Modules |
+| --- | --- | --- |
+| `crates/aegis-core` | Lib | Domain models (`BookId`, `BookType`, `Side`, `HmmRegime`, `SignalAction`, `PondCell`, `PondCellState`, `TradeRecord`, `BookTransfer`, `BookTransferStatus`, `BacktestTearSheet`, `OhlcvBar`), typed financial primitives (`Usdc`, `Price`, `Quantity`, `Leverage`, `Bps`), secret redaction (`sanitize_telemetry_message`, `sanitize_telemetry_details`, `SENSITIVE_CONFIG_KEYS`, `IMMUTABLE_SECURITY_CONFIG_KEYS`), and SHA-256 dataset provenance (`verify_data_provenance`). |
+| `crates/aegis-db` | Lib + Bin (`aegis-db-tool`) | Bundled SQLite WAL manager (`DatabaseManager`), canonical Schema `v16` initialization & migrations (`schema_ops.rs`, `sql/schema_and_seed.sql`), Fernet `AES-128-CBC + HMAC-SHA256` encryption (`fernet.rs`), non-reentrant advisory cycle lock with heartbeat renewal (`DbCycleLockGuard`), generation-stamped connection pool & online `VACUUM INTO` / chunked `rusqlite::backup` restore, and `BookScopedDb` (`scoped.rs`). |
+| `crates/aegis-signals` | Lib | Causal 3-State Gaussian HMM regime filter (`BULL`, `BEAR`, `CHOP`), MACE multi-grid momentum indicators, Continuous Signal-to-Noise Ratio (`SNR`) ensemble, and `WalkForwardCalibrator` (`1H` vs `4H`). |
+| `crates/aegis-risk` | Lib | Dynamic open-heat position sizing (`0.50%`–`1.50%` per trade), `4.0%` book heat cap, `25%` single-asset cap, `35%` 20-asset correlation-cluster cap (`25%` `OTHER` cluster cap), `1.50x` gross leverage cap, and two-tier Chandelier stop calculator. |
+| `crates/aegis-alerts` | Lib | Real-time Telegram Bot API & Discord webhook dispatcher (`AlertEngine`), 2-cycle `RegimeFlip` confirmation hysteresis, bounded exponential-backoff retry queue, and secret-redacted telemetry logging. |
+| `crates/aegis-telemetry` | Lib | Asynchronous inter-task event bus (`TelemetryBus`) with bounded SQLite background writer and broadcast channel. |
+| `crates/aegis-execution` | Lib | Hyperliquid L1 REST & EIP-712 / MsgPack order router (`signing`, `http_client`, `ingestion`, `live_dispatch`, `manual_close`, `reconcile`, `cycle`, `resting_reconcile`), post-only `Alo` BBO parser & passive retry, atomic protective stop replacement, `userFills` Fix-4 true-up, and HLP vault margin rebalancing. |
+| `crates/aegis-pit` | Lib | Book A (`PIT`) orchestrator (`PitOrchestrator`) executing scoped 4H/intraday signal evaluation, entry dispatch, and freeze-window Chandelier trailing. |
+| `crates/aegis-pond` | Lib | Book B (`POND`) orchestrator (`PondOrchestrator`), 80-coin universe manager (`universe.rs`), Champion `NPS-01` 6-Gate S-Cycle scanner (`scanner.rs`), 10-state cell FSM & 6-Tier Exit Priority Engine (`cell.rs`), relative ATR floor, and frozen-trail detector. |
+| `crates/aegis-settle` | Lib | Daily `00:05 UTC` 50/50 Cross-Book Settling controller (`SettleController`), idle-only transfer cap, crash-safe `PENDING` journal, and `PARTIAL`/`AMBIGUOUS` quarantine. |
+| `crates/aegis-backtest` | Lib | Isolated `:memory:` 365-day point-in-time walk-forward simulator (`BacktestEngine`) modeling taker/maker fees, dynamic impact slippage, 1H funding accrual, and stop-regime substitution disclosure. |
+| `crates/aegis-web` | Lib | Axum REST API (`/api/v1/*`), digest-deduplicated Server-Sent Events (`/api/v1/stream`), session-nonce cookie auth, two-step guarded database restore, and 4-page dark-mode dashboard (`web/static/index.html`, `web/static/app.js`). |
+| `crates/aegis-cli` | Bin (`aegis-quant`) | Unified CLI & daemon orchestrator (`AegisOrchestrator`) providing `run`, `pond`, `settle`, `db`, `backtest`, `alerts`, and 6-Gate (`21`-check) `readiness` subcommands. |
+
+---
+
+## 3. Core Subsystems & Hardening (Rounds 16–20)
+
+### 3.1 Security & At-Rest Cryptography
+- **Fernet `AES-128-CBC + HMAC-SHA256` Encryption (`crates/aegis-db/src/fernet.rs`)**: All secrets in `SENSITIVE_CONFIG_KEYS` (`private_key`, `gemini_api_key`, `telegram_bot_token`, `discord_webhook_url`, `web_api_token`) are stored on disk with `ENC:gAAAA...` ciphertext envelopes. Master key resolution follows strict precedence:
+  1. `CREDENTIALS_DIRECTORY/aegis_master_key` (`systemd` `LoadCredential`)
+  2. `AEGIS_MASTER_KEY` or `FERNET_MASTER_KEY` environment variable
+  3. `<db_dir>/.aegis_master_key` (`chmod 0600`)
+- **Immutable Security Policy Keys (`IMMUTABLE_SECURITY_CONFIG_KEYS`)**: Critical security and routing keys (`enforce_master_key`, `web_auth_enabled`, `web_allow_remote_bind`, `web_bind_host`, `web_csp_policy`, `web_cors_allowed_origins`, `web_allowed_hosts`, `web_api_token`, `pit_subaccount_address`, `pond_subaccount_address`, `settling_allow_single_wallet_virtual`, and Hyperliquid endpoint/vault addresses) cannot be weakened or mutated via the Web API.
+- **Session-Nonce Cookie Auth, CSRF & Proxy Trust Gate (`crates/aegis-web/src/lib.rs`)**:
+  - `POST /api/v1/auth/login` validates the operator token and issues an ephemeral 32-byte hex session nonce stored in `AppState::active_sessions` (`HttpOnly; SameSite=Strict` cookie); raw master tokens in cookies are rejected (`ME-13`, `R15-N7`).
+  - Mutating routes enforce `Origin` / `Host` allowlists (`web_allowed_hosts`) and `X-CSRF-Token` / `X-Requested-With` headers.
+  - Per-IP login rate limiting ignores `X-Forwarded-For` / `X-Real-IP` headers unless `web_trust_proxy_headers = true` is explicitly enabled (`ME-14`).
+  - Automated CI secret-hygiene scanning (`R16-U2` in `.github/workflows/ci.yml` and `crates/aegis-cli`) blocks any contiguous Telegram bot token or API key literal across tracked files.
+
+### 3.2 Persistence, Online Backup/Restore & Cross-Process Concurrency (`crates/aegis-db`)
+- **Generation-Stamped Pool & Chunked Online Restore (`R16-M1`, `R19-N2(c)`)**: `DatabaseManager` stamps pooled SQLite connections with an atomic `pool_generation` epoch (`discarded_stale_connections` counter) and coordinates online `VACUUM INTO` backups and `rusqlite::backup::Backup` restores under `file_swap_lock.write()`. Step 3 of `restore_sqlite_backup_with_options` copies pages in chunks (`backup.step(256)`), refreshing the preserved `web.restore` lease expiration on each step until `StepResult::Done`.
+- **Multi-Layered Live-Activity Restore Guard (`R16-M2`, `R17-M1`, `R17-L3`, `R19-L1`, `R19-L2`)**:
+  - `detect_live_database_activity` and `detect_external_pid_holding_db` scan `/proc/<pid>/fd` on Linux (with a `5ms` retry on transient `read_dir` errors when `/proc/<pid>` still exists, and a `30ms` cache `detect_external_pid_holding_db_cached` on WebUI precondition polls) to block restores whenever an external daemon holds `<db>`, `<db>-wal`, or `<db>-shm`.
+  - Check `(b)` retries read-only SQLite connection open once after `25ms` on non-empty DB files and fails closed if the open still fails (`R17-L3`).
+- **Strictly Non-Reentrant Advisory Cycle Lock & Renewal Heartbeat (`R18-L1`, `R18-N1`, `R18-N2`, `R19-M1`, `R19-N1`, `R19-N2`, `R20-N2`)**:
+  - `try_acquire_cycle_lock` is strictly non-reentrant while unexpired (`if !cur_owner.trim().is_empty() && cur_exp > now_ms { return Ok(false); }`). CLI one-shot commands use PID-suffixed owners (`cli-pond-scan.pid<pid>`, `cli-run-once.pid<pid>`).
+  - `acquire_cycle_lock_guard` spawns a background renewal heartbeat thread (`renew_cycle_lock`, which returns `Ok(false)` immediately if `file_swap_lock.try_read().is_none()` so it never blocks Step 3 backup copies).
+  - Renewal is bounded by `MAX_CYCLE_LOCK_RENEWAL_TICKS = 90` (`90` ticks = `min(30x initial TTL, 45 min)` under the `30s` renewal-interval clamp; `~47 min` total hold at the `120s` production TTL). Renewal failures increment `DatabaseManager::cycle_lock_renew_failures` (exposed in `GET /api/v1/health` and `check_web_restore_preconditions`).
+  - `apply_post_copy_cycle_lock_state` and `release_cycle_lock` preserve `"web.restore"` across in-service quiesced restores (`R18-N1`), unconditionally clear any backup-inherited `engine_cycle_lock_owner` on CLI restores (`R18-N2`), and scrub any rows in the legacy `db_cycle_lock` table (`R19-N1`).
+- **Two-Step Guarded WebUI Restore (`R16-U1`, `R17-L2`, `R17-N2`, `R18-N3`)**:
+  - `GET /api/v1/db/backups` and `POST /api/v1/db/restore` share `evaluate_web_restore_gate`.
+  - Step 1 (`confirm: false`) runs `PRAGMA integrity_check;`, hashes the snapshot in `1 MiB` chunks (`compute_file_sha256_streaming`), and mints a 60-second single-use `restore_token` with a per-IP cap of `3` and global cap of `64`.
+  - Step 2 (`confirm: true`, `confirm_text: "RESTORE"`, `restore_token`) performs non-destructive token pre-validation (`tokens.get`) before calling `acquire_cycle_lock_guard("web.restore", restore_ttl_ms)` (where `restore_ttl_ms = recommended_restore_lock_ttl_ms` in `[120_000, 3_600_000]` ms), ensuring a transient `409 Conflict` leaves the operator's token unburned for retry (`R18-N3`).
+
+### 3.3 Execution, Pond & Risk Hardening
+- **Post-Only `Alo` BBO Parser & Single-Shot Passive Retry (`R19-M2`)**: When Hyperliquid rejects a post-only `Alo` order with `"Post only order would have immediately matched. bbo was <bid>@<ask>"`, `submit_hyperliquid_order_live` extracts `(bid, ask)` directly from the rejection message via `parse_hl_rejection_bbo` (avoiding a redundant `metaAndAssetCtxs` HTTP round-trip on the fast path), computes a strictly passive tick-aligned retry price via `compute_alo_retry_passive_limit_price`, logs `ALO_IMMEDIATE_MATCH_PASSIVE_RETRY`, and dispatches a single `-retry1` passive maker order.
+- **Atomic Protective Stop Replacement & Belt-and-Braces Cleanup (`R17-L1`, `R18 Section 8`)**: Exchange-native trigger stop updates submit the replacement stop order before canceling the prior `protective_stop_oid`. Precondition checks scope `protective_stop_oid` queries to active positions (`status IN ('OPEN', 'PENDING')` on `trades`; `state IN ('ARMED', 'OPEN', 'TRAILED')` on `pond_cells`), and `cancel_resting_trade`, `close_trade`, and `close_open_pond_cell` unconditionally set `protective_stop_oid = NULL` in SQL alongside explicit `set_*_protective_stop_oid(..., None)` calls in `aegis-execution` and `aegis-pond`.
+- **Book A (`PIT`) Rejection Telemetry & HLP Vault Guardrails (`R16-L3`, `R19-L3`)**: All four Pit entry rejection paths emit structured `WARN` logs and `engine.execution` telemetry (`PIT_ENTRY_RISK_REJECTED`, `PIT_ENTRY_VAULT_MARGIN_CAPPED`, `PIT_ENTRY_EXECUTION_REJECTED`) in live/paper runs. Automated HLP vault withdrawals (`hlp_vault_auto_rebalance_enabled`) default to `false` and emit `HLP_VAULT_AUTO_REBALANCE_INITIATED` when opted into.
+- **Book B (`POND`) Relative 1H ATR Floor for Sub-Dollar Assets (`R20-M1`)**: `compute_wick_context_with_stops_and_atr_floor` applies a relative 1H ATR floor `pond_min_atr_pct = 0.0015` (`15 bps` of reference close/mark price, clamped to `[1e-6, 0.10]`, with `1e-8` numerical safety floor) at both `pre_open_atr_1h` and `atr_14_1h` call sites instead of a fixed `$0.01` floor. Sub-dollar tokens (e.g., `WLFI` at `~$0.0457` or `MON` at `~$0.0159`) retain accurate ~`0.56%` Tier-1 wick buffers (`0.85 * ATR_1H`) and `stop_dist > wick_buf`.
+- **Book B (`POND`) 4H-Close Chandelier Ratchet, Dead-Zone Note & `POND_FROZEN_TRAIL` Telemetry (`R20-L1`, `R20-N1`)**:
+  - `update_cell_mark_and_chandelier` ratchets `chandelier_stop` monotonically on 4H bar closes (`3.8 * ATR_4H`), transitioning `OPEN -> TRAILED` and triggering atomic `submit_or_refresh_protective_stop_order` sync.
+  - **Trailing-Stop Dead-Zone & `ME-2` Sequencing (`R20-N1`)**: Because `initial_stop = 2.5 * ATR_1H(entry)` while `chandelier_stop = 3.8 * ATR_4H(current)` with `ATR_4H >= 1.8 * ATR_1H`, early gains remain inside the dead zone where the raw Chandelier candidate stays clamped at `initial_stop`. Unifying `initial_stop` with `t=0` Chandelier (`Option (b)`) alters cell sizing (`risk_budget / stop_distance`) and remains gated behind `ME-2` backtest stop-fidelity closure plus walk-forward validation.
+  - **Frozen-Trail Observability (`R20-L1`)**: `PondOrchestrator` tracks consecutive 4H closes where a cell is in profit (`mark > entry` for `LONG`, `mark < entry` for `SHORT`) while `state == "OPEN"` and `chandelier_stop` remains pinned at `initial_stop` (persisted in `system_config` key `pond_frozen_trail_closes_json`). When the streak reaches `pond_frozen_trail_warn_closes` (default `6`), it emits a structured `WARN` log and `POND_FROZEN_TRAIL` telemetry event (`pond.ratchet`), and resets the counter as soon as the stop ratchets (`OPEN -> TRAILED`) or the cell closes.
+
+---
+
+## 4. Build, Configuration & CLI Reference
+
+### 4.1 Build & Install Release Binary
 
 ```bash
 cargo build --release --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cp target/release/aegis-quant bin/aegis-quant
 ```
 
-### 2. Initialize / Upgrade SQLite Database (Schema v16)
+### 4.2 Global Flags & Subcommands (`aegis-quant`)
 
-Both `--db <PATH>` and `--db-path <PATH>` are accepted globally across all subcommands (built binaries are output to `./target/release/aegis-quant` and installed to `./bin/aegis-quant`):
+Global options accepted before or after any subcommand:
+- `--db <PATH>` (alias `--db-path <PATH>`): Path to SQLite WAL database (default `data/aegis.db`; production convention `data/aegis_quant.db`).
+- `--book <pit|pond|both>`: Active book mode for `run` (default `both`).
+- `--once`: Run a single ingestion + signal + execution cycle and exit (`cli-run-once.pid<pid>` cycle lock).
+- `--calibrate`: Run walk-forward timeframe calibration (`1H` vs `4H`) before executing the cycle.
+- `--host <IP>` / `--port <PORT>`: WebUI bind address and port (default `127.0.0.1:8000`). Non-loopback binding requires `--allow-remote-bind`, `AEGIS_ALLOW_REMOTE_BIND=1`, or `web_allow_remote_bind=true`.
+- `--no-web`: Disable the embedded Axum WebUI server.
+- `--json`: Emit machine-readable JSON output.
 
 ```bash
-./target/release/aegis-quant --db data/aegis_quant.db db --init
-./target/release/aegis-quant --db data/aegis_quant.db db --migrate
-./target/release/aegis-quant --db data/aegis_quant.db db --backup
-./target/release/aegis-quant --db data/aegis_quant.db db --restore data/backups/aegis_quant_YYYYMMDD_HHMMSS_000.db --confirm
-./target/release/aegis-quant --db data/aegis_quant.db db --restore data/backups/aegis_quant_YYYYMMDD_HHMMSS_000.db --confirm --force
-./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
-./target/release/aegis-quant --db data/aegis_quant.db db --show-web-token
+# 1. Start the Dual-Book Daemon + 4-Page Axum WebUI Server
+./bin/aegis-quant --db data/aegis_quant.db run --host 127.0.0.1 --port 8000 --book both
+
+# 2. Run a single evaluation cycle (optionally with walk-forward calibration)
+./bin/aegis-quant --db data/aegis_quant.db run --once --book both
+./bin/aegis-quant --db data/aegis_quant.db run --once --calibrate
+
+# 3. Book B (The Pond) 80-coin universe refresh & hourly S-Cycle scan
+./bin/aegis-quant --db data/aegis_quant.db pond --refresh-universe
+./bin/aegis-quant --db data/aegis_quant.db pond --scan
+
+# 4. Daily 00:05 UTC 50/50 Cross-Book Settling (dry-run simulation or live execution)
+./bin/aegis-quant --db data/aegis_quant.db settle --dry-run
+./bin/aegis-quant --db data/aegis_quant.db settle --dry-run --initial-split 5000:5000 --rich-idle-usdc 500
+./bin/aegis-quant --db data/aegis_quant.db settle
+
+# 5. Database lifecycle, encryption, backup/restore & ledger maintenance
+./bin/aegis-quant --db data/aegis_quant.db db --init
+./bin/aegis-quant --db data/aegis_quant.db db --migrate
+./bin/aegis-quant --db data/aegis_quant.db db --test-encryption
+./bin/aegis-quant --db data/aegis_quant.db db --generate-key
+./bin/aegis-quant --db data/aegis_quant.db db --rotate-key --old-key-file /path/to/old.key --new-key-file /path/to/new.key
+./bin/aegis-quant --db data/aegis_quant.db db --backup
+./bin/aegis-quant --db data/aegis_quant.db db --restore data/backups/aegis_quant_YYYYMMDD_HHMMSS_000.db --confirm
+./bin/aegis-quant --db data/aegis_quant.db db --restore data/backups/aegis_quant_YYYYMMDD_HHMMSS_000.db --confirm --force
+./bin/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
+./bin/aegis-quant --db data/aegis_quant.db db --reclassify-dry-run-before 2026-11-08T00:00:00Z
+./bin/aegis-quant --db data/aegis_quant.db db --show-web-token
+
+# 6. 365-Day Point-in-Time Walk-Forward Backtest & Tear Sheet
+./bin/aegis-quant --db data/aegis_quant.db backtest --days 365
+./bin/aegis-quant --db data/aegis_quant.db backtest --days 365 --synthetic
+
+# 7. Real-Time Telegram/Discord Alerting Verification
+./bin/aegis-quant --db data/aegis_quant.db alerts --test
+
+# 8. 6-Gate (21-Check) Institutional Mainnet Go/No-Go Readiness Audit
+./bin/aegis-quant --db data/aegis_quant.db readiness
+./bin/aegis-quant --db data/aegis_quant.db readiness --mode TESTNET
 ```
 
-> **Restore Runbook (`db --restore` & WebUI Guarded Restore, `ME-19`, `R16-M1`, `R16-M2`, `R16-U1`)**:
-> - **CLI Restore (`db --restore <PATH> --confirm [--force]`)**: Stop all running `aegis-quant` / `aegis-pit` / `aegis-pond` daemons before running `db --restore <PATH> --confirm`. By default (`force == false`), `restore_sqlite_backup_with_options` calls `detect_live_database_activity()` and refuses the restore if another PID holds the DB/WAL/SHM open in `/proc`, if an unexpired `engine_cycle_lock` lease exists, or if a non-empty `<db>-shm` file was modified within the last 120 seconds (`R16-M2`). Pass `--force` only when intentionally overriding a stale activity indicator after confirming all daemons are stopped. The restore flow verifies the backup via `PRAGMA integrity_check;`, captures a pre-restore safety snapshot (`aegis_quant_pre_restore_<ts>.db`), bumps the `DatabaseManager` pool generation under `file_swap_lock` (`R16-M1`), restores via SQLite online Backup API, re-applies compiled `aegis-db` migrations, and verifies `PRAGMA quick_check;`.
-> - **WebUI Backup Inventory & Two-Step Guarded Restore (`GET /api/v1/db/backups` & `POST /api/v1/db/restore`, `R16-U1`)**: `GET /api/v1/db/backups` lists verified `.db` snapshots in `data/backups/` (newest first) along with pre-flight safety preconditions (`execution_mode != "LIVE"`, `pond_execution_mode != "LIVE"`, `0` active PIT trades, `0` active Pond cells, `0` working `protective_stop_oid`, and no active `engine_cycle_lock`). `POST /api/v1/db/restore` enforces a two-step flow restricted to whitelisted bare filenames inside `data/backups/`: Step 1 (`confirm: false`) runs `PRAGMA integrity_check;`, computes the backup SHA-256 and table row counts, and mints a single-use 60-second `restore_token`; Step 2 (`confirm: true`, `confirm_text: "RESTORE"`, `restore_token`) pauses concurrent API traffic with `503 Service Unavailable` (`restore_in_progress`), restores the snapshot in-service, invalidates the SSE cache, and logs a `WARN` `DB_RESTORE_COMPLETED` telemetry audit record.
+### 4.3 REST API & SSE Endpoints (`crates/aegis-web`)
 
-> **Security Note (`--show-web-token`)**: `db --show-web-token` is strictly read-only (`R4-N8`)—it never creates or mutates database rows or keys, and prints the decrypted `web_api_token` bearer secret to `stdout`. Do not run it in shared terminals or unredacted CI logs.
-
-All SQLite WAL tables, columns, views, indexes, triggers, and seed data (Schema `v16`) are consolidated in the single canonical schema build script `sql/schema_and_seed.sql` together with compiled incremental migrations in `crates/aegis-db/src/schema_ops.rs`. Both `db --init` and `db --migrate` idempotently initialize fresh databases and upgrade existing databases to Schema `v16`.
-- **Section 6f Custom Testnet Volume-Floor Preservation Rule (`R16-N3`)**: During `sql/schema_and_seed.sql` execution (`db --init` / `db --migrate`), Section 6f upgrades legacy `$5,000+` (`>= 5000.0`) or sub-`$1,000` (`< 1000.0`) values of `pond_testnet_min_vol_cap_usdc` to the canonical `$1,000` Testnet volume floor, while intentionally preserving any operator-customized value strictly between `1,000` and `5,000` (`1000.0 < value < 5000.0`).
-- **HLP Vault Auto-Rebalance Default & Telemetry (`R16-L3`)**: `hlp_vault_auto_rebalance_enabled` defaults to `'false'` in both `sql/schema_and_seed.sql` and `ExecutionEngine::rebalance_hlp_vault_margin_if_needed` so automated HLP vault withdrawals require explicit operator opt-in; when enabled and triggered, `rebalance_hlp_vault_margin_if_needed` emits a `WARN` log and `HLP_VAULT_AUTO_REBALANCE_INITIATED` telemetry event before submitting the withdrawal.
-
-### 3. Run the 4-Page Web Dashboard & Dual-Book Background Daemons
-
-```bash
-./target/release/aegis-quant --db data/aegis_quant.db run --host 127.0.0.1 --port 8000 --book both
-```
-
-Then open `http://127.0.0.1:8000` in your browser and authenticate via the dashboard session banner (`POST /api/v1/auth/login` -> `HttpOnly; SameSite=Strict` session cookie).
-
-### 4. CLI Subcommands
-
-```bash
-# Run a single dual-book evaluation cycle (optionally with walk-forward calibration)
-./target/release/aegis-quant --db data/aegis_quant.db run --once --book both
-./target/release/aegis-quant --db data/aegis_quant.db run --once --calibrate
-
-# Refresh the 80-coin Pond universe or run an hourly S-Cycle scan
-./target/release/aegis-quant --db data/aegis_quant.db pond --refresh-universe
-./target/release/aegis-quant --db data/aegis_quant.db pond --scan
-
-# Run Daily 00:05 UTC 50/50 Settling (dry-run or live)
-./target/release/aegis-quant --db data/aegis_quant.db settle --dry-run
-
-# Verify operational alert webhooks
-./target/release/aegis-quant --db data/aegis_quant.db alerts --test
-
-# Run 365-day walk-forward tear sheet simulation and institutional readiness audit
-./target/release/aegis-quant --db data/aegis_quant.db backtest --days 365
-./target/release/aegis-quant --db data/aegis_quant.db readiness
-```
-
-### 5. Operational Cadence & Cross-Book Settling Runbook
-
-- **Loop Cadence Keys (`system_config`, `R5-M3`, `R5-QB`, `R6-N1`, `R6-N5`, `R7-S5`)**:
-  - `pit_tick_interval_seconds` (default `900`): Book A (`PitOrchestrator`) evaluation cadence. In `--book pit` mode (`aegis-pit.service`), the daemon sleeps for `pit_tick_interval_seconds` between cycles and reloads the key from `system_config` on every tick (`R5-N3`). In `--book both` mode (`aegis-quant.service`), full Book A cycles (`ingest_universe` + `evaluate_universe` + `reconcile_cycle_with_options`, including Chandelier trailing-stop ratchets and regime exit evaluations) execute on Cycle #1 and whenever `pit_tick_interval_seconds` has elapsed since `last_pit_cycle_ms`. Operators should note that Book A position management reacts at `pit_tick_interval_seconds` granularity (up to 900s), whereas Book B position management (wick-stop monitoring, Chandelier trailing, and resting-order state) and LIVE/TESTNET exchange reconciliation (`maybe_run_maintenance`) evaluate at `pond_tick_interval_seconds` granularity (15s) (`R6-N1`, `R7-S5`).
-  - `pond_tick_interval_seconds` (default `15`): Book B (`PondOrchestrator`) 15s Tier 1 wick-stop and resting-order evaluation cadence (with hourly S-Cycle scans on UTC hour boundaries and 4H close ratchets on 4H boundaries). Reloaded dynamically on every tick.
-  - `polling_interval_seconds` (default `15`): Top-level wake cadence ceiling in `--book both` mode (`sleep_sec = min(pond_tick_interval_seconds, polling_interval_seconds, pit_tick_interval_seconds).max(1)`). Note the wake formula asymmetry (`R6-N5`): in `--book both` mode, the Pond step executes on every daemon wake iteration unless a Book A cycle is due. Consequently, `pond_tick_interval_seconds` only slows down Pond evaluations if it is configured smaller than `polling_interval_seconds`; setting `pond_tick_interval_seconds` higher than `polling_interval_seconds` will not throttle Pond ticks unless `polling_interval_seconds` is also increased.
-  - **Time-Based Periodic Maintenance Triggers (`R6-N1`, `R7-S5`, `R8-N5`)**: Rather than relying on cycle-count multiples (which drift when `pit_tick_interval_seconds` is lengthened), periodic maintenance triggers (`maybe_run_maintenance`) in `AegisOrchestrator` evaluate elapsed wall-clock time across all daemon book modes (`--book pit`, `--book pond`, and `--book both`): exchange state reconciliation in PAPER mode runs every 5 minutes (`now_ms - last_reconcile_ms >= 300_000`) and surfaces any SQLite query failure as `ERROR_DB_UNAVAILABLE`, while LIVE/TESTNET reconciles on every daemon tick, emits `ERROR` telemetry if the exchange clearinghouse is unreachable (`SKIPPED_OFFLINE`) or the DB is unavailable (`ERROR_DB_UNAVAILABLE`), and triggers a critical alert (`EXCHANGE_RECONCILE_DEGRADED`) on consecutive reconcile failures (`reconcile_error_streak == 3` and every 20th streak thereafter); retention data pruning runs every 1 hour (`now_ms - last_retention_prune_ms >= 3_600_000`), preserving intended operational intervals regardless of cadence configuration.
-  - **Mode-Dependent 15-Second Dashboard Mark-to-Market & `/health` Liveness (`PAPER` vs `LIVE`/`TESTNET`, `R11-N3`, `R12-N1`)**: 15-second dashboard mark-to-market liveness (`reconcile_exchange_state` updating open PIT trade `current_price`/`unrealized_pnl_usdc` and Pond live-candle refresh via `merge_recent_bars`) operates in `LIVE` and `TESTNET` modes, whereas in `PAPER` mode `reconcile_exchange_state` is throttled to every 5 minutes and Pond evaluates bar-close synthetic candles. Similarly, on `GET /health` and `GET /api/v1/health` (`api_health` in `crates/aegis-web/src/handlers.rs`), `data_fresh` in `LIVE`/`TESTNET` modes requires both `last_ms > 0` and `(now_ms - last_ms) <= max_bar_staleness_ms` (default `28_800_000` ms = 8 hours in `system_config`, fallback `28_800_000` ms = 8 hours) so stale market ingestion surfaces `503 Service Unavailable` (`status: "DEGRADED"`, `data_fresh: false`), while in `PAPER` mode `data_fresh` only requires `last_ms > 0` and `api_health` returns `200 OK` (`status: "ok"`).
-  - **SSE `/api/v1/stream` Digest-Deduplicated `heartbeat` Event Contract (`R15-P2`, `R16-N2`)**: On each 3-second `/api/v1/stream` tick, `api_sse_stream` computes a `DefaultHasher` digest of the core dashboard state (`build_sse_core_payload`). When the digest is unchanged from the prior tick (`unchanged_streak < 5`), the stream emits a lightweight named SSE event `event: heartbeat` with payload `{"unchanged":true,"ts":"<RFC3339>"}` for up to 5 consecutive ticks, and then forces a full default `message` event on the 6th tick (`unchanged_streak >= 5`, i.e., at least once every 18 seconds). Custom EventSource clients should listen for both default `message` events and named `heartbeat` events (`es.addEventListener('heartbeat', ...)` in `web/static/app.js`).
-- **Dual-Book Accounting Identity & `.max(0.0)` Solvency Floor (`R10-QA`, `R11-QA`, `R12-N2`)**:
-  - Both `compute_pit_pnl_components` (`crates/aegis-db/src/trade_ops.rs`) and `compute_pond_pnl_components_with_marks` (`crates/aegis-db/src/pond_ops.rs`) compute `total_net_pnl_usdc = round_dp(realized_pnl_usdc + unrealized_pnl_usdc + funding_pnl_usdc - open_fees_usdc + yield_pnl_usdc, 4)` without any floor, preserving the full unfloored cumulative loss if a book goes underwater.
-  - By contrast, `book_equity_usdc = round_dp((initial_capital_usdc + transfer_adj_usdc + total_net_pnl_usdc).max(0.0), 2)` applies a `.max(0.0)` solvency floor so risk-sizing and gross-leverage denominators never become negative; in all solvent states (`initial_capital_usdc + transfer_adj_usdc + total_net_pnl_usdc >= 0.0`), the exact additive identity `book_equity_usdc == round_dp(initial_capital_usdc + transfer_adj_usdc + total_net_pnl_usdc, 2)` holds.
-- **Testnet Faucet Spot USDC Offset & Conservative Equity Rule (`R9-QA`, `R9-N2`)**:
-  - **`testnet_faucet_offset_usdc` (default `10000.0`, category `risk`)**: Hyperliquid Testnet unified accounts receive an unallocated `$10,000.0` Spot USDC faucet grant alongside actual Perps test capital (e.g., `$1,000.0`). When running on Testnet (`is_testnet == true`) with `initial_equity_usdc <= testnet_faucet_offset_usdc` and `raw_spot_tot >= testnet_faucet_offset_usdc` (and no separate non-zero Perps clearinghouse account value), `ExecutionEngine::adjust_testnet_faucet_spot_usdc` automatically subtracts `testnet_faucet_offset_usdc` from the Spot USDC balance in both `fetch_hlp_vault_state` and `sync_wallet_equity`. This prevents the unallocated Testnet faucet grant from inflating `total_equity_usdc` or scaling up Book A/B risk caps by `10x`. Operators using a non-standard Testnet Spot grant can adjust or disable (`0.0`) `testnet_faucet_offset_usdc` via `system_config`.
-  - **Conservative Live Equity Rule (`min(live_wallet_equity, accounting_equity)`)**: During `reconcile_cycle_with_options`, `total_equity_usdc` adopts the live on-chain wallet equity (`perp_equity_usdc + vault_equity_usdc`) **only when it is lower** than the book accounting identity (`initial_equity_usdc + realized_pnl + unrealized_pnl + pond_total_pnl + accrued_yield_usdc`). Unrecorded on-chain drawdowns, fees, or funding debits immediately reduce sizing equity, whereas unallocated Spot balances or external wallet transfers never silently inflate position sizing above the configured capital baseline.
-  - **Raising Capital Baseline After a Real Deposit**: After depositing additional trading capital into the Hyperliquid Perps account, operators should explicitly raise `initial_equity_usdc` and rescale dollar risk caps via either:
-    1. `POST /api/v1/config/batch` with `{"updates": {"initial_equity_usdc": <NEW_EQUITY_USDC>}, "scale_risk_caps": true}`, or
-    2. `POST /api/v1/wallet/sync` from the Settings / Wallet Sync panel (which syncs `initial_equity_usdc` to the verified on-chain equity and invokes `scale_risk_caps_for_equity`).
-- **Cross-Book Transfer Quarantine (`PARTIAL` / `AMBIGUOUS`)**:
-  - Only `COMPLETED`, `CONFIRMED`, and live `PARTIAL_IDLE_CAPPED` rows in `book_transfers` are credited in virtual book equity (`BookTransferStatus::is_ledger_counted()`).
-  - If a 2-leg subaccount transfer fails after Leg 1 (`attempts = 1`), it transitions to `PARTIAL` (USDC stranded in master wallet). If an L1 transfer times out post-broadcast (`POST_SEND_UNCERTAIN`), it transitions to `AMBIGUOUS`. Both states emit a throttled critical alert (`STRANDED_BOOK_TRANSFER`) until reconciled by an operator.
-- **Pre-Live Dry-Run Residue Audit & Remediation (`R5-M2`, `R6-N4`)**:
-  - Before executing the first live settle on a database upgraded from pre-v8 builds, audit `book_transfers` for any historical `PARTIAL_IDLE_CAPPED` rows that lack a `DRY_RUN` marker:
-    ```bash
-    ./target/release/aegis-quant --db data/aegis_quant.db db --audit-dry-run-residue
-    ```
-    Or run the SQL detection query directly:
-    ```sql
-    SELECT transfer_id, settle_date, amount_usdc, tx_ref, transfer_mode, created_at
-    FROM book_transfers
-    WHERE status = 'PARTIAL_IDLE_CAPPED'
-      AND UPPER(COALESCE(transfer_mode, '')) NOT LIKE 'DRY_RUN%'
-      AND LOWER(COALESCE(tx_ref, '')) NOT LIKE 'dryrun-%';
-    ```
-  - If any historical dry-run rows remain from pre-v8 test windows, remediate using either:
-    1. **Operator CLI Reclassification (`R6-N4`)**: Reclassify historical `PARTIAL_IDLE_CAPPED` rows before an ISO-8601 UTC timestamp directly via CLI without raw SQL:
-       ```bash
-       ./target/release/aegis-quant --db data/aegis_quant.db db --reclassify-dry-run-before 2026-11-08T00:00:00Z
-       # Or via standalone db tool:
-       ./target/release/aegis-db-tool --db data/aegis_quant.db --reclassify-dry-run-before 2026-11-08T00:00:00Z
-       ```
-    2. **Migration Cutoff Reclassification**: Set `dry_run_reclassify_before_utc` in `system_config` to the ISO-8601 UTC cutoff timestamp before running `db --migrate`.
-    3. **One-Step Ledger Baseline Reset**: Set `equity_baseline_reset_at` in `system_config` to the current ISO-8601 UTC upgrade timestamp (`YYYY-MM-DDTHH:MM:SSZ`), which rebases both books' ledgers and zeroes any prior historical transfer or PnL distortion in a single step.
+- **Health & Status (Unauthenticated Probe)**: `GET /health`, `GET /api/v1/health` (exposes `status`, `schema_version`, `data_fresh`, `last_bar_timestamp_ms`, `max_bar_staleness_ms`, `pool_generation`, `discarded_stale_connections`, `cycle_lock_renew_failures`), `GET /api/v1/status`.
+- **Authentication**: `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`.
+- **Dashboard, Books & Real-Time Stream**: `GET /api/v1/dashboard`, `GET /api/v1/portfolio`, `GET /api/v1/pond`, `GET /api/v1/pond/universe`, `GET /api/v1/pond/cells`, `GET /api/v1/pond/cycles`, `POST /api/v1/pond/scan`, `POST /api/v1/pond/cells/close`, `GET /api/v1/settle`, `POST /api/v1/settle/run`, `GET /api/v1/signals`, `GET /api/v1/trades`, `POST /api/v1/trades/close`, `GET /api/v1/logs`, `GET /api/v1/stream` (3-second SSE stream emitting digest-deduplicated `event: heartbeat` up to 5 ticks and full `message` state at least every 18 seconds, `R16-N2`).
+- **Engine, Config, Wallet & Guarded Backup/Restore**: `POST /api/v1/engine/cycle`, `POST /api/v1/engine/backtest`, `POST /api/v1/engine/calibrate`, `GET|POST /api/v1/config`, `POST /api/v1/config/batch`, `GET|POST /api/v1/credentials`, `GET|POST /api/v1/alerts`, `POST /api/v1/alerts/test`, `POST /api/v1/wallet/sync`, `POST /api/v1/db/backup`, `GET /api/v1/db/backups`, `POST /api/v1/db/restore`.
 
 ---
 
-## Workspace Test Suite Inventory (`cargo test --workspace`)
+## 5. Operational Runbooks
 
-All **167** tests across all 13 workspace crates pass with zero ignored or skipped cases (`R15-QA(b)`, `R16`, `R17`, `R18`, `R19`):
+### 5.1 Database Initialization, Migration, Backup/Restore & Fernet Key Rotation
+- **Initialize & Migrate (`db --init` / `db --migrate`)**: Both commands idempotently apply `sql/schema_and_seed.sql` and compiled incremental migrations in `crates/aegis-db/src/schema_ops.rs` to bring any fresh or historical database to Schema `v16`. Section 6f of `sql/schema_and_seed.sql` normalizes legacy `>= $5,000` or `< $1,000` values of `pond_testnet_min_vol_cap_usdc` to `$1,000` while preserving custom operator values strictly inside `(1000.0, 5000.0)` (`R16-N3`).
+- **CLI Backup & Restore (`db --backup` / `db --restore <PATH> --confirm [--force]`)**:
+  - Stop running `aegis-quant` / `aegis-pit` / `aegis-pond` daemons before executing a CLI restore. By default (`--force` omitted), `restore_sqlite_backup_with_options` runs `detect_live_database_activity()` and refuses the restore if another PID holds the DB/WAL/SHM open in `/proc`, if an unexpired `engine_cycle_lock` lease exists, or if a non-empty `<db>-shm` was modified within the last 120s.
+  - The restore flow verifies the backup via `PRAGMA integrity_check;`, writes a pre-restore safety snapshot (`aegis_quant_pre_restore_<ts>.db`), increments `pool_generation` under `file_swap_lock.write()`, copies pages in `256`-page steps, clears any backup-inherited cycle lock (`R18-N2`, `R19-N1`), re-runs migrations, and verifies `PRAGMA quick_check;`.
+- **Fernet Master-Key Rotation (`db --rotate-key`)**:
+  ```bash
+  ./bin/aegis-quant --db data/aegis_quant.db db --generate-key > data/.aegis_master_key.new
+  chmod 600 data/.aegis_master_key.new
+  ./bin/aegis-quant --db data/aegis_quant.db db --rotate-key \
+    --old-key-file data/.aegis_master_key \
+    --new-key-file data/.aegis_master_key.new
+  mv data/.aegis_master_key.new data/.aegis_master_key
+  ./bin/aegis-quant --db data/aegis_quant.db db --test-encryption
+  ```
+- **Read-Only Web Token Inspection (`db --show-web-token`)**: Strictly read-only (`R4-N8`); decrypts and prints `web_api_token` to `stdout` without mutating rows or keys. Do not run in shared or unredacted logs.
+
+### 5.2 Single-Wallet Virtual Settling vs Two-Subaccount L1 Settling (`NB-1` & `R20-N3`)
+- **`PAPER` Mode (Default Virtual Ledger)**: When `execution_mode = 'PAPER'`, daily `00:05 UTC` settling (`aegis-settle`) always rebalances book equity via the internal SQLite `book_transfers` ledger (`VIRTUAL_SINGLE_WALLET_LEDGER`) by default.
+- **Single-Wallet `TESTNET` / `LIVE` Mode — Option 2B (`settling_allow_single_wallet_virtual`)**:
+  - When running `TESTNET` or `LIVE` on a single Hyperliquid wallet where `pit_subaccount_address` and `pond_subaccount_address` are both empty, `ExecutionEngine::execute_subaccount_transfer_for_record` refuses virtual ledger rebalancing by default so operators never unknowingly run live trading without on-chain subaccount separation.
+  - To explicitly opt into single-wallet virtual book rebalancing (**Option 2B**, e.g. on Hyperliquid Testnet where subaccount creation is unavailable or when intentionally sharing one wallet margin pool across both books), enable `settling_allow_single_wallet_virtual` directly in SQLite and verify via `readiness`:
+    ```bash
+    sqlite3 data/aegis_quant.db "UPDATE system_config SET config_value='true' WHERE config_key='settling_allow_single_wallet_virtual';"
+    ./bin/aegis-quant --db data/aegis_quant.db readiness
+    ```
+  - **Why Immutable in the Web API**: `settling_allow_single_wallet_virtual`, `pit_subaccount_address`, and `pond_subaccount_address` are listed in `IMMUTABLE_SECURITY_CONFIG_KEYS` (`crates/aegis-core/src/lib.rs`) so a compromised dashboard session or API bearer token cannot silently downgrade L1 subaccount settling into virtual ledger transfers or redirect funds to an unauthorized address.
+- **Two-Subaccount L1 Settling for Mainnet Isolation**:
+  - For hard L1 margin isolation between Book A (`PIT`) and Book B (`POND`) on Mainnet, configure distinct Hyperliquid sub-account EVM addresses in `pit_subaccount_address` and `pond_subaccount_address` and keep `settling_allow_single_wallet_virtual = 'false'`.
+  - `SettleController` will then execute real 2-leg L1 `subAccountTransfer` transactions (`from_subaccount -> Master wallet -> to_subaccount`) with crash-safe Leg-1 journaling (`legs_completed`, `leg1_tx_ref`).
+
+### 5.3 Daemon Cadence, Accounting Identity & Testnet Faucet Offset
+- **Loop Cadence Keys**: `pit_tick_interval_seconds` (default `900`s for Book A evaluation), `pond_tick_interval_seconds` (default `15`s for Book B Tier-1 wick monitoring, 4H close ratchets, and hourly S-Cycle scans), and `polling_interval_seconds` (default `15`s top-level wake ceiling). Periodic maintenance (`maybe_run_maintenance`) is wall-clock driven: exchange reconciliation runs every tick in `LIVE`/`TESTNET` and every `5` minutes in `PAPER`; retention pruning runs hourly.
+- **Dual-Book Accounting Identity**: `total_net_pnl_usdc = round_dp(realized_pnl_usdc + unrealized_pnl_usdc + funding_pnl_usdc - open_fees_usdc + yield_pnl_usdc, 4)` is unfloored, while `book_equity_usdc = round_dp((initial_capital_usdc + transfer_adj_usdc + total_net_pnl_usdc).max(0.0), 2)` applies a `.max(0.0)` solvency floor for risk-sizing denominators (`R10-QA`, `R11-QA`).
+- **Testnet Faucet Spot Offset & Conservative Live Equity (`R9-QA`)**: `testnet_faucet_offset_usdc` (default `10000.0`) automatically subtracts the unallocated `$10,000` Hyperliquid Testnet Spot faucet grant from unified equity when `initial_equity_usdc <= testnet_faucet_offset_usdc`, and live reconciliation adopts `min(live_wallet_equity, accounting_equity)` so unallocated Spot balances never inflate risk caps.
+
+---
+
+## 6. Deployment (`deploy/` Systemd Units) & 6-Gate (`21`-Check) Mainnet Readiness Suite
+
+### 6.1 Hardened Systemd Units (`deploy/`)
+
+The `deploy/` directory provides 5 hardened `systemd` units plus an automated Fedora/Linux bootstrap script (`deploy/bootstrap_vm.sh`):
+
+| File | Role |
+| --- | --- |
+| `deploy/aegis-quant.service` | Unified daemon (`aegis-quant --db .../data/aegis_quant.db run --host 127.0.0.1 --port 8000 --book both`) with `Conflicts=aegis-pit.service aegis-pond.service`. |
+| `deploy/aegis-pit.service` | Standalone Book A (`--book pit --no-web`) service for split-daemon deployments (`Conflicts=aegis-quant.service`). |
+| `deploy/aegis-pond.service` | Standalone Book B (`--book pond --no-web`) service for split-daemon deployments (`Conflicts=aegis-quant.service`). |
+| `deploy/aegis-settle.service` | Oneshot daily settling unit (`aegis-quant --db .../data/aegis_quant.db settle`). |
+| `deploy/aegis-settle.timer` | Daily `OnCalendar=*-*-* 00:05:00 UTC` (`Persistent=true`) timer triggering `aegis-settle.service` (`R19-L4`). |
+| `deploy/bootstrap_vm.sh` | Automated provisioning script that configures `chronyd` and `firewalld`, generates a `0600` Fernet master key, initializes/migrates Schema `v16`, installs all 5 systemd units (`chmod 644`), enables `aegis-settle.timer` and `aegis-quant.service`, and verifies `/api/v1/health`. |
+
+### 6.2 Six-Gate (`21`-Check) Institutional Readiness Suite (`aegis-quant readiness`)
+
+Implemented in `run_readiness_suite` (`crates/aegis-cli/src/main.rs`), all **21 checks across 6 Gates** must pass (`0 FAIL`, plus `SEC-01` and `SEC-03` `PASS` in `LIVE`/`TESTNET`) to earn a `GO FOR TESTNET` / `GO FOR LIVE` verdict:
+
+| Gate | Check ID | Check Name | Requirement Summary |
+| --- | --- | --- | --- |
+| **Gate 1: Database & Schema** | `DB-01` | SQLite WAL Mode & Foreign Keys | `journal_mode=wal`, `foreign_keys=1` |
+| **Gate 1: Database & Schema** | `DB-02` | Schema Migration Version | `schema_version >= 16` (`CANONICAL_SCHEMA_VERSION`) |
+| **Gate 1: Database & Schema** | `DB-03` | 31-Instrument Universe Seeded | `16 USDC_PERP` + `15 BTC_SYNTH` (`15 Alt Pairs`) |
+| **Gate 2: Security & Key Mgmt** | `SEC-01` | Fernet Master Key Isolation | External `AEGIS_MASTER_KEY` / `LoadCredential` or `chmod 600` `.aegis_master_key` |
+| **Gate 2: Security & Key Mgmt** | `SEC-02` | Fernet AES-128 Encryption at Rest | `0` plaintext sensitive keys on disk; `AES-128-CBC + HMAC-SHA256` round-trip verified |
+| **Gate 2: Security & Key Mgmt** | `SEC-03` | Trade-Only Agent Wallet & Key | Valid 42-char `0x` `wallet_address` + 64-hex secp256k1 `private_key` + signer binding (`hyperliquid_testnet=false` in `LIVE`) |
+| **Gate 2: Security & Key Mgmt** | `SEC-04` | Backfill Dataset SHA-256 Provenance | Exact SHA-256 match on `data/real_4h_backfill.json` against `data/real_4h_backfill.json.sha256` |
+| **Gate 3: Risk Guardrails** | `RISK-01` | Institutional Capital & Cap Alignment | Heat = `4.0%` book equity, Single-Asset = `25%` book equity, Gross Leverage = `1.50x` book equity |
+| **Gate 3: Risk Guardrails** | `RISK-02` | Two-Tier Chandelier Stop Parameters | Valid tight-trail or classic Chandelier ATR multipliers and wick buffer bounds in `system_config` |
+| **Gate 3: Risk Guardrails** | `RISK-03` | Live Guardrail Rejection Self-Test | `RiskEngine::evaluate_order_risk` approves valid order `<= 25%` cap and rejects order when heat `>= 4.0%` |
+| **Gate 4: Operational Readiness** | `OPS-01` | Real-Time Alert Channel & Retry Queue | Loopback self-test `DELIVERED` + Telegram/Discord webhook configured for `LIVE` |
+| **Gate 4: Operational Readiness** | `OPS-02` | Order FSM & Audit Trail Integrity | `PENDING -> OPEN_ON_BOOK -> PARTIALLY_FILLED -> FILLED` transitions logged in `order_state_audit` |
+| **Gate 4: Operational Readiness** | `OPS-03` | Exchange Position Drift Reconciliation | `reconcile_exchange_state` detects and reconciles simulated orphan/phantom/size-drift positions |
+| **Gate 5: Quant Acceptance** | `QUANT-01` | Out-of-Sample Annualized Sharpe Ratio | 365-day walk-forward `Annualized Sharpe >= 1.20` (with explicit `stop_regime_label`, `active_stop_set`, and `fired_stop_substitutions`) |
+| **Gate 5: Quant Acceptance** | `QUANT-02` | Out-of-Sample Maximum Drawdown (MDD) | 365-day walk-forward `Maximum Drawdown <= 20.0%` |
+| **Gate 5: Quant Acceptance** | `QUANT-03` | Out-of-Sample Profit Factor | 365-day walk-forward `Profit Factor >= 1.30` |
+| **Gate 5: Quant Acceptance** | `QUANT-04` | In-Memory Backtest DB Isolation | 365-day backtest executes in `:memory:` without mutating live SQLite WAL `trades` |
+| **Gate 6: Deployment & Backup** | `DEPLOY-01` | Systemd Settle Unit Argument Parity | `deploy/aegis-settle.service` `ExecStart` invokes `aegis-quant settle` without invalid `--execute` flag |
+| **Gate 6: Deployment & Backup** | `DEPLOY-02` | Systemd Mutual-Exclusion Conflicts | `deploy/aegis-quant.service` declares `Conflicts=aegis-pit.service aegis-pond.service` |
+| **Gate 6: Deployment & Backup** | `DEPLOY-03` | SQLite VACUUM INTO Backup Freshness | Writable `data/backups/` directory with verified snapshot `<= backup_max_age_hours` (`36h`) old |
+| **Gate 6: Deployment & Backup** | `DEPLOY-04` | Systemd Settle Timer & 5-Unit Bootstrap | All 5 `deploy/aegis-*.{service,timer}` units present, installed by `deploy/bootstrap_vm.sh` (`enable --now aegis-settle.timer`), and present in `/etc/systemd/system/` when host service is installed (`R19-L4`) |
+
+---
+
+## 7. Verification & Workspace Test Inventory (`172` Tests Across 13 Crates)
+
+### 7.1 Standard Verification Commands
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace -- --test-threads=4
+./bin/aegis-quant --db data/aegis_quant.db readiness
+```
+
+### 7.2 Per-Crate Test Suite Inventory (`172` Passing Tests)
+
+All **172** unit and integration tests across the 13 workspace crates pass with zero ignored or skipped cases, enforced in lockstep (`>= 172`) by `.github/workflows/ci.yml` (`R20-L2`):
 
 | Crate / Target | Tests | Coverage Highlights |
 | --- | ---: | --- |
-| `aegis-core` (lib) | 10 | Domain types, step/tick rounding, dynamic open-heat helpers, bare-hex & Gemini key redaction |
-| `aegis-db` (lib + `aegis-db-tool`) | 33 | Fernet AES encryption, schema `v16` upgrades, WAL split-brain pool generation epochs (`R16-M1`), live-activity & `/proc` restore guards (`R16-M2`, `R17-M1`), non-reentrant cycle lock & renewal heartbeat telemetry (`R18-L1`, `R19-M1`, `R19-N1`, `R19-N2`), streaming SHA-256 & backup preview (`R17-L2`) |
-| `aegis-signals` (lib) | 9 | Causal HMM, MACE, SNR, intrabar hysteresis margin & `prev_ema_v` cache persistence |
-| `aegis-risk` (lib) | 8 | Dynamic open heat, Chandelier stops, 20-asset cluster map & `OTHER` cluster cap |
-| `aegis-alerts` (lib) | 5 | Token redaction, 2-cycle RegimeFlip confirmation, per-channel retry, chat-id preservation |
-| `aegis-telemetry` (lib) | 2 | Bounded async SQLite log queue & broadcast bus |
-| `aegis-execution` (lib) | 31 | EIP-712 signing, stale-oracle IOC clamping, post-only `Alo` BBO passive retry (`R19-M2`), Pit rejection telemetry (`R19-L3`), submit-before-cancel & trigger field order stops, `cancelByCloid`, HLP rebalance (`R16-L3`), `ME-12` leg-1 journal |
-| `aegis-pit` (lib) | 3 | Scoped DB execution cycle, freeze-window Chandelier trailing |
-| `aegis-pond` (lib) | 20 | `NPS-01` 6-gate scanner, 6-tier exits, synthetic-refresh guard, persisted exit retry counters |
-| `aegis-settle` (lib) | 12 | PP-50 idle-only settling, `HaltedPp50` vs `SkippedNoIdle`, funding-offset `pond_heat`, transfer quarantine |
-| `aegis-backtest` (lib) | 4 | Zero-lookahead replay, taker default + entry slippage parity, `old -> new` stop disclosure & substitution counters (`R19-N3`) |
-| `aegis-web` (lib) | 18 | Session-nonce cookie auth, SSE `DefaultHasher` heartbeat, backup cooldown, two-step guarded WebUI restore, per-IP token cap & lock-conflict token preservation (`R16-U1`, `R17-M1`, `R17-N2`, `R18-N3`), proxy trust gate |
-| `aegis-cli` (`aegis-quant` + `test_firewall_ast`) | 12 | CLI args, firewall F1-F6 AST & WAL concurrency, `R16-U2` secret hygiene scan, readiness `DEPLOY-01..04` (`R19-L4`), shared backup cadence & `--force` restore |
-| **Total Workspace** | **167** | Enforced as minimum floor (`>= 167`) in `.github/workflows/ci.yml` |
+| `aegis-core` (`lib`) | 10 | Domain types, step/tick rounding, dynamic open-heat helpers, bare-hex & Gemini key redaction |
+| `aegis-db` (`33` `lib` + `1` `aegis-db-tool` `bin`) | 34 | Fernet AES-128 encryption, Schema `v16` migrations, WAL pool generation epochs (`R16-M1`), `/proc` & read-only open restore guards (`R16-M2`, `R17-M1`, `R17-L3`, `R19-L1`, `R19-L2`), non-reentrant cycle lock & 90-tick renewal heartbeat (`R18-L1`, `R19-M1`, `R19-N1`, `R19-N2`, `R20-N2`), streaming SHA-256 (`R17-L2`) |
+| `aegis-signals` (`lib`) | 9 | Causal 3-State Gaussian HMM, MACE momentum, SNR ensemble, intrabar hysteresis margin & `prev_ema_v` cache persistence |
+| `aegis-risk` (`lib`) | 8 | Dynamic open heat, two-tier Chandelier stops, 20-asset correlation-cluster map & `OTHER` cluster cap |
+| `aegis-alerts` (`lib`) | 5 | Token redaction, 2-cycle `RegimeFlip` confirmation, per-channel exponential-backoff retry, chat-id preservation |
+| `aegis-telemetry` (`lib`) | 2 | Bounded async SQLite log queue & broadcast bus |
+| `aegis-execution` (`lib`) | 32 | EIP-712 signing, stale-oracle IOC clamping, post-only `Alo` BBO passive retry (`R19-M2`), Pit rejection telemetry (`R19-L3`), atomic submit-then-cancel stops (`R17-L1`), `userFills` Fix-4 promotion true-up, `cancelByCloid`, HLP rebalance (`R16-L3`), `ME-12` leg-1 journal |
+| `aegis-pit` (`lib`) | 3 | Scoped Book A execution cycle & freeze-window Chandelier trailing |
+| `aegis-pond` (`lib`) | 22 | `NPS-01` 6-gate scanner, 10-state FSM & 6-tier exits, relative `0.0015` 1H ATR floor for sub-dollar assets & large-ratchet stop sync (`R20-M1`), `POND_FROZEN_TRAIL` consecutive-close telemetry & ratchet reset (`R20-L1`), synthetic-refresh guard, persisted exit retry counters |
+| `aegis-settle` (`lib`) | 13 | PP-50 idle-only settling, single-wallet virtual settling gate (`settling_allow_single_wallet_virtual`, `NB-1`, `R20-N3`), `HaltedPp50` vs `SkippedNoIdle`, funding-offset `pond_heat`, `PARTIAL`/`AMBIGUOUS` transfer quarantine |
+| `aegis-backtest` (`lib`) | 4 | Zero-lookahead 365-day replay, taker default + entry slippage parity, `stop_regime_label` / `active_stop_set` / `fired_stop_substitutions` disclosure (`R19-N3`) |
+| `aegis-web` (`lib`) | 18 | Session-nonce cookie auth, SSE `DefaultHasher` `heartbeat`, backup cooldown, two-step guarded WebUI restore, per-IP token cap (`R17-N2`), lock-conflict token preservation (`R18-N3`), health pool & cycle-lock metrics (`R17-N1`, `R19-N2`) |
+| `aegis-cli` (`6` `aegis-quant` `bin` + `6` `test_firewall_ast`) | 12 | CLI flag validation, Firewall Invariants `F1`–`F6` AST & runtime checks, `R16-U2` secret hygiene scan, readiness `DEPLOY-01..04` (`R19-L4`), shared backup cadence & `--force` restore |
+| **Total Workspace** | **172** | Enforced as minimum floor (`>= 172`) in `.github/workflows/ci.yml` (`R20-L2`) |

@@ -21,8 +21,9 @@ pub const CANONICAL_SCHEMA_VERSION: i64 = 16;
 /// Single canonical SQLite schema build & seed script replacing legacy incremental migrations.
 pub const ALL_MIGRATION_FILES: &[&str] = &["sql/schema_and_seed.sql"];
 
-/// Maximum background lease-renewal heartbeat ticks (`90` ticks = `30x` initial TTL) before
-/// allowing a hung cycle lock to expire naturally (`R19-N2`).
+/// Maximum background lease-renewal heartbeat ticks (`90` ticks = `min(30x initial TTL, 45 min)`
+/// under the `30s` renewal-interval clamp; `~47 min` total hold at the `120s` production TTL)
+/// before allowing a hung cycle lock to expire naturally (`R19-N2`, `R20-N2`).
 pub const MAX_CYCLE_LOCK_RENEWAL_TICKS: u32 = 90;
 
 /// RAII guard for the cross-process SQLite advisory cycle lock with background lease-renewal heartbeat (`HI-4`, `R18-L1`).
@@ -486,14 +487,20 @@ impl DatabaseManager {
         });
     }
 
-    /// Idempotently seeds `settling_allow_single_wallet_virtual = 'false'` on existing databases
-    /// without overwriting an operator's explicit opt-in (`'true'`).
+    /// Idempotently seeds Round 19/20 default configuration keys (`settling_allow_single_wallet_virtual`,
+    /// `pond_min_atr_pct`, `pond_frozen_trail_warn_closes`, `pond_frozen_trail_closes_json`) on existing
+    /// databases without overwriting explicit operator overrides (`NB-1`, `R20-M1`, `R20-L1`, `R20-N3`).
     pub fn ensure_settling_single_wallet_config(&self) {
         let _ = self.with_conn(|conn| {
-            let _ = conn.execute(
+            let _ = conn.execute_batch(
                 "INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
-                 VALUES ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
-                [],
+                 VALUES ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing on LIVE/TESTNET when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in; PAPER mode always uses virtual ledger by default)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('pond_min_atr_pct', '0.0015', 'float', 'pond', 'Minimum 1H ATR floor as fraction of reference close price for Pond trailing & wick evaluations (15 bps, R20-M1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('pond_frozen_trail_warn_closes', '6', 'int', 'pond', 'Consecutive 4H closes in profit with Chandelier stop pinned at initial_stop before emitting POND_FROZEN_TRAIL warning (R20-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('pond_frozen_trail_closes_json', '{}', 'json', 'pond', 'Persisted per-cell consecutive 4H closes in profit with Chandelier stop pinned at initial_stop (R20-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
             );
             Ok(())
         });
@@ -912,11 +919,12 @@ impl DatabaseManager {
         estimated_ms.clamp(120_000, 3_600_000)
     }
 
-    /// Acquire the cross-process database advisory cycle lock and return an RAII guard with background heartbeat renewal (`HI-4`, `R18-L1`, `R19-M1`, `R19-N2`).
+    /// Acquire the cross-process database advisory cycle lock and return an RAII guard with background heartbeat renewal (`HI-4`, `R18-L1`, `R19-M1`, `R19-N2`, `R20-N2`).
     ///
     /// Acquisition is strictly non-reentrant while unexpired (`R19-M1`); lease renewal is exclusively
     /// handled by `DbCycleLockGuard`'s background heartbeat (`renew_cycle_lock`), capped at
-    /// `MAX_CYCLE_LOCK_RENEWAL_TICKS` (`90` ticks = `30x` initial TTL).
+    /// `MAX_CYCLE_LOCK_RENEWAL_TICKS` (`90` ticks = `min(30x initial TTL, 45 min)` under the `30s`
+    /// renewal-interval clamp; `~47 min` total hold at the `120s` production TTL).
     pub fn acquire_cycle_lock_guard(
         &self,
         owner: &str,

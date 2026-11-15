@@ -857,6 +857,8 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('pond_gate6_structural_atr_mult', '2.5', 'float', 'pond', 'Gate 6 structural trend distance veto threshold in 4H ATR multiples'),
     ('pond_min_stop_pct_floor', '0.005', 'float', 'pond', 'Minimum initial stop distance floor as fraction of reference price (50 bps)'),
     ('pond_max_stop_distance_pct', '0.06', 'float', 'pond', 'Maximum initial protective stop distance as fraction of reference price for Pond NPS-01 cells (6.0%)'),
+    ('pond_min_atr_pct', '0.0015', 'float', 'pond', 'Minimum 1H ATR floor as fraction of reference close price for Pond trailing & wick evaluations (15 bps, R20-M1)'),
+    ('pond_frozen_trail_warn_closes', '6', 'int', 'pond', 'Consecutive 4H closes in profit with Chandelier stop pinned at initial_stop before emitting POND_FROZEN_TRAIL warning (R20-L1)'),
     ('pond_conviction_z_span', '2.0', 'float', 'pond', 'Z-score span above entry threshold for full 1.5x Pond cell conviction'),
     ('pond_conviction_min_mult', '0.5', 'float', 'pond', 'Minimum Pond cell conviction multiplier'),
     ('pond_conviction_max_mult', '1.5', 'float', 'pond', 'Maximum Pond cell conviction multiplier'),
@@ -875,7 +877,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('settling_window_open_utc', '00:00', 'STR', 'settling', 'Advisory no-opens window start'),
     ('settling_window_close_utc', '00:07', 'STR', 'settling', 'Advisory no-opens window end'),
     ('settling_kill_switch', 'false', 'BOOL', 'settling', 'Pause all capital transfers'),
-    ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in)'),
+    ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing on LIVE/TESTNET when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in; PAPER mode always uses virtual ledger by default)'),
     ('platform_pp50_enabled', 'false', 'BOOL', 'platform', 'Platform-level PP-50 master switch'),
     ('platform_settle_gate_enabled', 'false', 'BOOL', 'platform', 'Default-off open-gate hook during settle'),
     ('platform_pp50_halt', 'false', 'BOOL', 'platform', 'Emergency platform-wide entry halt'),
@@ -977,7 +979,8 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('web_allow_query_token_sse', 'false', 'bool', 'security', 'Allow legacy ?token= query-string authentication on /api/v1/stream SSE endpoint (Table 3 #6)'),
     ('backup_max_age_hours', '36', 'int', 'system', 'Maximum allowed age in hours of the newest SQLite backup for DEPLOY-03 readiness (ME-19)'),
     ('last_sqlite_backup_ms', '0', 'int', 'system', 'Epoch timestamp (ms) of the most recent automated or manual SQLite backup (R15-N10)'),
-    ('pond_exit_attempt_counts_json', '{}', 'json', 'pond', 'Persisted per-cell exit retry counters surviving daemon restarts (Table 3 #13)');
+    ('pond_exit_attempt_counts_json', '{}', 'json', 'pond', 'Persisted per-cell exit retry counters surviving daemon restarts (Table 3 #13)'),
+    ('pond_frozen_trail_closes_json', '{}', 'json', 'pond', 'Persisted per-cell consecutive 4H closes in profit with Chandelier stop pinned at initial_stop (R20-L1)');
 
 DELETE FROM system_config WHERE config_key IN (
     'discord_webhook_url',

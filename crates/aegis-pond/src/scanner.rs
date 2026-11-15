@@ -533,6 +533,13 @@ pub fn run_nps01_scan(
             ));
             continue;
         }
+        // `R20-N1`: Trailing-stop dead-zone geometry between `initial_stop = 2.5 * ATR_1H` and
+        // `chandelier_stop = 3.8 * ATR_4H` (where `ATR_4H >= 1.8 * ATR_1H` from Gate 6): at `t=0`,
+        // `raw_chand` starts wider than `init_s` (`raw_chand.max(init_s)` for LONG / `raw_chand.min(init_s)`
+        // for SHORT), so `chandelier_stop` remains pinned at `initial_stop` until favorable excursion
+        // overcomes the `3.8 * ATR_4H - 2.5 * ATR_1H` gap. Unifying `initial_stop` with `t=0` Chandelier
+        // (`Option (b)`) alters cell sizing (`risk_budget / stop_distance`) and stays gated behind `ME-2`
+        // backtest stop-fidelity closure plus walk-forward validation.
         let chandelier_dist = params.chandelier_atr_mult * atr_4h;
 
         let (initial_stop, chandelier_stop) = match side {

@@ -121,6 +121,47 @@ pub fn compute_wick_context_with_stops(
     min_stop_pct_floor: f64,
     max_stop_distance_pct: f64,
 ) -> WickContext {
+    compute_wick_context_with_stops_and_atr_floor(
+        bars_1h,
+        side,
+        opened_at_ms,
+        stored_high,
+        stored_low,
+        entry_price,
+        atr_period,
+        active_stop,
+        wick_buffer_atr_mult,
+        initial_stop_atr_mult,
+        min_stop_pct_floor,
+        max_stop_distance_pct,
+        0.0015,
+    )
+}
+
+/// Computes post-entry price watermarks, post-watermark adverse wick extremes, the index
+/// of the extreme adverse bar, and the crash-bar-excluded 1H ATR using configured stop parameters
+/// and a relative reference-price ATR floor (`min_atr_pct`, default `0.0015` = 15 bps, `R20-M1`).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_wick_context_with_stops_and_atr_floor(
+    bars_1h: &[OhlcvBar],
+    side: &str,
+    opened_at_ms: i64,
+    stored_high: Option<f64>,
+    stored_low: Option<f64>,
+    entry_price: f64,
+    atr_period: usize,
+    active_stop: Option<f64>,
+    wick_buffer_atr_mult: f64,
+    initial_stop_atr_mult: f64,
+    min_stop_pct_floor: f64,
+    max_stop_distance_pct: f64,
+    min_atr_pct: f64,
+) -> WickContext {
+    let eff_min_atr_pct = if min_atr_pct.is_finite() && min_atr_pct > 0.0 {
+        min_atr_pct.clamp(1e-6, 0.10)
+    } else {
+        0.0015
+    };
     let is_long = side.eq_ignore_ascii_case("LONG");
     let last_1h = bars_1h.last();
     let mark_px = last_1h
@@ -132,7 +173,15 @@ pub fn compute_wick_context_with_stops(
     } else {
         bars_1h
     };
-    let pre_open_atr_1h = compute_atr_from_bars(pre_open_slice, atr_period.max(1)).max(0.01);
+    let pre_open_ref_px = pre_open_slice
+        .last()
+        .map(|b| b.close)
+        .filter(|&p| p > 0.0 && p.is_finite())
+        .unwrap_or(mark_px)
+        .max(1e-8);
+    let pre_open_atr_1h = compute_atr_from_bars(pre_open_slice, atr_period.max(1))
+        .max(pre_open_ref_px * eff_min_atr_pct)
+        .max(1e-8);
     let min_pct = min_stop_pct_floor.max(0.0001);
     let max_pct = max_stop_distance_pct.max(min_pct);
     let default_stop_dist = (initial_stop_atr_mult.max(0.5) * pre_open_atr_1h)
@@ -273,7 +322,15 @@ pub fn compute_wick_context_with_stops(
     } else {
         bars_1h
     };
-    let atr_14_1h = compute_atr_from_bars(atr_1h_slice, atr_period.max(1)).max(0.01);
+    let atr_slice_ref_px = atr_1h_slice
+        .last()
+        .map(|b| b.close)
+        .filter(|&p| p > 0.0 && p.is_finite())
+        .unwrap_or(mark_px)
+        .max(1e-8);
+    let atr_14_1h = compute_atr_from_bars(atr_1h_slice, atr_period.max(1))
+        .max(atr_slice_ref_px * eff_min_atr_pct)
+        .max(1e-8);
 
     WickContext {
         watermark_high,
@@ -312,6 +369,7 @@ pub struct PondOrchestrator {
     pub telemetry: Option<TelemetryBus>,
     pub last_universe_refresh_ms: Arc<Mutex<Option<i64>>>,
     pub exit_attempt_count: Arc<Mutex<HashMap<i64, u32>>>,
+    pub frozen_trail_closes: Arc<Mutex<HashMap<i64, u32>>>,
     pub cycle_bars_cache: Arc<Mutex<Option<HashMap<String, CachedPondBars>>>>,
 }
 
@@ -321,11 +379,18 @@ impl PondOrchestrator {
         let ingestion = MarketIngestionEngine::new(db.clone());
         let execution = ExecutionEngine::new(db.clone());
         let universe_mgr = PondUniverseManager::new(scoped_db.clone(), ingestion.clone());
-        let initial_exit_attempts: HashMap<i64, u32> = db
-            .load_config_opts(false)
-            .ok()
+        let cfg_opt = db.load_config_opts(false).ok();
+        let initial_exit_attempts: HashMap<i64, u32> = cfg_opt
+            .as_ref()
             .and_then(|c| {
                 let raw = c.get_str("pond_exit_attempt_counts_json", "{}");
+                serde_json::from_str::<HashMap<i64, u32>>(&raw).ok()
+            })
+            .unwrap_or_default();
+        let initial_frozen_trail_closes: HashMap<i64, u32> = cfg_opt
+            .as_ref()
+            .and_then(|c| {
+                let raw = c.get_str("pond_frozen_trail_closes_json", "{}");
                 serde_json::from_str::<HashMap<i64, u32>>(&raw).ok()
             })
             .unwrap_or_default();
@@ -337,6 +402,7 @@ impl PondOrchestrator {
             telemetry,
             last_universe_refresh_ms: Arc::new(Mutex::new(None)),
             exit_attempt_count: Arc::new(Mutex::new(initial_exit_attempts)),
+            frozen_trail_closes: Arc::new(Mutex::new(initial_frozen_trail_closes)),
             cycle_bars_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -348,6 +414,16 @@ impl PondOrchestrator {
                 .scoped_db
                 .inner()
                 .set_config_value("pond_exit_attempt_counts_json", &json!(serialized));
+        }
+    }
+
+    pub(crate) fn persist_frozen_trail_closes(&self) {
+        let snapshot = self.frozen_trail_closes.lock().clone();
+        if let Ok(serialized) = serde_json::to_string(&snapshot) {
+            let _ = self
+                .scoped_db
+                .inner()
+                .set_config_value("pond_frozen_trail_closes_json", &json!(serialized));
         }
     }
 
@@ -703,7 +779,7 @@ impl PondOrchestrator {
             } else {
                 prev_chand
             };
-            let wick_ctx = compute_wick_context_with_stops(
+            let wick_ctx = compute_wick_context_with_stops_and_atr_floor(
                 &bars_1h,
                 &cell.side,
                 opened_at_ms.unwrap_or(0),
@@ -716,6 +792,7 @@ impl PondOrchestrator {
                 cfg.pond_initial_stop_atr_mult,
                 cfg.pond_min_stop_pct_floor,
                 cfg.pond_max_stop_distance_pct,
+                cfg.pond_min_atr_pct,
             );
             let watermark_high = wick_ctx.watermark_high;
             let watermark_low = wick_ctx.watermark_low;
@@ -793,6 +870,80 @@ impl PondOrchestrator {
                 chand_mult,
                 effective_4h_close,
             );
+            if cell.chandelier_stop != prev_chandelier_stop {
+                if self
+                    .frozen_trail_closes
+                    .lock()
+                    .remove(&cell.cell_id)
+                    .is_some()
+                {
+                    self.persist_frozen_trail_closes();
+                }
+            } else if effective_4h_close {
+                let in_profit = (cell.side == "LONG" && entry_px > 0.0 && mark_px > entry_px)
+                    || (cell.side == "SHORT" && entry_px > 0.0 && mark_px < entry_px);
+                let clamped_at_initial = prev_init > 0.0
+                    && (cell.chandelier_stop.unwrap_or(prev_init) - prev_init).abs() <= 1e-8
+                    && cell.state == "OPEN";
+                if in_profit && clamped_at_initial {
+                    let closes_frozen = {
+                        let mut map = self.frozen_trail_closes.lock();
+                        let entry = map.entry(cell.cell_id).or_insert(0);
+                        *entry = entry.saturating_add(1);
+                        *entry
+                    };
+                    self.persist_frozen_trail_closes();
+                    if closes_frozen >= cfg.pond_frozen_trail_warn_closes.max(1) {
+                        let chand_val = cell.chandelier_stop.unwrap_or(prev_init);
+                        tracing::warn!(
+                            symbol = %cell.symbol,
+                            cell_id = cell.cell_id,
+                            side = %cell.side,
+                            closes_frozen = closes_frozen,
+                            entry = entry_px,
+                            mark = mark_px,
+                            init_stop = prev_init,
+                            chandelier_stop = chand_val,
+                            atr_4h = atr_4h,
+                            "POND_FROZEN_TRAIL: Pond cell in profit with Chandelier stop pinned at initial_stop across consecutive 4H closes (R20-L1)"
+                        );
+                        let _ = self.scoped_db.inner().log_telemetry(
+                            "WARNING",
+                            "engine.pond",
+                            &format!(
+                                "POND_FROZEN_TRAIL: Pond cell #{} ({}, {}) in profit for {} consecutive 4H closes with Chandelier stop ({:.6}) pinned at initial_stop ({:.6}) (R20-L1)",
+                                cell.cell_id,
+                                cell.symbol,
+                                cell.side,
+                                closes_frozen,
+                                chand_val,
+                                prev_init
+                            ),
+                            Some(json!({
+                                "event": "POND_FROZEN_TRAIL",
+                                "symbol": cell.symbol,
+                                "cell_id": cell.cell_id,
+                                "side": cell.side,
+                                "closes_frozen": closes_frozen,
+                                "entry": entry_px,
+                                "mark": mark_px,
+                                "init_stop": prev_init,
+                                "chandelier_stop": chand_val,
+                                "atr_4h": atr_4h,
+                            })),
+                        );
+                    }
+                } else if !in_profit
+                    && cell.state == "OPEN"
+                    && self
+                        .frozen_trail_closes
+                        .lock()
+                        .remove(&cell.cell_id)
+                        .is_some()
+                {
+                    self.persist_frozen_trail_closes();
+                }
+            }
             let (eval_high_px, eval_low_px) = if cell.chandelier_stop != prev_chandelier_stop {
                 let wick_buf = wick_mult * atr_1h;
                 let breached_prev_stop = if prev_stop > 0.0 {
@@ -1050,6 +1201,14 @@ impl PondOrchestrator {
                         .is_some()
                     {
                         self.persist_exit_attempt_counts();
+                    }
+                    if self
+                        .frozen_trail_closes
+                        .lock()
+                        .remove(&cell.cell_id)
+                        .is_some()
+                    {
+                        self.persist_frozen_trail_closes();
                     }
                     let existing_stop_oid = if is_live_or_testnet {
                         self.scoped_db
@@ -3311,8 +3470,13 @@ mod tests {
                 c.name
             );
             if c.expected_extreme_idx >= 2 {
-                let expected_atr =
-                    compute_atr_from_bars(&c.bars[..c.expected_extreme_idx], 14).max(0.01);
+                let ref_close = c.bars[..c.expected_extreme_idx]
+                    .last()
+                    .map(|b| b.close)
+                    .unwrap_or(c.entry_price);
+                let expected_atr = compute_atr_from_bars(&c.bars[..c.expected_extreme_idx], 14)
+                    .max(ref_close * 0.0015)
+                    .max(1e-8);
                 assert!(
                     (ctx.atr_14_1h - expected_atr).abs() < 1e-9,
                     "{}: atr_14_1h {} != {} (crash-bar excluded)",
@@ -3341,8 +3505,14 @@ mod tests {
             0.85,
         );
         assert_eq!(ctx_idx1.extreme_bar_idx, 1);
+        let short_ref_close = short_bars.last().map(|b| b.close).unwrap_or(100.0);
         assert!(
-            (ctx_idx1.atr_14_1h - compute_atr_from_bars(&short_bars, 14).max(0.01)).abs() < 1e-9,
+            (ctx_idx1.atr_14_1h
+                - compute_atr_from_bars(&short_bars, 14)
+                    .max(short_ref_close * 0.0015)
+                    .max(1e-8))
+            .abs()
+                < 1e-9,
             "extreme_bar_idx < 2 must fall back to full bars_1h slice for atr_14_1h (R11-QB)"
         );
 
@@ -4201,5 +4371,607 @@ mod tests {
             .get_f64("taker_fee_bps", 4.5);
         let est_exit_fee = round_dp(10.0 * 100.0 * (2.0 * taker_fee_bps / 10_000.0), 4);
         assert!((est_exit_fee - 0.90).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_r20_m1_sub_dollar_relative_atr_floor_and_large_ratchet_stop_sync() {
+        let base_ts = 1_760_000_000_000_i64;
+        // Part 1: Verify compute_wick_context_with_stops_and_atr_floor at both ATR call sites
+        // (`pre_open_atr_1h` & `atr_14_1h`) on sub-dollar tokens WLFI ($0.045693) and MON ($0.0159).
+        let wlfi_px = 0.045693;
+        let wlfi_init_stop = 0.044293;
+        let wlfi_bars: Vec<OhlcvBar> = (0..18)
+            .map(|i| OhlcvBar {
+                symbol: "WLFI/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open: wlfi_px,
+                high: wlfi_px + 0.00015,
+                low: wlfi_px - 0.00015,
+                close: wlfi_px,
+                volume: 100_000.0,
+                funding_rate_hourly: -0.00012,
+                is_synthetic: 0,
+            })
+            .collect();
+        let wlfi_ctx = compute_wick_context_with_stops_and_atr_floor(
+            &wlfi_bars,
+            "LONG",
+            base_ts + 2 * 3_600_000,
+            Some(wlfi_px + 0.00015),
+            Some(wlfi_px - 0.00015),
+            wlfi_px,
+            14,
+            Some(wlfi_init_stop),
+            0.85,
+            2.5,
+            0.005,
+            0.06,
+            0.0015,
+        );
+        // Real 1H ATR is ~0.00030 (above relative floor 0.045693 * 0.0015 = 0.0000685395, NOT 0.01)
+        assert!(
+            (wlfi_ctx.atr_14_1h - 0.00030).abs() < 1e-7,
+            "WLFI atr_14_1h must equal real 0.00030 (got {}), never clamped to 0.01",
+            wlfi_ctx.atr_14_1h
+        );
+        let wlfi_wick_buf = 0.85 * wlfi_ctx.atr_14_1h;
+        let wlfi_wick_buf_pct = wlfi_wick_buf / wlfi_px;
+        let wlfi_stop_dist = wlfi_px - wlfi_init_stop;
+        assert!(
+            wlfi_wick_buf_pct < 0.02 && (wlfi_wick_buf_pct - 0.00558).abs() < 0.001,
+            "WLFI Tier-1 wick buffer must be ~0.56% of price (<2%), got {:.4}%",
+            wlfi_wick_buf_pct * 100.0
+        );
+        assert!(
+            wlfi_stop_dist > wlfi_wick_buf,
+            "WLFI stop_dist ({wlfi_stop_dist}) must exceed wick_buf ({wlfi_wick_buf})"
+        );
+
+        // MON ($0.0159): under the old `.max(0.01)` floor, `pre_open_atr_1h` and `atr_14_1h`
+        // were forced to `0.01` (62.9% of price), so `in_band_high_threshold` became `0.0259`
+        // and failed to sanitize a +2.5% pre-open spike (`0.0163`). With the relative 15 bps
+        // floor (`0.0159 * 0.0015 = 0.00002385`), `atr_14_1h` stays sub-mill (`0.0000795` on bars,
+        // `0.00002385` on empty-bar fallback) and `0.0163` IS sanitized to `0.0159`.
+        let mon_px = 0.0159;
+        let mut mon_bars: Vec<OhlcvBar> = (0..16)
+            .map(|i| OhlcvBar {
+                symbol: "MON/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open: mon_px,
+                high: mon_px,
+                low: mon_px,
+                close: mon_px,
+                volume: 50_000.0,
+                funding_rate_hourly: -0.00010,
+                is_synthetic: 0,
+            })
+            .collect();
+        mon_bars[0].high = 0.0163;
+        let mon_ctx = compute_wick_context_with_stops_and_atr_floor(
+            &mon_bars,
+            "LONG",
+            base_ts + 1_800_000, // opened 30m into Bar 0
+            Some(mon_px),
+            Some(mon_px),
+            mon_px,
+            14,
+            Some(mon_px * 0.995),
+            0.85,
+            2.5,
+            0.005,
+            0.06,
+            0.0015,
+        );
+        assert!(
+            mon_ctx.atr_14_1h < 0.0001 && (mon_ctx.atr_14_1h - 0.0000795).abs() < 1e-9,
+            "MON atr_14_1h on bars must stay sub-mill (0.0000795, NOT 0.01), got {}",
+            mon_ctx.atr_14_1h
+        );
+        assert!(
+            (mon_ctx.watermark_high - mon_px).abs() < 1e-9,
+            "MON pre_open_atr_1h relative floor must sanitize pre-open spike 0.0163 to 0.0159 (got {})",
+            mon_ctx.watermark_high
+        );
+        let mon_empty_ctx = compute_wick_context_with_stops_and_atr_floor(
+            &[],
+            "LONG",
+            base_ts,
+            Some(mon_px),
+            Some(mon_px),
+            mon_px,
+            14,
+            Some(mon_px * 0.995),
+            0.85,
+            2.5,
+            0.005,
+            0.06,
+            0.0015,
+        );
+        let expected_mon_floor = mon_px * 0.0015; // 0.00002385
+        assert!(
+            (mon_empty_ctx.atr_14_1h - expected_mon_floor).abs() < 1e-9,
+            "MON empty-bar atr_14_1h floor must equal 0.00002385 (got {})",
+            mon_empty_ctx.atr_14_1h
+        );
+
+        // Part 2: Simulate an open WLFI/USDC:USDC Pond cell across a 4H close at mark = 0.0475
+        // with live protective-stop sync (submit-then-cancel) and Fix-4 / exchange reconciliation.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let recorded_actions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded_actions.clone();
+        let server_handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed)
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                        let mut buf = [0u8; 8192];
+                        let mut total = Vec::new();
+                        let mut req_body_str = String::new();
+                        while let Ok(n) = stream.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            total.extend_from_slice(&buf[..n]);
+                            if let Some(hdr_end) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let body_start = hdr_end + 4;
+                                let hdr_str = String::from_utf8_lossy(&total[..hdr_end]);
+                                let content_len = hdr_str
+                                    .lines()
+                                    .find_map(|l| {
+                                        let lower = l.to_ascii_lowercase();
+                                        lower
+                                            .strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                if total.len() >= body_start + content_len {
+                                    req_body_str = String::from_utf8_lossy(
+                                        &total[body_start..body_start + content_len],
+                                    )
+                                    .to_string();
+                                    break;
+                                }
+                            }
+                        }
+                        let resp_json = if req_body_str.contains("\"type\":\"meta\"") {
+                            recorded_clone.lock().push("meta".to_string());
+                            r#"{"universe":[{"name":"WLFI","szDecimals":0}]}"#.to_string()
+                        } else if req_body_str.contains("\"type\":\"order\"") {
+                            recorded_clone.lock().push("order".to_string());
+                            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":8002}}]}}}"#.to_string()
+                        } else if req_body_str.contains("\"type\":\"cancel\"") {
+                            recorded_clone.lock().push("cancel".to_string());
+                            r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#.to_string()
+                        } else {
+                            r#"{"status":"ok"}"#.to_string()
+                        };
+                        let http_resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_json.len(),
+                            resp_json
+                        );
+                        let _ = stream.write_all(http_resp.as_bytes());
+                        let _ = stream.flush();
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        let _ = stream.read(&mut buf);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let endpoint = format!("http://{addr}");
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet", &json!(true))
+            .unwrap();
+        db.set_config_value("exchange_protective_stops_enabled", &json!(true))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &json!(endpoint))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_info_url", &json!(endpoint))
+            .unwrap();
+        let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let wallet = aegis_core::derive_evm_address_from_private_key(pk).unwrap();
+        db.set_config_value("wallet_address", &json!(wallet))
+            .unwrap();
+        db.set_config_value("private_key", &json!(pk)).unwrap();
+
+        let orch = PondOrchestrator::new(db.clone(), None);
+        db.upsert_pond_universe_batch(&[PondUniverseRow {
+            symbol: "WLFI/USDC:USDC".to_string(),
+            rank: 5,
+            median_daily_volume_usdc: 2_000_000.0,
+            tick_size: 0.000001,
+            lot_step_size: 1.0,
+            min_notional_usdc: 10.0,
+            max_leverage: 5.0,
+            reference_price: wlfi_px,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        }])
+        .unwrap();
+
+        let now_ms = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000;
+        let opened_iso = chrono::DateTime::from_timestamp_millis(now_ms - 8 * 3_600_000)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let cell_id = orch
+            .scoped_db
+            .upsert_pond_cell(&PondCell {
+                cell_id: 0,
+                symbol: "WLFI/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(wlfi_px),
+                quantity: Some(5000.0),
+                notional_usdc: Some(round_dp(5000.0 * wlfi_px, 2)),
+                risk_budget_usdc: Some(round_dp(5000.0 * (wlfi_px - wlfi_init_stop), 2)),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.8),
+                funding_rate_entry: Some(-0.00015),
+                initial_stop: Some(wlfi_init_stop),
+                chandelier_stop: Some(wlfi_init_stop),
+                highest_price_seen: Some(wlfi_px),
+                lowest_price_seen: Some(wlfi_px),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.0343,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some(opened_iso.clone()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: opened_iso,
+            })
+            .unwrap();
+        orch.scoped_db
+            .set_pond_cell_protective_stop_oid(cell_id, Some("hl-8001"))
+            .unwrap();
+
+        let mut bars_1h_4h_close: Vec<OhlcvBar> = (0..180)
+            .map(|i| OhlcvBar {
+                symbol: "WLFI/USDC:USDC".to_string(),
+                timeframe: "1h".to_string(),
+                timestamp_ms: now_ms - (179 - i as i64) * 3_600_000,
+                open: wlfi_px,
+                high: wlfi_px + 0.00015,
+                low: wlfi_px - 0.00015,
+                close: wlfi_px,
+                volume: 100_000.0,
+                funding_rate_hourly: -0.00015,
+                is_synthetic: 0,
+            })
+            .collect();
+        if let Some(last) = bars_1h_4h_close.last_mut() {
+            last.open = 0.0468;
+            last.high = 0.0475;
+            last.low = 0.0467;
+            last.close = 0.0475;
+        }
+        // 4H bars with ATR_4H ≈ 0.0005947368 -> 3.8 * ATR_4H ≈ 0.00226 -> chandelier_stop ≈ 0.04524
+        let bars_4h: Vec<OhlcvBar> = (0..65)
+            .map(|i| OhlcvBar {
+                symbol: "WLFI/USDC:USDC".to_string(),
+                timeframe: "4h".to_string(),
+                timestamp_ms: now_ms - (64 - i as i64) * 14_400_000,
+                open: 0.0475,
+                high: 0.0475,
+                low: 0.0475 - 0.0005947368,
+                close: 0.0475,
+                volume: 400_000.0,
+                funding_rate_hourly: -0.00015,
+                is_synthetic: 0,
+            })
+            .collect();
+        let mut funding_series = vec![-0.00002; 178];
+        funding_series.push(-0.00014);
+        funding_series.push(-0.00015);
+        let mut cache_map = HashMap::new();
+        cache_map.insert(
+            "WLFI/USDC:USDC".to_string(),
+            (funding_series, bars_1h_4h_close, bars_4h),
+        );
+        *orch.cycle_bars_cache.lock() = Some(cache_map);
+
+        let exits = orch.evaluate_open_cells(false, true).unwrap();
+        assert_eq!(exits, 0);
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = server_handle.join();
+
+        let actions = recorded_actions.lock().clone();
+        assert_eq!(
+            actions,
+            vec![
+                "meta".to_string(),
+                "order".to_string(),
+                "cancel".to_string()
+            ],
+            "submit_or_refresh_protective_stop_order must submit replacement stop BEFORE cancelling old stop (R15-S1)"
+        );
+
+        let updated_cell = orch
+            .scoped_db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cell_id)
+            .unwrap();
+        assert_eq!(updated_cell.state, "TRAILED");
+        let ratcheted_stop = updated_cell.chandelier_stop.unwrap();
+        assert!(
+            (ratcheted_stop - 0.04524).abs() < 1e-4 && ratcheted_stop > wlfi_init_stop,
+            "WLFI chandelier_stop must ratchet ~2.1% in a single jump (0.044293 -> ~0.04524), got {ratcheted_stop}"
+        );
+        assert_eq!(
+            orch.scoped_db
+                .get_pond_cell_protective_stop_oid(cell_id)
+                .unwrap()
+                .as_deref(),
+            Some("hl-8002")
+        );
+
+        // Verify Fix-4 userFills true-up and 15s reconcile_exchange_state preserve TRAILED & chandelier_stop symmetrically
+        orch.execution
+            .register_pending_fix4_pond_trueup(cell_id, Some("hl-7777"), 0.0343);
+        let trued = orch
+            .execution
+            .true_up_pending_fix4_promotions(Some(&[json!({
+                "oid": 7777,
+                "sz": "5000.0",
+                "px": "0.045693",
+                "fee": "0.0343"
+            })]));
+        assert_eq!(trued, 1);
+
+        let mut sim_positions = HashMap::new();
+        sim_positions.insert(
+            "WLFI".to_string(),
+            json!({
+                "szi": "5000.0",
+                "entryPx": "0.045693",
+                "markPx": "0.0475",
+                "unrealizedPnl": "9.035"
+            }),
+        );
+        let sim_orders = [json!({"coin": "WLFI", "oid": 8002})];
+        let rec = orch
+            .execution
+            .reconcile_exchange_state(Some(&sim_positions), Some(&sim_orders));
+        assert_eq!(rec.discrepancies_found, 0);
+
+        let post_rec_cell = orch
+            .scoped_db
+            .get_open_pond_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.cell_id == cell_id)
+            .unwrap();
+        assert_eq!(post_rec_cell.state, "TRAILED");
+        assert!((post_rec_cell.chandelier_stop.unwrap() - ratcheted_stop).abs() < 1e-8);
+        assert_eq!(
+            orch.scoped_db
+                .get_pond_cell_protective_stop_oid(cell_id)
+                .unwrap()
+                .as_deref(),
+            Some("hl-8002")
+        );
+    }
+
+    #[test]
+    fn test_r20_l1_frozen_trail_consecutive_closes_telemetry_and_ratchet_reset() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        db.set_config_value("execution_mode", &json!("PAPER"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("PAPER"))
+            .unwrap();
+        let orch = PondOrchestrator::new(db.clone(), None);
+        db.upsert_pond_universe_batch(&[PondUniverseRow {
+            symbol: "SOL/USDC:USDC".to_string(),
+            rank: 1,
+            median_daily_volume_usdc: 25_000_000.0,
+            tick_size: 0.01,
+            lot_step_size: 0.1,
+            min_notional_usdc: 10.0,
+            max_leverage: 10.0,
+            reference_price: 100.0,
+            status: "ACTIVE".to_string(),
+            warmup_until: None,
+            delist_streak: 0,
+            added_at: "2026-01-01T00:00:00Z".to_string(),
+            delisted_at: None,
+            is_synthetic_volume: 0,
+        }])
+        .unwrap();
+
+        let now_ms = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000;
+        let opened_iso = chrono::DateTime::from_timestamp_millis(now_ms - 12 * 3_600_000)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        // Entry = 100.0, initial_stop = 97.5 (2.5 * ATR_1H where ATR_1H = 1.0).
+        // ATR_4H = 2.0 -> 3.8 * ATR_4H = 7.6. At mild profit mark = 102.0 (> 100.0),
+        // raw_cand = 102.0 - 7.6 = 94.4 < 97.5, so chandelier_stop stays clamped at initial_stop (97.5).
+        let cell_id = orch
+            .scoped_db
+            .upsert_pond_cell(&PondCell {
+                cell_id: 0,
+                symbol: "SOL/USDC:USDC".to_string(),
+                champion_id: 1,
+                state: "OPEN".to_string(),
+                cycle_opened_id: None,
+                side: "LONG".to_string(),
+                option_analogue: "SHORT_PUT".to_string(),
+                entry_price: Some(100.0),
+                quantity: Some(10.0),
+                notional_usdc: Some(1000.0),
+                risk_budget_usdc: Some(25.0),
+                conviction_multiplier: Some(1.0),
+                funding_z_entry: Some(-2.6),
+                funding_rate_entry: Some(-0.00012),
+                initial_stop: Some(97.5),
+                chandelier_stop: Some(97.5),
+                highest_price_seen: Some(102.0),
+                lowest_price_seen: Some(100.0),
+                funding_accrued_usdc: 0.0,
+                realized_pnl_usdc: 0.0,
+                fees_paid_usdc: 0.15,
+                exit_price: None,
+                exit_reason: None,
+                resting_order_id: None,
+                opened_at: Some(opened_iso.clone()),
+                closed_at: None,
+                cooldown_until: None,
+                updated_at: opened_iso,
+            })
+            .unwrap();
+
+        let make_cached_bars = |mark_close: f64, high_seen: f64| {
+            let mut bars_1h: Vec<OhlcvBar> = (0..180)
+                .map(|i| OhlcvBar {
+                    symbol: "SOL/USDC:USDC".to_string(),
+                    timeframe: "1h".to_string(),
+                    timestamp_ms: now_ms - (179 - i as i64) * 3_600_000,
+                    open: 100.0,
+                    high: 100.5,
+                    low: 99.5,
+                    close: 100.0,
+                    volume: 100_000.0,
+                    funding_rate_hourly: -0.00012,
+                    is_synthetic: 0,
+                })
+                .collect();
+            if let Some(last) = bars_1h.last_mut() {
+                last.open = mark_close;
+                last.high = high_seen;
+                last.low = mark_close - 0.5;
+                last.close = mark_close;
+            }
+            let mut bars_4h: Vec<OhlcvBar> = (0..65)
+                .map(|i| OhlcvBar {
+                    symbol: "SOL/USDC:USDC".to_string(),
+                    timeframe: "4h".to_string(),
+                    timestamp_ms: now_ms - (64 - i as i64) * 14_400_000,
+                    open: 100.0,
+                    high: 101.0,
+                    low: 99.0,
+                    close: 100.0,
+                    volume: 400_000.0,
+                    funding_rate_hourly: -0.00012,
+                    is_synthetic: 0,
+                })
+                .collect();
+            if let Some(last4) = bars_4h.last_mut() {
+                last4.close = mark_close;
+                last4.high = high_seen;
+                last4.low = mark_close - 1.0;
+            }
+            let mut funding = vec![-0.00002; 178];
+            funding.push(-0.00012);
+            funding.push(-0.00012);
+            let mut map = HashMap::new();
+            map.insert("SOL/USDC:USDC".to_string(), (funding, bars_1h, bars_4h));
+            map
+        };
+
+        for close_idx in 1..=6u32 {
+            *orch.cycle_bars_cache.lock() = Some(make_cached_bars(102.0, 102.0));
+            let exits = orch.evaluate_open_cells(false, true).unwrap();
+            assert_eq!(exits, 0);
+            assert_eq!(
+                orch.frozen_trail_closes.lock().get(&cell_id).copied(),
+                Some(close_idx),
+                "frozen_trail_closes must equal {close_idx} after 4H close #{close_idx}"
+            );
+            let logs = db.get_recent_logs(50).unwrap();
+            let frozen_logs: Vec<_> = logs
+                .iter()
+                .filter(|r| {
+                    r.get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|m| m.contains("POND_FROZEN_TRAIL"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if close_idx < 6 {
+                assert!(
+                    frozen_logs.is_empty(),
+                    "POND_FROZEN_TRAIL must not fire before close #6 (at close #{close_idx})"
+                );
+            } else {
+                assert_eq!(
+                    frozen_logs.len(),
+                    1,
+                    "POND_FROZEN_TRAIL telemetry must be emitted at close #6"
+                );
+            }
+        }
+
+        // Verify persistence across PondOrchestrator restart via pond_frozen_trail_closes_json
+        let orch_restarted = PondOrchestrator::new(db.clone(), None);
+        assert_eq!(
+            orch_restarted
+                .frozen_trail_closes
+                .lock()
+                .get(&cell_id)
+                .copied(),
+            Some(6),
+            "frozen_trail_closes must survive PondOrchestrator restart via SQLite"
+        );
+
+        // 7th 4H close rallies to 108.0 -> raw_cand = 108.0 - 7.6 = 100.4 > 97.5, ratcheting stop & clearing counter
+        *orch_restarted.cycle_bars_cache.lock() = Some(make_cached_bars(108.0, 108.0));
+        let exits = orch_restarted.evaluate_open_cells(false, true).unwrap();
+        assert_eq!(exits, 0);
+        assert_eq!(
+            orch_restarted
+                .frozen_trail_closes
+                .lock()
+                .get(&cell_id)
+                .copied(),
+            None,
+            "frozen_trail_closes entry must be cleared once chandelier_stop ratchets above initial_stop"
+        );
+        let orch_after_ratchet = PondOrchestrator::new(db.clone(), None);
+        assert_eq!(
+            orch_after_ratchet
+                .frozen_trail_closes
+                .lock()
+                .get(&cell_id)
+                .copied(),
+            None,
+            "cleared frozen_trail_closes must persist to pond_frozen_trail_closes_json"
+        );
     }
 }
