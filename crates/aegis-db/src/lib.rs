@@ -4135,4 +4135,41 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_single_wallet_virtual_settle_config_backfill_is_idempotent() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+
+        let cfg = db.load_config().unwrap();
+        assert!(!cfg.get_bool("settling_allow_single_wallet_virtual", true));
+
+        // Simulate a v16 database created before settling_allow_single_wallet_virtual was seeded
+        db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM system_config WHERE config_key = 'settling_allow_single_wallet_virtual';",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let applied = db.run_migrations().unwrap();
+        assert!(applied.is_empty());
+        assert!(!db
+            .load_config()
+            .unwrap()
+            .get_bool("settling_allow_single_wallet_virtual", true));
+
+        // Explicit 'true' opt-in must never be overwritten back to 'false'
+        db.set_config_value("settling_allow_single_wallet_virtual", &json!(true))
+            .unwrap();
+        db.initialize_schema(false).unwrap();
+        let _ = db.run_migrations().unwrap();
+        assert!(db
+            .load_config()
+            .unwrap()
+            .get_bool("settling_allow_single_wallet_virtual", false));
+    }
 }

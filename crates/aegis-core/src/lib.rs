@@ -66,6 +66,7 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "hyperliquid_exchange_url_override",
     "pit_subaccount_address",
     "pond_subaccount_address",
+    "settling_allow_single_wallet_virtual",
     "hyperliquid_vault_address",
     "hyperliquid_default_vault_mainnet",
     "hyperliquid_default_vault_testnet",
@@ -2881,6 +2882,9 @@ mod tests {
             "hyperliquid_info_url_override"
         ));
         assert!(is_immutable_security_config_key("pit_subaccount_address"));
+        assert!(is_immutable_security_config_key(
+            "settling_allow_single_wallet_virtual"
+        ));
 
         assert_eq!(normalize_manual_exit_reason(None), "MANUAL_TAKE_PROFIT");
         assert_eq!(

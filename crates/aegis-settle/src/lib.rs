@@ -316,8 +316,10 @@ impl SettleController {
                         }
                         Err(e) => {
                             last_err = e.to_string();
-                            // R3-B3: Never blind-retry after an ambiguous post-send error or partial leg-1 completion
-                            if last_err.contains("AMBIGUOUS_POST_SEND")
+                            // R3-B3: Never blind-retry after an ambiguous post-send error,
+                            // partial leg-1 completion, or deterministic config failure.
+                            if matches!(e, AegisError::Config(_))
+                                || last_err.contains("AMBIGUOUS_POST_SEND")
                                 || last_err.contains("PARTIAL_LEG1_COMPLETED")
                             {
                                 break;
@@ -1180,5 +1182,87 @@ mod tests {
             "LT-2: settle PP-50 pond_heat must apply positive funding offset (100 - 25 = 75), got: {}",
             res.report_line
         );
+    }
+
+    #[test]
+    fn test_testnet_single_wallet_virtual_settle_opt_in_and_nb1_default() {
+        let db = DatabaseManager::memory();
+        db.initialize_schema(true).unwrap();
+        let ctrl = SettleController::new(db.clone(), None);
+
+        // Seed realized POND gain ($6000 POND / $5000 PIT -> $500 POND->PIT drift)
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO pond_cells (
+                    symbol, champion_id, state, side, option_analogue, entry_price, quantity, notional_usdc,
+                    risk_budget_usdc, realized_pnl_usdc, opened_at, closed_at
+                 ) VALUES ('BTC', (SELECT champion_id FROM pond_champions LIMIT 1), 'CLOSED', 'LONG', 'SHORT_PUT', 50000.0, 0.1, 5000.0, 100.0, 1000.0, '2026-11-13T00:00:00Z', '2026-11-14T00:00:00Z');",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        db.set_config_value("execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet", &json!(true))
+            .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            &json!("0x1111111111111111111111111111111111111111"),
+        )
+        .unwrap();
+
+        // 1. Default (settling_allow_single_wallet_virtual = false) still fails closed with NB-1 in 1 config attempt
+        let failed = ctrl
+            .run_settling(SettleOverrideInput {
+                day_index: Some(1),
+                dry_run: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(failed.status, "FAILED");
+        let recent_failed = db.get_recent_book_transfers(1).unwrap();
+        assert_eq!(recent_failed[0].status, "FAILED");
+        assert_eq!(recent_failed[0].attempts, 1);
+
+        // 2. Enable explicit single-wallet virtual settling opt-in (2B) -> COMPLETED via VIRTUAL_SINGLE_WALLET_LEDGER
+        db.set_config_value("settling_allow_single_wallet_virtual", &json!(true))
+            .unwrap();
+        let settled = ctrl
+            .run_settling(SettleOverrideInput {
+                day_index: Some(2),
+                dry_run: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settled.status, "COMPLETED");
+        assert_eq!(settled.from_book, "POND");
+        assert_eq!(settled.to_book, "PIT");
+        assert!((settled.executed_transfer_usdc - 500.0).abs() < 1e-6);
+        assert!(settled.tx_hash.as_deref().unwrap_or("").starts_with("0x"));
+
+        // Verify book equities actually rebalanced 50/50 ($5500 / $5500) via get_net_book_transfer_adjustment
+        let (pit_eq, _pit_idle, pond_eq, _pond_idle) = ctrl.inspect_books_state().unwrap();
+        assert!((pit_eq - 5500.0).abs() < 1e-6);
+        assert!((pond_eq - 5500.0).abs() < 1e-6);
+
+        let transfer_mode: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT transfer_mode FROM book_transfers WHERE transfer_id = {};",
+                        settled.transfer_id
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| aegis_core::AegisError::Database(e.to_string()))
+            })
+            .unwrap();
+        assert_eq!(transfer_mode, "VIRTUAL_SINGLE_WALLET_LEDGER");
     }
 }

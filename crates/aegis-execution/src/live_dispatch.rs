@@ -2580,12 +2580,83 @@ impl ExecutionEngine {
         self.execute_subaccount_transfer_for_record(None, from_book, to_book, amount_usdc, dry_run)
     }
 
+    /// Validates single-wallet virtual settling opt-in when both sub-account addresses are unset
+    /// in `LIVE`/`TESTNET` mode and records an audit telemetry entry (`NB-1` single-wallet 2B).
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_single_wallet_virtual_settle(
+        &self,
+        transfer_id: Option<i64>,
+        from_norm: &str,
+        to_norm: &str,
+        amt: f64,
+        mode: &str,
+        master_wallet: &str,
+        pit_sub: &str,
+        pond_sub: &str,
+        allow_single_wallet_virtual: bool,
+    ) -> Result<()> {
+        if !pit_sub.is_empty() || !pond_sub.is_empty() {
+            return Err(AegisError::Config(
+                "Configured pit_subaccount_address / pond_subaccount_address must be valid EVM addresses distinct from wallet_address (NB-1)"
+                    .to_string(),
+            ));
+        }
+        if !allow_single_wallet_virtual {
+            return Err(AegisError::Config(
+                "Live subAccountTransfer requires pit_subaccount_address or pond_subaccount_address configured (NB-1)"
+                    .to_string(),
+            ));
+        }
+        if master_wallet.is_empty()
+            || validate_evm_address(master_wallet, "wallet_address").is_err()
+        {
+            return Err(AegisError::Config(
+                "Single-wallet virtual settling requires a valid wallet_address configured"
+                    .to_string(),
+            ));
+        }
+        let usd_micro = (amt * 1e6).round() as i64;
+        if usd_micro <= 0 {
+            return Err(AegisError::Execution(
+                "Transfer amount must be positive for virtual single-wallet settling".to_string(),
+            ));
+        }
+        let audit_msg = format!(
+            "Single-wallet virtual ledger settling ${amt:.2} {from_norm}->{to_norm} in {mode} mode on wallet {master_wallet} (subaccount addresses empty; settling_allow_single_wallet_virtual=true)"
+        );
+        tracing::info!(
+            transfer_id = ?transfer_id,
+            from_book = %from_norm,
+            to_book = %to_norm,
+            amount_usdc = amt,
+            mode = %mode,
+            wallet = %master_wallet,
+            "{audit_msg}"
+        );
+        let _ = self.db.log_telemetry(
+            "INFO",
+            "aegis-settle.transfer",
+            &audit_msg,
+            Some(json!({
+                "transfer_id": transfer_id,
+                "from_book": from_norm,
+                "to_book": to_norm,
+                "amount_usdc": amt,
+                "mode": mode,
+                "transfer_mode": "VIRTUAL_SINGLE_WALLET_LEDGER",
+            })),
+        );
+        Ok(())
+    }
+
     /// Executes an inter-book USDC transfer with optional `transfer_id` per-leg persistence (`R3-B3`, `R4-N9`, `R4-H2`).
     ///
     /// - Persists `legs_completed`, `leg1_tx_ref`, and `leg2_tx_ref` after each leg so a retry on a
     ///   2-leg transfer where leg 1 succeeded and leg 2 failed NEVER re-executes leg 1 (`R3-B3`),
     ///   and a transfer where all legs already succeeded returns `CONFIRMED` without re-submitting (`R4-N9`).
     /// - Marks post-send HTTP timeouts with `AMBIGUOUS_POST_SEND:` so callers halt automatic retries (`R3-B3`).
+    /// - Preserves strict `NB-1` fail-closed L1 `subAccountTransfer` unless both sub-account addresses are
+    ///   empty and `settling_allow_single_wallet_virtual` is explicitly enabled (`2B`).
     pub fn execute_subaccount_transfer_for_record(
         &self,
         transfer_id: Option<i64>,
@@ -2608,6 +2679,9 @@ impl ExecutionEngine {
         let cfg = self.db.load_config()?;
         let amt = round_dp(amount_usdc.max(0.0), 2);
         let mode = cfg.get_str("execution_mode", "PAPER").to_ascii_uppercase();
+        let pond_mode = cfg
+            .get_str("pond_execution_mode", &mode)
+            .to_ascii_uppercase();
         let is_testnet = cfg.get_bool("hyperliquid_testnet", false) || mode == "TESTNET";
 
         let master_wallet = cfg.get_str("wallet_address", "").trim().to_lowercase();
@@ -2624,14 +2698,32 @@ impl ExecutionEngine {
             && validate_evm_address(&pond_sub, "pond_subaccount_address").is_ok()
             && pond_sub.to_lowercase() != master_wallet;
 
-        let is_live_or_testnet = mode == "LIVE" || mode == "TESTNET";
-        if !dry_run && is_live_or_testnet {
+        let allow_single_wallet_virtual =
+            cfg.get_bool("settling_allow_single_wallet_virtual", false);
+        let is_live_or_testnet =
+            mode == "LIVE" || mode == "TESTNET" || pond_mode == "LIVE" || pond_mode == "TESTNET";
+        let use_live_l1_subaccounts = if !dry_run && is_live_or_testnet {
             if !pit_is_sub && !pond_is_sub {
-                return Err(AegisError::Config(
-                    "Live subAccountTransfer requires pit_subaccount_address or pond_subaccount_address configured (NB-1)"
-                        .to_string(),
-                ));
+                self.authorize_single_wallet_virtual_settle(
+                    transfer_id,
+                    &from_norm,
+                    &to_norm,
+                    amt,
+                    &mode,
+                    &master_wallet,
+                    &pit_sub,
+                    &pond_sub,
+                    allow_single_wallet_virtual,
+                )?;
+                false
+            } else {
+                true
             }
+        } else {
+            false
+        };
+
+        if use_live_l1_subaccounts {
             let priv_key = self.db.get_signing_private_key()?;
             if priv_key.trim().is_empty() {
                 return Err(AegisError::Execution(

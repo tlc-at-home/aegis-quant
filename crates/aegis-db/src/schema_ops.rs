@@ -234,6 +234,7 @@ impl DatabaseManager {
                 if ver >= CANONICAL_SCHEMA_VERSION {
                     let _ = self.with_conn(Self::repair_interrupted_table_rebuilds);
                     self.reconcile_routing_config();
+                    self.ensure_settling_single_wallet_config();
                     return self.verify_integrity();
                 }
             }
@@ -485,12 +486,27 @@ impl DatabaseManager {
         });
     }
 
+    /// Idempotently seeds `settling_allow_single_wallet_virtual = 'false'` on existing databases
+    /// without overwriting an operator's explicit opt-in (`'true'`).
+    pub fn ensure_settling_single_wallet_config(&self) {
+        let _ = self.with_conn(|conn| {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+                [],
+            );
+            Ok(())
+        });
+    }
+
     pub fn run_migrations(&self) -> Result<Vec<String>> {
         let cur_ver = self.get_schema_version().unwrap_or(0).max(0);
         if cur_ver < CANONICAL_SCHEMA_VERSION {
             self.apply_migration("sql/schema_and_seed.sql")?;
+            self.ensure_settling_single_wallet_config();
             Ok(vec!["sql/schema_and_seed.sql".to_string()])
         } else {
+            self.ensure_settling_single_wallet_config();
             Ok(Vec::new())
         }
     }

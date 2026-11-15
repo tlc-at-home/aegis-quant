@@ -875,6 +875,7 @@ INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, categ
     ('settling_window_open_utc', '00:00', 'STR', 'settling', 'Advisory no-opens window start'),
     ('settling_window_close_utc', '00:07', 'STR', 'settling', 'Advisory no-opens window end'),
     ('settling_kill_switch', 'false', 'BOOL', 'settling', 'Pause all capital transfers'),
+    ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in)'),
     ('platform_pp50_enabled', 'false', 'BOOL', 'platform', 'Platform-level PP-50 master switch'),
     ('platform_settle_gate_enabled', 'false', 'BOOL', 'platform', 'Default-off open-gate hook during settle'),
     ('platform_pp50_halt', 'false', 'BOOL', 'platform', 'Emergency platform-wide entry halt'),

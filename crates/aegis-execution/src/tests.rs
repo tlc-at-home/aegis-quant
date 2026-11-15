@@ -3670,3 +3670,71 @@ fn test_alo_immediate_match_bbo_retry_and_pit_rejection_telemetry() {
         Some("Alo")
     );
 }
+
+#[test]
+fn test_single_wallet_virtual_settle_opt_in_2b_guards_misconfigured_subaccounts() {
+    let db = DatabaseManager::memory();
+    db.initialize_schema(true).unwrap();
+    db.set_config_value("execution_mode", &json!("TESTNET"))
+        .unwrap();
+    db.set_config_value("pond_execution_mode", &json!("TESTNET"))
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet", &json!(true))
+        .unwrap();
+
+    let exec = ExecutionEngine::new(db.clone());
+
+    // 1. Default false -> fails closed (NB-1)
+    let err_default = exec
+        .execute_subaccount_transfer("POND", "PIT", 43.53, false)
+        .unwrap_err();
+    assert!(err_default.to_string().contains("NB-1"));
+
+    // 2. Opt-in enabled but wallet_address missing -> fails closed
+    db.set_config_value("settling_allow_single_wallet_virtual", &json!(true))
+        .unwrap();
+    let err_no_wallet = exec
+        .execute_subaccount_transfer("POND", "PIT", 43.53, false)
+        .unwrap_err();
+    assert!(err_no_wallet.to_string().contains("wallet_address"));
+
+    // 3. Opt-in enabled + valid master wallet + empty subaccount fields -> VIRTUAL_SINGLE_WALLET_LEDGER Executed
+    let wallet = "0x1111111111111111111111111111111111111111";
+    db.set_config_value("wallet_address", &json!(wallet))
+        .unwrap();
+    let ok = exec
+        .execute_subaccount_transfer("POND", "PIT", 43.53, false)
+        .unwrap();
+    assert_eq!(ok.transfer_mode, "VIRTUAL_SINGLE_WALLET_LEDGER");
+    assert_eq!(ok.status, SubaccountTransferStatus::Executed);
+    assert!(!ok.dry_run);
+    assert!(ok.tx_hash.starts_with("0x"));
+
+    // 4. Opt-in enabled MUST STILL fail closed if pit_subaccount_address is non-empty but equal to master wallet (or malformed)
+    db.set_config_value("pit_subaccount_address", &json!(wallet))
+        .unwrap();
+    let err_same_sub = exec
+        .execute_subaccount_transfer("POND", "PIT", 43.53, false)
+        .unwrap_err();
+    assert!(err_same_sub.to_string().contains("NB-1"));
+
+    // 5. Opt-in enabled MUST still execute L1 subAccountTransfer when a distinct valid sub-account is configured
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE system_config SET config_value = '' WHERE config_key = 'pit_subaccount_address';",
+            [],
+        )
+        .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    db.set_config_value(
+        "pond_subaccount_address",
+        &json!("0x2222222222222222222222222222222222222222"),
+    )
+    .unwrap();
+    let err_live_leg = exec
+        .execute_subaccount_transfer("POND", "PIT", 43.53, false)
+        .unwrap_err();
+    assert!(err_live_leg.to_string().contains("Missing signing key"));
+}
