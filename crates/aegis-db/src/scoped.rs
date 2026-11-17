@@ -120,6 +120,7 @@ pub struct PondConfig {
     pub pond_max_stop_distance_pct: f64,
     pub pond_min_atr_pct: f64,
     pub pond_frozen_trail_warn_closes: u32,
+    pub pond_frozen_trail_max_edge_pct: f64,
     pub pond_conviction_z_span: f64,
     pub pond_maker_offset_bps: f64,
     pub pond_wick_buffer_atr_mult: f64,
@@ -210,6 +211,14 @@ impl PondConfig {
             },
             pond_frozen_trail_warn_closes: cfg.get_usize("pond_frozen_trail_warn_closes", 6).max(1)
                 as u32,
+            pond_frozen_trail_max_edge_pct: {
+                let raw = cfg.get_f64("pond_frozen_trail_max_edge_pct", 0.12);
+                if raw.is_finite() && raw > 0.0 {
+                    raw.clamp(0.01, 1.00)
+                } else {
+                    0.12
+                }
+            },
             pond_conviction_z_span: cfg.get_f64("pond_conviction_z_span", 2.0),
             pond_maker_offset_bps: cfg.get_f64("pond_maker_offset_bps", 1.5),
             pond_wick_buffer_atr_mult: cfg.get_f64("pond_wick_buffer_atr_mult", 0.85),

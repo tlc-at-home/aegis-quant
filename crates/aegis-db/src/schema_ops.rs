@@ -487,18 +487,24 @@ impl DatabaseManager {
         });
     }
 
-    /// Idempotently seeds Round 19/20 default configuration keys (`settling_allow_single_wallet_virtual`,
-    /// `pond_min_atr_pct`, `pond_frozen_trail_warn_closes`, `pond_frozen_trail_closes_json`) on existing
-    /// databases without overwriting explicit operator overrides (`NB-1`, `R20-M1`, `R20-L1`, `R20-N3`).
+    /// Idempotently seeds Round 19/20/21 default configuration keys (`settling_allow_single_wallet_virtual`,
+    /// `pond_min_atr_pct`, `pond_frozen_trail_warn_closes`, `pond_frozen_trail_closes_json`,
+    /// `pond_frozen_trail_max_edge_pct`) and aligns the `pond_min_atr_pct` description (`R21-N1`) on existing
+    /// databases without overwriting explicit operator overrides (`NB-1`, `R20-M1`, `R20-L1`, `R20-N3`, `R21-L1`).
     pub fn ensure_settling_single_wallet_config(&self) {
         let _ = self.with_conn(|conn| {
             let _ = conn.execute_batch(
                 "INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
                  VALUES ('settling_allow_single_wallet_virtual', 'false', 'BOOL', 'settling', 'Allow VIRTUAL_SINGLE_WALLET_LEDGER book rebalancing on LIVE/TESTNET when pit_subaccount_address and pond_subaccount_address are both empty (NB-1 opt-in; PAPER mode always uses virtual ledger by default)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
                  INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
-                 VALUES ('pond_min_atr_pct', '0.0015', 'float', 'pond', 'Minimum 1H ATR floor as fraction of reference close price for Pond trailing & wick evaluations (15 bps, R20-M1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 VALUES ('pond_min_atr_pct', '0.0015', 'float', 'pond', 'Minimum 1H ATR floor as fraction of reference close price for Pond trailing & wick evaluations (15 bps on empty-bar fallback; effective floor on non-empty bar windows is max(pond_min_atr_pct, 0.005) via compute_atr_from_bars internal 50 bps guard, R20-M1/R21-N1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 UPDATE system_config
+                 SET description = 'Minimum 1H ATR floor as fraction of reference close price for Pond trailing & wick evaluations (15 bps on empty-bar fallback; effective floor on non-empty bar windows is max(pond_min_atr_pct, 0.005) via compute_atr_from_bars internal 50 bps guard, R20-M1/R21-N1)'
+                 WHERE config_key = 'pond_min_atr_pct';
                  INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
-                 VALUES ('pond_frozen_trail_warn_closes', '6', 'int', 'pond', 'Consecutive 4H closes in profit with Chandelier stop pinned at initial_stop before emitting POND_FROZEN_TRAIL warning (R20-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 VALUES ('pond_frozen_trail_warn_closes', '6', 'int', 'pond', 'Consecutive 4H closes in profit with Chandelier stop pinned at initial_stop before emitting POND_FROZEN_TRAIL / POND_DEAD_ZONE_PIN telemetry (R20-L1, R21-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
+                 INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
+                 VALUES ('pond_frozen_trail_max_edge_pct', '0.12', 'float', 'pond', 'Maximum normal Chandelier dead-zone edge as fraction of entry price (12%) before a pinned-in-profit trail is classified as pathological (R21-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
                  INSERT OR IGNORE INTO system_config (config_key, config_value, value_type, category, description, updated_at)
                  VALUES ('pond_frozen_trail_closes_json', '{}', 'json', 'pond', 'Persisted per-cell consecutive 4H closes in profit with Chandelier stop pinned at initial_stop (R20-L1)', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
             );

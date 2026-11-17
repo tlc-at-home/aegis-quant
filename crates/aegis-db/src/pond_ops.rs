@@ -8,9 +8,9 @@ use aegis_core::{
     PondScanCycle, PondUniverseRow, Pp50PlatformSnapshot, Result,
 };
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Shared PnL, equity, and exposure components for a trading book (`PIT` or `POND`) (`R10-QA`, `R11-QA`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -621,6 +621,35 @@ impl DatabaseManager {
         })
     }
 
+    fn remove_pond_cell_counter_entry_conn(
+        conn: &Connection,
+        config_key: &str,
+        cell_id: i64,
+        now_iso: &str,
+    ) {
+        let Ok(Some(raw)) = conn
+            .query_row(
+                "SELECT config_value FROM system_config WHERE config_key = ?1;",
+                [config_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        else {
+            return;
+        };
+        let Ok(mut map) = serde_json::from_str::<HashMap<i64, u32>>(&raw) else {
+            return;
+        };
+        if map.remove(&cell_id).is_some() {
+            if let Ok(serialized) = serde_json::to_string(&map) {
+                let _ = conn.execute(
+                    "UPDATE system_config SET config_value = ?1, updated_at = ?2 WHERE config_key = ?3;",
+                    params![serialized, now_iso, config_key],
+                );
+            }
+        }
+    }
+
     /// Targeted atomic close of an open/trailed Pond cell (`R3-H1`).
     #[allow(clippy::too_many_arguments)]
     pub fn close_open_pond_cell(
@@ -674,6 +703,15 @@ impl DatabaseManager {
                     ],
                 )
                 .map_err(|e| AegisError::Database(e.to_string()))?;
+            if rows > 0 {
+                // R21-L1: Scrub closed cell counters atomically so manual Web UI / CLI closes never leak keys.
+                for key in [
+                    "pond_exit_attempt_counts_json",
+                    "pond_frozen_trail_closes_json",
+                ] {
+                    Self::remove_pond_cell_counter_entry_conn(conn, key, cell_id, &now_iso);
+                }
+            }
             Ok(rows > 0)
         })
     }

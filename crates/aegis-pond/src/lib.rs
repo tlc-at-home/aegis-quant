@@ -140,7 +140,12 @@ pub fn compute_wick_context_with_stops(
 
 /// Computes post-entry price watermarks, post-watermark adverse wick extremes, the index
 /// of the extreme adverse bar, and the crash-bar-excluded 1H ATR using configured stop parameters
-/// and a relative reference-price ATR floor (`min_atr_pct`, default `0.0015` = 15 bps, `R20-M1`).
+/// and a relative reference-price ATR floor (`min_atr_pct`, seeded at `0.0015` = 15 bps, `R20-M1`).
+///
+/// Note (`R21-N1`): `compute_atr_from_bars` (`crates/aegis-core/src/lib.rs`) applies an internal
+/// `50 bps` (`current_close * 0.005`) degenerate-data guard on every non-empty bar slice, so the
+/// effective floor on non-empty bar windows is `max(min_atr_pct, 0.005)`, while `min_atr_pct`
+/// binds directly on empty-bar fallbacks and whenever configured above `0.005`.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_wick_context_with_stops_and_atr_floor(
     bars_1h: &[OhlcvBar],
@@ -425,6 +430,16 @@ impl PondOrchestrator {
                 .inner()
                 .set_config_value("pond_frozen_trail_closes_json", &json!(serialized));
         }
+    }
+
+    fn retain_open_counter_entries(
+        map: &Mutex<HashMap<i64, u32>>,
+        open_ids: &HashSet<i64>,
+    ) -> bool {
+        let mut guard = map.lock();
+        let before = guard.len();
+        guard.retain(|cell_id, _| open_ids.contains(cell_id));
+        guard.len() != before
     }
 
     /// Loads the Book B (`PondConfig`) namespace view.
@@ -716,6 +731,13 @@ impl PondOrchestrator {
         let cd_norm = cfg.pond_cooldown_hours;
 
         let open_cells = self.scoped_db.get_open_pond_cells()?;
+        let open_ids: HashSet<i64> = open_cells.iter().map(|c| c.cell_id).collect();
+        if Self::retain_open_counter_entries(&self.exit_attempt_count, &open_ids) {
+            self.persist_exit_attempt_counts();
+        }
+        if Self::retain_open_counter_entries(&self.frozen_trail_closes, &open_ids) {
+            self.persist_frozen_trail_closes();
+        }
         if open_cells.is_empty() {
             return Ok(0);
         }
@@ -893,45 +915,157 @@ impl PondOrchestrator {
                         *entry
                     };
                     self.persist_frozen_trail_closes();
-                    if closes_frozen >= cfg.pond_frozen_trail_warn_closes.max(1) {
+                    let high_seen = cell
+                        .highest_price_seen
+                        .filter(|&p| p > 0.0)
+                        .unwrap_or(watermark_high)
+                        .max(mark_px);
+                    let low_seen = {
+                        let base = cell
+                            .lowest_price_seen
+                            .filter(|&p| p > 0.0)
+                            .unwrap_or(watermark_low);
+                        if mark_px > 0.0 && base > 0.0 {
+                            base.min(mark_px)
+                        } else if mark_px > 0.0 {
+                            mark_px
+                        } else {
+                            base
+                        }
+                    };
+                    let init_dist = (entry_px - prev_init).abs();
+                    let chand_dist = chand_mult * atr_4h;
+                    let dead_zone_edge_dist = (chand_dist - init_dist).max(0.0);
+                    let dead_zone_edge_frac = if entry_px > 0.0 {
+                        dead_zone_edge_dist / entry_px
+                    } else {
+                        0.0
+                    };
+                    let dead_zone_edge_pct = round_dp(dead_zone_edge_frac * 100.0, 4);
+                    let favorable_excursion_dist = if cell.side == "LONG" {
+                        (high_seen - entry_px).max(0.0)
+                    } else {
+                        (entry_px - low_seen).max(0.0)
+                    };
+                    let favorable_excursion_pct = if entry_px > 0.0 {
+                        round_dp((favorable_excursion_dist / entry_px) * 100.0, 4)
+                    } else {
+                        0.0
+                    };
+                    let excursion_past_edge = favorable_excursion_dist > dead_zone_edge_dist + 1e-8;
+                    let edge_exceeds_bound =
+                        dead_zone_edge_frac > cfg.pond_frozen_trail_max_edge_pct;
+                    let is_pathological = excursion_past_edge || edge_exceeds_bound;
+                    let pin_reason = if excursion_past_edge {
+                        "PATHOLOGICAL_EXCURSION_PAST_EDGE"
+                    } else if edge_exceeds_bound {
+                        "PATHOLOGICAL_DEAD_ZONE_WIDTH"
+                    } else {
+                        "EXPECTED_DEAD_ZONE_GEOMETRY"
+                    };
+                    let warn_closes = cfg.pond_frozen_trail_warn_closes.max(1);
+                    let should_emit = closes_frozen == warn_closes
+                        || (closes_frozen > warn_closes
+                            && (closes_frozen - warn_closes).is_multiple_of(6));
+                    if should_emit {
                         let chand_val = cell.chandelier_stop.unwrap_or(prev_init);
-                        tracing::warn!(
-                            symbol = %cell.symbol,
-                            cell_id = cell.cell_id,
-                            side = %cell.side,
-                            closes_frozen = closes_frozen,
-                            entry = entry_px,
-                            mark = mark_px,
-                            init_stop = prev_init,
-                            chandelier_stop = chand_val,
-                            atr_4h = atr_4h,
-                            "POND_FROZEN_TRAIL: Pond cell in profit with Chandelier stop pinned at initial_stop across consecutive 4H closes (R20-L1)"
-                        );
-                        let _ = self.scoped_db.inner().log_telemetry(
-                            "WARNING",
-                            "engine.pond",
-                            &format!(
-                                "POND_FROZEN_TRAIL: Pond cell #{} ({}, {}) in profit for {} consecutive 4H closes with Chandelier stop ({:.6}) pinned at initial_stop ({:.6}) (R20-L1)",
+                        let event_name = if is_pathological {
+                            "POND_FROZEN_TRAIL"
+                        } else {
+                            "POND_DEAD_ZONE_PIN"
+                        };
+                        let payload = json!({
+                            "event": event_name,
+                            "pathological": is_pathological,
+                            "pin_reason": pin_reason,
+                            "symbol": cell.symbol,
+                            "cell_id": cell.cell_id,
+                            "side": cell.side,
+                            "closes_frozen": closes_frozen,
+                            "entry": entry_px,
+                            "mark": mark_px,
+                            "init_stop": prev_init,
+                            "chandelier_stop": chand_val,
+                            "atr_4h": atr_4h,
+                            "dead_zone_edge_pct": dead_zone_edge_pct,
+                            "favorable_excursion_pct": favorable_excursion_pct,
+                            "watermark_high": high_seen,
+                            "watermark_low": low_seen,
+                        });
+                        if is_pathological {
+                            let msg = format!(
+                                "POND_FROZEN_TRAIL: Pond cell #{} ({}, {}) pinned at initial_stop ({:.6}) for {} consecutive 4H closes (pin_reason={}, dead_zone_edge_pct={:.4}%, favorable_excursion_pct={:.4}%, chand={:.6}) (R20-L1, R21-L1)",
+                                cell.cell_id,
+                                cell.symbol,
+                                cell.side,
+                                prev_init,
+                                closes_frozen,
+                                pin_reason,
+                                dead_zone_edge_pct,
+                                favorable_excursion_pct,
+                                chand_val
+                            );
+                            tracing::warn!(
+                                symbol = %cell.symbol,
+                                cell_id = cell.cell_id,
+                                side = %cell.side,
+                                closes_frozen = closes_frozen,
+                                pathological = is_pathological,
+                                pin_reason = pin_reason,
+                                entry = entry_px,
+                                mark = mark_px,
+                                init_stop = prev_init,
+                                chandelier_stop = chand_val,
+                                atr_4h = atr_4h,
+                                dead_zone_edge_pct = dead_zone_edge_pct,
+                                favorable_excursion_pct = favorable_excursion_pct,
+                                watermark_high = high_seen,
+                                watermark_low = low_seen,
+                                "{msg}"
+                            );
+                            let _ = self.scoped_db.inner().log_telemetry(
+                                "WARNING",
+                                "engine.pond",
+                                &msg,
+                                Some(payload),
+                            );
+                        } else {
+                            let msg = format!(
+                                "POND_DEAD_ZONE_PIN: Pond cell #{} ({}, {}) holding in profit inside expected dead-zone geometry for {} consecutive 4H closes (pin_reason={}, dead_zone_edge_pct={:.4}%, favorable_excursion_pct={:.4}%, init_stop={:.6}) (R21-L1, R21-N2)",
                                 cell.cell_id,
                                 cell.symbol,
                                 cell.side,
                                 closes_frozen,
-                                chand_val,
+                                pin_reason,
+                                dead_zone_edge_pct,
+                                favorable_excursion_pct,
                                 prev_init
-                            ),
-                            Some(json!({
-                                "event": "POND_FROZEN_TRAIL",
-                                "symbol": cell.symbol,
-                                "cell_id": cell.cell_id,
-                                "side": cell.side,
-                                "closes_frozen": closes_frozen,
-                                "entry": entry_px,
-                                "mark": mark_px,
-                                "init_stop": prev_init,
-                                "chandelier_stop": chand_val,
-                                "atr_4h": atr_4h,
-                            })),
-                        );
+                            );
+                            tracing::info!(
+                                symbol = %cell.symbol,
+                                cell_id = cell.cell_id,
+                                side = %cell.side,
+                                closes_frozen = closes_frozen,
+                                pathological = is_pathological,
+                                pin_reason = pin_reason,
+                                entry = entry_px,
+                                mark = mark_px,
+                                init_stop = prev_init,
+                                chandelier_stop = chand_val,
+                                atr_4h = atr_4h,
+                                dead_zone_edge_pct = dead_zone_edge_pct,
+                                favorable_excursion_pct = favorable_excursion_pct,
+                                watermark_high = high_seen,
+                                watermark_low = low_seen,
+                                "{msg}"
+                            );
+                            let _ = self.scoped_db.inner().log_telemetry(
+                                "INFO",
+                                "engine.pond",
+                                &msg,
+                                Some(payload),
+                            );
+                        }
                     }
                 } else if !in_profit
                     && cell.state == "OPEN"
@@ -4797,70 +4931,85 @@ mod tests {
         db.set_config_value("pond_execution_mode", &json!("PAPER"))
             .unwrap();
         let orch = PondOrchestrator::new(db.clone(), None);
-        db.upsert_pond_universe_batch(&[PondUniverseRow {
-            symbol: "SOL/USDC:USDC".to_string(),
-            rank: 1,
-            median_daily_volume_usdc: 25_000_000.0,
-            tick_size: 0.01,
-            lot_step_size: 0.1,
-            min_notional_usdc: 10.0,
-            max_leverage: 10.0,
-            reference_price: 100.0,
-            status: "ACTIVE".to_string(),
-            warmup_until: None,
-            delist_streak: 0,
-            added_at: "2026-01-01T00:00:00Z".to_string(),
-            delisted_at: None,
-            is_synthetic_volume: 0,
-        }])
+        db.upsert_pond_universe_batch(&[
+            PondUniverseRow {
+                symbol: "SOL/USDC:USDC".to_string(),
+                rank: 1,
+                median_daily_volume_usdc: 25_000_000.0,
+                tick_size: 0.01,
+                lot_step_size: 0.1,
+                min_notional_usdc: 10.0,
+                max_leverage: 10.0,
+                reference_price: 100.0,
+                status: "ACTIVE".to_string(),
+                warmup_until: None,
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 0,
+            },
+            PondUniverseRow {
+                symbol: "ETH/USDC:USDC".to_string(),
+                rank: 2,
+                median_daily_volume_usdc: 35_000_000.0,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                min_notional_usdc: 10.0,
+                max_leverage: 10.0,
+                reference_price: 100.0,
+                status: "ACTIVE".to_string(),
+                warmup_until: None,
+                delist_streak: 0,
+                added_at: "2026-01-01T00:00:00Z".to_string(),
+                delisted_at: None,
+                is_synthetic_volume: 0,
+            },
+        ])
         .unwrap();
 
         let now_ms = (chrono::Utc::now().timestamp_millis() / 3_600_000) * 3_600_000;
-        let opened_iso = chrono::DateTime::from_timestamp_millis(now_ms - 12 * 3_600_000)
+        let opened_iso = chrono::DateTime::from_timestamp_millis(now_ms - 6 * 3_600_000)
             .unwrap()
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
-        // Entry = 100.0, initial_stop = 97.5 (2.5 * ATR_1H where ATR_1H = 1.0).
-        // ATR_4H = 2.0 -> 3.8 * ATR_4H = 7.6. At mild profit mark = 102.0 (> 100.0),
-        // raw_cand = 102.0 - 7.6 = 94.4 < 97.5, so chandelier_stop stays clamped at initial_stop (97.5).
-        let cell_id = orch
-            .scoped_db
-            .upsert_pond_cell(&PondCell {
-                cell_id: 0,
-                symbol: "SOL/USDC:USDC".to_string(),
-                champion_id: 1,
-                state: "OPEN".to_string(),
-                cycle_opened_id: None,
-                side: "LONG".to_string(),
-                option_analogue: "SHORT_PUT".to_string(),
-                entry_price: Some(100.0),
-                quantity: Some(10.0),
-                notional_usdc: Some(1000.0),
-                risk_budget_usdc: Some(25.0),
-                conviction_multiplier: Some(1.0),
-                funding_z_entry: Some(-2.6),
-                funding_rate_entry: Some(-0.00012),
-                initial_stop: Some(97.5),
-                chandelier_stop: Some(97.5),
-                highest_price_seen: Some(102.0),
-                lowest_price_seen: Some(100.0),
-                funding_accrued_usdc: 0.0,
-                realized_pnl_usdc: 0.0,
-                fees_paid_usdc: 0.15,
-                exit_price: None,
-                exit_reason: None,
-                resting_order_id: None,
-                opened_at: Some(opened_iso.clone()),
-                closed_at: None,
-                cooldown_until: None,
-                updated_at: opened_iso,
-            })
-            .unwrap();
-
-        let make_cached_bars = |mark_close: f64, high_seen: f64| {
+        let cooldown_iso = chrono::DateTime::from_timestamp_millis(now_ms + 24 * 3_600_000)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let make_test_cell = |sym: &str| PondCell {
+            cell_id: 0,
+            symbol: sym.to_string(),
+            champion_id: 1,
+            state: "OPEN".to_string(),
+            cycle_opened_id: None,
+            side: "LONG".to_string(),
+            option_analogue: "SHORT_PUT".to_string(),
+            entry_price: Some(100.0),
+            quantity: Some(10.0),
+            notional_usdc: Some(1000.0),
+            risk_budget_usdc: Some(25.0),
+            conviction_multiplier: Some(1.0),
+            funding_z_entry: Some(-2.6),
+            funding_rate_entry: Some(-0.00012),
+            initial_stop: Some(97.5),
+            chandelier_stop: Some(97.5),
+            highest_price_seen: Some(102.0),
+            lowest_price_seen: Some(100.0),
+            funding_accrued_usdc: 0.0,
+            realized_pnl_usdc: 0.0,
+            fees_paid_usdc: 0.15,
+            exit_price: None,
+            exit_reason: None,
+            resting_order_id: None,
+            opened_at: Some(opened_iso.clone()),
+            closed_at: None,
+            cooldown_until: None,
+            updated_at: opened_iso.clone(),
+        };
+        let make_cached_bars = |sym: &str, mark_close: f64, high_seen: f64, half_range_4h: f64| {
             let mut bars_1h: Vec<OhlcvBar> = (0..180)
                 .map(|i| OhlcvBar {
-                    symbol: "SOL/USDC:USDC".to_string(),
+                    symbol: sym.to_string(),
                     timeframe: "1h".to_string(),
                     timestamp_ms: now_ms - (179 - i as i64) * 3_600_000,
                     open: 100.0,
@@ -4880,12 +5029,12 @@ mod tests {
             }
             let mut bars_4h: Vec<OhlcvBar> = (0..65)
                 .map(|i| OhlcvBar {
-                    symbol: "SOL/USDC:USDC".to_string(),
+                    symbol: sym.to_string(),
                     timeframe: "4h".to_string(),
                     timestamp_ms: now_ms - (64 - i as i64) * 14_400_000,
                     open: 100.0,
-                    high: 101.0,
-                    low: 99.0,
+                    high: 100.0 + half_range_4h,
+                    low: 100.0 - half_range_4h,
                     close: 100.0,
                     volume: 400_000.0,
                     funding_rate_hourly: -0.00012,
@@ -4894,46 +5043,81 @@ mod tests {
                 .collect();
             if let Some(last4) = bars_4h.last_mut() {
                 last4.close = mark_close;
-                last4.high = high_seen;
-                last4.low = mark_close - 1.0;
+                last4.high = (100.0 + half_range_4h).max(high_seen);
+                last4.low = last4.high - 2.0 * half_range_4h;
             }
             let mut funding = vec![-0.00002; 178];
             funding.push(-0.00012);
             funding.push(-0.00012);
             let mut map = HashMap::new();
-            map.insert("SOL/USDC:USDC".to_string(), (funding, bars_1h, bars_4h));
+            map.insert(sym.to_string(), (funding, bars_1h, bars_4h));
             map
         };
+        let collect_pond_events = |event_name: &str, expected_level: &str| -> Vec<Value> {
+            db.get_recent_logs(200)
+                .unwrap()
+                .into_iter()
+                .filter_map(|row| {
+                    let level = row.get("level").and_then(Value::as_str)?;
+                    let msg = row.get("message").and_then(Value::as_str)?;
+                    if level != expected_level || !msg.contains(event_name) {
+                        return None;
+                    }
+                    let details_str = row.get("details_json").and_then(Value::as_str)?;
+                    serde_json::from_str::<Value>(details_str).ok()
+                })
+                .collect()
+        };
 
-        for close_idx in 1..=6u32 {
-            *orch.cycle_bars_cache.lock() = Some(make_cached_bars(102.0, 102.0));
+        // Scenario 1: Healthy sub-edge SOL hold (+2% inside +5.1% dead zone; ATR_4H = 2.0)
+        // Must emit 0 POND_FROZEN_TRAIL WARNINGs across closes 1..=7, 1 POND_DEAD_ZONE_PIN INFO
+        // at close #6 (no re-emission at close #7), survive restart at 7, and clear on close #8 ratchet.
+        let sol_cell_id = orch
+            .scoped_db
+            .upsert_pond_cell(&make_test_cell("SOL/USDC:USDC"))
+            .unwrap();
+        for close_idx in 1..=7u32 {
+            *orch.cycle_bars_cache.lock() =
+                Some(make_cached_bars("SOL/USDC:USDC", 102.0, 102.0, 1.0));
             let exits = orch.evaluate_open_cells(false, true).unwrap();
             assert_eq!(exits, 0);
             assert_eq!(
-                orch.frozen_trail_closes.lock().get(&cell_id).copied(),
+                orch.frozen_trail_closes.lock().get(&sol_cell_id).copied(),
                 Some(close_idx),
-                "frozen_trail_closes must equal {close_idx} after 4H close #{close_idx}"
+                "frozen_trail_closes must equal {close_idx} after SOL 4H close #{close_idx}"
             );
-            let logs = db.get_recent_logs(50).unwrap();
-            let frozen_logs: Vec<_> = logs
-                .iter()
-                .filter(|r| {
-                    r.get("message")
-                        .and_then(|v| v.as_str())
-                        .map(|m| m.contains("POND_FROZEN_TRAIL"))
-                        .unwrap_or(false)
-                })
-                .collect();
+            let warn_events = collect_pond_events("POND_FROZEN_TRAIL", "WARNING");
+            assert!(
+                warn_events.is_empty(),
+                "Healthy sub-edge hold must emit 0 POND_FROZEN_TRAIL WARNINGs (at close #{close_idx})"
+            );
+            let pin_events = collect_pond_events("POND_DEAD_ZONE_PIN", "INFO");
             if close_idx < 6 {
                 assert!(
-                    frozen_logs.is_empty(),
-                    "POND_FROZEN_TRAIL must not fire before close #6 (at close #{close_idx})"
+                    pin_events.is_empty(),
+                    "POND_DEAD_ZONE_PIN must not fire before close #6 (at close #{close_idx})"
                 );
             } else {
                 assert_eq!(
-                    frozen_logs.len(),
+                    pin_events.len(),
                     1,
-                    "POND_FROZEN_TRAIL telemetry must be emitted at close #6"
+                    "POND_DEAD_ZONE_PIN must emit once at close #6 and not re-emit at close #7"
+                );
+                let details = &pin_events[0];
+                assert_eq!(details.get("pathological"), Some(&json!(false)));
+                assert_eq!(
+                    details.get("pin_reason").and_then(Value::as_str),
+                    Some("EXPECTED_DEAD_ZONE_GEOMETRY")
+                );
+                let edge_pct = details["dead_zone_edge_pct"].as_f64().unwrap();
+                let exc_pct = details["favorable_excursion_pct"].as_f64().unwrap();
+                assert!(
+                    (edge_pct - 5.1).abs() < 1e-6,
+                    "expected dead_zone_edge_pct == 5.1, got {edge_pct}"
+                );
+                assert!(
+                    (exc_pct - 2.0).abs() < 1e-6,
+                    "expected favorable_excursion_pct == 2.0, got {exc_pct}"
                 );
             }
         }
@@ -4944,21 +5128,22 @@ mod tests {
             orch_restarted
                 .frozen_trail_closes
                 .lock()
-                .get(&cell_id)
+                .get(&sol_cell_id)
                 .copied(),
-            Some(6),
+            Some(7),
             "frozen_trail_closes must survive PondOrchestrator restart via SQLite"
         );
 
-        // 7th 4H close rallies to 108.0 -> raw_cand = 108.0 - 7.6 = 100.4 > 97.5, ratcheting stop & clearing counter
-        *orch_restarted.cycle_bars_cache.lock() = Some(make_cached_bars(108.0, 108.0));
+        // Close #8 rallies to 108.0 -> ratchets Chandelier stop & clears persisted counter
+        *orch_restarted.cycle_bars_cache.lock() =
+            Some(make_cached_bars("SOL/USDC:USDC", 108.0, 108.0, 1.0));
         let exits = orch_restarted.evaluate_open_cells(false, true).unwrap();
         assert_eq!(exits, 0);
         assert_eq!(
             orch_restarted
                 .frozen_trail_closes
                 .lock()
-                .get(&cell_id)
+                .get(&sol_cell_id)
                 .copied(),
             None,
             "frozen_trail_closes entry must be cleared once chandelier_stop ratchets above initial_stop"
@@ -4968,10 +5153,139 @@ mod tests {
             orch_after_ratchet
                 .frozen_trail_closes
                 .lock()
-                .get(&cell_id)
+                .get(&sol_cell_id)
                 .copied(),
             None,
             "cleared frozen_trail_closes must persist to pond_frozen_trail_closes_json"
+        );
+        assert!(db
+            .close_open_pond_cell(
+                sol_cell_id,
+                "CLOSED",
+                None,
+                None,
+                None,
+                108.0,
+                80.0,
+                0.15,
+                Some("SCENARIO_1_COMPLETE"),
+                &opened_iso,
+                &cooldown_iso,
+            )
+            .unwrap());
+
+        // Scenario 2: Pathological dead-zone pin (ATR_4H = 5.0 -> 3.8*5.0 - 2.5 = 16.5% > 12%)
+        // and once-per-24h (6 closes) cadence bound across 13 consecutive 4H closes.
+        let eth_cell_id = orch_after_ratchet
+            .scoped_db
+            .upsert_pond_cell(&make_test_cell("ETH/USDC:USDC"))
+            .unwrap();
+        for close_idx in 1..=13u32 {
+            *orch_after_ratchet.cycle_bars_cache.lock() =
+                Some(make_cached_bars("ETH/USDC:USDC", 102.0, 102.0, 2.5));
+            let exits = orch_after_ratchet.evaluate_open_cells(false, true).unwrap();
+            assert_eq!(exits, 0);
+            let warn_events = collect_pond_events("POND_FROZEN_TRAIL", "WARNING");
+            let expected_warns = match close_idx {
+                1..=5 => 0,
+                6..=11 => 1,
+                12..=13 => 2,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                warn_events.len(),
+                expected_warns,
+                "Pathological POND_FROZEN_TRAIL WARNING count mismatch at close #{close_idx}"
+            );
+            if close_idx == 6 || close_idx == 12 {
+                let latest = &warn_events[0];
+                assert_eq!(latest.get("pathological"), Some(&json!(true)));
+                assert_eq!(
+                    latest.get("pin_reason").and_then(Value::as_str),
+                    Some("PATHOLOGICAL_DEAD_ZONE_WIDTH")
+                );
+                let edge_pct = latest["dead_zone_edge_pct"].as_f64().unwrap();
+                assert!(
+                    (edge_pct - 16.5).abs() < 0.2,
+                    "expected dead_zone_edge_pct ~= 16.5, got {edge_pct}"
+                );
+            }
+        }
+
+        // Scenario 3: External close_open_pond_cell cleanup (manual Web UI close path)
+        // scrubs both SQLite counter maps and evaluate_open_cells prunes in-memory maps.
+        orch_after_ratchet
+            .exit_attempt_count
+            .lock()
+            .insert(eth_cell_id, 3);
+        orch_after_ratchet.persist_exit_attempt_counts();
+        assert_eq!(
+            orch_after_ratchet
+                .frozen_trail_closes
+                .lock()
+                .get(&eth_cell_id)
+                .copied(),
+            Some(13)
+        );
+        let cfg_before = db.load_config_opts(false).unwrap();
+        let exit_before: HashMap<i64, u32> =
+            serde_json::from_str(&cfg_before.get_str("pond_exit_attempt_counts_json", "{}"))
+                .unwrap();
+        let frozen_before: HashMap<i64, u32> =
+            serde_json::from_str(&cfg_before.get_str("pond_frozen_trail_closes_json", "{}"))
+                .unwrap();
+        assert_eq!(exit_before.get(&eth_cell_id).copied(), Some(3));
+        assert_eq!(frozen_before.get(&eth_cell_id).copied(), Some(13));
+
+        assert!(db
+            .close_open_pond_cell(
+                eth_cell_id,
+                "CLOSED",
+                Some(97.5),
+                Some(102.0),
+                Some(99.5),
+                102.0,
+                20.0,
+                0.15,
+                Some("MANUAL_WEBUI_CLOSE"),
+                &opened_iso,
+                &cooldown_iso,
+            )
+            .unwrap());
+
+        let cfg_after = db.load_config_opts(false).unwrap();
+        let exit_after: HashMap<i64, u32> =
+            serde_json::from_str(&cfg_after.get_str("pond_exit_attempt_counts_json", "{}"))
+                .unwrap();
+        let frozen_after: HashMap<i64, u32> =
+            serde_json::from_str(&cfg_after.get_str("pond_frozen_trail_closes_json", "{}"))
+                .unwrap();
+        assert!(
+            !exit_after.contains_key(&eth_cell_id),
+            "close_open_pond_cell must remove cell_id from SQLite pond_exit_attempt_counts_json"
+        );
+        assert!(
+            !frozen_after.contains_key(&eth_cell_id),
+            "close_open_pond_cell must remove cell_id from SQLite pond_frozen_trail_closes_json"
+        );
+
+        let exits = orch_after_ratchet
+            .evaluate_open_cells(false, false)
+            .unwrap();
+        assert_eq!(exits, 0);
+        assert!(
+            !orch_after_ratchet
+                .exit_attempt_count
+                .lock()
+                .contains_key(&eth_cell_id),
+            "evaluate_open_cells must prune closed cell_id from in-memory exit_attempt_count"
+        );
+        assert!(
+            !orch_after_ratchet
+                .frozen_trail_closes
+                .lock()
+                .contains_key(&eth_cell_id),
+            "evaluate_open_cells must prune closed cell_id from in-memory frozen_trail_closes"
         );
     }
 }
