@@ -3,1440 +3,580 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AEGIS-QUANT // v0.3.0-rc1 PP-50 Two-Book Platform (Hyperliquid L1)</title>
-  <style>
-    :root {
-      --bg-primary: #070a10;
-      --bg-secondary: #0d131f;
-      --bg-card: #111927;
-      --bg-hover: #182336;
-      --border: #1e2d44;
-      --text-main: #e2e8f0;
-      --text-muted: #8b9bb4;
-      --accent-blue: #38bdf8;
-      --accent-indigo: #6366f1;
-      --accent-green: #10b981;
-      --accent-amber: #f59e0b;
-      --accent-red: #ef4444;
-      --accent-purple: #a855f7;
-      --pnl-pos-fg: #34d399;
-      --pnl-pos-bg: rgba(16, 185, 129, 0.14);
-      --pnl-pos-border: rgba(16, 185, 129, 0.42);
-      --pnl-neg-fg: #f87171;
-      --pnl-neg-bg: rgba(239, 68, 68, 0.14);
-      --pnl-neg-border: rgba(239, 68, 68, 0.42);
-      --pnl-flat-fg: #94a3b8;
-      --pnl-flat-bg: rgba(148, 163, 184, 0.12);
-      --pnl-flat-border: rgba(148, 163, 184, 0.3);
-      --font-mono: "JetBrains Mono", "Fira Code", Consolas, monospace;
-      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background-color: var(--bg-primary);
-      color: var(--text-main);
-      font-family: var(--font-sans);
-      font-size: 13px;
-      line-height: 1.45;
-      overflow-x: hidden;
-    }
-
-    /* Top Header */
-    header {
-      background: linear-gradient(90deg, #0b111e 0%, #131e32 100%);
-      border-bottom: 1px solid var(--border);
-      padding: 12px 22px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 12px;
-      position: sticky;
-      top: 0;
-      z-index: 100;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .brand-logo {
-      width: 11px;
-      height: 11px;
-      border-radius: 50%;
-      background: var(--accent-green);
-      box-shadow: 0 0 10px var(--accent-green);
-      animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
-    }
-
-    .brand-title {
-      font-family: var(--font-mono);
-      font-weight: 700;
-      font-size: 15px;
-      letter-spacing: 0.6px;
-      color: #fff;
-    }
-
-    .brand-sub {
-      color: var(--text-muted);
-      font-size: 11px;
-      font-family: var(--font-mono);
-    }
-
-    .header-actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    /* 4-Page Navigation Bar */
-    .page-nav-bar {
-      background: #0a101b;
-      border-bottom: 1px solid var(--border);
-      padding: 0 22px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
-      position: sticky;
-      top: 57px;
-      z-index: 95;
-    }
-
-    .page-tablist {
-      display: flex;
-      gap: 4px;
-      overflow-x: auto;
-    }
-
-    .page-tab {
-      appearance: none;
-      background: transparent;
-      color: var(--text-muted);
-      border: none;
-      border-bottom: 3px solid transparent;
-      padding: 12px 18px;
-      font-family: var(--font-mono);
-      font-size: 12px;
-      font-weight: 700;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: color 0.15s, border-color 0.15s, background-color 0.15s;
-      white-space: nowrap;
-    }
-
-    .page-tab:hover {
-      color: #fff;
-      background: rgba(56, 189, 248, 0.06);
-    }
-
-    .page-tab:focus-visible {
-      outline: 2px solid var(--accent-blue);
-      outline-offset: -2px;
-    }
-
-    .page-tab[aria-selected="true"] {
-      color: var(--accent-blue);
-      border-bottom-color: var(--accent-blue);
-      background: rgba(56, 189, 248, 0.09);
-    }
-
-    .page-tab-num {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 19px;
-      height: 19px;
-      border-radius: 4px;
-      font-size: 10px;
-      background: rgba(148, 163, 184, 0.16);
-      color: var(--text-main);
-    }
-
-    .page-tab[aria-selected="true"] .page-tab-num {
-      background: var(--accent-blue);
-      color: #06101e;
-    }
-
-    .nav-pnl-summary {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      padding: 6px 0;
-    }
-
-    /* Colour-Coded PnL System (Color + Icon + Sign for Accessibility) */
-    .pnl-pos {
-      color: var(--pnl-pos-fg) !important;
-      font-weight: 700;
-    }
-    .pnl-neg {
-      color: var(--pnl-neg-fg) !important;
-      font-weight: 700;
-    }
-    .pnl-flat {
-      color: var(--pnl-flat-fg) !important;
-    }
-
-    .pnl-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-family: var(--font-mono);
-      font-variant-numeric: tabular-nums;
-      font-size: 11px;
-      font-weight: 700;
-      line-height: 1.3;
-      border: 1px solid transparent;
-      white-space: nowrap;
-    }
-    .pnl-pill.pnl-pos {
-      background: var(--pnl-pos-bg);
-      color: var(--pnl-pos-fg);
-      border-color: var(--pnl-pos-border);
-    }
-    .pnl-pill.pnl-neg {
-      background: var(--pnl-neg-bg);
-      color: var(--pnl-neg-fg);
-      border-color: var(--pnl-neg-border);
-    }
-    .pnl-pill.pnl-flat {
-      background: var(--pnl-flat-bg);
-      color: var(--pnl-flat-fg);
-      border-color: var(--pnl-flat-border);
-    }
-
-    .badge {
-      padding: 3px 9px;
-      border-radius: 4px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      font-weight: 600;
-      border: 1px solid var(--border);
-      background: var(--bg-card);
-    }
-
-    .badge-bull { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.4); }
-    .badge-bear { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.4); }
-    .badge-chop { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.4); }
-    .badge-info { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4); }
-    .badge-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border-color: rgba(168, 85, 247, 0.4); }
-
-    button {
-      background: var(--bg-card);
-      color: var(--text-main);
-      border: 1px solid var(--border);
-      padding: 6px 12px;
-      border-radius: 5px;
-      font-size: 12px;
-      font-family: var(--font-mono);
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    button:hover {
-      background: var(--bg-hover);
-      border-color: var(--accent-blue);
-    }
-
-    button.primary {
-      background: rgba(56, 189, 248, 0.15);
-      border-color: var(--accent-blue);
-      color: var(--accent-blue);
-      font-weight: 600;
-    }
-
-    button.success {
-      background: rgba(16, 185, 129, 0.15);
-      border-color: var(--accent-green);
-      color: #34d399;
-      font-weight: 600;
-    }
-
-    button:disabled,
-    button[aria-disabled="true"] {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    main {
-      padding: 16px 22px 32px;
-      max-width: 1820px;
-      margin: 0 auto;
-    }
-
-    .page-view[hidden] {
-      display: none !important;
-    }
-
-    .page-view {
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    /* Top KPI Strip */
-    .kpi-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-    }
-
-    .kpi-card {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      padding: 12px 15px;
-      transition: border-color 0.2s;
-    }
-
-    .kpi-card.kpi-pnl-pos {
-      border-left: 3px solid var(--accent-green);
-    }
-    .kpi-card.kpi-pnl-neg {
-      border-left: 3px solid var(--accent-red);
-    }
-
-    .kpi-label {
-      color: var(--text-muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .kpi-value {
-      font-family: var(--font-mono);
-      font-variant-numeric: tabular-nums;
-      font-size: 20px;
-      font-weight: 700;
-      margin-top: 4px;
-      color: #fff;
-    }
-
-    .kpi-sub {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 4px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-wrap: wrap;
-    }
-
-    .progress-bar {
-      width: 100%;
-      height: 6px;
-      background: #1a2436;
-      border-radius: 3px;
-      margin-top: 6px;
-      overflow: hidden;
-      display: flex;
-    }
-
-    .progress-fill {
-      height: 100%;
-      background: var(--accent-blue);
-      transition: width 0.3s ease;
-    }
-
-    /* Layout Grid */
-    .grid-2col {
-      display: grid;
-      grid-template-columns: 1.5fr 1fr;
-      gap: 16px;
-    }
-
-    .grid-equal-2col {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-    }
-
-    @media (max-width: 1280px) {
-      .grid-2col, .grid-equal-2col { grid-template-columns: 1fr; }
-    }
-
-    .panel {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }
-
-    .panel-header {
-      background: var(--bg-secondary);
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-
-    .panel-title {
-      font-family: var(--font-mono);
-      font-weight: 700;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: #f8fafc;
-    }
-
-    .panel-body {
-      padding: 12px 14px;
-      overflow-x: auto;
-    }
-
-    .table-wrapper {
-      overflow-x: auto;
-      max-width: 100%;
-    }
-    .table-wrapper:focus-visible {
-      outline: 2px solid var(--accent-blue);
-      outline-offset: -2px;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-family: var(--font-mono);
-      font-variant-numeric: tabular-nums;
-      font-size: 11.5px;
-    }
-
-    th, td {
-      padding: 7px 9px;
-      text-align: left;
-      border-bottom: 1px solid rgba(30, 45, 68, 0.6);
-      white-space: nowrap;
-    }
-
-    th {
-      color: var(--text-muted);
-      font-weight: 600;
-      font-size: 10.5px;
-      text-transform: uppercase;
-      background: rgba(13, 19, 31, 0.92);
-      position: sticky;
-      top: 0;
-      z-index: 2;
-    }
-
-    tr:hover td {
-      background: rgba(24, 35, 54, 0.5);
-    }
-
-    .text-green { color: #34d399; }
-    .text-red { color: #f87171; }
-    .text-amber { color: #fbbf24; }
-    .text-blue { color: #38bdf8; }
-    .text-muted { color: var(--text-muted); }
-
-    .config-input {
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      color: #fff;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      padding: 4px 7px;
-      border-radius: 4px;
-      width: 115px;
-    }
-
-    .config-input:focus {
-      outline: none;
-      border-color: var(--accent-blue);
-    }
-
-    .log-stream {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      max-height: 240px;
-      overflow-y: auto;
-      padding: 8px 12px;
-      background: #06090f;
-    }
-
-    .log-entry {
-      padding: 3px 0;
-      border-bottom: 1px dashed rgba(30, 45, 68, 0.4);
-    }
-
-    .report-box {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      white-space: pre-wrap;
-      background: #05080d;
-      padding: 12px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      color: #34d399;
-      max-height: 360px;
-      overflow-y: auto;
-    }
-
-    .book-summary-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 10px;
-    }
-
-    .metric-tile {
-      background: rgba(7, 10, 16, 0.65);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 9px 11px;
-    }
-
-    .metric-tile-label {
-      font-size: 10px;
-      text-transform: uppercase;
-      color: var(--text-muted);
-      font-family: var(--font-mono);
-    }
-
-    .metric-tile-val {
-      font-size: 15px;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      margin-top: 3px;
-    }
-
-    .filter-pill-bar {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-
-    .filter-pill {
-      padding: 3px 9px;
-      font-size: 11px;
-      border-radius: 4px;
-      background: var(--bg-primary);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      cursor: pointer;
-    }
-
-    .filter-pill.active {
-      background: rgba(56, 189, 248, 0.16);
-      border-color: var(--accent-blue);
-      color: var(--accent-blue);
-      font-weight: 700;
-    }
-  </style>
+  <title>AEGIS QUANT v2.0 // Hyperliquid L1 Multi-Sleeve Real-Time Quantitative Terminal</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-
-  <header>
-    <div class="brand">
-      <div class="brand-logo" id="conn-dot"></div>
-      <div>
-        <div class="brand-title">AEGIS-QUANT // v0.3.0-rc1 PP-50 TWO-BOOK PLATFORM</div>
-        <div class="brand-sub">Book A: The Pit (MACE+SNR+HMM) | Book B: The Pond (NPS-01 Naked-Option Perp Scanner) | Daily <span id="header-settle-time">00:05 Local</span> Settling</div>
+  <!-- ========================================================================
+       TOP TELEMETRY BAR
+       ======================================================================== -->
+  <header class="top-telemetry-bar">
+    <div class="brand-cluster">
+      <div class="brand-emblem" title="Aegis Quant v2.0 Autonomous Engine">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="12 2 21 7 21 17 12 22 3 17 3 7 12 2"></polygon>
+          <polyline points="12 8 16 12 12 16 8 12 12 8"></polyline>
+        </svg>
+      </div>
+      <div class="brand-titles">
+        <div class="brand-name">
+          AEGIS QUANT
+          <span class="version-pill">v2.0.0</span>
+        </div>
+        <div class="brand-tagline">Hyperliquid L1 DEX · MariaDB 13.0 InnoDB · 3-Sleeve Event Engine</div>
       </div>
     </div>
-    <div class="header-actions">
-      <span class="badge badge-info" id="routing-mode-badge">MODE: PAPER_SIMULATION</span>
-      <span class="badge" id="alert-status-badge" style="color:var(--text-muted)">TELEGRAM: UNCONFIGURED</span>
-      <span class="badge badge-info" id="sse-status">SSE: CONNECTING</span>
-      <button class="primary" id="btn-cycle">Run Platform Cycle</button>
-      <button id="btn-pond-scan">Run Pond Scan</button>
-      <button id="btn-settle-dry">Dry-Run Settle</button>
-      <button id="btn-calibrate">Calibrate MACE</button>
-      <button id="btn-backtest">Run 365d Tear Sheet</button>
-      <button type="button" id="btn-backup-db">Backup DB</button>
-      <span class="badge" id="db-backup-status" role="status" aria-live="polite" style="display:none;"></span>
+
+    <div class="telemetry-badges">
+      <div class="t-badge mariadb-badge" id="badge-mariadb" title="MariaDB 13.0 Rolling InnoDB & 7 SQL Views Status">
+        <span class="pulse-dot cyan"></span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+        </svg>
+        <span id="mariadb-version-text">MariaDB 13.0.2 · 7 Views OK</span>
+      </div>
+
+      <div class="t-badge pulse-1s" id="badge-prio-pulse" title="1-Second High-Frequency Priority Watchlist & Maker Chaser Loop">
+        <span class="pulse-dot emerald"></span>
+        <span>1s PRIORITY WATCH: <strong id="prio-watch-count">0</strong></span>
+      </div>
+
+      <div class="t-badge pulse-3s" id="badge-scan-pulse" title="3-Second Full-Exchange 150+ Perp Scanner Loop">
+        <span class="pulse-dot amber"></span>
+        <span>3s PERP SCANNER: <strong id="scanner-asset-count">0</strong></span>
+      </div>
+
+      <div class="t-badge mode-badge mode-testnet" id="badge-exec-mode" title="Active Execution Routing Mode">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+        </svg>
+        <span id="exec-mode-text">TESTNET</span>
+      </div>
+    </div>
+
+    <div class="telemetry-controls">
+      <div class="risk-tier-group" id="risk-tier-selector" title="Dynamically Switch Portfolio Leverage Multiplier Tier">
+        <span class="risk-tier-label">Risk Tier</span>
+        <button type="button" class="tier-btn" data-tier="conservative" onclick="switchRiskTier('conservative')">Conservative 0.65x</button>
+        <button type="button" class="tier-btn" data-tier="standard" onclick="switchRiskTier('standard')">Standard 1.00x</button>
+        <button type="button" class="tier-btn" data-tier="aggressive" onclick="switchRiskTier('aggressive')">Aggressive 1.35x</button>
+        <button type="button" class="tier-btn active" data-tier="extreme" onclick="switchRiskTier('extreme')">🔥 Extreme 1.85x</button>
+      </div>
+
+      <button type="button" class="action-btn telegram-btn" id="btn-telegram-test" onclick="triggerTelegramTestAlert()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+        <span>Send Telegram HTML Alert</span>
+      </button>
     </div>
   </header>
 
-  <!-- 4-Page Accessible Navigation Bar -->
-  <nav class="page-nav-bar" aria-label="Dashboard Sections">
-    <div class="page-tablist" role="tablist" aria-label="PP-50 Platform Views">
-      <button
-        type="button"
-        role="tab"
-        class="page-tab"
-        id="tab-btn-overall"
-        data-page="overall"
-        aria-selected="true"
-        aria-controls="page-overall"
-        tabindex="0"
-      >
-        <span class="page-tab-num">1</span>
-        <span>Overall Status</span>
-      </button>
-      <button
-        type="button"
-        role="tab"
-        class="page-tab"
-        id="tab-btn-pit"
-        data-page="pit"
-        aria-selected="false"
-        aria-controls="page-pit"
-        tabindex="-1"
-      >
-        <span class="page-tab-num">2</span>
-        <span>Pit (Book A)</span>
-      </button>
-      <button
-        type="button"
-        role="tab"
-        class="page-tab"
-        id="tab-btn-pond"
-        data-page="pond"
-        aria-selected="false"
-        aria-controls="page-pond"
-        tabindex="-1"
-      >
-        <span class="page-tab-num">3</span>
-        <span>Pond (Book B)</span>
-      </button>
-      <button
-        type="button"
-        role="tab"
-        class="page-tab"
-        id="tab-btn-settings"
-        data-page="settings"
-        aria-selected="false"
-        aria-controls="page-settings"
-        tabindex="-1"
-      >
-        <span class="page-tab-num">4</span>
-        <span>Settings</span>
-      </button>
-    </div>
+  <!-- ========================================================================
+       MAIN TERMINAL WORKSPACE
+       ======================================================================== -->
+  <main class="terminal-container">
 
-    <div class="nav-pnl-summary" aria-live="polite">
-      <span class="text-muted">Platform PnL:</span>
-      <span id="nav-total-pnl-pill" class="pnl-pill pnl-flat">• $0.00 (0.00%)</span>
-      <span class="text-muted">| Pit:</span>
-      <span id="nav-pit-pnl-pill" class="pnl-pill pnl-flat">• $0.00</span>
-      <span class="text-muted">| Pond:</span>
-      <span id="nav-pond-pnl-pill" class="pnl-pill pnl-flat">• $0.00</span>
-    </div>
-  </nav>
-
-  <main>
-    <!-- Authentication Banner (shown when API returns 401 Unauthorized) -->
-    <div class="panel" id="auth-login-panel" style="display: none; margin-bottom: 16px; border-color: var(--accent-amber);">
-      <div class="panel-header">
-        <span class="panel-title">API Session Authentication Required (`web_api_token`)</span>
+    <!-- ACTIVE COOLDOWNS STRIP (v_assets_in_cooldown) -->
+    <section class="cooldown-strip" id="cooldown-strip">
+      <div class="cooldown-strip-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <polyline points="12 6 12 12 16 14"></polyline>
+        </svg>
+        <span>Active Cooldown Guard (<span id="cooldown-count">0</span>) · v_assets_in_cooldown</span>
       </div>
-      <div class="panel-body" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-        <input type="password" id="auth-token-input" class="config-input" style="width:320px;" placeholder="Enter AEGIS_WEB_TOKEN or web_api_token..." aria-label="API Authentication Token" />
-        <button type="button" class="primary" id="btn-auth-login">Authenticate Session</button>
-        <span class="text-muted" id="auth-login-status"></span>
-      </div>
-    </div>
-
-    <!-- ===================================================================== -->
-    <!-- PAGE 1: OVERALL STATUS                                                -->
-    <!-- ===================================================================== -->
-    <section
-      id="page-overall"
-      class="page-view"
-      role="tabpanel"
-      aria-labelledby="tab-btn-overall"
-    >
-      <!-- Composite PP-50 KPI Strip -->
-      <div class="kpi-grid">
-        <div class="kpi-card" id="pp50-card-equity">
-          <div class="kpi-label">
-            <span>PP-50 Platform Equity</span>
-            <span class="text-blue">PIT + POND</span>
-          </div>
-          <div class="kpi-value" id="pp50-total-equity">$10,000.00</div>
-          <div class="kpi-sub">
-            <span>Baseline: <strong id="pp50-initial-equity">$10,000.00</strong></span>
-            <span>| 50/50 Target: <strong id="pp50-target-each">$5,000.00</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card" id="pp50-card-total-pnl">
-          <div class="kpi-label">
-            <span>Total Platform Net PnL</span>
-            <span id="pp50-total-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pp50-total-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>Combined Realized + Unrealized + Funding</span>
-          </div>
-        </div>
-
-        <div class="kpi-card" id="pp50-card-pit-pnl">
-          <div class="kpi-label">
-            <span>Book A (The Pit) PnL</span>
-            <span id="pp50-pit-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pp50-pit-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>Equity: <strong id="pp50-pit-equity">$5,000.00</strong></span>
-            <span>| Share: <strong id="pp50-pit-share">50.0%</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card" id="pp50-card-pond-pnl">
-          <div class="kpi-label">
-            <span>Book B (The Pond) PnL</span>
-            <span id="pp50-pond-pnl-badge" class="pnl-pill pnl-flat">• 0.00%</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pp50-pond-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>Equity: <strong id="pp50-pond-equity">$5,000.00</strong></span>
-            <span>| Share: <strong id="pp50-pond-share">50.0%</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>50/50 Allocation Drift</span>
-            <span id="pp50-settle-time-badge" class="badge badge-info">00:05 Local</span>
-          </div>
-          <div class="kpi-value" id="pp50-drift-bps">0.0 bps</div>
-          <div class="kpi-sub">
-            <span>Dead-band: <strong id="pp50-deadband-bps">50.0 bps</strong></span>
-            <span>| Status: <strong id="pp50-settle-status-label">BALANCED</strong></span>
-          </div>
-          <div class="progress-bar" title="Book A (Pit) vs Book B (Pond) Capital Share">
-            <div class="progress-fill" id="pp50-split-bar-pit" style="width:50%; background: var(--accent-blue);"></div>
-            <div class="progress-fill" id="pp50-split-bar-pond" style="width:50%; background: var(--accent-purple);"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Two-Book Side-by-Side Comparison -->
-      <div class="grid-equal-2col">
-        <!-- Book A Summary Card -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title">Book A — The Pit (Directional MACE + SNR + 3-State HMM)</span>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <span class="badge badge-chop" id="overall-pit-regime-badge">CHOP</span>
-              <button type="button" data-switch-page="pit">Open Pit Page →</button>
-            </div>
-          </div>
-          <div class="panel-body">
-            <div class="book-summary-grid">
-              <div class="metric-tile">
-                <div class="metric-tile-label">Pit Equity / Baseline</div>
-                <div class="metric-tile-val" id="overall-pit-equity">$5,000.00 <span class="text-muted" style="font-size:11px;">/ $5,000</span></div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Pit Total Net PnL</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pit-total-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Realized PnL</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pit-realized-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Unrealized + Funding PnL</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pit-unrealized-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Open Positions & Heat</div>
-                <div class="metric-tile-val" id="overall-pit-positions">0 pos | $0.00 heat</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Deployed & Gross Leverage</div>
-                <div class="metric-tile-val" id="overall-pit-leverage">$0.00 (0.00x)</div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Book B Summary Card -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title">Book B — The Pond (Champion NPS-01 Naked-Option Perp Scanner)</span>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <span class="badge badge-purple" id="overall-pond-policy-badge">POLICY: BOTH</span>
-              <button type="button" data-switch-page="pond">Open Pond Page →</button>
-            </div>
-          </div>
-          <div class="panel-body">
-            <div class="book-summary-grid">
-              <div class="metric-tile">
-                <div class="metric-tile-label">Pond Equity / Baseline</div>
-                <div class="metric-tile-val" id="overall-pond-equity">$5,000.00 <span class="text-muted" style="font-size:11px;">/ $5,000</span></div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Pond Total Net PnL</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pond-total-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Realized PnL</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pond-realized-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Unrealized + Funding Harvested</div>
-                <div class="metric-tile-val pnl-flat" id="overall-pond-unrealized-pnl">• $0.00</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Active Cells & Heat Cap</div>
-                <div class="metric-tile-val" id="overall-pond-cells">0 / 8 cells | $0.00 / $200 heat</div>
-              </div>
-              <div class="metric-tile">
-                <div class="metric-tile-label">Deployed & Gross Leverage</div>
-                <div class="metric-tile-val" id="overall-pond-leverage">$0.00 (0.00x)</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Daily 50/50 Settling Transfers & Formatted Report Line -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title" id="settle-table-heading">Daily 50/50 Settling Ledger (`book_transfers` — Invariant F5 Idle-Only Transfer)</span>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <button type="button" class="primary" id="btn-settle-sim">Simulate Dry-Run Settle</button>
-            <button type="button" class="success" id="btn-settle-live">Execute Live Settle</button>
-          </div>
-        </div>
-        <div class="panel-body">
-          <div id="pp50-report-line" style="font-family:var(--font-mono); font-size:11.5px; padding:8px 10px; margin-bottom:10px; background:#06090f; border:1px solid var(--border); border-radius:5px; color:var(--accent-blue);">
-            PP-50 D+01 | platform $10000.00 (+0.00%) | PIT $5000.00 | POND $5000.00 | drift 0.0 bps | settle: $0.00 (READY) | cells: 0/8 (heat $0) | champion NPS-01
-          </div>
-          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="settle-table-heading">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">ID</th>
-                  <th scope="col" id="settle-ts-col-header">Timestamp (Local)</th>
-                  <th scope="col">Direction</th>
-                  <th scope="col">Pit Before</th>
-                  <th scope="col">Pond Before</th>
-                  <th scope="col">Platform Total</th>
-                  <th scope="col">Drift (bps)</th>
-                  <th scope="col">Required</th>
-                  <th scope="col">Rich Idle</th>
-                  <th scope="col">Executed</th>
-                  <th scope="col">Blocked (F5)</th>
-                  <th scope="col">Status</th>
-                </tr>
-              </thead>
-              <tbody id="settle-transfers-tbody">
-                <tr><td colspan="12" class="text-muted">No settling transfers recorded yet. Click "Simulate Dry-Run Settle" to test the 5-phase protocol.</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <!-- Backtest Tear Sheet Modal / Output Box -->
-      <div class="panel" id="report-panel" style="display: none;">
-        <div class="panel-header">
-          <span class="panel-title" id="report-title">Institutional Walk-Forward Tear Sheet</span>
-          <button type="button" id="btn-close-report">Close</button>
-        </div>
-        <div class="panel-body">
-          <div class="report-box" id="report-content"></div>
-        </div>
-      </div>
-
-      <!-- System Telemetry Logs -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">System Audit & Telemetry Stream (SQLite WAL)</span>
-          <span class="text-muted" id="schema-runtime-badge" style="font-family:var(--font-mono); font-size:11px;">Schema v7 // RUST_NATIVE (Axum / Tokio)</span>
-        </div>
-        <div class="log-stream" id="logs-box"></div>
+      <div class="cooldown-pills" id="cooldown-pills-container">
+        <span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 11px;">No assets currently in post-stop / shock cooldown — all eligible perps unlocked for entry.</span>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- PAGE 2: PIT (BOOK A)                                                  -->
-    <!-- ===================================================================== -->
-    <section
-      id="page-pit"
-      class="page-view"
-      role="tabpanel"
-      aria-labelledby="tab-btn-pit"
-      hidden
-    >
-      <div class="kpi-grid">
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Book A (Pit) Equity</span>
-            <span class="text-blue" id="kpi-equity-delta">$5,000.00 Base</span>
-          </div>
-          <div class="kpi-value" id="kpi-equity">$5,000.00</div>
-          <div class="kpi-sub" id="kpi-cash">Available Cash: $5,000.00</div>
-        </div>
-
-        <div class="kpi-card" id="pit-card-total-pnl">
-          <div class="kpi-label">
-            <span>Pit Total Net PnL</span>
-            <span id="pit-kpi-pnl-pct-badge" class="pnl-pill pnl-flat">• 0.00%</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pit-kpi-total-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>Realized: <strong id="pit-kpi-realized-pnl" class="pnl-flat">$0.00</strong></span>
-            <span>| uPnL: <strong id="pit-kpi-unrealized-pnl" class="pnl-flat">$0.00</strong></span>
+    <!-- KPI HERO CARDS (6-COLUMN GRID) -->
+    <section class="kpi-hero-grid">
+      <!-- 1. Total Equity -->
+      <article class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">Total Portfolio Equity</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="1" x2="12" y2="23"></line>
+              <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+            </svg>
           </div>
         </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Portfolio Heat (Cap: 4.0%)</span>
-            <span id="kpi-heat-pct">0.00%</span>
-          </div>
-          <div class="kpi-value" id="kpi-heat">$0.00 <span style="font-size:13px; color:var(--text-muted)">/ $400</span></div>
-          <div class="progress-bar"><div class="progress-fill" id="bar-heat" style="width: 0%"></div></div>
+        <div class="kpi-value" id="kpi-total-equity">$10,000.00</div>
+        <div class="kpi-sub">
+          <span id="kpi-tier-badge" style="color: #fda4af; font-weight: 700;">🔥 EXTREME (1.85x)</span>
+          <span id="kpi-eligible-coins">0 Eligible Perps</span>
         </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Gross Leverage (Cap: 1.50x)</span>
-            <span id="kpi-notional">$0.00</span>
-          </div>
-          <div class="kpi-value" id="kpi-leverage">0.00x</div>
-          <div class="progress-bar"><div class="progress-fill" id="bar-leverage" style="width: 0%"></div></div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill" style="width: 100%"></div>
         </div>
+      </article>
 
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Idle Basis / HLP Harvest</span>
-            <span class="text-green" id="kpi-yield">+$0.00 Yield</span>
-          </div>
-          <div class="kpi-value" id="kpi-basis">$0.00</div>
-          <div class="kpi-sub">35% Max Idle Cash Floor</div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>3-State Gaussian HMM Regime</span>
-            <span class="badge badge-chop" id="kpi-regime">CHOP</span>
-          </div>
-          <div class="kpi-sub" style="margin-top:8px; line-height:1.6;">
-            <div>BULL: <strong class="text-green" id="prob-bull">33.3%</strong> | BEAR: <strong class="text-red" id="prob-bear">33.3%</strong> | CHOP: <strong class="text-amber" id="prob-chop">33.4%</strong></div>
+      <!-- 2. Available Cash -->
+      <article class="kpi-card accent-emerald">
+        <div class="kpi-header">
+          <span class="kpi-title">Available Idle Cash</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="5" width="20" height="14" rx="2"></rect>
+              <line x1="2" y1="10" x2="22" y2="10"></line>
+            </svg>
           </div>
         </div>
-      </div>
+        <div class="kpi-value" id="kpi-avail-cash">$10,000.00</div>
+        <div class="kpi-sub">
+          <span id="kpi-cash-pct">100.0% of Equity</span>
+          <span>Unspent Liquidity</span>
+        </div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill" id="kpi-cash-meter" style="width: 100%"></div>
+        </div>
+      </article>
 
-      <!-- Cross-Pair Signal Matrix -->
-      <div class="panel">
+      <!-- 3. Reserved Order Margin (WORKING) -->
+      <article class="kpi-card accent-amber">
+        <div class="kpi-header">
+          <span class="kpi-title">Reserved Margin (WORKING)</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </svg>
+          </div>
+        </div>
+        <div class="kpi-value" id="kpi-reserved-margin">$0.00</div>
+        <div class="kpi-sub">
+          <span id="kpi-working-count" style="color: #fbbf24;">0 Working ALO Orders</span>
+          <span>1s Maker Chaser</span>
+        </div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill amber" id="kpi-reserved-meter" style="width: 0%"></div>
+        </div>
+      </article>
+
+      <!-- 4. Committed Notional (OPEN) -->
+      <article class="kpi-card accent-emerald">
+        <div class="kpi-header">
+          <span class="kpi-title">Committed Notional (OPEN)</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="22 7 13.5 15.5 8.5 10.5 2 17"></polyline>
+              <polyline points="16 7 22 7 22 13"></polyline>
+            </svg>
+          </div>
+        </div>
+        <div class="kpi-value" id="kpi-committed-notional">$0.00</div>
+        <div class="kpi-sub">
+          <span id="kpi-open-counts">0 Long · 0 Short</span>
+          <span id="kpi-net-notional">Net: $0.00</span>
+        </div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill" id="kpi-committed-meter" style="width: 0%"></div>
+        </div>
+      </article>
+
+      <!-- 5. Gross / Net Leverage -->
+      <article class="kpi-card accent-rose">
+        <div class="kpi-header">
+          <span class="kpi-title">Gross / Net Leverage</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+          </div>
+        </div>
+        <div class="kpi-value"><span id="kpi-gross-leverage">0.00x</span> <small style="font-size: 13px; color: var(--text-muted);">/ <span id="kpi-net-leverage">0.00x</span></small></div>
+        <div class="kpi-sub">
+          <span id="kpi-leverage-target">Target: 1.85x Extreme</span>
+          <span>Cap: 2.50x</span>
+        </div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill amber" id="kpi-leverage-meter" style="width: 0%"></div>
+        </div>
+      </article>
+
+      <!-- 6. Market Regime & Breadth Gauge -->
+      <article class="kpi-card accent-violet">
+        <div class="kpi-header">
+          <span class="kpi-title">Market Regime & Breadth</span>
+          <div class="kpi-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.21 15.89A10 10 0 1 1 8 2.83"></path>
+              <path d="M22 12A10 10 0 0 0 12 2v10z"></path>
+            </svg>
+          </div>
+        </div>
+        <div class="kpi-value" id="kpi-regime-label" style="font-size: 16px;">NEUTRAL</div>
+        <div class="kpi-sub">
+          <span id="kpi-breadth-pct">Bull Breadth: 50.0%</span>
+          <span id="kpi-beta-exp">Beta: 0.00</span>
+        </div>
+        <div class="kpi-meter">
+          <div class="kpi-meter-fill" id="kpi-breadth-meter" style="width: 50%"></div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ======================================================================
+         DUAL HTML5 CANVAS INTERACTIVE CHARTS
+         ====================================================================== -->
+    <section class="charts-grid">
+      <!-- Chart 1: Portfolio Equity & Committed vs Reserved Capital Curve -->
+      <div class="glass-panel">
         <div class="panel-header">
-          <span class="panel-title" id="pit-signals-heading">Cross-Pair Signal Matrix (`ALT/BTC:SYNTH` 35% MACE + 65% Continuous SNR → `ALT/USDC` Execution)</span>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <span class="text-muted" id="signals-count">15 Pairs</span>
-            <button type="button" class="primary" id="btn-eval-signals">Evaluate Signals</button>
+          <div class="panel-title-cluster">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
+              <polyline points="17 6 23 6 23 12"></polyline>
+            </svg>
+            <div>
+              <div class="panel-title">Portfolio Equity & Order-to-Open Capital Lifecycle Curve</div>
+              <div class="panel-subtitle">Real-time Total Equity vs Committed Notional (OPEN) & Reserved Margin (WORKING)</div>
+            </div>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-swatch" style="background: #00f2fe;"></span>Total Equity</span>
+            <span class="legend-item"><span class="legend-swatch" style="background: #10b981;"></span>Committed (OPEN)</span>
+            <span class="legend-item"><span class="legend-swatch" style="background: #f59e0b;"></span>Reserved (WORKING)</span>
           </div>
         </div>
-        <div class="panel-body">
-          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-signals-heading">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Exec Symbol</th>
-                  <th scope="col">Synth Ratio</th>
-                  <th scope="col">TF</th>
-                  <th scope="col">MACE (35%)</th>
-                  <th scope="col">Cont. SNR (65%)</th>
-                  <th scope="col">Ensemble</th>
-                  <th scope="col">Threshold</th>
-                  <th scope="col">Vol Tier</th>
-                  <th scope="col">1H Funding</th>
-                  <th scope="col">Action</th>
-                </tr>
-              </thead>
-              <tbody id="signals-tbody"></tbody>
-            </table>
-          </div>
+        <div class="canvas-wrapper">
+          <canvas id="equity-curve-canvas"></canvas>
         </div>
       </div>
 
-      <div class="grid-equal-2col">
-        <!-- Active Pit Positions -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title" id="pit-open-heading">Active Perpetual Positions & Chandelier Stops</span>
-            <span class="badge badge-info" id="open-trades-count">0 OPEN</span>
-          </div>
-          <div class="panel-body">
-            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-open-heading">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Symbol</th>
-                    <th scope="col">Side</th>
-                    <th scope="col">Notional</th>
-                    <th scope="col">Entry Px</th>
-                    <th scope="col">Mark Px</th>
-                    <th scope="col">Chandelier Stop</th>
-                    <th scope="col">Risk ($)</th>
-                    <th scope="col">uPnL + Funding</th>
-                    <th scope="col" id="pit-open-ts-col-header">Opened (Local)</th>
-                    <th scope="col">Action</th>
-                  </tr>
-                </thead>
-                <tbody id="open-trades-tbody"></tbody>
-              </table>
+      <!-- Chart 2: Multi-Sleeve Attribution Breakdown -->
+      <div class="glass-panel">
+        <div class="panel-header">
+          <div class="panel-title-cluster">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <line x1="3" y1="9" x2="21" y2="9"></line>
+              <line x1="9" y1="21" x2="9" y2="9"></line>
+            </svg>
+            <div>
+              <div class="panel-title">Multi-Sleeve Attribution Breakdown</div>
+              <div class="panel-subtitle">w_net = (w_s1 + w_s2 + w_s3) × L_tier</div>
             </div>
+          </div>
+          <div class="chart-legend">
+            <span class="legend-item"><span class="legend-swatch" style="background: #00f2fe;"></span>S1 Carry</span>
+            <span class="legend-item"><span class="legend-swatch" style="background: #10b981;"></span>S2 Trend</span>
+            <span class="legend-item"><span class="legend-swatch" style="background: #f59e0b;"></span>S3 Event</span>
           </div>
         </div>
-
-        <!-- Recent Closed Pit Trades -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title" id="pit-closed-heading">Recent Closed Pit Trades & Realized PnL</span>
-            <span class="text-muted">Colour-Coded PnL</span>
+        <div class="canvas-wrapper" style="height: 165px;">
+          <canvas id="sleeve-attr-canvas"></canvas>
+        </div>
+        <div class="sleeve-bars-list">
+          <div class="sleeve-stat-box s1">
+            <div class="sleeve-stat-name">S1 Carry-Mom</div>
+            <div class="sleeve-stat-val" id="sleeve-s1-weight" style="color: var(--neon-cyan);">0.0%</div>
           </div>
-          <div class="panel-body">
-            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pit-closed-heading">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">ID</th>
-                    <th scope="col" id="pit-closed-ts-col-header">Timestamp (Local)</th>
-                    <th scope="col">Symbol</th>
-                    <th scope="col">Side</th>
-                    <th scope="col">State / Reason</th>
-                    <th scope="col">Entry</th>
-                    <th scope="col">Exit</th>
-                    <th scope="col">Notional</th>
-                    <th scope="col">Funding</th>
-                    <th scope="col">Realized PnL</th>
-                  </tr>
-                </thead>
-                <tbody id="recent-trades-tbody"></tbody>
-              </table>
-            </div>
+          <div class="sleeve-stat-box s2">
+            <div class="sleeve-stat-name">S2 Trend-Breakout</div>
+            <div class="sleeve-stat-val" id="sleeve-s2-weight" style="color: #34d399;">0.0%</div>
+          </div>
+          <div class="sleeve-stat-box s3">
+            <div class="sleeve-stat-name">S3 Event-Reversion</div>
+            <div class="sleeve-stat-val" id="sleeve-s3-weight" style="color: #fbbf24;">0.0%</div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- PAGE 3: POND (BOOK B)                                                 -->
-    <!-- ===================================================================== -->
-    <section
-      id="page-pond"
-      class="page-view"
-      role="tabpanel"
-      aria-labelledby="tab-btn-pond"
-      hidden
-    >
-      <!-- Book B KPI Strip -->
-      <div class="kpi-grid">
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Book B (Pond) Equity</span>
-            <span class="badge badge-purple" id="pond-champion-badge">NPS-01</span>
-          </div>
-          <div class="kpi-value" id="pond-kpi-equity">$5,000.00</div>
-          <div class="kpi-sub">
-            <span>Idle USDC: <strong id="pond-kpi-idle">$5,000.00</strong></span>
-            <span>| Baseline: <strong id="pond-kpi-baseline">$5,000.00</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card" id="pond-card-total-pnl">
-          <div class="kpi-label">
-            <span>Pond Total Net PnL</span>
-            <span id="pond-kpi-pnl-pct-badge" class="pnl-pill pnl-flat">• 0.00%</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pond-kpi-total-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>Realized: <strong id="pond-kpi-realized-pnl" class="pnl-flat">$0.00</strong></span>
-            <span>| uPnL: <strong id="pond-kpi-unrealized-pnl" class="pnl-flat">$0.00</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card" id="pond-card-funding-pnl">
-          <div class="kpi-label">
-            <span>Option-Analogue Funding Harvest</span>
-            <span class="text-blue">168h Z-Score Fade</span>
-          </div>
-          <div class="kpi-value pnl-flat" id="pond-kpi-funding-pnl">• $0.00</div>
-          <div class="kpi-sub">
-            <span>SHORT_CALL: <strong id="pond-kpi-short-calls">0</strong></span>
-            <span>| SHORT_PUT: <strong id="pond-kpi-short-puts">0</strong></span>
-          </div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Open Pond Cells & Heat</span>
-            <span id="pond-kpi-cells">0 / 8 Cells</span>
-          </div>
-          <div class="kpi-value" id="pond-kpi-heat">$0.00 <span style="font-size:13px; color:var(--text-muted)">/ $200</span></div>
-          <div class="progress-bar"><div class="progress-fill" id="pond-bar-heat" style="width: 0%; background: var(--accent-purple);"></div></div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Pond Gross Leverage (Cap: 1.50x)</span>
-            <span id="pond-kpi-notional">$0.00</span>
-          </div>
-          <div class="kpi-value" id="pond-kpi-leverage">0.00x</div>
-          <div class="progress-bar"><div class="progress-fill" id="pond-bar-leverage" style="width: 0%; background: var(--accent-purple);"></div></div>
-        </div>
-
-        <div class="kpi-card">
-          <div class="kpi-label">
-            <span>Direction Policy (`pond_direction_policy`)</span>
-            <span class="badge badge-info" id="pond-kpi-policy-badge">both</span>
-          </div>
-          <div style="display:flex; gap:6px; margin-top:8px; align-items:center; flex-wrap:wrap;">
-            <select id="pond-policy-select" class="config-input" style="width:125px" aria-label="Pond Direction Policy">
-              <option value="both">both (Call+Put)</option>
-              <option value="short_only">short_only (Call)</option>
-              <option value="long_only">long_only (Put)</option>
-            </select>
-            <button type="button" class="primary" id="btn-pond-scan-inline">Scan Now</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Active & Recent Pond Cells Table -->
-      <div class="panel">
+    <!-- ======================================================================
+         1s PRIORITY WATCHLIST & WORKING ORDERS + ACTIVE OPEN HOLDINGS
+         ====================================================================== -->
+    <section class="surveillance-grid">
+      <!-- Left: 1s Priority Watchlist (v_priority_watchlist) & Working Orders (v_assets_ordered) -->
+      <div class="glass-panel">
         <div class="panel-header">
-          <span class="panel-title" id="pond-cells-heading">Pond Cells (`pond_cells` — 10-State FSM & 6-Tier Exit Priority Engine)</span>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <span class="badge badge-purple" id="pond-open-cells-badge">0 OPEN</span>
-            <button type="button" class="primary" id="btn-pond-scan-table">Run Hourly S-Cycle Scan</button>
+          <div class="panel-title-cluster">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            <div>
+              <div class="panel-title">1s Priority Watchlist & Active Working Orders</div>
+              <div class="panel-subtitle">Backed by SQL Views: <code>v_assets_ordered</code> & <code>v_priority_watchlist</code></div>
+            </div>
           </div>
+          <span class="status-pill working"><span class="pulse-dot emerald"></span>1000ms Loop</span>
         </div>
-        <div class="panel-body">
-          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-cells-heading">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Cell ID</th>
-                  <th scope="col" id="pond-cells-ts-col-header">Timestamp (Local)</th>
-                  <th scope="col">Symbol</th>
-                  <th scope="col">FSM State</th>
-                  <th scope="col">Side / Analogue</th>
-                  <th scope="col">Notional</th>
-                  <th scope="col">Risk ($)</th>
-                  <th scope="col">Entry Px</th>
-                  <th scope="col">Mark Px</th>
-                  <th scope="col">Init Stop</th>
-                  <th scope="col">4H Chandelier</th>
-                  <th scope="col">Entry Z / Cur Z</th>
-                  <th scope="col">Premium</th>
-                  <th scope="col">Funding ($)</th>
-                  <th scope="col">uPnL ($)</th>
-                  <th scope="col">Net / Realized PnL</th>
-                  <th scope="col">Exit Tier / Reason</th>
-                  <th scope="col">Action</th>
-                </tr>
-              </thead>
-              <tbody id="pond-cells-tbody">
-                <tr><td colspan="18" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>
-              </tbody>
-            </table>
-          </div>
+
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>State / Trigger</th>
+                <th>Side</th>
+                <th>Limit / Mark</th>
+                <th>Mid Dist (bps)</th>
+                <th>Reserved USDC</th>
+                <th>Chases</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-priority-ordered">
+              <tr>
+                <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+                  No active WORKING orders or priority triggers — monitoring 1s watchlist stream...
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
-      <div class="grid-2col">
-        <!-- 80-Coin Dynamic Pond Universe -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title" id="pond-univ-heading">80-Coin Dynamic Pond Universe (`pond_universe` — $50k Volume Floor & Rank 95 Hysteresis)</span>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <input
-                type="text"
-                id="pond-universe-filter"
-                class="config-input"
-                style="width:150px"
-                placeholder="Filter symbol..."
-                aria-label="Filter Pond Universe Symbol"
-              />
-              <span class="badge badge-info" id="pond-universe-count-badge">80 ACTIVE</span>
+      <!-- Right: Active Open Holdings (v_assets_held) -->
+      <div class="glass-panel">
+        <div class="panel-header">
+          <div class="panel-title-cluster">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+              <path d="M2 17l10 5 10-5"></path>
+              <path d="M2 12l10 5 10-5"></path>
+            </svg>
+            <div>
+              <div class="panel-title">Active Open Holdings (Committed Capital)</div>
+              <div class="panel-subtitle">Backed by SQL View: <code>v_assets_held</code> · Live Trailing Stop Surveillance</div>
             </div>
           </div>
-          <div class="panel-body" style="max-height: 420px; overflow-y: auto;">
-            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-univ-heading">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Rank</th>
-                    <th scope="col">Symbol</th>
-                    <th scope="col">Base</th>
-                    <th scope="col">7d Median Daily Vol</th>
-                    <th scope="col">Status</th>
-                    <th scope="col" id="pond-warmup-ts-col-header">Warmup Ready (168h Local)</th>
-                    <th scope="col">Below-Rank Streak</th>
-                  </tr>
-                </thead>
-                <tbody id="pond-universe-tbody"></tbody>
-              </table>
-            </div>
-          </div>
+          <span class="status-pill open" id="held-count-pill">0 OPEN</span>
         </div>
 
-        <!-- Hourly S-Cycle Scan History -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title" id="pond-cycles-heading">Hourly S-Cycle Scan Telemetry (`pond_scan_cycles`)</span>
-            <span class="text-muted">Champion NPS-01</span>
-          </div>
-          <div class="panel-body" style="max-height: 420px; overflow-y: auto;">
-            <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="pond-cycles-heading">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Cycle</th>
-                    <th scope="col" id="pond-cycles-ts-col-header">Timestamp (Local)</th>
-                    <th scope="col">Active</th>
-                    <th scope="col">Passed</th>
-                    <th scope="col">Opened</th>
-                    <th scope="col">Exits</th>
-                    <th scope="col">Cells</th>
-                    <th scope="col">Heat</th>
-                    <th scope="col">Equity</th>
-                  </tr>
-                </thead>
-                <tbody id="pond-cycles-tbody">
-                  <tr><td colspan="9" class="text-muted">No S-Cycle scans recorded yet.</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th>Committed</th>
+                <th>Entry / Mark</th>
+                <th>Protect Stop (Dist)</th>
+                <th>Unrealized PnL</th>
+                <th>Sleeve Mix</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-assets-held">
+              <tr>
+                <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+                  No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </section>
 
-    <!-- ===================================================================== -->
-    <!-- PAGE 4: SETTINGS                                                      -->
-    <!-- ===================================================================== -->
-    <section
-      id="page-settings"
-      class="page-view"
-      role="tabpanel"
-      aria-labelledby="tab-btn-settings"
-      hidden
-    >
-      <div class="grid-equal-2col">
-        <!-- Hyperliquid L1 Credentials & Routing -->
-        <div class="panel">
-          <div class="panel-header">
-            <span class="panel-title">Hyperliquid L1 Web3 DEX Credentials & Routing</span>
-            <span class="badge" id="cred-status-pill" style="color:var(--accent-amber)">PAPER MODE</span>
-          </div>
-          <div class="panel-body">
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
-              <div>
-                <label class="text-muted" for="cred-mode" style="font-size:11px; display:block; margin-bottom:4px;">Execution Routing Mode</label>
-                <select id="cred-mode" class="config-input" style="width:100%">
-                  <option value="PAPER">PAPER_SIMULATION — Simulated Fill + Slippage (PAPER)</option>
-                  <option value="TESTNET">LIVE_TESTNET — Hyperliquid Testnet (api.hyperliquid-testnet.xyz)</option>
-                  <option value="LIVE">LIVE_MAINNET — Hyperliquid Mainnet (api.hyperliquid.xyz)</option>
-                </select>
-              </div>
-              <div>
-                <label class="text-muted" for="cred-wallet" style="font-size:11px; display:block; margin-bottom:4px;">L1 Wallet Address (0x... 42-char EVM)</label>
-                <input type="text" id="cred-wallet" class="config-input" data-dirty-field="cred-wallet" style="width:100%" placeholder="0xYourHyperliquidWalletAddress" />
-              </div>
-            </div>
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
-              <div>
-                <label class="text-muted" for="cred-pk" style="font-size:11px; display:block; margin-bottom:4px;">API Agent / Wallet Private Key (`0x` + 64 hex)</label>
-                <input type="password" id="cred-pk" class="config-input" style="width:100%" placeholder="Leave blank to keep existing key" />
-              </div>
-              <div>
-                <label class="text-muted" for="cred-vault" style="font-size:11px; display:block; margin-bottom:4px;">Active HLP Vault (auto-switched per network)</label>
-                <input type="text" id="cred-vault" class="config-input" readonly style="width:100%; opacity:0.85; cursor:default;" placeholder="0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0" />
-              </div>
-            </div>
-            <div style="margin-bottom:10px;">
-              <label class="text-muted" for="cred-gemini" style="font-size:11px; display:block; margin-bottom:4px;">Gemini API Key (Optional AI Macro Overlay)</label>
-              <input type="password" id="cred-gemini" class="config-input" style="width:100%" placeholder="Leave blank to keep existing key" />
-            </div>
-            <div style="display:flex; justify-content:space-between; align-items:center;">
-              <span class="text-muted" id="cred-endpoint-label" style="font-size:11px; font-family:var(--font-mono)">Endpoint: Simulated Fill + Slippage</span>
-              <button type="button" class="primary" id="btn-save-credentials">Save L1 Credentials & Routing</button>
-            </div>
-          </div>
+    <!-- ======================================================================
+         MULTI-SLEEVE EXPLORER TABS & 150+ HYPERLIQUID PERP SCANNER
+         ====================================================================== -->
+    <section class="glass-panel">
+      <div class="explorer-tabs-bar">
+        <div class="tab-buttons">
+          <button type="button" class="tab-btn active" data-tab="s1" onclick="switchExplorerTab('s1')">
+            <span>S1 Carry-Momentum</span>
+            <span class="tab-count" id="tab-count-s1">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="s2" onclick="switchExplorerTab('s2')">
+            <span>S2 Trend & 3s Breakout</span>
+            <span class="tab-count" id="tab-count-s2">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="s3" onclick="switchExplorerTab('s3')">
+            <span>S3 Event & Funding Flush</span>
+            <span class="tab-count" id="tab-count-s3">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="scanner" onclick="switchExplorerTab('scanner')">
+            <span>150+ Hyperliquid Perp Scanner</span>
+            <span class="tab-count" id="tab-count-scanner">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="console" onclick="switchExplorerTab('console')">
+            <span>Order Audit & Telemetry Console</span>
+            <span class="tab-count" id="tab-count-console">0</span>
+          </button>
+          <button type="button" class="tab-btn" data-tab="config" onclick="switchExplorerTab('config')">
+            <span>System Config Vault</span>
+          </button>
         </div>
 
-        <!-- Telegram Bot Alerting & Capital Scaling -->
-        <div style="display:flex; flex-direction:column; gap:16px;">
-          <div class="panel">
-            <div class="panel-header">
-              <span class="panel-title">Telegram Bot Alerting & Daily Drawdown Guard</span>
-              <span class="badge" id="tg-status-pill" style="color:var(--text-muted)">NOT CONFIGURED</span>
+        <div class="scanner-search-box">
+          <input
+            type="text"
+            id="scanner-search-input"
+            class="search-input"
+            placeholder="Filter symbol (e.g. BTC-USDC, SOL, HYPE)..."
+            oninput="renderActiveExplorerTab()"
+          />
+        </div>
+      </div>
+
+      <!-- TAB 1: v_assets_sleeve_s1 -->
+      <div class="tab-pane active" id="tab-pane-s1">
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Mark Price</th>
+                <th>24h Volume (USDC)</th>
+                <th>Hourly Funding</th>
+                <th>Funding APR</th>
+                <th>Annual Vol</th>
+                <th>Market Beta</th>
+                <th>Mom Score</th>
+                <th>Carry Score</th>
+                <th>S1 Weight (w_s1)</th>
+                <th>Net Target Weight</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-sleeve-s1"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 2: v_assets_sleeve_s2 -->
+      <div class="tab-pane" id="tab-pane-s2">
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Mark Price</th>
+                <th>24h Volume (USDC)</th>
+                <th>Annual Vol</th>
+                <th>Trend Alignment</th>
+                <th>Vol Surge Ratio</th>
+                <th>Event Trigger</th>
+                <th>S2 Weight (w_s2)</th>
+                <th>Net Target Weight</th>
+                <th>Current Weight</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-sleeve-s2"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 3: v_assets_sleeve_s3 -->
+      <div class="tab-pane" id="tab-pane-s3">
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Mark Price</th>
+                <th>24h Volume (USDC)</th>
+                <th>Funding APR</th>
+                <th>Funding Z-Score</th>
+                <th>Flush ATR Mult</th>
+                <th>Event Trigger</th>
+                <th>S3 Weight (w_s3)</th>
+                <th>Net Target Weight</th>
+                <th>Current Weight</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-sleeve-s3"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 4: Full 150+ Hyperliquid Perp Scanner -->
+      <div class="tab-pane" id="tab-pane-scanner">
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Coin</th>
+                <th>Mark Price</th>
+                <th>Mid Price</th>
+                <th>Oracle Price</th>
+                <th>24h Volume (USDC)</th>
+                <th>Open Interest (USDC)</th>
+                <th>Funding / Hr</th>
+                <th>Max Lev</th>
+                <th>Eligibility</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-perp-scanner"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 5: Live Order Audit & Telemetry Console -->
+      <div class="tab-pane" id="tab-pane-console">
+        <div class="audit-telemetry-split">
+          <div>
+            <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: var(--neon-cyan);">
+              1-SECOND MAKER LIMIT CHASER ORDER AUDIT (<code>order_audit</code>)
             </div>
-            <div class="panel-body">
-              <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;">
-                <div>
-                  <label class="text-muted" for="tg-token" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Bot Token (`@BotFather`)</label>
-                  <input type="password" id="tg-token" class="config-input" style="width:100%" placeholder="<bot_id>:<bot_secret_from_BotFather>" />
-                </div>
-                <div>
-                  <label class="text-muted" for="tg-chat-id" style="font-size:11px; display:block; margin-bottom:4px;">Telegram Chat ID / Channel ID</label>
-                  <input type="text" id="tg-chat-id" class="config-input" data-dirty-field="tg-chat-id" style="width:100%" placeholder="-1001234567890 or 123456789" />
-                </div>
-              </div>
-              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-                <div style="display:flex; align-items:center; gap:6px;">
-                  <label class="text-muted" for="tg-dd-pct" style="font-size:11px;">Daily Drawdown Alert (%):</label>
-                  <input type="number" step="0.5" id="tg-dd-pct" class="config-input" data-dirty-field="tg-dd-pct" style="width:70px" value="3.0" />
-                </div>
-                <div style="display:flex; gap:6px;">
-                  <button type="button" id="btn-send-test-alert">Send Test Alert</button>
-                  <button type="button" class="primary" id="btn-save-tg-alerts">Save Telegram Config</button>
-                </div>
-              </div>
+            <div class="table-scroll">
+              <table class="quant-table">
+                <thead>
+                  <tr>
+                    <th>Time (UTC)</th>
+                    <th>Client OID</th>
+                    <th>Side</th>
+                    <th>Transition</th>
+                    <th>Limit / Fill Px</th>
+                    <th>Reserved / Committed</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-order-audit"></tbody>
+              </table>
             </div>
           </div>
 
-          <div class="panel">
-            <div class="panel-header">
-              <span class="panel-title">Capital Baseline & Proportional Risk Scaling</span>
-              <span class="badge badge-info" id="capital-scale-badge">1.00x Baseline</span>
+          <div>
+            <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: #34d399;">
+              LIVE OPERATIONAL TELEMETRY STREAM (<code>telemetry_logs</code>)
             </div>
-            <div class="panel-body">
-              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-                <div>
-                  <label class="text-muted" for="capital-baseline-input" style="font-size:11px; display:block; margin-bottom:4px;">Initial / Baseline Equity (USDC)</label>
-                  <input type="number" step="100" min="100" id="capital-baseline-input" class="config-input" data-dirty-field="capital-baseline-input" style="width:160px; font-size:13px; font-weight:700;" value="10000" />
-                </div>
-                <div style="display:flex; gap:8px; margin-top:14px;">
-                  <button type="button" class="primary" id="btn-apply-capital-baseline">Scale All Risk Caps</button>
-                  <button type="button" id="btn-sync-wallet">Sync From Hyperliquid L1 Wallet</button>
-                </div>
-              </div>
-              <div class="text-muted" id="capital-scale-summary" style="font-size:11px; margin-top:8px; font-family:var(--font-mono);">
-                Heat Cap: $400.00 (4.0%) | Base Risk/Trade: $100.00 [$50–$150] | Single Asset Cap: $2,500.00 | Max Notional: $15,000.00
-              </div>
-            </div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-header">
-              <span class="panel-title">SQLite WAL Backup (`VACUUM INTO`), Retention & Guarded Restore</span>
-              <span class="badge badge-info" id="db-backup-settings-badge" role="status" aria-live="polite">READY</span>
-            </div>
-            <div class="panel-body" style="display:flex; flex-direction:column; gap:10px;">
-              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-                <span class="text-muted" id="db-backup-settings-detail" style="font-size:11px; font-family:var(--font-mono);">
-                  Online atomic snapshot via SQLite VACUUM INTO (`data/backups/` — 7-day retention window)
-                </span>
-                <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                  <button type="button" id="btn-refresh-backups">Refresh Backups</button>
-                  <button type="button" class="primary" id="btn-backup-db-settings">Backup Database Now</button>
-                </div>
-              </div>
-              <div id="db-restore-precondition-banner" class="text-muted" style="font-size:11px; font-family:var(--font-mono); padding:7px 10px; background:#06090f; border:1px solid var(--border); border-radius:5px;">
-                Restore Preconditions: Checking execution mode, open PIT/Pond positions, and cycle lock status...
-              </div>
-              <div class="table-wrapper" tabindex="0" role="region" aria-label="Available SQLite Backups">
-                <table id="db-backups-table">
-                  <thead>
-                    <tr>
-                      <th scope="col">Filename</th>
-                      <th scope="col">Size</th>
-                      <th scope="col">Created (UTC)</th>
-                      <th scope="col">Expires</th>
-                      <th scope="col">Copy CLI Command</th>
-                      <th scope="col">Restore…</th>
-                    </tr>
-                  </thead>
-                  <tbody id="db-backups-tbody">
-                    <tr><td colspan="6" class="text-muted">Click "Refresh Backups" to list available SQLite snapshots in `data/backups/`.</td></tr>
-                  </tbody>
-                </table>
-              </div>
-
-              <!-- Two-Step Database Restore Confirmation Modal (R16-U1 Phase 2) -->
-              <div id="db-restore-modal" style="display:none; flex-direction:column; gap:10px; padding:12px; background:#05080d; border:1px solid var(--accent-amber); border-radius:6px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-                  <strong style="font-family:var(--font-mono); color:var(--accent-amber); font-size:12px;">Database Restore Confirmation Modal (Two-Step Guarded Restore)</strong>
-                  <button type="button" id="btn-cancel-db-restore">Cancel</button>
-                </div>
-                <div id="db-restore-preview-meta" class="report-box" style="max-height:180px; color:var(--text-main);"></div>
-                <div id="db-restore-modal-preconditions" class="text-muted" style="font-size:11px; font-family:var(--font-mono);"></div>
-                <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
-                  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                    <label for="db-restore-confirm-input" class="text-muted" style="font-size:11px; font-family:var(--font-mono);">Type <code>RESTORE</code> to confirm:</label>
-                    <input type="text" id="db-restore-confirm-input" class="config-input" style="width:150px;" placeholder="RESTORE" autocomplete="off" />
-                  </div>
-                  <div style="display:flex; align-items:center; gap:8px;">
-                    <span id="db-restore-modal-status" class="text-muted" style="font-size:11px; font-family:var(--font-mono);"></span>
-                    <button type="button" class="primary" id="btn-confirm-db-restore" disabled>Confirm Restore</button>
-                  </div>
-                </div>
-              </div>
-            </div>
+            <div class="telemetry-log-stream" id="telemetry-log-container"></div>
           </div>
         </div>
       </div>
 
-      <!-- Live Tunable System Config Table (All 333 Keys) -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title" id="settings-config-heading">Live Tunable `system_config` Parameters (333 Keys — SQLite Single Source of Truth)</span>
-          <div class="filter-pill-bar" id="config-filter-pill-bar">
-            <button type="button" class="filter-pill active" data-cat="all">All</button>
-            <button type="button" class="filter-pill" data-cat="platform">Platform</button>
-            <button type="button" class="filter-pill" data-cat="pond">Pond (Book B)</button>
-            <button type="button" class="filter-pill" data-cat="settling">Settling</button>
-            <button type="button" class="filter-pill" data-cat="risk">Risk</button>
-            <button type="button" class="filter-pill" data-cat="signals">Pit / Signals</button>
-            <button type="button" class="filter-pill" data-cat="execution">Execution</button>
-            <input
-              type="text"
-              id="config-search-input"
-              class="config-input"
-              style="width:165px"
-              placeholder="Search key..."
-              aria-label="Search system_config keys"
-            />
-          </div>
+      <!-- TAB 6: System Config & Encrypted Vault -->
+      <div class="tab-pane" id="tab-pane-config">
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap;">
+          <input type="text" id="cfg-key-input" class="search-input" placeholder="Config key (e.g. max_gross_leverage_x)" style="min-width: 240px;" />
+          <input type="text" id="cfg-val-input" class="search-input" placeholder="New value..." style="min-width: 240px;" />
+          <button type="button" class="action-btn cycle-btn" onclick="submitConfigUpdate()">Update Config Key</button>
         </div>
-        <div class="panel-body">
-          <div class="table-wrapper" tabindex="0" role="region" aria-labelledby="settings-config-heading">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Category</th>
-                  <th scope="col">Parameter Key</th>
-                  <th scope="col">Value</th>
-                  <th scope="col">Description</th>
-                  <th scope="col" id="config-updated-ts-col-header">Updated (Local)</th>
-                  <th scope="col">Action</th>
-                </tr>
-              </thead>
-              <tbody id="config-tbody"></tbody>
-            </table>
-          </div>
+        <div class="table-scroll">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Config Key</th>
+                <th>Value (Fernet Redacted)</th>
+                <th>Type</th>
+                <th>Description</th>
+                <th>Updated (UTC)</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-system-config"></tbody>
+          </table>
         </div>
       </div>
     </section>
+
   </main>
 
-  <!-- Externalized to /static/app.js (CSP script-src 'self'): parseUtcToDate, formatLocalTimestamp, formatUtcTimeOfDayToLocal, updateTimezoneIndicators, switchDashboardPage, formatPnlPillHtml, escapeHtml, triggerDbBackup -->
-  <script src="/static/app.js"></script>
+  <!-- Toast Banner -->
+  <div class="toast-banner" id="toast-banner"></div>
+
+  <script src="/app.js"></script>
 </body>
 </html>

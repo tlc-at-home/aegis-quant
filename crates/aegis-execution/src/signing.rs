@@ -1,14 +1,54 @@
-//! Hyperliquid L1 EIP-712 / MessagePack / secp256k1 action signing (`aegis-execution::signing`).
+//! Hyperliquid L1 EIP-712 / MessagePack / secp256k1 action signing & wire formatting (`aegis-execution::signing`).
 
 pub use aegis_core::{
-    derive_evm_address_from_private_key, validate_private_key, verify_signer_matches_wallet,
+    derive_evm_address_from_private_key, validate_evm_address, validate_private_key,
+    verify_signer_matches_wallet,
 };
-use aegis_core::{round_dp, AegisError, Result};
+use aegis_core::{now_ms, round_dp, AegisError, OrderSide, Result};
+use aegis_db::DatabaseManager;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zeroize::Zeroizing;
+
+/// Hyperliquid L1 oracle price band margin (`±3.95%`), safely inside the exchange's `±4.0%`
+/// (`Price too far from oracle`) rejection boundary.
+pub const HL_ORACLE_BAND_PCT: f64 = 0.0395;
+
+static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicU64`
+/// high-water floor and optional persistence in MariaDB `system_config` (`hyperliquid_last_nonce`).
+pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
+    let wall_ms = now_ms().max(1) as u64;
+    let db_floor = db
+        .and_then(|d| d.load_config().ok())
+        .map(|cfg| cfg.get_i64("hyperliquid_last_nonce", 0).max(0) as u64)
+        .unwrap_or(0);
+    let candidate_floor = wall_ms.max(db_floor);
+    let mut prev = LAST_NONCE_HIGH_WATER.load(Ordering::SeqCst);
+    let next = loop {
+        let n = if candidate_floor > prev {
+            candidate_floor
+        } else {
+            prev.saturating_add(1)
+        };
+        match LAST_NONCE_HIGH_WATER.compare_exchange(prev, n, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break n,
+            Err(actual) => prev = actual,
+        }
+    };
+    if let Some(d) = db {
+        let _ = d.set_config_value(
+            "hyperliquid_last_nonce",
+            &next.to_string(),
+            Some("Monotonic Hyperliquid L1 EIP-712 action nonce"),
+        );
+    }
+    next
+}
 
 /// Formats a float into a wire string matching Hyperliquid's `float_to_wire` specification.
 pub fn float_to_wire(x: f64) -> String {
@@ -32,7 +72,52 @@ pub fn infer_sz_decimals_from_lot_step(lot_step_size: f64) -> u32 {
     (-lot_step_size.log10()).round().clamp(0.0, 6.0) as u32
 }
 
-/// Formats a perpetual limit price for Hyperliquid L1 wire transmission (`NH-9`):
+/// Infers the Hyperliquid L1 perpetual tick size from `mark_price` and `sz_decimals`
+/// (5 significant figures and at most `6 - sz_decimals` decimal places).
+pub fn infer_tick_size(mark_price: f64, sz_decimals: u32) -> f64 {
+    if !mark_price.is_finite() || mark_price <= 0.0 {
+        return 0.01;
+    }
+    let max_perp_decimals = 6usize.saturating_sub(sz_decimals as usize);
+    let mag = mark_price.log10().floor() as i32;
+    let sig_fig_decimals = (4 - mag).max(0) as usize;
+    let allowed_decimals = sig_fig_decimals.min(max_perp_decimals);
+    10_f64.powi(-(allowed_decimals as i32)).max(1e-8)
+}
+
+/// Snaps a price to the nearest valid tick increment.
+pub fn snap_to_tick(price: f64, tick_size: f64) -> f64 {
+    if !price.is_finite() || price <= 0.0 {
+        return 0.0;
+    }
+    let tick = if tick_size.is_finite() && tick_size > 0.0 {
+        tick_size
+    } else {
+        0.01
+    };
+    let decimals = (-tick.log10()).round().clamp(0.0, 8.0) as i32;
+    round_dp((price / tick).round() * tick, decimals)
+}
+
+/// Snaps an order size down (`floor == true`) or nearest to `lot_step_size` and `sz_decimals`.
+pub fn snap_to_lot(size: f64, lot_step_size: f64, sz_decimals: u32, floor: bool) -> f64 {
+    if !size.is_finite() || size <= 0.0 {
+        return 0.0;
+    }
+    let lot = if lot_step_size.is_finite() && lot_step_size > 0.0 {
+        lot_step_size
+    } else {
+        10_f64.powi(-(sz_decimals.min(6) as i32))
+    };
+    let snapped = if floor {
+        ((size / lot) + 1e-9).floor() * lot
+    } else {
+        (size / lot).round() * lot
+    };
+    round_dp(snapped.max(0.0), sz_decimals.min(8) as i32)
+}
+
+/// Formats a perpetual limit price for Hyperliquid L1 wire transmission:
 /// - Snaps to `tick_size` if `tick_size > 0`
 /// - Enforces at most 5 significant figures (with integer prices allowed for `>= 100_000`)
 /// - Enforces at most `6 - sz_decimals` decimal places for perpetuals
@@ -57,7 +142,7 @@ pub fn format_hl_wire_price(price: f64, tick_size: f64, sz_decimals: u32) -> Str
     float_to_wire(round_dp(p, allowed_decimals as i32))
 }
 
-/// Formats a perpetual order size (`s`) for Hyperliquid L1 wire transmission (`NH-9`):
+/// Formats a perpetual order size (`s`) for Hyperliquid L1 wire transmission:
 /// - Snaps to `lot_step_size` if `lot_step_size > 0`
 /// - Rounds to `sz_decimals` decimal places
 pub fn format_hl_wire_size(size: f64, lot_step_size: f64, sz_decimals: u32) -> String {
@@ -73,7 +158,7 @@ pub fn format_hl_wire_size(size: f64, lot_step_size: f64, sz_decimals: u32) -> S
     float_to_wire(round_dp(s, dec as i32))
 }
 
-/// Formats a perpetual order size (`s`) floored to `lot_step_size` (`HI-7`) so `reduce_only`
+/// Formats a perpetual order size (`s`) floored to `lot_step_size` so `reduce_only`
 /// orders never round above the remaining position quantity on the exchange.
 pub fn format_hl_wire_size_floor(size: f64, lot_step_size: f64, sz_decimals: u32) -> String {
     if !size.is_finite() || size <= 0.0 {
@@ -89,7 +174,7 @@ pub fn format_hl_wire_size_floor(size: f64, lot_step_size: f64, sz_decimals: u32
 }
 
 /// Derives a deterministic 128-bit `0x`-prefixed 32-hex-character Hyperliquid client order ID (`cloid`)
-/// from an internal `coid` string (`HI-1`, `ME-6`).
+/// from an internal `coid` string.
 pub fn derive_hl_cloid_hex(coid: &str) -> String {
     let hash = Keccak256::digest(coid.as_bytes());
     format!("0x{}", hex::encode(&hash[..16]))
@@ -183,6 +268,88 @@ pub struct SubAccountTransferAction {
     pub usd: i64,
 }
 
+/// Builds a Hyperliquid L1 limit `OrderWire` (`"Alo"`, `"Ioc"`, or `"Gtc"`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_limit_order_wire(
+    asset_index: u32,
+    is_buy: bool,
+    limit_price: f64,
+    quantity: f64,
+    tick_size: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    reduce_only: bool,
+    tif: &str,
+    client_order_id: Option<&str>,
+) -> OrderWire {
+    let p = format_hl_wire_price(limit_price, tick_size, sz_decimals);
+    let s = if reduce_only {
+        format_hl_wire_size_floor(quantity, lot_step_size, sz_decimals)
+    } else {
+        format_hl_wire_size(quantity, lot_step_size, sz_decimals)
+    };
+    let c = client_order_id
+        .filter(|id| !id.trim().is_empty())
+        .map(derive_hl_cloid_hex);
+    OrderWire {
+        a: asset_index,
+        b: is_buy,
+        p,
+        s,
+        r: reduce_only,
+        t: OrderTypeWire {
+            limit: Some(LimitOrderType {
+                tif: tif.to_string(),
+            }),
+            trigger: None,
+        },
+        c,
+    }
+}
+
+/// Builds a Hyperliquid L1 protective stop-loss trigger `OrderWire` (`reduce_only = true`, `tpsl = "sl"`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_protective_stop_order_wire(
+    asset_index: u32,
+    position_side: OrderSide,
+    quantity: f64,
+    trigger_price: f64,
+    tick_size: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    client_order_id: Option<&str>,
+) -> OrderWire {
+    // Protective stop closes the open position: SELL (b=false) for LONG, BUY (b=true) for SHORT
+    let stop_is_buy = !position_side.is_buy();
+    let trigger_px_str = format_hl_wire_price(trigger_price, tick_size, sz_decimals);
+    let limit_fallback = if stop_is_buy {
+        trigger_price * (1.0 + HL_ORACLE_BAND_PCT)
+    } else {
+        trigger_price * (1.0 - HL_ORACLE_BAND_PCT)
+    };
+    let limit_px_str = format_hl_wire_price(limit_fallback, tick_size, sz_decimals);
+    let sz_str = format_hl_wire_size_floor(quantity, lot_step_size, sz_decimals);
+    let c = client_order_id
+        .filter(|id| !id.trim().is_empty())
+        .map(derive_hl_cloid_hex);
+    OrderWire {
+        a: asset_index,
+        b: stop_is_buy,
+        p: limit_px_str,
+        s: sz_str,
+        r: true,
+        t: OrderTypeWire {
+            limit: None,
+            trigger: Some(TriggerOrderTypeWire {
+                is_market: true,
+                trigger_px: trigger_px_str,
+                tpsl: "sl".to_string(),
+            }),
+        },
+        c,
+    }
+}
+
 /// Computes the exact Hyperliquid MessagePack + Keccak256 `action_hash` / phantom agent connection ID.
 pub fn compute_l1_action_hash<T: Serialize>(
     action: &T,
@@ -219,7 +386,7 @@ pub fn compute_l1_action_hash<T: Serialize>(
 }
 
 /// Signs an L1 action payload using MessagePack binary serialization, action_hash, and EIP-712 structured data signing.
-/// Zeroizes intermediate normalized key strings and raw secret key bytes on drop (`S10`, `NM-11`).
+/// Zeroizes intermediate normalized key strings and raw secret key bytes on drop.
 pub fn sign_l1_action<T: Serialize>(
     private_key_hex: &str,
     action: &T,
@@ -305,4 +472,64 @@ pub fn sign_l1_action<T: Serialize>(
         "signer": signer_address,
         "connection_id": format!("0x{}", hex::encode(action_h)),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_eip712_sign_l1_action_and_protective_stop_wire() {
+        let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let order = build_limit_order_wire(
+            0,
+            true,
+            92450.5,
+            0.05,
+            0.5,
+            0.0001,
+            4,
+            false,
+            "Alo",
+            Some("v2-btc-long-1"),
+        );
+        assert_eq!(order.p, "92451");
+        assert_eq!(order.s, "0.05");
+        assert!(order.c.as_ref().unwrap().starts_with("0x"));
+        assert_eq!(order.c.as_ref().unwrap().len(), 34);
+
+        let stop = build_protective_stop_order_wire(
+            3,
+            OrderSide::Long,
+            14.528,
+            176.82,
+            0.01,
+            0.01,
+            2,
+            Some("sl-sol-1"),
+        );
+        assert!(!stop.b);
+        assert!(stop.r);
+        assert_eq!(stop.s, "14.52");
+        assert_eq!(stop.t.trigger.as_ref().unwrap().trigger_px, "176.82");
+
+        let action = OrderAction {
+            action_type: "order".to_string(),
+            orders: vec![order, stop],
+            grouping: "na".to_string(),
+        };
+        let n1 = next_monotonic_nonce(None);
+        let n2 = next_monotonic_nonce(None);
+        assert!(n2 > n1);
+
+        let sig = sign_l1_action(pk, &action, None, n1, None, false).unwrap();
+        assert_eq!(
+            sig["signer"].as_str().unwrap(),
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"
+        );
+        assert!(sig["r"].as_str().unwrap().starts_with("0x"));
+        assert!(sig["s"].as_str().unwrap().starts_with("0x"));
+        let v = sig["v"].as_u64().unwrap();
+        assert!(v == 27 || v == 28);
+    }
 }

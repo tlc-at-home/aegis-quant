@@ -1,6 +1,50 @@
-const fmtUsd = (n) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const fmtNum = (n, d = 4) => Number(n || 0).toFixed(d);
-const pad2 = (n) => String(n).padStart(2, '0');
+/* ============================================================================
+   AEGIS QUANT v2.0 — REAL-TIME MULTI-SLEEVE TERMINAL APPLICATION (app.js)
+   Backed by MariaDB 13.0 InnoDB, 7 SQL Views & 1s/2s SSE Stream
+   ============================================================================ */
+
+const state = {
+  health: null,
+  dashboard: null,
+  activeTab: 's1',
+  cooldowns: [],
+  lastTickMs: Date.now(),
+  sse: null,
+};
+
+function fmtUsd(val, decimals = 2) {
+  const num = Number(val || 0);
+  const sign = num < 0 ? '-' : '';
+  return (
+    sign +
+    '$' +
+    Math.abs(num).toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    })
+  );
+}
+
+function fmtPrice(px) {
+  const n = Number(px || 0);
+  if (n === 0) return '$0.00';
+  if (n >= 1000) return fmtUsd(n, 2);
+  if (n >= 1) return fmtUsd(n, 4);
+  return '$' + n.toFixed(6);
+}
+
+function fmtPct(fracOrPct, isFraction = true, decimals = 1) {
+  const v = Number(fracOrPct || 0) * (isFraction ? 100.0 : 1.0);
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(decimals)}%`;
+}
+
+function fmtUtcTime(tsMs) {
+  if (!tsMs || tsMs <= 0) return '—';
+  const d = new Date(Number(tsMs));
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+}
 
 function escapeHtml(raw) {
   if (raw === null || raw === undefined) return '';
@@ -12,1877 +56,937 @@ function escapeHtml(raw) {
     .replace(/'/g, '&#39;');
 }
 
-function resolveApiAuthToken() {
-  return '';
+function showToast(msg, isError = false) {
+  const el = document.getElementById('toast-banner');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.borderColor = isError
+    ? 'rgba(244, 63, 94, 0.7)'
+    : 'rgba(0, 242, 254, 0.6)';
+  el.classList.add('visible');
+  clearTimeout(window.__aegisToastTimer);
+  window.__aegisToastTimer = setTimeout(() => {
+    el.classList.remove('visible');
+  }, 4200);
 }
 
-function apiFetch(url, options = {}) {
+async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
-  const token = resolveApiAuthToken();
-  if (token && !headers.has('X-Aegis-Token') && !headers.has('Authorization')) {
-    headers.set('X-Aegis-Token', token);
-    headers.set('Authorization', `Bearer ${token}`);
+  if (!headers.has('Content-Type') && options.body) {
+    headers.set('Content-Type', 'application/json');
   }
-  if (!headers.has('X-Requested-With')) {
-    headers.set('X-Requested-With', 'XMLHttpRequest');
-  }
-  if (!headers.has('X-CSRF-Token')) {
-    headers.set('X-CSRF-Token', token || 'aegis-same-origin');
-  }
-  return fetch(url, { cache: 'no-store', ...options, credentials: 'same-origin', headers }).then((res) => {
-    if (res.status === 401) {
-      const authPanel = document.getElementById('auth-login-panel');
-      if (authPanel) authPanel.style.display = 'flex';
-    }
-    return res;
+  headers.set('X-Requested-With', 'XMLHttpRequest');
+  return fetch(url, {
+    cache: 'no-store',
+    credentials: 'same-origin',
+    ...options,
+    headers,
   });
 }
 
-async function submitAuthLogin() {
-  const inputEl = document.getElementById('auth-token-input');
-  const statusEl = document.getElementById('auth-login-status');
-  const token = inputEl ? inputEl.value.trim() : '';
-  if (!token) {
-    if (statusEl) statusEl.textContent = 'Token required';
-    return;
-  }
+/* ============================================================================
+   INTERACTIVE ACTIONS (RISK TIER, TELEGRAM TEST, CLOSE POSITION, CONFIG)
+   ============================================================================ */
+
+async function switchRiskTier(tier) {
   try {
-    const res = await fetch('/api/v1/auth/login', {
+    const res = await apiFetch('/api/v1/risk-tier', {
       method: 'POST',
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      body: JSON.stringify({ token })
+      body: JSON.stringify({ risk_tier: tier }),
     });
+    const data = await res.json();
     if (!res.ok) {
-      if (statusEl) statusEl.textContent = 'Invalid token';
+      showToast(`Risk tier update failed: ${data.detail || data.error || res.status}`, true);
       return;
     }
-    if (inputEl) inputEl.value = '';
-    if (statusEl) statusEl.textContent = '';
-    const authPanel = document.getElementById('auth-login-panel');
-    if (authPanel) authPanel.style.display = 'none';
-    await fetchInitialDashboard();
-    connectSSE();
+    updateRiskTierButtons(data.risk_tier || tier);
+    showToast(
+      `Switched active Risk Tier -> ${(data.risk_tier || tier).toUpperCase()} (${Number(
+        data.target_leverage_multiplier || 1.85
+      ).toFixed(2)}x)`
+    );
+    await refreshAll();
   } catch (err) {
-    if (statusEl) statusEl.textContent = 'Login request failed';
+    showToast(`Failed to switch Risk Tier: ${err.message}`, true);
   }
 }
 
-async function submitAuthLogout() {
+async function triggerTelegramTestAlert() {
+  const btn = document.getElementById('btn-telegram-test');
+  if (btn) btn.disabled = true;
   try {
-    await apiFetch('/api/v1/auth/logout', { method: 'POST' });
-    const authPanel = document.getElementById('auth-login-panel');
-    if (authPanel) authPanel.style.display = 'flex';
+    showToast('Dispatching formatted HTML Telegram test alert...');
+    const res = await apiFetch('/api/v1/alerts/test', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok || data.delivered === false) {
+      showToast(
+        `Telegram alert status: ${data.detail || data.error || 'Check bot credentials'}`,
+        true
+      );
+    } else {
+      showToast(
+        `Telegram HTML alert delivered (${data.provider || 'telegram'} · HTTP ${
+          data.http_status || 200
+        })`
+      );
+    }
+    await refreshAll();
+  } catch (err) {
+    showToast(`Telegram test request error: ${err.message}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
+  try {
+    const res = await apiFetch('/api/v1/positions/close', {
+      method: 'POST',
+      body: JSON.stringify({
+        position_id: Number(positionId),
+        symbol: String(symbol || ''),
+        cooldown_sec: applyCooldown ? 1800 : 0,
+        reason: 'WEB_UI_OPERATOR_CLOSE',
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(`Close failed: ${data.detail || data.error || res.status}`, true);
+      return;
+    }
+    showToast(
+      `Position/Order #${positionId} (${symbol}) closed (${data.status || 'CLOSED'})`
+    );
+    await refreshAll();
+  } catch (err) {
+    showToast(`Error closing position: ${err.message}`, true);
+  }
+}
+
+async function submitConfigUpdate() {
+  const keyEl = document.getElementById('cfg-key-input');
+  const valEl = document.getElementById('cfg-val-input');
+  const key = keyEl ? keyEl.value.trim() : '';
+  const val = valEl ? valEl.value.trim() : '';
+  if (!key) {
+    showToast('Please enter a config_key to update', true);
+    return;
+  }
+  try {
+    const res = await apiFetch('/api/v1/config', {
+      method: 'POST',
+      body: JSON.stringify({ config_key: key, config_value: val }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(`Config update failed: ${data.detail || data.error || res.status}`, true);
+      return;
+    }
+    showToast(`Updated system_config['${key}']`);
+    if (valEl) valEl.value = '';
+    await refreshAll();
+  } catch (err) {
+    showToast(`Config update error: ${err.message}`, true);
+  }
+}
+
+function switchExplorerTab(tabName) {
+  state.activeTab = tabName;
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.getAttribute('data-tab') === tabName);
+  });
+  document.querySelectorAll('.tab-pane').forEach((pane) => {
+    pane.classList.toggle('active', pane.id === `tab-pane-${tabName}`);
+  });
+  renderActiveExplorerTab();
+}
+
+function updateRiskTierButtons(activeTier) {
+  const norm = String(activeTier || 'extreme').toLowerCase();
+  document.querySelectorAll('.tier-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.getAttribute('data-tier') === norm);
+  });
+}
+
+/* ============================================================================
+   TOP TELEMETRY, COOLDOWNS, KPI CARDS & TABLES RENDERERS
+   ============================================================================ */
+
+function renderHealthAndTopBar(health, dash) {
+  const dbVer =
+    (health && health.mariadb_version) ||
+    (dash && dash.mariadb_version) ||
+    '13.0.2-MariaDB';
+  const viewsCount =
+    (health && health.views_healthy_count) ||
+    (dash && dash.views_healthy_count) ||
+    7;
+  const dbText = document.getElementById('mariadb-version-text');
+  if (dbText) {
+    dbText.textContent = `${dbVer} · ${viewsCount}/7 Views OK`;
+  }
+
+  const prioWatch = (dash && dash.v_priority_watchlist) || [];
+  const prioEl = document.getElementById('prio-watch-count');
+  if (prioEl) prioEl.textContent = String(prioWatch.length);
+
+  const exAssets = (dash && dash.exchange_assets) || [];
+  const scanEl = document.getElementById('scanner-asset-count');
+  if (scanEl) scanEl.textContent = `${exAssets.length} PERPS`;
+
+  const mode =
+    (dash && dash.execution_mode) ||
+    (health && health.execution_mode) ||
+    'TESTNET';
+  const modeBadge = document.getElementById('badge-exec-mode');
+  const modeText = document.getElementById('exec-mode-text');
+  if (modeText) modeText.textContent = mode.toUpperCase();
+  if (modeBadge) {
+    modeBadge.classList.toggle('mode-live', mode.toUpperCase() === 'LIVE');
+    modeBadge.classList.toggle('mode-testnet', mode.toUpperCase() !== 'LIVE');
+  }
+
+  const tier =
+    (dash && dash.risk_tier) ||
+    (dash && dash.snapshot && dash.snapshot.risk_tier) ||
+    (health && health.risk_tier) ||
+    'extreme';
+  updateRiskTierButtons(tier);
+}
+
+function renderCooldownStrip(cooldowns) {
+  state.cooldowns = (cooldowns || []).map((c) => ({
+    ...c,
+    local_fetched_ms: Date.now(),
+  }));
+  paintCooldownTimers();
+}
+
+function paintCooldownTimers() {
+  const countEl = document.getElementById('cooldown-count');
+  const container = document.getElementById('cooldown-pills-container');
+  if (!container) return;
+
+  const now = Date.now();
+  const active = (state.cooldowns || []).filter((c) => {
+    const exp = Number(c.expires_at_ms || 0);
+    return exp > now || Number(c.remaining_seconds || 0) > 0;
+  });
+
+  if (countEl) countEl.textContent = String(active.length);
+
+  if (active.length === 0) {
+    container.innerHTML =
+      '<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 11px;">No assets currently in post-stop / shock cooldown — all eligible perps unlocked for entry.</span>';
+    return;
+  }
+
+  container.innerHTML = active
+    .map((c) => {
+      const remSec = c.expires_at_ms
+        ? Math.max(0, Math.round((Number(c.expires_at_ms) - now) / 1000))
+        : Math.max(0, Number(c.remaining_seconds || 0));
+      const mins = Math.floor(remSec / 60);
+      const secs = remSec % 60;
+      const timerStr = `${mins}m ${String(secs).padStart(2, '0')}s`;
+      return `
+        <div class="cooldown-pill" title="${escapeHtml(c.reason || '')}">
+          <span class="cd-sym">${escapeHtml(c.symbol)}</span>
+          <span class="cd-type">${escapeHtml(c.cooldown_type)}</span>
+          <span class="cd-timer">${timerStr}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function renderKpiCards(dash) {
+  const snap = (dash && dash.snapshot) || {};
+  const totalEq = Number(snap.total_equity_usdc || 10000.0);
+  const availCash = Number(snap.available_cash_usdc ?? totalEq);
+  const reservedMargin = Number(snap.reserved_order_cash_usdc || 0.0);
+  const committedNotional = Number(snap.committed_notional_usdc || 0.0);
+  const netNotional = Number(snap.net_notional_usdc || 0.0);
+  const grossLev = Number(snap.gross_leverage_x || 0.0);
+  const netLev = Number(snap.net_leverage_x || 0.0);
+  const tier = String(snap.risk_tier || dash.risk_tier || 'extreme').toUpperCase();
+  const mult = Number(
+    snap.leverage_multiplier || dash.target_leverage_multiplier || 1.85
+  );
+  const breadth = Number(snap.market_breadth_bull ?? 0.5);
+  const beta = Number(snap.market_beta_exposure || 0.0);
+  const regime = String(snap.market_regime_label || 'NEUTRAL');
+
+  const setTxt = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  const setWidth = (id, pct) => {
+    const el = document.getElementById(id);
+    if (el) el.style.width = `${Math.max(0, Math.min(100, pct)).toFixed(1)}%`;
+  };
+
+  setTxt('kpi-total-equity', fmtUsd(totalEq));
+  const tierIcon =
+    tier === 'EXTREME'
+      ? '🔥'
+      : tier === 'AGGRESSIVE'
+      ? '⚡'
+      : tier === 'STANDARD'
+      ? '⚖️'
+      : '🛡️';
+  setTxt('kpi-tier-badge', `${tierIcon} ${tier} (${mult.toFixed(2)}x)`);
+  setTxt(
+    'kpi-eligible-coins',
+    `${Number(snap.eligible_coin_count || (dash.exchange_assets || []).length)} Eligible Perps`
+  );
+
+  const cashPct = totalEq > 0 ? (availCash / totalEq) * 100.0 : 100.0;
+  setTxt('kpi-avail-cash', fmtUsd(availCash));
+  setTxt('kpi-cash-pct', `${cashPct.toFixed(1)}% of Equity`);
+  setWidth('kpi-cash-meter', cashPct);
+
+  const resPct = totalEq > 0 ? (reservedMargin / totalEq) * 100.0 : 0.0;
+  setTxt('kpi-reserved-margin', fmtUsd(reservedMargin));
+  setTxt(
+    'kpi-working-count',
+    `${Number(
+      snap.working_order_count ?? (dash.v_assets_ordered || []).length
+    )} Working ALO Orders`
+  );
+  setWidth('kpi-reserved-meter', Math.min(100, resPct * 2));
+
+  const commPct = totalEq > 0 ? (committedNotional / totalEq) * 100.0 : 0.0;
+  setTxt('kpi-committed-notional', fmtUsd(committedNotional));
+  setTxt(
+    'kpi-open-counts',
+    `${Number(snap.open_long_count || 0)} Long · ${Number(
+      snap.open_short_count || 0
+    )} Short`
+  );
+  setTxt('kpi-net-notional', `Net: ${fmtUsd(netNotional)}`);
+  setWidth('kpi-committed-meter', Math.min(100, commPct));
+
+  setTxt('kpi-gross-leverage', `${grossLev.toFixed(2)}x`);
+  setTxt('kpi-net-leverage', `${netLev >= 0 ? '+' : ''}${netLev.toFixed(2)}x`);
+  setTxt('kpi-leverage-target', `Target: ${mult.toFixed(2)}x ${tier}`);
+  setWidth('kpi-leverage-meter', (grossLev / 2.5) * 100.0);
+
+  setTxt('kpi-regime-label', regime);
+  setTxt('kpi-breadth-pct', `Bull Breadth: ${(breadth * 100.0).toFixed(1)}%`);
+  setTxt('kpi-beta-exp', `Beta: ${beta >= 0 ? '+' : ''}${beta.toFixed(2)}`);
+  setWidth('kpi-breadth-meter', breadth * 100.0);
+
+  // Sleeve attribution stat boxes
+  setTxt('sleeve-s1-weight', fmtPct(snap.s1_gross_weight || 0, true, 1));
+  setTxt('sleeve-s2-weight', fmtPct(snap.s2_gross_weight || 0, true, 1));
+  setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight || 0, true, 1));
+}
+
+function renderPriorityAndWorkingTable(dash) {
+  const tbody = document.getElementById('tbody-priority-ordered');
+  if (!tbody) return;
+
+  const ordered = (dash && dash.v_assets_ordered) || [];
+  const prio = (dash && dash.v_priority_watchlist) || [];
+
+  const orderedByAsset = new Map();
+  ordered.forEach((o) => orderedByAsset.set(o.asset_id, o));
+
+  const rowsHtml = [];
+
+  // Render active WORKING orders first (from v_assets_ordered)
+  ordered.forEach((o) => {
+    const sideCls = String(o.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
+    rowsHtml.push(`
+      <tr>
+        <td><span class="sym-badge">${escapeHtml(o.symbol)}</span></td>
+        <td><span class="status-pill working">${escapeHtml(o.fsm_state || 'WORKING_ALO')}</span></td>
+        <td><span class="side-pill ${sideCls}">${escapeHtml(o.side)}</span></td>
+        <td>${fmtPrice(o.limit_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(o.mark_price)}</small></td>
+        <td style="color: var(--neon-cyan); font-weight: 700;">${Number(o.distance_from_mid_bps || 0).toFixed(2)} bps</td>
+        <td style="color: #fbbf24; font-weight: 700;">${fmtUsd(o.reserved_margin_usdc)}</td>
+        <td><span class="tab-count">${Number(o.chase_count || 0)}</span></td>
+        <td>
+          <button type="button" class="close-btn" onclick="closePositionOrOrder(${o.position_id}, '${escapeHtml(o.symbol)}', false)">Cancel</button>
+        </td>
+      </tr>
+    `);
+  });
+
+  // Render additional priority watched assets (from v_priority_watchlist) not already in WORKING rows
+  prio.forEach((p) => {
+    if (orderedByAsset.has(p.asset_id)) return;
+    const statusLabel = p.position_status || p.event_trigger || 'PRIORITY_WATCH';
+    const sideHtml = p.position_side
+      ? `<span class="side-pill ${String(p.position_side).toUpperCase() === 'SHORT' ? 'short' : 'long'}">${escapeHtml(p.position_side)}</span>`
+      : '<span class="pnl-flat">—</span>';
+    rowsHtml.push(`
+      <tr>
+        <td><span class="sym-badge">${escapeHtml(p.symbol)}</span></td>
+        <td><span class="status-pill watch">${escapeHtml(statusLabel)}</span></td>
+        <td>${sideHtml}</td>
+        <td>${fmtPrice(p.entry_price || p.mark_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(p.mark_price)}</small></td>
+        <td>0.00 bps</td>
+        <td>${fmtUsd(p.reserved_margin_usdc || p.committed_notional_usdc || 0)}</td>
+        <td><span class="tab-count">1s</span></td>
+        <td>
+          ${
+            p.position_id
+              ? `<button type="button" class="close-btn" onclick="closePositionOrOrder(${p.position_id}, '${escapeHtml(p.symbol)}', true)">Close</button>`
+              : '<span class="pnl-flat">Watching</span>'
+          }
+        </td>
+      </tr>
+    `);
+  });
+
+  if (rowsHtml.length === 0) {
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+          No active WORKING orders or priority triggers — monitoring 1s watchlist stream...
+        </td>
+      </tr>
+    `;
+  } else {
+    tbody.innerHTML = rowsHtml.join('');
+  }
+}
+
+function renderOpenHoldingsTable(dash) {
+  const tbody = document.getElementById('tbody-assets-held');
+  const pill = document.getElementById('held-count-pill');
+  if (!tbody) return;
+
+  const held = (dash && dash.v_assets_held) || [];
+  if (pill) pill.textContent = `${held.length} OPEN`;
+
+  if (held.length === 0) {
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+          No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  tbody.innerHTML = held
+    .map((h) => {
+      const sideCls = String(h.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
+      const upnl = Number(h.unrealized_pnl_usdc || 0);
+      const pnlCls = upnl > 0.001 ? 'pnl-pos' : upnl < -0.001 ? 'pnl-neg' : 'pnl-flat';
+      const stopDist =
+        h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
+          ? `${Number(h.stop_distance_pct).toFixed(2)}%`
+          : '—';
+      return `
+        <tr>
+          <td><span class="sym-badge">${escapeHtml(h.symbol)}</span></td>
+          <td><span class="side-pill ${sideCls}">${escapeHtml(h.side)}</span></td>
+          <td style="font-weight: 700; color: #fff;">${fmtUsd(h.committed_notional_usdc)} <small style="color:var(--text-muted)">(${fmtPct(h.portfolio_weight || 0)})</small></td>
+          <td>${fmtPrice(h.entry_price)} <small style="color:var(--neon-cyan)">→ ${fmtPrice(h.mark_price)}</small></td>
+          <td>${fmtPrice(h.protective_stop_px)} <small style="color:#fbbf24">(${stopDist})</small></td>
+          <td class="${pnlCls}">${upnl >= 0 ? '+' : ''}${fmtUsd(upnl)}</td>
+          <td>
+            <div class="sleeve-mix-pills">
+              <span class="sp-tag s1" title="Sleeve 1 Carry-Momentum">S1 ${fmtPct(h.s1_weight_contrib || 0)}</span>
+              <span class="sp-tag s2" title="Sleeve 2 Trend-Breakout">S2 ${fmtPct(h.s2_weight_contrib || 0)}</span>
+              <span class="sp-tag s3" title="Sleeve 3 Event-Reversion">S3 ${fmtPct(h.s3_weight_contrib || 0)}</span>
+            </div>
+          </td>
+          <td>
+            <button type="button" class="close-btn" onclick="closePositionOrOrder(${h.position_id}, '${escapeHtml(h.symbol)}', true)">Close</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+}
+
+function renderActiveExplorerTab() {
+  const dash = state.dashboard;
+  if (!dash) return;
+
+  const query = (document.getElementById('scanner-search-input')?.value || '')
+    .trim()
+    .toUpperCase();
+  const matchSym = (item) =>
+    !query ||
+    String(item.symbol || '')
+      .toUpperCase()
+      .includes(query) ||
+    String(item.coin || '')
+      .toUpperCase()
+      .includes(query);
+
+  const s1 = (dash.v_assets_sleeve_s1 || []).filter(matchSym);
+  const s2 = (dash.v_assets_sleeve_s2 || []).filter(matchSym);
+  const s3 = (dash.v_assets_sleeve_s3 || []).filter(matchSym);
+  const scanner = (dash.exchange_assets || []).filter(matchSym);
+  const audits = dash.order_audit || [];
+  const logs = dash.telemetry_logs || [];
+  const configs = dash.system_config || [];
+
+  const setCnt = (id, n) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = String(n);
+  };
+  setCnt('tab-count-s1', s1.length);
+  setCnt('tab-count-s2', s2.length);
+  setCnt('tab-count-s3', s3.length);
+  setCnt('tab-count-scanner', scanner.length);
+  setCnt('tab-count-console', audits.length + logs.length);
+
+  // Render S1
+  const tbS1 = document.getElementById('tbody-sleeve-s1');
+  if (tbS1) {
+    tbS1.innerHTML =
+      s1
+        .slice(0, 60)
+        .map((r) => {
+          const wCls =
+            r.w_s1_carry_mom > 0.001
+              ? 'pnl-pos'
+              : r.w_s1_carry_mom < -0.001
+              ? 'pnl-neg'
+              : 'pnl-flat';
+          return `
+            <tr>
+              <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
+              <td>${fmtPrice(r.mark_price)}</td>
+              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td>${(Number(r.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
+              <td class="${r.funding_apr_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
+              <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
+              <td>${Number(r.market_beta || 1).toFixed(2)}</td>
+              <td>${Number(r.s1_mom_score || 0).toFixed(3)}</td>
+              <td>${Number(r.s1_carry_score || 0).toFixed(3)}</td>
+              <td class="${wCls}">${fmtPct(r.w_s1_carry_mom)}</td>
+              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+            </tr>
+          `;
+        })
+        .join('') ||
+      '<tr><td colspan="11" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 1 assets matching filter.</td></tr>';
+  }
+
+  // Render S2
+  const tbS2 = document.getElementById('tbody-sleeve-s2');
+  if (tbS2) {
+    tbS2.innerHTML =
+      s2
+        .slice(0, 60)
+        .map((r) => {
+          const align = Number(r.s2_trend_alignment || 0);
+          const alignBadge =
+            align > 0
+              ? '<span class="side-pill long">BULL (+1)</span>'
+              : align < 0
+              ? '<span class="side-pill short">BEAR (-1)</span>'
+              : '<span class="pnl-flat">NEUTRAL (0)</span>';
+          const wCls =
+            r.w_s2_trend_breakout > 0.001
+              ? 'pnl-pos'
+              : r.w_s2_trend_breakout < -0.001
+              ? 'pnl-neg'
+              : 'pnl-flat';
+          return `
+            <tr>
+              <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
+              <td>${fmtPrice(r.mark_price)}</td>
+              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
+              <td>${alignBadge}</td>
+              <td style="color:var(--neon-cyan);font-weight:700;">${Number(r.s2_vol_surge_ratio || 1).toFixed(2)}x</td>
+              <td>${r.event_trigger ? `<span class="status-pill watch">${escapeHtml(r.event_trigger)}</span>` : '—'}</td>
+              <td class="${wCls}">${fmtPct(r.w_s2_trend_breakout)}</td>
+              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+              <td>${fmtPct(r.current_weight)}</td>
+            </tr>
+          `;
+        })
+        .join('') ||
+      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 2 assets matching filter.</td></tr>';
+  }
+
+  // Render S3
+  const tbS3 = document.getElementById('tbody-sleeve-s3');
+  if (tbS3) {
+    tbS3.innerHTML =
+      s3
+        .slice(0, 60)
+        .map((r) => {
+          const wCls =
+            r.w_s3_event_reversion > 0.001
+              ? 'pnl-pos'
+              : r.w_s3_event_reversion < -0.001
+              ? 'pnl-neg'
+              : 'pnl-flat';
+          return `
+            <tr>
+              <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
+              <td>${fmtPrice(r.mark_price)}</td>
+              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td>${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
+              <td style="color:#fbbf24;font-weight:700;">${Number(r.s3_funding_zscore || 0).toFixed(2)}σ</td>
+              <td>${Number(r.s3_flush_atr_mult || 0).toFixed(2)} ATR</td>
+              <td>${r.event_trigger ? `<span class="status-pill working">${escapeHtml(r.event_trigger)}</span>` : '—'}</td>
+              <td class="${wCls}">${fmtPct(r.w_s3_event_reversion)}</td>
+              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+              <td>${fmtPct(r.current_weight)}</td>
+            </tr>
+          `;
+        })
+        .join('') ||
+      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 3 assets matching filter.</td></tr>';
+  }
+
+  // Render 150+ Perp Scanner
+  const tbScan = document.getElementById('tbody-perp-scanner');
+  if (tbScan) {
+    tbScan.innerHTML =
+      scanner
+        .slice(0, 200)
+        .map((a) => {
+          const tags = [];
+          if (a.is_priority_watched)
+            tags.push('<span class="sp-tag s1">1s PRIORITY</span>');
+          if (a.is_core_eligible)
+            tags.push('<span class="sp-tag s2">CORE S1/S2</span>');
+          if (a.is_event_eligible)
+            tags.push('<span class="sp-tag s3">EVENT S3</span>');
+          return `
+            <tr>
+              <td><span class="sym-badge">${escapeHtml(a.symbol)}</span></td>
+              <td>${escapeHtml(a.coin)}</td>
+              <td>${fmtPrice(a.mark_price)}</td>
+              <td>${fmtPrice(a.mid_price)}</td>
+              <td>${fmtPrice(a.oracle_price)}</td>
+              <td>${fmtUsd(a.day_volume_usdc, 0)}</td>
+              <td>${fmtUsd(a.open_interest_usdc, 0)}</td>
+              <td>${(Number(a.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
+              <td>${Number(a.max_leverage || 20).toFixed(0)}x</td>
+              <td><div class="sleeve-mix-pills">${tags.join('') || '<span class="pnl-flat">SCAN</span>'}</div></td>
+            </tr>
+          `;
+        })
+        .join('') ||
+      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Hyperliquid perp assets matching search filter.</td></tr>';
+  }
+
+  // Render Order Audit & Telemetry Console
+  const tbAudit = document.getElementById('tbody-order-audit');
+  if (tbAudit) {
+    tbAudit.innerHTML =
+      audits
+        .slice(0, 40)
+        .map((a) => {
+          const sideCls =
+            String(a.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
+          return `
+            <tr>
+              <td>${fmtUtcTime(a.created_at_ms)}</td>
+              <td><code>${escapeHtml(a.client_order_id)}</code></td>
+              <td><span class="side-pill ${sideCls}">${escapeHtml(a.side)}</span></td>
+              <td><span class="status-pill watch">${escapeHtml(a.from_state)} → ${escapeHtml(a.to_state)}</span></td>
+              <td>${fmtPrice(a.limit_price)} / ${fmtPrice(a.avg_fill_price)}</td>
+              <td>${fmtUsd(a.reserved_usdc)} / <strong style="color:#34d399">${fmtUsd(a.committed_usdc)}</strong></td>
+              <td>${escapeHtml(a.reason)}</td>
+            </tr>
+          `;
+        })
+        .join('') ||
+      '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--text-muted)">No order audit state transitions recorded yet.</td></tr>';
+  }
+
+  const logStream = document.getElementById('telemetry-log-container');
+  if (logStream) {
+    logStream.innerHTML =
+      logs
+        .slice(0, 40)
+        .map((l) => {
+          const lvl = String(l.level || 'INFO').toUpperCase();
+          return `
+            <div class="t-log-item">
+              <div class="t-log-meta">
+                <span><span class="t-log-lvl ${escapeHtml(lvl)}">${escapeHtml(lvl)}</span> · <strong>${escapeHtml(l.component)}</strong></span>
+                <span>${fmtUtcTime(l.created_at_ms)}</span>
+              </div>
+              <div style="color: var(--text-primary);">${escapeHtml(l.message)}</div>
+            </div>
+          `;
+        })
+        .join('') ||
+      '<div style="color:var(--text-muted);padding:12px;">No telemetry events recorded yet.</div>';
+  }
+
+  // Render System Config Vault
+  const tbCfg = document.getElementById('tbody-system-config');
+  if (tbCfg) {
+    tbCfg.innerHTML = configs
+      .filter(
+        (c) =>
+          !query ||
+          String(c.config_key || '')
+            .toUpperCase()
+            .includes(query)
+      )
+      .map(
+        (c) => `
+        <tr>
+          <td><strong style="color:var(--neon-cyan)">${escapeHtml(c.config_key)}</strong></td>
+          <td><code>${escapeHtml(c.config_value)}</code></td>
+          <td><span class="tab-count">${escapeHtml(c.value_type)}</span></td>
+          <td style="color:var(--text-muted)">${escapeHtml(c.description)}</td>
+          <td>${fmtUtcTime(c.updated_at_ms)}</td>
+        </tr>
+      `
+      )
+      .join('');
+  }
+}
+
+/* ============================================================================
+   DUAL HTML5 CANVAS CHARTS (RETINA HIGH-DPI)
+   ============================================================================ */
+
+function prepareCanvas(canvasId) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(280, rect.width);
+  const h = Math.max(150, rect.height);
+  if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function drawEquityCurveCanvas(dash) {
+  const prep = prepareCanvas('equity-curve-canvas');
+  if (!prep) return;
+  const { ctx, w, h } = prep;
+  ctx.clearRect(0, 0, w, h);
+
+  let history = (dash && dash.snapshots_history) || [];
+  if (history.length === 0 && dash && dash.snapshot) {
+    history = [dash.snapshot];
+  }
+  if (history.length === 1) {
+    history = [
+      { ...history[0], created_at_ms: history[0].created_at_ms - 60000 },
+      history[0],
+    ];
+  }
+
+  const padL = 64;
+  const padR = 18;
+  const padT = 16;
+  const padB = 26;
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+
+  const vals = [];
+  history.forEach((pt) => {
+    vals.push(Number(pt.total_equity_usdc || 10000));
+    vals.push(Number(pt.committed_notional_usdc || 0));
+    vals.push(Number(pt.reserved_order_cash_usdc || 0));
+  });
+  const minVal = 0;
+  const maxVal = Math.max(10500, ...vals) * 1.06;
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)';
+  ctx.lineWidth = 1;
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.fillStyle = '#64748b';
+  for (let i = 0; i <= 4; i++) {
+    const frac = i / 4;
+    const y = padT + plotH - frac * plotH;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    const labelVal = minVal + frac * (maxVal - minVal);
+    ctx.fillText('$' + Math.round(labelVal).toLocaleString(), 6, y + 3);
+  }
+
+  const xFor = (idx) =>
+    padL + (history.length <= 1 ? 0 : (idx / (history.length - 1)) * plotW);
+  const yFor = (v) =>
+    padT + plotH - ((v - minVal) / Math.max(1, maxVal - minVal)) * plotH;
+
+  const drawSeries = (getter, strokeColor, fillTop) => {
+    ctx.beginPath();
+    history.forEach((pt, idx) => {
+      const x = xFor(idx);
+      const y = yFor(getter(pt));
+      if (idx === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = 2.2;
+    ctx.stroke();
+
+    if (fillTop) {
+      const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+      grad.addColorStop(0, fillTop);
+      grad.addColorStop(1, 'rgba(6, 9, 17, 0.0)');
+      ctx.lineTo(xFor(history.length - 1), padT + plotH);
+      ctx.lineTo(xFor(0), padT + plotH);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+    }
+  };
+
+  // 1. Total Equity Curve (Neon Cyan)
+  drawSeries(
+    (p) => Number(p.total_equity_usdc || 10000),
+    '#00f2fe',
+    'rgba(0, 242, 254, 0.22)'
+  );
+  // 2. Committed Notional Curve (Neon Emerald)
+  drawSeries(
+    (p) => Number(p.committed_notional_usdc || 0),
+    '#10b981',
+    'rgba(16, 185, 129, 0.16)'
+  );
+  // 3. Reserved Working Order Margin (Neon Amber)
+  drawSeries(
+    (p) => Number(p.reserved_order_cash_usdc || 0),
+    '#f59e0b',
+    null
+  );
+}
+
+function drawSleeveAttributionCanvas(dash) {
+  const prep = prepareCanvas('sleeve-attr-canvas');
+  if (!prep) return;
+  const { ctx, w, h } = prep;
+  ctx.clearRect(0, 0, w, h);
+
+  const snap = (dash && dash.snapshot) || {};
+  const s1 = Math.abs(Number(snap.s1_gross_weight || 0.45));
+  const s2 = Math.abs(Number(snap.s2_gross_weight || 0.40));
+  const s3 = Math.abs(Number(snap.s3_gross_weight || 0.25));
+
+  const bars = [
+    { label: 'S1 CARRY-MOM', val: s1, budget: 0.45, color: '#00f2fe' },
+    { label: 'S2 TREND-BRK', val: s2, budget: 0.40, color: '#10b981' },
+    { label: 'S3 EVENT-REV', val: s3, budget: 0.25, color: '#f59e0b' },
+  ];
+
+  const padL = 108;
+  const padR = 54;
+  const rowH = Math.floor((h - 20) / 3);
+  const maxW = Math.max(1.0, s1 + s2 + s3, 0.85);
+
+  ctx.font = '700 11px "JetBrains Mono", monospace';
+
+  bars.forEach((b, i) => {
+    const yCenter = 16 + i * rowH + rowH / 2;
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(b.label, 8, yCenter + 4);
+
+    const trackW = Math.max(20, w - padL - padR);
+    const barH = 14;
+    const barY = yCenter - barH / 2;
+
+    // Background track
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
+    ctx.fillRect(padL, barY, trackW, barH);
+
+    // Active weight fill
+    const fillW = Math.min(trackW, (b.val / maxW) * trackW);
+    ctx.fillStyle = b.color;
+    ctx.fillRect(padL, barY, Math.max(4, fillW), barH);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`${(b.val * 100).toFixed(1)}%`, padL + trackW + 8, yCenter + 4);
+  });
+}
+
+/* ============================================================================
+   DATA FETCHING & 1s/2s SSE STREAM WIRING
+   ============================================================================ */
+
+function applyDashboardPayload(dash) {
+  if (!dash) return;
+  state.dashboard = dash;
+  renderHealthAndTopBar(state.health, dash);
+  renderCooldownStrip(dash.v_assets_in_cooldown || []);
+  renderKpiCards(dash);
+  renderPriorityAndWorkingTable(dash);
+  renderOpenHoldingsTable(dash);
+  renderActiveExplorerTab();
+  drawEquityCurveCanvas(dash);
+  drawSleeveAttributionCanvas(dash);
+}
+
+async function refreshAll() {
+  try {
+    const [hRes, dRes] = await Promise.all([
+      apiFetch('/api/v1/health'),
+      apiFetch('/api/v1/dashboard'),
+    ]);
+    if (hRes.ok) {
+      state.health = await hRes.json();
+    }
+    if (dRes.ok) {
+      const dash = await dRes.json();
+      applyDashboardPayload(dash);
+    }
+  } catch (err) {
+    console.warn('Dashboard refresh warning:', err);
+  }
+}
+
+function connectSSE() {
+  if (state.sse) {
+    try {
+      state.sse.close();
+    } catch (_) {}
+  }
+  try {
+    const es = new EventSource('/api/v1/stream');
+    state.sse = es;
+    es.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data && (data.snapshot || data.v_assets_held)) {
+          applyDashboardPayload(data);
+        }
+      } catch (_) {}
+    };
+    es.onerror = () => {
+      // Fallback polling handles transient reconnects cleanly
+    };
   } catch (_) {}
 }
 
-let activePage = 'overall';
-let cachedConfigRows = [];
-let activeConfigCategory = 'all';
-let cachedPondUniverse = [];
-let latestSettlingTimeUtc = '00:05';
-
-// Browser Local Timezone Parsing & Formatting Utilities
-function parseUtcToDate(raw) {
-  if (raw === null || raw === undefined) return null;
-  if (raw instanceof Date) {
-    return Number.isNaN(raw.getTime()) ? null : raw;
+window.addEventListener('resize', () => {
+  if (state.dashboard) {
+    drawEquityCurveCanvas(state.dashboard);
+    drawSleeveAttributionCanvas(state.dashboard);
   }
-  if (typeof raw === 'number') {
-    if (!Number.isFinite(raw) || raw < 1e9) return null;
-    const ms = raw < 1e11 ? raw * 1000 : raw;
-    const dt = new Date(ms);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  const str = String(raw).trim();
-  if (!str) return null;
-  if (/^\d{10,13}$/.test(str)) {
-    const num = Number(str);
-    if (!Number.isFinite(num) || num < 1e9) return null;
-    const ms = str.length === 10 ? num * 1000 : num;
-    const dt = new Date(ms);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  const cleaned = str.replace(/(\d{2}:\d{2}:\d{2})\.\d+/, '$1');
-  const norm = cleaned.replace(/^(\d{4})\/(\d{2})\/(\d{2})(?=[ T]|$)/, '$1-$2-$3');
-  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(norm)) {
-    const withSec = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}$/.test(norm) ? `${norm}:00` : norm;
-    const isoUtc = withSec.replace(' ', 'T') + 'Z';
-    const dt = new Date(isoUtc);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})$/i.test(norm)) {
-    const normalizedOffset = norm
-      .replace(' ', 'T')
-      .replace(/([+-]\d{2})(\d{2})$/, '$1:$2')
-      .replace(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(Z|[+-]\d{2}:\d{2})$/i, '$1:00$2');
-    const dt = new Date(normalizedOffset);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  if (/^\d{4}-\d{2}-\d{2}$/.test(norm)) {
-    const dt = new Date(`${norm}T00:00:00Z`);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-  return null;
-}
-
-function formatLocalTimestamp(raw, fallback = '-') {
-  if (raw === null || raw === undefined) return fallback;
-  const str = String(raw).trim();
-  if (!str) return fallback;
-  const dt = parseUtcToDate(raw);
-  if (!dt) return str.replace(/(\d{2}:\d{2}:\d{2})\.\d+/, '$1');
-  const yyyy = dt.getFullYear();
-  const mm = pad2(dt.getMonth() + 1);
-  const dd = pad2(dt.getDate());
-  const hh = pad2(dt.getHours());
-  const mi = pad2(dt.getMinutes());
-  const ss = pad2(dt.getSeconds());
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
-}
-
-function formatUtcTimeOfDayToLocal(utcHhMm) {
-  const raw = String(utcHhMm || '00:05').trim();
-  const m = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (!m) return raw;
-  const hhUtc = Number(m[1]);
-  const mmUtc = Number(m[2]);
-  const ssUtc = Number(m[3] || 0);
-  if (hhUtc < 0 || hhUtc > 23 || mmUtc < 0 || mmUtc > 59 || ssUtc < 0 || ssUtc > 59) {
-    return raw;
-  }
-  const now = new Date();
-  const dt = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    hhUtc,
-    mmUtc,
-    ssUtc
-  ));
-  if (Number.isNaN(dt.getTime())) return raw;
-  const hh = pad2(dt.getHours());
-  const mi = pad2(dt.getMinutes());
-  if (m[3] !== undefined && ssUtc > 0) {
-    return `${hh}:${mi}:${pad2(dt.getSeconds())}`;
-  }
-  return `${hh}:${mi}`;
-}
-
-function replaceUtcTimestampsInText(text) {
-  if (typeof text !== 'string') return String(text ?? '');
-  return text
-    .replace(
-      /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?/g,
-      (match) => formatLocalTimestamp(match, match)
-    )
-    .replace(
-      /\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*UTC\b/gi,
-      (full, hStr, mStr, sStr) => {
-        const hh = Number(hStr), mm = Number(mStr), ss = Number(sStr || 0);
-        if (hh > 23 || mm > 59 || ss > 59) return full;
-        const hhmm = sStr !== undefined ? `${hStr}:${mStr}:${sStr}` : `${hStr}:${mStr}`;
-        return `${formatUtcTimeOfDayToLocal(hhmm)} Local`;
-      }
-    );
-}
-
-function formatConfigDescriptionWithLocalTime(c, overrideVal) {
-  const baseDesc = c.description || '';
-  const key = c.config_key || '';
-  const rawVal = overrideVal !== undefined
-    ? overrideVal
-    : (Object.prototype.hasOwnProperty.call(dirtyConfigInputs, key) ? dirtyConfigInputs[key] : (c.config_value ?? ''));
-  const val = String(rawVal).trim();
-  if (!val) return baseDesc;
-  if (['settling_time_utc', 'settling_window_open_utc', 'settling_window_close_utc'].includes(key)) {
-    const m = val.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-    if (!m) return baseDesc;
-    const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3] || 0);
-    if (hh > 23 || mm > 59 || ss > 59) return baseDesc;
-    return `${baseDesc} (Local: ${formatUtcTimeOfDayToLocal(val)})`;
-  }
-  if (key === 'equity_baseline_reset_at' || key.endsWith('_at')) {
-    const dt = parseUtcToDate(val);
-    if (!dt) return baseDesc;
-    return `${baseDesc} (Local: ${formatLocalTimestamp(dt)})`;
-  }
-  return baseDesc;
-}
-
-function updateTimezoneIndicators(utcHhMm = latestSettlingTimeUtc) {
-  latestSettlingTimeUtc = utcHhMm || '00:05';
-  const localSettleStr = formatUtcTimeOfDayToLocal(latestSettlingTimeUtc);
-
-  const headerSettleEl = document.getElementById('header-settle-time');
-  if (headerSettleEl) headerSettleEl.textContent = `${localSettleStr} Local`;
-
-  const settleBadgeEl = document.getElementById('pp50-settle-time-badge');
-  if (settleBadgeEl) settleBadgeEl.textContent = `${localSettleStr} Local`;
-
-  const settleHeadingEl = document.getElementById('settle-table-heading');
-  if (settleHeadingEl) {
-    settleHeadingEl.textContent = `Daily ${localSettleStr} Local 50/50 Settling Ledger (\`book_transfers\` — Invariant F5 Idle-Only Transfer)`;
-  }
-
-  const dryBtn = document.getElementById('btn-settle-dry');
-  if (dryBtn && !dryBtn.disabled) {
-    dryBtn.textContent = `Dry-Run ${localSettleStr} Settle`;
-  }
-}
-
-// Accessible 4-Page Tab Switcher with Keyboard Navigation & URL Hash Sync
-function switchDashboardPage(pageId) {
-  const validPages = ['overall', 'pit', 'pond', 'settings'];
-  if (!validPages.includes(pageId)) pageId = 'overall';
-  activePage = pageId;
-
-  validPages.forEach((id) => {
-    const btn = document.getElementById(`tab-btn-${id}`);
-    const panel = document.getElementById(`page-${id}`);
-    const isSelected = id === pageId;
-    if (btn) {
-      btn.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-      btn.setAttribute('tabindex', isSelected ? '0' : '-1');
-    }
-    if (panel) {
-      if (isSelected) {
-        panel.removeAttribute('hidden');
-      } else {
-        panel.setAttribute('hidden', '');
-      }
-    }
-  });
-
-  if (history.replaceState) {
-    history.replaceState(null, '', `#${pageId}`);
-  }
-  if (pageId === 'settings' && typeof fetchDbBackups === 'function') {
-    fetchDbBackups();
-  }
-}
-
-// Keyboard Left/Right/Home/End navigation for ARIA tablist + DOM event bindings
-document.addEventListener('DOMContentLoaded', () => {
-  updateTimezoneIndicators('00:05');
-  const tabIds = ['overall', 'pit', 'pond', 'settings'];
-  const tablist = document.querySelector('[role="tablist"]');
-  if (tablist) {
-    tablist.addEventListener('keydown', (e) => {
-      const curIdx = tabIds.indexOf(activePage);
-      let nextIdx = curIdx;
-      if (e.key === 'ArrowRight') nextIdx = (curIdx + 1) % tabIds.length;
-      else if (e.key === 'ArrowLeft') nextIdx = (curIdx - 1 + tabIds.length) % tabIds.length;
-      else if (e.key === 'Home') nextIdx = 0;
-      else if (e.key === 'End') nextIdx = tabIds.length - 1;
-      else return;
-      e.preventDefault();
-      const nextId = tabIds[nextIdx];
-      switchDashboardPage(nextId);
-      const btn = document.getElementById(`tab-btn-${nextId}`);
-      if (btn) btn.focus();
-    });
-  }
-
-  document.querySelectorAll('.page-tab[data-page]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      switchDashboardPage(btn.getAttribute('data-page'));
-    });
-  });
-
-  document.querySelectorAll('[data-switch-page]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      switchDashboardPage(btn.getAttribute('data-switch-page'));
-    });
-  });
-
-  const bindClick = (id, fn) => {
-    const el = document.getElementById(id);
-    if (el) el.addEventListener('click', fn);
-  };
-  bindClick('btn-cycle', triggerCycle);
-  bindClick('btn-eval-signals', triggerCycle);
-  bindClick('btn-pond-scan', triggerPondScan);
-  bindClick('btn-pond-scan-inline', triggerPondScan);
-  bindClick('btn-pond-scan-table', triggerPondScan);
-  bindClick('btn-settle-dry', () => triggerSettleRun(true));
-  bindClick('btn-settle-sim', () => triggerSettleRun(true));
-  bindClick('btn-settle-live', () => triggerSettleRun(false));
-  bindClick('btn-calibrate', triggerCalibration);
-  bindClick('btn-backtest', triggerBacktest);
-  bindClick('btn-backup-db', triggerDbBackup);
-  bindClick('btn-backup-db-settings', triggerDbBackup);
-  bindClick('btn-refresh-backups', fetchDbBackups);
-  bindClick('btn-cancel-db-restore', closeDbRestoreModal);
-  bindClick('btn-confirm-db-restore', confirmDbRestore);
-  bindClick('btn-auth-login', submitAuthLogin);
-  bindClick('btn-close-report', () => {
-    const rp = document.getElementById('report-panel');
-    if (rp) rp.style.display = 'none';
-  });
-  bindClick('btn-apply-capital-baseline', applyCapitalBaseline);
-  bindClick('btn-sync-wallet', syncWalletEquity);
-  bindClick('btn-save-credentials', saveCredentials);
-  bindClick('btn-save-tg-alerts', saveTelegramAlerts);
-  bindClick('btn-send-test-alert', sendTestAlert);
-
-  const authInput = document.getElementById('auth-token-input');
-  if (authInput) {
-    authInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') submitAuthLogin();
-    });
-  }
-
-  const pondPolicySelect = document.getElementById('pond-policy-select');
-  if (pondPolicySelect) {
-    pondPolicySelect.addEventListener('change', (e) => updatePondDirectionPolicy(e.target.value));
-  }
-
-  const pondFilterInput = document.getElementById('pond-universe-filter');
-  if (pondFilterInput) {
-    pondFilterInput.addEventListener('input', () => renderPondUniverseTable());
-  }
-
-  document.querySelectorAll('[data-dirty-field]').forEach((el) => {
-    el.addEventListener('input', () => markFormFieldDirty(el.getAttribute('data-dirty-field')));
-  });
-
-  const credModeSelect = document.getElementById('cred-mode');
-  if (credModeSelect) {
-    credModeSelect.addEventListener('change', onRoutingModeChange);
-  }
-
-  document.querySelectorAll('#config-filter-pill-bar [data-cat]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      setConfigCategoryFilter(btn.getAttribute('data-cat'), btn);
-    });
-  });
-
-  const cfgSearchInput = document.getElementById('config-search-input');
-  if (cfgSearchInput) {
-    cfgSearchInput.addEventListener('input', () => renderConfigTable());
-  }
-
-  const cfgTbody = document.getElementById('config-tbody');
-  if (cfgTbody) {
-    cfgTbody.addEventListener('input', (e) => {
-      const target = e.target;
-      if (target && target.matches && target.matches('input[data-config-input]')) {
-        const key = target.getAttribute('data-config-input');
-        if (key) onConfigInputEdit(key, target.value);
-      }
-    });
-    cfgTbody.addEventListener('click', (e) => {
-      const btn = e.target && e.target.closest ? e.target.closest('button[data-save-config]') : null;
-      if (btn) {
-        const key = btn.getAttribute('data-save-config');
-        if (key) saveConfig(key);
-      }
-    });
-  }
-
-  const openTradesTbody = document.getElementById('open-trades-tbody');
-  if (openTradesTbody) {
-    openTradesTbody.addEventListener('click', (e) => {
-      const btn = e.target && e.target.closest ? e.target.closest('button[data-take-profit-trade]') : null;
-      if (btn) {
-        const tradeId = Number(btn.getAttribute('data-take-profit-trade'));
-        const symbol = btn.getAttribute('data-trade-symbol') || '';
-        if (Number.isFinite(tradeId) && tradeId > 0) {
-          triggerTakeProfit(tradeId, symbol, btn);
-        }
-      }
-    });
-  }
-
-  const pondCellsTbody = document.getElementById('pond-cells-tbody');
-  if (pondCellsTbody) {
-    pondCellsTbody.addEventListener('click', (e) => {
-      const btn = e.target && e.target.closest ? e.target.closest('button[data-take-profit-cell]') : null;
-      if (btn) {
-        const cellId = Number(btn.getAttribute('data-take-profit-cell'));
-        const symbol = btn.getAttribute('data-cell-symbol') || '';
-        if (Number.isFinite(cellId) && cellId > 0) {
-          triggerPondCellTakeProfit(cellId, symbol, btn);
-        }
-      }
-    });
-  }
-
-  const dbBackupsTbody = document.getElementById('db-backups-tbody');
-  if (dbBackupsTbody) {
-    dbBackupsTbody.addEventListener('click', (e) => {
-      const copyBtn = e.target && e.target.closest ? e.target.closest('button[data-copy-restore-cli]') : null;
-      if (copyBtn) {
-        const cliCmd = copyBtn.getAttribute('data-copy-restore-cli') || '';
-        if (cliCmd && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-          navigator.clipboard.writeText(cliCmd).then(() => {
-            copyBtn.textContent = 'Copied!';
-            setTimeout(() => { copyBtn.textContent = 'Copy CLI Command'; }, 1500);
-          }).catch(() => {});
-        }
-        return;
-      }
-      const restoreBtn = e.target && e.target.closest ? e.target.closest('button[data-open-restore-modal]') : null;
-      if (restoreBtn && !restoreBtn.disabled) {
-        const filename = restoreBtn.getAttribute('data-open-restore-modal') || '';
-        if (filename) {
-          openDbRestoreModal(filename);
-        }
-      }
-    });
-  }
-
-  const restoreConfirmInput = document.getElementById('db-restore-confirm-input');
-  if (restoreConfirmInput) {
-    restoreConfirmInput.addEventListener('input', (e) => {
-      const confirmBtn = document.getElementById('btn-confirm-db-restore');
-      if (confirmBtn) {
-        confirmBtn.disabled = !(e.target.value.trim() === 'RESTORE' && Boolean(pendingRestoreToken));
-      }
-    });
-  }
-
-  const hash = (window.location.hash || '').replace('#', '').toLowerCase();
-  if (['overall', 'pit', 'pond', 'settings'].includes(hash)) {
-    switchDashboardPage(hash);
-  }
-
-  fetchInitialDashboard();
-  fetchDbBackups();
-  connectSSE();
 });
 
-// Colour-Coded PnL Helpers (Color + Directional Icon + Sign)
-function getPnlClass(val) {
-  const num = Number(val || 0);
-  if (num > 0.0001) return 'pnl-pos';
-  if (num < -0.0001) return 'pnl-neg';
-  return 'pnl-flat';
-}
-
-function formatPnlText(val, pctOpt = null) {
-  const num = Number(val || 0);
-  const absStr = fmtUsd(Math.abs(num));
-  let prefix = '• ';
-  let sign = '';
-  if (num > 0.0001) { prefix = '▲ '; sign = '+'; }
-  else if (num < -0.0001) { prefix = '▼ '; sign = '-'; }
-  const pctSuffix = pctOpt !== null && pctOpt !== undefined
-    ? ` (${num > 0.0001 ? '+' : ''}${Number(pctOpt).toFixed(2)}%)`
-    : '';
-  return `${prefix}${sign}${absStr}${pctSuffix}`;
-}
-
-function formatPnlPillHtml(val, pctOpt = null) {
-  const cls = getPnlClass(val);
-  return `<span class="pnl-pill ${cls}">${formatPnlText(val, pctOpt)}</span>`;
-}
-
-function applyPnlElement(el, val, pctOpt = null, isPill = false) {
-  if (!el) return;
-  const cls = getPnlClass(val);
-  el.classList.remove('pnl-pos', 'pnl-neg', 'pnl-flat');
-  el.classList.add(cls);
-  if (isPill) el.classList.add('pnl-pill');
-  el.textContent = formatPnlText(val, pctOpt);
-}
-
-function applyKpiCardPnlBorder(cardEl, val) {
-  if (!cardEl) return;
-  cardEl.classList.remove('kpi-pnl-pos', 'kpi-pnl-neg');
-  const num = Number(val || 0);
-  if (num > 0.0001) cardEl.classList.add('kpi-pnl-pos');
-  else if (num < -0.0001) cardEl.classList.add('kpi-pnl-neg');
-}
-
-function regimeBadgeClass(regime) {
-  if (regime === 'BULL') return 'badge badge-bull';
-  if (regime === 'BEAR') return 'badge badge-bear';
-  return 'badge badge-chop';
-}
-
-function computeRowPnl(row, isOpen = true) {
-  if (!row) return 0;
-  return isOpen
-    ? ((row.unrealized_pnl_usdc || 0) + (row.realized_pnl_usdc || 0) + (row.funding_accrued_usdc || 0) - (row.fees_paid_usdc || 0))
-    : (row.realized_pnl_usdc || 0);
-}
-
-function renderDashboard(data) {
-  if (!data) return;
-  const p = data.portfolio || {};
-  const pond = data.pond || {};
-  const pp50 = data.pp50 || {};
-
-  // 1. OVERALL STATUS & NAV BAR PNL PILLS
-  const totalEq = pp50.total_platform_equity_usdc ?? ((p.pit_equity_usdc || 5000) + (pond.pond_equity_usdc || 5000));
-  const initEq = pp50.platform_initial_equity_usdc ?? 10000;
-  const totalPnl = pp50.total_platform_pnl_usdc ?? ((p.total_pnl_usdc || 0) + (pond.total_pnl_usdc || 0));
-  const totalPnlPct = pp50.total_platform_pnl_pct ?? ((totalPnl / Math.max(initEq, 1)) * 100);
-
-  const pitInfo = pp50.pit || {};
-  const pondInfo = pp50.pond || {};
-  const pitEq = pitInfo.equity_usdc ?? p.pit_equity_usdc ?? 5000;
-  const pitPnl = pitInfo.total_pnl_usdc ?? p.total_pnl_usdc ?? 0;
-  const pitPnlPct = pitInfo.total_pnl_pct ?? p.total_pnl_pct ?? 0;
-  const pitRealized = pitInfo.realized_pnl_usdc ?? p.realized_pnl_usdc ?? 0;
-  const pitUnrealized = (pitInfo.unrealized_pnl_usdc ?? p.unrealized_pnl_usdc ?? 0) + (pitInfo.funding_accrued_usdc ?? p.funding_accrued_usdc ?? 0);
-
-  const pondEq = pondInfo.equity_usdc ?? pond.pond_equity_usdc ?? 5000;
-  const pondPnl = pondInfo.total_pnl_usdc ?? pond.total_pnl_usdc ?? 0;
-  const pondPnlPct = pondInfo.total_pnl_pct ?? pond.total_pnl_pct ?? 0;
-  const pondRealized = pondInfo.realized_pnl_usdc ?? pond.realized_pnl_usdc ?? 0;
-  const pondUnrealized = (pondInfo.unrealized_pnl_usdc ?? pond.unrealized_pnl_usdc ?? 0) + (pondInfo.funding_accrued_usdc ?? pond.funding_accrued_usdc ?? 0);
-
-  applyPnlElement(document.getElementById('nav-total-pnl-pill'), totalPnl, totalPnlPct, true);
-  applyPnlElement(document.getElementById('nav-pit-pnl-pill'), pitPnl, null, true);
-  applyPnlElement(document.getElementById('nav-pond-pnl-pill'), pondPnl, null, true);
-
-  document.getElementById('pp50-total-equity').textContent = fmtUsd(totalEq);
-  document.getElementById('pp50-initial-equity').textContent = fmtUsd(initEq);
-  document.getElementById('pp50-target-each').textContent = fmtUsd(totalEq * 0.5);
-
-  applyPnlElement(document.getElementById('pp50-total-pnl'), totalPnl);
-  applyPnlElement(document.getElementById('pp50-total-pnl-badge'), totalPnl, totalPnlPct, true);
-  applyKpiCardPnlBorder(document.getElementById('pp50-card-total-pnl'), totalPnl);
-
-  applyPnlElement(document.getElementById('pp50-pit-pnl'), pitPnl);
-  applyPnlElement(document.getElementById('pp50-pit-pnl-badge'), pitPnl, pitPnlPct, true);
-  applyKpiCardPnlBorder(document.getElementById('pp50-card-pit-pnl'), pitPnl);
-  document.getElementById('pp50-pit-equity').textContent = fmtUsd(pitEq);
-  const pitShare = pp50.pit_share_pct ?? 50.0;
-  const pondShare = pp50.pond_share_pct ?? 50.0;
-  document.getElementById('pp50-pit-share').textContent = `${Number(pitShare).toFixed(1)}%`;
-
-  applyPnlElement(document.getElementById('pp50-pond-pnl'), pondPnl);
-  applyPnlElement(document.getElementById('pp50-pond-pnl-badge'), pondPnl, pondPnlPct, true);
-  applyKpiCardPnlBorder(document.getElementById('pp50-card-pond-pnl'), pondPnl);
-  document.getElementById('pp50-pond-equity').textContent = fmtUsd(pondEq);
-  document.getElementById('pp50-pond-share').textContent = `${Number(pondShare).toFixed(1)}%`;
-
-  const driftBps = Number(pp50.drift_bps || 0);
-  const deadbandBps = Number(pp50.deadband_bps || 50);
-  document.getElementById('pp50-drift-bps').textContent = `${driftBps.toFixed(1)} bps`;
-  document.getElementById('pp50-deadband-bps').textContent = `${deadbandBps.toFixed(1)} bps`;
-  updateTimezoneIndicators(pp50.settling_time_utc || '00:05');
-  const settleStatusEl = document.getElementById('pp50-settle-status-label');
-  if (pp50.platform_pp50_halt) {
-    settleStatusEl.textContent = 'HALTED';
-    settleStatusEl.className = 'text-red';
-  } else if (pp50.settling_in_progress) {
-    settleStatusEl.textContent = 'SETTLING';
-    settleStatusEl.className = 'text-amber';
-  } else if (driftBps > deadbandBps) {
-    settleStatusEl.textContent = 'REBALANCE DUE';
-    settleStatusEl.className = 'text-amber';
-  } else {
-    settleStatusEl.textContent = 'WITHIN DEAD-BAND';
-    settleStatusEl.className = 'text-green';
-  }
-  document.getElementById('pp50-split-bar-pit').style.width = `${Math.max(5, Math.min(95, pitShare))}%`;
-  document.getElementById('pp50-split-bar-pond').style.width = `${Math.max(5, Math.min(95, pondShare))}%`;
-
-  const pitRegime = pitInfo.hmm_regime || p.hmm_regime || 'CHOP';
-  const ovPitRegime = document.getElementById('overall-pit-regime-badge');
-  ovPitRegime.textContent = pitRegime;
-  ovPitRegime.className = regimeBadgeClass(pitRegime);
-  document.getElementById('overall-pit-equity').innerHTML = `${fmtUsd(pitEq)} <span class="text-muted" style="font-size:11px;">/ ${fmtUsd(pitInfo.initial_capital_usdc || 5000)}</span>`;
-  applyPnlElement(document.getElementById('overall-pit-total-pnl'), pitPnl, pitPnlPct);
-  applyPnlElement(document.getElementById('overall-pit-realized-pnl'), pitRealized);
-  applyPnlElement(document.getElementById('overall-pit-unrealized-pnl'), pitUnrealized);
-  document.getElementById('overall-pit-positions').textContent = `${pitInfo.open_positions || 0} pos | ${fmtUsd(pitInfo.heat_usdc || 0)} heat`;
-  document.getElementById('overall-pit-leverage').textContent = `${fmtUsd(pitInfo.deployed_notional_usdc || 0)} (${fmtNum(pitInfo.gross_leverage || 0, 2)}x)`;
-
-  const pondPolicy = pondInfo.direction_policy || pond.direction_policy || 'both';
-  document.getElementById('overall-pond-policy-badge').textContent = `POLICY: ${pondPolicy.toUpperCase()}`;
-  document.getElementById('overall-pond-equity').innerHTML = `${fmtUsd(pondEq)} <span class="text-muted" style="font-size:11px;">/ ${fmtUsd(pondInfo.initial_capital_usdc || 5000)}</span>`;
-  applyPnlElement(document.getElementById('overall-pond-total-pnl'), pondPnl, pondPnlPct);
-  applyPnlElement(document.getElementById('overall-pond-realized-pnl'), pondRealized);
-  applyPnlElement(document.getElementById('overall-pond-unrealized-pnl'), pondUnrealized);
-  document.getElementById('overall-pond-cells').textContent = `${pond.open_cells_count || 0} / ${pond.max_concurrent_cells || 8} cells | ${fmtUsd(pond.open_heat_usdc || 0)} / ${fmtUsd(pond.max_open_heat_usdc || 200)} heat`;
-  document.getElementById('overall-pond-leverage').textContent = `${fmtUsd(pond.deployed_notional_usdc || 0)} (${fmtNum(pond.gross_leverage || 0, 2)}x)`;
-
-  if (pp50.latest_snapshot) {
-    const snap = pp50.latest_snapshot;
-    const snapTs = formatLocalTimestamp(snap.timestamp_ms || snap.created_at, '');
-    if (snap.report_line) {
-      const localizedLine = replaceUtcTimestampsInText(snap.report_line);
-      document.getElementById('pp50-report-line').textContent =
-        (snapTs && !localizedLine.includes(snapTs)) ? `[${snapTs}] ${localizedLine}` : localizedLine;
-    } else {
-      const prefix = snapTs ? `[${snapTs}] ` : '';
-      document.getElementById('pp50-report-line').textContent =
-        `${prefix}PP-50 D+${pad2(snap.snapshot_id || 1)} | platform ${fmtUsd(snap.platform_equity_usdc ?? totalEq)} (${totalPnlPct >= 0 ? '+' : ''}${Number(totalPnlPct).toFixed(2)}%) | PIT ${fmtUsd(snap.pit_equity_usdc ?? pitEq)} | POND ${fmtUsd(snap.pond_equity_usdc ?? pondEq)} | drift ${fmtNum(snap.drift_bps ?? driftBps, 1)} bps | settle: ${replaceUtcTimestampsInText(snap.settling_status || 'READY')} | cells: ${snap.pond_open_cells ?? (pond.open_cells_count || 0)}/${pond.max_concurrent_cells || 8} (heat ${fmtUsd(pond.open_heat_usdc || 0)}) | champion ${pond.active_champion_id || 'NPS-01'}`;
-    }
-  }
-
-  const transfers = pp50.recent_transfers || [];
-  const settleTbody = document.getElementById('settle-transfers-tbody');
-  if (transfers.length === 0) {
-    settleTbody.innerHTML = '<tr><td colspan="12" class="text-muted">No settling transfers recorded yet. Click "Simulate Dry-Run Settle" to test the 5-phase protocol.</td></tr>';
-  } else {
-    settleTbody.innerHTML = transfers.map((tr) => {
-      const stClass = (tr.status === 'COMPLETED' || tr.status === 'NO_ACTION_WITHIN_DEADBAND') ? 'text-green' : (tr.status === 'PARTIAL_IDLE_CAPPED' ? 'text-amber' : 'text-blue');
-      const prePit = tr.from_book === 'PIT' ? tr.pre_from_usdc : (tr.to_book === 'PIT' ? tr.pre_to_usdc : tr.pre_from_usdc);
-      const prePond = tr.from_book === 'POND' ? tr.pre_from_usdc : (tr.to_book === 'POND' ? tr.pre_to_usdc : tr.pre_to_usdc);
-      const preTotal = (Number(prePit || 0) + Number(prePond || 0));
-      const execAmt = tr.amount_usdc ?? tr.executed_transfer_usdc ?? 0;
-      const reqAmt = tr.required_transfer_usdc ?? execAmt;
-      const driftVal = tr.drift_bps_before ?? tr.drift_bps ?? 0;
-      const rawTs = (tr.created_at && (!tr.settle_date || String(tr.settle_date).length <= 10))
-        ? tr.created_at
-        : (tr.settle_date || tr.created_at);
-      return `
-        <tr>
-          <td>#${escapeHtml(tr.transfer_id)}</td>
-          <td>${escapeHtml(formatLocalTimestamp(rawTs))}</td>
-          <td><strong>${escapeHtml(tr.from_book)} → ${escapeHtml(tr.to_book)}</strong></td>
-          <td>${fmtUsd(prePit)}</td>
-          <td>${fmtUsd(prePond)}</td>
-          <td>${fmtUsd(preTotal)}</td>
-          <td>${fmtNum(driftVal, 1)} bps</td>
-          <td>${fmtUsd(reqAmt)}</td>
-          <td>${fmtUsd(tr.available_idle_usdc ?? execAmt)}</td>
-          <td class="text-green"><strong>${fmtUsd(execAmt)}</strong></td>
-          <td class="${(tr.blocked_remainder_usdc || 0) > 0 ? 'text-amber' : 'text-muted'}">${fmtUsd(tr.blocked_remainder_usdc || 0)}</td>
-          <td class="${stClass}"><strong>${escapeHtml(tr.status)}</strong></td>
-        </tr>
-      `;
-    }).join('');
-  }
-
-  // 2. PIT (BOOK A) PAGE
-  const pitInitCap = p.pit_initial_capital_usdc || 5000;
-  document.getElementById('kpi-equity').textContent = fmtUsd(pitEq);
-  const deltaEl = document.getElementById('kpi-equity-delta');
-  applyPnlElement(deltaEl, pitPnl, pitPnlPct);
-  document.getElementById('kpi-cash').textContent = `Idle USDC: ${fmtUsd(p.pit_idle_usdc ?? p.available_cash_usdc)} | Baseline: ${fmtUsd(pitInitCap)}`;
-
-  applyPnlElement(document.getElementById('pit-kpi-total-pnl'), pitPnl);
-  applyPnlElement(document.getElementById('pit-kpi-pnl-pct-badge'), pitPnl, pitPnlPct, true);
-  applyPnlElement(document.getElementById('pit-kpi-realized-pnl'), pitRealized);
-  applyPnlElement(document.getElementById('pit-kpi-unrealized-pnl'), pitUnrealized);
-  applyKpiCardPnlBorder(document.getElementById('pit-card-total-pnl'), pitPnl);
-
-  const maxHeat = p.max_portfolio_heat_usdc || (pitInitCap * 0.04);
-  const heatPct = (p.portfolio_heat_pct || 0) * 100;
-  document.getElementById('kpi-heat').innerHTML = `${fmtUsd(p.portfolio_heat_usdc)} <span style="font-size:13px; color:var(--text-muted)">/ ${fmtUsd(maxHeat)}</span>`;
-  document.getElementById('kpi-heat-pct').textContent = fmtNum(heatPct, 2) + '%';
-  document.getElementById('bar-heat').style.width = Math.min(100, (heatPct / 4.0) * 100) + '%';
-
-  const lev = p.gross_leverage || 0;
-  document.getElementById('kpi-leverage').textContent = fmtNum(lev, 2) + 'x';
-  document.getElementById('kpi-notional').textContent = fmtUsd(p.deployed_notional_usdc);
-  document.getElementById('bar-leverage').style.width = Math.min(100, (lev / 1.5) * 100) + '%';
-
-  document.getElementById('kpi-basis').textContent = fmtUsd(p.basis_harvest_notional_usdc);
-  applyPnlElement(document.getElementById('kpi-yield'), p.accrued_yield_usdc || 0);
-
-  const regime = p.hmm_regime || 'CHOP';
-  const regBadge = document.getElementById('kpi-regime');
-  regBadge.textContent = regime;
-  regBadge.className = regimeBadgeClass(regime);
-  document.getElementById('prob-bull').textContent = fmtNum((p.prob_bull || 0) * 100, 1) + '%';
-  document.getElementById('prob-bear').textContent = fmtNum((p.prob_bear || 0) * 100, 1) + '%';
-  document.getElementById('prob-chop').textContent = fmtNum((p.prob_chop || 0) * 100, 1) + '%';
-
-  const sigs = data.signals || [];
-  const latestSigTs = sigs.length > 0 ? (sigs[0].timestamp_ms || sigs[0].created_at) : null;
-  document.getElementById('signals-count').textContent = latestSigTs
-    ? `${sigs.length} Pairs | Eval: ${formatLocalTimestamp(latestSigTs)}`
-    : `${sigs.length} Pairs`;
-  const sigTbody = document.getElementById('signals-tbody');
-  sigTbody.innerHTML = sigs.map(s => {
-    const execSym = s.symbol || s.exec_symbol || '-';
-    const tf = s.timeframe || '4h';
-    const ensScore = s.ensemble_score ?? s.blended_conviction ?? 0;
-    const entryThresh = s.entry_threshold ?? 0.65;
-    const volTier = s.volatility_tier || `RANK_${s.rs_rank || 1}`;
-    const ensClass = ensScore >= entryThresh ? 'text-green' : (ensScore <= -entryThresh ? 'text-red' : 'text-muted');
-    let actionBadge = `<span class="text-muted">${escapeHtml(s.signal_action)}</span>`;
-    if (s.signal_action === 'LONG_ENTRY') actionBadge = `<span class="badge badge-bull">LONG_ENTRY</span>`;
-    else if (s.signal_action === 'SHORT_ENTRY') actionBadge = `<span class="badge badge-bear">SHORT_ENTRY</span>`;
-    else if (s.signal_action === 'BASIS_HARVEST') actionBadge = `<span class="badge badge-info">BASIS_HARVEST</span>`;
-
-    return `
-      <tr>
-        <td><strong>${escapeHtml(execSym)}</strong></td>
-        <td class="text-muted">${escapeHtml(s.synth_symbol || '-')}</td>
-        <td>${escapeHtml(tf)}</td>
-        <td class="${s.mace_score >= 0 ? 'text-green' : 'text-red'}">${s.mace_score >= 0 ? '+' : ''}${fmtNum(s.mace_score, 3)}</td>
-        <td class="${s.snr_score >= 0 ? 'text-green' : 'text-red'}">${s.snr_score >= 0 ? '+' : ''}${fmtNum(s.snr_score, 3)}</td>
-        <td class="${ensClass}"><strong>${ensScore >= 0 ? '+' : ''}${fmtNum(ensScore, 3)}</strong></td>
-        <td>±${fmtNum(entryThresh, 2)}</td>
-        <td>${escapeHtml(volTier)}</td>
-        <td>${fmtNum((s.funding_rate_hourly || 0) * 100, 4)}%</td>
-        <td>${actionBadge}</td>
-      </tr>
-    `;
-  }).join('');
-
-  const openTrades = data.open_trades || [];
-  document.getElementById('open-trades-count').textContent = `${openTrades.length} OPEN`;
-  const openTbody = document.getElementById('open-trades-tbody');
-  if (openTrades.length === 0) {
-    openTbody.innerHTML = `<tr><td colspan="10" class="text-muted" style="text-align:center; padding:16px;">No active perpetual positions open</td></tr>`;
-  } else {
-    openTbody.innerHTML = openTrades.map(t => {
-      const upnl = computeRowPnl(t, true);
-      return `
-        <tr>
-          <td><strong>${escapeHtml(t.symbol)}</strong></td>
-          <td><span class="badge ${t.side === 'LONG' ? 'badge-bull' : 'badge-bear'}">${escapeHtml(t.side)}</span></td>
-          <td>${fmtUsd(t.notional_usdc)}</td>
-          <td>${fmtNum(t.entry_price, 4)}</td>
-          <td>${fmtNum(t.current_price, 4)}</td>
-          <td class="text-amber">${fmtNum(t.chandelier_stop_price, 4)}</td>
-          <td>${fmtUsd(t.risk_budget_usdc)}</td>
-          <td>${formatPnlPillHtml(upnl)}</td>
-          <td class="text-muted">${escapeHtml(formatLocalTimestamp(t.opened_at))}</td>
-          <td><button type="button" class="success" style="padding: 3px 8px; font-size: 11px;" data-take-profit-trade="${escapeHtml(t.trade_id)}" data-trade-symbol="${escapeHtml(t.symbol)}" title="Manually take profit / close position #${escapeHtml(t.trade_id)}">Take Profit</button></td>
-        </tr>
-      `;
-    }).join('');
-  }
-
-  const recentTrades = data.recent_trades || [];
-  const recTbody = document.getElementById('recent-trades-tbody');
-  recTbody.innerHTML = recentTrades.slice(0, 20).map(t => {
-    const tradeState = t.status || t.state || 'CLOSED';
-    const pnl = computeRowPnl(t, tradeState === 'OPEN');
-    const fPnl = t.funding_accrued_usdc || 0;
-    const tradeTs = tradeState === 'OPEN' ? t.opened_at : (t.closed_at || t.opened_at);
-    return `
-      <tr>
-        <td>#${escapeHtml(t.trade_id)}</td>
-        <td class="text-muted">${escapeHtml(formatLocalTimestamp(tradeTs))}</td>
-        <td><strong>${escapeHtml(t.symbol)}</strong></td>
-        <td><span class="${t.side === 'LONG' ? 'text-green' : 'text-red'}">${escapeHtml(t.side)}</span></td>
-        <td>${escapeHtml(replaceUtcTimestampsInText(t.exit_reason || tradeState))}</td>
-        <td>${fmtNum(t.entry_price, 4)}</td>
-        <td>${t.exit_price ? fmtNum(t.exit_price, 4) : fmtNum(t.current_price, 4)}</td>
-        <td>${fmtUsd(t.notional_usdc)}</td>
-        <td class="${getPnlClass(fPnl)}">${formatPnlText(fPnl)}</td>
-        <td>${formatPnlPillHtml(pnl)}</td>
-      </tr>
-    `;
-  }).join('');
-
-  // 3. POND (BOOK B) PAGE
-  const pondInitCap = pondInfo.initial_capital_usdc ?? pond.initial_capital_usdc ?? (initEq * 0.5);
-  document.getElementById('pond-kpi-equity').textContent = fmtUsd(pondEq);
-  document.getElementById('pond-kpi-idle').textContent = fmtUsd(pond.idle_usdc ?? pondEq);
-  const pondBaselineEl = document.getElementById('pond-kpi-baseline');
-  if (pondBaselineEl) pondBaselineEl.textContent = fmtUsd(pondInitCap);
-  document.getElementById('pond-champion-badge').textContent = pond.active_champion_id || 'NPS-01';
-
-  applyPnlElement(document.getElementById('pond-kpi-total-pnl'), pondPnl);
-  applyPnlElement(document.getElementById('pond-kpi-pnl-pct-badge'), pondPnl, pondPnlPct, true);
-  applyPnlElement(document.getElementById('pond-kpi-realized-pnl'), pondRealized);
-  applyPnlElement(document.getElementById('pond-kpi-unrealized-pnl'), pond.unrealized_pnl_usdc || 0);
-  applyKpiCardPnlBorder(document.getElementById('pond-card-total-pnl'), pondPnl);
-
-  const pondFunding = pond.funding_accrued_usdc || 0;
-  applyPnlElement(document.getElementById('pond-kpi-funding-pnl'), pondFunding);
-  applyKpiCardPnlBorder(document.getElementById('pond-card-funding-pnl'), pondFunding);
-  document.getElementById('pond-kpi-short-calls').textContent = pond.short_call_count ?? 0;
-  document.getElementById('pond-kpi-short-puts').textContent = pond.short_put_count ?? 0;
-
-  const pondOpenCount = pond.open_cells_count ?? 0;
-  const pondMaxCells = pond.max_concurrent_cells ?? 8;
-  const pondHeat = pond.open_heat_usdc ?? 0;
-  const pondMaxHeat = pond.max_open_heat_usdc ?? 200;
-  document.getElementById('pond-kpi-cells').textContent = `${pondOpenCount} / ${pondMaxCells} Cells`;
-  document.getElementById('pond-open-cells-badge').textContent = `${pondOpenCount} OPEN`;
-  document.getElementById('pond-kpi-heat').innerHTML = `${fmtUsd(pondHeat)} <span style="font-size:13px; color:var(--text-muted)">/ ${fmtUsd(pondMaxHeat)}</span>`;
-  document.getElementById('pond-bar-heat').style.width = `${Math.min(100, (pondHeat / Math.max(pondMaxHeat, 1)) * 100)}%`;
-
-  const pondLev = pond.gross_leverage ?? 0;
-  const pondMaxLev = pond.max_gross_leverage ?? 1.5;
-  document.getElementById('pond-kpi-leverage').textContent = `${fmtNum(pondLev, 2)}x`;
-  document.getElementById('pond-kpi-notional').textContent = fmtUsd(pond.deployed_notional_usdc || 0);
-  document.getElementById('pond-bar-leverage').style.width = `${Math.min(100, (pondLev / Math.max(pondMaxLev, 0.1)) * 100)}%`;
-
-  document.getElementById('pond-kpi-policy-badge').textContent = pondPolicy;
-  const policySelect = document.getElementById('pond-policy-select');
-  if (policySelect && document.activeElement !== policySelect) {
-    policySelect.value = pondPolicy;
-  }
-
-  const recentCells = pond.recent_cells || [];
-  const pondCellsTbody = document.getElementById('pond-cells-tbody');
-  if (recentCells.length === 0) {
-    pondCellsTbody.innerHTML = '<tr><td colspan="18" class="text-muted">No Pond cells opened yet. Click "Run Hourly S-Cycle Scan" to evaluate the 80-coin universe.</td></tr>';
-  } else {
-    pondCellsTbody.innerHTML = recentCells.map((c) => {
-      const isOpen = ['OPEN', 'TRAILED', 'ARMED'].includes(c.state);
-      const netPnl = computeRowPnl(c, isOpen);
-      const sideBadge = c.option_analogue === 'SHORT_CALL'
-        ? '<span class="badge badge-bear">SHORT / SHORT_CALL</span>'
-        : '<span class="badge badge-bull">LONG / SHORT_PUT</span>';
-      const stateBadge = isOpen
-        ? `<span class="badge badge-info">${escapeHtml(c.state)}</span>`
-        : `<span class="badge">${escapeHtml(c.state)}</span>`;
-      const cellTs = isOpen ? (c.opened_at || c.updated_at) : (c.closed_at || c.updated_at || c.opened_at);
-      const exitFallback = isOpen
-        ? 'HOLDING'
-        : (c.cooldown_until ? `COOLDOWN (${formatLocalTimestamp(c.cooldown_until)})` : '-');
-      const reasonText = c.exit_reason ? replaceUtcTimestampsInText(c.exit_reason) : exitFallback;
-      const exitLabel = escapeHtml(`${c.exit_tier ? `T${c.exit_tier}: ` : ''}${reasonText}`);
-      const actionCell = isOpen
-        ? `<button type="button" class="success" style="padding: 3px 8px; font-size: 11px;" data-take-profit-cell="${escapeHtml(c.cell_id)}" data-cell-symbol="${escapeHtml(c.symbol)}" title="Manually take profit / close Pond cell #${escapeHtml(c.cell_id)}">Take Profit</button>`
-        : '<span class="text-muted">-</span>';
-      return `
-        <tr>
-          <td>#${escapeHtml(c.cell_id)}</td>
-          <td class="text-muted">${escapeHtml(formatLocalTimestamp(cellTs))}</td>
-          <td><strong>${escapeHtml(c.symbol)}</strong></td>
-          <td>${stateBadge}</td>
-          <td>${sideBadge}</td>
-          <td>${fmtUsd(c.notional_usdc)}</td>
-          <td>${fmtUsd(c.risk_budget_usdc)}</td>
-          <td>${c.entry_price ? fmtNum(c.entry_price, 4) : '-'}</td>
-          <td>${fmtNum(c.current_price, 4)}</td>
-          <td class="text-amber">${fmtNum(c.initial_stop ?? c.initial_stop_price, 4)}</td>
-          <td class="text-blue">${fmtNum(c.chandelier_stop ?? c.chandelier_stop_price, 4)}</td>
-          <td>${fmtNum(c.funding_z_entry ?? c.entry_funding_z, 2)}σ → <strong>${fmtNum(c.current_funding_z, 2)}σ</strong></td>
-          <td>${fmtNum(c.premium_score, 2)}</td>
-          <td class="${getPnlClass(c.funding_accrued_usdc)}">${formatPnlText(c.funding_accrued_usdc)}</td>
-          <td class="${getPnlClass(c.unrealized_pnl_usdc)}">${formatPnlText(c.unrealized_pnl_usdc)}</td>
-          <td>${formatPnlPillHtml(netPnl)}</td>
-          <td class="text-muted">${exitLabel}</td>
-          <td>${actionCell}</td>
-        </tr>
-      `;
-    }).join('');
-  }
-
-  cachedPondUniverse = pond.universe || [];
-  document.getElementById('pond-universe-count-badge').textContent = `${pond.universe_active_count ?? cachedPondUniverse.length} ACTIVE / ${cachedPondUniverse.length} TOTAL`;
-  renderPondUniverseTable();
-
-  const cycles = pond.scan_cycles || [];
-  const cyclesTbody = document.getElementById('pond-cycles-tbody');
-  if (cycles.length === 0) {
-    cyclesTbody.innerHTML = '<tr><td colspan="9" class="text-muted">No S-Cycle scans recorded yet.</td></tr>';
-  } else {
-    cyclesTbody.innerHTML = cycles.map((cy) => `
-      <tr>
-        <td>#${escapeHtml(cy.cycle_id)}</td>
-        <td>${escapeHtml(formatLocalTimestamp(cy.started_at || cy.completed_at))}</td>
-        <td>${escapeHtml(cy.coins_scanned ?? cy.universe_active_count)}</td>
-        <td class="text-blue">${escapeHtml(cy.candidates ?? cy.candidates_passed_gates)}</td>
-        <td class="text-green"><strong>+${escapeHtml(cy.opened ?? cy.entries_opened)}</strong></td>
-        <td class="text-amber">${escapeHtml(cy.exits_evaluated ?? cy.exits_triggered)}</td>
-        <td>${escapeHtml(cy.open_cells_after ?? pondOpenCount)}</td>
-        <td>${fmtUsd(cy.open_heat_usdc ?? pondHeat)}</td>
-        <td>${fmtUsd(cy.pond_equity_usdc ?? pondEq)}</td>
-      </tr>
-    `).join('');
-  }
-
-  // 4. SETTINGS PAGE & SYSTEM CONFIG
-  const initCap = p.initial_equity_usdc || 10000;
-  const scaleMult = initCap / 10000.0;
-  const capInput = document.getElementById('capital-baseline-input');
-  if (capInput && !dirtyFormFields.has('capital-baseline-input') && document.activeElement !== capInput) {
-    capInput.value = Math.round(initCap);
-  }
-  const capBadge = document.getElementById('capital-scale-badge');
-  if (capBadge) capBadge.textContent = `${fmtNum(scaleMult, 2)}x Baseline`;
-  const capSummary = document.getElementById('capital-scale-summary');
-  if (capSummary) {
-    capSummary.textContent = `Heat Cap: ${fmtUsd(p.max_portfolio_heat_usdc || (initCap * 0.04))} (4.0%) | Base Risk/Trade: ${fmtUsd(p.baseline_risk_per_trade_usdc || (initCap * 0.01))} [${fmtUsd(p.min_risk_per_trade_usdc || (initCap * 0.005))}–${fmtUsd(p.max_risk_per_trade_usdc || (initCap * 0.015))}] | Single Asset Cap: ${fmtUsd(p.single_asset_cap_usdc || (initCap * 0.25))}`;
-  }
-
-  if (data.credentials) {
-    renderCredentials(data.credentials);
-  }
-
-  const schemaRuntimeEl = document.getElementById('schema-runtime-badge');
-  if (schemaRuntimeEl) {
-    const sv = data.schema_version ?? 7;
-    const rt = data.engine_runtime_detail || data.engine_runtime || 'RUST_NATIVE (Axum / Tokio)';
-    schemaRuntimeEl.textContent = `Schema v${sv} // ${rt}`;
-  }
-
-  cachedConfigRows = data.config || [];
-  const cfgHeadingEl = document.getElementById('settings-config-heading');
-  if (cfgHeadingEl && cachedConfigRows.length > 0) {
-    cfgHeadingEl.textContent = `Live Tunable \`system_config\` Parameters (${cachedConfigRows.length} Keys — SQLite Single Source of Truth)`;
-  }
-  renderConfigTable();
-
-  const logs = data.logs || [];
-  const logsBox = document.getElementById('logs-box');
-  logsBox.innerHTML = logs.map(l => `
-    <div class="log-entry">
-      <span class="text-muted">[${escapeHtml(formatLocalTimestamp(l.timestamp_ms || l.created_at))}]</span>
-      <span class="${l.level === 'ERROR' ? 'text-red' : (l.level === 'WARN' ? 'text-amber' : 'text-blue')}">[${escapeHtml(l.level)}]</span>
-      <span class="text-muted">${escapeHtml(l.component)}:</span>
-      <span>${escapeHtml(replaceUtcTimestampsInText(l.message))}</span>
-    </div>
-  `).join('');
-}
-
-function renderPondUniverseTable() {
-  const tbody = document.getElementById('pond-universe-tbody');
-  if (!tbody) return;
-  const q = (document.getElementById('pond-universe-filter')?.value || '').trim().toUpperCase();
-  const filtered = cachedPondUniverse.filter((u) => {
-    const sym = (u.symbol || '').toUpperCase();
-    const base = (u.base_asset || sym.split('/')[0] || '').toUpperCase();
-    return !q || sym.includes(q) || base.includes(q);
-  });
-  if (filtered.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="text-muted">No matching Pond universe coins.</td></tr>';
-    return;
-  }
-  tbody.innerHTML = filtered.map((u) => {
-    const baseAsset = u.base_asset || (u.symbol || '').split('/')[0] || '-';
-    let stBadge = `<span class="badge badge-bull">${escapeHtml(u.status)}</span>`;
-    if (u.status === 'WARMUP') stBadge = `<span class="badge badge-chop">WARMUP</span>`;
-    else if (u.status === 'DELISTING' || u.status === 'RETIRED') stBadge = `<span class="badge badge-bear">${escapeHtml(u.status)}</span>`;
-    const streak = u.below_rank95_streak ?? u.delist_streak ?? u.consecutive_below_rank_count ?? 0;
-    const rank = u.volume_rank_30d ?? u.rank ?? u.rank_by_volume ?? '-';
-    const rawWarmup = u.warmup_until || u.warmup_ready_at;
-    const warmupDisplay = rawWarmup ? formatLocalTimestamp(rawWarmup) : 'READY';
-    return `
-      <tr>
-        <td>#${escapeHtml(rank)}</td>
-        <td><strong>${escapeHtml(u.symbol)}</strong></td>
-        <td><span class="text-blue">${escapeHtml(baseAsset)}</span></td>
-        <td>${fmtUsd(u.median_daily_volume_usdc ?? u.median_daily_vol_usdc)}</td>
-        <td>${stBadge}</td>
-        <td class="text-muted">${escapeHtml(warmupDisplay)}</td>
-        <td class="${streak > 0 ? 'text-amber' : 'text-muted'}">${escapeHtml(streak)} / 2</td>
-      </tr>
-    `;
-  }).join('');
-}
-
-function setConfigCategoryFilter(cat, btnEl) {
-  activeConfigCategory = cat;
-  document.querySelectorAll('.filter-pill').forEach((el) => el.classList.remove('active'));
-  if (btnEl) btnEl.classList.add('active');
-  renderConfigTable();
-}
-
-let credModeDirty = false;
-let lastCredState = null;
-const dirtyConfigInputs = {};
-const dirtyFormFields = new Set();
-const ROUTING_CONFIG_KEYS = ['execution_mode', 'pond_execution_mode', 'hyperliquid_testnet', 'environment'];
-
-function markFormFieldDirty(fieldId) {
-  if (fieldId) dirtyFormFields.add(fieldId);
-}
-
-function clearRoutingDirtyInputs() {
-  credModeDirty = false;
-  ROUTING_CONFIG_KEYS.forEach((k) => {
-    delete dirtyConfigInputs[k];
-  });
-}
-
-function onConfigInputEdit(key, val) {
-  dirtyConfigInputs[key] = val;
-  const cfgRow = cachedConfigRows.find((r) => r.config_key === key);
-  if (cfgRow) {
-    const cfgTbody = document.getElementById('config-tbody');
-    const tr = cfgTbody ? Array.from(cfgTbody.querySelectorAll('tr[data-config-key]')).find((el) => el.getAttribute('data-config-key') === key) : null;
-    const descCell = tr ? tr.querySelector('.cfg-desc-cell') : null;
-    if (descCell) {
-      descCell.textContent = formatConfigDescriptionWithLocalTime(cfgRow, val);
-    }
-  }
-  if (key === 'settling_time_utc' && /^\d{1,2}:\d{2}(?::\d{2})?$/.test(String(val).trim())) {
-    updateTimezoneIndicators(String(val).trim());
-  }
-}
-
-function renderConfigTable() {
-  const cfgTbody = document.getElementById('config-tbody');
-  if (!cfgTbody) return;
-  const q = (document.getElementById('config-search-input')?.value || '').trim().toLowerCase();
-  const filtered = cachedConfigRows.filter((c) => {
-    if (c.category === 'credentials') return false;
-    if (activeConfigCategory !== 'all') {
-      if (activeConfigCategory === 'signals') {
-        if (!['hmm', 'mace', 'stops', 'basis'].includes(c.category)) return false;
-      } else if (c.category !== activeConfigCategory) {
-        return false;
-      }
-    }
-    if (q && !c.config_key.toLowerCase().includes(q) && !(c.description || '').toLowerCase().includes(q)) {
-      return false;
-    }
-    return true;
-  });
-
-  const existingRows = Array.from(cfgTbody.querySelectorAll('tr[data-config-key]'));
-  const sameRowOrder = existingRows.length === filtered.length &&
-    existingRows.every((tr, idx) => tr.getAttribute('data-config-key') === filtered[idx].config_key);
-
-  if (sameRowOrder) {
-    filtered.forEach((c, idx) => {
-      const row = existingRows[idx];
-      const inputEl = document.getElementById(`cfg-${c.config_key}`);
-      const targetVal = String(
-        Object.prototype.hasOwnProperty.call(dirtyConfigInputs, c.config_key)
-          ? dirtyConfigInputs[c.config_key]
-          : (c.config_value ?? '')
-      );
-      if (inputEl && document.activeElement !== inputEl && inputEl.value !== targetVal) {
-        inputEl.value = targetVal;
-      }
-      const descText = formatConfigDescriptionWithLocalTime(c);
-      const descCell = row.querySelector('.cfg-desc-cell');
-      if (descCell && descCell.textContent !== descText) {
-        descCell.textContent = descText;
-      }
-      const updatedText = formatLocalTimestamp(c.updated_at);
-      const updatedCell = row.querySelector('.cfg-updated-cell');
-      if (updatedCell && updatedCell.textContent !== updatedText) {
-        updatedCell.textContent = updatedText;
-      }
-      const catBadge = row.querySelector('.cfg-cat-badge');
-      if (catBadge && catBadge.textContent !== (c.category || '')) {
-        catBadge.textContent = c.category || '';
-      }
-    });
-    return;
-  }
-
-  const activeId = document.activeElement ? document.activeElement.id : null;
-  cfgTbody.innerHTML = filtered.map((c) => {
-    const safeKey = escapeHtml(c.config_key);
-    return `
-      <tr data-config-key="${safeKey}">
-        <td><span class="badge cfg-cat-badge">${escapeHtml(c.category)}</span></td>
-        <td><strong>${safeKey}</strong></td>
-        <td><input class="config-input" id="cfg-${safeKey}" aria-label="${safeKey}" data-config-input="${safeKey}" /></td>
-        <td class="text-muted cfg-desc-cell" style="white-space:normal; max-width:360px;"></td>
-        <td class="text-muted cfg-updated-cell">${escapeHtml(formatLocalTimestamp(c.updated_at))}</td>
-        <td><button type="button" data-save-config="${safeKey}">Save</button></td>
-      </tr>
-    `;
-  }).join('');
-
-  filtered.forEach((c) => {
-    const inputEl = document.getElementById(`cfg-${c.config_key}`);
-    if (inputEl) {
-      inputEl.value = String(
-        Object.prototype.hasOwnProperty.call(dirtyConfigInputs, c.config_key)
-          ? dirtyConfigInputs[c.config_key]
-          : (c.config_value ?? '')
-      );
-    }
-    const row = Array.from(cfgTbody.querySelectorAll('tr[data-config-key]')).find((el) => el.getAttribute('data-config-key') === c.config_key);
-    const descCell = row ? row.querySelector('.cfg-desc-cell') : null;
-    if (descCell) {
-      descCell.textContent = formatConfigDescriptionWithLocalTime(c);
-    }
-  });
-
-  if (activeId && activeId.startsWith('cfg-')) {
-    const el = document.getElementById(activeId);
-    if (el) el.focus();
-  }
-}
-
-function resolveCredMode(cred) {
-  if (!cred) return 'PAPER';
-  const raw = String(cred.execution_mode || 'PAPER').toUpperCase();
-  if (raw === 'TESTNET' || (raw === 'LIVE' && cred.hyperliquid_testnet) || cred.active_routing === 'LIVE_TESTNET') {
-    return 'TESTNET';
-  }
-  if (raw === 'LIVE' || cred.active_routing === 'LIVE_MAINNET') {
-    return 'LIVE';
-  }
-  return 'PAPER';
-}
-
-function modeToRoutingLabel(mode) {
-  const m = String(mode || 'PAPER').toUpperCase();
-  if (m === 'TESTNET') return 'LIVE_TESTNET';
-  if (m === 'LIVE') return 'LIVE_MAINNET';
-  return 'PAPER_SIMULATION';
-}
-
-function updateRoutingStatusPill(selectedMode, cred) {
-  const pill = document.getElementById('cred-status-pill');
-  if (!pill || !cred) return;
-  const resolvedMode = resolveCredMode(cred);
-  const savedRouting = cred.active_routing || modeToRoutingLabel(resolvedMode);
-  const isLiveRouting = savedRouting === 'LIVE_TESTNET' || savedRouting === 'LIVE_MAINNET';
-  if (credModeDirty && selectedMode && selectedMode !== resolvedMode) {
-    pill.textContent = `${savedRouting} → ${modeToRoutingLabel(selectedMode)} (UNSAVED)`;
-    pill.style.color = '#fbbf24';
-  } else {
-    pill.textContent = savedRouting;
-    pill.style.color = isLiveRouting ? '#34d399' : '#fbbf24';
-  }
-}
-
-function updateRoutingEndpointPreview(selectedMode, cred) {
-  const endpointLabel = document.getElementById('cred-endpoint-label');
-  const vaultInput = document.getElementById('cred-vault');
-  const defaultVault = selectedMode === 'LIVE'
-    ? '0xdfc24b077bc1425ad1dea75bcb6f8158e10df303'
-    : '0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0';
-  if (vaultInput) {
-    vaultInput.placeholder = defaultVault;
-    vaultInput.value = defaultVault;
-  }
-  if (!endpointLabel) return;
-  const pkLabel = cred && cred.private_key_configured ? cred.private_key_masked : 'Not Set';
-  const signerRaw = cred && cred.signer_address ? String(cred.signer_address) : '';
-  const signerLabel = signerRaw.length >= 10
-    ? ` (${signerRaw.slice(0, 6)}...${signerRaw.slice(-4)})`
-    : '';
-  const geminiLabel = cred && cred.gemini_api_key_configured ? cred.gemini_api_key_masked : 'Not Set';
-  let epText = 'Simulated Fill + Slippage';
-  if (selectedMode === 'TESTNET') {
-    epText = 'https://api.hyperliquid-testnet.xyz';
-  } else if (selectedMode === 'LIVE') {
-    epText = 'https://api.hyperliquid.xyz';
-  } else if (cred && cred.api_endpoint) {
-    epText = `Simulated Fill + Slippage (Data: ${cred.api_endpoint})`;
-  }
-  endpointLabel.textContent = `Endpoint: ${epText} | PK: ${pkLabel}${signerLabel} | Gemini: ${geminiLabel}`;
-}
-
-function onRoutingModeChange() {
-  const modeSelect = document.getElementById('cred-mode');
-  if (!modeSelect) return;
-  const resolvedMode = resolveCredMode(lastCredState);
-  credModeDirty = modeSelect.value !== resolvedMode;
-  updateRoutingStatusPill(modeSelect.value, lastCredState);
-  updateRoutingEndpointPreview(modeSelect.value, lastCredState);
-}
-
-function renderCredentials(cred) {
-  if (!cred) return;
-  lastCredState = cred;
-  const modeBadge = document.getElementById('routing-mode-badge');
-  const modeSelect = document.getElementById('cred-mode');
-  const walletInput = document.getElementById('cred-wallet');
-  const vaultInput = document.getElementById('cred-vault');
-
-  const resolvedMode = resolveCredMode(cred);
-  const isLiveRouting = cred.active_routing === 'LIVE_TESTNET' || cred.active_routing === 'LIVE_MAINNET';
-
-  if (modeBadge) {
-    modeBadge.textContent = `MODE: ${cred.active_routing || resolvedMode}`;
-    modeBadge.className = isLiveRouting ? 'badge badge-bull' : 'badge badge-info';
-  }
-  if (modeSelect && credModeDirty && modeSelect.value === resolvedMode) {
-    credModeDirty = false;
-  }
-  if (modeSelect && !credModeDirty && document.activeElement !== modeSelect) {
-    modeSelect.value = resolvedMode;
-  }
-  const currentSelectedMode = modeSelect ? modeSelect.value : resolvedMode;
-  updateRoutingStatusPill(currentSelectedMode, cred);
-  updateRoutingEndpointPreview(currentSelectedMode, cred);
-
-  if (walletInput && !dirtyFormFields.has('cred-wallet') && document.activeElement !== walletInput && cred.wallet_address !== undefined) {
-    walletInput.value = cred.wallet_address;
-  }
-  if (vaultInput && !dirtyFormFields.has('cred-vault') && document.activeElement !== vaultInput && cred.hyperliquid_vault_address !== undefined) {
-    vaultInput.value = cred.hyperliquid_vault_address;
-  }
-
-  const alertBadge = document.getElementById('alert-status-badge');
-  const tgPill = document.getElementById('tg-status-pill');
-  const tgChatInput = document.getElementById('tg-chat-id');
-  const tgDdInput = document.getElementById('tg-dd-pct');
-
-  if (alertBadge) {
-    alertBadge.textContent = cred.telegram_alerts_ready ? 'TELEGRAM: READY' : 'TELEGRAM: UNCONFIGURED';
-    alertBadge.className = cred.telegram_alerts_ready ? 'badge badge-bull' : 'badge';
-  }
-  if (tgPill) {
-    tgPill.textContent = cred.telegram_alerts_ready ? `READY (${cred.telegram_bot_token_masked})` : 'NOT CONFIGURED';
-    tgPill.style.color = cred.telegram_alerts_ready ? '#34d399' : 'var(--text-muted)';
-  }
-  if (tgChatInput && !dirtyFormFields.has('tg-chat-id') && document.activeElement !== tgChatInput && cred.telegram_chat_id !== undefined) {
-    tgChatInput.placeholder = cred.telegram_chat_id || 'Enter Telegram Chat ID (leave blank to keep existing)';
-    tgChatInput.value = '';
-  }
-  if (tgDdInput && !dirtyFormFields.has('tg-dd-pct') && document.activeElement !== tgDdInput && cred.max_daily_drawdown_alert_pct !== undefined) {
-    tgDdInput.value = Number(cred.max_daily_drawdown_alert_pct * 100).toFixed(1);
-  }
-}
-
-async function fetchInitialDashboard() {
-  try {
-    const res = await apiFetch('/api/v1/dashboard');
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data && !data.error) {
-      renderDashboard(data);
-    }
-  } catch (err) {
-    console.error('Initial dashboard load error:', err);
-  }
-}
-
-let activeEventSource = null;
-let sseReconnectTimer = null;
-
-function connectSSE() {
-  if (sseReconnectTimer) {
-    clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = null;
-  }
-  if (activeEventSource) {
-    try { activeEventSource.close(); } catch (_) {}
-    activeEventSource = null;
-  }
-  const sseBadge = document.getElementById('sse-status');
-  const sseToken = resolveApiAuthToken();
-  const sseUrl = sseToken ? `/api/v1/stream?token=${encodeURIComponent(sseToken)}` : '/api/v1/stream';
-  const evtSource = new EventSource(sseUrl);
-  const es = evtSource;
-  activeEventSource = evtSource;
-  evtSource.onopen = () => {
-    sseBadge.textContent = 'SSE: LIVE (3s)';
-    sseBadge.className = 'badge badge-bull';
-  };
-  es.addEventListener('heartbeat', () => {
-    if (sseBadge) {
-      sseBadge.textContent = 'SSE: LIVE (3s)';
-      sseBadge.className = 'badge badge-bull';
-    }
-  });
-  evtSource.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      if (data && !data.error) {
-        sseBadge.textContent = 'SSE: LIVE (3s)';
-        sseBadge.className = 'badge badge-bull';
-        renderDashboard(data);
-      }
-    } catch (err) {
-      console.error('SSE parse error:', err);
-    }
-  };
-  evtSource.onerror = () => {
-    sseBadge.textContent = 'SSE: RECONNECTING';
-    sseBadge.className = 'badge badge-chop';
-    try { evtSource.close(); } catch (_) {}
-    if (activeEventSource === evtSource) {
-      activeEventSource = null;
-    }
-    fetchInitialDashboard();
-    if (!sseReconnectTimer) {
-      sseReconnectTimer = setTimeout(connectSSE, 3000);
-    }
-  };
-}
-
-setInterval(() => {
-  if (!activeEventSource || activeEventSource.readyState !== 1) {
-    fetchInitialDashboard();
-  }
-}, 5000);
-
-async function saveConfig(key) {
-  const inputEl = document.getElementById(`cfg-${key}`);
-  if (!inputEl) return;
-  const val = inputEl.value;
-  const res = await apiFetch('/api/v1/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config_key: key, config_value: val })
-  });
-  if (res.ok) {
-    delete dirtyConfigInputs[key];
-    if (ROUTING_CONFIG_KEYS.includes(key)) {
-      clearRoutingDirtyInputs();
-    }
-    if (key === 'initial_equity_usdc') {
-      dirtyFormFields.delete('capital-baseline-input');
-    }
-    await fetchInitialDashboard();
-  } else {
-    const err = await res.json().catch(() => ({}));
-    alert('Error updating config: ' + (err.detail || res.statusText));
-  }
-}
-
-async function updatePondDirectionPolicy(policyVal) {
-  const res = await apiFetch('/api/v1/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config_key: 'pond_direction_policy', config_value: policyVal })
-  });
-  if (res.ok) {
-    await fetchInitialDashboard();
-  }
-}
-
-async function triggerPondScan() {
-  const btn = document.getElementById('btn-pond-scan');
-  if (btn) { btn.disabled = true; btn.textContent = 'Scanning 80 Coins...'; }
-  try {
-    const res = await apiFetch('/api/v1/pond/scan', { method: 'POST' });
-    const data = await res.json();
-    if (data.dashboard) renderDashboard(data.dashboard);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Run Pond Scan'; }
-  }
-}
-
-async function triggerSettleRun(dryRun) {
-  const isDry = Boolean(dryRun);
-  if (!isDry) {
-    if (
-      typeof window !== 'undefined' &&
-      typeof window.confirm === 'function' &&
-      !window.confirm('Execute LIVE 50/50 capital settling across Pit (Book A) and Pond (Book B)?')
-    ) {
-      return;
-    }
-  }
-  const btn = document.getElementById(isDry ? 'btn-settle-dry' : 'btn-settle-live');
-  if (btn) {
-    btn.setAttribute('aria-disabled', 'true');
-    btn.textContent = 'Settling...';
-  }
-  try {
-    const payload = isDry
-      ? { dry_run: true }
-      : { dry_run: false, confirm_live_settle: 'CONFIRM_LIVE_SETTLE' };
-    const res = await apiFetch('/api/v1/settle/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert('Settle run failed: ' + (data.detail || data.error || res.statusText));
-      return;
-    }
-    if (data.dashboard) renderDashboard(data.dashboard);
-  } finally {
-    if (btn) {
-      btn.removeAttribute('aria-disabled');
-      btn.textContent = isDry
-        ? `Dry-Run ${formatUtcTimeOfDayToLocal(latestSettlingTimeUtc)} Settle`
-        : 'Execute Live Settle';
-    }
-  }
-}
-
-let dbBackupInFlight = false;
-async function triggerDbBackup() {
-  if (dbBackupInFlight) return;
-  dbBackupInFlight = true;
-  const hdrBtn = document.getElementById('btn-backup-db');
-  const setBtn = document.getElementById('btn-backup-db-settings');
-  const statusEl = document.getElementById('db-backup-status');
-  const settingsBadgeEl = document.getElementById('db-backup-settings-badge');
-  const settingsDetailEl = document.getElementById('db-backup-settings-detail');
-  if (hdrBtn) {
-    hdrBtn.setAttribute('aria-disabled', 'true');
-    hdrBtn.textContent = 'Backing up DB...';
-  }
-  if (setBtn) {
-    setBtn.setAttribute('aria-disabled', 'true');
-    setBtn.textContent = 'Backing up...';
-  }
-  try {
-    const res = await apiFetch('/api/v1/db/backup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reason: 'dashboard_manual' })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const errMsg = data.detail || data.error || res.statusText || 'Backup failed';
-      if (statusEl) {
-        statusEl.style.display = 'inline-block';
-        statusEl.className = 'badge badge-bear';
-        statusEl.textContent = `BACKUP ERR: ${errMsg}`;
-      }
-      if (settingsBadgeEl) {
-        settingsBadgeEl.className = 'badge badge-bear';
-        settingsBadgeEl.textContent = 'BACKUP FAILED';
-      }
-      if (settingsDetailEl) {
-        settingsDetailEl.textContent = `Backup error: ${errMsg}`;
-      }
-      return;
-    }
-    const b = data.backup || {};
-    const fullPath = String(b.backup_path || '');
-    const fileName = fullPath.split(/[\\/]/).pop() || fullPath || 'snapshot.db';
-    const sizeKb = ((Number(b.size_bytes || 0)) / 1024).toFixed(1);
-    const retained = Number(b.retained_count || 1);
-    if (statusEl) {
-      statusEl.style.display = 'inline-block';
-      statusEl.className = 'badge badge-bull';
-      statusEl.textContent = `BACKUP OK: ${sizeKb} KB (${retained} kept)`;
-      statusEl.title = fullPath;
-    }
-    if (settingsBadgeEl) {
-      settingsBadgeEl.className = 'badge badge-bull';
-      settingsBadgeEl.textContent = `OK (${sizeKb} KB)`;
-    }
-    if (settingsDetailEl) {
-      settingsDetailEl.textContent = `Saved ${fileName} (${sizeKb} KB, ${retained} backups retained, ${Number(b.pruned_count || 0)} pruned)`;
-    }
-    if (data.dashboard) {
-      renderDashboard(data.dashboard);
-    } else {
-      await fetchInitialDashboard();
-    }
-    await fetchDbBackups();
-  } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    if (statusEl) {
-      statusEl.style.display = 'inline-block';
-      statusEl.className = 'badge badge-bear';
-      statusEl.textContent = 'BACKUP ERR';
-    }
-    if (settingsBadgeEl) {
-      settingsBadgeEl.className = 'badge badge-bear';
-      settingsBadgeEl.textContent = 'BACKUP FAILED';
-    }
-    if (settingsDetailEl) {
-      settingsDetailEl.textContent = `Backup error: ${msg}`;
-    }
-  } finally {
-    dbBackupInFlight = false;
-    if (hdrBtn) {
-      hdrBtn.removeAttribute('aria-disabled');
-      hdrBtn.textContent = 'Backup DB';
-    }
-    if (setBtn) {
-      setBtn.removeAttribute('aria-disabled');
-      setBtn.textContent = 'Backup Database Now';
-    }
-  }
-}
-
-async function applyCapitalBaseline() {
-  const val = parseFloat(document.getElementById('capital-baseline-input').value);
-  if (!val || val < 100) {
-    alert('Initial equity must be at least $100 USDC.');
-    return;
-  }
-  const res = await apiFetch('/api/v1/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config_key: 'initial_equity_usdc', config_value: val, scale_risk_caps: true })
-  });
-  if (res.ok) {
-    dirtyFormFields.delete('capital-baseline-input');
-    delete dirtyConfigInputs['initial_equity_usdc'];
-    await fetchInitialDashboard();
-  }
-}
-
-async function syncWalletEquity() {
-  const btn = document.getElementById('btn-sync-wallet');
-  btn.disabled = true;
-  btn.textContent = 'Querying Hyperliquid L1...';
-  try {
-    const res = await apiFetch('/api/v1/wallet/sync', { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) {
-      alert('Wallet sync failed: ' + (data.detail || 'Unknown error'));
-      return;
-    }
-    dirtyFormFields.delete('capital-baseline-input');
-    await fetchInitialDashboard();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Sync From Hyperliquid L1 Wallet';
-  }
-}
-
-async function saveCredentials() {
-  const mode = document.getElementById('cred-mode').value;
-  const wallet = document.getElementById('cred-wallet').value.trim();
-  const pk = document.getElementById('cred-pk').value.trim();
-  const gemini = document.getElementById('cred-gemini').value.trim();
-
-  const payload = {
-    execution_mode: mode,
-    hyperliquid_testnet: mode !== 'LIVE',
-    wallet_address: wallet
-  };
-  if (pk.length > 0) payload.private_key = pk;
-  if (gemini.length > 0) payload.gemini_api_key = gemini;
-
-  const res = await apiFetch('/api/v1/credentials', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    alert('Credential validation error: ' + (data.detail || 'Invalid format'));
-    return;
-  }
-  clearRoutingDirtyInputs();
-  dirtyFormFields.delete('cred-wallet');
-  dirtyFormFields.delete('cred-vault');
-  document.getElementById('cred-pk').value = '';
-  document.getElementById('cred-gemini').value = '';
-  renderCredentials(data.credentials);
-  await fetchInitialDashboard();
-}
-
-async function saveTelegramAlerts() {
-  const token = document.getElementById('tg-token').value.trim();
-  const chatId = document.getElementById('tg-chat-id').value.trim();
-  const ddPct = parseFloat(document.getElementById('tg-dd-pct').value || '3.0') / 100.0;
-
-  const payload = {
-    max_daily_drawdown_alert_pct: ddPct
-  };
-  if (chatId.length > 0) payload.telegram_chat_id = chatId;
-  if (token.length > 0) payload.telegram_bot_token = token;
-
-  const res = await apiFetch('/api/v1/alerts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    alert('Telegram config error: ' + (data.detail || 'Invalid parameter'));
-    return;
-  }
-  dirtyFormFields.delete('tg-chat-id');
-  dirtyFormFields.delete('tg-dd-pct');
-  document.getElementById('tg-token').value = '';
-  document.getElementById('tg-chat-id').value = '';
-  renderCredentials(data.alerts);
-  await fetchInitialDashboard();
-}
-
-async function sendTestAlert() {
-  const res = await apiFetch('/api/v1/alerts/test', { method: 'POST' });
-  const data = await res.json();
-  dirtyFormFields.delete('tg-chat-id');
-  if (data.status === 'DELIVERED') {
-    const cid = data.chat_id ? ` (Chat ID: ${data.chat_id})` : '';
-    alert(`Telegram Alert Dispatch Status: DELIVERED${cid}`);
-  } else {
-    const detail = data.error_detail || (data.channels && data.channels[0] && data.channels[0].error) || data.reason || '';
-    alert(`Telegram Alert Dispatch Status: ${data.status}${detail ? '\n\n' + detail : ''}`);
-  }
-  await fetchInitialDashboard();
-}
-
-async function triggerCycle() {
-  const btn = document.getElementById('btn-cycle');
-  btn.disabled = true;
-  btn.textContent = 'Running Cycle...';
-  try {
-    const res = await apiFetch('/api/v1/engine/cycle', { method: 'POST' });
-    const data = await res.json();
-    if (data.dashboard) renderDashboard(data.dashboard);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Run Platform Cycle';
-  }
-}
-
-async function triggerCalibration() {
-  const btn = document.getElementById('btn-calibrate');
-  btn.disabled = true;
-  btn.textContent = 'Calibrating...';
-  try {
-    const res = await apiFetch('/api/v1/engine/calibrate', { method: 'POST' });
-    const data = await res.json();
-    document.getElementById('report-panel').style.display = 'flex';
-    document.getElementById('report-title').textContent = 'Walk-Forward MACE Calibration Report';
-    document.getElementById('report-content').textContent = replaceUtcTimestampsInText(JSON.stringify(data.calibration_report, null, 2));
-    switchDashboardPage('overall');
-    await fetchInitialDashboard();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Calibrate MACE';
-  }
-}
-
-async function triggerBacktest() {
-  const btn = document.getElementById('btn-backtest');
-  btn.disabled = true;
-  btn.textContent = 'Simulating 365d...';
-  try {
-    const res = await apiFetch('/api/v1/engine/backtest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ days: 365, use_real_history: true })
-    });
-    const data = await res.json();
-    document.getElementById('report-panel').style.display = 'flex';
-    document.getElementById('report-title').textContent = '365-Day Walk-Forward Tear Sheet (0.35% Slippage + 1H Funding)';
-    document.getElementById('report-content').textContent = replaceUtcTimestampsInText(data.formatted_report);
-    switchDashboardPage('overall');
-    await fetchInitialDashboard();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Run 365d Tear Sheet';
-  }
-}
-
-async function triggerTakeProfit(tradeId, symbol, btnEl) {
-  if (btnEl) {
-    btnEl.disabled = true;
-    btnEl.textContent = 'Closing...';
-  }
-  try {
-    const res = await apiFetch('/api/v1/trades/close', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ trade_id: Number(tradeId), reason: 'MANUAL_TAKE_PROFIT' })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert(`Failed to close ${symbol || '#' + tradeId}: ${data.detail || data.error || res.statusText || 'Unknown error'}`);
-      return;
-    }
-    if (data.dashboard) {
-      renderDashboard(data.dashboard);
-    } else {
-      await fetchInitialDashboard();
-    }
-    await fetchDbBackups();
-  } catch (err) {
-    alert(`Failed to close ${symbol || '#' + tradeId}: ${err && err.message ? err.message : String(err)}`);
-  } finally {
-    if (btnEl) {
-      btnEl.disabled = false;
-      btnEl.textContent = 'Take Profit';
-    }
-  }
-}
-
-async function triggerPondCellTakeProfit(cellId, symbol, btnEl) {
-  if (btnEl) {
-    btnEl.disabled = true;
-    btnEl.textContent = 'Closing...';
-  }
-  try {
-    const res = await apiFetch('/api/v1/pond/cells/close', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cell_id: Number(cellId), reason: 'MANUAL_TAKE_PROFIT' })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${data.detail || data.error || res.statusText || 'Unknown error'}`);
-      return;
-    }
-    if (data.dashboard) {
-      renderDashboard(data.dashboard);
-    } else {
-      await fetchInitialDashboard();
-    }
-    await fetchDbBackups();
-  } catch (err) {
-    alert(`Failed to close Pond cell ${symbol || '#' + cellId}: ${err && err.message ? err.message : String(err)}`);
-  } finally {
-    if (btnEl) {
-      btnEl.disabled = false;
-      btnEl.textContent = 'Take Profit';
-    }
-  }
-}
-
-let pendingRestoreToken = null;
-let pendingRestoreFilename = null;
-
-async function fetchDbBackups() {
-  try {
-    const res = await apiFetch('/api/v1/db/backups');
-    if (!res.ok) return;
-    const data = await res.json().catch(() => ({}));
-    if (data && data.status === 'ok') {
-      renderDbBackupsList(data);
-    }
-  } catch (err) {
-    console.error('Failed to fetch SQLite backups:', err);
-  }
-}
-
-function renderDbBackupsList(data) {
-  const bannerEl = document.getElementById('db-restore-precondition-banner');
-  const tbody = document.getElementById('db-backups-tbody');
-  const restoreAllowed = Boolean(data.restore_allowed);
-  const reasons = Array.isArray(data.disabled_reasons) ? data.disabled_reasons : [];
-  const runbookNotice = data.runbook_notice || '';
-  const precond = data.preconditions || {};
-  const poolStatsText = `[Pool Gen #${precond.pool_generation ?? 1}, Discarded Stale Conns: ${precond.discarded_stale_connections ?? 0}]`;
-
-  if (bannerEl) {
-    if (restoreAllowed) {
-      bannerEl.className = 'text-green';
-      bannerEl.textContent = `Restore Preconditions: READY (PAPER/TESTNET, 0 open PIT trades, 0 open Pond cells, no active cycle lock) ${poolStatsText}. ${runbookNotice}`;
-    } else {
-      bannerEl.className = 'text-amber';
-      bannerEl.textContent = `Restore Preconditions BLOCKED: ${reasons.join(' | ') || 'Preconditions not satisfied'} ${poolStatsText}. ${runbookNotice}`;
-    }
-  }
-
-  if (!tbody) return;
-  const backups = Array.isArray(data.backups) ? data.backups : [];
-  if (backups.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="text-muted">No SQLite backup snapshots found in `data/backups/`. Click "Backup Database Now" to create one.</td></tr>';
-    return;
-  }
-
-  const disabledReasonAttr = escapeHtml(reasons.join('; ') || 'Restore preconditions not satisfied');
-  tbody.innerHTML = backups.map((b) => {
-    const fname = b.filename || b.file_name || '';
-    const sizeKb = ((Number(b.size_bytes || 0)) / 1024).toFixed(1) + ' KB';
-    const createdUtc = b.created_at || '-';
-    const expiresUtc = b.expires_at || '-';
-    const cliCmd = b.restore_cli_command || `aegis-quant db --restore data/backups/${fname} --confirm`;
-    const preTag = b.is_pre_restore_snapshot ? ' <span class="badge badge-info">PRE-RESTORE</span>' : '';
-    const restoreDisabledAttr = restoreAllowed ? '' : `disabled title="${disabledReasonAttr}"`;
-    return `
-      <tr>
-        <td><strong>${escapeHtml(fname)}</strong>${preTag}</td>
-        <td>${escapeHtml(sizeKb)}</td>
-        <td class="text-muted">${escapeHtml(createdUtc)}</td>
-        <td class="text-muted">${escapeHtml(expiresUtc)}</td>
-        <td><button type="button" title="Copies the CLI restore command using the active binary and --db path" data-copy-restore-cli="${escapeHtml(cliCmd)}">Copy CLI Command</button></td>
-        <td><button type="button" class="primary" data-open-restore-modal="${escapeHtml(fname)}" ${restoreDisabledAttr}>Restore…</button></td>
-      </tr>
-    `;
-  }).join('');
-}
-
-function closeDbRestoreModal() {
-  pendingRestoreToken = null;
-  pendingRestoreFilename = null;
-  const modal = document.getElementById('db-restore-modal');
-  if (modal) modal.style.display = 'none';
-  const input = document.getElementById('db-restore-confirm-input');
-  if (input) input.value = '';
-  const confirmBtn = document.getElementById('btn-confirm-db-restore');
-  if (confirmBtn) confirmBtn.disabled = true;
-  const statusEl = document.getElementById('db-restore-modal-status');
-  if (statusEl) statusEl.textContent = '';
-}
-
-async function openDbRestoreModal(filename) {
-  const modal = document.getElementById('db-restore-modal');
-  const metaEl = document.getElementById('db-restore-preview-meta');
-  const precondEl = document.getElementById('db-restore-modal-preconditions');
-  const inputEl = document.getElementById('db-restore-confirm-input');
-  const confirmBtn = document.getElementById('btn-confirm-db-restore');
-  const statusEl = document.getElementById('db-restore-modal-status');
-
-  pendingRestoreToken = null;
-  pendingRestoreFilename = filename;
-  if (inputEl) inputEl.value = '';
-  if (confirmBtn) confirmBtn.disabled = true;
-  if (statusEl) statusEl.textContent = 'Requesting Step 1 backup preview & integrity check...';
-  if (modal) modal.style.display = 'flex';
-
-  try {
-    const res = await apiFetch('/api/v1/db/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename, confirm: false })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const reasons = Array.isArray(data.disabled_reasons) && data.disabled_reasons.length > 0
-        ? data.disabled_reasons.join('; ')
-        : (data.detail || data.error || res.statusText);
-      if (metaEl) metaEl.textContent = `Preview refused (${res.status}): ${reasons}`;
-      if (precondEl) precondEl.textContent = reasons;
-      if (statusEl) statusEl.textContent = 'Restore blocked';
-      return;
-    }
-
-    pendingRestoreToken = data.restore_token || null;
-    const p = data.preview || {};
-    const rc = p.row_counts || {};
-    if (metaEl) {
-      metaEl.textContent = [
-        `Filename:        ${p.filename || filename}`,
-        `SHA-256:         ${p.sha256 || '-'}`,
-        `Size:            ${((Number(p.size_bytes || 0)) / 1024).toFixed(1)} KB (${p.size_bytes || 0} bytes)`,
-        `Created (UTC):   ${p.created_at || '-'}`,
-        `Schema Version:  v${p.schema_version ?? '-'}`,
-        `Integrity Check: ${p.integrity_check || '-'}`,
-        `Row Counts:      trades=${rc.trades ?? 0}, pond_cells=${rc.pond_cells ?? 0}, portfolio_snapshots=${rc.portfolio_snapshots ?? 0}, system_config=${rc.system_config ?? 0}`,
-        `Token TTL:       ${data.expires_in_seconds || 60}s single-use token`
-      ].join('\n');
-    }
-    if (precondEl) {
-      precondEl.textContent = 'Preconditions verified: PAPER/TESTNET mode, 0 open positions/cells, no active cycle lock. A pre-restore snapshot will be created automatically before overwrite.';
-    }
-    if (statusEl) {
-      statusEl.textContent = 'Awaiting typed RESTORE confirmation';
-    }
-  } catch (err) {
-    if (metaEl) metaEl.textContent = `Failed to inspect backup: ${err && err.message ? err.message : String(err)}`;
-    if (statusEl) statusEl.textContent = 'Preview error';
-  }
-}
-
-async function confirmDbRestore() {
-  const inputEl = document.getElementById('db-restore-confirm-input');
-  const confirmBtn = document.getElementById('btn-confirm-db-restore');
-  const statusEl = document.getElementById('db-restore-modal-status');
-  const confirmText = inputEl ? inputEl.value.trim() : '';
-
-  if (confirmText !== 'RESTORE' || !pendingRestoreToken || !pendingRestoreFilename) {
-    return;
-  }
-
-  if (confirmBtn) {
-    confirmBtn.disabled = true;
-    confirmBtn.textContent = 'Restoring...';
-  }
-  if (statusEl) statusEl.textContent = 'Executing atomic backup restore...';
-
-  try {
-    const res = await apiFetch('/api/v1/db/restore', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        filename: pendingRestoreFilename,
-        confirm: true,
-        restore_token: pendingRestoreToken,
-        confirm_text: confirmText
-      })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const errMsg = (Array.isArray(data.disabled_reasons) && data.disabled_reasons.join('; ')) || data.detail || data.error || res.statusText;
-      if (statusEl) statusEl.textContent = `Restore failed: ${errMsg}`;
-      alert('Database restore failed: ' + errMsg);
-      return;
-    }
-    closeDbRestoreModal();
-    await fetchDbBackups();
-    await fetchInitialDashboard();
-  } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    if (statusEl) statusEl.textContent = `Restore error: ${msg}`;
-  } finally {
-    if (confirmBtn) {
-      confirmBtn.textContent = 'Confirm Restore';
-    }
-  }
-}
-
+document.addEventListener('DOMContentLoaded', async () => {
+  await refreshAll();
+  connectSSE();
+  // 1-second local countdown timer tick for active cooldowns
+  setInterval(paintCooldownTimers, 1000);
+  // 2-second fallback sync
+  setInterval(refreshAll, 2500);
+});

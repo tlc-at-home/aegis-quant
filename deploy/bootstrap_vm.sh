@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Aegis Quant (v0.3.0-rc1 Rust Native) — Automated Fedora 45 Minimal Bootstrap
+# Aegis Quant v2.0 — Automated Fedora Minimal Bootstrap (MariaDB 13.0 Rolling)
 # Target Root: /home/fedora/aegis
 # =============================================================================
 set -euo pipefail
@@ -9,81 +9,68 @@ AEGIS_ROOT="/home/fedora/aegis"
 DATA_DIR="${AEGIS_ROOT}/data"
 LOG_DIR="${AEGIS_ROOT}/logs"
 BIN_DIR="${AEGIS_ROOT}/bin"
-DB_PATH="${DATA_DIR}/aegis_quant.db"
 KEY_PATH="${DATA_DIR}/.aegis_master_key"
 DEPLOY_DIR="${AEGIS_ROOT}/deploy"
+SQL_SCHEMA="${AEGIS_ROOT}/sql/schema_v2_mariadb.sql"
 SYSTEMD_DIR="/etc/systemd/system"
-SYSTEMD_UNITS=(
-    "aegis-quant.service"
-    "aegis-pit.service"
-    "aegis-pond.service"
-    "aegis-settle.service"
-    "aegis-settle.timer"
-)
+MARIADB_VERSION="${MARIADB_VERSION:-13.0}"
 
-echo "[1/6] Verifying system dependencies & chronyd time synchronization on Fedora..."
-sudo dnf install -y --skip-unavailable sqlite chrony curl firewalld
+echo "[1/7] Installing system dependencies & chronyd time synchronization..."
+sudo dnf install -y --skip-unavailable chrony curl firewalld
 sudo systemctl enable --now chronyd.service
 chronyc tracking || true
 
-echo "[2/6] Configuring firewalld to block external access to port 8000 (loopback/SSH tunnel only)..."
-if sudo systemctl is-active --quiet firewalld || sudo systemctl enable --now firewalld 2>/dev/null; then
-    sudo firewall-cmd --permanent --remove-port=8000/tcp 2>/dev/null || true
-    sudo firewall-cmd --reload 2>/dev/null || true
-fi
+echo "[2/7] Installing & tuning official MariaDB (${MARIADB_VERSION} Rolling)..."
+curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-${MARIADB_VERSION}" --os-type=rhel --os-version=9
+sudo dnf install -y --allowerasing MariaDB-server MariaDB-client
+sudo cp "${DEPLOY_DIR}/99-aegis-mariadb.cnf" /etc/my.cnf.d/99-aegis-mariadb.cnf
+sudo chmod 644 /etc/my.cnf.d/99-aegis-mariadb.cnf
+sudo systemctl enable --now mariadb.service
+sudo systemctl restart mariadb.service
 
-echo "[3/6] Preparing Aegis Quant directories (${DATA_DIR}, ${LOG_DIR}, ${BIN_DIR})..."
+echo "[3/7] Provisioning MariaDB database user & applying schema_v2_mariadb.sql..."
+sudo mariadb -e "CREATE DATABASE IF NOT EXISTS aegis_quant CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'aegis'@'localhost' IDENTIFIED BY 'aegis_v2_local';
+CREATE USER IF NOT EXISTS 'aegis'@'127.0.0.1' IDENTIFIED BY 'aegis_v2_local';
+GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis'@'localhost';
+GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON \`aegis_quant_test%\`.* TO 'aegis'@'localhost';
+GRANT ALL PRIVILEGES ON \`aegis_quant_test%\`.* TO 'aegis'@'127.0.0.1';
+FLUSH PRIVILEGES;"
+sudo mariadb aegis_quant < "${SQL_SCHEMA}"
+
+echo "[4/7] Preparing Aegis Quant directories (${DATA_DIR}, ${LOG_DIR}, ${BIN_DIR})..."
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BIN_DIR}"
 chmod 700 "${DATA_DIR}"
 chmod 750 "${LOG_DIR}"
 chmod 755 "${BIN_DIR}"
 
-echo "[4/6] Verifying Aegis Quant Rust binary (${BIN_DIR}/aegis-quant)..."
+echo "[5/7] Building or verifying Aegis Quant v2.0 Rust binary (${BIN_DIR}/aegis-quant)..."
 if [ ! -x "${BIN_DIR}/aegis-quant" ]; then
-    echo "Building release binary via cargo..."
     cargo build --release --manifest-path "${AEGIS_ROOT}/Cargo.toml"
-    if [ -f "${AEGIS_ROOT}/target/release/aegis-quant" ]; then
-        cp "${AEGIS_ROOT}/target/release/aegis-quant" "${BIN_DIR}/aegis-quant"
-    elif [ -f "/tmp/aegis-cargo-target/release/aegis-quant" ]; then
-        cp "/tmp/aegis-cargo-target/release/aegis-quant" "${BIN_DIR}/aegis-quant"
-    fi
+    cp "${AEGIS_ROOT}/target/release/aegis-quant" "${BIN_DIR}/aegis-quant"
 fi
 chmod 755 "${BIN_DIR}/aegis-quant"
 chcon -t bin_t "${BIN_DIR}/aegis-quant" 2>/dev/null || true
 
-echo "[5/6] Provisioning CSPRNG Fernet master key & SQLite WAL database (${DB_PATH})..."
+echo "[6/7] Verifying CSPRNG Fernet master key & initializing MariaDB seed..."
 if [ ! -s "${KEY_PATH}" ]; then
-    (umask 0077; "${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --generate-key > "${KEY_PATH}")
+    (umask 0077; "${BIN_DIR}/aegis-quant" db --generate-key > "${KEY_PATH}")
 fi
 chmod 600 "${KEY_PATH}"
-"${BIN_DIR}/aegis-quant" --db "${DB_PATH}" db --init --migrate
-chmod 600 "${DB_PATH}"
+"${BIN_DIR}/aegis-quant" db --init --migrate
 
-echo "[6/6] Installing and starting hardened systemd units (${SYSTEMD_UNITS[*]}) (R19-L4)..."
-for unit in "${SYSTEMD_UNITS[@]}"; do
-    src="${DEPLOY_DIR}/${unit}"
-    dst="${SYSTEMD_DIR}/${unit}"
-    if [ ! -s "${src}" ]; then
-        echo "ERROR: Missing required systemd unit ${src}" >&2
-        exit 1
-    fi
-    sudo cp "${src}" "${dst}"
-    sudo chmod 644 "${dst}"
-    sudo restorecon -v "${dst}" 2>/dev/null || true
-done
+echo "[7/7] Installing and starting hardened aegis-quant.service..."
+sudo systemctl disable --now aegis-pit.service aegis-pond.service aegis-settle.service aegis-settle.timer 2>/dev/null || true
+sudo rm -f "${SYSTEMD_DIR}/aegis-pit.service" "${SYSTEMD_DIR}/aegis-pond.service" "${SYSTEMD_DIR}/aegis-settle.service" "${SYSTEMD_DIR}/aegis-settle.timer"
+sudo cp "${DEPLOY_DIR}/aegis-quant.service" "${SYSTEMD_DIR}/aegis-quant.service"
+sudo chmod 644 "${SYSTEMD_DIR}/aegis-quant.service"
+sudo restorecon -v "${SYSTEMD_DIR}/aegis-quant.service" 2>/dev/null || true
 sudo systemctl daemon-reload
-sudo systemctl enable --now aegis-settle.timer
 sudo systemctl enable aegis-quant.service
 sudo systemctl restart aegis-quant.service
 
-for unit in "${SYSTEMD_UNITS[@]}"; do
-    if [ ! -s "${SYSTEMD_DIR}/${unit}" ]; then
-        echo "ERROR: Installed systemd unit missing at ${SYSTEMD_DIR}/${unit}" >&2
-        exit 1
-    fi
-done
-
-echo "Waiting for Aegis Quant Axum WebUI server on http://127.0.0.1:8000/api/v1/health..."
+echo "Waiting for Aegis Quant v2.0 WebUI server on http://127.0.0.1:8000/api/v1/health..."
 for _ in $(seq 1 30); do
     if curl -fsS http://127.0.0.1:8000/api/v1/health >/dev/null 2>&1; then
         break
@@ -92,8 +79,7 @@ for _ in $(seq 1 30); do
 done
 
 echo "=== Bootstrap Complete ==="
+systemctl is-active mariadb.service
 systemctl is-active aegis-quant.service
-systemctl is-active aegis-settle.timer
-chronyc tracking
 curl -fsS http://127.0.0.1:8000/api/v1/health
 echo ""

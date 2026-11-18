@@ -10,6 +10,7 @@ aegis-alerts = { workspace = true }
 aegis-core = { workspace = true }
 aegis-db = { workspace = true }
 aegis-risk = { workspace = true }
+aegis-signals = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 k256 = { workspace = true }
@@ -17,10 +18,10 @@ parking_lot = { workspace = true }
 reqwest = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
-
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }

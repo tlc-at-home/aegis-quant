@@ -4,12 +4,13 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Thread-safe SQLite WAL & :memory: manager with Fernet AES-128-CBC + HMAC-SHA256 encryption at rest"
+description = "Tuned MariaDB 13.0 Rolling / 12.3 LTS InnoDB connection pool, 7 SQL Views repository, and Fernet AES-128-CBC + HMAC-SHA256 vault"
 
 [dependencies]
 aegis-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+mysql.workspace = true
 rusqlite.workspace = true
 chrono.workspace = true
 uuid.workspace = true
@@ -22,9 +23,3 @@ rand.workspace = true
 zeroize.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
-
-
-[[bin]]
-name = "aegis-db-tool"
-path = "src/bin/aegis-db-tool.rs"
-

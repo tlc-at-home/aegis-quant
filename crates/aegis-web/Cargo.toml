@@ -7,15 +7,9 @@ license.workspace = true
 
 [dependencies]
 aegis-alerts = { workspace = true }
-aegis-backtest = { workspace = true }
 aegis-core = { workspace = true }
 aegis-db = { workspace = true }
 aegis-execution = { workspace = true }
-aegis-pit = { workspace = true }
-aegis-pond = { workspace = true }
-aegis-risk = { workspace = true }
-aegis-settle = { workspace = true }
-aegis-signals = { workspace = true }
 aegis-telemetry = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
