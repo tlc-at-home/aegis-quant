@@ -1,5 +1,5 @@
 //! Primary Alert Engine (`aegis-alerts::engine`) orchestrating Rich HTML Telegram Cards,
-//! Config-Switchable Discord Webhooks, and MariaDB `alert_queue` persistence.
+//! Config-Switchable Discord Webhooks, MariaDB `alert_queue` persistence, and 5-Minute Deduplication Guard.
 
 use crate::discord::send_discord_webhook;
 use crate::formatter::{
@@ -18,8 +18,175 @@ use aegis_core::{
     Result,
 };
 use aegis_db::DatabaseManager;
+use mysql::params;
+use mysql::prelude::*;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Default 5-minute (300,000 ms) deduplication cooldown window preventing repeated Telegram alerts
+/// for the same `(event_type, asset_symbol / message_prefix)`.
+pub const DEFAULT_ALERT_DEDUP_WINDOW_MS: i64 = 300_000;
+
+static PROCESS_ALERT_DEDUP_CACHE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+fn process_dedup_cache() -> &'static Mutex<HashMap<String, i64>> {
+    PROCESS_ALERT_DEDUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extracts the canonical asset symbol from `payload_json` (`"symbol"`) or from the HTML card tag
+/// (`<b>Asset:</b> <code>SYMBOL</code>`).
+pub fn extract_asset_symbol_from_alert(
+    html_message: &str,
+    payload_json: Option<&Value>,
+) -> Option<String> {
+    if let Some(sym) = payload_json
+        .and_then(|v| v.get("symbol"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(sym.to_ascii_uppercase());
+    }
+    let marker = "<b>Asset:</b> <code>";
+    if let Some(start_idx) = html_message.find(marker) {
+        let rest = &html_message[start_idx + marker.len()..];
+        if let Some(end_idx) = rest.find("</code>") {
+            let sym = rest[..end_idx].trim();
+            if !sym.is_empty() {
+                return Some(sym.to_ascii_uppercase());
+            }
+        }
+    }
+    None
+}
+
+/// Returns the first `max_chars` characters of `s` safely on UTF-8 char boundaries.
+pub fn message_prefix_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// Computes the deterministic in-memory deduplication key for an alert.
+pub fn compute_alert_dedup_key(
+    event_type: &str,
+    html_message: &str,
+    payload_json: Option<&Value>,
+) -> String {
+    let ev = event_type.trim().to_ascii_uppercase();
+    if let Some(sym) = extract_asset_symbol_from_alert(html_message, payload_json) {
+        format!("{ev}::ASSET::{sym}")
+    } else {
+        let prefix = message_prefix_chars(html_message.trim(), 160);
+        format!("{ev}::MSG::{prefix}")
+    }
+}
+
+/// Checks both the process-wide in-memory deduplication cache and MariaDB `alert_queue`
+/// to determine whether an alert with the same `event_type` and same asset symbol
+/// (or identical first 160 chars of `message`) was already sent within `window_ms` (300,000 ms).
+/// Excludes `SYSTEM_TEST_ALERT`.
+pub fn is_duplicate_alert_within_window(
+    db: &DatabaseManager,
+    event_type: &str,
+    html_message: &str,
+    payload_json: Option<&Value>,
+    window_ms: i64,
+) -> bool {
+    let ev_upper = event_type.trim().to_ascii_uppercase();
+    if ev_upper == "SYSTEM_TEST_ALERT" || window_ms <= 0 {
+        return false;
+    }
+
+    let now = now_ms();
+    let cutoff_ms = now.saturating_sub(window_ms);
+    let dedup_key = compute_alert_dedup_key(&ev_upper, html_message, payload_json);
+
+    // 1. Check process-wide in-memory cache first
+    {
+        let mut cache = process_dedup_cache().lock();
+        cache.retain(|_, ts| *ts >= cutoff_ms);
+        if let Some(&last_ts) = cache.get(&dedup_key) {
+            if last_ts >= cutoff_ms {
+                return true;
+            }
+        }
+    }
+
+    // 2. Check MariaDB `alert_queue` for any recent row within `cutoff_ms`
+    let prefix = message_prefix_chars(html_message, 160);
+    let sym_opt = extract_asset_symbol_from_alert(html_message, payload_json);
+
+    if let Ok(mut conn) = db.get_conn() {
+        let count_res: std::result::Result<Option<i64>, mysql::Error> =
+            if let Some(ref sym) = sym_opt {
+                let sym_tag_pattern = format!("%<code>{sym}</code>%");
+                let sym_json_pattern = format!("%\"symbol\":\"{sym}\"%");
+                conn.exec_first(
+                    r#"SELECT COUNT(*)
+                       FROM alert_queue
+                       WHERE event_type = :ev
+                         AND created_at_ms >= :cutoff
+                         AND status IN ('DELIVERED', 'PENDING', 'SKIPPED')
+                         AND (
+                             message LIKE :sym_tag
+                             OR CAST(payload_json AS CHAR) LIKE :sym_json
+                             OR LEFT(message, 160) = :prefix
+                         )"#,
+                    params! {
+                        "ev" => event_type.trim(),
+                        "cutoff" => cutoff_ms,
+                        "sym_tag" => sym_tag_pattern,
+                        "sym_json" => sym_json_pattern,
+                        "prefix" => &prefix,
+                    },
+                )
+            } else {
+                conn.exec_first(
+                    r#"SELECT COUNT(*)
+                       FROM alert_queue
+                       WHERE event_type = :ev
+                         AND created_at_ms >= :cutoff
+                         AND status IN ('DELIVERED', 'PENDING', 'SKIPPED')
+                         AND LEFT(message, 160) = :prefix"#,
+                    params! {
+                        "ev" => event_type.trim(),
+                        "cutoff" => cutoff_ms,
+                        "prefix" => &prefix,
+                    },
+                )
+            };
+
+        if let Ok(Some(cnt)) = count_res {
+            if cnt > 0 {
+                process_dedup_cache().lock().insert(dedup_key, now);
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Records an alert dispatch in the process-wide in-memory deduplication cache.
+pub fn record_alert_dedup_timestamp(
+    event_type: &str,
+    html_message: &str,
+    payload_json: Option<&Value>,
+) {
+    let ev_upper = event_type.trim().to_ascii_uppercase();
+    if ev_upper == "SYSTEM_TEST_ALERT" {
+        return;
+    }
+    let key = compute_alert_dedup_key(&ev_upper, html_message, payload_json);
+    process_dedup_cache().lock().insert(key, now_ms());
+}
+
+/// Clears the in-memory deduplication cache (for unit tests).
+pub fn clear_alert_dedup_cache_for_tests() {
+    process_dedup_cache().lock().clear();
+}
 
 /// Structured dispatch outcome returned by all `AlertEngine` methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +224,7 @@ impl AlertDispatchResult {
 pub struct AlertEngine {
     pub db: DatabaseManager,
     pub timeout_sec: u64,
+    pub dedup_window_ms: i64,
     pub retry_queue: AlertRetryQueue,
 }
 
@@ -64,9 +232,13 @@ impl AlertEngine {
     pub fn new(db: DatabaseManager) -> Self {
         let cfg = db.load_config_or_default();
         let timeout_sec = cfg.get_usize("alert_http_timeout_sec", 10).max(2) as u64;
+        let dedup_window_ms = cfg
+            .get_i64("alert_dedup_window_ms", DEFAULT_ALERT_DEDUP_WINDOW_MS)
+            .max(0);
         Self {
             db,
             timeout_sec,
+            dedup_window_ms,
             retry_queue: AlertRetryQueue::new(),
         }
     }
@@ -222,7 +394,8 @@ impl AlertEngine {
     }
 
     /// Dispatches a formatted HTML alert immediately and records its lifecycle in MariaDB `alert_queue` and `telemetry_logs`.
-    /// If a transient HTTP error occurs, leaves the record as `PENDING` in `alert_queue` for retry.
+    /// Enforces a 5-minute (300,000 ms) in-memory and DB-backed deduplication cooldown guard (excluding `SYSTEM_TEST_ALERT`)
+    /// so duplicate alerts for the same `event_type` and asset symbol cannot spam Telegram.
     pub fn dispatch_html_alert(
         &self,
         event_type: &str,
@@ -230,6 +403,36 @@ impl AlertEngine {
         html_message: &str,
         payload_json: Option<Value>,
     ) -> AlertDispatchResult {
+        if is_duplicate_alert_within_window(
+            &self.db,
+            event_type,
+            html_message,
+            payload_json.as_ref(),
+            self.dedup_window_ms,
+        ) {
+            let cfg = self.db.load_config_or_default();
+            return AlertDispatchResult {
+                status: "SUPPRESSED_DUPLICATE".to_string(),
+                reason: Some("DUPLICATE_WITHIN_5M_COOLDOWN".to_string()),
+                provider: cfg.alert_provider().as_str().to_string(),
+                telegram_sent: false,
+                discord_sent: false,
+                webhook_payload_verified: false,
+                queued_for_retry: false,
+                alert_queue_id: None,
+                chat_id: String::new(),
+                error_detail: None,
+                title: event_type.to_string(),
+                severity: severity.to_string(),
+                timestamp: now_iso8601_utc(),
+                html_message: html_message.to_string(),
+                channels: Vec::new(),
+            };
+        }
+
+        // Record in-memory dedup timestamp prior to dispatch to block concurrent duplicate bursts
+        record_alert_dedup_timestamp(event_type, html_message, payload_json.as_ref());
+
         let mut res = self.dispatch_raw_html_without_requeue(event_type, severity, html_message);
         let db_status = if res.status == "DELIVERED" {
             "DELIVERED"
@@ -297,7 +500,8 @@ impl AlertEngine {
         .map_err(|e| AegisError::Alert(format!("dispatch_html_alert_async join failed: {e}")))
     }
 
-    /// Enqueues an HTML alert into MariaDB `alert_queue` (`status = 'PENDING'`) for background polling.
+    /// Enqueues an HTML alert into MariaDB `alert_queue` (`status = 'PENDING'`) for background polling,
+    /// enforcing the 5-minute deduplication guard.
     pub fn enqueue_html_alert(
         &self,
         event_type: &str,
@@ -449,4 +653,86 @@ pub async fn send_test_alert_async(db: &DatabaseManager) -> Result<AlertDispatch
     tokio::task::spawn_blocking(move || send_test_alert(&db_clone))
         .await
         .map_err(|e| AegisError::Alert(format!("send_test_alert_async join failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_core::OrderSide;
+
+    #[test]
+    fn test_extract_asset_symbol_and_dedup_key() {
+        let closed = PositionClosedAlert {
+            symbol: "MET-USDC".to_string(),
+            side: OrderSide::Short,
+            exit_reason: "PROTECTIVE_STOP_EXIT (mark=0.1753, stop=0.1726)".to_string(),
+            entry_price: 0.1660,
+            exit_price: 0.1753,
+            filled_qty: 799.0,
+            realized_pnl_usdc: -7.43,
+            available_cash_usdc: 910.42,
+            cooldown_type: Some("STOP_OUT".to_string()),
+            cooldown_seconds: 1800,
+            timestamp_ms: 1795053912000,
+        };
+        let html = format_position_closed_html(&closed);
+        let payload = serde_json::to_value(&closed).ok();
+
+        assert_eq!(
+            extract_asset_symbol_from_alert(&html, None),
+            Some("MET-USDC".to_string())
+        );
+        assert_eq!(
+            extract_asset_symbol_from_alert("plain message", payload.as_ref()),
+            Some("MET-USDC".to_string())
+        );
+        assert_eq!(
+            compute_alert_dedup_key("POSITION_CLOSED_COOLDOWN", &html, payload.as_ref()),
+            "POSITION_CLOSED_COOLDOWN::ASSET::MET-USDC"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_and_db_alert_deduplication_5m_window() {
+        clear_alert_dedup_cache_for_tests();
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let engine = AlertEngine::new(db);
+
+        let closed = PositionClosedAlert {
+            symbol: "HYPE-USDC".to_string(),
+            side: OrderSide::Short,
+            exit_reason: "PROTECTIVE_STOP_EXIT".to_string(),
+            entry_price: 39.20,
+            exit_price: 41.32,
+            filled_qty: 3.31,
+            realized_pnl_usdc: -7.02,
+            available_cash_usdc: 910.42,
+            cooldown_type: Some("STOP_OUT".to_string()),
+            cooldown_seconds: 1800,
+            timestamp_ms: now_ms(),
+        };
+
+        // First dispatch proceeds (SKIPPED because no token is configured in isolated test DB)
+        let first = engine.notify_position_closed(&closed);
+        assert_eq!(first.status, "SKIPPED");
+
+        // Second dispatch within 5 minutes for the same (POSITION_CLOSED_COOLDOWN, HYPE-USDC) is suppressed in-memory
+        let second = engine.notify_position_closed(&closed);
+        assert_eq!(second.status, "SUPPRESSED_DUPLICATE");
+        assert_eq!(
+            second.reason.as_deref(),
+            Some("DUPLICATE_WITHIN_5M_COOLDOWN")
+        );
+
+        // Even if the in-memory cache is cleared (simulating daemon restart), MariaDB `alert_queue` 5-minute check suppresses the duplicate
+        clear_alert_dedup_cache_for_tests();
+        let third = engine.notify_position_closed(&closed);
+        assert_eq!(third.status, "SUPPRESSED_DUPLICATE");
+
+        // SYSTEM_TEST_ALERT is never suppressed by deduplication
+        let test1 = engine.send_test_alert();
+        let test2 = engine.send_test_alert();
+        assert_ne!(test1.status, "SUPPRESSED_DUPLICATE");
+        assert_ne!(test2.status, "SUPPRESSED_DUPLICATE");
+    }
 }

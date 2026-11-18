@@ -25,6 +25,22 @@ pub struct WorkingOrderInput {
     pub reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReconciledClosedTradeInput {
+    pub asset_id: i64,
+    pub client_order_id: String,
+    pub exchange_order_id: String,
+    pub side: OrderSide,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub filled_quantity: f64,
+    pub realized_pnl_usdc: f64,
+    pub fees_paid_usdc: f64,
+    pub created_at_ms: i64,
+    pub closed_at_ms: i64,
+    pub exit_reason: String,
+}
+
 impl DatabaseManager {
     /// Places a new `WORKING` order into `positions`, reserving `reserved_margin_usdc` without spending cash yet,
     /// and writes the initial transition into `order_audit`.
@@ -513,7 +529,12 @@ impl DatabaseManager {
                 }
             }
 
-            let eff_stop = if existing_stop > 0.0 {
+            let stop_is_valid_non_breached = existing_stop > 0.0
+                && match side {
+                    OrderSide::Long => existing_stop < mark_price * 0.998,
+                    OrderSide::Short => existing_stop > mark_price * 1.002,
+                };
+            let eff_stop = if stop_is_valid_non_breached {
                 existing_stop
             } else {
                 protective_stop_px
@@ -654,6 +675,133 @@ impl DatabaseManager {
             ))
         })?;
         Ok((new_id, true))
+    }
+
+    /// Reconciles historical `CLOSED` positions in MariaDB 1:1 with Hyperliquid `userFills` closed trades:
+    /// 1. Purges any synthetic/duplicate local `CLOSED` rows whose `client_order_id` does not start with `'hl-closed-'`.
+    /// 2. Upserts every aggregated Hyperliquid closed trade (`hl-closed-<coin>-<oid>`) with exact timestamps, quantities, entry/exit prices, fees, and realized PnL.
+    pub fn reconcile_closed_positions_from_exchange_fills(
+        &self,
+        trades: &[ReconciledClosedTradeInput],
+    ) -> Result<usize> {
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "reconcile_closed_positions_from_exchange_fills tx failed: {e}"
+                ))
+            })?;
+
+        tx.query_drop(
+            "DELETE FROM positions WHERE status = 'CLOSED' AND client_order_id NOT LIKE 'hl-closed-%'",
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "Failed to purge synthetic local CLOSED rows: {e}"
+            ))
+        })?;
+
+        for t in trades {
+            let high = t.entry_price.max(t.exit_price);
+            let low = t.entry_price.min(t.exit_price).max(0.0);
+            tx.exec_drop(
+                r#"INSERT INTO positions (
+                       asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
+                       exit_price, requested_quantity, filled_quantity, reserved_margin_usdc,
+                       committed_notional_usdc, portfolio_weight, s1_weight_contrib, s2_weight_contrib,
+                       s3_weight_contrib, protective_stop_px, highest_price_seen, lowest_price_seen,
+                       chase_count, realized_pnl_usdc, unrealized_pnl_usdc, fees_paid_usdc,
+                       exchange_order_id, created_at_ms, opened_at_ms, closed_at_ms, updated_at_ms, exit_reason
+                   ) VALUES (
+                       :aid, :coid, :side, 'CLOSED', 'CLOSED', :entry_px, :exit_px,
+                       :exit_px, :qty, :qty, 0.0,
+                       0.0, 0.0, 0.0, 0.0,
+                       0.0, 0.0, :high, :low,
+                       0, :rpnl, 0.0, :fees,
+                       :eoid, :cts, :cts, :clts, :clts, :reason
+                   )
+                   ON DUPLICATE KEY UPDATE
+                       asset_id = VALUES(asset_id),
+                       side = VALUES(side),
+                       status = 'CLOSED',
+                       fsm_state = 'CLOSED',
+                       entry_price = VALUES(entry_price),
+                       current_price = VALUES(current_price),
+                       exit_price = VALUES(exit_price),
+                       requested_quantity = VALUES(requested_quantity),
+                       filled_quantity = VALUES(filled_quantity),
+                       reserved_margin_usdc = 0.0,
+                       committed_notional_usdc = 0.0,
+                       realized_pnl_usdc = VALUES(realized_pnl_usdc),
+                       unrealized_pnl_usdc = 0.0,
+                       fees_paid_usdc = VALUES(fees_paid_usdc),
+                       exchange_order_id = VALUES(exchange_order_id),
+                       closed_at_ms = VALUES(closed_at_ms),
+                       updated_at_ms = VALUES(updated_at_ms),
+                       exit_reason = VALUES(exit_reason)"#,
+                params! {
+                    "aid" => t.asset_id,
+                    "coid" => &t.client_order_id,
+                    "side" => t.side.as_str(),
+                    "entry_px" => round_dp(t.entry_price, 6),
+                    "exit_px" => round_dp(t.exit_price, 6),
+                    "qty" => round_dp(t.filled_quantity, 6),
+                    "high" => round_dp(high, 6),
+                    "low" => round_dp(low, 6),
+                    "rpnl" => round_dp(t.realized_pnl_usdc, 4),
+                    "fees" => round_dp(t.fees_paid_usdc, 4),
+                    "eoid" => &t.exchange_order_id,
+                    "cts" => t.created_at_ms,
+                    "clts" => t.closed_at_ms,
+                    "reason" => &t.exit_reason,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "Failed to upsert reconciled closed trade '{}': {e}",
+                    t.client_order_id
+                ))
+            })?;
+        }
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "reconcile_closed_positions_from_exchange_fills commit failed: {e}"
+            ))
+        })?;
+        Ok(trades.len())
+    }
+
+    /// Tags a newly closed position with its canonical Hyperliquid closing `client_order_id` (`hl-closed-<coin>-<oid>`)
+    /// and `exchange_order_id` (`hl-<oid>`) so it seamlessly aligns with `userFills`.
+    pub fn set_position_closed_exchange_ids(
+        &self,
+        position_id: i64,
+        client_order_id: &str,
+        exchange_order_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.get_conn()?;
+        // Remove any older duplicate row with the same client_order_id before tagging
+        let _ = conn.exec_drop(
+            "DELETE FROM positions WHERE client_order_id = :coid AND id != :pid",
+            params! { "coid" => client_order_id, "pid" => position_id },
+        );
+        conn.exec_drop(
+            r#"UPDATE positions
+               SET client_order_id = :coid,
+                   exchange_order_id = :eoid
+               WHERE id = :pid"#,
+            params! {
+                "coid" => client_order_id,
+                "eoid" => exchange_order_id,
+                "pid" => position_id,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("set_position_closed_exchange_ids failed: {e}"))
+        })?;
+        Ok(())
     }
 }
 

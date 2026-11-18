@@ -8,7 +8,7 @@
 
 use crate::http_client::HyperliquidHttpClient;
 use crate::order_chaser::{ChaseStepOutcome, OrderChaser};
-use crate::signing::{build_limit_order_wire, HL_ORACLE_BAND_PCT};
+use crate::signing::{build_limit_order_wire, snap_to_tick, HL_ORACLE_BAND_PCT};
 use aegis_alerts::{AlertEngine, PositionClosedAlert};
 use aegis_core::{now_ms, round_dp, HeldAssetView, OrderSide, Result};
 use aegis_db::DatabaseManager;
@@ -140,8 +140,12 @@ impl PriorityMonitor {
                     .exit_reason
                     .as_deref()
                     .unwrap_or("PROTECTIVE_STOP_BREACH");
-                self.execute_protective_stop_exit(h, live_mark, exit_reason, &risk)?;
-                report.stops_triggered_closed += 1;
+                if self
+                    .execute_protective_stop_exit(h, live_mark, exit_reason, &risk)?
+                    .is_some()
+                {
+                    report.stops_triggered_closed += 1;
+                }
             } else {
                 self.db.update_open_position_mark_and_stop(
                     h.position_id,
@@ -159,58 +163,91 @@ impl PriorityMonitor {
 
     /// Executes an immediate stop-out exit for an `OPEN` holding, inserts a post-stop cooldown
     /// into `asset_cooldowns`, logs telemetry, and dispatches a rich HTML Telegram alert.
+    /// In `TESTNET`/`LIVE` mode, only closes in MariaDB and fires an alert if Hyperliquid confirms a fill;
+    /// if the Testnet orderbook cannot fill the close order, re-anchors `protective_stop_px` beyond `exit_price`
+    /// so it never enters a 1s alert/close loop.
     pub fn execute_protective_stop_exit(
         &self,
         held: &HeldAssetView,
         exit_price: f64,
         exit_reason: &str,
         risk: &RiskEngine,
-    ) -> Result<f64> {
+    ) -> Result<Option<f64>> {
         let cfg = self.db.load_config_or_default();
         let side = OrderSide::parse(&held.side);
         let taker_fee_bps = risk.limits.taker_fee_bps;
+        let default_stop_pct = risk.limits.protective_stop_default_pct.clamp(0.01, 0.25);
         let mut fees_paid_usdc =
             round_dp(exit_price * held.quantity * (taker_fee_bps / 10_000.0), 4);
         let mut eff_exit_price = exit_price;
+        let mut live_close_oid: Option<String> = None;
 
-        if cfg.execution_mode().is_live_or_testnet() {
+        let is_live_exchange = cfg.execution_mode().is_live_or_testnet()
+            && !cfg.get_str("private_key", "").is_empty()
+            && !self.db.is_ephemeral_test_db();
+
+        if is_live_exchange {
             let pk = cfg.get_str("private_key", "");
-            if !pk.is_empty() {
-                if let Ok(Some(asset)) = self.db.get_asset_by_id(held.asset_id) {
-                    // Submit reduce-only IOC market-like order to close position on Hyperliquid
-                    let exit_is_buy = !side.is_buy();
-                    let limit_px = if exit_is_buy {
-                        exit_price * (1.0 + HL_ORACLE_BAND_PCT)
-                    } else {
-                        exit_price * (1.0 - HL_ORACLE_BAND_PCT)
-                    };
-                    let wire = build_limit_order_wire(
-                        asset.asset_index,
-                        exit_is_buy,
-                        limit_px,
-                        held.quantity,
-                        asset.tick_size,
-                        asset.lot_step_size,
-                        asset.sz_decimals,
-                        true,
-                        "Ioc",
-                        Some(&format!("v2-stopexit-{}-{}", held.position_id, now_ms())),
-                    );
-                    if let Ok(ack) = self.http.submit_order_wire(
-                        wire,
-                        held.quantity,
-                        exit_price,
-                        taker_fee_bps,
-                        &pk,
-                        Some(&self.db),
-                        &cfg,
-                    ) {
-                        if ack.status == "FILLED" && ack.avg_fill_price > 0.0 {
+            let asset_opt = self.db.get_asset_by_id(held.asset_id)?;
+            let tick = asset_opt
+                .as_ref()
+                .map(|a| a.tick_size)
+                .unwrap_or(0.01)
+                .max(1e-8);
+            let mut filled_on_hl = false;
+
+            if let Some(asset) = asset_opt {
+                let exit_is_buy = !side.is_buy();
+                let limit_px = if exit_is_buy {
+                    exit_price * (1.0 + HL_ORACLE_BAND_PCT)
+                } else {
+                    exit_price * (1.0 - HL_ORACLE_BAND_PCT)
+                };
+                let wire = build_limit_order_wire(
+                    asset.asset_index,
+                    exit_is_buy,
+                    limit_px,
+                    held.quantity,
+                    asset.tick_size,
+                    asset.lot_step_size,
+                    asset.sz_decimals,
+                    true,
+                    "Ioc",
+                    Some(&format!("v2-stopexit-{}-{}", held.position_id, now_ms())),
+                );
+                if let Ok(ack) = self.http.submit_order_wire(
+                    wire,
+                    held.quantity,
+                    exit_price,
+                    taker_fee_bps,
+                    &pk,
+                    Some(&self.db),
+                    &cfg,
+                ) {
+                    if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                        filled_on_hl = true;
+                        if ack.avg_fill_price > 0.0 {
                             eff_exit_price = ack.avg_fill_price;
-                            fees_paid_usdc = ack.fee_usdc;
                         }
+                        fees_paid_usdc = ack.fee_usdc;
+                        live_close_oid = ack.exchange_order_id;
                     }
                 }
+            }
+
+            if !filled_on_hl {
+                // Re-anchor protective_stop_px beyond current mark/exit price so it does not spam 1s stop attempts on an illiquid Testnet book
+                let widened_stop = if side.is_buy() {
+                    snap_to_tick(exit_price * (1.0 - default_stop_pct), tick)
+                } else {
+                    snap_to_tick(exit_price * (1.0 + default_stop_pct), tick)
+                };
+                self.db.update_open_position_mark_and_stop(
+                    held.position_id,
+                    exit_price,
+                    widened_stop,
+                )?;
+                return Ok(None);
             }
         }
 
@@ -220,6 +257,14 @@ impl PriorityMonitor {
             fees_paid_usdc,
             exit_reason,
         )?;
+
+        if let Some(ref eoid) = live_close_oid {
+            let oid_num = eoid.strip_prefix("hl-").unwrap_or(eoid.as_str());
+            let coid = format!("hl-closed-{}-{oid_num}", held.coin.to_ascii_lowercase());
+            let _ = self
+                .db
+                .set_position_closed_exchange_ids(held.position_id, &coid, eoid);
+        }
 
         let cooldown_sec = risk.limits.stop_out_cooldown_sec.max(60);
         let cd_reason = format!(
@@ -266,6 +311,6 @@ impl PriorityMonitor {
         };
         let _ = self.alerts.notify_position_closed(&alert);
 
-        Ok(realized_pnl)
+        Ok(Some(realized_pnl))
     }
 }

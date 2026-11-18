@@ -296,9 +296,15 @@ impl DatabaseManager {
     ) -> Result<PnlSummary> {
         let now = now_ms();
         let cfg = self.load_config_or_default();
-        let fallback_base_eq = cfg
-            .get_f64("initial_paper_equity_usdc", 10_000.0)
-            .max(100.0);
+        let live_eq_cfg = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        let anchor_equity = if live_eq_cfg > 0.0 {
+            live_eq_cfg
+        } else if current_total_equity > 0.0 {
+            current_total_equity
+        } else {
+            cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+        }
+        .max(100.0);
 
         let mut conn = self.get_conn()?;
         let build_horizon = |conn: &mut mysql::PooledConn,
@@ -329,26 +335,7 @@ impl DatabaseManager {
             let net_pnl_usdc = round_dp(realized_pnl_usdc + unrealized_pnl_usdc, 2);
             let fees_funding_usdc = round_dp(closed_fees_funding + open_fees_funding, 2);
 
-            let earliest_snap_eq: Option<f64> = conn
-                .exec_first(
-                    r#"SELECT total_equity_usdc
-                       FROM portfolio_snapshots
-                       WHERE created_at_ms >= :start_ms
-                       ORDER BY created_at_ms ASC, id ASC
-                       LIMIT 1"#,
-                    params! { "start_ms" => start_ms },
-                )
-                .ok()
-                .flatten();
-
-            let derived_base = (current_total_equity - net_pnl_usdc).max(100.0);
-            let baseline_equity_usdc = round_dp(
-                earliest_snap_eq
-                    .filter(|&v| v > 100.0)
-                    .unwrap_or(derived_base)
-                    .max(fallback_base_eq.min(derived_base)),
-                2,
-            );
+            let baseline_equity_usdc = round_dp((anchor_equity - net_pnl_usdc).max(100.0), 2);
 
             let return_pct = if baseline_equity_usdc > 0.0 {
                 round_dp((net_pnl_usdc / baseline_equity_usdc) * 100.0, 2)

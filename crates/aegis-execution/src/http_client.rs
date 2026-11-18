@@ -550,6 +550,18 @@ impl HyperliquidHttpClient {
         Ok(raw.as_array().cloned().unwrap_or_default())
     }
 
+    /// Polls `userFills` for `user_wallet` returning historical trade fills from Hyperliquid L1.
+    pub fn fetch_user_fills(&self, user_wallet: &str, cfg: &ConfigMap) -> Result<Vec<Value>> {
+        let raw = self.post_info(
+            &json!({
+                "type": "userFills",
+                "user": user_wallet.trim(),
+            }),
+            cfg,
+        )?;
+        Ok(raw.as_array().cloned().unwrap_or_default())
+    }
+
     /// Signs and posts an EIP-712 L1 action to `/exchange` with automatic single-retry on nonce collision.
     pub fn post_exchange_action<T: Serialize>(
         &self,

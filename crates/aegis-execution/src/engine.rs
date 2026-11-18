@@ -712,6 +712,7 @@ impl ExecutionEngine {
 
                                 // Submit reduceOnly IOC order for exact live_qty (try 3.95% oracle band, then l2Book BBO / 8% fallback)
                                 let mut filled_on_hl = false;
+                                let mut close_eoid_opt: Option<String> = None;
                                 for attempt in 0..2 {
                                     let ref_anchor = if attempt == 0 {
                                         exit_px
@@ -775,10 +776,23 @@ impl ExecutionEngine {
                                                 exit_px = ack.avg_fill_price;
                                             }
                                             fee_usdc = ack.fee_usdc;
+                                            close_eoid_opt = ack.exchange_order_id;
                                             filled_on_hl = true;
                                             break;
                                         }
                                     }
+                                }
+                                if let Some(ref eoid) = close_eoid_opt {
+                                    let oid_num = eoid.strip_prefix("hl-").unwrap_or(eoid.as_str());
+                                    let coid = format!(
+                                        "hl-closed-{}-{oid_num}",
+                                        asset.coin.to_ascii_lowercase()
+                                    );
+                                    let _ = self.db.set_position_closed_exchange_ids(
+                                        position_id,
+                                        &coid,
+                                        eoid,
+                                    );
                                 }
                                 if !filled_on_hl {
                                     tracing::warn!(

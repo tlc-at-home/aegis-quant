@@ -1,6 +1,9 @@
 //! MariaDB `alert_queue` poller, persistent retry state machine, and in-memory retry queue (`aegis-alerts::queue`).
 
-use crate::engine::AlertEngine;
+use crate::engine::{
+    is_duplicate_alert_within_window, record_alert_dedup_timestamp, AlertEngine,
+    DEFAULT_ALERT_DEDUP_WINDOW_MS,
+};
 use aegis_core::{now_ms, AegisError, AlertQueueRecord, Result};
 use aegis_db::DatabaseManager;
 use mysql::params;
@@ -14,7 +17,8 @@ use std::sync::{
     Arc,
 };
 
-/// Enqueues a rich HTML alert card into MariaDB `alert_queue` with `status = "PENDING"`.
+/// Enqueues a rich HTML alert card into MariaDB `alert_queue` with `status = "PENDING"`,
+/// enforcing the 5-minute (300,000 ms) deduplication cooldown guard (excluding `SYSTEM_TEST_ALERT`).
 pub fn enqueue_pending_alert(
     db: &DatabaseManager,
     event_type: &str,
@@ -23,6 +27,13 @@ pub fn enqueue_pending_alert(
     payload_json: Option<&Value>,
 ) -> Result<i64> {
     let cfg = db.load_config_or_default();
+    let window_ms = cfg
+        .get_i64("alert_dedup_window_ms", DEFAULT_ALERT_DEDUP_WINDOW_MS)
+        .max(0);
+    if is_duplicate_alert_within_window(db, event_type, html_message, payload_json, window_ms) {
+        return Ok(0);
+    }
+    record_alert_dedup_timestamp(event_type, html_message, payload_json);
     let provider = cfg.alert_provider().as_str();
     let ts = now_ms();
     let payload_str = payload_json.map(|v| v.to_string());

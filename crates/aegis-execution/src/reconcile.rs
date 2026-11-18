@@ -15,10 +15,10 @@ use aegis_core::{
     mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp, ExecutionMode, OrderSide,
     Result,
 };
-use aegis_db::{AssetUpsertInput, DatabaseManager};
+use aegis_db::{AssetUpsertInput, DatabaseManager, ReconciledClosedTradeInput};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -329,9 +329,9 @@ impl CutoverReconciler {
                 if !closed_on_exchange {
                     let tick = asset.tick_size.max(1e-8);
                     let stop_px = if side.is_buy() {
-                        snap_to_tick(entry_px * (1.0 - default_stop_pct), tick)
+                        snap_to_tick(entry_px.min(mark_px) * (1.0 - default_stop_pct), tick)
                     } else {
-                        snap_to_tick(entry_px * (1.0 + default_stop_pct), tick)
+                        snap_to_tick(entry_px.max(mark_px) * (1.0 + default_stop_pct), tick)
                     };
                     let committed_usdc = if pos_val > 0.0 {
                         round_dp(pos_val, 4)
@@ -387,6 +387,157 @@ impl CutoverReconciler {
                         h.position_id, h.symbol
                     ));
                 }
+            }
+        }
+
+        // 5. Reconcile historical `CLOSED` trades 1:1 from Hyperliquid `userFills`
+        if let Ok(user_fills) = self.http.fetch_user_fills(&wallet, &cfg) {
+            #[derive(Default)]
+            struct AggClosingOrder {
+                coin: String,
+                side: Option<OrderSide>,
+                total_sz: f64,
+                notional_sum: f64,
+                gross_closed_pnl: f64,
+                fees_usdc: f64,
+                min_time_ms: i64,
+                max_time_ms: i64,
+            }
+
+            let mut agg_by_key: BTreeMap<(String, u64), AggClosingOrder> = BTreeMap::new();
+
+            for fill in &user_fills {
+                let raw_coin = fill
+                    .get("coin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if raw_coin.is_empty() {
+                    continue;
+                }
+                let Ok((_, coin)) = normalize_hyperliquid_symbol(raw_coin) else {
+                    continue;
+                };
+                let closed_pnl = parse_f(fill.get("closedPnl"));
+                let dir = fill.get("dir").and_then(Value::as_str).unwrap_or("").trim();
+                let is_closing =
+                    closed_pnl.abs() > 1e-9 || dir.starts_with("Close") || dir.contains('>');
+                if !is_closing {
+                    continue;
+                }
+
+                let px = parse_f(fill.get("px"));
+                let sz = parse_f(fill.get("sz"));
+                if px <= 0.0 || sz <= 0.0 {
+                    continue;
+                }
+                let fee = parse_f(fill.get("fee"));
+                let fill_time = fill
+                    .get("time")
+                    .and_then(Value::as_i64)
+                    .filter(|&t| t > 0)
+                    .unwrap_or(ts);
+                let oid = fill
+                    .get("oid")
+                    .and_then(Value::as_u64)
+                    .or_else(|| {
+                        fill.get("oid")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+                    .filter(|&id| id > 0)
+                    .or_else(|| fill.get("tid").and_then(Value::as_u64))
+                    .unwrap_or(fill_time as u64);
+
+                let fill_side_str = fill.get("side").and_then(Value::as_str).unwrap_or("");
+                let closed_pos_side = if dir.starts_with("Close Long")
+                    || dir.starts_with("Long >")
+                    || (!dir.contains("Short") && fill_side_str == "A")
+                {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                };
+
+                let entry =
+                    agg_by_key
+                        .entry((coin.clone(), oid))
+                        .or_insert_with(|| AggClosingOrder {
+                            coin: coin.clone(),
+                            side: Some(closed_pos_side),
+                            min_time_ms: fill_time,
+                            max_time_ms: fill_time,
+                            ..Default::default()
+                        });
+                entry.total_sz += sz;
+                entry.notional_sum += px * sz;
+                entry.gross_closed_pnl += closed_pnl;
+                entry.fees_usdc += fee;
+                entry.min_time_ms = entry.min_time_ms.min(fill_time);
+                entry.max_time_ms = entry.max_time_ms.max(fill_time);
+            }
+
+            let mut closed_inputs = Vec::with_capacity(agg_by_key.len());
+            for ((_coin_key, oid), agg) in agg_by_key {
+                if agg.total_sz <= 1e-9 {
+                    continue;
+                }
+                let exit_px = agg.notional_sum / agg.total_sz;
+                let side = agg.side.unwrap_or(OrderSide::Long);
+                let entry_px = match side {
+                    OrderSide::Long => (exit_px - (agg.gross_closed_pnl / agg.total_sz)).max(1e-8),
+                    OrderSide::Short => (exit_px + (agg.gross_closed_pnl / agg.total_sz)).max(1e-8),
+                };
+                let net_rpnl = round_dp(agg.gross_closed_pnl - agg.fees_usdc, 4);
+
+                let asset_id = match self.db.get_asset_by_symbol(&agg.coin)? {
+                    Some(a) => a.id,
+                    None => {
+                        let tick = infer_tick_size(exit_px, 2);
+                        self.db.upsert_exchange_asset(&AssetUpsertInput {
+                            raw_symbol_or_coin: agg.coin.clone(),
+                            asset_index: 0,
+                            sz_decimals: 2,
+                            tick_size: tick,
+                            lot_step_size: 0.01,
+                            max_leverage: 20.0,
+                            mark_price: exit_px,
+                            mid_price: exit_px,
+                            oracle_price: exit_px,
+                            funding_rate_hourly: 0.0,
+                            day_volume_usdc: 100_000.0,
+                            open_interest_usdc: 50_000.0,
+                            prev_day_price: exit_px,
+                            is_core_eligible: false,
+                            is_event_eligible: true,
+                            is_priority_watched: false,
+                        })?
+                    }
+                };
+
+                closed_inputs.push(ReconciledClosedTradeInput {
+                    asset_id,
+                    client_order_id: format!("hl-closed-{}-{oid}", agg.coin.to_ascii_lowercase()),
+                    exchange_order_id: format!("hl-{oid}"),
+                    side,
+                    entry_price: entry_px,
+                    exit_price: exit_px,
+                    filled_quantity: agg.total_sz,
+                    realized_pnl_usdc: net_rpnl,
+                    fees_paid_usdc: round_dp(agg.fees_usdc, 4),
+                    created_at_ms: agg.min_time_ms,
+                    closed_at_ms: agg.max_time_ms,
+                    exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+                });
+            }
+
+            if let Ok(reconciled_closed_count) = self
+                .db
+                .reconcile_closed_positions_from_exchange_fills(&closed_inputs)
+            {
+                report.details.push(format!(
+                    "Reconciled {reconciled_closed_count} historical closed trades from Hyperliquid userFills"
+                ));
             }
         }
 

@@ -180,7 +180,7 @@ async function triggerHyperliquidReconcile() {
   const btn = document.getElementById('btn-sync-hyperliquid');
   if (btn) btn.disabled = true;
   try {
-    showToast('Synchronizing MariaDB 1:1 with Hyperliquid clearinghouseState...');
+    showToast('Synchronizing MariaDB 1:1 with Hyperliquid clearinghouseState & userFills...');
     const res = await apiFetch('/api/v1/reconcile', {
       method: 'POST',
       body: JSON.stringify({ close_legacy_positions: false }),
@@ -195,11 +195,21 @@ async function triggerHyperliquidReconcile() {
           r.exchange_equity_usdc ||
           0
       );
-      showToast(
-        `Synced 1:1 with Hyperliquid (Equity: ${fmtUsd(eq)} · Open Positions: ${Number(
-          r.legacy_positions_found || 0
-        )} · Cancelled Orders: ${Number(r.stale_orders_cancelled || 0)})`
+      await refreshAll(true);
+      const closedYtd = Number(
+        (state.dashboard &&
+          state.dashboard.pnl_summary &&
+          state.dashboard.pnl_summary.ytd &&
+          state.dashboard.pnl_summary.ytd.trade_count) ||
+          r.closed_fills_reconciled ||
+          0
       );
+      showToast(
+        `Synced 1:1 with Hyperliquid (Equity: ${fmtUsd(eq)} · Open: ${Number(
+          r.legacy_positions_found || 0
+        )} · Closed Trades: ${closedYtd})`
+      );
+      return;
     }
     await refreshAll(true);
   } catch (err) {
