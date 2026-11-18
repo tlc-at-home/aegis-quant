@@ -1,20 +1,55 @@
 /* ============================================================================
    AEGIS QUANT v2.0 — REAL-TIME MULTI-SLEEVE TERMINAL APPLICATION (app.js)
-   Backed by MariaDB 13.0 InnoDB, 7 SQL Views & 1s/2s SSE Stream
+   Backed by MariaDB 13.0 InnoDB & 1s/2s SSE Stream
    ============================================================================ */
 
 const state = {
   health: null,
   dashboard: null,
   activeTab: 's1',
-  cooldowns: [],
-  lastTickMs: Date.now(),
+  configCategory: 'all',
+  showAllPriorityWatch: false,
+  closingPositionIds: new Set(),
+  closingSymbols: new Set(),
+  closeInFlightCount: 0,
   sse: null,
 };
+
+const IMMUTABLE_SECURITY_KEYS = new Set([
+  'enforce_master_key',
+  'web_auth_enabled',
+  'web_allow_remote_bind',
+  'web_bind_host',
+  'web_csp_policy',
+  'web_cors_allowed_origins',
+  'web_allowed_hosts',
+  'web_api_token',
+  'telegram_api_base_url',
+  'hyperliquid_mainnet_url',
+  'hyperliquid_testnet_url',
+  'hyperliquid_info_url',
+  'hyperliquid_testnet_info_url',
+  'hyperliquid_exchange_url',
+  'hyperliquid_testnet_exchange_url',
+  'hyperliquid_allowed_hosts',
+]);
 
 function fmtUsd(val, decimals = 2) {
   const num = Number(val || 0);
   const sign = num < 0 ? '-' : '';
+  return (
+    sign +
+    '$' +
+    Math.abs(num).toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    })
+  );
+}
+
+function fmtSignedUsd(val, decimals = 2) {
+  const num = Number(val || 0);
+  const sign = num > 0.0001 ? '+' : num < -0.0001 ? '-' : '';
   return (
     sign +
     '$' +
@@ -35,7 +70,7 @@ function fmtPrice(px) {
 
 function fmtPct(fracOrPct, isFraction = true, decimals = 1) {
   const v = Number(fracOrPct || 0) * (isFraction ? 100.0 : 1.0);
-  const sign = v > 0 ? '+' : '';
+  const sign = v > 0.0001 ? '+' : '';
   return `${sign}${v.toFixed(decimals)}%`;
 }
 
@@ -85,7 +120,7 @@ async function apiFetch(url, options = {}) {
 }
 
 /* ============================================================================
-   INTERACTIVE ACTIONS (RISK TIER, TELEGRAM TEST, CLOSE POSITION, CONFIG)
+   INTERACTIVE ACTIONS (RISK TIER, TELEGRAM TEST, CLOSE POSITION, CONFIG MODAL)
    ============================================================================ */
 
 async function switchRiskTier(tier) {
@@ -105,7 +140,7 @@ async function switchRiskTier(tier) {
         data.target_leverage_multiplier || 1.85
       ).toFixed(2)}x)`
     );
-    await refreshAll();
+    await refreshAll(true);
   } catch (err) {
     showToast(`Failed to switch Risk Tier: ${err.message}`, true);
   }
@@ -142,13 +177,41 @@ async function triggerTelegramTestAlert() {
 }
 
 async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
+  const pid = Number(positionId || 0);
+  const sym = String(symbol || '').trim();
+  if ((pid > 0 && state.closingPositionIds.has(pid)) || (sym && state.closingSymbols.has(sym))) {
+    return;
+  }
+  if (pid > 0) state.closingPositionIds.add(pid);
+  if (sym) state.closingSymbols.add(sym);
+  state.closeInFlightCount += 1;
+
+  // Immediate visual feedback on button + optimistic removal
+  document
+    .querySelectorAll(`.close-btn[data-close-pos-id="${pid}"]`)
+    .forEach((btn) => {
+      btn.disabled = true;
+      btn.textContent = 'Closing...';
+    });
+
+  if (state.dashboard) {
+    state.dashboard.v_assets_held = (state.dashboard.v_assets_held || []).filter(
+      (h) => Number(h.position_id) !== pid && h.symbol !== sym
+    );
+    state.dashboard.v_assets_ordered = (state.dashboard.v_assets_ordered || []).filter(
+      (o) => Number(o.position_id) !== pid && o.symbol !== sym
+    );
+    renderOpenHoldingsTable(state.dashboard, true);
+    renderPriorityAndWorkingTable(state.dashboard, true);
+  }
+
   try {
     const res = await apiFetch('/api/v1/positions/close', {
       method: 'POST',
       body: JSON.stringify({
-        position_id: Number(positionId),
-        symbol: String(symbol || ''),
-        cooldown_sec: applyCooldown ? 1800 : 0,
+        position_id: pid > 0 ? pid : null,
+        symbol: sym,
+        cooldown_sec: applyCooldown ? 3600 : 600,
         reason: 'WEB_UI_OPERATOR_CLOSE',
       }),
     });
@@ -158,11 +221,58 @@ async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
       return;
     }
     showToast(
-      `Position/Order #${positionId} (${symbol}) closed (${data.status || 'CLOSED'})`
+      `Closed ${data.symbol || sym} (#${data.position_id || pid}) -> ${
+        data.new_status || 'CLOSED'
+      }`
     );
-    await refreshAll();
   } catch (err) {
     showToast(`Error closing position: ${err.message}`, true);
+  } finally {
+    state.closeInFlightCount = Math.max(0, state.closeInFlightCount - 1);
+    setTimeout(() => {
+      if (pid > 0) state.closingPositionIds.delete(pid);
+      if (sym) state.closingSymbols.delete(sym);
+    }, 2500);
+    await refreshAll(true);
+  }
+}
+
+async function closeAllOpenPositions() {
+  const btn = document.getElementById('btn-close-all-open');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Closing All...';
+  }
+  state.closeInFlightCount += 1;
+  try {
+    showToast('Closing all open positions & cancelling working orders...');
+    const res = await apiFetch('/api/v1/positions/close', {
+      method: 'POST',
+      body: JSON.stringify({
+        close_all: true,
+        cooldown_sec: 3600,
+        reason: 'WEB_UI_CLOSE_ALL',
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(`Close All failed: ${data.detail || data.error || res.status}`, true);
+      return;
+    }
+    showToast(
+      `Closed ${Number(data.closed_count || 0)} position(s)/order(s) (Realized PnL: ${fmtSignedUsd(
+        data.realized_pnl_usdc || 0
+      )})`
+    );
+  } catch (err) {
+    showToast(`Error closing all positions: ${err.message}`, true);
+  } finally {
+    state.closeInFlightCount = Math.max(0, state.closeInFlightCount - 1);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Close All';
+    }
+    await refreshAll(true);
   }
 }
 
@@ -175,7 +285,27 @@ async function submitConfigUpdate() {
     showToast('Please enter a config_key to update', true);
     return;
   }
+  await saveConfigKeyValue(key, val);
+  if (valEl) valEl.value = '';
+}
+
+async function saveSingleConfigRow(key, inputId) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  const val = el.value.trim();
+  if (el.getAttribute('data-is-secret') === 'true' && !val) {
+    showToast(`Enter a new secret value before saving '${key}'`, true);
+    return;
+  }
+  await saveConfigKeyValue(key, val);
+}
+
+async function saveConfigKeyValue(key, val) {
   try {
+    if (key === 'risk_tier') {
+      await switchRiskTier(val);
+      return;
+    }
     const res = await apiFetch('/api/v1/config', {
       method: 'POST',
       body: JSON.stringify({ config_key: key, config_value: val }),
@@ -185,11 +315,89 @@ async function submitConfigUpdate() {
       showToast(`Config update failed: ${data.detail || data.error || res.status}`, true);
       return;
     }
-    showToast(`Updated system_config['${key}']`);
-    if (valEl) valEl.value = '';
-    await refreshAll();
+    showToast(`Saved config '${key}'`);
+    await refreshAll(true);
   } catch (err) {
     showToast(`Config update error: ${err.message}`, true);
+  }
+}
+
+function openConfigModal() {
+  const modal = document.getElementById('config-settings-modal');
+  if (modal) {
+    modal.classList.add('open');
+    renderSystemConfigTables(true);
+  }
+}
+
+function closeConfigModal() {
+  const modal = document.getElementById('config-settings-modal');
+  if (modal) {
+    modal.classList.remove('open');
+  }
+}
+
+function handleConfigModalBackdropClick(evt) {
+  if (evt.target && evt.target.id === 'config-settings-modal') {
+    closeConfigModal();
+  }
+}
+
+function setConfigCategory(cat) {
+  state.configCategory = cat;
+  document.querySelectorAll('.cfg-cat-btn[data-cat]').forEach((btn) => {
+    btn.classList.toggle('active', btn.getAttribute('data-cat') === cat);
+  });
+  renderSystemConfigTables(true);
+}
+
+function classifyConfigKeyCategory(key) {
+  const k = String(key || '').toLowerCase();
+  if (
+    k.includes('risk_tier') ||
+    k.includes('leverage') ||
+    k.includes('weight') ||
+    k.includes('stop') ||
+    k.includes('cooldown') ||
+    k.includes('equity')
+  ) {
+    return 'risk';
+  }
+  if (
+    k.includes('execution') ||
+    k.includes('hyperliquid') ||
+    k.includes('scanner') ||
+    k.includes('priority') ||
+    k.includes('chase') ||
+    k.includes('fee') ||
+    k.includes('notional') ||
+    k.includes('volume')
+  ) {
+    return 'execution';
+  }
+  if (k.startsWith('s1_') || k.startsWith('s2_') || k.startsWith('s3_')) {
+    return 'sleeves';
+  }
+  if (k.includes('alert') || k.includes('telegram') || k.includes('discord')) {
+    return 'alerts';
+  }
+  if (
+    k.includes('wallet') ||
+    k.includes('private_key') ||
+    k.includes('agent') ||
+    k.includes('vault') ||
+    k.includes('master_key') ||
+    k.includes('token')
+  ) {
+    return 'wallet';
+  }
+  return 'all';
+}
+
+function toggleShowAllPriorityWatch() {
+  state.showAllPriorityWatch = !state.showAllPriorityWatch;
+  if (state.dashboard) {
+    renderPriorityAndWorkingTable(state.dashboard);
   }
 }
 
@@ -201,7 +409,7 @@ function switchExplorerTab(tabName) {
   document.querySelectorAll('.tab-pane').forEach((pane) => {
     pane.classList.toggle('active', pane.id === `tab-pane-${tabName}`);
   });
-  renderActiveExplorerTab();
+  renderActiveExplorerTab(true);
 }
 
 function updateRiskTierButtons(activeTier) {
@@ -212,7 +420,7 @@ function updateRiskTierButtons(activeTier) {
 }
 
 /* ============================================================================
-   TOP TELEMETRY, COOLDOWNS, KPI CARDS & TABLES RENDERERS
+   TOP TELEMETRY, PNL HORIZON RIBBON, KPI CARDS & TABLES RENDERERS
    ============================================================================ */
 
 function renderHealthAndTopBar(health, dash) {
@@ -220,13 +428,9 @@ function renderHealthAndTopBar(health, dash) {
     (health && health.mariadb_version) ||
     (dash && dash.mariadb_version) ||
     '13.0.2-MariaDB';
-  const viewsCount =
-    (health && health.views_healthy_count) ||
-    (dash && dash.views_healthy_count) ||
-    7;
   const dbText = document.getElementById('mariadb-version-text');
   if (dbText) {
-    dbText.textContent = `${dbVer} · ${viewsCount}/7 Views OK`;
+    dbText.textContent = `${dbVer} · Online`;
   }
 
   const prioWatch = (dash && dash.v_priority_watchlist) || [];
@@ -257,50 +461,67 @@ function renderHealthAndTopBar(health, dash) {
   updateRiskTierButtons(tier);
 }
 
-function renderCooldownStrip(cooldowns) {
-  state.cooldowns = (cooldowns || []).map((c) => ({
-    ...c,
-    local_fetched_ms: Date.now(),
-  }));
-  paintCooldownTimers();
-}
+function renderPnlHorizonRibbon(dash) {
+  const summary = (dash && dash.pnl_summary) || {};
+  const fallbackUpnl = ((dash && dash.v_assets_held) || []).reduce(
+    (acc, h) => acc + Number(h.unrealized_pnl_usdc || 0),
+    0
+  );
+  const totalEq = Number((dash && dash.snapshot && dash.snapshot.total_equity_usdc) || 10000);
 
-function paintCooldownTimers() {
-  const countEl = document.getElementById('cooldown-count');
-  const container = document.getElementById('cooldown-pills-container');
-  if (!container) return;
+  const paintHorizon = (key, defaultObj) => {
+    const h = summary[key] || defaultObj;
+    const netPnl = Number(h.net_pnl_usdc ?? fallbackUpnl);
+    const retPct = Number(
+      h.return_pct ?? (totalEq > 0 ? (netPnl / totalEq) * 100.0 : 0.0)
+    );
+    const rpnl = Number(h.realized_pnl_usdc || 0);
+    const upnl = Number(h.unrealized_pnl_usdc ?? fallbackUpnl);
+    const trades = Number(h.trade_count || 0);
+    const wins = Number(h.win_count || 0);
 
-  const now = Date.now();
-  const active = (state.cooldowns || []).filter((c) => {
-    const exp = Number(c.expires_at_ms || 0);
-    return exp > now || Number(c.remaining_seconds || 0) > 0;
-  });
+    const tone = netPnl > 0.005 ? 'pos' : netPnl < -0.005 ? 'neg' : 'flat';
 
-  if (countEl) countEl.textContent = String(active.length);
+    const cardEl = document.getElementById(`pnl-card-${key}`);
+    const pctEl = document.getElementById(`pnl-${key}-pct`);
+    const usdcEl = document.getElementById(`pnl-${key}-usdc`);
+    const subEl = document.getElementById(`pnl-${key}-sub`);
 
-  if (active.length === 0) {
-    container.innerHTML =
-      '<span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 11px;">No assets currently in post-stop / shock cooldown — all eligible perps unlocked for entry.</span>';
-    return;
-  }
-
-  container.innerHTML = active
-    .map((c) => {
-      const remSec = c.expires_at_ms
-        ? Math.max(0, Math.round((Number(c.expires_at_ms) - now) / 1000))
-        : Math.max(0, Number(c.remaining_seconds || 0));
-      const mins = Math.floor(remSec / 60);
-      const secs = remSec % 60;
-      const timerStr = `${mins}m ${String(secs).padStart(2, '0')}s`;
-      return `
-        <div class="cooldown-pill" title="${escapeHtml(c.reason || '')}">
-          <span class="cd-sym">${escapeHtml(c.symbol)}</span>
-          <span class="cd-type">${escapeHtml(c.cooldown_type)}</span>
-          <span class="cd-timer">${timerStr}</span>
-        </div>
+    if (cardEl) {
+      cardEl.classList.remove('pos', 'neg', 'flat');
+      cardEl.classList.add(tone);
+    }
+    if (pctEl) {
+      pctEl.classList.remove('pos', 'neg', 'flat');
+      pctEl.classList.add(tone);
+      pctEl.textContent = `${retPct > 0.001 ? '+' : ''}${retPct.toFixed(2)}%`;
+    }
+    if (usdcEl) {
+      usdcEl.classList.remove('pos', 'neg', 'flat');
+      usdcEl.classList.add(tone);
+      usdcEl.textContent = fmtSignedUsd(netPnl);
+    }
+    if (subEl) {
+      const tradeStr =
+        trades > 0 ? `${trades} Trades (${wins}W)` : '0 Closed · Live Mark';
+      subEl.innerHTML = `
+        <span>Realized: ${fmtSignedUsd(rpnl)} · Unrealized: ${fmtSignedUsd(upnl)}</span>
+        <span>${escapeHtml(tradeStr)}</span>
       `;
-    })
-    .join('');
+    }
+  };
+
+  const fallback = {
+    net_pnl_usdc: fallbackUpnl,
+    realized_pnl_usdc: 0,
+    unrealized_pnl_usdc: fallbackUpnl,
+    trade_count: 0,
+    win_count: 0,
+  };
+  paintHorizon('daily', fallback);
+  paintHorizon('weekly', fallback);
+  paintHorizon('monthly', fallback);
+  paintHorizon('ytd', fallback);
 }
 
 function renderKpiCards(dash) {
@@ -386,19 +607,55 @@ function renderKpiCards(dash) {
   setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight || 0, true, 1));
 }
 
-function renderPriorityAndWorkingTable(dash) {
+function renderPriorityAndWorkingTable(dash, forceRender = false) {
   const tbody = document.getElementById('tbody-priority-ordered');
+  const toggleBtn = document.getElementById('btn-toggle-watch-all');
   if (!tbody) return;
+  if (!forceRender && state.closeInFlightCount > 0) return;
 
-  const ordered = (dash && dash.v_assets_ordered) || [];
+  const held = (dash && dash.v_assets_held) || [];
+  const heldAssetIds = new Set(held.map((h) => Number(h.asset_id)));
+
+  const ordered = ((dash && dash.v_assets_ordered) || []).filter(
+    (o) =>
+      !state.closingPositionIds.has(Number(o.position_id)) &&
+      !state.closingSymbols.has(String(o.symbol))
+  );
   const prio = (dash && dash.v_priority_watchlist) || [];
 
   const orderedByAsset = new Map();
-  ordered.forEach((o) => orderedByAsset.set(o.asset_id, o));
+  ordered.forEach((o) => orderedByAsset.set(Number(o.asset_id), o));
+
+  // Filter out OPEN holdings and WORKING orders from passive priority watch list so OPEN positions ONLY render in Right Table
+  const passiveWatched = prio.filter((p) => {
+    const aid = Number(p.asset_id);
+    const st = String(p.position_status || '').toUpperCase();
+    const pid = Number(p.position_id || 0);
+    return (
+      !orderedByAsset.has(aid) &&
+      !heldAssetIds.has(aid) &&
+      st !== 'OPEN' &&
+      st !== 'WORKING' &&
+      !state.closingPositionIds.has(pid) &&
+      !state.closingSymbols.has(String(p.symbol))
+    );
+  });
+  const maxPassiveDefault = 6;
+
+  if (toggleBtn) {
+    if (passiveWatched.length > maxPassiveDefault) {
+      toggleBtn.style.display = 'inline-flex';
+      toggleBtn.textContent = state.showAllPriorityWatch
+        ? `Show Top ${maxPassiveDefault}`
+        : `Show All (${ordered.length + passiveWatched.length})`;
+    } else {
+      toggleBtn.style.display = 'none';
+    }
+  }
 
   const rowsHtml = [];
 
-  // Render active WORKING orders first (from v_assets_ordered)
+  // 1. Render active WORKING orders first
   ordered.forEach((o) => {
     const sideCls = String(o.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
     rowsHtml.push(`
@@ -411,35 +668,36 @@ function renderPriorityAndWorkingTable(dash) {
         <td style="color: #fbbf24; font-weight: 700;">${fmtUsd(o.reserved_margin_usdc)}</td>
         <td><span class="tab-count">${Number(o.chase_count || 0)}</span></td>
         <td>
-          <button type="button" class="close-btn" onclick="closePositionOrOrder(${o.position_id}, '${escapeHtml(o.symbol)}', false)">Cancel</button>
+          <button
+            type="button"
+            class="close-btn"
+            data-close-pos-id="${o.position_id}"
+            data-close-symbol="${escapeHtml(o.symbol)}"
+            data-close-cooldown="false"
+            onclick="closePositionOrOrder(${o.position_id}, '${escapeHtml(o.symbol)}', false)"
+          >Cancel</button>
         </td>
       </tr>
     `);
   });
 
-  // Render additional priority watched assets (from v_priority_watchlist) not already in WORKING rows
-  prio.forEach((p) => {
-    if (orderedByAsset.has(p.asset_id)) return;
-    const statusLabel = p.position_status || p.event_trigger || 'PRIORITY_WATCH';
-    const sideHtml = p.position_side
-      ? `<span class="side-pill ${String(p.position_side).toUpperCase() === 'SHORT' ? 'short' : 'long'}">${escapeHtml(p.position_side)}</span>`
-      : '<span class="pnl-flat">—</span>';
+  // 2. Render pre-entry priority watched items (capped unless toggled)
+  const visibleWatched = state.showAllPriorityWatch
+    ? passiveWatched
+    : passiveWatched.slice(0, maxPassiveDefault);
+
+  visibleWatched.forEach((p) => {
+    const statusLabel = p.event_trigger || 'PRIORITY_WATCH';
     rowsHtml.push(`
       <tr>
         <td><span class="sym-badge">${escapeHtml(p.symbol)}</span></td>
         <td><span class="status-pill watch">${escapeHtml(statusLabel)}</span></td>
-        <td>${sideHtml}</td>
-        <td>${fmtPrice(p.entry_price || p.mark_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(p.mark_price)}</small></td>
+        <td><span class="pnl-flat">—</span></td>
+        <td>${fmtPrice(p.mark_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(p.mid_price || p.mark_price)}</small></td>
         <td>0.00 bps</td>
-        <td>${fmtUsd(p.reserved_margin_usdc || p.committed_notional_usdc || 0)}</td>
+        <td>$0.00</td>
         <td><span class="tab-count">1s</span></td>
-        <td>
-          ${
-            p.position_id
-              ? `<button type="button" class="close-btn" onclick="closePositionOrOrder(${p.position_id}, '${escapeHtml(p.symbol)}', true)">Close</button>`
-              : '<span class="pnl-flat">Watching</span>'
-          }
-        </td>
+        <td><span class="pnl-flat">1s Watch</span></td>
       </tr>
     `);
   });
@@ -457,13 +715,22 @@ function renderPriorityAndWorkingTable(dash) {
   }
 }
 
-function renderOpenHoldingsTable(dash) {
+function renderOpenHoldingsTable(dash, forceRender = false) {
   const tbody = document.getElementById('tbody-assets-held');
   const pill = document.getElementById('held-count-pill');
+  const closeAllBtn = document.getElementById('btn-close-all-open');
   if (!tbody) return;
+  if (!forceRender && state.closeInFlightCount > 0) return;
 
-  const held = (dash && dash.v_assets_held) || [];
+  const held = ((dash && dash.v_assets_held) || []).filter(
+    (h) =>
+      !state.closingPositionIds.has(Number(h.position_id)) &&
+      !state.closingSymbols.has(String(h.symbol))
+  );
   if (pill) pill.textContent = `${held.length} OPEN`;
+  if (closeAllBtn) {
+    closeAllBtn.style.display = held.length > 0 ? 'inline-flex' : 'none';
+  }
 
   if (held.length === 0) {
     tbody.innerHTML = `
@@ -492,7 +759,7 @@ function renderOpenHoldingsTable(dash) {
           <td style="font-weight: 700; color: #fff;">${fmtUsd(h.committed_notional_usdc)} <small style="color:var(--text-muted)">(${fmtPct(h.portfolio_weight || 0)})</small></td>
           <td>${fmtPrice(h.entry_price)} <small style="color:var(--neon-cyan)">→ ${fmtPrice(h.mark_price)}</small></td>
           <td>${fmtPrice(h.protective_stop_px)} <small style="color:#fbbf24">(${stopDist})</small></td>
-          <td class="${pnlCls}">${upnl >= 0 ? '+' : ''}${fmtUsd(upnl)}</td>
+          <td class="${pnlCls}">${fmtSignedUsd(upnl)}</td>
           <td>
             <div class="sleeve-mix-pills">
               <span class="sp-tag s1" title="Sleeve 1 Carry-Momentum">S1 ${fmtPct(h.s1_weight_contrib || 0)}</span>
@@ -501,7 +768,14 @@ function renderOpenHoldingsTable(dash) {
             </div>
           </td>
           <td>
-            <button type="button" class="close-btn" onclick="closePositionOrOrder(${h.position_id}, '${escapeHtml(h.symbol)}', true)">Close</button>
+            <button
+              type="button"
+              class="close-btn"
+              data-close-pos-id="${h.position_id}"
+              data-close-symbol="${escapeHtml(h.symbol)}"
+              data-close-cooldown="true"
+              onclick="closePositionOrOrder(${h.position_id}, '${escapeHtml(h.symbol)}', true)"
+            >Close</button>
           </td>
         </tr>
       `;
@@ -509,7 +783,155 @@ function renderOpenHoldingsTable(dash) {
     .join('');
 }
 
-function renderActiveExplorerTab() {
+function buildInlineConfigControlHtml(row, idPrefix) {
+  const key = String(row.config_key || '');
+  const val = String(row.config_value ?? '');
+  const vtype = String(row.value_type || 'string').toLowerCase();
+  const inputId = `${idPrefix}-cfg-input-${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+  if (IMMUTABLE_SECURITY_KEYS.has(key.toLowerCase())) {
+    return `<span class="pnl-flat" title="Immutable security policy key">Locked Policy</span>`;
+  }
+
+  // Dropdown for well-known enum or boolean config keys
+  let enumOptions = null;
+  if (key === 'execution_mode') {
+    enumOptions = ['TESTNET', 'LIVE', 'PAPER'];
+  } else if (key === 'risk_tier') {
+    enumOptions = ['extreme', 'aggressive', 'standard', 'conservative', 'custom'];
+  } else if (key === 'alert_provider') {
+    enumOptions = ['telegram', 'discord', 'both'];
+  } else if (vtype === 'bool' || val === 'true' || val === 'false') {
+    enumOptions = ['true', 'false'];
+  }
+
+  if (enumOptions) {
+    const optsHtml = enumOptions
+      .map(
+        (opt) =>
+          `<option value="${escapeHtml(opt)}" ${
+            val.toLowerCase() === opt.toLowerCase() ? 'selected' : ''
+          }>${escapeHtml(opt)}</option>`
+      )
+      .join('');
+    return `
+      <div class="cfg-inline-controls">
+        <select id="${inputId}" class="cfg-inline-select">${optsHtml}</select>
+        <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+      </div>
+    `;
+  }
+
+  const isSecret =
+    vtype === 'secret' ||
+    val === '[FERNET_ENCRYPTED_SECRET]' ||
+    val === '[UNSET]' ||
+    key.includes('private_key') ||
+    key.includes('token') ||
+    key.includes('webhook');
+
+  if (isSecret && key !== 'telegram_chat_id') {
+    return `
+      <div class="cfg-inline-controls">
+        <input
+          type="password"
+          id="${inputId}"
+          class="cfg-inline-input"
+          data-is-secret="true"
+          placeholder="Enter new secret to overwrite..."
+          onkeydown="if(event.key==='Enter') saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')"
+        />
+        <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+      </div>
+    `;
+  }
+
+  const prefill = val === '[UNSET]' || val.includes('...') ? '' : val;
+  const placeholder = val.includes('...') ? `${val} (enter full value)` : 'Enter value...';
+  return `
+    <div class="cfg-inline-controls">
+      <input
+        type="text"
+        id="${inputId}"
+        class="cfg-inline-input"
+        value="${escapeHtml(prefill)}"
+        placeholder="${escapeHtml(placeholder)}"
+        onkeydown="if(event.key==='Enter') saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')"
+      />
+      <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+    </div>
+  `;
+}
+
+function renderSystemConfigTables(force = false) {
+  const dash = state.dashboard;
+  if (!dash) return;
+
+  // Do not overwrite inline config inputs while the operator is actively typing inside one
+  if (!force && document.activeElement) {
+    const activeCls = document.activeElement.className || '';
+    if (
+      activeCls.includes('cfg-inline-input') ||
+      activeCls.includes('cfg-inline-select')
+    ) {
+      return;
+    }
+  }
+
+  const configs = dash.system_config || [];
+  const cat = state.configCategory || 'all';
+  const tabQuery = (document.getElementById('scanner-search-input')?.value || '')
+    .trim()
+    .toUpperCase();
+  const modalQuery = (document.getElementById('modal-cfg-search')?.value || '')
+    .trim()
+    .toUpperCase();
+
+  const filterRows = (q) =>
+    configs.filter((c) => {
+      if (cat !== 'all' && classifyConfigKeyCategory(c.config_key) !== cat) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        String(c.config_key || '')
+          .toUpperCase()
+          .includes(q) ||
+        String(c.description || '')
+          .toUpperCase()
+          .includes(q)
+      );
+    });
+
+  const renderRows = (rows, prefix) =>
+    rows
+      .map(
+        (c) => `
+        <tr>
+          <td><strong style="color:var(--neon-cyan)">${escapeHtml(c.config_key)}</strong></td>
+          <td><code>${escapeHtml(c.config_value)}</code></td>
+          <td>${buildInlineConfigControlHtml(c, prefix)}</td>
+          <td><span class="tab-count">${escapeHtml(c.value_type)}</span></td>
+          <td style="color:var(--text-muted); white-space: normal; max-width: 340px;">${escapeHtml(c.description)}</td>
+          <td>${fmtUtcTime(c.updated_at_ms)}</td>
+        </tr>
+      `
+      )
+      .join('') ||
+    '<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--text-muted)">No configuration keys matching filter.</td></tr>';
+
+  const tbTab = document.getElementById('tbody-system-config');
+  if (tbTab) {
+    tbTab.innerHTML = renderRows(filterRows(tabQuery), 'tab');
+  }
+
+  const tbModal = document.getElementById('tbody-modal-system-config');
+  if (tbModal) {
+    tbModal.innerHTML = renderRows(filterRows(modalQuery), 'modal');
+  }
+}
+
+function renderActiveExplorerTab(forceConfig = false) {
   const dash = state.dashboard;
   if (!dash) return;
 
@@ -531,7 +953,6 @@ function renderActiveExplorerTab() {
   const scanner = (dash.exchange_assets || []).filter(matchSym);
   const audits = dash.order_audit || [];
   const logs = dash.telemetry_logs || [];
-  const configs = dash.system_config || [];
 
   const setCnt = (id, n) => {
     const el = document.getElementById(id);
@@ -726,30 +1147,8 @@ function renderActiveExplorerTab() {
       '<div style="color:var(--text-muted);padding:12px;">No telemetry events recorded yet.</div>';
   }
 
-  // Render System Config Vault
-  const tbCfg = document.getElementById('tbody-system-config');
-  if (tbCfg) {
-    tbCfg.innerHTML = configs
-      .filter(
-        (c) =>
-          !query ||
-          String(c.config_key || '')
-            .toUpperCase()
-            .includes(query)
-      )
-      .map(
-        (c) => `
-        <tr>
-          <td><strong style="color:var(--neon-cyan)">${escapeHtml(c.config_key)}</strong></td>
-          <td><code>${escapeHtml(c.config_value)}</code></td>
-          <td><span class="tab-count">${escapeHtml(c.value_type)}</span></td>
-          <td style="color:var(--text-muted)">${escapeHtml(c.description)}</td>
-          <td>${fmtUtcTime(c.updated_at_ms)}</td>
-        </tr>
-      `
-      )
-      .join('');
-  }
+  // Render System Config Vault (both bottom tab and modal)
+  renderSystemConfigTables(forceConfig);
 }
 
 /* ============================================================================
@@ -921,20 +1320,20 @@ function drawSleeveAttributionCanvas(dash) {
    DATA FETCHING & 1s/2s SSE STREAM WIRING
    ============================================================================ */
 
-function applyDashboardPayload(dash) {
+function applyDashboardPayload(dash, forceConfig = false) {
   if (!dash) return;
   state.dashboard = dash;
   renderHealthAndTopBar(state.health, dash);
-  renderCooldownStrip(dash.v_assets_in_cooldown || []);
+  renderPnlHorizonRibbon(dash);
   renderKpiCards(dash);
   renderPriorityAndWorkingTable(dash);
   renderOpenHoldingsTable(dash);
-  renderActiveExplorerTab();
+  renderActiveExplorerTab(forceConfig);
   drawEquityCurveCanvas(dash);
   drawSleeveAttributionCanvas(dash);
 }
 
-async function refreshAll() {
+async function refreshAll(forceConfig = false) {
   try {
     const [hRes, dRes] = await Promise.all([
       apiFetch('/api/v1/health'),
@@ -945,7 +1344,7 @@ async function refreshAll() {
     }
     if (dRes.ok) {
       const dash = await dRes.json();
-      applyDashboardPayload(dash);
+      applyDashboardPayload(dash, forceConfig);
     }
   } catch (err) {
     console.warn('Dashboard refresh warning:', err);
@@ -965,7 +1364,7 @@ function connectSSE() {
       try {
         const data = JSON.parse(evt.data);
         if (data && (data.snapshot || data.v_assets_held)) {
-          applyDashboardPayload(data);
+          applyDashboardPayload(data, false);
         }
       } catch (_) {}
     };
@@ -982,11 +1381,30 @@ window.addEventListener('resize', () => {
   }
 });
 
+document.addEventListener('keydown', (evt) => {
+  if (evt.key === 'Escape') {
+    closeConfigModal();
+  }
+});
+
 document.addEventListener('DOMContentLoaded', async () => {
-  await refreshAll();
+  // Attach delegated pointerdown listeners on surveillance tables so button presses trigger immediately before any 1.5s SSE DOM swap
+  ['tbody-assets-held', 'tbody-priority-ordered'].forEach((tbodyId) => {
+    const el = document.getElementById(tbodyId);
+    if (!el) return;
+    el.addEventListener('pointerdown', (evt) => {
+      const btn = evt.target && evt.target.closest ? evt.target.closest('.close-btn[data-close-pos-id]') : null;
+      if (!btn || btn.disabled) return;
+      evt.preventDefault();
+      const pid = Number(btn.getAttribute('data-close-pos-id') || 0);
+      const sym = btn.getAttribute('data-close-symbol') || '';
+      const applyCd = btn.getAttribute('data-close-cooldown') !== 'false';
+      closePositionOrOrder(pid, sym, applyCd);
+    });
+  });
+
+  await refreshAll(true);
   connectSSE();
-  // 1-second local countdown timer tick for active cooldowns
-  setInterval(paintCooldownTimers, 1000);
-  // 2-second fallback sync
-  setInterval(refreshAll, 2500);
+  // 2.5-second fallback sync
+  setInterval(() => refreshAll(false), 2500);
 });

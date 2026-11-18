@@ -3,9 +3,9 @@
 use aegis_core::{
     is_immutable_security_config_key, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
     now_ms, round_dp, AegisError, CooldownAssetView, ExchangeAsset, HeldAssetView,
-    OrderAuditRecord, OrderedAssetView, PortfolioSnapshot, PriorityWatchView, Result, RiskTier,
-    SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord,
-    PLATFORM_VERSION,
+    OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result,
+    RiskTier, SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow,
+    TelemetryLogRecord, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -55,6 +55,7 @@ pub struct DashboardPayload {
     pub target_leverage_multiplier: f64,
     pub risk_tier_badge: String,
     pub loop_cadence: String,
+    pub pnl_summary: PnlSummary,
     pub snapshot: PortfolioSnapshot,
     pub snapshots_history: Vec<PortfolioSnapshot>,
     pub v_assets_held: Vec<HeldAssetView>,
@@ -121,6 +122,8 @@ pub struct ClosePositionRequest {
     pub cooldown_sec: Option<i64>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub close_all: bool,
 }
 
 /// Response payload for `POST /api/v1/positions/close`.
@@ -134,6 +137,7 @@ pub struct ClosePositionResponse {
     pub new_status: String,
     pub realized_pnl_usdc: f64,
     pub cooldown_applied_sec: i64,
+    pub closed_count: usize,
     pub updated_at_ms: i64,
 }
 
@@ -271,6 +275,15 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         snapshots_history.push(snapshot.clone());
     }
 
+    let current_upnl: f64 = v_assets_held.iter().map(|h| h.unrealized_pnl_usdc).sum();
+    let open_fees_funding: f64 = v_assets_held
+        .iter()
+        .map(|h| h.funding_accrued_usdc - h.fees_paid_usdc)
+        .sum();
+    let pnl_summary = db
+        .compute_pnl_summary(current_upnl, open_fees_funding, snapshot.total_equity_usdc)
+        .unwrap_or_default();
+
     let raw_configs = db.list_system_config_rows().unwrap_or_default();
     let system_config: Vec<SystemConfigRow> = raw_configs
         .into_iter()
@@ -299,6 +312,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         target_leverage_multiplier: mult,
         risk_tier_badge: tier.display_badge(Some(mult)),
         loop_cadence: "1s Priority / 3s Scanner".to_string(),
+        pnl_summary,
         snapshot,
         snapshots_history,
         v_assets_held,
@@ -326,16 +340,67 @@ pub fn execute_close_position_or_order(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("MANUAL_WEB_CLOSE");
-    let cooldown_sec = req.cooldown_sec.unwrap_or(0).max(0);
+    let cooldown_sec = req.cooldown_sec.unwrap_or(3600).max(0);
     let engine = aegis_execution::ExecutionEngine::new(db.clone());
 
+    if req.close_all {
+        let held = db.get_assets_held().unwrap_or_default();
+        let ordered = db.get_assets_ordered().unwrap_or_default();
+        let mut total_rpnl = 0.0;
+        let mut closed_count = 0usize;
+
+        for o in &ordered {
+            if let Ok(rep) =
+                engine.close_or_cancel_position(o.position_id, reason, Some(cooldown_sec))
+            {
+                total_rpnl += rep.realized_pnl_usdc;
+                closed_count += 1;
+            }
+        }
+        for h in &held {
+            if let Ok(rep) =
+                engine.close_or_cancel_position(h.position_id, reason, Some(cooldown_sec))
+            {
+                total_rpnl += rep.realized_pnl_usdc;
+                closed_count += 1;
+            }
+        }
+
+        return Ok(ClosePositionResponse {
+            status: "ok".to_string(),
+            position_id: 0,
+            asset_id: 0,
+            symbol: "ALL".to_string(),
+            previous_status: "OPEN".to_string(),
+            new_status: "CLOSED".to_string(),
+            realized_pnl_usdc: round_dp(total_rpnl, 4),
+            cooldown_applied_sec: cooldown_sec,
+            closed_count,
+            updated_at_ms: now_ms(),
+        });
+    }
+
     let report = if let Some(pid) = req.position_id {
-        engine.close_or_cancel_position(pid, reason, Some(cooldown_sec))?
+        match engine.close_or_cancel_position(pid, reason, Some(cooldown_sec)) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(ref raw_sym) = req.symbol {
+                    if !raw_sym.trim().is_empty() {
+                        engine.close_or_cancel_by_symbol(raw_sym, reason, Some(cooldown_sec))?
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        }
     } else if let Some(ref raw_sym) = req.symbol {
         engine.close_or_cancel_by_symbol(raw_sym, reason, Some(cooldown_sec))?
     } else {
         return Err(AegisError::Validation(
-            "Either position_id or symbol is required to close a position".to_string(),
+            "Either position_id, symbol, or close_all=true is required to close a position"
+                .to_string(),
         ));
     };
 
@@ -348,6 +413,7 @@ pub fn execute_close_position_or_order(
         new_status: report.final_status,
         realized_pnl_usdc: report.realized_pnl_usdc,
         cooldown_applied_sec: report.cooldown_inserted_sec,
+        closed_count: 1,
         updated_at_ms: now_ms(),
     })
 }

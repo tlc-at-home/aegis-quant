@@ -509,3 +509,27 @@ pub struct CheckResult {
     pub passed: bool,
     pub detail: String,
 }
+
+/// Performance & PnL metrics for a single time horizon (`daily`, `weekly`, `monthly`, `ytd`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PnlHorizonMetrics {
+    pub horizon_label: String,
+    pub window_start_ms: i64,
+    pub baseline_equity_usdc: f64,
+    pub net_pnl_usdc: f64,
+    pub return_pct: f64,
+    pub realized_pnl_usdc: f64,
+    pub unrealized_pnl_usdc: f64,
+    pub fees_funding_usdc: f64,
+    pub trade_count: usize,
+    pub win_count: usize,
+}
+
+/// Multi-horizon PnL breakdown (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`) for the operator dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PnlSummary {
+    pub daily: PnlHorizonMetrics,
+    pub weekly: PnlHorizonMetrics,
+    pub monthly: PnlHorizonMetrics,
+    pub ytd: PnlHorizonMetrics,
+}

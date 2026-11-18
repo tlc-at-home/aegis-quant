@@ -144,14 +144,24 @@ fn test_unified_single_cycle_and_manual_close() {
     assert!(!s2_view.is_empty());
     assert!(!s3_view.is_empty());
 
-    // If any working orders were placed during the cycle, test manual cancellation + cooldown
+    // If any working orders were placed during the cycle, test manual cancellation + default 3600s cooldown & close_all
     let ordered = db.get_assets_ordered().unwrap();
     if let Some(first_ord) = ordered.first() {
         let close_rep = engine
-            .close_or_cancel_position(first_ord.position_id, "MANUAL_TEST_CANCEL", Some(300))
+            .close_or_cancel_position(first_ord.position_id, "MANUAL_TEST_CANCEL", None)
             .unwrap();
         assert_eq!(close_rep.final_status, "CANCELLED");
         assert!(close_rep.released_reserved_usdc > 0.0);
-        assert_eq!(close_rep.cooldown_inserted_sec, 300);
+        assert_eq!(close_rep.cooldown_inserted_sec, 3600);
+        assert!(db.is_asset_in_cooldown(first_ord.asset_id).unwrap());
     }
+
+    let closed_all = engine
+        .close_all_active_positions("CLOSE_ALL_TEST", Some(1800))
+        .unwrap();
+    for rep in &closed_all {
+        assert_eq!(rep.cooldown_inserted_sec, 1800);
+    }
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+    assert!(db.get_assets_held().unwrap().is_empty());
 }

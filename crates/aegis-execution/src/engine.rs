@@ -14,7 +14,9 @@ use crate::order_chaser::{NewWorkingOrderRequest, OrderChaser};
 use crate::priority_monitor::{PriorityMonitor, PriorityTickReport};
 use crate::reconcile::{CutoverReconcileReport, CutoverReconciler};
 use crate::signing::{build_limit_order_wire, HL_ORACLE_BAND_PCT};
-use aegis_alerts::{AlertEngine, CutoverReconcileAlert, PositionClosedAlert};
+use aegis_alerts::{
+    format_position_closed_html, AlertEngine, CutoverReconcileAlert, PositionClosedAlert,
+};
 use aegis_core::{
     normalize_hyperliquid_symbol, now_ms, round_dp, AegisError, ExchangeAsset, OhlcvBar, OrderSide,
     PortfolioSnapshot, PositionStatus, Result,
@@ -290,8 +292,16 @@ impl ExecutionEngine {
         for sig in &signal_out.signals {
             if sig.rebalance_action == ACTION_CLOSE || sig.rebalance_action == ACTION_FLIP {
                 if let Some(h) = held.iter().find(|x| x.asset_id == sig.asset_id) {
-                    let close_res =
-                        self.close_or_cancel_position(h.position_id, &sig.rebalance_action, None)?;
+                    let close_cd = if sig.rebalance_action == ACTION_FLIP {
+                        Some(0)
+                    } else {
+                        Some(300)
+                    };
+                    let close_res = self.close_or_cancel_position(
+                        h.position_id,
+                        &sig.rebalance_action,
+                        close_cd,
+                    )?;
                     report.positions_closed += 1;
                     report.closed_position_ids.push(close_res.position_id);
                 }
@@ -506,7 +516,10 @@ impl ExecutionEngine {
         })
     }
 
-    /// Closes an `OPEN` position or cancels a `WORKING` order by `position_id`, optionally inserting a cooldown.
+    /// Closes an `OPEN` position or cancels a `WORKING` order by `position_id`, inserting a cooldown
+    /// (defaults to 3600s / 1h when `cooldown_seconds` is `None` so manual closes are not immediately re-entered).
+    /// Commits MariaDB state transitions (`positions`, `order_audit`, `asset_cooldowns`, `portfolio_snapshots`)
+    /// first and dispatches exchange/Telegram network I/O asynchronously so Web UI responses are instant.
     pub fn close_or_cancel_position(
         &self,
         position_id: i64,
@@ -523,15 +536,21 @@ impl ExecutionEngine {
             .ok_or_else(|| AegisError::Database(format!("Asset #{} not found", pos.asset_id)))?;
         let cfg = self.db.load_config_or_default();
         let status = PositionStatus::parse(&pos.status);
+        let cd_sec = cooldown_seconds.unwrap_or(3600).max(0);
 
         let mut exit_price_opt = None;
         let mut realized_pnl = 0.0;
         let mut released_reserved = 0.0;
         let final_status: String;
+        let mut pending_close_alert: Option<PositionClosedAlert> = None;
 
         match status {
             PositionStatus::Working => {
-                if cfg.execution_mode().is_live_or_testnet() {
+                released_reserved = pos.reserved_margin_usdc;
+                self.db.cancel_working_order(position_id, reason)?;
+                final_status = "CANCELLED".to_string();
+
+                if cfg.execution_mode().is_live_or_testnet() && !self.db.is_ephemeral_test_db() {
                     let pk = cfg.get_str("private_key", "");
                     if !pk.is_empty() {
                         if let Some(oid) = pos
@@ -540,42 +559,68 @@ impl ExecutionEngine {
                             .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
                             .and_then(|s| s.parse::<u64>().ok())
                         {
-                            let _ = self.http.cancel_order_wire(
-                                asset.asset_index,
-                                oid,
-                                &pk,
-                                Some(&self.db),
-                                &cfg,
-                            );
+                            let http = self.http.clone();
+                            let db = self.db.clone();
+                            let cfg_clone = cfg.clone();
+                            let asset_index = asset.asset_index;
+                            std::thread::spawn(move || {
+                                let _ = http.cancel_order_wire(
+                                    asset_index,
+                                    oid,
+                                    &pk,
+                                    Some(&db),
+                                    &cfg_clone,
+                                );
+                            });
                         }
                     }
                 }
-                released_reserved = pos.reserved_margin_usdc;
-                self.db.cancel_working_order(position_id, reason)?;
-                final_status = "CANCELLED".to_string();
             }
             PositionStatus::Open => {
                 let side = OrderSide::parse(&pos.side);
-                let mark_px = if asset.mark_price > 0.0 {
+                let exit_px = if asset.mark_price > 0.0 {
                     asset.mark_price
                 } else {
                     pos.current_price.max(pos.entry_price)
                 };
                 let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-                let mut exit_px = mark_px;
-                let mut fee_usdc = round_dp(
+                let fee_usdc = round_dp(
                     exit_px * pos.filled_quantity * (taker_fee_bps / 10_000.0),
                     4,
                 );
 
-                if cfg.execution_mode().is_live_or_testnet() {
+                realized_pnl = self
+                    .db
+                    .close_position(position_id, exit_px, fee_usdc, reason)?;
+                exit_price_opt = Some(exit_px);
+                final_status = "CLOSED".to_string();
+
+                pending_close_alert = Some(PositionClosedAlert {
+                    symbol: asset.symbol.clone(),
+                    side,
+                    exit_reason: reason.to_string(),
+                    entry_price: pos.entry_price,
+                    exit_price: exit_px,
+                    filled_qty: pos.filled_quantity,
+                    realized_pnl_usdc: realized_pnl,
+                    available_cash_usdc: 0.0,
+                    cooldown_type: (cd_sec > 0).then(|| "MANUAL".to_string()),
+                    cooldown_seconds: cd_sec,
+                    timestamp_ms: now_ms(),
+                });
+
+                if cfg.execution_mode().is_live_or_testnet() && !self.db.is_ephemeral_test_db() {
                     let pk = cfg.get_str("private_key", "");
-                    if !pk.is_empty() {
+                    let has_live_oid = pos
+                        .exchange_order_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !pk.is_empty() && has_live_oid {
                         let close_is_buy = !side.is_buy();
                         let limit_px = if close_is_buy {
-                            mark_px * (1.0 + HL_ORACLE_BAND_PCT)
+                            exit_px * (1.0 + HL_ORACLE_BAND_PCT)
                         } else {
-                            mark_px * (1.0 - HL_ORACLE_BAND_PCT)
+                            exit_px * (1.0 - HL_ORACLE_BAND_PCT)
                         };
                         let wire = build_limit_order_wire(
                             asset.asset_index,
@@ -589,52 +634,29 @@ impl ExecutionEngine {
                             "Ioc",
                             Some(&format!("v2-close-{position_id}-{}", now_ms())),
                         );
-                        if let Ok(ack) = self.http.submit_order_wire(
-                            wire,
-                            pos.filled_quantity,
-                            mark_px,
-                            taker_fee_bps,
-                            &pk,
-                            Some(&self.db),
-                            &cfg,
-                        ) {
-                            if ack.status == "FILLED" && ack.avg_fill_price > 0.0 {
-                                exit_px = ack.avg_fill_price;
-                                fee_usdc = ack.fee_usdc;
-                            }
-                        }
+                        let http = self.http.clone();
+                        let db = self.db.clone();
+                        let cfg_clone = cfg.clone();
+                        let filled_qty = pos.filled_quantity;
+                        std::thread::spawn(move || {
+                            let _ = http.submit_order_wire(
+                                wire,
+                                filled_qty,
+                                exit_px,
+                                taker_fee_bps,
+                                &pk,
+                                Some(&db),
+                                &cfg_clone,
+                            );
+                        });
                     }
                 }
-
-                realized_pnl = self
-                    .db
-                    .close_position(position_id, exit_px, fee_usdc, reason)?;
-                exit_price_opt = Some(exit_px);
-                final_status = "CLOSED".to_string();
-
-                let cd_sec = cooldown_seconds.unwrap_or(0).max(0);
-                let snap = self.record_portfolio_snapshot(None, None)?;
-                let alert = PositionClosedAlert {
-                    symbol: asset.symbol.clone(),
-                    side,
-                    exit_reason: reason.to_string(),
-                    entry_price: pos.entry_price,
-                    exit_price: exit_px,
-                    filled_qty: pos.filled_quantity,
-                    realized_pnl_usdc: realized_pnl,
-                    available_cash_usdc: snap.available_cash_usdc,
-                    cooldown_type: (cd_sec > 0).then(|| "MANUAL".to_string()),
-                    cooldown_seconds: cd_sec,
-                    timestamp_ms: now_ms(),
-                };
-                let _ = self.alerts.notify_position_closed(&alert);
             }
             PositionStatus::Closed | PositionStatus::Cancelled => {
                 final_status = pos.status.clone();
             }
         }
 
-        let cd_sec = cooldown_seconds.unwrap_or(0).max(0);
         if cd_sec > 0 {
             self.db.insert_asset_cooldown(
                 asset.id,
@@ -644,7 +666,7 @@ impl ExecutionEngine {
             )?;
         }
 
-        let _ = self.record_portfolio_snapshot(None, None);
+        let snap_opt = self.record_portfolio_snapshot(None, None).ok();
         let _ = self.db.log_telemetry(
             "INFO",
             "execution.engine",
@@ -663,6 +685,26 @@ impl ExecutionEngine {
             })),
         );
 
+        if let Some(mut alert) = pending_close_alert {
+            if let Some(ref snap) = snap_opt {
+                alert.available_cash_usdc = snap.available_cash_usdc;
+            }
+            let html = format_position_closed_html(&alert);
+            let payload_val = serde_json::to_value(&alert).ok();
+            let _ = self.alerts.enqueue_html_alert(
+                "POSITION_CLOSED",
+                "INFO",
+                &html,
+                payload_val.as_ref(),
+            );
+            if !self.db.is_ephemeral_test_db() {
+                let alerts_engine = self.alerts.clone();
+                std::thread::spawn(move || {
+                    let _ = alerts_engine.poll_pending_queue(4);
+                });
+            }
+        }
+
         Ok(ManualCloseReport {
             position_id,
             asset_id: asset.id,
@@ -675,6 +717,31 @@ impl ExecutionEngine {
             cooldown_inserted_sec: cd_sec,
             reason: reason.to_string(),
         })
+    }
+
+    /// Closes all currently `OPEN` holdings (`v_assets_held`) and cancels all `WORKING` orders (`v_assets_ordered`).
+    pub fn close_all_active_positions(
+        &self,
+        reason: &str,
+        cooldown_seconds: Option<i64>,
+    ) -> Result<Vec<ManualCloseReport>> {
+        let mut reports = Vec::new();
+        let ordered = self.db.get_assets_ordered().unwrap_or_default();
+        for o in ordered {
+            if let Ok(rep) = self.close_or_cancel_position(o.position_id, reason, cooldown_seconds)
+            {
+                reports.push(rep);
+            }
+        }
+        let held = self.db.get_assets_held().unwrap_or_default();
+        for h in held {
+            if let Ok(rep) = self.close_or_cancel_position(h.position_id, reason, cooldown_seconds)
+            {
+                reports.push(rep);
+            }
+        }
+        let _ = self.record_portfolio_snapshot(None, None);
+        Ok(reports)
     }
 
     /// Closes an `OPEN` position or cancels a `WORKING` order by canonical or raw symbol (`"SOL-USDC"`, `"SOL"`).

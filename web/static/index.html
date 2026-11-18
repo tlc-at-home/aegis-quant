@@ -28,14 +28,14 @@
     </div>
 
     <div class="telemetry-badges">
-      <div class="t-badge mariadb-badge" id="badge-mariadb" title="MariaDB 13.0 Rolling InnoDB & 7 SQL Views Status">
+      <div class="t-badge mariadb-badge" id="badge-mariadb" title="MariaDB 13.0 Rolling Engine Health">
         <span class="pulse-dot cyan"></span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
           <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
           <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
         </svg>
-        <span id="mariadb-version-text">MariaDB 13.0.2 · 7 Views OK</span>
+        <span id="mariadb-version-text">MariaDB 13.0.2 · Healthy</span>
       </div>
 
       <div class="t-badge pulse-1s" id="badge-prio-pulse" title="1-Second High-Frequency Priority Watchlist & Maker Chaser Loop">
@@ -72,6 +72,14 @@
         </svg>
         <span>Send Telegram HTML Alert</span>
       </button>
+
+      <button type="button" class="action-btn config-btn" id="btn-open-config-modal" onclick="openConfigModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+        <span>⚙ Config Settings</span>
+      </button>
     </div>
   </header>
 
@@ -80,21 +88,66 @@
        ======================================================================== -->
   <main class="terminal-container">
 
-    <!-- ACTIVE COOLDOWNS STRIP (v_assets_in_cooldown) -->
-    <section class="cooldown-strip" id="cooldown-strip">
-      <div class="cooldown-strip-title">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="12" r="10"></circle>
-          <polyline points="12 6 12 12 16 14"></polyline>
-        </svg>
-        <span>Active Cooldown Guard (<span id="cooldown-count">0</span>) · v_assets_in_cooldown</span>
-      </div>
-      <div class="cooldown-pills" id="cooldown-pills-container">
-        <span style="color: var(--text-muted); font-family: var(--font-mono); font-size: 11px;">No assets currently in post-stop / shock cooldown — all eligible perps unlocked for entry.</span>
-      </div>
+    <!-- ======================================================================
+         4-CARD PNL HORIZON RIBBON (DAILY 24H · WEEKLY 7D · MONTHLY 30D · YTD)
+         ====================================================================== -->
+    <section class="pnl-horizon-ribbon" id="pnl-horizon-ribbon">
+      <!-- 1. Daily PnL (24H) -->
+      <article class="pnl-horizon-card flat" id="pnl-card-daily">
+        <div class="pnl-card-header">
+          <span class="pnl-period-label">Daily PnL (24H)</span>
+          <span class="pnl-ret-pill flat" id="pnl-daily-pct">0.00%</span>
+        </div>
+        <div class="pnl-main-val flat" id="pnl-daily-usdc">$0.00</div>
+        <div class="pnl-sub-breakdown" id="pnl-daily-sub">
+          <span>Realized: $0.00 · Unrealized: $0.00</span>
+          <span>0 Trades</span>
+        </div>
+      </article>
+
+      <!-- 2. Weekly PnL (7D) -->
+      <article class="pnl-horizon-card flat" id="pnl-card-weekly">
+        <div class="pnl-card-header">
+          <span class="pnl-period-label">Weekly PnL (7D)</span>
+          <span class="pnl-ret-pill flat" id="pnl-weekly-pct">0.00%</span>
+        </div>
+        <div class="pnl-main-val flat" id="pnl-weekly-usdc">$0.00</div>
+        <div class="pnl-sub-breakdown" id="pnl-weekly-sub">
+          <span>Realized: $0.00 · Unrealized: $0.00</span>
+          <span>0 Trades</span>
+        </div>
+      </article>
+
+      <!-- 3. Monthly PnL (30D) -->
+      <article class="pnl-horizon-card flat" id="pnl-card-monthly">
+        <div class="pnl-card-header">
+          <span class="pnl-period-label">Monthly PnL (30D)</span>
+          <span class="pnl-ret-pill flat" id="pnl-monthly-pct">0.00%</span>
+        </div>
+        <div class="pnl-main-val flat" id="pnl-monthly-usdc">$0.00</div>
+        <div class="pnl-sub-breakdown" id="pnl-monthly-sub">
+          <span>Realized: $0.00 · Unrealized: $0.00</span>
+          <span>0 Trades</span>
+        </div>
+      </article>
+
+      <!-- 4. Year-to-Date PnL (YTD) -->
+      <article class="pnl-horizon-card flat" id="pnl-card-ytd">
+        <div class="pnl-card-header">
+          <span class="pnl-period-label">Year-to-Date (YTD)</span>
+          <span class="pnl-ret-pill flat" id="pnl-ytd-pct">0.00%</span>
+        </div>
+        <div class="pnl-main-val flat" id="pnl-ytd-usdc">$0.00</div>
+        <div class="pnl-sub-breakdown" id="pnl-ytd-sub">
+          <span>Realized: $0.00 · Unrealized: $0.00</span>
+          <span>0 Trades</span>
+        </div>
+      </article>
     </section>
 
-    <!-- KPI HERO CARDS (6-COLUMN GRID) -->
+    <!-- ======================================================================
+         KPI HERO CARDS (6-COLUMN GRID)
+         ====================================================================== -->
     <section class="kpi-hero-grid">
       <!-- 1. Total Equity -->
       <article class="kpi-card">
@@ -262,7 +315,7 @@
             </svg>
             <div>
               <div class="panel-title">Multi-Sleeve Attribution Breakdown</div>
-              <div class="panel-subtitle">w_net = (w_s1 + w_s2 + w_s3) × L_tier</div>
+              <div class="panel-subtitle">Net Portfolio Allocation Scaled by Active Risk Tier Multiplier</div>
             </div>
           </div>
           <div class="chart-legend">
@@ -295,7 +348,7 @@
          1s PRIORITY WATCHLIST & WORKING ORDERS + ACTIVE OPEN HOLDINGS
          ====================================================================== -->
     <section class="surveillance-grid">
-      <!-- Left: 1s Priority Watchlist (v_priority_watchlist) & Working Orders (v_assets_ordered) -->
+      <!-- Left: 1s Priority Watchlist & Working Orders -->
       <div class="glass-panel">
         <div class="panel-header">
           <div class="panel-title-cluster">
@@ -305,10 +358,13 @@
             </svg>
             <div>
               <div class="panel-title">1s Priority Watchlist & Active Working Orders</div>
-              <div class="panel-subtitle">Backed by SQL Views: <code>v_assets_ordered</code> & <code>v_priority_watchlist</code></div>
+              <div class="panel-subtitle">Real-Time Top-of-Book Maker Limit Chaser & Active Trigger Surveillance</div>
             </div>
           </div>
-          <span class="status-pill working"><span class="pulse-dot emerald"></span>1000ms Loop</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <button type="button" class="cfg-cat-btn" id="btn-toggle-watch-all" onclick="toggleShowAllPriorityWatch()" style="display: none;">Show All</button>
+            <span class="status-pill working"><span class="pulse-dot emerald"></span>1000ms Loop</span>
+          </div>
         </div>
 
         <div class="table-scroll">
@@ -336,7 +392,7 @@
         </div>
       </div>
 
-      <!-- Right: Active Open Holdings (v_assets_held) -->
+      <!-- Right: Active Open Holdings -->
       <div class="glass-panel">
         <div class="panel-header">
           <div class="panel-title-cluster">
@@ -347,10 +403,13 @@
             </svg>
             <div>
               <div class="panel-title">Active Open Holdings (Committed Capital)</div>
-              <div class="panel-subtitle">Backed by SQL View: <code>v_assets_held</code> · Live Trailing Stop Surveillance</div>
+              <div class="panel-subtitle">Live Exchange Positions · 1s High-Water Trailing Stop Protection</div>
             </div>
           </div>
-          <span class="status-pill open" id="held-count-pill">0 OPEN</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <button type="button" class="close-btn" id="btn-close-all-open" onclick="closeAllOpenPositions()" style="display: none; padding: 4px 10px;">Close All</button>
+            <span class="status-pill open" id="held-count-pill">0 OPEN</span>
+          </div>
         </div>
 
         <div class="table-scroll">
@@ -406,7 +465,7 @@
             <span class="tab-count" id="tab-count-console">0</span>
           </button>
           <button type="button" class="tab-btn" data-tab="config" onclick="switchExplorerTab('config')">
-            <span>System Config Vault</span>
+            <span>⚙ System Config & Vault</span>
           </button>
         </div>
 
@@ -415,13 +474,13 @@
             type="text"
             id="scanner-search-input"
             class="search-input"
-            placeholder="Filter symbol (e.g. BTC-USDC, SOL, HYPE)..."
+            placeholder="Filter symbol or config key (e.g. BTC-USDC, SOL, HYPE)..."
             oninput="renderActiveExplorerTab()"
           />
         </div>
       </div>
 
-      <!-- TAB 1: v_assets_sleeve_s1 -->
+      <!-- TAB 1: Sleeve 1 Carry-Momentum -->
       <div class="tab-pane active" id="tab-pane-s1">
         <div class="table-scroll">
           <table class="quant-table">
@@ -445,7 +504,7 @@
         </div>
       </div>
 
-      <!-- TAB 2: v_assets_sleeve_s2 -->
+      <!-- TAB 2: Sleeve 2 Trend & 3s Breakout -->
       <div class="tab-pane" id="tab-pane-s2">
         <div class="table-scroll">
           <table class="quant-table">
@@ -468,7 +527,7 @@
         </div>
       </div>
 
-      <!-- TAB 3: v_assets_sleeve_s3 -->
+      <!-- TAB 3: Sleeve 3 Event & Funding Flush -->
       <div class="tab-pane" id="tab-pane-s3">
         <div class="table-scroll">
           <table class="quant-table">
@@ -519,7 +578,7 @@
         <div class="audit-telemetry-split">
           <div>
             <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: var(--neon-cyan);">
-              1-SECOND MAKER LIMIT CHASER ORDER AUDIT (<code>order_audit</code>)
+              1-SECOND MAKER LIMIT CHASER EXECUTION AUDIT
             </div>
             <div class="table-scroll">
               <table class="quant-table">
@@ -541,7 +600,7 @@
 
           <div>
             <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: #34d399;">
-              LIVE OPERATIONAL TELEMETRY STREAM (<code>telemetry_logs</code>)
+              LIVE OPERATIONAL TELEMETRY STREAM
             </div>
             <div class="telemetry-log-stream" id="telemetry-log-container"></div>
           </div>
@@ -550,17 +609,28 @@
 
       <!-- TAB 6: System Config & Encrypted Vault -->
       <div class="tab-pane" id="tab-pane-config">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap;">
-          <input type="text" id="cfg-key-input" class="search-input" placeholder="Config key (e.g. max_gross_leverage_x)" style="min-width: 240px;" />
-          <input type="text" id="cfg-val-input" class="search-input" placeholder="New value..." style="min-width: 240px;" />
-          <button type="button" class="action-btn cycle-btn" onclick="submitConfigUpdate()">Update Config Key</button>
+        <div class="config-toolbar" style="margin-bottom: 14px;">
+          <div class="config-category-pills" id="tab-config-cat-pills">
+            <button type="button" class="cfg-cat-btn active" data-cat="all" onclick="setConfigCategory('all')">All Settings</button>
+            <button type="button" class="cfg-cat-btn" data-cat="risk" onclick="setConfigCategory('risk')">Risk & Leverage</button>
+            <button type="button" class="cfg-cat-btn" data-cat="execution" onclick="setConfigCategory('execution')">Execution & Chaser</button>
+            <button type="button" class="cfg-cat-btn" data-cat="sleeves" onclick="setConfigCategory('sleeves')">Sleeves S1/S2/S3</button>
+            <button type="button" class="cfg-cat-btn" data-cat="alerts" onclick="setConfigCategory('alerts')">Alerts & Telegram</button>
+            <button type="button" class="cfg-cat-btn" data-cat="wallet" onclick="setConfigCategory('wallet')">Wallet & Vault</button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <input type="text" id="cfg-key-input" class="search-input" placeholder="Config key (e.g. max_gross_leverage_x)" style="min-width: 220px;" />
+            <input type="text" id="cfg-val-input" class="search-input" placeholder="New value..." style="min-width: 200px;" />
+            <button type="button" class="action-btn cycle-btn" onclick="submitConfigUpdate()">Update Key</button>
+          </div>
         </div>
         <div class="table-scroll">
           <table class="quant-table">
             <thead>
               <tr>
                 <th>Config Key</th>
-                <th>Value (Fernet Redacted)</th>
+                <th>Current Value</th>
+                <th>Inline Edit & Save</th>
                 <th>Type</th>
                 <th>Description</th>
                 <th>Updated (UTC)</th>
@@ -573,6 +643,63 @@
     </section>
 
   </main>
+
+  <!-- ========================================================================
+       SYSTEM CONFIGURATION & CREDENTIALS MODAL (OPENED VIA TOP-BAR ⚙ BUTTON)
+       ======================================================================== -->
+  <div class="config-modal-backdrop" id="config-settings-modal" onclick="handleConfigModalBackdropClick(event)">
+    <div class="config-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="config-modal-title">
+      <div class="config-modal-header">
+        <div class="panel-title-cluster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <div>
+            <div class="panel-title" id="config-modal-title">System Configuration & Encrypted Credentials Vault</div>
+            <div class="panel-subtitle">Edit runtime parameters, sleeve budgets, risk limits, and Fernet-encrypted API credentials</div>
+          </div>
+        </div>
+        <button type="button" class="close-btn" onclick="closeConfigModal()" style="padding: 6px 12px; font-size: 11.5px;">✕ Close</button>
+      </div>
+
+      <div class="config-modal-body">
+        <div class="config-toolbar">
+          <div class="config-category-pills" id="modal-config-cat-pills">
+            <button type="button" class="cfg-cat-btn active" data-cat="all" onclick="setConfigCategory('all')">All Settings</button>
+            <button type="button" class="cfg-cat-btn" data-cat="risk" onclick="setConfigCategory('risk')">Risk & Leverage</button>
+            <button type="button" class="cfg-cat-btn" data-cat="execution" onclick="setConfigCategory('execution')">Execution & Chaser</button>
+            <button type="button" class="cfg-cat-btn" data-cat="sleeves" onclick="setConfigCategory('sleeves')">Sleeves S1/S2/S3</button>
+            <button type="button" class="cfg-cat-btn" data-cat="alerts" onclick="setConfigCategory('alerts')">Alerts & Telegram</button>
+            <button type="button" class="cfg-cat-btn" data-cat="wallet" onclick="setConfigCategory('wallet')">Wallet & Vault</button>
+          </div>
+          <input
+            type="text"
+            id="modal-cfg-search"
+            class="search-input"
+            placeholder="Search config key or description..."
+            oninput="renderSystemConfigTables()"
+          />
+        </div>
+
+        <div class="table-scroll" style="max-height: 60vh; overflow-y: auto;">
+          <table class="quant-table">
+            <thead>
+              <tr>
+                <th>Config Key</th>
+                <th>Current Value</th>
+                <th>Inline Edit & Save</th>
+                <th>Type</th>
+                <th>Description</th>
+                <th>Updated (UTC)</th>
+              </tr>
+            </thead>
+            <tbody id="tbody-modal-system-config"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <!-- Toast Banner -->
   <div class="toast-banner" id="toast-banner"></div>

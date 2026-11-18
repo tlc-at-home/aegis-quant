@@ -133,6 +133,10 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
     let dash_json: Value = serde_json::from_slice(&dash_bytes).unwrap();
     assert_eq!(dash_json["v_assets_ordered"].as_array().unwrap().len(), 1);
     assert_eq!(dash_json["v_assets_ordered"][0]["symbol"], "BTC-USDC");
+    assert!(dash_json["pnl_summary"]["daily"].is_object());
+    assert!(dash_json["pnl_summary"]["weekly"].is_object());
+    assert!(dash_json["pnl_summary"]["monthly"].is_object());
+    assert!(dash_json["pnl_summary"]["ytd"].is_object());
 
     // 4. POST /api/v1/risk-tier
     let tier_req = RiskTierUpdateRequest {
@@ -204,6 +208,7 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
         symbol: Some("BTC-USDC".to_string()),
         cooldown_sec: Some(600),
         reason: Some("TEST_WEB_CLOSE".to_string()),
+        close_all: false,
     };
     let res_close = app
         .clone()

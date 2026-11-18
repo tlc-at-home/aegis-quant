@@ -1,11 +1,20 @@
 //! Canonical millisecond epoch & ISO-8601 UTC time utilities (`aegis-core::time`).
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 
 /// Returns the current UTC timestamp in milliseconds since Unix epoch.
 #[inline]
 pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+/// Returns the millisecond epoch timestamp for Jan 1 00:00:00 UTC of the current year.
+pub fn ytd_start_ms() -> i64 {
+    let year = Utc::now().year();
+    NaiveDate::from_ymd_opt(year, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .unwrap_or(0)
 }
 
 /// Canonical UTC timestamp formatted as ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`).

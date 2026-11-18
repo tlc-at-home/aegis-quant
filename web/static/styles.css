@@ -369,6 +369,20 @@ html, body {
   transform: translateY(-1px);
 }
 
+.action-btn.config-btn {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.24), rgba(0, 242, 254, 0.16));
+  border-color: rgba(139, 92, 246, 0.5);
+  color: #e2e8f0;
+}
+
+.action-btn.config-btn:hover {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.38), rgba(0, 242, 254, 0.28));
+  border-color: var(--neon-cyan);
+  color: #ffffff;
+  box-shadow: 0 0 18px rgba(139, 92, 246, 0.35);
+  transform: translateY(-1px);
+}
+
 /* ============================================================================
    MAIN TERMINAL CONTAINER & LAYOUT
    ============================================================================ */
@@ -381,73 +395,124 @@ html, body {
   gap: 20px;
 }
 
-/* Active Cooldowns Strip */
-.cooldown-strip {
+/* ============================================================================
+   4-CARD PNL HORIZON RIBBON (DAILY 24H · WEEKLY 7D · MONTHLY 30D · YTD)
+   ============================================================================ */
+.pnl-horizon-ribbon {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 1180px) {
+  .pnl-horizon-ribbon {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .pnl-horizon-ribbon {
+    grid-template-columns: 1fr;
+  }
+}
+
+.pnl-horizon-card {
+  position: relative;
+  overflow: hidden;
+  padding: 14px 18px;
+  border-radius: var(--radius-lg);
+  background: linear-gradient(145deg, rgba(16, 24, 45, 0.86), rgba(10, 15, 29, 0.92));
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-glass);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.pnl-horizon-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(0, 242, 254, 0.38);
+}
+
+.pnl-horizon-card.pos {
+  border-left: 3px solid var(--neon-emerald);
+}
+
+.pnl-horizon-card.neg {
+  border-left: 3px solid var(--neon-rose);
+}
+
+.pnl-horizon-card.flat {
+  border-left: 3px solid var(--neon-cyan);
+}
+
+.pnl-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pnl-period-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.pnl-ret-pill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.3px;
+}
+
+.pnl-ret-pill.pos {
+  background: var(--neon-emerald-soft);
+  color: #34d399;
+  border: 1px solid var(--border-glow-emerald);
+}
+
+.pnl-ret-pill.neg {
+  background: var(--neon-rose-soft);
+  color: #fda4af;
+  border: 1px solid var(--border-glow-rose);
+}
+
+.pnl-ret-pill.flat {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+}
+
+.pnl-main-val {
+  font-family: var(--font-mono);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+
+.pnl-main-val.pos { color: #34d399; }
+.pnl-main-val.neg { color: #fb7185; }
+.pnl-main-val.flat { color: var(--text-primary); }
+
+.pnl-sub-breakdown {
   display: flex;
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 12px;
-  padding: 10px 16px;
-  border-radius: var(--radius-md);
-  background: linear-gradient(90deg, rgba(245, 158, 11, 0.12) 0%, rgba(14, 21, 38, 0.78) 100%);
-  border: 1px solid rgba(245, 158, 11, 0.32);
-  box-shadow: var(--shadow-glass);
-}
-
-.cooldown-strip-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
-  color: #fbbf24;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-}
-
-.cooldown-strip-title svg {
-  width: 15px;
-  height: 15px;
-}
-
-.cooldown-pills {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  flex: 1;
-}
-
-.cooldown-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  border-radius: 6px;
-  background: rgba(6, 9, 17, 0.75);
-  border: 1px solid rgba(245, 158, 11, 0.4);
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-
-.cooldown-pill .cd-sym {
-  font-weight: 800;
-  color: #fff;
-}
-
-.cooldown-pill .cd-type {
-  color: #fbbf24;
-  font-size: 10px;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: rgba(245, 158, 11, 0.18);
-}
-
-.cooldown-pill .cd-timer {
-  color: var(--neon-cyan);
-  font-weight: 700;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+  padding-top: 7px;
 }
 
 /* ============================================================================
@@ -736,6 +801,11 @@ html, body {
 .table-scroll {
   width: 100%;
   overflow-x: auto;
+}
+
+.surveillance-grid .table-scroll {
+  max-height: 360px;
+  overflow-y: auto;
 }
 
 .quant-table {
@@ -1028,7 +1098,7 @@ html, body {
   position: fixed;
   bottom: 24px;
   right: 24px;
-  z-index: 999;
+  z-index: 1200;
   padding: 12px 18px;
   border-radius: 10px;
   background: rgba(14, 21, 38, 0.95);
@@ -1046,3 +1116,138 @@ html, body {
   transform: translateY(0);
   opacity: 1;
 }
+
+/* ============================================================================
+   SYSTEM CONFIGURATION & CREDENTIALS MODAL + INLINE CONFIG EDITOR
+   ============================================================================ */
+.config-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  background: rgba(4, 7, 14, 0.78);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.config-modal-backdrop.open {
+  display: flex;
+}
+
+.config-modal-dialog {
+  width: 100%;
+  max-width: 1220px;
+  max-height: 88vh;
+  border-radius: var(--radius-lg);
+  background: rgba(12, 18, 34, 0.96);
+  border: 1px solid var(--border-glow-cyan);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.85), 0 0 28px rgba(0, 242, 254, 0.16);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.config-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 22px;
+  background: rgba(6, 9, 17, 0.75);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.config-modal-body {
+  padding: 18px 22px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.config-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.config-category-pills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cfg-cat-btn {
+  padding: 5px 11px;
+  border-radius: 6px;
+  background: rgba(6, 9, 17, 0.7);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.cfg-cat-btn:hover {
+  background: var(--bg-glass-hover);
+  color: #fff;
+}
+
+.cfg-cat-btn.active {
+  background: rgba(0, 242, 254, 0.16);
+  border-color: var(--border-glow-cyan);
+  color: var(--neon-cyan);
+}
+
+.cfg-inline-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cfg-inline-input,
+.cfg-inline-select {
+  background: rgba(6, 9, 17, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 6px;
+  padding: 5px 9px;
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  min-width: 210px;
+  outline: none;
+  transition: border-color 0.18s ease;
+}
+
+.cfg-inline-input:focus,
+.cfg-inline-select:focus {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 8px rgba(0, 242, 254, 0.25);
+}
+
+.cfg-save-btn {
+  padding: 5px 11px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.24), rgba(0, 242, 254, 0.18));
+  border: 1px solid var(--border-glow-emerald);
+  color: #34d399;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.cfg-save-btn:hover {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.4), rgba(0, 242, 254, 0.3));
+  color: #ffffff;
+}
+

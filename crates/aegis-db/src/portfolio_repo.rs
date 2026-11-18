@@ -2,8 +2,8 @@
 
 use crate::engine::DatabaseManager;
 use aegis_core::{
-    now_ms, sanitize_telemetry_message, AegisError, AlertQueueRecord, PortfolioSnapshot, Result,
-    TelemetryLogRecord,
+    now_ms, round_dp, sanitize_telemetry_message, ytd_start_ms, AegisError, AlertQueueRecord,
+    PnlHorizonMetrics, PnlSummary, PortfolioSnapshot, Result, TelemetryLogRecord,
 };
 use mysql::params;
 use mysql::prelude::*;
@@ -284,6 +284,104 @@ impl DatabaseManager {
                 }
             })
             .collect())
+    }
+
+    /// Computes multi-horizon PnL metrics (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`)
+    /// combining closed positions in each horizon window with active `OPEN` unrealized PnL.
+    pub fn compute_pnl_summary(
+        &self,
+        current_unrealized_pnl: f64,
+        open_fees_funding: f64,
+        current_total_equity: f64,
+    ) -> Result<PnlSummary> {
+        let now = now_ms();
+        let cfg = self.load_config_or_default();
+        let fallback_base_eq = cfg
+            .get_f64("initial_paper_equity_usdc", 10_000.0)
+            .max(100.0);
+
+        let mut conn = self.get_conn()?;
+        let build_horizon = |conn: &mut mysql::PooledConn,
+                             label: &str,
+                             start_ms: i64|
+         -> Result<PnlHorizonMetrics> {
+            let row: Option<(f64, f64, i64, i64)> = conn
+                .exec_first(
+                    r#"SELECT
+                           COALESCE(SUM(realized_pnl_usdc), 0.0),
+                           COALESCE(SUM(funding_accrued_usdc - fees_paid_usdc), 0.0),
+                           COUNT(*),
+                           COALESCE(SUM(CASE WHEN realized_pnl_usdc > 0.0 THEN 1 ELSE 0 END), 0)
+                       FROM positions
+                       WHERE status = 'CLOSED'
+                         AND COALESCE(closed_at_ms, updated_at_ms) >= :start_ms"#,
+                    params! { "start_ms" => start_ms },
+                )
+                .map_err(|e| {
+                    AegisError::Database(format!("compute_pnl_summary query failed: {e}"))
+                })?;
+
+            let (closed_rpnl, closed_fees_funding, trade_cnt, win_cnt) =
+                row.unwrap_or((0.0, 0.0, 0, 0));
+
+            let realized_pnl_usdc = round_dp(closed_rpnl, 2);
+            let unrealized_pnl_usdc = round_dp(current_unrealized_pnl, 2);
+            let net_pnl_usdc = round_dp(realized_pnl_usdc + unrealized_pnl_usdc, 2);
+            let fees_funding_usdc = round_dp(closed_fees_funding + open_fees_funding, 2);
+
+            let earliest_snap_eq: Option<f64> = conn
+                .exec_first(
+                    r#"SELECT total_equity_usdc
+                       FROM portfolio_snapshots
+                       WHERE created_at_ms >= :start_ms
+                       ORDER BY created_at_ms ASC, id ASC
+                       LIMIT 1"#,
+                    params! { "start_ms" => start_ms },
+                )
+                .ok()
+                .flatten();
+
+            let derived_base = (current_total_equity - net_pnl_usdc).max(100.0);
+            let baseline_equity_usdc = round_dp(
+                earliest_snap_eq
+                    .filter(|&v| v > 100.0)
+                    .unwrap_or(derived_base)
+                    .max(fallback_base_eq.min(derived_base)),
+                2,
+            );
+
+            let return_pct = if baseline_equity_usdc > 0.0 {
+                round_dp((net_pnl_usdc / baseline_equity_usdc) * 100.0, 2)
+            } else {
+                0.0
+            };
+
+            Ok(PnlHorizonMetrics {
+                horizon_label: label.to_string(),
+                window_start_ms: start_ms,
+                baseline_equity_usdc,
+                net_pnl_usdc,
+                return_pct,
+                realized_pnl_usdc,
+                unrealized_pnl_usdc,
+                fees_funding_usdc,
+                trade_count: trade_cnt.max(0) as usize,
+                win_count: win_cnt.max(0) as usize,
+            })
+        };
+
+        let day_ms = 86_400_000i64;
+        let daily = build_horizon(&mut conn, "DAILY (24H)", now - day_ms)?;
+        let weekly = build_horizon(&mut conn, "WEEKLY (7D)", now - 7 * day_ms)?;
+        let monthly = build_horizon(&mut conn, "MONTHLY (30D)", now - 30 * day_ms)?;
+        let ytd = build_horizon(&mut conn, "YTD", ytd_start_ms())?;
+
+        Ok(PnlSummary {
+            daily,
+            weekly,
+            monthly,
+            ytd,
+        })
     }
 }
 
