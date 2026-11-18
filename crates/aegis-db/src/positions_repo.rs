@@ -441,6 +441,220 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("list_closed_positions failed: {e}")))?;
         Ok(rows.into_iter().map(row_to_position_record).collect())
     }
+
+    /// Synchronizes MariaDB `positions` 1:1 with a live Hyperliquid `clearinghouseState` position for `asset_id`.
+    /// - If an `OPEN` position already exists for `asset_id`, updates it in-place (and cancels any duplicate active rows).
+    /// - If only `WORKING` rows or no active rows exist for `asset_id`, cancels any `WORKING` rows and inserts the exact `OPEN` position.
+    ///
+    /// Returns `(position_id, was_newly_adopted)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_open_position_from_exchange(
+        &self,
+        asset_id: i64,
+        coin: &str,
+        side: OrderSide,
+        entry_price: f64,
+        mark_price: f64,
+        quantity: f64,
+        committed_notional_usdc: f64,
+        unrealized_pnl_usdc: f64,
+        portfolio_weight: f64,
+        protective_stop_px: f64,
+    ) -> Result<(i64, bool)> {
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("sync_open_position_from_exchange tx failed: {e}"))
+            })?;
+
+        let active_rows: Vec<(i64, String, f64)> = tx
+            .exec(
+                r#"SELECT id, status, protective_stop_px
+                   FROM positions
+                   WHERE asset_id = :aid AND status IN ('OPEN', 'WORKING')
+                   ORDER BY FIELD(status, 'OPEN', 'WORKING'), id DESC"#,
+                params! { "aid" => asset_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_position_from_exchange query failed: {e}"
+                ))
+            })?;
+
+        let open_row_opt = active_rows
+            .iter()
+            .find(|(_, st, _)| st.eq_ignore_ascii_case("OPEN"))
+            .cloned();
+
+        let high = entry_price.max(mark_price);
+        let low = entry_price.min(mark_price).max(0.0);
+
+        if let Some((open_id, _, existing_stop)) = open_row_opt {
+            // Cancel any extra duplicate active rows for this asset_id
+            for (other_id, _, _) in &active_rows {
+                if *other_id != open_id {
+                    tx.exec_drop(
+                        r#"UPDATE positions
+                           SET status = 'CANCELLED',
+                               fsm_state = 'CANCELLED',
+                               reserved_margin_usdc = 0.0,
+                               committed_notional_usdc = 0.0,
+                               closed_at_ms = :ts,
+                               updated_at_ms = :ts,
+                               exit_reason = 'DEDUP_EXCHANGE_RECONCILE'
+                           WHERE id = :pid"#,
+                        params! { "ts" => ts, "pid" => *other_id },
+                    )
+                    .map_err(|e| {
+                        AegisError::Database(format!("dedup cancel position failed: {e}"))
+                    })?;
+                }
+            }
+
+            let eff_stop = if existing_stop > 0.0 {
+                existing_stop
+            } else {
+                protective_stop_px
+            };
+
+            tx.exec_drop(
+                r#"UPDATE positions
+                   SET side = :side,
+                       status = 'OPEN',
+                       fsm_state = 'FILLED_OPEN',
+                       entry_price = :entry_px,
+                       current_price = :mark_px,
+                       requested_quantity = :qty,
+                       filled_quantity = :qty,
+                       reserved_margin_usdc = 0.0,
+                       committed_notional_usdc = :comm_usdc,
+                       unrealized_pnl_usdc = :upnl,
+                       portfolio_weight = :pw,
+                       protective_stop_px = :stop_px,
+                       highest_price_seen = GREATEST(highest_price_seen, :high),
+                       lowest_price_seen = CASE WHEN lowest_price_seen > 0 THEN LEAST(lowest_price_seen, :low) ELSE :low END,
+                       updated_at_ms = :ts
+                   WHERE id = :pid"#,
+                params! {
+                    "side" => side.as_str(),
+                    "entry_px" => entry_price,
+                    "mark_px" => mark_price,
+                    "qty" => quantity,
+                    "comm_usdc" => round_dp(committed_notional_usdc, 4),
+                    "upnl" => round_dp(unrealized_pnl_usdc, 4),
+                    "pw" => round_dp(portfolio_weight, 4),
+                    "stop_px" => eff_stop,
+                    "high" => high,
+                    "low" => low,
+                    "ts" => ts,
+                    "pid" => open_id,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_position_from_exchange update failed: {e}"
+                ))
+            })?;
+
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_position_from_exchange commit failed: {e}"
+                ))
+            })?;
+            return Ok((open_id, false));
+        }
+
+        // Cancel any WORKING rows for this asset before inserting the exact OPEN position
+        for (working_id, _, _) in &active_rows {
+            tx.exec_drop(
+                r#"UPDATE positions
+                   SET status = 'CANCELLED',
+                       fsm_state = 'CANCELLED',
+                       reserved_margin_usdc = 0.0,
+                       committed_notional_usdc = 0.0,
+                       closed_at_ms = :ts,
+                       updated_at_ms = :ts,
+                       exit_reason = 'REPLACED_BY_EXCHANGE_OPEN'
+                   WHERE id = :pid"#,
+                params! { "ts" => ts, "pid" => *working_id },
+            )
+            .map_err(|e| AegisError::Database(format!("cancel working before sync failed: {e}")))?;
+        }
+
+        let coid = format!("hl-sync-{}-{ts}", coin.trim().to_ascii_lowercase());
+        tx.exec_drop(
+            r#"INSERT INTO positions (
+                   asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
+                   requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
+                   portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                   protective_stop_px, highest_price_seen, lowest_price_seen, chase_count,
+                   unrealized_pnl_usdc, exchange_order_id, created_at_ms, opened_at_ms, updated_at_ms
+               ) VALUES (
+                   :aid, :coid, :side, 'OPEN', 'FILLED_OPEN', :entry_px, :mark_px,
+                   :qty, :qty, 0.0, :comm_usdc,
+                   :pw, :pw, 0.0, 0.0,
+                   :stop_px, :high, :low, 0,
+                   :upnl, 'hl-reconciled', :ts, :ts, :ts
+               )"#,
+            params! {
+                "aid" => asset_id,
+                "coid" => &coid,
+                "side" => side.as_str(),
+                "entry_px" => entry_price,
+                "mark_px" => mark_price,
+                "qty" => quantity,
+                "comm_usdc" => round_dp(committed_notional_usdc, 4),
+                "pw" => round_dp(portfolio_weight, 4),
+                "stop_px" => protective_stop_px,
+                "high" => high,
+                "low" => low,
+                "upnl" => round_dp(unrealized_pnl_usdc, 4),
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "sync_open_position_from_exchange insert failed: {e}"
+            ))
+        })?;
+
+        let new_id = tx.last_insert_id().unwrap_or(0) as i64;
+        tx.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :pid, :aid, :coid, :side, 'RECONCILED', 'FILLED_OPEN',
+                   :qty, :qty, :entry_px, :entry_px,
+                   0.0, :comm_usdc, 0.0, 'HYPERLIQUID_CLEARINGHOUSE_1_TO_1_SYNC', :ts, :ts
+               )"#,
+            params! {
+                "pid" => new_id,
+                "aid" => asset_id,
+                "coid" => &coid,
+                "side" => side.as_str(),
+                "qty" => quantity,
+                "entry_px" => entry_price,
+                "comm_usdc" => round_dp(committed_notional_usdc, 4),
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "sync_open_position_from_exchange audit failed: {e}"
+            ))
+        })?;
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "sync_open_position_from_exchange commit failed: {e}"
+            ))
+        })?;
+        Ok((new_id, true))
+    }
 }
 
 fn row_to_position_record(r: mysql::Row) -> PositionRecord {

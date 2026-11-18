@@ -13,7 +13,10 @@ use crate::market_watcher::{MarketScanReport, MarketWatcher};
 use crate::order_chaser::{NewWorkingOrderRequest, OrderChaser};
 use crate::priority_monitor::{PriorityMonitor, PriorityTickReport};
 use crate::reconcile::{CutoverReconcileReport, CutoverReconciler};
-use crate::signing::{build_limit_order_wire, HL_ORACLE_BAND_PCT};
+use crate::signing::{
+    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, CancelWire, LimitOrderType,
+    OrderTypeWire, OrderWire, HL_ORACLE_BAND_PCT,
+};
 use aegis_alerts::{
     format_position_closed_html, AlertEngine, CutoverReconcileAlert, PositionClosedAlert,
 };
@@ -406,18 +409,36 @@ impl ExecutionEngine {
         let ordered = self.db.get_assets_ordered()?;
         let assets = self.db.list_exchange_assets()?;
 
-        let closed_realized_pnl: f64 = self
-            .db
-            .list_closed_positions(200)
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.realized_pnl_usdc)
-            .sum();
-
-        let seed_equity = base_equity_override
-            .filter(|&v| v > 0.0)
-            .unwrap_or_else(|| cfg.get_f64("initial_paper_equity_usdc", 10_000.0));
-        let base_cash_equity = (seed_equity + closed_realized_pnl).max(100.0);
+        let live_eq_cfg = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        let base_cash_equity = if let Some(explicit_eq) = base_equity_override.filter(|&v| v > 0.0)
+        {
+            if cfg.execution_mode().is_live_or_testnet() {
+                let upnl_sum: f64 = held.iter().map(|h| h.unrealized_pnl_usdc).sum();
+                (explicit_eq - upnl_sum).max(1.0)
+            } else {
+                let closed_realized_pnl: f64 = self
+                    .db
+                    .list_closed_positions(200)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| p.realized_pnl_usdc)
+                    .sum();
+                (explicit_eq + closed_realized_pnl).max(100.0)
+            }
+        } else if cfg.execution_mode().is_live_or_testnet() && live_eq_cfg > 0.0 {
+            let upnl_sum: f64 = held.iter().map(|h| h.unrealized_pnl_usdc).sum();
+            (live_eq_cfg - upnl_sum).max(1.0)
+        } else {
+            let closed_realized_pnl: f64 = self
+                .db
+                .list_closed_positions(200)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.realized_pnl_usdc)
+                .sum();
+            let seed_equity = cfg.get_f64("initial_paper_equity_usdc", 10_000.0);
+            (seed_equity + closed_realized_pnl).max(100.0)
+        };
 
         let ledger = risk.evaluate_ledger_from_views(base_cash_equity, &held, &ordered);
         let eligible_count = assets
@@ -494,7 +515,16 @@ impl ExecutionEngine {
         let market_scan = self.watcher.run_3s_exchange_scan()?;
         let priority_tick = self.priority_monitor.run_1s_priority_tick()?;
 
-        let base_equity = cfg.get_f64("initial_paper_equity_usdc", 10_000.0);
+        let base_equity = if cfg.execution_mode().is_live_or_testnet() {
+            let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+            if live_eq > 0.0 {
+                live_eq
+            } else {
+                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+            }
+        } else {
+            cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+        };
         let signal_out = self.evaluate_and_persist_signals(base_equity)?;
 
         let rebalance = if execute_orders {
@@ -516,10 +546,16 @@ impl ExecutionEngine {
         })
     }
 
+    /// Synchronizes MariaDB `positions` and `portfolio_snapshots` 1:1 with live Hyperliquid `clearinghouseState`.
+    pub fn sync_with_hyperliquid(&self) -> Result<CutoverFullReport> {
+        self.run_cutover_reconciliation(false)
+    }
+
     /// Closes an `OPEN` position or cancels a `WORKING` order by `position_id`, inserting a cooldown
     /// (defaults to 3600s / 1h when `cooldown_seconds` is `None` so manual closes are not immediately re-entered).
-    /// Commits MariaDB state transitions (`positions`, `order_audit`, `asset_cooldowns`, `portfolio_snapshots`)
-    /// first and dispatches exchange/Telegram network I/O asynchronously so Web UI responses are instant.
+    /// In `TESTNET`/`LIVE` mode, cancels any resting `openOrders` on `asset.coin`, queries live Hyperliquid
+    /// `clearinghouseState` for the actual `szi`, and submits a `reduceOnly: true` IOC market close order
+    /// for the exact on-chain quantity synchronously before marking the position `CLOSED` in MariaDB.
     pub fn close_or_cancel_position(
         &self,
         position_id: i64,
@@ -537,6 +573,9 @@ impl ExecutionEngine {
         let cfg = self.db.load_config_or_default();
         let status = PositionStatus::parse(&pos.status);
         let cd_sec = cooldown_seconds.unwrap_or(3600).max(0);
+        let is_live_exchange = cfg.execution_mode().is_live_or_testnet()
+            && !cfg.get_str("private_key", "").is_empty()
+            && !self.db.is_ephemeral_test_db();
 
         let mut exit_price_opt = None;
         let mut realized_pnl = 0.0;
@@ -546,48 +585,212 @@ impl ExecutionEngine {
 
         match status {
             PositionStatus::Working => {
+                if is_live_exchange {
+                    let pk = cfg.get_str("private_key", "");
+                    let wallet = cfg.get_str("wallet_address", "");
+                    let mut cancels = Vec::new();
+                    if let Some(oid) = pos
+                        .exchange_order_id
+                        .as_deref()
+                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        cancels.push(CancelWire {
+                            a: asset.asset_index,
+                            o: oid,
+                        });
+                    } else if !wallet.is_empty() {
+                        if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
+                            for ord in open_orders {
+                                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                                if c.eq_ignore_ascii_case(&asset.coin) {
+                                    if let Some(oid) =
+                                        ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
+                                            ord.get("oid")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                        })
+                                    {
+                                        cancels.push(CancelWire {
+                                            a: asset.asset_index,
+                                            o: oid,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !cancels.is_empty() {
+                        let _ = self
+                            .http
+                            .cancel_orders_batch(cancels, &pk, Some(&self.db), &cfg);
+                    }
+                }
                 released_reserved = pos.reserved_margin_usdc;
                 self.db.cancel_working_order(position_id, reason)?;
                 final_status = "CANCELLED".to_string();
-
-                if cfg.execution_mode().is_live_or_testnet() && !self.db.is_ephemeral_test_db() {
-                    let pk = cfg.get_str("private_key", "");
-                    if !pk.is_empty() {
-                        if let Some(oid) = pos
-                            .exchange_order_id
-                            .as_deref()
-                            .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                            .and_then(|s| s.parse::<u64>().ok())
-                        {
-                            let http = self.http.clone();
-                            let db = self.db.clone();
-                            let cfg_clone = cfg.clone();
-                            let asset_index = asset.asset_index;
-                            std::thread::spawn(move || {
-                                let _ = http.cancel_order_wire(
-                                    asset_index,
-                                    oid,
-                                    &pk,
-                                    Some(&db),
-                                    &cfg_clone,
-                                );
-                            });
-                        }
-                    }
-                }
             }
             PositionStatus::Open => {
                 let side = OrderSide::parse(&pos.side);
-                let exit_px = if asset.mark_price > 0.0 {
+                let mut exit_px = if asset.mark_price > 0.0 {
                     asset.mark_price
                 } else {
                     pos.current_price.max(pos.entry_price)
                 };
                 let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-                let fee_usdc = round_dp(
-                    exit_px * pos.filled_quantity * (taker_fee_bps / 10_000.0),
-                    4,
-                );
+                let mut closed_qty = pos.filled_quantity;
+                let mut fee_usdc = round_dp(exit_px * closed_qty * (taker_fee_bps / 10_000.0), 4);
+
+                if is_live_exchange {
+                    let pk = cfg.get_str("private_key", "");
+                    let wallet = cfg.get_str("wallet_address", "");
+
+                    // 1. Cancel any resting openOrders on this coin first
+                    if !wallet.is_empty() {
+                        if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
+                            let mut cancels = Vec::new();
+                            for ord in open_orders {
+                                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                                if c.eq_ignore_ascii_case(&asset.coin) {
+                                    if let Some(oid) =
+                                        ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
+                                            ord.get("oid")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<u64>().ok())
+                                        })
+                                    {
+                                        cancels.push(CancelWire {
+                                            a: asset.asset_index,
+                                            o: oid,
+                                        });
+                                    }
+                                }
+                            }
+                            if !cancels.is_empty() {
+                                let _ = self.http.cancel_orders_batch(
+                                    cancels,
+                                    &pk,
+                                    Some(&self.db),
+                                    &cfg,
+                                );
+                            }
+                        }
+
+                        // 2. Query live Hyperliquid clearinghouseState for exact `szi` on this coin
+                        if let Ok(ch_state) = self.http.fetch_clearinghouse_state(&wallet, &cfg) {
+                            let parse_f = |v: Option<&serde_json::Value>| -> f64 {
+                                v.and_then(|x| {
+                                    x.as_f64()
+                                        .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+                                })
+                                .filter(|val| val.is_finite())
+                                .unwrap_or(0.0)
+                            };
+                            let mut live_szi = 0.0;
+                            let mut live_pos_val = 0.0;
+                            if let Some(arr) =
+                                ch_state.get("assetPositions").and_then(|v| v.as_array())
+                            {
+                                for item in arr {
+                                    let p = item.get("position").unwrap_or(item);
+                                    let c = p.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                                    if c.eq_ignore_ascii_case(&asset.coin) {
+                                        live_szi = parse_f(p.get("szi"));
+                                        live_pos_val = parse_f(p.get("positionValue"));
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if live_szi.abs() > 1e-9 {
+                                let live_qty = live_szi.abs();
+                                closed_qty = live_qty;
+                                let close_is_buy = live_szi < 0.0;
+                                if live_pos_val > 0.0 {
+                                    exit_px = round_dp(live_pos_val / live_qty, 6);
+                                }
+
+                                // Submit reduceOnly IOC order for exact live_qty (try 3.95% oracle band, then l2Book BBO / 8% fallback)
+                                let mut filled_on_hl = false;
+                                for attempt in 0..2 {
+                                    let ref_anchor = if attempt == 0 {
+                                        exit_px
+                                    } else if let Ok(Some((bid, ask))) =
+                                        self.http.fetch_l2_book(&asset.coin, &cfg)
+                                    {
+                                        if close_is_buy {
+                                            ask
+                                        } else {
+                                            bid
+                                        }
+                                    } else {
+                                        exit_px
+                                    };
+                                    let slip = if attempt == 0 {
+                                        HL_ORACLE_BAND_PCT
+                                    } else {
+                                        0.06
+                                    };
+                                    let limit_px = if close_is_buy {
+                                        ref_anchor * (1.0 + slip)
+                                    } else {
+                                        ref_anchor * (1.0 - slip)
+                                    };
+                                    let wire = OrderWire {
+                                        a: asset.asset_index,
+                                        b: close_is_buy,
+                                        p: format_hl_wire_price(
+                                            limit_px,
+                                            asset.tick_size,
+                                            asset.sz_decimals,
+                                        ),
+                                        s: format_hl_wire_size(
+                                            live_qty,
+                                            asset.lot_step_size,
+                                            asset.sz_decimals,
+                                        ),
+                                        r: true,
+                                        t: OrderTypeWire {
+                                            limit: Some(LimitOrderType {
+                                                tif: "Ioc".to_string(),
+                                            }),
+                                            trigger: None,
+                                        },
+                                        c: Some(derive_hl_cloid_hex(&format!(
+                                            "v2-close-{position_id}-{attempt}-{}",
+                                            now_ms()
+                                        ))),
+                                    };
+                                    if let Ok(ack) = self.http.submit_order_wire(
+                                        wire,
+                                        live_qty,
+                                        ref_anchor,
+                                        taker_fee_bps,
+                                        &pk,
+                                        Some(&self.db),
+                                        &cfg,
+                                    ) {
+                                        if ack.accepted && ack.status == "FILLED" {
+                                            if ack.avg_fill_price > 0.0 {
+                                                exit_px = ack.avg_fill_price;
+                                            }
+                                            fee_usdc = ack.fee_usdc;
+                                            filled_on_hl = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if !filled_on_hl {
+                                    tracing::warn!(
+                                        symbol = %asset.symbol,
+                                        live_qty = live_qty,
+                                        "Hyperliquid reduceOnly IOC close did not immediately fill"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
 
                 realized_pnl = self
                     .db
@@ -601,56 +804,13 @@ impl ExecutionEngine {
                     exit_reason: reason.to_string(),
                     entry_price: pos.entry_price,
                     exit_price: exit_px,
-                    filled_qty: pos.filled_quantity,
+                    filled_qty: closed_qty,
                     realized_pnl_usdc: realized_pnl,
                     available_cash_usdc: 0.0,
                     cooldown_type: (cd_sec > 0).then(|| "MANUAL".to_string()),
                     cooldown_seconds: cd_sec,
                     timestamp_ms: now_ms(),
                 });
-
-                if cfg.execution_mode().is_live_or_testnet() && !self.db.is_ephemeral_test_db() {
-                    let pk = cfg.get_str("private_key", "");
-                    let has_live_oid = pos
-                        .exchange_order_id
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty());
-                    if !pk.is_empty() && has_live_oid {
-                        let close_is_buy = !side.is_buy();
-                        let limit_px = if close_is_buy {
-                            exit_px * (1.0 + HL_ORACLE_BAND_PCT)
-                        } else {
-                            exit_px * (1.0 - HL_ORACLE_BAND_PCT)
-                        };
-                        let wire = build_limit_order_wire(
-                            asset.asset_index,
-                            close_is_buy,
-                            limit_px,
-                            pos.filled_quantity,
-                            asset.tick_size,
-                            asset.lot_step_size,
-                            asset.sz_decimals,
-                            true,
-                            "Ioc",
-                            Some(&format!("v2-close-{position_id}-{}", now_ms())),
-                        );
-                        let http = self.http.clone();
-                        let db = self.db.clone();
-                        let cfg_clone = cfg.clone();
-                        let filled_qty = pos.filled_quantity;
-                        std::thread::spawn(move || {
-                            let _ = http.submit_order_wire(
-                                wire,
-                                filled_qty,
-                                exit_px,
-                                taker_fee_bps,
-                                &pk,
-                                Some(&db),
-                                &cfg_clone,
-                            );
-                        });
-                    }
-                }
             }
             PositionStatus::Closed | PositionStatus::Cancelled => {
                 final_status = pos.status.clone();
@@ -782,6 +942,12 @@ impl ExecutionEngine {
                 .max(1);
 
                 if tick_counter.is_multiple_of(scan_ratio) {
+                    let scan_index = tick_counter / scan_ratio;
+                    if cfg.execution_mode().is_live_or_testnet() && scan_index.is_multiple_of(5) {
+                        if let Err(e) = engine.reconciler.run_cutover_reconciliation(false) {
+                            tracing::warn!(error = %e, "15s Hyperliquid 1:1 reconciliation error");
+                        }
+                    }
                     let execute_orders = cfg.get_bool("auto_rebalance_enabled", true);
                     if let Err(e) = engine.run_single_cycle(execute_orders) {
                         tracing::warn!(error = %e, "3s exchange scan & signal cycle error");

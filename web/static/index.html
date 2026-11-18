@@ -65,6 +65,15 @@
         <button type="button" class="tier-btn active" data-tier="extreme" onclick="switchRiskTier('extreme')">🔥 Extreme 1.85x</button>
       </div>
 
+      <button type="button" class="action-btn cycle-btn" id="btn-sync-hyperliquid" onclick="triggerHyperliquidReconcile()" title="Synchronize MariaDB 1:1 with Live Hyperliquid Clearinghouse State & Open Orders">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
+        <span>⟳ Sync Hyperliquid</span>
+      </button>
+
       <button type="button" class="action-btn telegram-btn" id="btn-telegram-test" onclick="triggerTelegramTestAlert()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="22" y1="2" x2="11" y2="13"></line>

@@ -176,6 +176,39 @@ async function triggerTelegramTestAlert() {
   }
 }
 
+async function triggerHyperliquidReconcile() {
+  const btn = document.getElementById('btn-sync-hyperliquid');
+  if (btn) btn.disabled = true;
+  try {
+    showToast('Synchronizing MariaDB 1:1 with Hyperliquid clearinghouseState...');
+    const res = await apiFetch('/api/v1/reconcile', {
+      method: 'POST',
+      body: JSON.stringify({ close_legacy_positions: false }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(`Reconcile error: ${data.detail || data.error || res.status}`, true);
+    } else {
+      const r = data.reconcile || {};
+      const eq = Number(
+        (data.snapshot && data.snapshot.total_equity_usdc) ||
+          r.exchange_equity_usdc ||
+          0
+      );
+      showToast(
+        `Synced 1:1 with Hyperliquid (Equity: ${fmtUsd(eq)} · Open Positions: ${Number(
+          r.legacy_positions_found || 0
+        )} · Cancelled Orders: ${Number(r.stale_orders_cancelled || 0)})`
+      );
+    }
+    await refreshAll(true);
+  } catch (err) {
+    showToast(`Hyperliquid sync error: ${err.message}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
   const pid = Number(positionId || 0);
   const sym = String(symbol || '').trim();

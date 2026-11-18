@@ -5,7 +5,7 @@ use crate::payloads::{
     build_dashboard_payload, build_health_payload, execute_close_position_or_order,
     execute_risk_tier_switch, json_value_to_config_string, map_aegis_error_response,
     validate_config_key_value, ApiErrorBody, ClosePositionRequest, ConfigUpdateRequest,
-    ConfigUpdateResponse, RiskTierUpdateRequest,
+    ConfigUpdateResponse, ReconcileRequest, RiskTierUpdateRequest,
 };
 use crate::server::AppState;
 use aegis_alerts::send_test_alert_async;
@@ -217,6 +217,30 @@ pub async fn post_positions_close_handler(
         Err(e) => map_aegis_error_response(AegisError::Database(format!(
             "Close position task error: {e}"
         ))),
+    }
+}
+
+/// `POST /api/v1/reconcile` — Runs an immediate 1:1 MariaDB-to-Hyperliquid clearinghouseState & openOrders reconciliation.
+pub async fn post_reconcile_handler(
+    State(state): State<AppState>,
+    req_opt: Option<Json<ReconcileRequest>>,
+) -> Response {
+    let close_legacy = req_opt
+        .map(|Json(r)| r.close_legacy_positions)
+        .unwrap_or(false);
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let engine = aegis_execution::ExecutionEngine::new(db);
+        engine.run_cutover_reconciliation(close_legacy)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(e)) => map_aegis_error_response(e),
+        Err(e) => {
+            map_aegis_error_response(AegisError::Database(format!("Reconcile task error: {e}")))
+        }
     }
 }
 

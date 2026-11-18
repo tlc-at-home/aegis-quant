@@ -638,12 +638,31 @@ impl HyperliquidHttpClient {
         db: Option<&DatabaseManager>,
         cfg: &ConfigMap,
     ) -> Result<Value> {
-        let action = CancelAction {
-            action_type: "cancel".to_string(),
-            cancels: vec![CancelWire {
+        self.cancel_orders_batch(
+            vec![CancelWire {
                 a: asset_index,
                 o: oid,
             }],
+            private_key,
+            db,
+            cfg,
+        )
+    }
+
+    /// Cancels a batch of resting orders on Hyperliquid in a single signed `/exchange` request.
+    pub fn cancel_orders_batch(
+        &self,
+        cancels: Vec<CancelWire>,
+        private_key: &str,
+        db: Option<&DatabaseManager>,
+        cfg: &ConfigMap,
+    ) -> Result<Value> {
+        if cancels.is_empty() {
+            return Ok(json!({ "status": "ok" }));
+        }
+        let action = CancelAction {
+            action_type: "cancel".to_string(),
+            cancels,
         };
         self.post_exchange_action(&action, private_key, db, cfg)
     }

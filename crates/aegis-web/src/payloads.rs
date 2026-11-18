@@ -141,6 +141,13 @@ pub struct ClosePositionResponse {
     pub updated_at_ms: i64,
 }
 
+/// Request payload for `POST /api/v1/reconcile`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReconcileRequest {
+    #[serde(default)]
+    pub close_legacy_positions: bool,
+}
+
 /// Converts a JSON `Value` into a clean configuration string.
 pub fn json_value_to_config_string(val: &Value) -> String {
     match val {
@@ -243,7 +250,10 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
             .map(|h| h.committed_notional_usdc)
             .sum();
         let upnl: f64 = v_assets_held.iter().map(|h| h.unrealized_pnl_usdc).sum();
-        let base_eq = cfg.get_f64("initial_paper_equity_usdc", 10_000.0);
+        let base_eq = cfg.get_f64(
+            "live_exchange_equity_usdc",
+            cfg.get_f64("initial_paper_equity_usdc", 10_000.0),
+        );
         let total_eq = round_dp(base_eq + upnl, 2);
         let avail_cash = round_dp((total_eq - committed - reserved).max(0.0), 2);
         snapshot.total_equity_usdc = total_eq;

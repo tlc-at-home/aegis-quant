@@ -1,17 +1,21 @@
-//! Dynamic Cutover & Live Hyperliquid Exchange Reconciliation (`aegis-execution::reconcile`).
+//! Dynamic Cutover & Live 1:1 Hyperliquid Exchange Reconciliation (`aegis-execution::reconcile`).
 //!
 //! Queries live Hyperliquid Testnet/Mainnet `clearinghouseState` and `openOrders` using the
 //! preserved `wallet_address` and decrypted `private_key` from MariaDB `system_config`.
-//! Dynamically cancels stale legacy v1 open orders and closes or cleanly adopts any open
-//! legacy/dust positions at cutover time, logging the audit trail to `telemetry_logs`.
+//! Synchronizes MariaDB `positions` 1:1 with Hyperliquid's actual `assetPositions` (`szi`, `entryPx`,
+//! `positionValue`, `unrealizedPnl`), cancels orphan/stale open orders on Hyperliquid, closes local
+//! phantom/flat rows, and persists live `exchange_equity_usdc`.
 
 use crate::http_client::{is_testnet_configured, HyperliquidHttpClient};
-use crate::signing::{build_limit_order_wire, infer_tick_size, snap_to_tick, HL_ORACLE_BAND_PCT};
+use crate::signing::{
+    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, infer_tick_size, snap_to_tick,
+    CancelWire, LimitOrderType, OrderTypeWire, OrderWire,
+};
 use aegis_core::{
     mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp, ExecutionMode, OrderSide,
     Result,
 };
-use aegis_db::{AssetUpsertInput, DatabaseManager, WorkingOrderInput};
+use aegis_db::{AssetUpsertInput, DatabaseManager};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -34,7 +38,7 @@ pub struct CutoverReconcileReport {
     pub details: Vec<String>,
 }
 
-/// Dynamic Cutover & Live Exchange State Reconciler.
+/// Dynamic Cutover & Live 1:1 Exchange State Reconciler.
 #[derive(Clone)]
 pub struct CutoverReconciler {
     pub db: DatabaseManager,
@@ -46,8 +50,15 @@ impl CutoverReconciler {
         Self { db, http }
     }
 
-    /// Queries live Hyperliquid `clearinghouseState` and `openOrders`, cancels stale v1 open orders,
-    /// and either closes (`close_legacy_positions == true`) or cleanly adopts any open legacy positions.
+    /// Performs an exact 1:1 synchronization of MariaDB `positions` and `portfolio_snapshots`
+    /// against live Hyperliquid `clearinghouseState` and `openOrders`.
+    pub fn sync_db_with_hyperliquid(&self) -> Result<CutoverReconcileReport> {
+        self.run_cutover_reconciliation(false)
+    }
+
+    /// Queries live Hyperliquid `clearinghouseState` and `openOrders`, cancels stale/untracked open orders,
+    /// and either closes (`close_legacy_positions == true`) or 1:1 synchronizes all open Hyperliquid positions
+    /// into MariaDB while closing any local rows that are flat on Hyperliquid.
     pub fn run_cutover_reconciliation(
         &self,
         close_legacy_positions: bool,
@@ -132,46 +143,20 @@ impl CutoverReconciler {
                 }
             }
         }
-        report.exchange_equity_usdc = if live_eq >= 10.0 {
+        report.exchange_equity_usdc = if live_eq >= 1.0 {
             round_dp(live_eq, 2)
         } else {
             fallback_eq
         };
+        let _ = self.db.set_config_value(
+            "live_exchange_equity_usdc",
+            &format!("{:.2}", report.exchange_equity_usdc),
+            Some("Latest reconciled Hyperliquid accountValue in USDC"),
+        );
 
-        // 2. Reconcile & cancel stale v1 open orders not present in v2 `positions`
-        let known_local_oids: HashSet<u64> = {
-            let mut set = HashSet::new();
-            if let Ok(ordered) = self.db.get_assets_ordered() {
-                for o in ordered {
-                    if let Some(oid) = o
-                        .exchange_order_id
-                        .as_deref()
-                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        set.insert(oid);
-                    }
-                }
-            }
-            if let Ok(held) = self.db.get_assets_held() {
-                for h in held {
-                    if let Ok(Some(pos)) = self.db.get_position_by_id(h.position_id) {
-                        for opt in [pos.exchange_order_id, pos.protective_stop_oid] {
-                            if let Some(oid) = opt
-                                .as_deref()
-                                .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                                .and_then(|s| s.parse::<u64>().ok())
-                            {
-                                set.insert(oid);
-                            }
-                        }
-                    }
-                }
-            }
-            set
-        };
-
+        // 2. Cancel all stale/orphan open orders on Hyperliquid
         if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
+            let mut batch_cancels: Vec<CancelWire> = Vec::new();
             for ord in &open_orders {
                 let coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
                 let oid = ord
@@ -183,36 +168,45 @@ impl CutoverReconciler {
                             .and_then(|s| s.parse::<u64>().ok())
                     })
                     .unwrap_or(0);
-                if oid == 0 || coin.is_empty() || known_local_oids.contains(&oid) {
+                if oid == 0 || coin.is_empty() {
                     continue;
                 }
                 report.stale_orders_found += 1;
+                if let Ok(Some(asset)) = self.db.get_asset_by_symbol(coin) {
+                    batch_cancels.push(CancelWire {
+                        a: asset.asset_index,
+                        o: oid,
+                    });
+                }
+            }
 
-                if !private_key.is_empty() {
-                    if let Ok(Some(asset)) = self.db.get_asset_by_symbol(coin) {
-                        if self
-                            .http
-                            .cancel_order_wire(
-                                asset.asset_index,
-                                oid,
-                                &private_key,
-                                Some(&self.db),
-                                &cfg,
-                            )
-                            .is_ok()
-                        {
-                            report.stale_orders_cancelled += 1;
-                            report.details.push(format!(
-                                "Cancelled stale open order oid={oid} on {}",
-                                asset.symbol
-                            ));
-                        }
+            if !private_key.is_empty() && !batch_cancels.is_empty() {
+                for chunk in batch_cancels.chunks(25) {
+                    if self
+                        .http
+                        .cancel_orders_batch(chunk.to_vec(), &private_key, Some(&self.db), &cfg)
+                        .is_ok()
+                    {
+                        report.stale_orders_cancelled += chunk.len();
                     }
                 }
+                report.details.push(format!(
+                    "Cancelled {}/{} resting orders on Hyperliquid",
+                    report.stale_orders_cancelled, report.stale_orders_found
+                ));
             }
         }
 
-        // 3. Inspect live Hyperliquid `assetPositions`
+        // Cancel any local WORKING rows since all resting entry orders on Hyperliquid were cleared
+        if let Ok(local_ordered) = self.db.get_assets_ordered() {
+            for o in local_ordered {
+                let _ = self
+                    .db
+                    .cancel_working_order(o.position_id, "EXCHANGE_RECONCILED_WORKING_CLEARED");
+            }
+        }
+
+        // 3. Inspect live Hyperliquid `assetPositions` and synchronize 1:1 with MariaDB `positions`
         let mut exchange_open_asset_ids: HashSet<i64> = HashSet::new();
         let default_stop_pct = cfg
             .get_f64("protective_stop_default_pct", 0.04)
@@ -228,6 +222,9 @@ impl CutoverReconciler {
                     continue;
                 }
                 let entry_px = parse_f(pos.get("entryPx")).max(0.0001);
+                let pos_val = parse_f(pos.get("positionValue"));
+                let upnl = parse_f(pos.get("unrealizedPnl"));
+
                 let Ok((symbol, coin)) = normalize_hyperliquid_symbol(raw_coin) else {
                     continue;
                 };
@@ -260,13 +257,6 @@ impl CutoverReconciler {
                     }
                 };
 
-                if let Some(existing_local) = self.db.get_active_position_for_asset(asset.id)? {
-                    if existing_local.status == "OPEN" {
-                        exchange_open_asset_ids.insert(asset.id);
-                        continue;
-                    }
-                }
-
                 report.legacy_positions_found += 1;
                 let side = if szi > 0.0 {
                     OrderSide::Long
@@ -274,112 +264,114 @@ impl CutoverReconciler {
                     OrderSide::Short
                 };
                 let qty = szi.abs();
-                let ref_px = if asset.mark_price > 0.0 {
+                let mark_px = if pos_val > 0.0 && qty > 1e-9 {
+                    round_dp(pos_val / qty, 6)
+                } else if asset.mark_price > 0.0 {
                     asset.mark_price
                 } else {
                     entry_px
                 };
+                let _ = self.db.update_asset_live_quote(asset.id, mark_px, mark_px);
 
                 let mut closed_on_exchange = false;
                 if close_legacy_positions && !private_key.is_empty() {
                     let close_is_buy = !side.is_buy();
-                    let limit_px = if close_is_buy {
-                        ref_px * (1.0 + HL_ORACLE_BAND_PCT)
-                    } else {
-                        ref_px * (1.0 - HL_ORACLE_BAND_PCT)
-                    };
-                    let wire = build_limit_order_wire(
-                        asset.asset_index,
-                        close_is_buy,
-                        limit_px,
-                        qty,
-                        asset.tick_size,
-                        asset.lot_step_size,
-                        asset.sz_decimals,
-                        true,
-                        "Ioc",
-                        Some(&format!(
-                            "cutover-close-{}-{}",
-                            coin.to_ascii_lowercase(),
-                            ts
-                        )),
-                    );
-                    if let Ok(ack) = self.http.submit_order_wire(
-                        wire,
-                        qty,
-                        ref_px,
-                        taker_fee_bps,
-                        &private_key,
-                        Some(&self.db),
-                        &cfg,
-                    ) {
-                        if ack.accepted && ack.status == "FILLED" {
-                            closed_on_exchange = true;
-                            report.legacy_positions_closed += 1;
-                            report.details.push(format!(
-                                "Closed legacy Testnet position {} ({} {:.4} @ ${:.4})",
-                                asset.symbol,
-                                side.as_str(),
-                                qty,
-                                ack.avg_fill_price
-                            ));
+                    for slip_pct in [0.0395, 0.08] {
+                        let limit_px = if close_is_buy {
+                            mark_px * (1.0 + slip_pct)
+                        } else {
+                            mark_px * (1.0 - slip_pct)
+                        };
+                        let wire = OrderWire {
+                            a: asset.asset_index,
+                            b: close_is_buy,
+                            p: format_hl_wire_price(limit_px, asset.tick_size, asset.sz_decimals),
+                            s: format_hl_wire_size(qty, asset.lot_step_size, asset.sz_decimals),
+                            r: true,
+                            t: OrderTypeWire {
+                                limit: Some(LimitOrderType {
+                                    tif: "Ioc".to_string(),
+                                }),
+                                trigger: None,
+                            },
+                            c: Some(derive_hl_cloid_hex(&format!(
+                                "cutover-close-{}-{}-{}",
+                                coin.to_ascii_lowercase(),
+                                slip_pct,
+                                ts
+                            ))),
+                        };
+                        if let Ok(ack) = self.http.submit_order_wire(
+                            wire,
+                            qty,
+                            mark_px,
+                            taker_fee_bps,
+                            &private_key,
+                            Some(&self.db),
+                            &cfg,
+                        ) {
+                            if ack.accepted && ack.status == "FILLED" {
+                                closed_on_exchange = true;
+                                report.legacy_positions_closed += 1;
+                                report.details.push(format!(
+                                    "Closed position {} ({} {:.4} @ ${:.4})",
+                                    asset.symbol,
+                                    side.as_str(),
+                                    qty,
+                                    ack.avg_fill_price
+                                ));
+                                break;
+                            }
                         }
                     }
                 }
 
                 if !closed_on_exchange {
-                    // Adopt the position cleanly into MariaDB `positions` so v2 1s Priority Monitor tracks it
                     let tick = asset.tick_size.max(1e-8);
                     let stop_px = if side.is_buy() {
                         snap_to_tick(entry_px * (1.0 - default_stop_pct), tick)
                     } else {
                         snap_to_tick(entry_px * (1.0 + default_stop_pct), tick)
                     };
-                    let coid = format!("cutover-adopt-{}-{}", coin.to_ascii_lowercase(), ts);
-                    let notional = round_dp(entry_px * qty, 4);
+                    let committed_usdc = if pos_val > 0.0 {
+                        round_dp(pos_val, 4)
+                    } else {
+                        round_dp(mark_px * qty, 4)
+                    };
                     let weight = round_dp(
-                        (notional / report.exchange_equity_usdc.max(1.0)) * side.sign(),
+                        (committed_usdc / report.exchange_equity_usdc.max(1.0)) * side.sign(),
                         4,
                     );
-                    let pid = self.db.create_working_order(&WorkingOrderInput {
-                        asset_id: asset.id,
-                        client_order_id: coid,
+                    let (_pid, _newly_adopted) = self.db.sync_open_position_from_exchange(
+                        asset.id,
+                        &coin,
                         side,
-                        limit_price: entry_px,
-                        requested_quantity: qty,
-                        reserved_margin_usdc: notional,
-                        portfolio_weight: weight,
-                        s1_weight_contrib: weight,
-                        s2_weight_contrib: 0.0,
-                        s3_weight_contrib: 0.0,
-                        protective_stop_px: stop_px,
-                        exchange_order_id: Some("hl-cutover-adopted".to_string()),
-                        reason: "CUTOVER_ADOPTED_EXCHANGE_POSITION".to_string(),
-                    })?;
-                    self.db.promote_working_to_open(
-                        pid,
                         entry_px,
+                        mark_px,
                         qty,
-                        0.0,
+                        committed_usdc,
+                        upnl,
+                        weight,
                         stop_px,
-                        Some("hl-cutover-adopted"),
-                        "CUTOVER_ADOPTED_EXCHANGE_POSITION",
                     )?;
                     let _ = self.db.set_asset_priority_watch(asset.id, true);
                     exchange_open_asset_ids.insert(asset.id);
                     report.legacy_positions_adopted += 1;
                     report.details.push(format!(
-                        "Adopted live exchange position {} ({} {:.4} @ ${:.4}) into MariaDB",
+                        "Synced 1:1 exchange position {} ({} {:.4} @ entry=${:.4}, mark=${:.4}, notional=${:.2}, uPnL=${:+.2})",
                         asset.symbol,
                         side.as_str(),
                         qty,
-                        entry_px
+                        entry_px,
+                        mark_px,
+                        committed_usdc,
+                        upnl
                     ));
                 }
             }
         }
 
-        // 4. Close any local `OPEN` rows in MariaDB that no longer exist on the exchange
+        // 4. Close any local `OPEN` rows in MariaDB that are flat on Hyperliquid
         if let Ok(local_held) = self.db.get_assets_held() {
             for h in local_held {
                 if !exchange_open_asset_ids.contains(&h.asset_id) {
@@ -387,11 +379,11 @@ impl CutoverReconciler {
                         h.position_id,
                         h.mark_price,
                         0.0,
-                        "CUTOVER_EXCHANGE_FLAT_RECONCILED",
+                        "EXCHANGE_RECONCILED_FLAT",
                     );
                     report.local_orphans_closed += 1;
                     report.details.push(format!(
-                        "Closed local orphan position #{} on {} (flat on exchange)",
+                        "Closed local position #{} on {} (flat on Hyperliquid)",
                         h.position_id, h.symbol
                     ));
                 }
@@ -402,13 +394,13 @@ impl CutoverReconciler {
             "INFO",
             "execution.reconcile",
             &format!(
-                "Cutover reconciliation complete: mode={}, equity=${:.2}, stale_orders_cancelled={}/{}, legacy_pos_closed={}, legacy_pos_adopted={}",
+                "Hyperliquid 1:1 reconciliation complete: mode={}, equity=${:.2}, orders_cancelled={}/{}, open_positions_synced={}, local_flat_closed={}",
                 report.execution_mode,
                 report.exchange_equity_usdc,
                 report.stale_orders_cancelled,
                 report.stale_orders_found,
-                report.legacy_positions_closed,
-                report.legacy_positions_adopted
+                report.legacy_positions_adopted,
+                report.local_orphans_closed
             ),
             Some(json!(report)),
         );

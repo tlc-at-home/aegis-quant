@@ -82,10 +82,10 @@ enum Commands {
         generate_key: bool,
     },
 
-    /// Run dynamic Hyperliquid Testnet/Mainnet cutover reconciliation, seed 150+ perp assets & initial S1/S2/S3 signals
+    /// Run dynamic Hyperliquid Testnet/Mainnet 1:1 exchange reconciliation, seed 150+ perp assets & initial S1/S2/S3 signals
     Cutover {
-        /// Close any open legacy/dust positions on Hyperliquid during cutover (default: true)
-        #[arg(long, default_value_t = true)]
+        /// Close any open legacy/dust positions on Hyperliquid during cutover instead of 1:1 adopting/syncing them
+        #[arg(long)]
         close_legacy: bool,
     },
 
@@ -467,7 +467,9 @@ mod tests {
         let cli_cutover = Cli::try_parse_from(["aegis-quant", "cutover"]).unwrap();
         assert!(matches!(
             cli_cutover.command,
-            Some(Commands::Cutover { close_legacy: true })
+            Some(Commands::Cutover {
+                close_legacy: false
+            })
         ));
 
         let cli_alert = Cli::try_parse_from(["aegis-quant", "alert", "--test"]).unwrap();
