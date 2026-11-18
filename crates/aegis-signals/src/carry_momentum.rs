@@ -3,6 +3,7 @@
 //! Computes per-asset `s1_mom_score`, `s1_carry_score`, `market_beta`, `annualized_vol`,
 //! and risk-adjusted inverse-volatility weight `w_s1_carry_mom` across core-eligible Hyperliquid perps.
 
+use crate::trend_breakout::compute_rsi_and_range_position;
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -134,8 +135,23 @@ pub fn compute_s1_momentum_score(
         let r_slow = (last_px / bars[slow_idx].close.max(1e-12)).ln();
 
         let composite_ret = 0.45 * r_fast + 0.35 * r_mid + 0.20 * r_slow;
-        let score = (composite_ret / (vol_norm * 0.18)).tanh();
-        return round_dp(score.clamp(-1.0, 1.0), 4);
+        let score = (composite_ret / (vol_norm * 0.18)).tanh().clamp(-1.0, 1.0);
+        let (rsi_14, range_pos, bouncing_from_low) = compute_rsi_and_range_position(bars, last_px);
+        if score < 0.0 && (rsi_14 < 36.0 || range_pos < 0.22 || bouncing_from_low) {
+            if bouncing_from_low && range_pos <= 0.20 && rsi_14 < 54.0 {
+                let bounce_strength = ((0.22 - range_pos).max(0.02) / 0.22).clamp(0.15, 1.0);
+                return round_dp((0.55 + 0.35 * bounce_strength).clamp(0.45, 0.90), 4);
+            }
+            return 0.0;
+        }
+        if score > 0.0
+            && rsi_14 > 76.0
+            && range_pos > 0.90
+            && bars.last().is_some_and(|b| last_px < b.open)
+        {
+            return round_dp(score * 0.25, 4);
+        }
+        return round_dp(score, 4);
     }
 
     if asset.prev_day_price > 0.0 && asset.mark_price > 0.0 {
@@ -177,9 +193,35 @@ pub fn evaluate_sleeve_s1(
         let s1_mom_score = compute_s1_momentum_score(bars, asset, annualized_vol);
         let s1_carry_score = compute_s1_carry_score(asset.funding_rate_hourly, s1_mom_score);
 
-        let composite_alpha = 0.65 * s1_mom_score + 0.35 * s1_carry_score;
+        let last_px = if asset.mark_price > 0.0 {
+            asset.mark_price
+        } else {
+            bars.last().map(|b| b.close).unwrap_or(0.0)
+        };
+        let at_range_bottom = if bars.len() >= 8 && last_px > 0.0 {
+            let (rsi_14, range_pos, bouncing_from_low) =
+                compute_rsi_and_range_position(bars, last_px);
+            rsi_14 < 36.0 || range_pos < 0.22 || bouncing_from_low
+        } else {
+            false
+        };
+
+        let eff_carry_score = if at_range_bottom {
+            s1_carry_score.max(0.0)
+        } else {
+            s1_carry_score
+        };
+        let mut composite_alpha = 0.65 * s1_mom_score + 0.35 * eff_carry_score;
+        if at_range_bottom && composite_alpha < 0.0 {
+            composite_alpha = 0.0;
+        }
+        let eff_vol = if at_range_bottom && composite_alpha > 0.0 {
+            annualized_vol.clamp(0.30, 0.65)
+        } else {
+            annualized_vol.max(0.25)
+        };
         let inv_vol_score = if asset.is_core_eligible && composite_alpha.abs() >= 0.05 {
-            composite_alpha / annualized_vol.max(0.25)
+            composite_alpha / eff_vol
         } else {
             0.0
         };
@@ -192,6 +234,7 @@ pub fn evaluate_sleeve_s1(
             s1_mom_score,
             s1_carry_score,
             inv_vol_score,
+            at_range_bottom,
         ));
     }
 
@@ -209,24 +252,41 @@ pub fn evaluate_sleeve_s1(
     let mut adjusted_scores: Vec<(i64, f64)> = Vec::with_capacity(raw_metrics.len());
     let mut abs_sum = 0.0;
     for m in &raw_metrics {
-        let adj = if m.6.abs() > 1e-6 {
+        let mut adj = if m.7 && m.6 > 0.0 {
+            m.6
+        } else if m.6.abs() > 1e-6 {
             0.65 * m.6 + 0.35 * (m.6 - mean_score)
         } else {
             0.0
         };
+        if m.7 && adj < 0.0 {
+            adj = 0.0;
+        }
         abs_sum += adj.abs();
         adjusted_scores.push((m.0, adj));
     }
 
-    let norm_denom = if abs_sum > 1e-8 { abs_sum } else { 1.0 };
+    let _ = abs_sum;
+    let mut abs_scores: Vec<f64> = adjusted_scores
+        .iter()
+        .map(|(_, adj)| adj.abs())
+        .filter(|&v| v > 1e-6)
+        .collect();
+    abs_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
+    let norm_denom = if top_abs_sum > 1e-8 {
+        top_abs_sum
+    } else {
+        1.0
+    };
     let score_lookup: HashMap<i64, f64> = adjusted_scores.into_iter().collect();
 
     let mut out = HashMap::with_capacity(raw_metrics.len());
-    for (asset_id, symbol, annualized_vol, market_beta, s1_mom_score, s1_carry_score, _) in
+    for (asset_id, symbol, annualized_vol, market_beta, s1_mom_score, s1_carry_score, _, _) in
         raw_metrics
     {
         let adj = score_lookup.get(&asset_id).copied().unwrap_or(0.0);
-        let w_s1 = if abs_sum > 1e-8 {
+        let w_s1 = if top_abs_sum > 1e-8 {
             round_dp((adj / norm_denom) * budget, 4)
         } else {
             0.0

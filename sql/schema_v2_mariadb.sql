@@ -139,6 +139,8 @@ CREATE TABLE IF NOT EXISTS positions (
     s3_weight_contrib         DOUBLE NOT NULL DEFAULT 0.0,
     protective_stop_px        DOUBLE NOT NULL DEFAULT 0.0,
     protective_stop_oid       VARCHAR(64),
+    take_profit_px            DOUBLE NOT NULL DEFAULT 0.0,
+    take_profit_oid           VARCHAR(64),
     highest_price_seen        DOUBLE NOT NULL DEFAULT 0.0,
     lowest_price_seen         DOUBLE NOT NULL DEFAULT 0.0,
     chase_count               INT UNSIGNED NOT NULL DEFAULT 0,
@@ -258,11 +260,19 @@ SELECT
     p.entry_price,
     a.mark_price,
     p.protective_stop_px,
+    p.protective_stop_oid,
     CASE
         WHEN p.protective_stop_px > 0 AND a.mark_price > 0
         THEN ROUND(ABS(a.mark_price - p.protective_stop_px) / a.mark_price * 100.0, 2)
         ELSE NULL
     END AS stop_distance_pct,
+    p.take_profit_px,
+    p.take_profit_oid,
+    CASE
+        WHEN p.take_profit_px > 0 AND a.mark_price > 0
+        THEN ROUND(ABS(p.take_profit_px - a.mark_price) / a.mark_price * 100.0, 2)
+        ELSE NULL
+    END AS tp_distance_pct,
     p.highest_price_seen,
     p.lowest_price_seen,
     p.unrealized_pnl_usdc,
@@ -304,6 +314,8 @@ SELECT
         ELSE 0.0
     END AS distance_from_mid_bps,
     p.chase_count,
+    p.protective_stop_px,
+    p.take_profit_px,
     p.s1_weight_contrib,
     p.s2_weight_contrib,
     p.s3_weight_contrib,
@@ -416,6 +428,9 @@ SELECT
     p.reserved_margin_usdc,
     p.committed_notional_usdc,
     p.protective_stop_px,
+    p.protective_stop_oid,
+    p.take_profit_px,
+    p.take_profit_oid,
     p.unrealized_pnl_usdc,
     COALESCE(s.target_weight, 0.0) AS target_weight,
     s.event_trigger,

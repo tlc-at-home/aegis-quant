@@ -307,6 +307,53 @@ pub fn build_limit_order_wire(
     }
 }
 
+/// Builds a Hyperliquid L1 reduce-only trigger `OrderWire` (`tpsl = "sl"` or `"tp"`).
+#[allow(clippy::too_many_arguments)]
+fn build_trigger_tpsl_order_wire(
+    asset_index: u32,
+    position_side: OrderSide,
+    quantity: f64,
+    trigger_price: f64,
+    tick_size: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    tpsl: &str,
+    client_order_id: Option<&str>,
+) -> OrderWire {
+    // Trigger order closes the open position: SELL (b=false) for LONG, BUY (b=true) for SHORT
+    let close_is_buy = !position_side.is_buy();
+    let trigger_px_str = format_hl_wire_price(trigger_price, tick_size, sz_decimals);
+    let limit_fallback = if close_is_buy {
+        trigger_price * (1.0 + HL_ORACLE_BAND_PCT)
+    } else {
+        (trigger_price * (1.0 - HL_ORACLE_BAND_PCT)).max(tick_size.max(1e-8))
+    };
+    let limit_px_str = format_hl_wire_price(limit_fallback, tick_size, sz_decimals);
+    let mut sz_str = format_hl_wire_size_floor(quantity, lot_step_size, sz_decimals);
+    if sz_str == "0" {
+        sz_str = format_hl_wire_size(quantity, lot_step_size, sz_decimals);
+    }
+    let c = client_order_id
+        .filter(|id| !id.trim().is_empty())
+        .map(derive_hl_cloid_hex);
+    OrderWire {
+        a: asset_index,
+        b: close_is_buy,
+        p: limit_px_str,
+        s: sz_str,
+        r: true,
+        t: OrderTypeWire {
+            limit: None,
+            trigger: Some(TriggerOrderTypeWire {
+                is_market: true,
+                trigger_px: trigger_px_str,
+                tpsl: tpsl.to_string(),
+            }),
+        },
+        c,
+    }
+}
+
 /// Builds a Hyperliquid L1 protective stop-loss trigger `OrderWire` (`reduce_only = true`, `tpsl = "sl"`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_protective_stop_order_wire(
@@ -319,35 +366,42 @@ pub fn build_protective_stop_order_wire(
     sz_decimals: u32,
     client_order_id: Option<&str>,
 ) -> OrderWire {
-    // Protective stop closes the open position: SELL (b=false) for LONG, BUY (b=true) for SHORT
-    let stop_is_buy = !position_side.is_buy();
-    let trigger_px_str = format_hl_wire_price(trigger_price, tick_size, sz_decimals);
-    let limit_fallback = if stop_is_buy {
-        trigger_price * (1.0 + HL_ORACLE_BAND_PCT)
-    } else {
-        trigger_price * (1.0 - HL_ORACLE_BAND_PCT)
-    };
-    let limit_px_str = format_hl_wire_price(limit_fallback, tick_size, sz_decimals);
-    let sz_str = format_hl_wire_size_floor(quantity, lot_step_size, sz_decimals);
-    let c = client_order_id
-        .filter(|id| !id.trim().is_empty())
-        .map(derive_hl_cloid_hex);
-    OrderWire {
-        a: asset_index,
-        b: stop_is_buy,
-        p: limit_px_str,
-        s: sz_str,
-        r: true,
-        t: OrderTypeWire {
-            limit: None,
-            trigger: Some(TriggerOrderTypeWire {
-                is_market: true,
-                trigger_px: trigger_px_str,
-                tpsl: "sl".to_string(),
-            }),
-        },
-        c,
-    }
+    build_trigger_tpsl_order_wire(
+        asset_index,
+        position_side,
+        quantity,
+        trigger_price,
+        tick_size,
+        lot_step_size,
+        sz_decimals,
+        "sl",
+        client_order_id,
+    )
+}
+
+/// Builds a Hyperliquid L1 take-profit trigger `OrderWire` (`reduce_only = true`, `tpsl = "tp"`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_take_profit_order_wire(
+    asset_index: u32,
+    position_side: OrderSide,
+    quantity: f64,
+    trigger_price: f64,
+    tick_size: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    client_order_id: Option<&str>,
+) -> OrderWire {
+    build_trigger_tpsl_order_wire(
+        asset_index,
+        position_side,
+        quantity,
+        trigger_price,
+        tick_size,
+        lot_step_size,
+        sz_decimals,
+        "tp",
+        client_order_id,
+    )
 }
 
 /// Computes the exact Hyperliquid MessagePack + Keccak256 `action_hash` / phantom agent connection ID.
@@ -512,10 +566,27 @@ mod tests {
         assert!(stop.r);
         assert_eq!(stop.s, "14.52");
         assert_eq!(stop.t.trigger.as_ref().unwrap().trigger_px, "176.82");
+        assert_eq!(stop.t.trigger.as_ref().unwrap().tpsl, "sl");
+
+        let tp = build_take_profit_order_wire(
+            3,
+            OrderSide::Long,
+            14.528,
+            199.15,
+            0.01,
+            0.01,
+            2,
+            Some("tp-sol-1"),
+        );
+        assert!(!tp.b);
+        assert!(tp.r);
+        assert_eq!(tp.s, "14.52");
+        assert_eq!(tp.t.trigger.as_ref().unwrap().trigger_px, "199.15");
+        assert_eq!(tp.t.trigger.as_ref().unwrap().tpsl, "tp");
 
         let action = OrderAction {
             action_type: "order".to_string(),
-            orders: vec![order, stop],
+            orders: vec![order, stop, tp],
             grouping: "na".to_string(),
         };
         let n1 = next_monotonic_nonce(None);

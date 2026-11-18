@@ -7,8 +7,8 @@
 //!   inserting a post-stop cooldown (`asset_cooldowns`) + rich HTML Telegram alert on stop breach.
 
 use crate::http_client::HyperliquidHttpClient;
-use crate::order_chaser::{ChaseStepOutcome, OrderChaser};
-use crate::signing::{build_limit_order_wire, snap_to_tick, HL_ORACLE_BAND_PCT};
+use crate::order_chaser::{parse_hl_oid, ChaseStepOutcome, OrderChaser};
+use crate::signing::{build_limit_order_wire, snap_to_tick, CancelWire, HL_ORACLE_BAND_PCT};
 use aegis_alerts::{AlertEngine, PositionClosedAlert};
 use aegis_core::{now_ms, round_dp, HeldAssetView, OrderSide, Result};
 use aegis_db::DatabaseManager;
@@ -123,12 +123,13 @@ impl PriorityMonitor {
             });
 
             let side = OrderSide::parse(&h.side);
-            let eval = risk.evaluate_1s_stop_ratchet(
+            let eval = risk.evaluate_1s_stop_and_tp_ratchet(
                 side,
                 h.entry_price,
                 live_mark,
                 h.quantity,
                 h.protective_stop_px,
+                h.take_profit_px,
                 h.highest_price_seen,
                 h.lowest_price_seen,
                 atr_opt,
@@ -155,17 +156,54 @@ impl PriorityMonitor {
                 if eval.stop_ratcheted {
                     report.stops_ratcheted += 1;
                 }
+                let missing_sl = h
+                    .protective_stop_oid
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty();
+                let missing_tp = h
+                    .take_profit_oid
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                    || h.take_profit_px <= 0.0;
+                let sl_ratcheted_materially = eval.stop_ratcheted
+                    && h.protective_stop_px > 0.0
+                    && ((eval.new_protective_stop_px - h.protective_stop_px).abs()
+                        / h.protective_stop_px)
+                        >= 0.0025;
+                if missing_sl || missing_tp || sl_ratcheted_materially {
+                    if let Some(ref asset) = asset_opt {
+                        let _ = self.chaser.ensure_exchange_tpsl_orders(
+                            h.position_id,
+                            asset,
+                            side,
+                            h.quantity,
+                            live_mark,
+                            eval.new_protective_stop_px,
+                            eval.take_profit_px,
+                            h.protective_stop_oid.as_deref(),
+                            h.take_profit_oid.as_deref(),
+                            sl_ratcheted_materially,
+                            false,
+                            None,
+                            &cfg,
+                        );
+                    }
+                }
             }
         }
 
         Ok(report)
     }
 
-    /// Executes an immediate stop-out exit for an `OPEN` holding, inserts a post-stop cooldown
+    /// Executes an immediate stop-out or take-profit exit for an `OPEN` holding, inserts a post-exit cooldown
     /// into `asset_cooldowns`, logs telemetry, and dispatches a rich HTML Telegram alert.
     /// In `TESTNET`/`LIVE` mode, only closes in MariaDB and fires an alert if Hyperliquid confirms a fill;
-    /// if the Testnet orderbook cannot fill the close order, re-anchors `protective_stop_px` beyond `exit_price`
-    /// so it never enters a 1s alert/close loop.
+    /// if the Testnet orderbook cannot fill the close order, re-anchors `protective_stop_px` / `take_profit_px`
+    /// beyond `exit_price` so it never enters a 1s alert/close loop.
     pub fn execute_protective_stop_exit(
         &self,
         held: &HeldAssetView,
@@ -175,6 +213,7 @@ impl PriorityMonitor {
     ) -> Result<Option<f64>> {
         let cfg = self.db.load_config_or_default();
         let side = OrderSide::parse(&held.side);
+        let is_tp_exit = exit_reason.starts_with("TAKE_PROFIT");
         let taker_fee_bps = risk.limits.taker_fee_bps;
         let default_stop_pct = risk.limits.protective_stop_default_pct.clamp(0.01, 0.25);
         let mut fees_paid_usdc =
@@ -196,57 +235,157 @@ impl PriorityMonitor {
                 .max(1e-8);
             let mut filled_on_hl = false;
 
-            if let Some(asset) = asset_opt {
+            if let Some(ref asset) = asset_opt {
                 let exit_is_buy = !side.is_buy();
-                let limit_px = if exit_is_buy {
-                    exit_price * (1.0 + HL_ORACLE_BAND_PCT)
-                } else {
-                    exit_price * (1.0 - HL_ORACLE_BAND_PCT)
-                };
-                let wire = build_limit_order_wire(
-                    asset.asset_index,
-                    exit_is_buy,
-                    limit_px,
-                    held.quantity,
-                    asset.tick_size,
-                    asset.lot_step_size,
-                    asset.sz_decimals,
-                    true,
-                    "Ioc",
-                    Some(&format!("v2-stopexit-{}-{}", held.position_id, now_ms())),
-                );
-                if let Ok(ack) = self.http.submit_order_wire(
-                    wire,
-                    held.quantity,
-                    exit_price,
-                    taker_fee_bps,
-                    &pk,
-                    Some(&self.db),
-                    &cfg,
-                ) {
-                    if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                let l2_bbo = self.http.fetch_l2_book(&asset.coin, &cfg).ok().flatten();
+                let bbo_anchor = l2_bbo
+                    .map(|(bid, ask)| if exit_is_buy { ask } else { bid })
+                    .filter(|&px| px > 0.0)
+                    .unwrap_or(exit_price);
+
+                let mut rem_qty = held.quantity.abs();
+                let mut total_hl_fee = 0.0;
+                for (attempt, (ref_anchor, slip)) in [
+                    (bbo_anchor, 0.0),
+                    (bbo_anchor, 0.01),
+                    (bbo_anchor, 0.025),
+                    (exit_price, HL_ORACLE_BAND_PCT),
+                    (bbo_anchor, 0.05),
+                    (exit_price, 0.075),
+                    (bbo_anchor, 0.075),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
                         filled_on_hl = true;
-                        if ack.avg_fill_price > 0.0 {
-                            eff_exit_price = ack.avg_fill_price;
+                        break;
+                    }
+                    let limit_px = if exit_is_buy {
+                        ref_anchor * (1.0 + slip)
+                    } else {
+                        (ref_anchor * (1.0 - slip)).max(tick)
+                    };
+                    let wire = build_limit_order_wire(
+                        asset.asset_index,
+                        exit_is_buy,
+                        limit_px,
+                        rem_qty,
+                        asset.tick_size,
+                        asset.lot_step_size,
+                        asset.sz_decimals,
+                        true,
+                        "Ioc",
+                        Some(&format!(
+                            "v2-{}-{}-{attempt}-{}",
+                            if is_tp_exit { "tpexit" } else { "stopexit" },
+                            held.position_id,
+                            now_ms()
+                        )),
+                    );
+                    if let Ok(ack) = self.http.submit_order_wire(
+                        wire,
+                        rem_qty,
+                        ref_anchor,
+                        taker_fee_bps,
+                        &pk,
+                        Some(&self.db),
+                        &cfg,
+                    ) {
+                        if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                            if ack.avg_fill_price > 0.0 {
+                                eff_exit_price = ack.avg_fill_price;
+                            }
+                            total_hl_fee += ack.fee_usdc;
+                            live_close_oid = ack.exchange_order_id;
+                            rem_qty = (rem_qty - ack.filled_quantity).max(0.0);
+                            if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
+                                filled_on_hl = true;
+                                break;
+                            }
                         }
-                        fees_paid_usdc = ack.fee_usdc;
-                        live_close_oid = ack.exchange_order_id;
+                    }
+                }
+                if total_hl_fee > 0.0 {
+                    fees_paid_usdc = round_dp(total_hl_fee, 4);
+                }
+
+                if filled_on_hl {
+                    let mut cancels = Vec::new();
+                    if let Some(oid) = parse_hl_oid(held.protective_stop_oid.as_deref()) {
+                        cancels.push(CancelWire {
+                            a: asset.asset_index,
+                            o: oid,
+                        });
+                    }
+                    if let Some(oid) = parse_hl_oid(held.take_profit_oid.as_deref()) {
+                        cancels.push(CancelWire {
+                            a: asset.asset_index,
+                            o: oid,
+                        });
+                    }
+                    if !cancels.is_empty() {
+                        let _ = self
+                            .http
+                            .cancel_orders_batch(cancels, &pk, Some(&self.db), &cfg);
                     }
                 }
             }
 
             if !filled_on_hl {
-                // Re-anchor protective_stop_px beyond current mark/exit price so it does not spam 1s stop attempts on an illiquid Testnet book
-                let widened_stop = if side.is_buy() {
-                    snap_to_tick(exit_price * (1.0 - default_stop_pct), tick)
+                if is_tp_exit {
+                    let reanchored_tp = if side.is_buy() {
+                        snap_to_tick(exit_price * 1.01, tick)
+                    } else {
+                        snap_to_tick((exit_price * 0.99).max(tick), tick)
+                    };
+                    if let Some(ref asset) = asset_opt {
+                        let _ = self.chaser.ensure_exchange_tpsl_orders(
+                            held.position_id,
+                            asset,
+                            side,
+                            held.quantity,
+                            exit_price,
+                            held.protective_stop_px,
+                            reanchored_tp,
+                            held.protective_stop_oid.as_deref(),
+                            held.take_profit_oid.as_deref(),
+                            false,
+                            true,
+                            None,
+                            &cfg,
+                        );
+                    }
                 } else {
-                    snap_to_tick(exit_price * (1.0 + default_stop_pct), tick)
-                };
-                self.db.update_open_position_mark_and_stop(
-                    held.position_id,
-                    exit_price,
-                    widened_stop,
-                )?;
+                    // Re-anchor protective_stop_px beyond current mark/exit price so it does not spam 1s stop attempts on an illiquid Testnet book
+                    let widened_stop = if side.is_buy() {
+                        snap_to_tick((exit_price * (1.0 - default_stop_pct)).max(tick), tick)
+                    } else {
+                        snap_to_tick(exit_price * (1.0 + default_stop_pct), tick)
+                    };
+                    self.db.update_open_position_mark_and_stop(
+                        held.position_id,
+                        exit_price,
+                        widened_stop,
+                    )?;
+                    if let Some(ref asset) = asset_opt {
+                        let _ = self.chaser.ensure_exchange_tpsl_orders(
+                            held.position_id,
+                            asset,
+                            side,
+                            held.quantity,
+                            exit_price,
+                            widened_stop,
+                            held.take_profit_px,
+                            held.protective_stop_oid.as_deref(),
+                            held.take_profit_oid.as_deref(),
+                            true,
+                            false,
+                            None,
+                            &cfg,
+                        );
+                    }
+                }
                 return Ok(None);
             }
         }
@@ -266,13 +405,27 @@ impl PriorityMonitor {
                 .set_position_closed_exchange_ids(held.position_id, &coid, eoid);
         }
 
-        let cooldown_sec = risk.limits.stop_out_cooldown_sec.max(60);
-        let cd_reason = format!(
-            "Protective stop triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
-            held.symbol, eff_exit_price, held.entry_price, realized_pnl
-        );
+        let (cooldown_type, cooldown_sec, cd_reason) = if is_tp_exit {
+            (
+                "CHURN_GUARD",
+                300,
+                format!(
+                    "Take-profit target triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
+                    held.symbol, eff_exit_price, held.entry_price, realized_pnl
+                ),
+            )
+        } else {
+            (
+                "STOP_OUT",
+                risk.limits.stop_out_cooldown_sec.max(60),
+                format!(
+                    "Protective stop triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
+                    held.symbol, eff_exit_price, held.entry_price, realized_pnl
+                ),
+            )
+        };
         self.db
-            .insert_asset_cooldown(held.asset_id, "STOP_OUT", &cd_reason, cooldown_sec)?;
+            .insert_asset_cooldown(held.asset_id, cooldown_type, &cd_reason, cooldown_sec)?;
 
         let _ = self.db.log_telemetry(
             "WARN",
@@ -305,7 +458,7 @@ impl PriorityMonitor {
             filled_qty: held.quantity,
             realized_pnl_usdc: realized_pnl,
             available_cash_usdc: avail_cash,
-            cooldown_type: Some("STOP_OUT".to_string()),
+            cooldown_type: Some(cooldown_type.to_string()),
             cooldown_seconds: cooldown_sec,
             timestamp_ms: now_ms(),
         };

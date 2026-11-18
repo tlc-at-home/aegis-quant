@@ -21,6 +21,8 @@ pub struct RiskLimitsConfig {
     pub min_order_notional_usdc: f64,
     pub protective_stop_atr_mult: f64,
     pub protective_stop_default_pct: f64,
+    pub take_profit_atr_mult: f64,
+    pub take_profit_default_pct: f64,
     pub stop_out_cooldown_sec: i64,
     pub maker_fee_bps: f64,
     pub taker_fee_bps: f64,
@@ -37,6 +39,8 @@ impl Default for RiskLimitsConfig {
             min_order_notional_usdc: 12.0,
             protective_stop_atr_mult: 2.2,
             protective_stop_default_pct: 0.04,
+            take_profit_atr_mult: 4.4,
+            take_profit_default_pct: 0.08,
             stop_out_cooldown_sec: 1800,
             maker_fee_bps: 1.5,
             taker_fee_bps: 4.5,
@@ -65,6 +69,12 @@ impl RiskLimitsConfig {
             protective_stop_default_pct: cfg
                 .get_f64("protective_stop_default_pct", 0.04)
                 .clamp(0.005, 0.35),
+            take_profit_atr_mult: cfg
+                .get_f64("take_profit_atr_mult", 4.4)
+                .clamp(1.0, 20.0),
+            take_profit_default_pct: cfg
+                .get_f64("take_profit_default_pct", 0.08)
+                .clamp(0.01, 0.80),
             stop_out_cooldown_sec: cfg.get_i64("stop_out_cooldown_sec", 1800).max(60),
             maker_fee_bps: cfg.get_f64("maker_fee_bps", 1.5).max(0.0),
             taker_fee_bps: cfg.get_f64("taker_fee_bps", 4.5).max(0.0),

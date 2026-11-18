@@ -325,6 +325,44 @@ pub fn parse_exchange_order_ack(
         };
     }
 
+    if first.as_str() == Some("waitingForTrigger") || first.as_str() == Some("waitingForFill") {
+        return ExchangeOrderAck {
+            accepted: true,
+            status: "WAITING_FOR_TRIGGER".to_string(),
+            exchange_order_id: None,
+            filled_quantity: 0.0,
+            avg_fill_price: ref_price,
+            fee_usdc: 0.0,
+            raw_error: None,
+        };
+    }
+
+    if let Some(waiting) = first
+        .get("waitingForTrigger")
+        .or_else(|| first.get("waitingForFill"))
+    {
+        let oid = waiting
+            .get("oid")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                waiting
+                    .get("oid")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        let eoid = (oid > 0).then(|| format!("hl-{oid}"));
+        return ExchangeOrderAck {
+            accepted: true,
+            status: "WAITING_FOR_TRIGGER".to_string(),
+            exchange_order_id: eoid,
+            filled_quantity: 0.0,
+            avg_fill_price: ref_price,
+            fee_usdc: 0.0,
+            raw_error: None,
+        };
+    }
+
     if let Some(resting) = first.get("resting") {
         let oid = resting
             .get("oid")
@@ -550,6 +588,22 @@ impl HyperliquidHttpClient {
         Ok(raw.as_array().cloned().unwrap_or_default())
     }
 
+    /// Polls `frontendOpenOrders` for `user_wallet` (includes trigger/SL/TP metadata and `oid`/`cloid`).
+    pub fn fetch_frontend_open_orders(
+        &self,
+        user_wallet: &str,
+        cfg: &ConfigMap,
+    ) -> Result<Vec<Value>> {
+        let raw = self.post_info(
+            &json!({
+                "type": "frontendOpenOrders",
+                "user": user_wallet.trim(),
+            }),
+            cfg,
+        )?;
+        Ok(raw.as_array().cloned().unwrap_or_default())
+    }
+
     /// Polls `userFills` for `user_wallet` returning historical trade fills from Hyperliquid L1.
     pub fn fetch_user_fills(&self, user_wallet: &str, cfg: &ConfigMap) -> Result<Vec<Value>> {
         let raw = self.post_info(
@@ -616,6 +670,7 @@ impl HyperliquidHttpClient {
     }
 
     /// Submits a single [`OrderWire`] to `/exchange` and parses its [`ExchangeOrderAck`].
+    /// Trigger orders (`t.trigger.is_some()`) first try `grouping = "positionTpsl"` and fall back once to `"na"`.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_order_wire(
         &self,
@@ -627,18 +682,33 @@ impl HyperliquidHttpClient {
         db: Option<&DatabaseManager>,
         cfg: &ConfigMap,
     ) -> Result<ExchangeOrderAck> {
+        let is_trigger = order.t.trigger.is_some();
+        let primary_grouping = if is_trigger { "positionTpsl" } else { "na" };
         let action = OrderAction {
             action_type: "order".to_string(),
-            orders: vec![order],
-            grouping: "na".to_string(),
+            orders: vec![order.clone()],
+            grouping: primary_grouping.to_string(),
         };
         let resp = self.post_exchange_action(&action, private_key, db, cfg)?;
-        Ok(parse_exchange_order_ack(
-            &resp,
-            requested_qty,
-            ref_price,
-            fee_bps,
-        ))
+        let ack = parse_exchange_order_ack(&resp, requested_qty, ref_price, fee_bps);
+        if is_trigger && !ack.accepted {
+            let fallback_action = OrderAction {
+                action_type: "order".to_string(),
+                orders: vec![order],
+                grouping: "na".to_string(),
+            };
+            if let Ok(fb_resp) =
+                self.post_exchange_action(&fallback_action, private_key, db, cfg)
+            {
+                return Ok(parse_exchange_order_ack(
+                    &fb_resp,
+                    requested_qty,
+                    ref_price,
+                    fee_bps,
+                ));
+            }
+        }
+        Ok(ack)
     }
 
     /// Cancels a resting order on Hyperliquid by `(asset_index, oid)`.

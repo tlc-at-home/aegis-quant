@@ -705,12 +705,16 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
   // 1. Render active WORKING orders first
   ordered.forEach((o) => {
     const sideCls = String(o.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
+    const hasTpsl = Number(o.protective_stop_px || 0) > 0 || Number(o.take_profit_px || 0) > 0;
+    const tpslHint = hasTpsl
+      ? `<br><small style="color:var(--text-muted)">SL ${fmtPrice(o.protective_stop_px)} · TP ${fmtPrice(o.take_profit_px)}</small>`
+      : '';
     rowsHtml.push(`
       <tr>
         <td><span class="sym-badge">${escapeHtml(o.symbol)}</span></td>
         <td><span class="status-pill working">${escapeHtml(o.fsm_state || 'WORKING_ALO')}</span></td>
         <td><span class="side-pill ${sideCls}">${escapeHtml(o.side)}</span></td>
-        <td>${fmtPrice(o.limit_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(o.mark_price)}</small></td>
+        <td>${fmtPrice(o.limit_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(o.mark_price)}</small>${tpslHint}</td>
         <td style="color: var(--neon-cyan); font-weight: 700;">${Number(o.distance_from_mid_bps || 0).toFixed(2)} bps</td>
         <td style="color: #fbbf24; font-weight: 700;">${fmtUsd(o.reserved_margin_usdc)}</td>
         <td><span class="tab-count">${Number(o.chase_count || 0)}</span></td>
@@ -782,7 +786,7 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
   if (held.length === 0) {
     tbody.innerHTML = `
       <tr>
-        <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+        <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 18px;">
           No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
         </td>
       </tr>
@@ -799,13 +803,26 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
         h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
           ? `${Number(h.stop_distance_pct).toFixed(2)}%`
           : '—';
+      const tpDist =
+        h.tp_distance_pct !== null && h.tp_distance_pct !== undefined
+          ? `${Number(h.tp_distance_pct).toFixed(2)}%`
+          : '—';
+      const slOid = h.protective_stop_oid ? String(h.protective_stop_oid).trim() : '';
+      const tpOid = h.take_profit_oid ? String(h.take_profit_oid).trim() : '';
+      const slBadge = slOid
+        ? `<span class="sp-tag s1" title="Exchange SL Order: ${escapeHtml(slOid)}">SL</span>`
+        : `<span class="sp-tag s3" title="SL Order Pending">SL?</span>`;
+      const tpBadge = tpOid
+        ? `<span class="sp-tag s2" title="Exchange TP Order: ${escapeHtml(tpOid)}">TP</span>`
+        : `<span class="sp-tag s3" title="TP Order Pending">TP?</span>`;
       return `
         <tr>
           <td><span class="sym-badge">${escapeHtml(h.symbol)}</span></td>
           <td><span class="side-pill ${sideCls}">${escapeHtml(h.side)}</span></td>
           <td style="font-weight: 700; color: #fff;">${fmtUsd(h.committed_notional_usdc)} <small style="color:var(--text-muted)">(${fmtPct(h.portfolio_weight || 0)})</small></td>
           <td>${fmtPrice(h.entry_price)} <small style="color:var(--neon-cyan)">→ ${fmtPrice(h.mark_price)}</small></td>
-          <td>${fmtPrice(h.protective_stop_px)} <small style="color:#fbbf24">(${stopDist})</small></td>
+          <td>${fmtPrice(h.protective_stop_px)} <small style="color:#fbbf24">(${stopDist})</small> ${slBadge}</td>
+          <td>${Number(h.take_profit_px || 0) > 0 ? fmtPrice(h.take_profit_px) : '—'} <small style="color:#34d399">(${tpDist})</small> ${tpBadge}</td>
           <td class="${pnlCls}">${fmtSignedUsd(upnl)}</td>
           <td>
             <div class="sleeve-mix-pills">
@@ -935,6 +952,7 @@ function renderSystemConfigTables(force = false) {
     .toUpperCase();
 
   const PRIORITY_CONFIG_KEYS = [
+    'live_exchange_equity_usdc',
     'risk_tier',
     'target_leverage_multiplier',
     'max_open_positions',

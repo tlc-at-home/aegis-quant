@@ -322,10 +322,14 @@ impl MarketWatcher {
         let now = now_ms();
         let refresh_ttl_ms = 60_000i64; // 60s bar refresh cadence per asset
 
-        let candidates: Vec<ExchangeAsset> = assets
+        let mut candidates: Vec<ExchangeAsset> = assets
             .into_iter()
             .filter(|a| a.is_core_eligible || a.is_priority_watched || a.is_event_eligible)
             .collect();
+        {
+            let guard = self.last_bar_sync_ms.lock();
+            candidates.sort_by_key(|a| guard.get(&(a.id, "1h".to_string())).copied().unwrap_or(0));
+        }
 
         let mut refreshed_assets = 0usize;
         for asset in candidates {
@@ -364,7 +368,7 @@ impl MarketWatcher {
         Ok(refreshed_assets)
     }
 
-    fn fetch_or_synthesize_bars(
+    pub fn fetch_or_synthesize_bars(
         &self,
         asset: &ExchangeAsset,
         timeframe: &str,

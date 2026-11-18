@@ -250,6 +250,10 @@ pub struct PositionRecord {
     pub s3_weight_contrib: f64,
     pub protective_stop_px: f64,
     pub protective_stop_oid: Option<String>,
+    #[serde(default)]
+    pub take_profit_px: f64,
+    #[serde(default)]
+    pub take_profit_oid: Option<String>,
     pub highest_price_seen: f64,
     pub lowest_price_seen: f64,
     pub chase_count: u32,
@@ -362,7 +366,15 @@ pub struct HeldAssetView {
     pub entry_price: f64,
     pub mark_price: f64,
     pub protective_stop_px: f64,
+    #[serde(default)]
+    pub protective_stop_oid: Option<String>,
     pub stop_distance_pct: Option<f64>,
+    #[serde(default)]
+    pub take_profit_px: f64,
+    #[serde(default)]
+    pub take_profit_oid: Option<String>,
+    #[serde(default)]
+    pub tp_distance_pct: Option<f64>,
     pub highest_price_seen: f64,
     pub lowest_price_seen: f64,
     pub unrealized_pnl_usdc: f64,
@@ -396,6 +408,10 @@ pub struct OrderedAssetView {
     pub mid_price: f64,
     pub mark_price: f64,
     pub distance_from_mid_bps: f64,
+    #[serde(default)]
+    pub protective_stop_px: f64,
+    #[serde(default)]
+    pub take_profit_px: f64,
     pub chase_count: u32,
     pub s1_weight_contrib: f64,
     pub s2_weight_contrib: f64,
@@ -495,6 +511,12 @@ pub struct PriorityWatchView {
     pub reserved_margin_usdc: Option<f64>,
     pub committed_notional_usdc: Option<f64>,
     pub protective_stop_px: Option<f64>,
+    #[serde(default)]
+    pub protective_stop_oid: Option<String>,
+    #[serde(default)]
+    pub take_profit_px: Option<f64>,
+    #[serde(default)]
+    pub take_profit_oid: Option<String>,
     pub unrealized_pnl_usdc: Option<f64>,
     pub target_weight: f64,
     pub event_trigger: Option<String>,

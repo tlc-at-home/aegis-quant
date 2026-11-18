@@ -21,17 +21,19 @@ use aegis_alerts::{
     format_position_closed_html, AlertEngine, CutoverReconcileAlert, PositionClosedAlert,
 };
 use aegis_core::{
-    normalize_hyperliquid_symbol, now_ms, round_dp, AegisError, ExchangeAsset, OhlcvBar, OrderSide,
-    PortfolioSnapshot, PositionStatus, Result,
+    normalize_hyperliquid_symbol, now_ms, round_dp, AegisError, ConfigMap, ExchangeAsset,
+    HeldAssetView, OhlcvBar, OrderSide, PortfolioSnapshot, PositionStatus, Result,
 };
 use aegis_db::{DatabaseManager, SignalUpsertInput, SnapshotInsertInput};
 use aegis_risk::{compute_atr_from_bars, RiskEngine};
 use aegis_signals::{
     SignalCycleOutput, SignalEngine, ACTION_CLOSE, ACTION_FLIP, ACTION_OPEN_LONG, ACTION_OPEN_SHORT,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Report returned by [`ExecutionEngine::run_cutover_reconciliation`].
@@ -89,6 +91,7 @@ pub struct ExecutionEngine {
     pub priority_monitor: PriorityMonitor,
     pub reconciler: CutoverReconciler,
     pub alerts: AlertEngine,
+    pub illiquid_close_backoff_ms: Arc<Mutex<HashMap<i64, i64>>>,
 }
 
 impl ExecutionEngine {
@@ -113,6 +116,58 @@ impl ExecutionEngine {
             priority_monitor,
             reconciler,
             alerts,
+            illiquid_close_backoff_ms: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn is_illiquid_close_backed_off(&self, position_id: i64, now: i64) -> bool {
+        self.illiquid_close_backoff_ms
+            .lock()
+            .get(&position_id)
+            .is_some_and(|&ts| now.saturating_sub(ts) < 180_000)
+    }
+
+    fn cancel_coin_exchange_orders(
+        &self,
+        asset: &ExchangeAsset,
+        wallet: &str,
+        pk: &str,
+        cfg: &ConfigMap,
+        include_triggers: bool,
+    ) {
+        if wallet.is_empty() {
+            return;
+        }
+        if let Ok(open_orders) = self
+            .http
+            .fetch_frontend_open_orders(wallet, cfg)
+            .or_else(|_| self.http.fetch_open_orders(wallet, cfg))
+        {
+            let mut cancels = Vec::new();
+            for ord in open_orders {
+                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                let is_trig = ord
+                    .get("isTrigger")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if c.eq_ignore_ascii_case(&asset.coin) && (include_triggers || !is_trig) {
+                    if let Some(oid) = ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
+                        ord.get("oid")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    }) {
+                        cancels.push(CancelWire {
+                            a: asset.asset_index,
+                            o: oid,
+                        });
+                    }
+                }
+            }
+            if !cancels.is_empty() {
+                let _ = self
+                    .http
+                    .cancel_orders_batch(cancels, pk, Some(&self.db), cfg);
+            }
         }
     }
 
@@ -214,17 +269,18 @@ impl ExecutionEngine {
                     .unwrap_or_default();
             }
             if bars.len() < 16 && asset.mark_price > 0.0 {
-                let synth_inputs = MarketWatcher::generate_anchored_bars(
-                    asset.id,
-                    &asset.symbol,
+                let use_live_candles =
+                    cfg.execution_mode().is_live_or_testnet() && !self.db.is_ephemeral_test_db();
+                let bar_inputs = self.watcher.fetch_or_synthesize_bars(
+                    asset,
                     "4h",
-                    48,
-                    asset.mark_price,
-                    asset.prev_day_price,
-                    asset.funding_rate_hourly,
-                    asset.day_volume_usdc,
+                    72,
+                    use_live_candles,
+                    &cfg,
                 );
-                let _ = self.db.upsert_ohlcv_bars(&synth_inputs);
+                if !bar_inputs.is_empty() {
+                    let _ = self.db.upsert_ohlcv_bars(&bar_inputs);
+                }
                 bars = self
                     .db
                     .get_ohlcv_bars(asset.id, "4h", 96)
@@ -331,7 +387,14 @@ impl ExecutionEngine {
         }
 
         // 2. Close excess OPEN holdings if open count > max_open_positions or committed_notional > max_gross_notional * 1.03
+        let check_ts = now_ms();
         let mut open_count = held.len();
+        for h in &held {
+            if self.is_illiquid_close_backed_off(h.position_id, check_ts) {
+                current_committed = (current_committed - h.committed_notional_usdc).max(0.0);
+                open_count = open_count.saturating_sub(1);
+            }
+        }
         if open_count > max_open_positions || current_committed > max_gross_notional * 1.03 {
             held.sort_by(|a, b| {
                 let a_align = a.latest_target_weight * OrderSide::parse(&a.side).sign();
@@ -347,13 +410,22 @@ impl ExecutionEngine {
             });
 
             for h in &held {
+                if self.is_illiquid_close_backed_off(h.position_id, check_ts) {
+                    continue;
+                }
                 if open_count <= max_open_positions && current_committed <= max_gross_notional {
                     break;
                 }
+                let deleverage_cd =
+                    if h.latest_target_weight * OrderSide::parse(&h.side).sign() < 0.0 {
+                        0
+                    } else {
+                        900
+                    };
                 if let Ok(rep) = self.close_or_cancel_position(
                     h.position_id,
                     "AUTO_DELEVERAGE_RISK_CAP",
-                    Some(900),
+                    Some(deleverage_cd),
                 ) {
                     if rep.final_status == "CLOSED" {
                         current_committed =
@@ -401,11 +473,15 @@ impl ExecutionEngine {
 
         let held = self.db.get_assets_held()?;
 
+        let rebalance_now = now_ms();
+
         // 1. Handle CLOSE or FLIP on currently OPEN holdings
         for sig in &signal_out.signals {
             if sig.rebalance_action == ACTION_CLOSE || sig.rebalance_action == ACTION_FLIP {
                 if let Some(h) = held.iter().find(|x| x.asset_id == sig.asset_id) {
-                    if report.closed_position_ids.contains(&h.position_id) {
+                    if report.closed_position_ids.contains(&h.position_id)
+                        || self.is_illiquid_close_backed_off(h.position_id, rebalance_now)
+                    {
                         continue;
                     }
                     let close_cd = if sig.rebalance_action == ACTION_FLIP {
@@ -426,16 +502,24 @@ impl ExecutionEngine {
 
         // 2. Re-evaluate active holdings/orders and enforce max_open_positions (6) & min_entry_interval_sec (150s)
         let held_now = self.db.get_assets_held()?;
+        let tradable_held: Vec<HeldAssetView> = held_now
+            .into_iter()
+            .filter(|h| !self.is_illiquid_close_backed_off(h.position_id, rebalance_now))
+            .collect();
         let ordered_now = self.db.get_assets_ordered()?;
         let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
         let min_entry_interval_sec = cfg.get_i64("min_entry_interval_sec", 150).max(0);
-        let total_active = held_now.len() + ordered_now.len();
+        let total_active = tradable_held.len() + ordered_now.len();
 
         if total_active >= max_open_positions {
             return Ok(report);
         }
 
-        if min_entry_interval_sec > 0 {
+        let has_flip_candidate = signal_out
+            .signals
+            .iter()
+            .any(|s| s.rebalance_action == ACTION_FLIP);
+        if min_entry_interval_sec > 0 && !has_flip_candidate {
             if let Ok(Some(last_entry_ms)) = self.db.last_position_entry_timestamp_ms() {
                 if now_ms().saturating_sub(last_entry_ms) < min_entry_interval_sec * 1000 {
                     return Ok(report);
@@ -444,7 +528,7 @@ impl ExecutionEngine {
         }
 
         let risk = RiskEngine::from_config_map(&cfg);
-        let ledger = risk.evaluate_ledger_from_views(eff_equity, &held_now, &ordered_now);
+        let ledger = risk.evaluate_ledger_from_views(eff_equity, &tradable_held, &ordered_now);
         let target_mult = cfg.target_leverage_multiplier();
         let max_allowed_gross_notional = eff_equity * target_mult;
         let max_per_pos_weight = ((target_mult / (max_open_positions as f64)) * 1.25)
@@ -454,14 +538,32 @@ impl ExecutionEngine {
         let asset_map: HashMap<i64, ExchangeAsset> =
             assets.into_iter().map(|a| (a.id, a)).collect();
 
+        let mut candidate_signals = signal_out.signals.clone();
+        candidate_signals.sort_by(|a, b| {
+            let a_prio = ((a.rebalance_action == ACTION_FLIP) as i32) * 2
+                + ((a.event_trigger.as_deref() == Some("CAPITULATION_FLUSH")
+                    && a.s1_mom_score > 0.0) as i32);
+            let b_prio = ((b.rebalance_action == ACTION_FLIP) as i32) * 2
+                + ((b.event_trigger.as_deref() == Some("CAPITULATION_FLUSH")
+                    && b.s1_mom_score > 0.0) as i32);
+            b_prio.cmp(&a_prio).then_with(|| {
+                b.target_weight
+                    .abs()
+                    .partial_cmp(&a.target_weight.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
         // 3. Place at most 1 new WORKING order per cycle when all gates pass
-        for sig in &signal_out.signals {
+        for sig in &candidate_signals {
             if report.working_orders_placed >= 1
                 || (total_active + report.working_orders_placed) >= max_open_positions
             {
                 break;
             }
-            if sig.rebalance_action != ACTION_OPEN_LONG && sig.rebalance_action != ACTION_OPEN_SHORT
+            if sig.rebalance_action != ACTION_OPEN_LONG
+                && sig.rebalance_action != ACTION_OPEN_SHORT
+                && sig.rebalance_action != ACTION_FLIP
             {
                 continue;
             }
@@ -498,10 +600,15 @@ impl ExecutionEngine {
                 .target_weight
                 .clamp(-max_per_pos_weight, max_per_pos_weight);
 
+            let effective_current_weight = if sig.rebalance_action == ACTION_FLIP {
+                0.0
+            } else {
+                sig.current_weight
+            };
             let plan = risk.size_working_order_from_weights(
                 asset,
                 capped_target_weight,
-                sig.current_weight,
+                effective_current_weight,
                 sig.w_s1_carry_mom,
                 sig.w_s2_trend_breakout,
                 sig.w_s3_event_reversion,
@@ -733,6 +840,7 @@ impl ExecutionEngine {
         let mut exit_price_opt = None;
         let mut realized_pnl = 0.0;
         let mut released_reserved = 0.0;
+        let mut exchange_close_unfilled = false;
         let final_status: String;
         let mut pending_close_alert: Option<PositionClosedAlert> = None;
 
@@ -753,7 +861,11 @@ impl ExecutionEngine {
                             o: oid,
                         });
                     } else if !wallet.is_empty() {
-                        if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
+                        if let Ok(open_orders) = self
+                            .http
+                            .fetch_frontend_open_orders(&wallet, &cfg)
+                            .or_else(|_| self.http.fetch_open_orders(&wallet, &cfg))
+                        {
                             for ord in open_orders {
                                 let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
                                 if c.eq_ignore_ascii_case(&asset.coin) {
@@ -794,42 +906,14 @@ impl ExecutionEngine {
                 let mut closed_qty = pos.filled_quantity;
                 let mut fee_usdc = round_dp(exit_px * closed_qty * (taker_fee_bps / 10_000.0), 4);
 
-                let mut exchange_close_unfilled = false;
                 if is_live_exchange {
                     let pk = cfg.get_str("private_key", "");
                     let wallet = cfg.get_str("wallet_address", "");
 
-                    // 1. Cancel any resting openOrders on this coin first
-                    if !wallet.is_empty() {
-                        if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
-                            let mut cancels = Vec::new();
-                            for ord in open_orders {
-                                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-                                if c.eq_ignore_ascii_case(&asset.coin) {
-                                    if let Some(oid) =
-                                        ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
-                                            ord.get("oid")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                        })
-                                    {
-                                        cancels.push(CancelWire {
-                                            a: asset.asset_index,
-                                            o: oid,
-                                        });
-                                    }
-                                }
-                            }
-                            if !cancels.is_empty() {
-                                let _ = self.http.cancel_orders_batch(
-                                    cancels,
-                                    &pk,
-                                    Some(&self.db),
-                                    &cfg,
-                                );
-                            }
-                        }
+                    // 1. Cancel ONLY non-trigger open orders first; preserve resting SL/TP trigger orders until close fills
+                    self.cancel_coin_exchange_orders(&asset, &wallet, &pk, &cfg, false);
 
+                    if !wallet.is_empty() {
                         // 2. Query live Hyperliquid clearinghouseState for exact `szi` on this coin
                         if let Ok(ch_state) = self.http.fetch_clearinghouse_state(&wallet, &cfg) {
                             let parse_f = |v: Option<&serde_json::Value>| -> f64 {
@@ -962,13 +1046,64 @@ impl ExecutionEngine {
                                 }
                                 if !filled_on_hl {
                                     exchange_close_unfilled = true;
+                                    self.illiquid_close_backoff_ms
+                                        .lock()
+                                        .insert(position_id, now_ms());
+                                    let resting_oids: Option<HashSet<u64>> = self
+                                        .http
+                                        .fetch_frontend_open_orders(&wallet, &cfg)
+                                        .or_else(|_| self.http.fetch_open_orders(&wallet, &cfg))
+                                        .ok()
+                                        .map(|orders| {
+                                            orders
+                                                .iter()
+                                                .filter_map(|o| {
+                                                    o.get("oid").and_then(|v| v.as_u64()).or_else(
+                                                        || {
+                                                            o.get("oid")
+                                                                .and_then(|v| v.as_str())
+                                                                .and_then(|s| {
+                                                                    s.parse::<u64>().ok()
+                                                                })
+                                                        },
+                                                    )
+                                                })
+                                                .collect()
+                                        });
+                                    let _ = self.chaser.ensure_exchange_tpsl_orders(
+                                        position_id,
+                                        &asset,
+                                        side,
+                                        rem_qty,
+                                        exit_px,
+                                        pos.protective_stop_px,
+                                        pos.take_profit_px,
+                                        pos.protective_stop_oid.as_deref(),
+                                        pos.take_profit_oid.as_deref(),
+                                        false,
+                                        false,
+                                        resting_oids.as_ref(),
+                                        &cfg,
+                                    );
                                     tracing::warn!(
                                         symbol = %asset.symbol,
                                         live_qty = live_qty,
                                         rem_qty = rem_qty,
                                         "Hyperliquid reduceOnly IOC close did not completely fill due to illiquid Testnet book"
                                     );
+                                } else {
+                                    self.cancel_coin_exchange_orders(
+                                        &asset,
+                                        &wallet,
+                                        &pk,
+                                        &cfg,
+                                        true,
+                                    );
+                                    self.illiquid_close_backoff_ms.lock().remove(&position_id);
                                 }
+                            } else {
+                                self.cancel_coin_exchange_orders(&asset, &wallet, &pk, &cfg, true);
+                                self.illiquid_close_backoff_ms.lock().remove(&position_id);
                             }
                         }
                     }
@@ -1003,7 +1138,7 @@ impl ExecutionEngine {
             }
         }
 
-        if cd_sec > 0 {
+        if cd_sec > 0 && !exchange_close_unfilled {
             self.db.insert_asset_cooldown(
                 asset.id,
                 "MANUAL",

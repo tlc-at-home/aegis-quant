@@ -7,18 +7,24 @@
 //! phantom/flat rows, and persists live `exchange_equity_usdc`.
 
 use crate::http_client::{is_testnet_configured, HyperliquidHttpClient};
+use crate::order_chaser::{extract_order_oid, parse_hl_oid, OrderChaser};
 use crate::signing::{
-    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, infer_tick_size, snap_to_tick,
+    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, infer_tick_size,
     CancelWire, LimitOrderType, OrderTypeWire, OrderWire,
 };
+use aegis_alerts::AlertEngine;
 use aegis_core::{
     mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp, ExecutionMode, OrderSide,
     Result,
 };
 use aegis_db::{AssetUpsertInput, DatabaseManager, ReconciledClosedTradeInput};
+use aegis_risk::{
+    compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
+    RiskLimitsConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -144,75 +150,162 @@ impl CutoverReconciler {
                 }
             }
         }
-        report.exchange_equity_usdc = if live_eq >= 1.0 {
-            round_dp(live_eq, 2)
+        let configured_live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        if configured_live_eq > 10.0 {
+            report.exchange_equity_usdc = round_dp(configured_live_eq, 2);
         } else {
-            fallback_eq
-        };
-        let _ = self.db.set_config_value(
-            "live_exchange_equity_usdc",
-            &format!("{:.2}", report.exchange_equity_usdc),
-            Some("Latest reconciled Hyperliquid accountValue in USDC"),
-        );
+            report.exchange_equity_usdc = if live_eq >= 1.0 {
+                round_dp(live_eq, 2)
+            } else {
+                fallback_eq
+            };
+            let _ = self.db.set_config_value(
+                "live_exchange_equity_usdc",
+                &format!("{:.2}", report.exchange_equity_usdc),
+                Some("Latest reconciled Hyperliquid accountValue in USDC"),
+            );
+        }
 
-        // 2. Cancel all stale/orphan open orders on Hyperliquid
-        if let Ok(open_orders) = self.http.fetch_open_orders(&wallet, &cfg) {
-            let mut batch_cancels: Vec<CancelWire> = Vec::new();
-            for ord in &open_orders {
-                let coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
-                let oid = ord
-                    .get("oid")
-                    .and_then(Value::as_u64)
-                    .or_else(|| {
-                        ord.get("oid")
-                            .and_then(Value::as_str)
-                            .and_then(|s| s.parse::<u64>().ok())
-                    })
-                    .unwrap_or(0);
-                if oid == 0 || coin.is_empty() {
-                    continue;
-                }
-                report.stale_orders_found += 1;
-                if let Ok(Some(asset)) = self.db.get_asset_by_symbol(coin) {
-                    batch_cancels.push(CancelWire {
-                        a: asset.asset_index,
-                        o: oid,
-                    });
-                }
-            }
-
-            if !private_key.is_empty() && !batch_cancels.is_empty() {
-                for chunk in batch_cancels.chunks(25) {
-                    if self
-                        .http
-                        .cancel_orders_batch(chunk.to_vec(), &private_key, Some(&self.db), &cfg)
-                        .is_ok()
-                    {
-                        report.stale_orders_cancelled += chunk.len();
+        // Identify currently open coins on Hyperliquid before clearing orphan openOrders
+        let mut open_coins: HashSet<String> = HashSet::new();
+        if let Some(asset_positions) = ch_state.get("assetPositions").and_then(Value::as_array) {
+            for item in asset_positions {
+                let pos = item.get("position").unwrap_or(item);
+                let raw_coin = pos.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                let szi = parse_f(pos.get("szi"));
+                if !raw_coin.is_empty() && szi.abs() > 1e-9 {
+                    if let Ok((_, coin)) = normalize_hyperliquid_symbol(raw_coin) {
+                        open_coins.insert(coin.to_ascii_uppercase());
                     }
                 }
-                report.details.push(format!(
-                    "Cancelled {}/{} resting orders on Hyperliquid",
-                    report.stale_orders_cancelled, report.stale_orders_found
-                ));
             }
         }
 
-        // Cancel any local WORKING rows since all resting entry orders on Hyperliquid were cleared
+        // 2. Inspect resting orders via frontendOpenOrders (includes SL/TP trigger orders) and preserve active tracked orders
+        let open_orders = self
+            .http
+            .fetch_frontend_open_orders(&wallet, &cfg)
+            .or_else(|_| self.http.fetch_open_orders(&wallet, &cfg))
+            .unwrap_or_default();
+
+        let mut resting_exchange_oids: HashSet<u64> = HashSet::new();
+        let mut cloid_to_oid: HashMap<String, u64> = HashMap::new();
+        for ord in &open_orders {
+            if let Some(oid) = extract_order_oid(ord) {
+                resting_exchange_oids.insert(oid);
+                if let Some(cloid) = ord.get("cloid").and_then(Value::as_str) {
+                    cloid_to_oid.insert(cloid.trim().to_ascii_lowercase(), oid);
+                }
+            }
+        }
+
+        let mut protected_oids: HashSet<u64> = HashSet::new();
+        if !close_legacy_positions {
+            if let Ok(local_held) = self.db.get_assets_held() {
+                for h in local_held {
+                    if !open_coins.contains(&h.coin.to_ascii_uppercase()) {
+                        continue;
+                    }
+                    for raw_oid in [
+                        h.protective_stop_oid.as_deref(),
+                        h.take_profit_oid.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if let Some(oid) = parse_hl_oid(Some(raw_oid)).or_else(|| {
+                            cloid_to_oid
+                                .get(&raw_oid.trim().to_ascii_lowercase())
+                                .copied()
+                        }) {
+                            protected_oids.insert(oid);
+                        }
+                    }
+                }
+            }
+            if let Ok(local_ordered) = self.db.get_assets_ordered() {
+                for o in local_ordered {
+                    if ts.saturating_sub(o.created_at_ms) < 45_000
+                        && !open_coins.contains(&o.coin.to_ascii_uppercase())
+                    {
+                        if let Some(oid) = parse_hl_oid(o.exchange_order_id.as_deref()) {
+                            protected_oids.insert(oid);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut batch_cancels: Vec<CancelWire> = Vec::new();
+        let mut cancelled_oid_candidates: Vec<u64> = Vec::new();
+        for ord in &open_orders {
+            let coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+            let Some(oid) = extract_order_oid(ord) else {
+                continue;
+            };
+            if coin.is_empty() {
+                continue;
+            }
+            if !close_legacy_positions && protected_oids.contains(&oid) {
+                continue;
+            }
+            report.stale_orders_found += 1;
+            if let Ok(Some(asset)) = self.db.get_asset_by_symbol(coin) {
+                batch_cancels.push(CancelWire {
+                    a: asset.asset_index,
+                    o: oid,
+                });
+                cancelled_oid_candidates.push(oid);
+            }
+        }
+
+        if !private_key.is_empty() && !batch_cancels.is_empty() {
+            for (chunk, oid_chunk) in batch_cancels
+                .chunks(25)
+                .zip(cancelled_oid_candidates.chunks(25))
+            {
+                if self
+                    .http
+                    .cancel_orders_batch(chunk.to_vec(), &private_key, Some(&self.db), &cfg)
+                    .is_ok()
+                {
+                    report.stale_orders_cancelled += chunk.len();
+                    for oid in oid_chunk {
+                        resting_exchange_oids.remove(oid);
+                    }
+                }
+            }
+            report.details.push(format!(
+                "Cancelled {}/{} resting orphan orders on Hyperliquid",
+                report.stale_orders_cancelled, report.stale_orders_found
+            ));
+        }
+
+        // Cancel local WORKING rows only if close_legacy_positions, coin already open, expired, or no longer resting
         if let Ok(local_ordered) = self.db.get_assets_ordered() {
             for o in local_ordered {
-                let _ = self
-                    .db
-                    .cancel_working_order(o.position_id, "EXCHANGE_RECONCILED_WORKING_CLEARED");
+                let is_open_on_exch = open_coins.contains(&o.coin.to_ascii_uppercase());
+                let is_expired = ts.saturating_sub(o.created_at_ms) >= 45_000;
+                let is_resting = parse_hl_oid(o.exchange_order_id.as_deref())
+                    .is_some_and(|oid| resting_exchange_oids.contains(&oid));
+                if close_legacy_positions || is_open_on_exch || is_expired || !is_resting {
+                    let _ = self.db.cancel_working_order(
+                        o.position_id,
+                        "EXCHANGE_RECONCILED_WORKING_CLEARED",
+                    );
+                }
             }
         }
 
-        // 3. Inspect live Hyperliquid `assetPositions` and synchronize 1:1 with MariaDB `positions`
+        // 3. Inspect live Hyperliquid `assetPositions` and synchronize 1:1 with MariaDB `positions` + SL/TP orders
         let mut exchange_open_asset_ids: HashSet<i64> = HashSet::new();
-        let default_stop_pct = cfg
-            .get_f64("protective_stop_default_pct", 0.04)
-            .clamp(0.005, 0.25);
-        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
+        let limits = RiskLimitsConfig::from_config_map(&cfg);
+        let taker_fee_bps = limits.taker_fee_bps;
+        let chaser = OrderChaser::new(
+            self.db.clone(),
+            self.http.clone(),
+            AlertEngine::new(self.db.clone()),
+        );
 
         if let Some(asset_positions) = ch_state.get("assetPositions").and_then(Value::as_array) {
             for item in asset_positions {
@@ -367,11 +460,39 @@ impl CutoverReconciler {
 
                 if !closed_on_exchange {
                     let tick = asset.tick_size.max(1e-8);
-                    let stop_px = if side.is_buy() {
-                        snap_to_tick(entry_px.min(mark_px) * (1.0 - default_stop_pct), tick)
+                    let bars_1h = self
+                        .db
+                        .get_ohlcv_bars(asset.id, "1h", 20)
+                        .unwrap_or_default();
+                    let atr_opt = (!bars_1h.is_empty()).then(|| {
+                        compute_atr_from_bars(
+                            &bars_1h,
+                            14,
+                            mark_px,
+                            limits.protective_stop_default_pct,
+                        )
+                    });
+                    let entry_stop =
+                        compute_initial_protective_stop(side, entry_px, atr_opt, tick, &limits);
+                    let stop_px = if match side {
+                        OrderSide::Long => entry_stop < mark_px - tick * 0.5,
+                        OrderSide::Short => entry_stop > mark_px + tick * 0.5,
+                    } {
+                        entry_stop
                     } else {
-                        snap_to_tick(entry_px.max(mark_px) * (1.0 + default_stop_pct), tick)
+                        compute_initial_protective_stop(side, mark_px, atr_opt, tick, &limits)
                     };
+                    let entry_tp =
+                        compute_initial_take_profit(side, entry_px, atr_opt, tick, &limits);
+                    let tp_px = if match side {
+                        OrderSide::Long => entry_tp > mark_px + tick * 0.5,
+                        OrderSide::Short => entry_tp < mark_px - tick * 0.5,
+                    } {
+                        entry_tp
+                    } else {
+                        compute_initial_take_profit(side, mark_px, atr_opt, tick, &limits)
+                    };
+
                     let committed_usdc = if pos_val > 0.0 {
                         round_dp(pos_val, 4)
                     } else {
@@ -381,7 +502,7 @@ impl CutoverReconciler {
                         (committed_usdc / report.exchange_equity_usdc.max(1.0)) * side.sign(),
                         4,
                     );
-                    let (_pid, _newly_adopted) = self.db.sync_open_position_from_exchange(
+                    let (pid, _newly_adopted) = self.db.sync_open_position_from_exchange(
                         asset.id,
                         &coin,
                         side,
@@ -392,7 +513,25 @@ impl CutoverReconciler {
                         upnl,
                         weight,
                         stop_px,
+                        tp_px,
                     )?;
+                    if let Ok(Some(synced_pos)) = self.db.get_position_by_id(pid) {
+                        let _ = chaser.ensure_exchange_tpsl_orders(
+                            pid,
+                            &asset,
+                            side,
+                            qty,
+                            mark_px,
+                            synced_pos.protective_stop_px,
+                            synced_pos.take_profit_px,
+                            synced_pos.protective_stop_oid.as_deref(),
+                            synced_pos.take_profit_oid.as_deref(),
+                            false,
+                            false,
+                            Some(&resting_exchange_oids),
+                            &cfg,
+                        );
+                    }
                     let _ = self.db.set_asset_priority_watch(asset.id, true);
                     exchange_open_asset_ids.insert(asset.id);
                     report.legacy_positions_adopted += 1;

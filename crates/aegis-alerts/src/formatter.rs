@@ -118,6 +118,8 @@ pub struct OrderFilledOpenAlert {
     pub total_equity_usdc: f64,
     pub available_cash_usdc: f64,
     pub protective_stop_px: f64,
+    #[serde(default)]
+    pub take_profit_px: f64,
     pub s1_weight: f64,
     pub s2_weight: f64,
     pub s3_weight: f64,
@@ -144,6 +146,7 @@ impl OrderFilledOpenAlert {
             total_equity_usdc: snap.total_equity_usdc,
             available_cash_usdc: snap.available_cash_usdc,
             protective_stop_px: held.protective_stop_px,
+            take_profit_px: held.take_profit_px,
             s1_weight: held.s1_weight_contrib,
             s2_weight: held.s2_weight_contrib,
             s3_weight: held.s3_weight_contrib,
@@ -189,6 +192,23 @@ pub fn format_order_filled_open_html(alert: &OrderFilledOpenAlert) -> String {
         -4.00
     };
 
+    let tp_line = if alert.fill_price > 0.0 && alert.take_profit_px > 0.0 {
+        let tp_dist_pct = match alert.side {
+            OrderSide::Long => {
+                ((alert.take_profit_px - alert.fill_price) / alert.fill_price) * 100.0
+            }
+            OrderSide::Short => {
+                ((alert.fill_price - alert.take_profit_px) / alert.fill_price) * 100.0
+            }
+        };
+        format!(
+            "\nTake Profit  : ${:.4} ({:+.2}%)",
+            alert.take_profit_px, tp_dist_pct
+        )
+    } else {
+        String::new()
+    };
+
     let ts_str = format_ms_human_utc(if alert.timestamp_ms > 0 {
         alert.timestamp_ms
     } else {
@@ -207,7 +227,7 @@ Fill Price   : ${fill_px:.4}\n\
 Filled Qty   : {qty:.2} {safe_coin}\n\
 Committed    : {committed} USDC ({eq_pct:.1}% Eq)\n\
 Avail Cash   : {avail} USDC\n\
-Protect Stop : ${stop_px:.4} ({stop_dist:+.2}%)\n\
+Protect Stop : ${stop_px:.4} ({stop_dist:+.2}%){tp_line}\n\
 </pre>\n\
 <b>Sleeve Mix:</b> <code>S1 Carry {s1}</code> · <code>S2 Trend {s2}</code> · <code>S3 Event {s3}</code>\n\
 ⏱ <i>{ts_str} · 1s Priority Watch Active</i>",
@@ -217,6 +237,7 @@ Protect Stop : ${stop_px:.4} ({stop_dist:+.2}%)\n\
         avail = format_usdc(alert.available_cash_usdc),
         stop_px = alert.protective_stop_px,
         stop_dist = stop_dist_pct,
+        tp_line = tp_line,
         s1 = format_sleeve_pct(alert.s1_weight),
         s2 = format_sleeve_pct(alert.s2_weight),
         s3 = format_sleeve_pct(alert.s3_weight),
@@ -536,6 +557,7 @@ mod tests {
             total_equity_usdc: 10000.0,
             available_cash_usdc: 7328.37,
             protective_stop_px: 176.80,
+            take_profit_px: 199.15,
             s1_weight: 0.112,
             s2_weight: 0.155,
             s3_weight: 0.0,
@@ -552,6 +574,7 @@ mod tests {
         assert!(html.contains("Committed    : $2,671.63 USDC (26.7% Eq)"));
         assert!(html.contains("Avail Cash   : $7,328.37 USDC"));
         assert!(html.contains("Protect Stop : $176.8000 (-4.04%)"));
+        assert!(html.contains("Take Profit  : $199.1500 (+8.09%)"));
         assert!(html.contains(
             "<b>Sleeve Mix:</b> <code>S1 Carry +11.2%</code> · <code>S2 Trend +15.5%</code> · <code>S3 Event 0.0%</code>"
         ));

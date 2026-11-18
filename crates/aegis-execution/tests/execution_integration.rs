@@ -92,6 +92,11 @@ fn test_3s_market_watcher_and_order_to_open_capital_lifecycle() {
     assert_eq!(held[0].position_id, pos_id);
     assert_eq!(held[0].symbol, "SOL-USDC");
     assert!(held[0].committed_notional_usdc > 1800.0);
+    assert!(held[0].protective_stop_px > 0.0);
+    assert!(held[0].protective_stop_px < held[0].entry_price);
+    assert!(held[0].protective_stop_oid.is_some());
+    assert!(held[0].take_profit_px > held[0].entry_price);
+    assert!(held[0].take_profit_oid.is_some());
 
     let pos_open = db.get_position_by_id(pos_id).unwrap().unwrap();
     assert_eq!(pos_open.status, "OPEN");
@@ -164,4 +169,69 @@ fn test_unified_single_cycle_and_manual_close() {
     }
     assert!(db.get_assets_ordered().unwrap().is_empty());
     assert!(db.get_assets_held().unwrap().is_empty());
+}
+
+#[test]
+fn test_take_profit_trigger_exit_and_live_equity_preservation() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    db.set_config_value("live_exchange_equity_usdc", "1000.00", None)
+        .unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    engine.watcher.run_3s_exchange_scan().unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    db.update_asset_live_quote(sol.id, 180.00, 180.00).unwrap();
+    let sol_fresh = db.get_asset_by_id(sol.id).unwrap().unwrap();
+
+    let pos_id = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: sol_fresh,
+            side: OrderSide::Long,
+            requested_quantity: 5.0,
+            reserved_margin_usdc: 450.0,
+            portfolio_weight: 0.15,
+            s1_weight_contrib: 0.10,
+            s2_weight_contrib: 0.05,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 174.00,
+            reason: "TP_TEST_ENTRY".to_string(),
+        })
+        .unwrap();
+
+    // Promote WORKING -> OPEN via live quote touching the working limit order
+    let ordered = db.get_assets_ordered().unwrap();
+    let fill_px = ordered[0].limit_price;
+    db.update_asset_live_quote(sol.id, fill_px, fill_px)
+        .unwrap();
+    let open_tick = engine.priority_monitor.run_1s_priority_tick().unwrap();
+    assert_eq!(open_tick.orders_promoted_to_open, 1);
+
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    let tp_px = held[0].take_profit_px;
+    assert!(tp_px > held[0].entry_price);
+    assert!(held[0].take_profit_oid.is_some());
+    assert!(held[0].protective_stop_oid.is_some());
+
+    // Simulate rally hitting take_profit_px -> Priority Monitor exits at TP without STOP_OUT cooldown
+    db.update_asset_live_quote(sol.id, tp_px + 0.50, tp_px + 0.50)
+        .unwrap();
+    let tp_tick = engine.priority_monitor.run_1s_priority_tick().unwrap();
+    assert_eq!(tp_tick.stops_triggered_closed, 1);
+    assert!(db.get_assets_held().unwrap().is_empty());
+
+    let closed_pos = db.get_position_by_id(pos_id).unwrap().unwrap();
+    assert_eq!(closed_pos.status, "CLOSED");
+    assert_eq!(closed_pos.exit_reason.as_deref(), Some("TAKE_PROFIT_LONG"));
+    assert!(closed_pos.realized_pnl_usdc > 0.0);
+
+    let cooldowns = db.get_assets_in_cooldown().unwrap();
+    assert!(cooldowns.iter().all(|c| c.cooldown_type != "STOP_OUT"));
+
+    let cfg = db.load_config().unwrap();
+    assert!((cfg.get_f64("live_exchange_equity_usdc", 0.0) - 1000.0).abs() < 1e-6);
 }

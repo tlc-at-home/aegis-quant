@@ -250,10 +250,12 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
             .map(|h| h.committed_notional_usdc)
             .sum();
         let upnl: f64 = v_assets_held.iter().map(|h| h.unrealized_pnl_usdc).sum();
-        let base_eq = cfg.get_f64(
-            "live_exchange_equity_usdc",
-            cfg.get_f64("initial_paper_equity_usdc", 10_000.0),
-        );
+        let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        let base_eq = if live_eq > 10.0 {
+            live_eq
+        } else {
+            cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+        };
         let total_eq = round_dp(base_eq + upnl, 2);
         let avail_cash = round_dp((total_eq - committed - reserved).max(0.0), 2);
         snapshot.total_equity_usdc = total_eq;

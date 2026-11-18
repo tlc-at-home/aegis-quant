@@ -41,11 +41,28 @@ pub struct ReconciledClosedTradeInput {
     pub exit_reason: String,
 }
 
+fn derive_take_profit_px(side: OrderSide, entry_price: f64, protective_stop_px: f64) -> f64 {
+    if !entry_price.is_finite() || entry_price <= 0.0 {
+        return 0.0;
+    }
+    let tp_dist = if protective_stop_px.is_finite() && protective_stop_px > 0.0 {
+        ((entry_price - protective_stop_px).abs() * 2.0).max(entry_price * 0.016)
+    } else {
+        entry_price * 0.08
+    };
+    match side {
+        OrderSide::Long => round_dp(entry_price + tp_dist, 8),
+        OrderSide::Short => round_dp((entry_price - tp_dist).max(entry_price * 0.05), 8),
+    }
+}
+
 impl DatabaseManager {
     /// Places a new `WORKING` order into `positions`, reserving `reserved_margin_usdc` without spending cash yet,
     /// and writes the initial transition into `order_audit`.
     pub fn create_working_order(&self, input: &WorkingOrderInput) -> Result<i64> {
         let ts = now_ms();
+        let take_profit_px =
+            derive_take_profit_px(input.side, input.limit_price, input.protective_stop_px);
         let mut conn = self.get_conn()?;
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
@@ -56,13 +73,13 @@ impl DatabaseManager {
                    asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
                    requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
                    portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                   protective_stop_px, highest_price_seen, lowest_price_seen, chase_count,
+                   protective_stop_px, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
                    exchange_order_id, created_at_ms, updated_at_ms
                ) VALUES (
                    :aid, :coid, :side, 'WORKING', 'WORKING_ALO', :px, :px,
                    :qty, 0.0, :res_usdc, 0.0,
                    :pw, :s1, :s2, :s3,
-                   :stop_px, :px, :px, 0,
+                   :stop_px, :tp_px, :px, :px, 0,
                    :eoid, :ts, :ts
                )"#,
             params! {
@@ -77,6 +94,7 @@ impl DatabaseManager {
                 "s2" => input.s2_weight_contrib,
                 "s3" => input.s3_weight_contrib,
                 "stop_px" => input.protective_stop_px,
+                "tp_px" => take_profit_px,
                 "eoid" => &input.exchange_order_id,
                 "ts" => ts,
             },
@@ -131,6 +149,8 @@ impl DatabaseManager {
         let pos = self
             .get_position_by_id(position_id)?
             .ok_or_else(|| AegisError::Database(format!("Position {position_id} not found")))?;
+        let side = OrderSide::parse(&pos.side);
+        let take_profit_px = derive_take_profit_px(side, fill_price, protective_stop_px);
         let ts = now_ms();
         let committed_usdc = round_dp(fill_price * filled_quantity, 4);
 
@@ -149,6 +169,7 @@ impl DatabaseManager {
                    reserved_margin_usdc = 0.0,
                    committed_notional_usdc = :comm_usdc,
                    protective_stop_px = :stop_px,
+                   take_profit_px = :tp_px,
                    highest_price_seen = :px,
                    lowest_price_seen = :px,
                    fees_paid_usdc = fees_paid_usdc + :fees,
@@ -161,6 +182,7 @@ impl DatabaseManager {
                 "qty" => filled_quantity,
                 "comm_usdc" => committed_usdc,
                 "stop_px" => protective_stop_px,
+                "tp_px" => take_profit_px,
                 "fees" => round_dp(fees_paid_usdc, 4),
                 "eoid" => exchange_order_id,
                 "ts" => ts,
@@ -223,6 +245,11 @@ impl DatabaseManager {
         } else {
             mark_price
         };
+        let eff_tp = if pos.take_profit_px > 0.0 {
+            pos.take_profit_px
+        } else {
+            derive_take_profit_px(side, pos.entry_price, new_protective_stop_px)
+        };
         let ts = now_ms();
 
         let mut conn = self.get_conn()?;
@@ -230,6 +257,7 @@ impl DatabaseManager {
             r#"UPDATE positions
                SET current_price = :mark,
                    protective_stop_px = :stop_px,
+                   take_profit_px = :tp_px,
                    highest_price_seen = :high,
                    lowest_price_seen = :low,
                    unrealized_pnl_usdc = :upnl,
@@ -238,6 +266,7 @@ impl DatabaseManager {
             params! {
                 "mark" => mark_price,
                 "stop_px" => new_protective_stop_px,
+                "tp_px" => eff_tp,
                 "high" => high,
                 "low" => low,
                 "upnl" => upnl,
@@ -248,6 +277,38 @@ impl DatabaseManager {
         .map_err(|e| {
             AegisError::Database(format!("update_open_position_mark_and_stop failed: {e}"))
         })?;
+        Ok(())
+    }
+
+    /// Persists stop-loss and take-profit trigger prices and exchange order IDs on an active position.
+    pub fn update_position_tpsl_orders(
+        &self,
+        position_id: i64,
+        protective_stop_px: f64,
+        protective_stop_oid: Option<&str>,
+        take_profit_px: f64,
+        take_profit_oid: Option<&str>,
+    ) -> Result<()> {
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        conn.exec_drop(
+            r#"UPDATE positions
+               SET protective_stop_px = CASE WHEN :stop_px > 0 THEN :stop_px ELSE protective_stop_px END,
+                   protective_stop_oid = :sl_oid,
+                   take_profit_px = CASE WHEN :tp_px > 0 THEN :tp_px ELSE take_profit_px END,
+                   take_profit_oid = :tp_oid,
+                   updated_at_ms = :ts
+               WHERE id = :pid AND status IN ('WORKING', 'OPEN')"#,
+            params! {
+                "stop_px" => protective_stop_px,
+                "sl_oid" => protective_stop_oid,
+                "tp_px" => take_profit_px,
+                "tp_oid" => take_profit_oid,
+                "ts" => ts,
+                "pid" => position_id,
+            },
+        )
+        .map_err(|e| AegisError::Database(format!("update_position_tpsl_orders failed: {e}")))?;
         Ok(())
     }
 
@@ -395,11 +456,11 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, highest_price_seen,
-                          lowest_price_seen, chase_count, realized_pnl_usdc, unrealized_pnl_usdc,
-                          fees_paid_usdc, funding_accrued_usdc, slippage_paid_usdc,
-                          exchange_order_id, created_at_ms, opened_at_ms, closed_at_ms,
-                          updated_at_ms, exit_reason
+                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
+                          unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
+                          slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                          closed_at_ms, updated_at_ms, exit_reason
                    FROM positions
                    WHERE id = :pid"#,
                 params! { "pid" => position_id },
@@ -417,11 +478,11 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, highest_price_seen,
-                          lowest_price_seen, chase_count, realized_pnl_usdc, unrealized_pnl_usdc,
-                          fees_paid_usdc, funding_accrued_usdc, slippage_paid_usdc,
-                          exchange_order_id, created_at_ms, opened_at_ms, closed_at_ms,
-                          updated_at_ms, exit_reason
+                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
+                          unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
+                          slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                          closed_at_ms, updated_at_ms, exit_reason
                    FROM positions
                    WHERE asset_id = :aid AND status IN ('WORKING', 'OPEN')
                    ORDER BY id DESC
@@ -443,11 +504,11 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, highest_price_seen,
-                          lowest_price_seen, chase_count, realized_pnl_usdc, unrealized_pnl_usdc,
-                          fees_paid_usdc, funding_accrued_usdc, slippage_paid_usdc,
-                          exchange_order_id, created_at_ms, opened_at_ms, closed_at_ms,
-                          updated_at_ms, exit_reason
+                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
+                          unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
+                          slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                          closed_at_ms, updated_at_ms, exit_reason
                    FROM positions
                    WHERE status IN ('CLOSED', 'CANCELLED')
                    ORDER BY updated_at_ms DESC
@@ -476,6 +537,7 @@ impl DatabaseManager {
         unrealized_pnl_usdc: f64,
         portfolio_weight: f64,
         protective_stop_px: f64,
+        take_profit_px: f64,
     ) -> Result<(i64, bool)> {
         let ts = now_ms();
         let mut conn = self.get_conn()?;
@@ -485,9 +547,20 @@ impl DatabaseManager {
                 AegisError::Database(format!("sync_open_position_from_exchange tx failed: {e}"))
             })?;
 
-        let active_rows: Vec<(i64, String, f64)> = tx
+        #[allow(clippy::type_complexity)]
+        let active_rows: Vec<(
+            i64,
+            String,
+            String,
+            f64,
+            f64,
+            Option<String>,
+            f64,
+            Option<String>,
+        )> = tx
             .exec(
-                r#"SELECT id, status, protective_stop_px
+                r#"SELECT id, status, side, filled_quantity, protective_stop_px,
+                          protective_stop_oid, take_profit_px, take_profit_oid
                    FROM positions
                    WHERE asset_id = :aid AND status IN ('OPEN', 'WORKING')
                    ORDER BY FIELD(status, 'OPEN', 'WORKING'), id DESC"#,
@@ -501,15 +574,25 @@ impl DatabaseManager {
 
         let open_row_opt = active_rows
             .iter()
-            .find(|(_, st, _)| st.eq_ignore_ascii_case("OPEN"))
+            .find(|(_, st, ..)| st.eq_ignore_ascii_case("OPEN"))
             .cloned();
 
         let high = entry_price.max(mark_price);
         let low = entry_price.min(mark_price).max(0.0);
 
-        if let Some((open_id, _, existing_stop)) = open_row_opt {
+        if let Some((
+            open_id,
+            _,
+            existing_side,
+            existing_qty,
+            existing_stop,
+            existing_sl_oid,
+            existing_tp,
+            existing_tp_oid,
+        )) = open_row_opt
+        {
             // Cancel any extra duplicate active rows for this asset_id
-            for (other_id, _, _) in &active_rows {
+            for (other_id, ..) in &active_rows {
                 if *other_id != open_id {
                     tx.exec_drop(
                         r#"UPDATE positions
@@ -529,7 +612,11 @@ impl DatabaseManager {
                 }
             }
 
-            let stop_is_valid_non_breached = existing_stop > 0.0
+            let side_matches = existing_side.eq_ignore_ascii_case(side.as_str());
+            let qty_matches = (existing_qty - quantity).abs() <= (quantity.abs() * 1e-4).max(1e-6);
+
+            let stop_is_valid_non_breached = side_matches
+                && existing_stop > 0.0
                 && match side {
                     OrderSide::Long => existing_stop < mark_price * 0.998,
                     OrderSide::Short => existing_stop > mark_price * 1.002,
@@ -538,6 +625,30 @@ impl DatabaseManager {
                 existing_stop
             } else {
                 protective_stop_px
+            };
+            let eff_sl_oid = if stop_is_valid_non_breached && qty_matches {
+                existing_sl_oid
+            } else {
+                None
+            };
+
+            let tp_is_valid_non_breached = side_matches
+                && existing_tp > 0.0
+                && match side {
+                    OrderSide::Long => existing_tp > mark_price * 1.002,
+                    OrderSide::Short => existing_tp < mark_price * 0.998,
+                };
+            let eff_tp = if tp_is_valid_non_breached {
+                existing_tp
+            } else if take_profit_px > 0.0 {
+                take_profit_px
+            } else {
+                derive_take_profit_px(side, entry_price, eff_stop)
+            };
+            let eff_tp_oid = if tp_is_valid_non_breached && qty_matches {
+                existing_tp_oid
+            } else {
+                None
             };
 
             tx.exec_drop(
@@ -554,6 +665,9 @@ impl DatabaseManager {
                        unrealized_pnl_usdc = :upnl,
                        portfolio_weight = :pw,
                        protective_stop_px = :stop_px,
+                       protective_stop_oid = :sl_oid,
+                       take_profit_px = :tp_px,
+                       take_profit_oid = :tp_oid,
                        highest_price_seen = GREATEST(highest_price_seen, :high),
                        lowest_price_seen = CASE WHEN lowest_price_seen > 0 THEN LEAST(lowest_price_seen, :low) ELSE :low END,
                        updated_at_ms = :ts
@@ -567,6 +681,9 @@ impl DatabaseManager {
                     "upnl" => round_dp(unrealized_pnl_usdc, 4),
                     "pw" => round_dp(portfolio_weight, 4),
                     "stop_px" => eff_stop,
+                    "sl_oid" => eff_sl_oid,
+                    "tp_px" => eff_tp,
+                    "tp_oid" => eff_tp_oid,
                     "high" => high,
                     "low" => low,
                     "ts" => ts,
@@ -588,7 +705,7 @@ impl DatabaseManager {
         }
 
         // Cancel any WORKING rows for this asset before inserting the exact OPEN position
-        for (working_id, _, _) in &active_rows {
+        for (working_id, ..) in &active_rows {
             tx.exec_drop(
                 r#"UPDATE positions
                    SET status = 'CANCELLED',
@@ -604,19 +721,24 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("cancel working before sync failed: {e}")))?;
         }
 
+        let eff_tp = if take_profit_px > 0.0 {
+            take_profit_px
+        } else {
+            derive_take_profit_px(side, entry_price, protective_stop_px)
+        };
         let coid = format!("hl-sync-{}-{ts}", coin.trim().to_ascii_lowercase());
         tx.exec_drop(
             r#"INSERT INTO positions (
                    asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
                    requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
                    portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                   protective_stop_px, highest_price_seen, lowest_price_seen, chase_count,
+                   protective_stop_px, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
                    unrealized_pnl_usdc, exchange_order_id, created_at_ms, opened_at_ms, updated_at_ms
                ) VALUES (
                    :aid, :coid, :side, 'OPEN', 'FILLED_OPEN', :entry_px, :mark_px,
                    :qty, :qty, 0.0, :comm_usdc,
                    :pw, :pw, 0.0, 0.0,
-                   :stop_px, :high, :low, 0,
+                   :stop_px, :tp_px, :high, :low, 0,
                    :upnl, 'hl-reconciled', :ts, :ts, :ts
                )"#,
             params! {
@@ -629,6 +751,7 @@ impl DatabaseManager {
                 "comm_usdc" => round_dp(committed_notional_usdc, 4),
                 "pw" => round_dp(portfolio_weight, 4),
                 "stop_px" => protective_stop_px,
+                "tp_px" => eff_tp,
                 "high" => high,
                 "low" => low,
                 "upnl" => round_dp(unrealized_pnl_usdc, 4),
@@ -854,19 +977,21 @@ fn row_to_position_record(r: mysql::Row) -> PositionRecord {
         s3_weight_contrib: r.get(16).unwrap_or_default(),
         protective_stop_px: r.get(17).unwrap_or_default(),
         protective_stop_oid: r.get::<Option<String>, _>(18).unwrap_or(None),
-        highest_price_seen: r.get(19).unwrap_or_default(),
-        lowest_price_seen: r.get(20).unwrap_or_default(),
-        chase_count: r.get(21).unwrap_or_default(),
-        realized_pnl_usdc: r.get(22).unwrap_or_default(),
-        unrealized_pnl_usdc: r.get(23).unwrap_or_default(),
-        fees_paid_usdc: r.get(24).unwrap_or_default(),
-        funding_accrued_usdc: r.get(25).unwrap_or_default(),
-        slippage_paid_usdc: r.get(26).unwrap_or_default(),
-        exchange_order_id: r.get::<Option<String>, _>(27).unwrap_or(None),
-        created_at_ms: r.get(28).unwrap_or_default(),
-        opened_at_ms: r.get::<Option<i64>, _>(29).unwrap_or(None),
-        closed_at_ms: r.get::<Option<i64>, _>(30).unwrap_or(None),
-        updated_at_ms: r.get(31).unwrap_or_default(),
-        exit_reason: r.get::<Option<String>, _>(32).unwrap_or(None),
+        take_profit_px: r.get(19).unwrap_or_default(),
+        take_profit_oid: r.get::<Option<String>, _>(20).unwrap_or(None),
+        highest_price_seen: r.get(21).unwrap_or_default(),
+        lowest_price_seen: r.get(22).unwrap_or_default(),
+        chase_count: r.get(23).unwrap_or_default(),
+        realized_pnl_usdc: r.get(24).unwrap_or_default(),
+        unrealized_pnl_usdc: r.get(25).unwrap_or_default(),
+        fees_paid_usdc: r.get(26).unwrap_or_default(),
+        funding_accrued_usdc: r.get(27).unwrap_or_default(),
+        slippage_paid_usdc: r.get(28).unwrap_or_default(),
+        exchange_order_id: r.get::<Option<String>, _>(29).unwrap_or(None),
+        created_at_ms: r.get(30).unwrap_or_default(),
+        opened_at_ms: r.get::<Option<i64>, _>(31).unwrap_or(None),
+        closed_at_ms: r.get::<Option<i64>, _>(32).unwrap_or(None),
+        updated_at_ms: r.get(33).unwrap_or_default(),
+        exit_reason: r.get::<Option<String>, _>(34).unwrap_or(None),
     }
 }

@@ -252,7 +252,6 @@ pub fn allocate_multi_sleeve_weights(
     }
 
     let mut drafts = Vec::with_capacity(assets.len());
-    let mut total_gross_before_cap = 0.0;
 
     for asset in assets {
         let s1 = s1_map.get(&asset.id);
@@ -272,6 +271,13 @@ pub fn allocate_multi_sleeve_weights(
         let s3_funding_zscore = s3.map(|x| x.s3_funding_zscore).unwrap_or(0.0);
         let s3_flush_atr_mult = s3.map(|x| x.s3_flush_atr_mult).unwrap_or(0.0);
         let w_s3 = s3.map(|x| x.w_s3_event_reversion).unwrap_or(0.0);
+
+        let is_downward_flush = (w_s3 > 0.0
+            && s3_flush_atr_mult < 0.0
+            && (s1_mom_score >= 0.0 || s2_trend_alignment >= 0))
+            || (s3_flush_atr_mult <= -3.5 && s3_funding_zscore < 0.5);
+        let w_s1 = if is_downward_flush { w_s1.max(0.0) } else { w_s1 };
+        let w_s2 = if is_downward_flush { w_s2.max(0.0) } else { w_s2 };
 
         let event_trigger = s3
             .and_then(|x| x.event_trigger.clone())
@@ -302,7 +308,6 @@ pub fn allocate_multi_sleeve_weights(
         };
 
         let capped_single = post_cooldown_weight.clamp(-max_single, max_single);
-        total_gross_before_cap += capped_single.abs();
 
         drafts.push(DraftAlloc {
             asset: asset.clone(),
@@ -325,6 +330,36 @@ pub fn allocate_multi_sleeve_weights(
             event_trigger,
         });
     }
+
+    if drafts.len() > 12 {
+        let mut keep_ids: HashSet<i64> = HashSet::new();
+        for d in &drafts {
+            if d.current_weight.abs() >= 1e-4
+                || (d.w_s1 > 0.0 && d.w_s3 > 0.0 && d.s3_flush_atr_mult < 0.0)
+            {
+                keep_ids.insert(d.asset.id);
+            }
+        }
+        let mut ranked: Vec<(i64, f64, f64)> = drafts
+            .iter()
+            .map(|d| (d.asset.id, d.capped_single_weight.abs(), d.asset.day_volume_usdc))
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for (id, _, _) in ranked.into_iter().take(12) {
+            keep_ids.insert(id);
+        }
+        for d in &mut drafts {
+            if !keep_ids.contains(&d.asset.id) {
+                d.capped_single_weight = 0.0;
+            }
+        }
+    }
+
+    let total_gross_before_cap: f64 = drafts.iter().map(|d| d.capped_single_weight.abs()).sum();
 
     let gross_scale = if total_gross_before_cap > max_gross && total_gross_before_cap > 1e-8 {
         max_gross / total_gross_before_cap

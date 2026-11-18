@@ -23,11 +23,12 @@ impl DatabaseManager {
             .query(
                 r#"SELECT position_id, asset_id, symbol, coin, client_order_id, side, quantity,
                           committed_notional_usdc, portfolio_weight, entry_price, mark_price,
-                          protective_stop_px, stop_distance_pct, highest_price_seen,
-                          lowest_price_seen, unrealized_pnl_usdc, realized_pnl_usdc,
-                          funding_accrued_usdc, fees_paid_usdc, s1_weight_contrib,
-                          s2_weight_contrib, s3_weight_contrib, latest_target_weight,
-                          latest_delta_weight, opened_at_ms, updated_at_ms
+                          protective_stop_px, protective_stop_oid, stop_distance_pct,
+                          take_profit_px, take_profit_oid, tp_distance_pct,
+                          highest_price_seen, lowest_price_seen, unrealized_pnl_usdc,
+                          realized_pnl_usdc, funding_accrued_usdc, fees_paid_usdc,
+                          s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                          latest_target_weight, latest_delta_weight, opened_at_ms, updated_at_ms
                    FROM v_assets_held
                    ORDER BY committed_notional_usdc DESC, position_id DESC"#,
             )
@@ -48,20 +49,24 @@ impl DatabaseManager {
                 entry_price: r.get(9).unwrap_or_default(),
                 mark_price: r.get(10).unwrap_or_default(),
                 protective_stop_px: r.get(11).unwrap_or_default(),
-                stop_distance_pct: r.get::<Option<f64>, _>(12).unwrap_or(None),
-                highest_price_seen: r.get(13).unwrap_or_default(),
-                lowest_price_seen: r.get(14).unwrap_or_default(),
-                unrealized_pnl_usdc: r.get(15).unwrap_or_default(),
-                realized_pnl_usdc: r.get(16).unwrap_or_default(),
-                funding_accrued_usdc: r.get(17).unwrap_or_default(),
-                fees_paid_usdc: r.get(18).unwrap_or_default(),
-                s1_weight_contrib: r.get(19).unwrap_or_default(),
-                s2_weight_contrib: r.get(20).unwrap_or_default(),
-                s3_weight_contrib: r.get(21).unwrap_or_default(),
-                latest_target_weight: r.get(22).unwrap_or_default(),
-                latest_delta_weight: r.get(23).unwrap_or_default(),
-                opened_at_ms: r.get::<Option<i64>, _>(24).unwrap_or(None),
-                updated_at_ms: r.get(25).unwrap_or_default(),
+                protective_stop_oid: r.get::<Option<String>, _>(12).unwrap_or(None),
+                stop_distance_pct: r.get::<Option<f64>, _>(13).unwrap_or(None),
+                take_profit_px: r.get(14).unwrap_or_default(),
+                take_profit_oid: r.get::<Option<String>, _>(15).unwrap_or(None),
+                tp_distance_pct: r.get::<Option<f64>, _>(16).unwrap_or(None),
+                highest_price_seen: r.get(17).unwrap_or_default(),
+                lowest_price_seen: r.get(18).unwrap_or_default(),
+                unrealized_pnl_usdc: r.get(19).unwrap_or_default(),
+                realized_pnl_usdc: r.get(20).unwrap_or_default(),
+                funding_accrued_usdc: r.get(21).unwrap_or_default(),
+                fees_paid_usdc: r.get(22).unwrap_or_default(),
+                s1_weight_contrib: r.get(23).unwrap_or_default(),
+                s2_weight_contrib: r.get(24).unwrap_or_default(),
+                s3_weight_contrib: r.get(25).unwrap_or_default(),
+                latest_target_weight: r.get(26).unwrap_or_default(),
+                latest_delta_weight: r.get(27).unwrap_or_default(),
+                opened_at_ms: r.get::<Option<i64>, _>(28).unwrap_or(None),
+                updated_at_ms: r.get(29).unwrap_or_default(),
             })
             .collect())
     }
@@ -74,8 +79,9 @@ impl DatabaseManager {
                 r#"SELECT position_id, asset_id, symbol, coin, client_order_id, exchange_order_id,
                           side, fsm_state, requested_quantity, filled_quantity,
                           reserved_margin_usdc, limit_price, mid_price, mark_price,
-                          distance_from_mid_bps, chase_count, s1_weight_contrib,
-                          s2_weight_contrib, s3_weight_contrib, created_at_ms, updated_at_ms
+                          distance_from_mid_bps, chase_count, protective_stop_px, take_profit_px,
+                          s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                          created_at_ms, updated_at_ms
                    FROM v_assets_ordered
                    ORDER BY created_at_ms DESC, position_id DESC"#,
             )
@@ -102,11 +108,13 @@ impl DatabaseManager {
                 mark_price: r.get(13).unwrap_or_default(),
                 distance_from_mid_bps: r.get(14).unwrap_or_default(),
                 chase_count: r.get(15).unwrap_or_default(),
-                s1_weight_contrib: r.get(16).unwrap_or_default(),
-                s2_weight_contrib: r.get(17).unwrap_or_default(),
-                s3_weight_contrib: r.get(18).unwrap_or_default(),
-                created_at_ms: r.get(19).unwrap_or_default(),
-                updated_at_ms: r.get(20).unwrap_or_default(),
+                protective_stop_px: r.get(16).unwrap_or_default(),
+                take_profit_px: r.get(17).unwrap_or_default(),
+                s1_weight_contrib: r.get(18).unwrap_or_default(),
+                s2_weight_contrib: r.get(19).unwrap_or_default(),
+                s3_weight_contrib: r.get(20).unwrap_or_default(),
+                created_at_ms: r.get(21).unwrap_or_default(),
+                updated_at_ms: r.get(22).unwrap_or_default(),
             })
             .collect())
     }
@@ -257,7 +265,8 @@ impl DatabaseManager {
                           position_id, position_status, position_side, fsm_state,
                           entry_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc,
-                          protective_stop_px, unrealized_pnl_usdc,
+                          protective_stop_px, protective_stop_oid,
+                          take_profit_px, take_profit_oid, unrealized_pnl_usdc,
                           target_weight, event_trigger, updated_at_ms
                    FROM v_priority_watchlist
                    ORDER BY position_id DESC, ABS(target_weight) DESC, symbol ASC"#,
@@ -285,10 +294,13 @@ impl DatabaseManager {
                 reserved_margin_usdc: r.get::<Option<f64>, _>(13).unwrap_or(None),
                 committed_notional_usdc: r.get::<Option<f64>, _>(14).unwrap_or(None),
                 protective_stop_px: r.get::<Option<f64>, _>(15).unwrap_or(None),
-                unrealized_pnl_usdc: r.get::<Option<f64>, _>(16).unwrap_or(None),
-                target_weight: r.get(17).unwrap_or_default(),
-                event_trigger: r.get::<Option<String>, _>(18).unwrap_or(None),
-                updated_at_ms: r.get(19).unwrap_or_default(),
+                protective_stop_oid: r.get::<Option<String>, _>(16).unwrap_or(None),
+                take_profit_px: r.get::<Option<f64>, _>(17).unwrap_or(None),
+                take_profit_oid: r.get::<Option<String>, _>(18).unwrap_or(None),
+                unrealized_pnl_usdc: r.get::<Option<f64>, _>(19).unwrap_or(None),
+                target_weight: r.get(20).unwrap_or_default(),
+                event_trigger: r.get::<Option<String>, _>(21).unwrap_or(None),
+                updated_at_ms: r.get(22).unwrap_or_default(),
             })
             .collect())
     }

@@ -153,6 +153,23 @@ pub async fn post_config_handler(
         }
 
         updated_keys.sort();
+        if updated_keys.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                "live_exchange_equity_usdc"
+                    | "initial_paper_equity_usdc"
+                    | "max_open_positions"
+                    | "target_leverage_multiplier"
+                    | "max_gross_leverage_x"
+                    | "max_single_asset_weight"
+            )
+        }) {
+            let cfg = db.load_config_or_default();
+            let engine = aegis_execution::ExecutionEngine::new(db.clone());
+            let base_eq = engine.resolve_effective_base_equity_usdc(&cfg);
+            let _ = engine.enforce_leverage_and_position_caps();
+            let _ = engine.record_portfolio_snapshot(Some(base_eq), None);
+        }
         let _ = db.log_telemetry(
             "INFO",
             "aegis-web.config",

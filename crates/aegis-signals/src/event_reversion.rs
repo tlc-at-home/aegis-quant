@@ -3,7 +3,7 @@
 //! Computes `s3_funding_zscore`, `s3_flush_atr_mult`, `w_s3_event_reversion`,
 //! and detects `"CAPITULATION_FLUSH"` and `"FUNDING_SQUEEZE"` triggers.
 
-use crate::trend_breakout::causal_ema;
+use crate::trend_breakout::{causal_ema, compute_rsi_and_range_position};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -110,11 +110,28 @@ pub fn evaluate_sleeve_s3(
             4,
         );
         let flush_atr = compute_flush_atr_multiple(asset, bars);
+        let live_px = if asset.mark_price > 0.0 {
+            asset.mark_price
+        } else {
+            bars.last().map(|b| b.close).unwrap_or(0.0)
+        };
+        let (rsi_14, range_pos, bouncing_from_low) = if bars.len() >= 8 && live_px > 0.0 {
+            compute_rsi_and_range_position(bars, live_px)
+        } else {
+            (50.0, 0.5, false)
+        };
 
-        let is_capitulation = flush_atr.abs() >= 2.0;
-        let is_funding_squeeze = f_zscore.abs() >= 1.8;
+        let is_capitulation = flush_atr <= -2.0 || (flush_atr >= 2.0 && range_pos > 0.55);
+        let is_funding_squeeze =
+            f_zscore <= -1.8 || (f_zscore >= 1.8 && flush_atr > 0.25 && range_pos > 0.35);
+        let is_bottom_reversion = bars.len() >= 8
+            && !is_capitulation
+            && range_pos <= 0.20
+            && rsi_14 < 54.0
+            && flush_atr <= 0.25
+            && (bouncing_from_low || rsi_14 < 38.0);
 
-        let trigger = if is_capitulation {
+        let trigger = if is_capitulation || is_bottom_reversion {
             Some(TRIGGER_CAPITULATION_FLUSH.to_string())
         } else if is_funding_squeeze {
             Some(TRIGGER_FUNDING_SQUEEZE.to_string())
@@ -122,11 +139,12 @@ pub fn evaluate_sleeve_s3(
             None
         };
 
-        let eligible = asset.is_event_eligible || asset.is_core_eligible || trigger.is_some();
+        let eligible = asset.is_event_eligible || asset.is_core_eligible;
 
         // Contrarian mean-reversion & funding dislocation score:
         // - Deep downward flush (`flush_atr <= -2.0`) -> contrarian LONG (+score)
         // - Deeply negative funding (`f_zscore <= -1.8`) -> short squeeze LONG (+score)
+        // - Oversold range-bottom bounce / higher-low retest -> contrarian LONG (scaled by range depth)
         // - Extreme blow-off + crowded positive funding -> contrarian SHORT (-score)
         let mut raw_score = 0.0;
         if eligible {
@@ -135,6 +153,10 @@ pub fn evaluate_sleeve_s3(
             }
             if is_funding_squeeze {
                 raw_score += (-f_zscore * 0.40).clamp(-1.5, 1.5);
+            }
+            if is_bottom_reversion {
+                let depth_boost = ((0.22 - range_pos).max(0.02) / 0.22).clamp(0.2, 1.0);
+                raw_score += 1.15 + 0.85 * depth_boost;
             }
         }
 
@@ -149,12 +171,24 @@ pub fn evaluate_sleeve_s3(
         ));
     }
 
-    let denom = if abs_sum > 1e-8 { abs_sum } else { 1.0 };
+    let _ = abs_sum;
+    let mut abs_scores: Vec<f64> = raw_items
+        .iter()
+        .map(|x| x.4.abs())
+        .filter(|&v| v > 1e-6)
+        .collect();
+    abs_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
+    let denom = if top_abs_sum > 1e-8 {
+        top_abs_sum
+    } else {
+        1.0
+    };
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for (asset_id, symbol, s3_funding_zscore, s3_flush_atr_mult, score, event_trigger) in raw_items
     {
-        let w_s3 = if abs_sum > 1e-8 && score.abs() > 1e-6 {
+        let w_s3 = if top_abs_sum > 1e-8 && score.abs() > 1e-6 {
             round_dp((score / denom) * budget, 4)
         } else {
             0.0

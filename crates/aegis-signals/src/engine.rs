@@ -407,4 +407,60 @@ mod tests {
             ACTION_COOLDOWN_BLOCKED
         );
     }
+
+    #[test]
+    fn test_bottom_range_asset_is_not_shorted() {
+        // Simulate an asset (like FET-USDC) that fell over the lookback window and is now
+        // bouncing slightly off the bottom of its range without breaking down below min_low.
+        let mut fet_bars = build_trend_bars(10, 0.25, -0.014, 30, 1.0);
+        let last_close = fet_bars.last().unwrap().close;
+        // Make the final bar stabilize slightly higher off the low so it is not actively crashing
+        let prev_close = last_close;
+        let bounce_close = prev_close * 1.006;
+        let mut last_bar = fet_bars.last().unwrap().clone();
+        last_bar.id = 31;
+        last_bar.timestamp_ms += 14_400_000;
+        last_bar.open = prev_close;
+        last_bar.low = prev_close * 0.996;
+        last_bar.close = bounce_close;
+        last_bar.high = bounce_close * 1.002;
+        fet_bars.push(last_bar);
+
+        let fet = sample_asset(10, "FET", bounce_close, 0.25, 0.0001, 5_000_000.0);
+        let mut bars_by_asset = HashMap::new();
+        bars_by_asset.insert(10, fet_bars);
+
+        let engine = SignalEngine::default();
+        let output = engine.evaluate_universe(&[fet], &bars_by_asset, &HashMap::new(), &[]);
+        let fet_sig = &output.signals[0];
+
+        assert!(
+            fet_sig.s1_mom_score > 0.0,
+            "S1 should produce positive recovery momentum at bouncing range bottom, got {}",
+            fet_sig.s1_mom_score
+        );
+        assert!(
+            fet_sig.w_s1_carry_mom > 0.0,
+            "S1 carry-mom weight should be positive at bouncing range bottom, got {}",
+            fet_sig.w_s1_carry_mom
+        );
+        assert!(
+            fet_sig.w_s3_event_reversion > 0.0,
+            "S3 bottom reversion weight should be positive, got {}",
+            fet_sig.w_s3_event_reversion
+        );
+        assert_ne!(
+            fet_sig.s2_trend_alignment, -1,
+            "S2 should block bearish alignment at range bottom"
+        );
+        assert!(
+            fet_sig.target_weight > 0.0,
+            "Bottom-range bouncing asset should receive positive LONG target weight, got {}",
+            fet_sig.target_weight
+        );
+        assert_eq!(
+            fet_sig.rebalance_action, ACTION_OPEN_LONG,
+            "Range-bottom bouncing asset should receive OPEN_LONG action"
+        );
+    }
 }

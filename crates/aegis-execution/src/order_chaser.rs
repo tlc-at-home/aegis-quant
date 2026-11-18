@@ -8,7 +8,8 @@
 
 use crate::http_client::HyperliquidHttpClient;
 use crate::signing::{
-    build_limit_order_wire, build_protective_stop_order_wire, snap_to_lot, snap_to_tick,
+    build_limit_order_wire, build_protective_stop_order_wire, build_take_profit_order_wire,
+    derive_hl_cloid_hex, snap_to_lot, snap_to_tick,
 };
 use aegis_alerts::{AlertEngine, OrderFilledOpenAlert, WorkingOrderPlacedAlert};
 use aegis_core::{
@@ -16,7 +17,30 @@ use aegis_core::{
     OrderedAssetView, Result,
 };
 use aegis_db::{DatabaseManager, WorkingOrderInput};
+use aegis_risk::{
+    compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
+    RiskLimitsConfig,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+
+pub(crate) fn parse_hl_oid(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|s| s.trim().strip_prefix("hl-").or_else(|| Some(s.trim())))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+}
+
+pub(crate) fn extract_order_oid(ord: &Value) -> Option<u64> {
+    ord.get("oid")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            ord.get("oid")
+                .and_then(Value::as_str)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .filter(|&v| v > 0)
+}
 
 /// Request payload to place a new `WORKING` (`WORKING_ALO`) order reserving margin.
 #[derive(Debug, Clone)]
@@ -427,6 +451,18 @@ impl OrderChaser {
                         &cfg,
                     );
                 }
+                if let Some(outcome) = self.try_finalize_existing_exchange_fill(
+                    ordered,
+                    pos.protective_stop_px,
+                    &asset,
+                    side,
+                    default_stop_pct,
+                    maker_fee_bps,
+                    tick,
+                    &cfg,
+                )? {
+                    return Ok(outcome);
+                }
                 let wire = build_limit_order_wire(
                     asset.asset_index,
                     side.is_buy(),
@@ -575,6 +611,18 @@ impl OrderChaser {
                         &cfg,
                     );
                 }
+                if let Some(outcome) = self.try_finalize_existing_exchange_fill(
+                    ordered,
+                    pos.protective_stop_px,
+                    &asset,
+                    side,
+                    default_stop_pct,
+                    maker_fee_bps,
+                    tick,
+                    &cfg,
+                )? {
+                    return Ok(outcome);
+                }
                 let chase_coid = format!(
                     "{}-c{}",
                     ordered.client_order_id,
@@ -682,6 +730,432 @@ impl OrderChaser {
         })
     }
 
+    /// Promotes a `WORKING` order immediately if `clearinghouseState` already shows a filled matching position.
+    #[allow(clippy::too_many_arguments)]
+    fn try_finalize_existing_exchange_fill(
+        &self,
+        ordered: &OrderedAssetView,
+        existing_stop_px: f64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        default_stop_pct: f64,
+        maker_fee_bps: f64,
+        tick: f64,
+        cfg: &ConfigMap,
+    ) -> Result<Option<ChaseStepOutcome>> {
+        let Some((fill_px, fill_qty)) =
+            self.check_if_working_order_filled_on_exchange(asset, side, cfg)
+        else {
+            return Ok(None);
+        };
+        let stop_px = if existing_stop_px > 0.0 {
+            existing_stop_px
+        } else if side.is_buy() {
+            snap_to_tick(fill_px * (1.0 - default_stop_pct), tick)
+        } else {
+            snap_to_tick(fill_px * (1.0 + default_stop_pct), tick)
+        };
+        let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+        let committed_usdc = self.finalize_fill_to_open(
+            ordered.position_id,
+            asset,
+            side,
+            fill_px,
+            fill_qty,
+            est_fee,
+            stop_px,
+            ordered.exchange_order_id.as_deref(),
+            "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
+            cfg,
+        )?;
+        Ok(Some(ChaseStepOutcome::FilledOpen {
+            position_id: ordered.position_id,
+            asset_id: ordered.asset_id,
+            symbol: ordered.symbol.clone(),
+            side: side.as_str().to_string(),
+            fill_price: fill_px,
+            filled_quantity: fill_qty,
+            committed_notional_usdc: committed_usdc,
+            protective_stop_px: stop_px,
+            fees_paid_usdc: est_fee,
+        }))
+    }
+
+    /// Queries Hyperliquid `clearinghouseState` to check if a `WORKING` order on `asset.coin`
+    /// already filled on-chain before cancelling/re-submitting a chase/IOC order.
+    fn check_if_working_order_filled_on_exchange(
+        &self,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        cfg: &ConfigMap,
+    ) -> Option<(f64, f64)> {
+        let wallet = cfg.get_str("wallet_address", "");
+        if wallet.is_empty() {
+            return None;
+        }
+        let ch_state = self.http.fetch_clearinghouse_state(&wallet, cfg).ok()?;
+        let parse_f = |v: Option<&Value>| -> f64 {
+            v.and_then(|x| {
+                x.as_f64()
+                    .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+            })
+            .filter(|val| val.is_finite())
+            .unwrap_or(0.0)
+        };
+        let arr = ch_state.get("assetPositions")?.as_array()?;
+        for item in arr {
+            let p = item.get("position").unwrap_or(item);
+            let coin = p.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+            if !coin.eq_ignore_ascii_case(&asset.coin) {
+                continue;
+            }
+            let szi = parse_f(p.get("szi"));
+            if szi.abs() > 1e-9 && (szi > 0.0) == side.is_buy() {
+                let qty = szi.abs();
+                let entry_px = parse_f(p.get("entryPx"));
+                let pos_val = parse_f(p.get("positionValue"));
+                let fill_px = if entry_px > 0.0 {
+                    entry_px
+                } else if pos_val > 0.0 {
+                    round_dp(pos_val / qty, 6)
+                } else if asset.mark_price > 0.0 {
+                    asset.mark_price
+                } else {
+                    asset.mid_price
+                };
+                if fill_px > 0.0 {
+                    return Some((fill_px, qty));
+                }
+            }
+        }
+        None
+    }
+
+    /// Ensures an active `OPEN` position has valid Stop-Loss (`tpsl = "sl"`) and Take-Profit (`tpsl = "tp"`)
+    /// prices and exchange trigger orders (or paper IDs in PAPER/test mode), persisting them to MariaDB.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_exchange_tpsl_orders(
+        &self,
+        position_id: i64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        quantity: f64,
+        mark_price: f64,
+        desired_stop_px: f64,
+        desired_tp_px: f64,
+        existing_sl_oid: Option<&str>,
+        existing_tp_oid: Option<&str>,
+        replace_sl: bool,
+        replace_tp: bool,
+        resting_exchange_oids: Option<&HashSet<u64>>,
+        cfg: &ConfigMap,
+    ) -> Result<(f64, Option<String>, f64, Option<String>)> {
+        let tick = asset.tick_size.max(1e-8);
+        let ref_mark = if mark_price > 0.0 {
+            mark_price
+        } else if asset.mark_price > 0.0 {
+            asset.mark_price
+        } else {
+            asset.mid_price
+        };
+        let default_sl_pct = cfg
+            .get_f64("protective_stop_default_pct", 0.04)
+            .clamp(0.005, 0.35);
+        let default_tp_pct = cfg
+            .get_f64("take_profit_default_pct", 0.08)
+            .clamp(0.01, 0.80);
+
+        let stop_px = if desired_stop_px > 0.0
+            && (ref_mark <= 0.0
+                || match side {
+                    OrderSide::Long => desired_stop_px < ref_mark - tick * 0.5,
+                    OrderSide::Short => desired_stop_px > ref_mark + tick * 0.5,
+                }) {
+            snap_to_tick(desired_stop_px, tick)
+        } else if ref_mark > 0.0 {
+            match side {
+                OrderSide::Long => snap_to_tick((ref_mark * (1.0 - default_sl_pct)).max(tick), tick),
+                OrderSide::Short => snap_to_tick(ref_mark * (1.0 + default_sl_pct), tick),
+            }
+        } else {
+            0.0
+        };
+
+        let tp_px = if desired_tp_px > 0.0
+            && (ref_mark <= 0.0
+                || match side {
+                    OrderSide::Long => desired_tp_px > ref_mark + tick * 0.5,
+                    OrderSide::Short => desired_tp_px < ref_mark - tick * 0.5,
+                }) {
+            snap_to_tick(desired_tp_px, tick)
+        } else if ref_mark > 0.0 {
+            match side {
+                OrderSide::Long => snap_to_tick(ref_mark * (1.0 + default_tp_pct), tick),
+                OrderSide::Short => {
+                    snap_to_tick((ref_mark * (1.0 - default_tp_pct)).max(tick), tick)
+                }
+            }
+        } else {
+            0.0
+        };
+
+        let is_live_exchange = cfg.execution_mode().is_live_or_testnet()
+            && !cfg.get_str("private_key", "").is_empty()
+            && !self.db.is_ephemeral_test_db();
+
+        if !is_live_exchange {
+            let sl_oid = Some(format!("paper-sl-{position_id}"));
+            let tp_oid = Some(format!("paper-tp-{position_id}"));
+            self.db.update_position_tpsl_orders(
+                position_id,
+                stop_px,
+                sl_oid.as_deref(),
+                tp_px,
+                tp_oid.as_deref(),
+            )?;
+            return Ok((stop_px, sl_oid, tp_px, tp_oid));
+        }
+
+        let pk = cfg.get_str("private_key", "");
+        let wallet = cfg.get_str("wallet_address", "");
+        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
+
+        let mut resting_oids: HashSet<u64> = HashSet::new();
+        let mut cloid_to_oid: HashMap<String, u64> = HashMap::new();
+
+        if let Some(set) = resting_exchange_oids {
+            resting_oids.extend(set.iter().copied());
+        } else if !wallet.is_empty()
+            && ((!replace_sl && existing_sl_oid.is_some())
+                || (!replace_tp && existing_tp_oid.is_some()))
+        {
+            let orders = self
+                .http
+                .fetch_frontend_open_orders(&wallet, cfg)
+                .or_else(|_| self.http.fetch_open_orders(&wallet, cfg))
+                .unwrap_or_default();
+            for ord in &orders {
+                if let Some(oid) = extract_order_oid(ord) {
+                    resting_oids.insert(oid);
+                    if let Some(cloid) = ord.get("cloid").and_then(Value::as_str) {
+                        cloid_to_oid.insert(cloid.trim().to_ascii_lowercase(), oid);
+                    }
+                }
+            }
+        }
+
+        let sl_oid = if stop_px > 0.0 && quantity > 0.0 {
+            self.ensure_single_trigger_leg(
+                false,
+                position_id,
+                asset,
+                side,
+                quantity,
+                stop_px,
+                existing_sl_oid,
+                replace_sl,
+                resting_exchange_oids.is_some() || !cloid_to_oid.is_empty() || !resting_oids.is_empty(),
+                &resting_oids,
+                &cloid_to_oid,
+                &pk,
+                &wallet,
+                taker_fee_bps,
+                cfg,
+            )
+        } else {
+            None
+        };
+
+        let tp_oid = if tp_px > 0.0 && quantity > 0.0 {
+            self.ensure_single_trigger_leg(
+                true,
+                position_id,
+                asset,
+                side,
+                quantity,
+                tp_px,
+                existing_tp_oid,
+                replace_tp,
+                resting_exchange_oids.is_some() || !cloid_to_oid.is_empty() || !resting_oids.is_empty(),
+                &resting_oids,
+                &cloid_to_oid,
+                &pk,
+                &wallet,
+                taker_fee_bps,
+                cfg,
+            )
+        } else {
+            None
+        };
+
+        self.db.update_position_tpsl_orders(
+            position_id,
+            stop_px,
+            sl_oid.as_deref(),
+            tp_px,
+            tp_oid.as_deref(),
+        )?;
+
+        Ok((stop_px, sl_oid, tp_px, tp_oid))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_single_trigger_leg(
+        &self,
+        is_tp: bool,
+        position_id: i64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        quantity: f64,
+        trigger_px: f64,
+        existing_oid_str: Option<&str>,
+        force_replace: bool,
+        have_resting_snapshot: bool,
+        resting_oids: &HashSet<u64>,
+        cloid_to_oid: &HashMap<String, u64>,
+        pk: &str,
+        wallet: &str,
+        taker_fee_bps: f64,
+        cfg: &ConfigMap,
+    ) -> Option<String> {
+        let leg_label = if is_tp { "TP" } else { "SL" };
+        let existing_num_oid = parse_hl_oid(existing_oid_str).or_else(|| {
+            existing_oid_str
+                .map(|s| s.trim().to_ascii_lowercase())
+                .and_then(|c| cloid_to_oid.get(&c).copied())
+        });
+
+        let already_resting = if let Some(oid) = existing_num_oid {
+            if have_resting_snapshot {
+                resting_oids.contains(&oid)
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        if already_resting && !force_replace {
+            return existing_num_oid.map(|id| format!("hl-{id}"));
+        }
+
+        if let Some(old_oid) = existing_num_oid {
+            if !have_resting_snapshot || resting_oids.contains(&old_oid) {
+                let _ = self.http.cancel_order_wire(
+                    asset.asset_index,
+                    old_oid,
+                    pk,
+                    Some(&self.db),
+                    cfg,
+                );
+            }
+        }
+
+        let coid = format!(
+            "v2-{}-{position_id}-{}",
+            if is_tp { "tp" } else { "sl" },
+            now_ms()
+        );
+        let expected_cloid = derive_hl_cloid_hex(&coid);
+        let wire = if is_tp {
+            build_take_profit_order_wire(
+                asset.asset_index,
+                side,
+                quantity,
+                trigger_px,
+                asset.tick_size,
+                asset.lot_step_size,
+                asset.sz_decimals,
+                Some(&coid),
+            )
+        } else {
+            build_protective_stop_order_wire(
+                asset.asset_index,
+                side,
+                quantity,
+                trigger_px,
+                asset.tick_size,
+                asset.lot_step_size,
+                asset.sz_decimals,
+                Some(&coid),
+            )
+        };
+
+        match self.http.submit_order_wire(
+            wire,
+            quantity,
+            trigger_px,
+            taker_fee_bps,
+            pk,
+            Some(&self.db),
+            cfg,
+        ) {
+            Ok(ack) if ack.accepted => {
+                if let Some(eoid) = ack.exchange_order_id {
+                    return Some(eoid);
+                }
+                if !wallet.is_empty() {
+                    if let Ok(front_orders) = self.http.fetch_frontend_open_orders(wallet, cfg) {
+                        for ord in &front_orders {
+                            let cloid_match = ord
+                                .get("cloid")
+                                .and_then(Value::as_str)
+                                .is_some_and(|c| c.trim().eq_ignore_ascii_case(&expected_cloid));
+                            if cloid_match {
+                                if let Some(oid) = extract_order_oid(ord) {
+                                    return Some(format!("hl-{oid}"));
+                                }
+                            }
+                        }
+                        let expected_type_prefix = if is_tp { "take profit" } else { "stop" };
+                        for ord in &front_orders {
+                            let coin_match = ord
+                                .get("coin")
+                                .and_then(Value::as_str)
+                                .is_some_and(|c| c.trim().eq_ignore_ascii_case(&asset.coin));
+                            let is_trigger = ord
+                                .get("isTrigger")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let type_match = ord
+                                .get("orderType")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| {
+                                    t.to_ascii_lowercase().contains(expected_type_prefix)
+                                });
+                            if coin_match && is_trigger && type_match {
+                                if let Some(oid) = extract_order_oid(ord) {
+                                    return Some(format!("hl-{oid}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(expected_cloid)
+            }
+            Ok(ack) => {
+                tracing::warn!(
+                    symbol = %asset.symbol,
+                    leg = leg_label,
+                    trigger_px = trigger_px,
+                    error = ?ack.raw_error,
+                    "Hyperliquid rejected exchange trigger order"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    symbol = %asset.symbol,
+                    leg = leg_label,
+                    trigger_px = trigger_px,
+                    error = %e,
+                    "Failed to submit exchange trigger order"
+                );
+                None
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finalize_fill_to_open(
         &self,
@@ -696,42 +1170,62 @@ impl OrderChaser {
         reason: &str,
         cfg: &ConfigMap,
     ) -> Result<f64> {
+        let bars_1h = self
+            .db
+            .get_ohlcv_bars(asset.id, "1h", 20)
+            .unwrap_or_default();
+        let limits = RiskLimitsConfig::from_config_map(cfg);
+        let atr_opt = (!bars_1h.is_empty()).then(|| {
+            compute_atr_from_bars(
+                &bars_1h,
+                14,
+                fill_price,
+                limits.protective_stop_default_pct,
+            )
+        });
+        let tick = asset.tick_size.max(1e-8);
+        let eff_stop_px = if stop_px > 0.0
+            && match side {
+                OrderSide::Long => stop_px < fill_price - tick * 0.5,
+                OrderSide::Short => stop_px > fill_price + tick * 0.5,
+            } {
+            snap_to_tick(stop_px, tick)
+        } else {
+            compute_initial_protective_stop(side, fill_price, atr_opt, tick, &limits)
+        };
+        let atr_tp_px = compute_initial_take_profit(side, fill_price, atr_opt, tick, &limits);
+        let min_2r_dist = (fill_price - eff_stop_px).abs() * 2.0;
+        let eff_tp_dist = (atr_tp_px - fill_price).abs().max(min_2r_dist);
+        let eff_tp_px = match side {
+            OrderSide::Long => snap_to_tick(fill_price + eff_tp_dist, tick),
+            OrderSide::Short => snap_to_tick((fill_price - eff_tp_dist).max(tick), tick),
+        };
+
         self.db.promote_working_to_open(
             position_id,
             fill_price,
             filled_qty,
             fees_paid_usdc,
-            stop_px,
+            eff_stop_px,
             exchange_order_id,
             reason,
         )?;
 
-        // Submit exchange-side protective trigger stop order if on Testnet/Live
-        if cfg.execution_mode().is_live_or_testnet() {
-            let pk = cfg.get_str("private_key", "");
-            if !pk.is_empty() && stop_px > 0.0 {
-                let stop_wire = build_protective_stop_order_wire(
-                    asset.asset_index,
-                    side,
-                    filled_qty,
-                    stop_px,
-                    asset.tick_size,
-                    asset.lot_step_size,
-                    asset.sz_decimals,
-                    Some(&format!("v2-sl-{position_id}-{}", now_ms())),
-                );
-                let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-                let _ = self.http.submit_order_wire(
-                    stop_wire,
-                    filled_qty,
-                    stop_px,
-                    taker_fee_bps,
-                    &pk,
-                    Some(&self.db),
-                    cfg,
-                );
-            }
-        }
+        let (final_stop_px, _sl_oid, final_tp_px, _tp_oid) = self.ensure_exchange_tpsl_orders(
+            position_id,
+            asset,
+            side,
+            filled_qty,
+            fill_price,
+            eff_stop_px,
+            eff_tp_px,
+            None,
+            None,
+            true,
+            true,
+            None,
+            cfg,
+        )?;
 
         let committed_usdc = round_dp(fill_price * filled_qty, 4);
 
@@ -751,7 +1245,8 @@ impl OrderChaser {
                 committed_notional_usdc: committed_usdc,
                 total_equity_usdc: snap.total_equity_usdc,
                 available_cash_usdc: avail_after,
-                protective_stop_px: stop_px,
+                protective_stop_px: final_stop_px,
+                take_profit_px: final_tp_px,
                 s1_weight: pos.s1_weight_contrib,
                 s2_weight: pos.s2_weight_contrib,
                 s3_weight: pos.s3_weight_contrib,

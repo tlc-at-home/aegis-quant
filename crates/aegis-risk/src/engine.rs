@@ -11,7 +11,8 @@ use crate::limits::{
     RiskLimitsConfig,
 };
 use crate::stops::{
-    compute_initial_protective_stop, evaluate_1s_protective_stop, StopRatchetEvaluation,
+    compute_initial_protective_stop, compute_initial_take_profit, evaluate_1s_position_tpsl,
+    evaluate_1s_protective_stop, StopRatchetEvaluation,
 };
 use aegis_core::{
     round_dp, ConfigMap, ExchangeAsset, HeldAssetView, OrderSide, OrderedAssetView, PositionRecord,
@@ -38,6 +39,8 @@ pub struct WorkingOrderSizingPlan {
     pub s3_weight_contrib: f64,
     pub protective_stop_px: f64,
     pub stop_distance_pct: f64,
+    pub take_profit_px: f64,
+    pub tp_distance_pct: f64,
 }
 
 /// Summary of the `WORKING -> OPEN` capital commitment transition when an exchange fill is confirmed.
@@ -49,6 +52,7 @@ pub struct OpenCommitmentSummary {
     pub committed_notional_usdc: f64,
     pub available_cash_after_usdc: f64,
     pub protective_stop_px: f64,
+    pub take_profit_px: f64,
     pub fees_paid_usdc: f64,
 }
 
@@ -166,6 +170,8 @@ impl RiskEngine {
             s3_weight_contrib: 0.0,
             protective_stop_px: 0.0,
             stop_distance_pct: 0.0,
+            take_profit_px: 0.0,
+            tp_distance_pct: 0.0,
         };
 
         if limit_price <= 0.0 {
@@ -240,6 +246,21 @@ impl RiskEngine {
         } else {
             0.0
         };
+        let take_profit_px = compute_initial_take_profit(
+            side,
+            limit_price,
+            atr_opt,
+            asset.tick_size,
+            &self.limits,
+        );
+        let tp_distance_pct = if take_profit_px > 0.0 {
+            round_dp(
+                ((take_profit_px - limit_price).abs() / limit_price) * 100.0,
+                2,
+            )
+        } else {
+            0.0
+        };
 
         let achieved_weight = round_dp((target_notional_usdc / equity) * side.sign(), 4);
         let raw_sleeve_sum =
@@ -267,6 +288,8 @@ impl RiskEngine {
             s3_weight_contrib,
             protective_stop_px,
             stop_distance_pct,
+            take_profit_px,
+            tp_distance_pct,
         }
     }
 
@@ -294,6 +317,8 @@ impl RiskEngine {
         let fees_paid_usdc = round_dp(committed_notional_usdc * (fee_bps / 10_000.0), 4);
         let protective_stop_px =
             compute_initial_protective_stop(side, fill_price, atr_opt, tick_size, &self.limits);
+        let take_profit_px =
+            compute_initial_take_profit(side, fill_price, atr_opt, tick_size, &self.limits);
 
         let committed_margin = compute_reserved_margin_usdc(
             committed_notional_usdc,
@@ -314,6 +339,7 @@ impl RiskEngine {
             committed_notional_usdc,
             available_cash_after_usdc,
             protective_stop_px,
+            take_profit_px,
             fees_paid_usdc,
         }
     }
@@ -338,6 +364,36 @@ impl RiskEngine {
             mark_price,
             quantity,
             current_stop_px,
+            highest_price_seen,
+            lowest_price_seen,
+            atr_opt,
+            tick_size,
+            &self.limits,
+        )
+    }
+
+    /// Evaluates both the 1-second High-Water Chandelier/ATR trailing stop ratchet AND take-profit target on an `OPEN` position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_1s_stop_and_tp_ratchet(
+        &self,
+        side: OrderSide,
+        entry_price: f64,
+        mark_price: f64,
+        quantity: f64,
+        current_stop_px: f64,
+        current_tp_px: f64,
+        highest_price_seen: f64,
+        lowest_price_seen: f64,
+        atr_opt: Option<f64>,
+        tick_size: f64,
+    ) -> StopRatchetEvaluation {
+        evaluate_1s_position_tpsl(
+            side,
+            entry_price,
+            mark_price,
+            quantity,
+            current_stop_px,
+            current_tp_px,
             highest_price_seen,
             lowest_price_seen,
             atr_opt,
@@ -405,6 +461,7 @@ mod tests {
         assert!(plan.reserved_margin_usdc > 0.0);
         assert_eq!(plan.committed_notional_usdc, 0.0);
         assert!(plan.protective_stop_px < plan.limit_price);
+        assert!(plan.take_profit_px > plan.limit_price);
 
         let working_pos = PositionRecord {
             id: 1,
@@ -426,6 +483,8 @@ mod tests {
             s3_weight_contrib: plan.s3_weight_contrib,
             protective_stop_px: plan.protective_stop_px,
             protective_stop_oid: None,
+            take_profit_px: plan.take_profit_px,
+            take_profit_oid: None,
             highest_price_seen: plan.limit_price,
             lowest_price_seen: plan.limit_price,
             chase_count: 0,

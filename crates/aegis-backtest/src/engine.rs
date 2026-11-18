@@ -328,6 +328,7 @@ impl BacktestEngine {
                     pos.reserved_margin_usdc = 0.0;
                     pos.committed_notional_usdc = commit.committed_notional_usdc;
                     pos.protective_stop_px = commit.protective_stop_px;
+                    pos.take_profit_px = commit.take_profit_px;
                     pos.fees_paid_usdc += commit.fees_paid_usdc;
                     pos.opened_at_ms = Some(ts_ms);
                     pos.updated_at_ms = ts_ms;
@@ -361,12 +362,13 @@ impl BacktestEngine {
                 realized_cash_equity += funding_cash;
                 total_funding_usdc += funding_cash;
 
-                let stop_eval = risk_engine.evaluate_1s_stop_ratchet(
+                let stop_eval = risk_engine.evaluate_1s_stop_and_tp_ratchet(
                     side,
                     pos.entry_price,
                     asset.mark_price,
                     pos.filled_quantity,
                     pos.protective_stop_px,
+                    pos.take_profit_px,
                     pos.highest_price_seen,
                     pos.lowest_price_seen,
                     Some(atr),
@@ -377,6 +379,7 @@ impl BacktestEngine {
                 pos.highest_price_seen = stop_eval.highest_price_seen;
                 pos.lowest_price_seen = stop_eval.lowest_price_seen;
                 pos.protective_stop_px = stop_eval.new_protective_stop_px;
+                pos.take_profit_px = stop_eval.take_profit_px;
                 pos.unrealized_pnl_usdc = stop_eval.unrealized_pnl_usdc;
                 pos.updated_at_ms = ts_ms;
 
@@ -425,10 +428,13 @@ impl BacktestEngine {
                     pos.updated_at_ms = ts_ms;
                     pos.exit_reason = Some(reason.clone());
                     closed_positions.push(pos);
-                    stop_out_count += 1;
+                    if !reason.starts_with("TAKE_PROFIT") {
+                        stop_out_count += 1;
 
-                    let exp_ms = ts_ms + (self.config.stop_out_cooldown_bars as i64) * 14_400_000;
-                    cooldown_until_ms.insert(aid, (exp_ms, sym));
+                        let exp_ms =
+                            ts_ms + (self.config.stop_out_cooldown_bars as i64) * 14_400_000;
+                        cooldown_until_ms.insert(aid, (exp_ms, sym));
+                    }
                 }
             }
 
@@ -572,6 +578,8 @@ impl BacktestEngine {
                                 s3_weight_contrib: plan.s3_weight_contrib,
                                 protective_stop_px: plan.protective_stop_px,
                                 protective_stop_oid: None,
+                                take_profit_px: plan.take_profit_px,
+                                take_profit_oid: None,
                                 highest_price_seen: plan.limit_price,
                                 lowest_price_seen: plan.limit_price,
                                 chase_count: 0,

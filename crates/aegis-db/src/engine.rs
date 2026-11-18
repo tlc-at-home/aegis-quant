@@ -224,6 +224,7 @@ impl DatabaseManager {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let mut migrated_columns = false;
         for raw_stmt in uncommented_sql.split(';') {
             let trimmed = raw_stmt.trim();
             if trimmed.is_empty() {
@@ -232,6 +233,17 @@ impl DatabaseManager {
             let upper = trimmed.to_ascii_uppercase();
             if upper.starts_with("CREATE DATABASE") || upper.starts_with("USE ") {
                 continue;
+            }
+            if !migrated_columns && upper.starts_with("CREATE OR REPLACE VIEW") {
+                migrated_columns = true;
+                conn.query_drop(
+                    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_px DOUBLE NOT NULL DEFAULT 0.0 AFTER protective_stop_oid",
+                )
+                .map_err(|e| AegisError::Database(format!("Schema migration take_profit_px failed: {e}")))?;
+                conn.query_drop(
+                    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_oid VARCHAR(64) NULL AFTER take_profit_px",
+                )
+                .map_err(|e| AegisError::Database(format!("Schema migration take_profit_oid failed: {e}")))?;
             }
             conn.query_drop(trimmed).map_err(|e| {
                 AegisError::Database(format!("Schema DDL execution failed on `{trimmed}`: {e}"))
