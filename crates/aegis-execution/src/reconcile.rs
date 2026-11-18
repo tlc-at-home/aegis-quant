@@ -131,14 +131,15 @@ impl CutoverReconciler {
             ))
             .max(parse_f(ch_state.get("withdrawable")));
         let mut live_eq = perp_eq;
-        if live_eq < 1.0 {
-            if let Ok(spot_state) = self.http.fetch_spot_clearinghouse_state(&wallet, &cfg) {
-                if let Some(balances) = spot_state.get("balances").and_then(Value::as_array) {
-                    for b in balances {
-                        let coin = b.get("coin").and_then(Value::as_str).unwrap_or("");
-                        if coin.eq_ignore_ascii_case("USDC") {
-                            live_eq += parse_f(b.get("total"));
-                        }
+        if let Ok(spot_state) = self.http.fetch_spot_clearinghouse_state(&wallet, &cfg) {
+            if let Some(balances) = spot_state.get("balances").and_then(Value::as_array) {
+                for b in balances {
+                    let coin = b.get("coin").and_then(Value::as_str).unwrap_or("");
+                    if coin.eq_ignore_ascii_case("USDC") {
+                        let total = parse_f(b.get("total"));
+                        let hold = parse_f(b.get("hold"));
+                        let unheld_spot_usdc = (total - hold).max(0.0);
+                        live_eq += unheld_spot_usdc;
                     }
                 }
             }
@@ -274,19 +275,46 @@ impl CutoverReconciler {
                 let _ = self.db.update_asset_live_quote(asset.id, mark_px, mark_px);
 
                 let mut closed_on_exchange = false;
+                let mut remaining_qty = qty;
                 if close_legacy_positions && !private_key.is_empty() {
                     let close_is_buy = !side.is_buy();
-                    for slip_pct in [0.0395, 0.08] {
+                    let l2_bbo = self.http.fetch_l2_book(&coin, &cfg).ok().flatten();
+                    let bbo_anchor = l2_bbo
+                        .map(|(bid, ask)| if close_is_buy { ask } else { bid })
+                        .filter(|&px| px > 0.0)
+                        .unwrap_or(mark_px);
+
+                    for (attempt_idx, (base_px, slip_pct)) in [
+                        (bbo_anchor, 0.0),
+                        (bbo_anchor, 0.01),
+                        (bbo_anchor, 0.025),
+                        (mark_px, 0.0395),
+                        (bbo_anchor, 0.05),
+                        (mark_px, 0.075),
+                        (bbo_anchor, 0.075),
+                        (bbo_anchor, 0.12),
+                        (mark_px, 0.12),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if remaining_qty <= 1e-9 {
+                            break;
+                        }
                         let limit_px = if close_is_buy {
-                            mark_px * (1.0 + slip_pct)
+                            base_px * (1.0 + slip_pct)
                         } else {
-                            mark_px * (1.0 - slip_pct)
+                            base_px * (1.0 - slip_pct)
                         };
                         let wire = OrderWire {
                             a: asset.asset_index,
                             b: close_is_buy,
                             p: format_hl_wire_price(limit_px, asset.tick_size, asset.sz_decimals),
-                            s: format_hl_wire_size(qty, asset.lot_step_size, asset.sz_decimals),
+                            s: format_hl_wire_size(
+                                remaining_qty,
+                                asset.lot_step_size,
+                                asset.sz_decimals,
+                            ),
                             r: true,
                             t: OrderTypeWire {
                                 limit: Some(LimitOrderType {
@@ -295,7 +323,7 @@ impl CutoverReconciler {
                                 trigger: None,
                             },
                             c: Some(derive_hl_cloid_hex(&format!(
-                                "cutover-close-{}-{}-{}",
+                                "cutover-close-{}-{}-{attempt_idx}-{}",
                                 coin.to_ascii_lowercase(),
                                 slip_pct,
                                 ts
@@ -303,28 +331,39 @@ impl CutoverReconciler {
                         };
                         if let Ok(ack) = self.http.submit_order_wire(
                             wire,
-                            qty,
-                            mark_px,
+                            remaining_qty,
+                            base_px,
                             taker_fee_bps,
                             &private_key,
                             Some(&self.db),
                             &cfg,
                         ) {
-                            if ack.accepted && ack.status == "FILLED" {
-                                closed_on_exchange = true;
-                                report.legacy_positions_closed += 1;
-                                report.details.push(format!(
-                                    "Closed position {} ({} {:.4} @ ${:.4})",
-                                    asset.symbol,
-                                    side.as_str(),
-                                    qty,
-                                    ack.avg_fill_price
-                                ));
-                                break;
+                            if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                                remaining_qty = (remaining_qty - ack.filled_quantity).max(0.0);
+                                if remaining_qty <= asset.lot_step_size * 0.5 {
+                                    closed_on_exchange = true;
+                                    report.legacy_positions_closed += 1;
+                                    let _ = self.db.insert_asset_cooldown(
+                                        asset.id,
+                                        "MANUAL",
+                                        "Cutover position flatten cooldown",
+                                        900,
+                                    );
+                                    report.details.push(format!(
+                                        "Closed position {} ({} {:.4} @ ${:.4})",
+                                        asset.symbol,
+                                        side.as_str(),
+                                        qty,
+                                        ack.avg_fill_price
+                                    ));
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+
+                let qty = remaining_qty.max(1e-9);
 
                 if !closed_on_exchange {
                     let tick = asset.tick_size.max(1e-8);

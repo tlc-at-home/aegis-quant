@@ -281,6 +281,8 @@ pub fn default_v2_system_config_seeds(
         ("risk_tier", "extreme", "string", "Active portfolio risk tier: conservative (0.65x), standard (1.00x), aggressive (1.35x), extreme (1.85x), custom"),
         ("target_leverage_multiplier", "1.85", "float", "Active target leverage multiplier L_tier seeded at Extreme (1.85x)"),
         ("max_gross_leverage_x", "2.50", "float", "Hard portfolio gross leverage ceiling (2.50x)"),
+        ("max_open_positions", "6", "int", "Hard cap on total concurrent active positions (OPEN + WORKING combined)"),
+        ("min_entry_interval_sec", "150", "int", "Minimum cooldown interval in seconds between opening new positions (150s default)"),
         ("max_single_asset_weight", "0.30", "float", "Maximum single-asset portfolio weight cap (30% of equity)"),
         ("min_rebalance_delta_weight", "0.025", "float", "Minimum weight delta (2.5% of equity) required to submit a rebalance order"),
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),

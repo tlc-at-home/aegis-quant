@@ -97,6 +97,30 @@ impl OrderChaser {
         }
 
         let cfg = self.db.load_config_or_default();
+        let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
+        let min_entry_interval_sec = cfg.get_i64("min_entry_interval_sec", 150).max(0);
+
+        let total_active = self.db.get_assets_held().map(|v| v.len()).unwrap_or(0)
+            + self.db.get_assets_ordered().map(|v| v.len()).unwrap_or(0);
+        if total_active >= max_open_positions {
+            return Err(AegisError::Validation(format!(
+                "MAX_OPEN_POSITIONS_REACHED: active={total_active} >= max_open_positions={max_open_positions}"
+            )));
+        }
+
+        if min_entry_interval_sec > 0 {
+            if let Ok(Some(last_entry_ms)) = self.db.last_position_entry_timestamp_ms() {
+                let elapsed_ms = now_ms().saturating_sub(last_entry_ms);
+                if elapsed_ms < min_entry_interval_sec * 1000 {
+                    return Err(AegisError::Validation(format!(
+                        "MIN_ENTRY_INTERVAL_COOLDOWN: elapsed={}s < min_entry_interval_sec={}s",
+                        elapsed_ms / 1000,
+                        min_entry_interval_sec
+                    )));
+                }
+            }
+        }
+
         let ref_mid = if req.asset.mid_price > 0.0 {
             req.asset.mid_price
         } else {
@@ -213,6 +237,7 @@ impl OrderChaser {
             reason: req.reason.clone(),
         })?;
 
+        let _ = self.db.record_position_entry_timestamp_ms(now_ms());
         let _ = self.db.set_asset_priority_watch(req.asset.id, true);
 
         if let Ok(snap) = self.db.get_latest_portfolio_snapshot() {

@@ -397,16 +397,20 @@ function setConfigCategory(cat) {
 function classifyConfigKeyCategory(key) {
   const k = String(key || '').toLowerCase();
   if (
+    k === 'max_open_positions' ||
+    k === 'min_entry_interval_sec' ||
     k.includes('risk_tier') ||
     k.includes('leverage') ||
     k.includes('weight') ||
     k.includes('stop') ||
     k.includes('cooldown') ||
-    k.includes('equity')
+    k.includes('equity') ||
+    k.includes('max_open')
   ) {
     return 'risk';
   }
   if (
+    k.includes('entry_interval') ||
     k.includes('execution') ||
     k.includes('hyperliquid') ||
     k.includes('scanner') ||
@@ -930,21 +934,47 @@ function renderSystemConfigTables(force = false) {
     .trim()
     .toUpperCase();
 
+  const PRIORITY_CONFIG_KEYS = [
+    'risk_tier',
+    'target_leverage_multiplier',
+    'max_open_positions',
+    'min_entry_interval_sec',
+    'max_gross_leverage_x',
+    'max_single_asset_weight',
+    'execution_mode',
+  ];
+
   const filterRows = (q) =>
-    configs.filter((c) => {
-      if (cat !== 'all' && classifyConfigKeyCategory(c.config_key) !== cat) {
-        return false;
-      }
-      if (!q) return true;
-      return (
-        String(c.config_key || '')
-          .toUpperCase()
-          .includes(q) ||
-        String(c.description || '')
-          .toUpperCase()
-          .includes(q)
-      );
-    });
+    configs
+      .filter((c) => {
+        const k = String(c.config_key || '').toLowerCase();
+        const isDualRiskExec =
+          k === 'max_open_positions' || k === 'min_entry_interval_sec';
+        if (
+          cat !== 'all' &&
+          classifyConfigKeyCategory(c.config_key) !== cat &&
+          !(isDualRiskExec && (cat === 'risk' || cat === 'execution'))
+        ) {
+          return false;
+        }
+        if (!q) return true;
+        return (
+          String(c.config_key || '')
+            .toUpperCase()
+            .includes(q) ||
+          String(c.description || '')
+            .toUpperCase()
+            .includes(q)
+        );
+      })
+      .sort((a, b) => {
+        const ia = PRIORITY_CONFIG_KEYS.indexOf(String(a.config_key || ''));
+        const ib = PRIORITY_CONFIG_KEYS.indexOf(String(b.config_key || ''));
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return String(a.config_key || '').localeCompare(String(b.config_key || ''));
+      });
 
   const renderRows = (rows, prefix) =>
     rows

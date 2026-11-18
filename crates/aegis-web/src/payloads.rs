@@ -468,6 +468,13 @@ pub fn execute_risk_tier_switch(
         Some("Active target leverage multiplier L_tier"),
     )?;
 
+    // Immediately enforce max_open_positions & target_leverage_multiplier cap upon switching risk tier
+    let cfg = db.load_config_or_default();
+    let engine = aegis_execution::ExecutionEngine::new(db.clone());
+    let base_eq = engine.resolve_effective_base_equity_usdc(&cfg);
+    let _ = engine.enforce_leverage_and_position_caps();
+    let _ = engine.record_portfolio_snapshot(Some(base_eq), None);
+
     let badge = tier.display_badge(Some(mult));
     let _ = db.log_telemetry(
         "INFO",

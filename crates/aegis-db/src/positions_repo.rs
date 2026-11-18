@@ -803,6 +803,34 @@ impl DatabaseManager {
         })?;
         Ok(())
     }
+
+    /// Returns the millisecond timestamp of the most recent v2 position entry (`client_order_id LIKE 'v2-%'`)
+    /// or `last_entry_order_ms` stored in `system_config`, whichever is newer.
+    pub fn last_position_entry_timestamp_ms(&self) -> Result<Option<i64>> {
+        let mut conn = self.get_conn()?;
+        let db_max: Option<Option<i64>> = conn
+            .query_first(
+                "SELECT MAX(created_at_ms) FROM positions WHERE client_order_id LIKE 'v2-%'",
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("last_position_entry_timestamp_ms failed: {e}"))
+            })?;
+        let pos_ts = db_max.flatten().unwrap_or(0);
+        let cfg_ts = self
+            .load_config_or_default()
+            .get_i64("last_entry_order_ms", 0);
+        let max_ts = pos_ts.max(cfg_ts);
+        Ok((max_ts > 0).then_some(max_ts))
+    }
+
+    /// Persists the latest new position entry timestamp (`last_entry_order_ms`) in `system_config`.
+    pub fn record_position_entry_timestamp_ms(&self, ts_ms: i64) -> Result<()> {
+        self.set_config_value(
+            "last_entry_order_ms",
+            &ts_ms.to_string(),
+            Some("Timestamp (ms) of the most recent new position entry order"),
+        )
+    }
 }
 
 fn row_to_position_record(r: mysql::Row) -> PositionRecord {
