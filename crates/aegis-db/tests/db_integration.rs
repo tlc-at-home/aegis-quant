@@ -841,3 +841,116 @@ fn test_pnl_summary_horizon_baseline_funding_and_cap_cutoff() {
     assert!(!det_str.contains("0x4c0883"));
     assert!(!det_str.contains("gAAAAABembedded"));
 }
+
+#[test]
+fn test_batch_mid_priority_open_positions_and_signals() {
+    let db = DatabaseManager::new(Some(std::path::Path::new(":memory:")), None).unwrap();
+    db.init_schema(false).unwrap();
+
+    let btc_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "BTC".to_string(),
+            asset_index: 0,
+            sz_decimals: 4,
+            tick_size: 1.0,
+            lot_step_size: 0.0001,
+            max_leverage: 20.0,
+            mark_price: 90_000.0,
+            mid_price: 90_000.0,
+            oracle_price: 90_000.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 100_000_000.0,
+            open_interest_usdc: 50_000_000.0,
+            prev_day_price: 89_000.0,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+
+    // 1. Batch mid & priority watch updates
+    assert_eq!(db.update_assets_live_mid_batch(&[]).unwrap(), 0);
+    assert_eq!(
+        db.update_assets_live_mid_batch(&[(btc_id, 90_125.0), (btc_id, -1.0)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.set_assets_priority_watch_batch(&[(btc_id, true)])
+            .unwrap(),
+        1
+    );
+    let btc = db.get_asset_by_id(btc_id).unwrap().unwrap();
+    assert!((btc.mark_price - 90_000.0).abs() < 1e-6);
+    assert!((btc.mid_price - 90_125.0).abs() < 1e-6);
+    assert!(btc.is_priority_watched);
+
+    // 2. Batch OPEN position mark & stop update skips unchanged rows
+    let (pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            btc_id,
+            "BTC",
+            OrderSide::Long,
+            90_000.0,
+            90_500.0,
+            0.1,
+            9_050.0,
+            50.0,
+            0.25,
+            88_000.0,
+            95_000.0,
+            1.25,
+            Some(1_700_000_000_000),
+        )
+        .unwrap();
+    // Initial sync leaves highest_price_seen = 90_500 and stop = 88_000 -> first call writes 0 if identical
+    assert_eq!(
+        db.update_open_positions_mark_and_stop_batch(&[(pid, 90_500.0, 88_000.0)])
+            .unwrap(),
+        0
+    );
+    // Changing mark & ratcheted stop writes exactly 1 row, and immediate repeat writes 0 rows
+    assert_eq!(
+        db.update_open_positions_mark_and_stop_batch(&[(pid, 91_000.0, 88_500.0)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.update_open_positions_mark_and_stop_batch(&[(pid, 91_000.0, 88_500.0)])
+            .unwrap(),
+        0
+    );
+    let pos = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((pos.current_price - 91_000.0).abs() < 1e-6);
+    assert!((pos.protective_stop_px - 88_500.0).abs() < 1e-6);
+    assert!((pos.unrealized_pnl_usdc - 100.0).abs() < 1e-6);
+
+    // 3. Batch signal upsert
+    let up = db
+        .upsert_sleeve_signals_batch(&[aegis_db::SignalUpsertInput {
+            asset_id: btc_id,
+            mark_price: 91_000.0,
+            day_volume_usdc: 100_000_000.0,
+            funding_rate_hourly: 0.0001,
+            annualized_vol: 0.55,
+            market_beta: 1.0,
+            s1_mom_score: 0.5,
+            s1_carry_score: 0.2,
+            s2_trend_alignment: 1,
+            s2_vol_surge_ratio: 1.4,
+            s3_funding_zscore: 0.3,
+            s3_flush_atr_mult: 0.1,
+            w_s1_carry_mom: 0.15,
+            w_s2_trend_breakout: 0.10,
+            w_s3_event_reversion: 0.0,
+            raw_combined_weight: 0.25,
+            target_weight: 0.25,
+            current_weight: 0.25,
+            delta_weight: 0.0,
+            event_trigger: None,
+            rebalance_action: "HOLD".to_string(),
+        }])
+        .unwrap();
+    assert_eq!(up, 1);
+    assert_eq!(db.list_sleeve_signals().unwrap().len(), 1);
+}

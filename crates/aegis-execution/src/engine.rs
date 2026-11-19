@@ -321,8 +321,10 @@ impl ExecutionEngine {
             .collect();
         let asset_by_id: HashMap<i64, &ExchangeAsset> = assets.iter().map(|a| (a.id, a)).collect();
 
+        let mut signal_inputs: Vec<SignalUpsertInput> = Vec::with_capacity(output.signals.len());
+        let mut prio_updates: Vec<(i64, bool)> = Vec::new();
         for sig in &output.signals {
-            self.db.upsert_sleeve_signal(&SignalUpsertInput {
+            signal_inputs.push(SignalUpsertInput {
                 asset_id: sig.asset_id,
                 mark_price: sig.mark_price,
                 day_volume_usdc: sig.day_volume_usdc,
@@ -344,10 +346,15 @@ impl ExecutionEngine {
                 delta_weight: sig.delta_weight,
                 event_trigger: sig.event_trigger.clone(),
                 rebalance_action: sig.rebalance_action.clone(),
-            })?;
+            });
 
             if sig.event_trigger.is_some() {
-                let _ = self.db.set_asset_priority_watch(sig.asset_id, true);
+                if !asset_by_id
+                    .get(&sig.asset_id)
+                    .is_some_and(|a| a.is_priority_watched)
+                {
+                    prio_updates.push((sig.asset_id, true));
+                }
             } else if !active_asset_ids.contains(&sig.asset_id) {
                 if let Some(a) = asset_by_id.get(&sig.asset_id) {
                     let day_chg = if a.prev_day_price > 0.0 {
@@ -359,11 +366,13 @@ impl ExecutionEngine {
                         && a.funding_rate_hourly.abs() < 0.0004
                         && day_chg < 0.08
                     {
-                        let _ = self.db.set_asset_priority_watch(sig.asset_id, false);
+                        prio_updates.push((sig.asset_id, false));
                     }
                 }
             }
         }
+        self.db.upsert_sleeve_signals_batch(&signal_inputs)?;
+        let _ = self.db.set_assets_priority_watch_batch(&prio_updates);
 
         Ok(output)
     }
@@ -1535,11 +1544,12 @@ impl ExecutionEngine {
             }
         };
 
-        // 1. Fast 1s Priority Monitor & ALO Chaser loop
+        // 1. Fast 1s Priority Monitor & ALO Chaser loop (fixed-rate tick scheduling)
         let prio_engine = self.clone();
         let prio_rx = rx.clone();
         std::thread::spawn(move || {
             while !*prio_rx.borrow() {
+                let tick_start = std::time::Instant::now();
                 let cfg = prio_engine.db.load_config_or_default();
                 let prio_ms = cfg
                     .get_i64("priority_monitor_interval_ms", 1000)
@@ -1547,7 +1557,9 @@ impl ExecutionEngine {
                 if let Err(e) = prio_engine.priority_monitor.run_1s_priority_tick() {
                     tracing::warn!(error = %e, "1s priority watchlist tick error");
                 }
-                sleep_interruptible(&prio_rx, prio_ms);
+                let elapsed_ms = tick_start.elapsed().as_millis() as u64;
+                let rem_ms = prio_ms.saturating_sub(elapsed_ms).max(50);
+                sleep_interruptible(&prio_rx, rem_ms);
             }
         });
 

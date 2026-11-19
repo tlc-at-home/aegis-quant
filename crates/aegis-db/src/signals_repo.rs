@@ -101,6 +101,101 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Batch upserts all multi-sleeve signals inside a single MariaDB transaction.
+    pub fn upsert_sleeve_signals_batch(&self, signals: &[SignalUpsertInput]) -> Result<usize> {
+        if signals.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("upsert_sleeve_signals_batch tx failed: {e}"))
+            })?;
+
+        let stmt = tx
+            .prep(
+                r#"INSERT INTO sleeve_signals (
+                       asset_id, mark_price, day_volume_usdc, funding_rate_hourly, annualized_vol,
+                       market_beta, s1_mom_score, s1_carry_score, s2_trend_alignment, s2_vol_surge_ratio,
+                       s3_funding_zscore, s3_flush_atr_mult, w_s1_carry_mom, w_s2_trend_breakout,
+                       w_s3_event_reversion, raw_combined_weight, target_weight, current_weight,
+                       delta_weight, event_trigger, rebalance_action, created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :aid, :mark, :vol, :fr, :avol,
+                       :beta, :s1_mom, :s1_carry, :s2_align, :s2_surge,
+                       :s3_fz, :s3_flush, :w_s1, :w_s2,
+                       :w_s3, :raw_w, :tgt_w, :cur_w,
+                       :delta_w, :trig, :action, :ts, :ts
+                   )
+                   ON DUPLICATE KEY UPDATE
+                       mark_price = VALUES(mark_price),
+                       day_volume_usdc = VALUES(day_volume_usdc),
+                       funding_rate_hourly = VALUES(funding_rate_hourly),
+                       annualized_vol = VALUES(annualized_vol),
+                       market_beta = VALUES(market_beta),
+                       s1_mom_score = VALUES(s1_mom_score),
+                       s1_carry_score = VALUES(s1_carry_score),
+                       s2_trend_alignment = VALUES(s2_trend_alignment),
+                       s2_vol_surge_ratio = VALUES(s2_vol_surge_ratio),
+                       s3_funding_zscore = VALUES(s3_funding_zscore),
+                       s3_flush_atr_mult = VALUES(s3_flush_atr_mult),
+                       w_s1_carry_mom = VALUES(w_s1_carry_mom),
+                       w_s2_trend_breakout = VALUES(w_s2_trend_breakout),
+                       w_s3_event_reversion = VALUES(w_s3_event_reversion),
+                       raw_combined_weight = VALUES(raw_combined_weight),
+                       target_weight = VALUES(target_weight),
+                       current_weight = VALUES(current_weight),
+                       delta_weight = VALUES(delta_weight),
+                       event_trigger = VALUES(event_trigger),
+                       rebalance_action = VALUES(rebalance_action),
+                       updated_at_ms = VALUES(updated_at_ms)"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("upsert_sleeve_signals_batch prep failed: {e}"))
+            })?;
+
+        tx.exec_batch(
+            &stmt,
+            signals.iter().map(|s| {
+                params! {
+                    "aid" => s.asset_id,
+                    "mark" => s.mark_price,
+                    "vol" => s.day_volume_usdc,
+                    "fr" => s.funding_rate_hourly,
+                    "avol" => s.annualized_vol,
+                    "beta" => s.market_beta,
+                    "s1_mom" => s.s1_mom_score,
+                    "s1_carry" => s.s1_carry_score,
+                    "s2_align" => s.s2_trend_alignment,
+                    "s2_surge" => s.s2_vol_surge_ratio,
+                    "s3_fz" => s.s3_funding_zscore,
+                    "s3_flush" => s.s3_flush_atr_mult,
+                    "w_s1" => s.w_s1_carry_mom,
+                    "w_s2" => s.w_s2_trend_breakout,
+                    "w_s3" => s.w_s3_event_reversion,
+                    "raw_w" => s.raw_combined_weight,
+                    "tgt_w" => s.target_weight,
+                    "cur_w" => s.current_weight,
+                    "delta_w" => s.delta_weight,
+                    "trig" => &s.event_trigger,
+                    "action" => &s.rebalance_action,
+                    "ts" => ts,
+                }
+            }),
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("upsert_sleeve_signals_batch exec failed: {e}"))
+        })?;
+        drop(stmt);
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!("upsert_sleeve_signals_batch commit failed: {e}"))
+        })?;
+        Ok(signals.len())
+    }
+
     /// Lists all `sleeve_signals` ordered by absolute target weight descending.
     pub fn list_sleeve_signals(&self) -> Result<Vec<SleeveSignal>> {
         let mut conn = self.get_conn()?;

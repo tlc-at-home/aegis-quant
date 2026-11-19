@@ -324,6 +324,132 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Batch updates live mark price, watermarks, unrealized PnL, and trailing stop on changed `OPEN` holdings
+    /// inside a single MariaDB transaction, skipping rows whose tracked values did not change.
+    pub fn update_open_positions_mark_and_stop_batch(
+        &self,
+        updates: &[(i64, f64, f64)],
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        type OpenMarkSnapshotRow = (i64, String, f64, f64, f64, f64, f64, f64, f64, f64);
+
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| AegisError::Database(format!("open position batch tx failed: {e}")))?;
+
+        let rows: Vec<OpenMarkSnapshotRow> = tx
+            .query(
+                r#"SELECT id, side, entry_price, current_price, filled_quantity,
+                          protective_stop_px, take_profit_px, highest_price_seen,
+                          lowest_price_seen, unrealized_pnl_usdc
+                   FROM positions
+                   WHERE status = 'OPEN'"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "update_open_positions_mark_and_stop_batch select failed: {e}"
+                ))
+            })?;
+
+        let by_id: std::collections::HashMap<i64, OpenMarkSnapshotRow> =
+            rows.into_iter().map(|r| (r.0, r)).collect();
+
+        let mut changed = Vec::new();
+        for &(pid, mark_price, new_stop_px) in updates {
+            if !mark_price.is_finite() || mark_price <= 0.0 {
+                continue;
+            }
+            let Some((
+                _,
+                side_str,
+                entry_px,
+                cur_px,
+                qty,
+                cur_stop,
+                cur_tp,
+                hi_seen,
+                lo_seen,
+                cur_upnl,
+            )) = by_id.get(&pid)
+            else {
+                continue;
+            };
+            let side = OrderSide::parse(side_str);
+            let eff_qty = qty.max(0.0);
+            let upnl = round_dp((mark_price - *entry_px) * eff_qty * side.sign(), 4);
+            let high = hi_seen.max(mark_price);
+            let low = if *lo_seen > 0.0 {
+                lo_seen.min(mark_price)
+            } else {
+                mark_price
+            };
+            let eff_tp = if *cur_tp > 0.0 {
+                *cur_tp
+            } else {
+                derive_take_profit_px(side, *entry_px, new_stop_px)
+            };
+
+            let unchanged = (*cur_px - mark_price).abs() <= 1e-10
+                && (*cur_stop - new_stop_px).abs() <= 1e-10
+                && (*cur_tp - eff_tp).abs() <= 1e-10
+                && (*hi_seen - high).abs() <= 1e-10
+                && (*lo_seen - low).abs() <= 1e-10
+                && (*cur_upnl - upnl).abs() <= 1e-10;
+            if !unchanged {
+                changed.push((pid, mark_price, new_stop_px, eff_tp, high, low, upnl));
+            }
+        }
+
+        if changed.is_empty() {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!("open position batch empty commit failed: {e}"))
+            })?;
+            return Ok(0);
+        }
+
+        let stmt = tx
+            .prep(
+                r#"UPDATE positions
+                   SET current_price = :mark,
+                       protective_stop_px = :stop_px,
+                       take_profit_px = :tp_px,
+                       highest_price_seen = :high,
+                       lowest_price_seen = :low,
+                       unrealized_pnl_usdc = :upnl,
+                       updated_at_ms = :ts
+                   WHERE id = :pid AND status = 'OPEN'"#,
+            )
+            .map_err(|e| AegisError::Database(format!("open position batch prep failed: {e}")))?;
+
+        tx.exec_batch(
+            &stmt,
+            changed
+                .iter()
+                .map(|&(pid, mark, stop_px, tp_px, high, low, upnl)| {
+                    params! {
+                        "mark" => mark,
+                        "stop_px" => stop_px,
+                        "tp_px" => tp_px,
+                        "high" => high,
+                        "low" => low,
+                        "upnl" => upnl,
+                        "ts" => ts,
+                        "pid" => pid,
+                    }
+                }),
+        )
+        .map_err(|e| AegisError::Database(format!("open position batch exec failed: {e}")))?;
+        drop(stmt);
+
+        tx.commit()
+            .map_err(|e| AegisError::Database(format!("open position batch commit failed: {e}")))?;
+        Ok(changed.len())
+    }
+
     /// Persists stop-loss and take-profit trigger prices and exchange order IDs on an active position.
     pub fn update_position_tpsl_orders(
         &self,

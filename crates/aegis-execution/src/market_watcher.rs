@@ -98,8 +98,8 @@ impl MarketWatcher {
         let mut prio_count = 0usize;
         let mut upserted_prio_symbols: HashSet<String> = HashSet::new();
 
-        for input in &raw_inputs {
-            if self.db.upsert_exchange_asset(input).is_ok() {
+        if self.db.upsert_exchange_assets_batch(&raw_inputs).is_ok() {
+            for input in &raw_inputs {
                 total_upserted += 1;
                 if input.is_core_eligible {
                     core_count += 1;
@@ -114,17 +114,38 @@ impl MarketWatcher {
                     }
                 }
             }
+        } else {
+            for input in &raw_inputs {
+                if self.db.upsert_exchange_asset(input).is_ok() {
+                    total_upserted += 1;
+                    if input.is_core_eligible {
+                        core_count += 1;
+                    }
+                    if input.is_event_eligible {
+                        event_count += 1;
+                    }
+                    if input.is_priority_watched {
+                        prio_count += 1;
+                        if let Ok((sym, _)) =
+                            normalize_hyperliquid_symbol(&input.raw_symbol_or_coin)
+                        {
+                            upserted_prio_symbols.insert(sym);
+                        }
+                    }
+                }
+            }
         }
 
         // Clear stale `is_priority_watched` flags on assets that are no longer held, ordered, or extreme-dislocated
         if let Ok(existing) = self.db.list_exchange_assets() {
+            let mut prio_clears: Vec<(i64, bool)> = Vec::new();
             for a in &existing {
                 if !a.is_priority_watched || active_asset_ids.contains(&a.id) {
                     continue;
                 }
                 if live_connected {
                     if !upserted_prio_symbols.contains(&a.symbol) {
-                        let _ = self.db.set_asset_priority_watch(a.id, false);
+                        prio_clears.push((a.id, false));
                     }
                 } else if raw_inputs.is_empty() {
                     let day_chg = if a.prev_day_price > 0.0 {
@@ -133,10 +154,11 @@ impl MarketWatcher {
                         0.0
                     };
                     if a.funding_rate_hourly.abs() < 0.0004 && day_chg < 0.08 {
-                        let _ = self.db.set_asset_priority_watch(a.id, false);
+                        prio_clears.push((a.id, false));
                     }
                 }
             }
+            let _ = self.db.set_assets_priority_watch_batch(&prio_clears);
         }
 
         if total_upserted == 0 {

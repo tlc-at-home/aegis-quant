@@ -75,13 +75,18 @@ impl PriorityMonitor {
 
         // Update ONLY `mid_price` from `allMids` (never overwrite true `mark_price`)
         if let Some(ref mids) = mids_opt {
-            for item in &watchlist {
-                if let Some(&live_mid) = mids.get(&item.coin) {
-                    if live_mid.is_finite() && live_mid > 0.0 {
-                        let _ = self.db.update_asset_live_mid(item.asset_id, live_mid);
-                    }
-                }
-            }
+            let mid_updates: Vec<(i64, f64)> = watchlist
+                .iter()
+                .filter_map(|item| {
+                    mids.get(&item.coin).copied().and_then(|live_mid| {
+                        (live_mid.is_finite()
+                            && live_mid > 0.0
+                            && (live_mid - item.mid_price).abs() > 1e-12)
+                            .then_some((item.asset_id, live_mid))
+                    })
+                })
+                .collect();
+            let _ = self.db.update_assets_live_mid_batch(&mid_updates);
         }
 
         let mut report = PriorityTickReport {
@@ -109,6 +114,8 @@ impl PriorityMonitor {
         let held = self.db.get_assets_held()?;
         report.open_holdings_checked = held.len();
         let risk = RiskEngine::from_config_map(&cfg);
+        let mut pos_updates: Vec<(i64, f64, f64)> = Vec::with_capacity(held.len());
+        let mut tpsl_syncs = Vec::new();
 
         for h in &held {
             let asset_opt = self.db.get_asset_by_id(h.asset_id)?;
@@ -175,11 +182,7 @@ impl PriorityMonitor {
                     report.stops_triggered_closed += 1;
                 }
             } else {
-                self.db.update_open_position_mark_and_stop(
-                    h.position_id,
-                    live_mark,
-                    eval.new_protective_stop_px,
-                )?;
+                pos_updates.push((h.position_id, live_mark, eval.new_protective_stop_px));
                 if eval.stop_ratcheted {
                     report.stops_ratcheted += 1;
                 }
@@ -202,25 +205,40 @@ impl PriorityMonitor {
                         / h.protective_stop_px)
                         >= 0.0025;
                 if missing_sl || missing_tp || sl_ratcheted_materially {
-                    if let Some(ref asset) = asset_opt {
-                        let _ = self.chaser.ensure_exchange_tpsl_orders(
-                            h.position_id,
+                    if let Some(asset) = asset_opt {
+                        tpsl_syncs.push((
+                            h,
                             asset,
                             side,
-                            h.quantity,
                             live_mark,
                             eval.new_protective_stop_px,
                             eval.take_profit_px,
-                            h.protective_stop_oid.as_deref(),
-                            h.take_profit_oid.as_deref(),
                             sl_ratcheted_materially,
-                            false,
-                            None,
-                            &cfg,
-                        );
+                        ));
                     }
                 }
             }
+        }
+
+        self.db
+            .update_open_positions_mark_and_stop_batch(&pos_updates)?;
+
+        for (h, asset, side, live_mark, stop_px, tp_px, sl_ratcheted_materially) in tpsl_syncs {
+            let _ = self.chaser.ensure_exchange_tpsl_orders(
+                h.position_id,
+                &asset,
+                side,
+                h.quantity,
+                live_mark,
+                stop_px,
+                tp_px,
+                h.protective_stop_oid.as_deref(),
+                h.take_profit_oid.as_deref(),
+                sl_ratcheted_materially,
+                false,
+                None,
+                &cfg,
+            );
         }
 
         Ok(report)

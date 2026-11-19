@@ -215,6 +215,45 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Batch updates ONLY `mid_price` and `updated_at_ms` inside a single transaction.
+    pub fn update_assets_live_mid_batch(&self, updates: &[(i64, f64)]) -> Result<usize> {
+        let valid: Vec<(i64, f64)> = updates
+            .iter()
+            .copied()
+            .filter(|&(_, mid)| mid.is_finite() && mid > 0.0)
+            .collect();
+        if valid.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| AegisError::Database(format!("Failed to start mid batch tx: {e}")))?;
+        let stmt = tx
+            .prep(
+                r#"UPDATE exchange_assets
+                   SET mid_price = :mid, updated_at_ms = :ts
+                   WHERE id = :id"#,
+            )
+            .map_err(|e| AegisError::Database(format!("Failed preparing mid batch update: {e}")))?;
+        tx.exec_batch(
+            &stmt,
+            valid.iter().map(|&(asset_id, mid)| {
+                params! {
+                    "mid" => mid,
+                    "ts" => ts,
+                    "id" => asset_id,
+                }
+            }),
+        )
+        .map_err(|e| AegisError::Database(format!("Batch live mid update failed: {e}")))?;
+        drop(stmt);
+        tx.commit()
+            .map_err(|e| AegisError::Database(format!("Batch live mid commit failed: {e}")))?;
+        Ok(valid.len())
+    }
+
     /// Updates live mark/mid price on an existing asset during the 1s Priority Watchlist loop.
     pub fn update_asset_live_quote(
         &self,
@@ -251,6 +290,39 @@ impl DatabaseManager {
         )
         .map_err(|e| AegisError::Database(format!("Failed to set priority watch: {e}")))?;
         Ok(())
+    }
+
+    /// Batch updates `is_priority_watched` inside a single transaction.
+    pub fn set_assets_priority_watch_batch(&self, updates: &[(i64, bool)]) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("Failed to start priority watch batch tx: {e}"))
+            })?;
+        let stmt = tx
+            .prep("UPDATE exchange_assets SET is_priority_watched = :w, updated_at_ms = :ts WHERE id = :id")
+            .map_err(|e| AegisError::Database(format!("Failed preparing priority watch batch: {e}")))?;
+        tx.exec_batch(
+            &stmt,
+            updates.iter().map(|&(asset_id, watched)| {
+                params! {
+                    "w" => i32::from(watched),
+                    "ts" => ts,
+                    "id" => asset_id,
+                }
+            }),
+        )
+        .map_err(|e| AegisError::Database(format!("Batch priority watch update failed: {e}")))?;
+        drop(stmt);
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!("Batch priority watch commit failed: {e}"))
+        })?;
+        Ok(updates.len())
     }
 
     /// Looks up an `ExchangeAsset` by symbol (`"BTC-USDC"`, `"BTC"`, or `"BTC/USDC:USDC"`).
