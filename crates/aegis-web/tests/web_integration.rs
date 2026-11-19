@@ -479,3 +479,52 @@ async fn test_web_health_503_and_config_validation() {
     assert!(validate_config_key_value("private_key", "gAAAAABrawinvalid").is_err());
     assert!(validate_config_key_value("risk_capital_cap_usdc", "1000.0").is_ok());
 }
+
+#[tokio::test]
+async fn test_web_auth_explicit_disable_on_non_loopback_respects_operator_opt_out() {
+    // 1. When web_auth_enabled is unset and a token exists on non-loopback, fail closed (401).
+    let db_default = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_default = create_web_router_for_host(db_default, None, Some("0.0.0.0"));
+    let res_default = app_default
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_default.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. When web_auth_enabled is explicitly "false" in DB (immutable via HTTP), allow direct access.
+    let db_disabled = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
+            .unwrap();
+        mgr.set_config_value("web_auth_enabled", "false", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_disabled = create_web_router_for_host(db_disabled, None, Some("0.0.0.0"));
+    let res_disabled = app_disabled
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_disabled.status(), StatusCode::OK);
+}

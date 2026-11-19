@@ -50,22 +50,36 @@ pub struct AppState {
     broadcaster_guard: Arc<BroadcasterDropGuard>,
 }
 
-fn load_auth_config_fail_closed(db: &DatabaseManager) -> (Option<String>, bool, String) {
+fn parse_optional_bool(raw: Option<&String>) -> Option<bool> {
+    let v = raw?.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn load_auth_config_fail_closed(db: &DatabaseManager) -> (Option<String>, Option<bool>, String) {
     match db.load_config() {
         Ok(cfg) => {
             let tok = cfg
                 .get("web_api_token")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let auth_flag =
-                cfg.get_bool("web_auth_enabled", false) || cfg.get_bool("web_require_auth", false);
+            let explicit_enabled = parse_optional_bool(cfg.get("web_auth_enabled"));
+            let explicit_require = parse_optional_bool(cfg.get("web_require_auth"));
+            let explicit_auth_flag = match (explicit_enabled, explicit_require) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (None, None) => None,
+            };
             let bind_host = cfg.get_str("web_bind_host", "127.0.0.1");
-            (tok, auth_flag, bind_host)
+            (tok, explicit_auth_flag, bind_host)
         }
         Err(_) => {
             // Fallback inspection of raw system_config rows so one corrupt secret cannot silently disable auth
             let mut tok: Option<String> = None;
-            let mut auth_flag = false;
+            let mut explicit_auth_flag: Option<bool> = None;
             let mut bind_host = "127.0.0.1".to_string();
             let mut any_auth_error = false;
             if let Ok(rows) = db.list_system_config_rows() {
@@ -89,9 +103,10 @@ fn load_auth_config_fail_closed(db: &DatabaseManager) -> (Option<String>, bool, 
                             }
                         }
                         "web_auth_enabled" | "web_require_auth" => {
-                            let v = r.config_value.trim().to_ascii_lowercase();
-                            if matches!(v.as_str(), "true" | "1" | "yes" | "on") {
-                                auth_flag = true;
+                            if let Some(parsed) = parse_optional_bool(Some(&r.config_value)) {
+                                if parsed || explicit_auth_flag.is_none() {
+                                    explicit_auth_flag = Some(parsed);
+                                }
                             }
                         }
                         "web_bind_host" if !r.config_value.trim().is_empty() => {
@@ -105,12 +120,12 @@ fn load_auth_config_fail_closed(db: &DatabaseManager) -> (Option<String>, bool, 
                 bind_host = cfg.get_str("web_bind_host", "127.0.0.1");
             }
             if any_auth_error {
-                auth_flag = true;
+                explicit_auth_flag = Some(true);
                 if tok.is_none() {
                     tok = Some(generate_session_token());
                 }
             }
-            (tok, auth_flag, bind_host)
+            (tok, explicit_auth_flag, bind_host)
         }
     }
 }
@@ -131,14 +146,18 @@ impl AppState {
         bind_host: Option<&str>,
     ) -> Self {
         let dir = static_dir.unwrap_or_else(|| resolve_project_root().join("web").join("static"));
-        let (configured_api_token, auth_flag, cfg_bind_host) = load_auth_config_fail_closed(&db);
+        let (configured_api_token, explicit_auth_flag, cfg_bind_host) =
+            load_auth_config_fail_closed(&db);
         let effective_host = bind_host
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(cfg_bind_host.as_str());
-        // Fail closed to true when bound non-loopback and a token exists
-        let require_bearer_auth =
-            auth_flag || (!is_loopback_host(effective_host) && configured_api_token.is_some());
+        // Respect explicit operator setting when present (immutable over HTTP);
+        // otherwise fail closed to true when bound non-loopback and a token exists.
+        let require_bearer_auth = match explicit_auth_flag {
+            Some(flag) => flag,
+            None => !is_loopback_host(effective_host) && configured_api_token.is_some(),
+        };
 
         let (dashboard_tx, dashboard_rx) = watch::channel(Arc::new(String::new()));
         let (sd_tx, _) = watch::channel(false);
