@@ -13,9 +13,37 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+type ViewsHealthEntry = (Instant, Vec<String>, Vec<String>);
+type ViewsHealthCache = Mutex<HashMap<String, ViewsHealthEntry>>;
+
+static VIEWS_HEALTH_CACHE: OnceLock<ViewsHealthCache> = OnceLock::new();
+
+const VIEWS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+fn get_cached_tables_and_views(db: &DatabaseManager) -> Result<(Vec<String>, Vec<String>)> {
+    let db_key = db.db_name().to_string();
+    let cache = VIEWS_HEALTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock();
+        if let Some((captured_at, tables, views)) = guard.get(&db_key) {
+            if captured_at.elapsed() < VIEWS_CACHE_TTL {
+                return Ok((tables.clone(), views.clone()));
+            }
+        }
+    }
+    let (tables, views) = db.list_tables_and_views()?;
+    cache
+        .lock()
+        .insert(db_key, (Instant::now(), tables.clone(), views.clone()));
+    Ok((tables, views))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorBody {
@@ -159,34 +187,278 @@ pub fn json_value_to_config_string(val: &Value) -> String {
     }
 }
 
-/// Validates a configuration update before persisting to MariaDB `system_config`.
-pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
-    let clean_key = key.trim();
-    if clean_key.is_empty() {
-        return Err(AegisError::Validation(
-            "config_key cannot be empty".to_string(),
-        ));
-    }
-    if is_immutable_security_config_key(clean_key) {
-        return Err(AegisError::SecurityViolation(format!(
-            "Configuration key '{clean_key}' is an immutable security policy key and cannot be modified via Web API"
+fn parse_f64_bounded(key: &str, raw: &str, min: f64, max: f64) -> Result<f64> {
+    let val = raw.trim().parse::<f64>().map_err(|_| {
+        AegisError::Validation(format!("'{key}' must be a valid number, got '{raw}'"))
+    })?;
+    if !val.is_finite() || val < min || val > max {
+        return Err(AegisError::Validation(format!(
+            "'{key}' must be between {min} and {max}, got {val}"
         )));
     }
-    if clean_key == "wallet_address" && !value_str.is_empty() {
-        let _ = aegis_core::validate_evm_address(value_str)?;
+    Ok(val)
+}
+
+fn parse_i64_bounded(key: &str, raw: &str, min: i64, max: i64) -> Result<i64> {
+    let val = raw.trim().parse::<i64>().map_err(|_| {
+        AegisError::Validation(format!("'{key}' must be a valid integer, got '{raw}'"))
+    })?;
+    if val < min || val > max {
+        return Err(AegisError::Validation(format!(
+            "'{key}' must be between {min} and {max}, got {val}"
+        )));
     }
-    if clean_key == "private_key" && !value_str.is_empty() && !value_str.starts_with("gAAAAAB") {
-        let _ = aegis_core::validate_private_key(value_str)?;
+    Ok(val)
+}
+
+fn parse_bool_strict(key: &str, raw: &str) -> Result<()> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "false" => Ok(()),
+        _ => Err(AegisError::Validation(format!(
+            "'{key}' must be 'true' or 'false', got '{raw}'"
+        ))),
+    }
+}
+
+/// Validates a configuration update before persisting to MariaDB `system_config`.
+/// Enforces key syntax, immutable security blocks, numeric/enum bounds, and rejects raw `"gAAAAAB"` strings.
+pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
+    let clean_key = key.trim();
+    let clean_val = value_str.trim();
+
+    if clean_key.is_empty() || clean_key.len() > 128 {
+        return Err(AegisError::Validation(
+            "config_key must be between 1 and 128 characters".to_string(),
+        ));
+    }
+    if !clean_key
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        || !clean_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AegisError::Validation(format!(
+            "Invalid config_key '{clean_key}': must start with an ASCII letter and contain only [A-Za-z0-9_]"
+        )));
+    }
+
+    let lower_key = clean_key.to_ascii_lowercase();
+    if is_immutable_security_config_key(clean_key)
+        || matches!(
+            lower_key.as_str(),
+            "web_require_auth"
+                | "hyperliquid_testnet"
+                | "platform_version"
+                | "risk_capital_cap_updated_at_ms"
+                | "hyperliquid_last_nonce"
+                | "last_db_backup_ms"
+                | "last_entry_order_ms"
+        )
+    {
+        return Err(AegisError::SecurityViolation(format!(
+            "Configuration key '{clean_key}' is an immutable security or internal state key and cannot be modified via Web API"
+        )));
+    }
+
+    if clean_val.starts_with("gAAAAAB") || clean_val.starts_with("ENC:") {
+        return Err(AegisError::Validation(format!(
+            "Configuration value for '{clean_key}' cannot be a raw encrypted ciphertext envelope"
+        )));
+    }
+
+    match lower_key.as_str() {
+        "execution_mode" => {
+            if !matches!(
+                clean_val.to_ascii_uppercase().as_str(),
+                "PAPER" | "TESTNET" | "LIVE"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid execution_mode '{clean_val}': expected PAPER, TESTNET, or LIVE"
+                )));
+            }
+        }
+        "risk_tier" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "conservative" | "standard" | "aggressive" | "extreme" | "custom"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid risk_tier '{clean_val}': expected conservative, standard, aggressive, extreme, or custom"
+                )));
+            }
+        }
+        "alert_provider" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "telegram" | "discord" | "both"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid alert_provider '{clean_val}': expected telegram, discord, or both"
+                )));
+            }
+        }
+        "auto_rebalance_enabled" | "web_trust_proxy_headers" => {
+            parse_bool_strict(clean_key, clean_val)?;
+        }
+        "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
+            if !clean_val.is_empty() {
+                let _ = aegis_core::validate_evm_address(clean_val)?;
+            }
+        }
+        "private_key" => {
+            if clean_val.is_empty() {
+                return Err(AegisError::Validation(
+                    "private_key cannot be cleared to empty via Web API".to_string(),
+                ));
+            }
+            let _ = aegis_core::validate_private_key(clean_val)?;
+        }
+        "telegram_bot_token" => {
+            if clean_val.is_empty()
+                || !clean_val.contains(':')
+                || clean_val.chars().any(char::is_whitespace)
+            {
+                return Err(AegisError::Validation(
+                    "telegram_bot_token must be a valid non-empty bot token containing ':'"
+                        .to_string(),
+                ));
+            }
+        }
+        "telegram_chat_id" => {
+            if !clean_val.is_empty()
+                && (clean_val.len() > 64
+                    || clean_val.chars().any(char::is_whitespace)
+                    || clean_val.contains('<')
+                    || clean_val.contains('>'))
+            {
+                return Err(AegisError::Validation(
+                    "Invalid telegram_chat_id format".to_string(),
+                ));
+            }
+        }
+        "discord_webhook_url" => {
+            if !clean_val.is_empty()
+                && (!clean_val.starts_with("https://")
+                    || clean_val.chars().any(char::is_whitespace))
+            {
+                return Err(AegisError::Validation(
+                    "discord_webhook_url must be a valid https:// URL without whitespace"
+                        .to_string(),
+                ));
+            }
+        }
+        "gemini_api_key" => {
+            if clean_val.is_empty() || clean_val.chars().any(char::is_whitespace) {
+                return Err(AegisError::Validation(
+                    "gemini_api_key must be non-empty without whitespace".to_string(),
+                ));
+            }
+        }
+        "target_leverage_multiplier" => {
+            parse_f64_bounded(clean_key, clean_val, 0.10, 3.00)?;
+        }
+        "max_gross_leverage_x" => {
+            parse_f64_bounded(clean_key, clean_val, 0.20, 5.00)?;
+        }
+        "max_single_asset_weight" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 1.00)?;
+        }
+        "min_rebalance_delta_weight" => {
+            parse_f64_bounded(clean_key, clean_val, 0.001, 0.50)?;
+        }
+        "min_order_notional_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 10.0, 100_000.0)?;
+        }
+        "initial_paper_equity_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 100.0, 100_000_000.0)?;
+        }
+        "live_exchange_equity_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
+        }
+        "risk_capital_cap_usdc" => {
+            let v = parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
+            if v > 0.0 && v < 10.0 {
+                return Err(AegisError::Validation(
+                    "risk_capital_cap_usdc must be 0 (disabled) or at least $10.00".to_string(),
+                ));
+            }
+        }
+        "core_min_day_volume_usdc" | "event_min_day_volume_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000_000.0)?;
+        }
+        "s1_carry_mom_budget" | "s2_trend_breakout_budget" | "s3_event_reversion_budget" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 1.50)?;
+        }
+        "protective_stop_atr_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.5, 15.0)?;
+        }
+        "protective_stop_default_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.002, 0.50)?;
+        }
+        "take_profit_atr_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.5, 30.0)?;
+        }
+        "take_profit_default_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.002, 2.00)?;
+        }
+        "alo_chase_threshold_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 0.1, 500.0)?;
+        }
+        "maker_fee_bps" | "taker_fee_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
+        }
+        "max_entry_spread_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 1.0, 1000.0)?;
+        }
+        "max_daily_drawdown_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 0.95)?;
+        }
+        "max_open_positions" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
+        }
+        "min_entry_interval_sec" | "min_position_hold_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 86_400)?;
+        }
+        "scanner_interval_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 500, 60_000)?;
+        }
+        "priority_monitor_interval_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 250, 10_000)?;
+        }
+        "stop_out_cooldown_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 60, 604_800)?;
+        }
+        "max_alo_chase_ticks" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
+        }
+        "alert_dedup_window_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 86_400_000)?;
+        }
+        "alert_http_timeout_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 2, 60)?;
+        }
+        "telemetry_queue_capacity" => {
+            parse_i64_bounded(clean_key, clean_val, 64, 65_536)?;
+        }
+        "web_server_port" => {
+            parse_i64_bounded(clean_key, clean_val, 1024, 65535)?;
+        }
+        _ => {
+            return Err(AegisError::Validation(format!(
+                "Unknown or unsupported configuration key '{clean_key}'"
+            )));
+        }
     }
     Ok(())
 }
 
 /// Builds `HealthPayload` by querying MariaDB 13.0 version, tables/views inventory, and active `system_config`.
+/// Propagates MariaDB connectivity or schema errors rather than swallowing them.
 pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
-    let mariadb_version = db
-        .server_version()
-        .unwrap_or_else(|_| "13.0.2-MariaDB".to_string());
-    let (tables, views) = db.list_tables_and_views().unwrap_or_default();
+    let mariadb_version = db.server_version()?;
+    let (tables, views) = db.list_tables_and_views()?;
     let cfg = db.load_config_or_default();
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
@@ -214,13 +486,10 @@ pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
 }
 
 /// Builds the unified `DashboardPayload` querying MariaDB 13.0 tables and all 7 SQL Views.
+/// Uses a 30-second cache for the `SHOW FULL TABLES` view-health check and performs zero writes.
 pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload> {
-    let _ = db.expire_finished_cooldowns();
-
-    let mariadb_version = db
-        .server_version()
-        .unwrap_or_else(|_| "13.0.2-MariaDB".to_string());
-    let (_, views) = db.list_tables_and_views().unwrap_or_default();
+    let mariadb_version = db.server_version()?;
+    let (_, views) = get_cached_tables_and_views(db)?;
     let cfg = db.load_config_or_default();
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
@@ -300,7 +569,8 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     let system_config: Vec<SystemConfigRow> = raw_configs
         .into_iter()
         .map(|mut r| {
-            if is_sensitive_config_key(&r.config_key) {
+            if is_sensitive_config_key(&r.config_key) || r.value_type.eq_ignore_ascii_case("secret")
+            {
                 if r.config_value.trim().is_empty() {
                     r.config_value = "[UNSET]".to_string();
                 } else if r.config_key == "telegram_chat_id" {
@@ -318,7 +588,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
         mariadb_version,
-        views_healthy_count: views.len().max(7),
+        views_healthy_count: views.len(),
         execution_mode: cfg.execution_mode().as_str().to_string(),
         risk_tier: tier.as_str().to_string(),
         target_leverage_multiplier: mult,
@@ -358,23 +628,37 @@ pub fn execute_close_position_or_order(
     if req.close_all {
         let held = db.get_assets_held().unwrap_or_default();
         let ordered = db.get_assets_ordered().unwrap_or_default();
+        let total_targets = held.len() + ordered.len();
         let mut total_rpnl = 0.0;
         let mut closed_count = 0usize;
+        let mut last_err: Option<AegisError> = None;
 
         for o in &ordered {
-            if let Ok(rep) =
-                engine.close_or_cancel_position(o.position_id, reason, Some(cooldown_sec))
-            {
-                total_rpnl += rep.realized_pnl_usdc;
-                closed_count += 1;
+            match engine.close_or_cancel_position(o.position_id, reason, Some(cooldown_sec)) {
+                Ok(rep) => {
+                    if matches!(rep.final_status.as_str(), "CLOSED" | "CANCELLED") {
+                        total_rpnl += rep.realized_pnl_usdc;
+                        closed_count += 1;
+                    }
+                }
+                Err(e) => last_err = Some(e),
             }
         }
         for h in &held {
-            if let Ok(rep) =
-                engine.close_or_cancel_position(h.position_id, reason, Some(cooldown_sec))
-            {
-                total_rpnl += rep.realized_pnl_usdc;
-                closed_count += 1;
+            match engine.close_or_cancel_position(h.position_id, reason, Some(cooldown_sec)) {
+                Ok(rep) => {
+                    if matches!(rep.final_status.as_str(), "CLOSED" | "CANCELLED") {
+                        total_rpnl += rep.realized_pnl_usdc;
+                        closed_count += 1;
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        if total_targets > 0 && closed_count == 0 {
+            if let Some(err) = last_err {
+                return Err(err);
             }
         }
 
@@ -384,7 +668,11 @@ pub fn execute_close_position_or_order(
             asset_id: 0,
             symbol: "ALL".to_string(),
             previous_status: "OPEN".to_string(),
-            new_status: "CLOSED".to_string(),
+            new_status: if closed_count > 0 || total_targets == 0 {
+                "CLOSED".to_string()
+            } else {
+                "OPEN".to_string()
+            },
             realized_pnl_usdc: round_dp(total_rpnl, 4),
             cooldown_applied_sec: cooldown_sec,
             closed_count,
@@ -457,6 +745,15 @@ pub fn execute_risk_tier_switch(
         )));
     }
     let tier = RiskTier::parse(&raw);
+    if tier == RiskTier::Custom {
+        if let Some(m) = req.custom_leverage_multiplier {
+            if !m.is_finite() || !(0.10..=3.00).contains(&m) {
+                return Err(AegisError::Validation(format!(
+                    "custom_leverage_multiplier must be between 0.10 and 3.00, got {m}"
+                )));
+            }
+        }
+    }
     let mult = tier.leverage_multiplier(req.custom_leverage_multiplier);
 
     db.set_config_value(

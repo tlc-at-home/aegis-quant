@@ -84,33 +84,45 @@ pub fn evaluate_sleeve_s3(
         return HashMap::new();
     }
 
-    // Cross-sectional funding rate distribution (with baseline floor on standard deviation)
-    let n = assets.len() as f64;
-    let mean_funding = assets.iter().map(|a| a.funding_rate_hourly).sum::<f64>() / n;
-    let var_funding = assets
+    // Cross-sectional funding rate distribution over eligible assets only
+    let eligible_fundings: Vec<f64> = assets
         .iter()
-        .map(|a| {
-            let d = a.funding_rate_hourly - mean_funding;
-            d * d
+        .filter(|a| {
+            (a.is_core_eligible || a.is_event_eligible) && a.funding_rate_hourly.is_finite()
         })
-        .sum::<f64>()
-        / (n - 1.0).max(1.0);
-    let std_funding = var_funding.sqrt().max(0.00004);
+        .map(|a| a.funding_rate_hourly)
+        .collect();
+    let (mean_funding, std_funding) = if eligible_fundings.is_empty() {
+        (0.0, 0.00004)
+    } else {
+        let n = eligible_fundings.len() as f64;
+        let mean = eligible_fundings.iter().sum::<f64>() / n;
+        let var = eligible_fundings
+            .iter()
+            .map(|&f| {
+                let d = f - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / (n - 1.0).max(1.0);
+        (mean, var.sqrt().max(0.00004))
+    };
 
     let mut raw_items = Vec::with_capacity(assets.len());
-    let mut abs_sum = 0.0;
 
     for asset in assets {
         let bars = bars_by_asset
             .get(&asset.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let f_zscore = round_dp(
-            ((asset.funding_rate_hourly - mean_funding) / std_funding).clamp(-6.0, 6.0),
-            4,
-        );
+        let funding = if asset.funding_rate_hourly.is_finite() {
+            asset.funding_rate_hourly
+        } else {
+            mean_funding
+        };
+        let f_zscore = round_dp(((funding - mean_funding) / std_funding).clamp(-6.0, 6.0), 4);
         let flush_atr = compute_flush_atr_multiple(asset, bars);
-        let live_px = if asset.mark_price > 0.0 {
+        let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
             asset.mark_price
         } else {
             bars.last().map(|b| b.close).unwrap_or(0.0)
@@ -121,17 +133,19 @@ pub fn evaluate_sleeve_s3(
             (50.0, 0.5, false)
         };
 
+        let eligible = asset.is_event_eligible || asset.is_core_eligible;
         let is_capitulation = flush_atr <= -2.0 || (flush_atr >= 2.0 && range_pos > 0.55);
         let is_funding_squeeze =
             f_zscore <= -1.8 || (f_zscore >= 1.8 && flush_atr > 0.25 && range_pos > 0.35);
         let is_bottom_reversion = bars.len() >= 8
-            && !is_capitulation
             && range_pos <= 0.20
             && rsi_14 < 54.0
             && flush_atr <= 0.25
-            && (bouncing_from_low || rsi_14 < 38.0);
+            && bouncing_from_low;
 
-        let trigger = if is_capitulation || is_bottom_reversion {
+        let trigger = if !eligible {
+            None
+        } else if is_capitulation || is_bottom_reversion {
             Some(TRIGGER_CAPITULATION_FLUSH.to_string())
         } else if is_funding_squeeze {
             Some(TRIGGER_FUNDING_SQUEEZE.to_string())
@@ -139,28 +153,33 @@ pub fn evaluate_sleeve_s3(
             None
         };
 
-        let eligible = asset.is_event_eligible || asset.is_core_eligible;
-
         // Contrarian mean-reversion & funding dislocation score:
         // - Deep downward flush (`flush_atr <= -2.0`) -> contrarian LONG (+score)
         // - Deeply negative funding (`f_zscore <= -1.8`) -> short squeeze LONG (+score)
-        // - Oversold range-bottom bounce / higher-low retest -> contrarian LONG (scaled by range depth)
+        // - Confirmed oversold range-bottom green bounce -> contrarian LONG (monotonic with flush)
         // - Extreme blow-off + crowded positive funding -> contrarian SHORT (-score)
-        let mut raw_score = 0.0;
-        if eligible {
-            if is_capitulation {
-                raw_score += (-flush_atr * 0.45).clamp(-1.5, 1.5);
-            }
-            if is_funding_squeeze {
-                raw_score += (-f_zscore * 0.40).clamp(-1.5, 1.5);
-            }
-            if is_bottom_reversion {
+        let raw_score = if eligible {
+            let cap = if is_capitulation {
+                (-flush_atr * 0.45).clamp(-1.5, 1.5)
+            } else {
+                0.0
+            };
+            let fund = if is_funding_squeeze {
+                (-f_zscore * 0.40).clamp(-1.5, 1.5)
+            } else {
+                0.0
+            };
+            let bounce = if is_bottom_reversion {
                 let depth_boost = ((0.22 - range_pos).max(0.02) / 0.22).clamp(0.2, 1.0);
-                raw_score += 1.15 + 0.85 * depth_boost;
-            }
-        }
+                0.45 + 0.45 * depth_boost
+            } else {
+                0.0
+            };
+            (cap + fund + bounce).clamp(-1.5, 1.5)
+        } else {
+            0.0
+        };
 
-        abs_sum += raw_score.abs();
         raw_items.push((
             asset.id,
             asset.symbol.clone(),
@@ -171,19 +190,14 @@ pub fn evaluate_sleeve_s3(
         ));
     }
 
-    let _ = abs_sum;
     let mut abs_scores: Vec<f64> = raw_items
         .iter()
         .map(|x| x.4.abs())
-        .filter(|&v| v > 1e-6)
+        .filter(|v| v.is_finite() && *v > 1e-6)
         .collect();
-    abs_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    abs_scores.sort_by(|a, b| b.total_cmp(a));
     let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
-    let denom = if top_abs_sum > 1e-8 {
-        top_abs_sum
-    } else {
-        1.0
-    };
+    let denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for (asset_id, symbol, s3_funding_zscore, s3_flush_atr_mult, score, event_trigger) in raw_items
@@ -207,4 +221,171 @@ pub fn evaluate_sleeve_s3(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_asset(id: i64, coin: &str, funding: f64, mark: f64, eligible: bool) -> ExchangeAsset {
+        ExchangeAsset {
+            id,
+            symbol: format!("{coin}-USDC"),
+            coin: coin.to_string(),
+            asset_index: id as u32,
+            sz_decimals: 2,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+            max_leverage: 20.0,
+            mark_price: mark,
+            mid_price: mark,
+            oracle_price: mark,
+            funding_rate_hourly: funding,
+            day_volume_usdc: 10_000_000.0,
+            open_interest_usdc: 4_000_000.0,
+            prev_day_price: mark,
+            is_core_eligible: eligible,
+            is_event_eligible: eligible,
+            is_priority_watched: false,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn make_downtrend_bars(
+        asset_id: i64,
+        start: f64,
+        step_pct: f64,
+        count: usize,
+    ) -> Vec<OhlcvBar> {
+        let mut bars = Vec::with_capacity(count);
+        let mut px = start;
+        for i in 0..count {
+            let open = px;
+            px *= 1.0 + step_pct;
+            let close = px;
+            bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id,
+                timeframe: "4h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 14_400_000,
+                open,
+                high: open.max(close) * 1.004,
+                low: open.min(close) * 0.996,
+                close,
+                volume: 100_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        bars
+    }
+
+    #[test]
+    fn test_funding_zscore_excludes_ineligible_and_blocks_ineligible_triggers() {
+        let a1 = test_asset(1, "BTC", 0.00001, 90_000.0, true);
+        let a2 = test_asset(2, "ETH", 0.00002, 3_000.0, true);
+        let a3 = test_asset(3, "SOL", -0.00020, 150.0, true);
+        let dead = test_asset(4, "DEAD", 0.05000, 1.0, false);
+
+        let bars = HashMap::new();
+        let with_dead =
+            evaluate_sleeve_s3(&[a1.clone(), a2.clone(), a3.clone(), dead], &bars, 0.25);
+        let without_dead = evaluate_sleeve_s3(&[a1, a2, a3], &bars, 0.25);
+
+        assert!(
+            (with_dead[&3].s3_funding_zscore - without_dead[&3].s3_funding_zscore).abs() < 1e-6
+        );
+        assert_eq!(with_dead[&4].event_trigger, None);
+        assert_eq!(with_dead[&4].w_s3_event_reversion, 0.0);
+    }
+
+    #[test]
+    fn test_bottom_reversion_requires_confirmed_bounce_and_monotonic_flush() {
+        // 1. Falling knife (red candle, no green bounce, mild flush > -2.0 ATR) must NOT trigger CAPITULATION_FLUSH
+        let mut knife_bars = make_downtrend_bars(1, 100.0, -0.008, 25);
+        let prev_c = knife_bars.last().unwrap().close;
+        let red_close = prev_c * 0.994;
+        knife_bars.push(OhlcvBar {
+            id: 26,
+            asset_id: 1,
+            timeframe: "4h".to_string(),
+            timestamp_ms: 1_700_000_000_000 + 25 * 14_400_000,
+            open: prev_c,
+            high: prev_c * 1.001,
+            low: red_close * 0.990,
+            close: red_close,
+            volume: 100_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+        let knife_asset = test_asset(1, "KNIFE", 0.0, red_close, true);
+        let mut map = HashMap::new();
+        map.insert(1, knife_bars);
+        let out_knife = evaluate_sleeve_s3(&[knife_asset], &map, 0.25);
+        if out_knife[&1].s3_flush_atr_mult > -2.0 {
+            assert_eq!(out_knife[&1].event_trigger, None);
+            assert_eq!(out_knife[&1].w_s3_event_reversion, 0.0);
+        }
+
+        // 2. Confirmed green bounce at range bottom: deeper flush (-2.6 ATR) gets >= weight of shallower flush (-1.4 ATR)
+        let mut shallow_bars = make_downtrend_bars(2, 100.0, -0.005, 25);
+        let s_prev = shallow_bars.last().unwrap().close;
+        let s_close = s_prev * 1.005;
+        shallow_bars.push(OhlcvBar {
+            id: 26,
+            asset_id: 2,
+            timeframe: "4h".to_string(),
+            timestamp_ms: 1_700_000_000_000 + 25 * 14_400_000,
+            open: s_prev,
+            high: s_close * 1.002,
+            low: s_prev * 0.998,
+            close: s_close,
+            volume: 100_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+
+        let mut deep_bars = make_downtrend_bars(3, 100.0, -0.018, 25);
+        let d_prev = deep_bars.last().unwrap().close;
+        let d_close = d_prev * 1.005;
+        deep_bars.push(OhlcvBar {
+            id: 26,
+            asset_id: 3,
+            timeframe: "4h".to_string(),
+            timestamp_ms: 1_700_000_000_000 + 25 * 14_400_000,
+            open: d_prev,
+            high: d_close * 1.002,
+            low: d_prev * 0.998,
+            close: d_close,
+            volume: 100_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+
+        let a_shallow = test_asset(2, "SHAL", 0.0, s_close, true);
+        let a_deep = test_asset(3, "DEEP", 0.0, d_close, true);
+        let mut both_bars = HashMap::new();
+        both_bars.insert(2, shallow_bars);
+        both_bars.insert(3, deep_bars);
+        let out_both = evaluate_sleeve_s3(&[a_shallow, a_deep], &both_bars, 0.25);
+        assert_eq!(
+            out_both[&2].event_trigger.as_deref(),
+            Some(TRIGGER_CAPITULATION_FLUSH)
+        );
+        assert_eq!(
+            out_both[&3].event_trigger.as_deref(),
+            Some(TRIGGER_CAPITULATION_FLUSH)
+        );
+        assert!(
+            out_both[&3].w_s3_event_reversion >= out_both[&2].w_s3_event_reversion,
+            "Deeper flush ({}) must not get halved below shallower bounce ({})",
+            out_both[&3].w_s3_event_reversion,
+            out_both[&2].w_s3_event_reversion
+        );
+    }
 }

@@ -2,6 +2,8 @@
 Description=Aegis Quant v2.0 Autonomous Web3 DEX Quantitative Trading Platform (Hyperliquid L1 + MariaDB 13.0)
 After=network-online.target chronyd.service mariadb.service
 Wants=network-online.target chronyd.service mariadb.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,11 +11,13 @@ User=fedora
 Group=fedora
 WorkingDirectory=/home/fedora/aegis
 Environment="RUST_LOG=info"
-Environment="AEGIS_DB_URL=mysql://aegis:aegis_v2_local@127.0.0.1:3306/aegis_quant"
+# /etc/aegis-quant.env MUST have 0600 permissions (root-owned) and hold AEGIS_DB_URL=...
+EnvironmentFile=/etc/aegis-quant.env
 LoadCredential=aegis_master_key:/home/fedora/aegis/data/.aegis_master_key
 ExecStart=/home/fedora/aegis/bin/aegis-quant --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 LimitNOFILE=65535
@@ -25,16 +29,21 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/fedora/aegis/data -/home/fedora/aegis/logs -/var/lib/mysql
+ReadWritePaths=/home/fedora/aegis/data -/home/fedora/aegis/logs -/var/lib/mysql/mysql.sock
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+ProtectClock=true
+ProtectKernelLogs=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

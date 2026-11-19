@@ -77,10 +77,26 @@ impl MarketWatcher {
             }
         };
 
+        let active_asset_ids: HashSet<i64> = self
+            .db
+            .get_assets_held()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.asset_id)
+            .chain(
+                self.db
+                    .get_assets_ordered()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|o| o.asset_id),
+            )
+            .collect();
+
         let mut total_upserted = 0usize;
         let mut core_count = 0usize;
         let mut event_count = 0usize;
         let mut prio_count = 0usize;
+        let mut upserted_prio_symbols: HashSet<String> = HashSet::new();
 
         for input in &raw_inputs {
             if self.db.upsert_exchange_asset(input).is_ok() {
@@ -93,6 +109,32 @@ impl MarketWatcher {
                 }
                 if input.is_priority_watched {
                     prio_count += 1;
+                    if let Ok((sym, _)) = normalize_hyperliquid_symbol(&input.raw_symbol_or_coin) {
+                        upserted_prio_symbols.insert(sym);
+                    }
+                }
+            }
+        }
+
+        // Clear stale `is_priority_watched` flags on assets that are no longer held, ordered, or extreme-dislocated
+        if let Ok(existing) = self.db.list_exchange_assets() {
+            for a in &existing {
+                if !a.is_priority_watched || active_asset_ids.contains(&a.id) {
+                    continue;
+                }
+                if live_connected {
+                    if !upserted_prio_symbols.contains(&a.symbol) {
+                        let _ = self.db.set_asset_priority_watch(a.id, false);
+                    }
+                } else if raw_inputs.is_empty() {
+                    let day_chg = if a.prev_day_price > 0.0 {
+                        ((a.mark_price - a.prev_day_price) / a.prev_day_price).abs()
+                    } else {
+                        0.0
+                    };
+                    if a.funding_rate_hourly.abs() < 0.0004 && day_chg < 0.08 {
+                        let _ = self.db.set_asset_priority_watch(a.id, false);
+                    }
                 }
             }
         }
@@ -384,6 +426,9 @@ impl MarketWatcher {
         let now = now_ms();
         let start_ms = now - (lookback_bars as i64 + 6) * tf_ms;
 
+        let is_live_mode = cfg.execution_mode().is_live_or_testnet()
+            && (!self.db.is_ephemeral_test_db() || crate::http_client::endpoints_are_loopback(cfg));
+
         if live_connected {
             if let Ok(raw_list) =
                 self.http
@@ -405,6 +450,7 @@ impl MarketWatcher {
                     let l = parse_f(item.get("l"));
                     let c = parse_f(item.get("c"));
                     let v = parse_f(item.get("v"));
+                    let f = parse_f(item.get("f"));
                     if t > 0 && c > 0.0 {
                         live_bars.push(BarUpsertInput {
                             asset_id: asset.id,
@@ -415,14 +461,26 @@ impl MarketWatcher {
                             low: if l > 0.0 { l } else { c },
                             close: c,
                             volume: v.max(0.0),
-                            funding_rate: asset.funding_rate_hourly,
+                            funding_rate: f,
                         });
                     }
+                }
+                if is_live_mode {
+                    return live_bars;
                 }
                 if live_bars.len() >= 24 {
                     return live_bars;
                 }
             }
+        }
+
+        if is_live_mode {
+            tracing::debug!(
+                symbol = %asset.symbol,
+                timeframe = timeframe,
+                "Skipping synthetic bar generation in LIVE/TESTNET mode on transient candle snapshot failure"
+            );
+            return Vec::new();
         }
 
         Self::generate_anchored_bars(

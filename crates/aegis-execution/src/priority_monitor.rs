@@ -13,8 +13,11 @@ use aegis_alerts::{AlertEngine, PositionClosedAlert};
 use aegis_core::{now_ms, round_dp, HeldAssetView, OrderSide, Result};
 use aegis_db::DatabaseManager;
 use aegis_risk::{compute_atr_from_bars, RiskEngine};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Telemetry report emitted by each 1-second Priority Monitor tick.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -36,6 +39,7 @@ pub struct PriorityMonitor {
     pub http: HyperliquidHttpClient,
     pub chaser: OrderChaser,
     pub alerts: AlertEngine,
+    widened_watermarks: Arc<Mutex<HashMap<i64, (f64, f64)>>>,
 }
 
 impl PriorityMonitor {
@@ -50,6 +54,7 @@ impl PriorityMonitor {
             http,
             chaser,
             alerts,
+            widened_watermarks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -59,16 +64,21 @@ impl PriorityMonitor {
         let cfg = self.db.load_config_or_default();
         let watchlist = self.db.get_priority_watchlist()?;
 
-        // Refresh live mid/mark quotes from Hyperliquid `allMids` if any assets are under 1s priority watch
-        if !watchlist.is_empty() && cfg.execution_mode().is_live_or_testnet() {
-            if let Ok(mids) = self.http.fetch_all_mids(&cfg) {
-                for item in &watchlist {
-                    if let Some(&live_mid) = mids.get(&item.coin) {
-                        if live_mid > 0.0 {
-                            let _ =
-                                self.db
-                                    .update_asset_live_quote(item.asset_id, live_mid, live_mid);
-                        }
+        // Poll Hyperliquid `allMids` outside the execution lock so slow network responses never block closes
+        let mids_opt = if !watchlist.is_empty() && cfg.execution_mode().is_live_or_testnet() {
+            self.http.fetch_all_mids(&cfg).ok()
+        } else {
+            None
+        };
+
+        let _exec_guard = crate::engine::execution_lock().lock();
+
+        // Update ONLY `mid_price` from `allMids` (never overwrite true `mark_price`)
+        if let Some(ref mids) = mids_opt {
+            for item in &watchlist {
+                if let Some(&live_mid) = mids.get(&item.coin) {
+                    if live_mid.is_finite() && live_mid > 0.0 {
+                        let _ = self.db.update_asset_live_mid(item.asset_id, live_mid);
                     }
                 }
             }
@@ -123,6 +133,22 @@ impl PriorityMonitor {
             });
 
             let side = OrderSide::parse(&h.side);
+            let (eff_highest, eff_lowest) = {
+                let mut guard = self.widened_watermarks.lock();
+                if let Some((wh, wl)) = guard.get_mut(&h.position_id) {
+                    if live_mark.is_finite() && live_mark > 0.0 {
+                        *wh = wh.max(live_mark);
+                        *wl = if *wl > 0.0 {
+                            wl.min(live_mark)
+                        } else {
+                            live_mark
+                        };
+                    }
+                    (*wh, *wl)
+                } else {
+                    (h.highest_price_seen, h.lowest_price_seen)
+                }
+            };
             let eval = risk.evaluate_1s_stop_and_tp_ratchet(
                 side,
                 h.entry_price,
@@ -130,8 +156,8 @@ impl PriorityMonitor {
                 h.quantity,
                 h.protective_stop_px,
                 h.take_profit_px,
-                h.highest_price_seen,
-                h.lowest_price_seen,
+                eff_highest,
+                eff_lowest,
                 atr_opt,
                 tick_size,
             );
@@ -145,6 +171,7 @@ impl PriorityMonitor {
                     .execute_protective_stop_exit(h, live_mark, exit_reason, &risk)?
                     .is_some()
                 {
+                    self.widened_watermarks.lock().remove(&h.position_id);
                     report.stops_triggered_closed += 1;
                 }
             } else {
@@ -221,12 +248,54 @@ impl PriorityMonitor {
         let mut eff_exit_price = exit_price;
         let mut live_close_oid: Option<String> = None;
 
-        let is_live_exchange = cfg.execution_mode().is_live_or_testnet()
-            && !cfg.get_str("private_key", "").is_empty()
-            && !self.db.is_ephemeral_test_db();
+        let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
 
         if is_live_exchange {
             let pk = cfg.get_str("private_key", "");
+            let wallet = cfg.get_str("wallet_address", "");
+            if wallet.trim().is_empty() {
+                tracing::warn!(
+                    position_id = held.position_id,
+                    symbol = %held.symbol,
+                    "wallet_address is empty; skipping live protective stop close"
+                );
+                return Ok(None);
+            }
+
+            let parse_f = |v: Option<&Value>| -> f64 {
+                v.and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+                })
+                .filter(|val| val.is_finite())
+                .unwrap_or(0.0)
+            };
+
+            let ch_state = match self.http.fetch_clearinghouse_state(&wallet, &cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        position_id = held.position_id,
+                        symbol = %held.symbol,
+                        error = %e,
+                        "clearinghouseState unreachable during protective exit; skipping DB close"
+                    );
+                    return Ok(None);
+                }
+            };
+
+            let mut live_szi = 0.0_f64;
+            if let Some(arr) = ch_state.get("assetPositions").and_then(Value::as_array) {
+                for item in arr {
+                    let p = item.get("position").unwrap_or(item);
+                    let c = p.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                    if c.eq_ignore_ascii_case(&held.coin) {
+                        live_szi = parse_f(p.get("szi"));
+                        break;
+                    }
+                }
+            }
+
             let asset_opt = self.db.get_asset_by_id(held.asset_id)?;
             let tick = asset_opt
                 .as_ref()
@@ -235,24 +304,67 @@ impl PriorityMonitor {
                 .max(1e-8);
             let mut filled_on_hl = false;
 
-            if let Some(ref asset) = asset_opt {
-                let exit_is_buy = !side.is_buy();
+            if live_szi.abs() <= 1e-9 {
+                // HL native SL/TP trigger already filled on exchange: close DB without sending IOC retries or phantom SL
+                filled_on_hl = true;
+                fees_paid_usdc = 0.0;
+                if let Ok(fills) = self.http.fetch_user_fills(&wallet, &cfg) {
+                    let now = now_ms();
+                    let mut sz_sum = 0.0_f64;
+                    let mut ntl_sum = 0.0_f64;
+                    let mut fee_sum = 0.0_f64;
+                    let mut last_oid: Option<u64> = None;
+                    for f in fills.iter().rev() {
+                        let fc = f.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                        let ft = f.get("time").and_then(Value::as_i64).unwrap_or(0);
+                        let cpnl = parse_f(f.get("closedPnl"));
+                        let dir = f.get("dir").and_then(Value::as_str).unwrap_or("");
+                        if fc.eq_ignore_ascii_case(&held.coin)
+                            && now.saturating_sub(ft) <= 120_000
+                            && (cpnl.abs() > 1e-9 || dir.starts_with("Close") || dir.contains('>'))
+                        {
+                            let px = parse_f(f.get("px"));
+                            let sz = parse_f(f.get("sz"));
+                            let fee = parse_f(f.get("fee"));
+                            if px > 0.0 && sz > 0.0 {
+                                sz_sum += sz;
+                                ntl_sum += px * sz;
+                                fee_sum += fee;
+                                if last_oid.is_none() {
+                                    last_oid = f.get("oid").and_then(Value::as_u64).or_else(|| {
+                                        f.get("oid")
+                                            .and_then(Value::as_str)
+                                            .and_then(|s| s.parse::<u64>().ok())
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if sz_sum > 0.0 {
+                        eff_exit_price = round_dp(ntl_sum / sz_sum, 6);
+                        fees_paid_usdc = round_dp(fee_sum, 4);
+                        live_close_oid = last_oid.map(|id| format!("hl-{id}"));
+                    }
+                }
+            } else if let Some(ref asset) = asset_opt {
+                let exit_is_buy = live_szi < 0.0;
                 let l2_bbo = self.http.fetch_l2_book(&asset.coin, &cfg).ok().flatten();
                 let bbo_anchor = l2_bbo
                     .map(|(bid, ask)| if exit_is_buy { ask } else { bid })
                     .filter(|&px| px > 0.0)
                     .unwrap_or(exit_price);
+                let band_lo = (exit_price * (1.0 - 0.038)).max(tick);
+                let band_hi = exit_price * (1.0 + 0.038);
 
-                let mut rem_qty = held.quantity.abs();
+                let mut rem_qty = live_szi.abs();
                 let mut total_hl_fee = 0.0;
+                let mut fill_ntl_sum = 0.0;
+                let mut fill_qty_sum = 0.0;
                 for (attempt, (ref_anchor, slip)) in [
                     (bbo_anchor, 0.0),
-                    (bbo_anchor, 0.01),
-                    (bbo_anchor, 0.025),
-                    (exit_price, HL_ORACLE_BAND_PCT),
-                    (bbo_anchor, 0.05),
-                    (exit_price, 0.075),
-                    (bbo_anchor, 0.075),
+                    (bbo_anchor, 0.008),
+                    (bbo_anchor, 0.02),
+                    (exit_price, HL_ORACLE_BAND_PCT.min(0.038)),
                 ]
                 .into_iter()
                 .enumerate()
@@ -261,11 +373,12 @@ impl PriorityMonitor {
                         filled_on_hl = true;
                         break;
                     }
-                    let limit_px = if exit_is_buy {
+                    let raw_limit_px = if exit_is_buy {
                         ref_anchor * (1.0 + slip)
                     } else {
                         (ref_anchor * (1.0 - slip)).max(tick)
                     };
+                    let limit_px = raw_limit_px.clamp(band_lo, band_hi);
                     let wire = build_limit_order_wire(
                         asset.asset_index,
                         exit_is_buy,
@@ -293,10 +406,14 @@ impl PriorityMonitor {
                         &cfg,
                     ) {
                         if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
-                            if ack.avg_fill_price > 0.0 {
-                                eff_exit_price = ack.avg_fill_price;
-                            }
+                            let fill_px = if ack.avg_fill_price > 0.0 {
+                                ack.avg_fill_price
+                            } else {
+                                ref_anchor
+                            };
                             total_hl_fee += ack.fee_usdc;
+                            fill_ntl_sum += fill_px * ack.filled_quantity;
+                            fill_qty_sum += ack.filled_quantity;
                             live_close_oid = ack.exchange_order_id;
                             rem_qty = (rem_qty - ack.filled_quantity).max(0.0);
                             if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
@@ -306,7 +423,8 @@ impl PriorityMonitor {
                         }
                     }
                 }
-                if total_hl_fee > 0.0 {
+                if fill_qty_sum > 0.0 {
+                    eff_exit_price = round_dp(fill_ntl_sum / fill_qty_sum, 6);
                     fees_paid_usdc = round_dp(total_hl_fee, 4);
                 }
 
@@ -357,7 +475,7 @@ impl PriorityMonitor {
                         );
                     }
                 } else {
-                    // Re-anchor protective_stop_px beyond current mark/exit price so it does not spam 1s stop attempts on an illiquid Testnet book
+                    // Re-anchor protective_stop_px beyond current mark/exit price and reset watermarks so the 1s ratchet doesn't snap back immediately
                     let widened_stop = if side.is_buy() {
                         snap_to_tick((exit_price * (1.0 - default_stop_pct)).max(tick), tick)
                     } else {
@@ -368,6 +486,9 @@ impl PriorityMonitor {
                         exit_price,
                         widened_stop,
                     )?;
+                    self.widened_watermarks
+                        .lock()
+                        .insert(held.position_id, (exit_price, exit_price));
                     if let Some(ref asset) = asset_opt {
                         let _ = self.chaser.ensure_exchange_tpsl_orders(
                             held.position_id,

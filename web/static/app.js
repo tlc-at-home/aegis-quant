@@ -13,11 +13,14 @@ const state = {
   closingSymbols: new Set(),
   closeInFlightCount: 0,
   sse: null,
+  authRequired: false,
+  equityChartPoints: [],
 };
 
 const IMMUTABLE_SECURITY_KEYS = new Set([
   'enforce_master_key',
   'web_auth_enabled',
+  'web_require_auth',
   'web_allow_remote_bind',
   'web_bind_host',
   'web_csp_policy',
@@ -32,6 +35,8 @@ const IMMUTABLE_SECURITY_KEYS = new Set([
   'hyperliquid_exchange_url',
   'hyperliquid_testnet_exchange_url',
   'hyperliquid_allowed_hosts',
+  'hyperliquid_testnet',
+  'risk_capital_cap_updated_at_ms',
 ]);
 
 function fmtUsd(val, decimals = 2) {
@@ -74,11 +79,107 @@ function fmtPct(fracOrPct, isFraction = true, decimals = 1) {
   return `${sign}${v.toFixed(decimals)}%`;
 }
 
-function fmtUtcTime(tsMs) {
+function getLocalTzAbbrev(dateObj) {
+  try {
+    const parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' }).formatToParts(dateObj);
+    const tzPart = parts.find((p) => p.type === 'timeZoneName');
+    if (tzPart && tzPart.value) return tzPart.value;
+  } catch (_) {}
+  const offsetMin = -dateObj.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const absMin = Math.abs(offsetMin);
+  const hh = String(Math.floor(absMin / 60)).padStart(2, '0');
+  const mm = String(absMin % 60).padStart(2, '0');
+  return mm === '00' ? `GMT${sign}${hh}` : `GMT${sign}${hh}:${mm}`;
+}
+
+function fmtLocalTime(tsMs) {
   if (!tsMs || tsMs <= 0) return '—';
   const d = new Date(Number(tsMs));
   if (Number.isNaN(d.getTime())) return '—';
-  return d.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  const tz = getLocalTzAbbrev(d);
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} ${tz}`;
+}
+
+function fmtLocalShortTime(tsMs) {
+  if (!tsMs || tsMs <= 0) return '';
+  const d = new Date(Number(tsMs));
+  if (Number.isNaN(d.getTime())) return '';
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mi}:${ss}`;
+}
+
+const fmtUtcTime = fmtLocalTime;
+
+function openAuthModal(errMsg = '') {
+  const modal = document.getElementById('auth-login-modal');
+  const errEl = document.getElementById('auth-login-error');
+  const inp = document.getElementById('auth-token-input');
+  if (errEl) {
+    if (errMsg) {
+      errEl.textContent = errMsg;
+      errEl.style.display = 'block';
+    } else {
+      errEl.textContent = '';
+      errEl.style.display = 'none';
+    }
+  }
+  if (modal && !modal.classList.contains('open')) {
+    modal.classList.add('open');
+    if (inp) setTimeout(() => inp.focus(), 40);
+  }
+}
+
+function closeAuthModal() {
+  const modal = document.getElementById('auth-login-modal');
+  const errEl = document.getElementById('auth-login-error');
+  const inp = document.getElementById('auth-token-input');
+  if (modal) modal.classList.remove('open');
+  if (errEl) {
+    errEl.textContent = '';
+    errEl.style.display = 'none';
+  }
+  if (inp) inp.value = '';
+}
+
+async function submitAuthLogin(evt) {
+  evt.preventDefault();
+  const inp = document.getElementById('auth-token-input');
+  const btn = document.getElementById('btn-auth-login-submit');
+  const token = inp ? inp.value.trim() : '';
+  if (!token) {
+    openAuthModal('Please enter your Web API Bearer Token.');
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const res = await apiFetch('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      openAuthModal(data.detail || data.error || 'Invalid API token');
+      return;
+    }
+    state.authRequired = false;
+    closeAuthModal();
+    showToast('Authenticated — connected to live terminal');
+    await refreshAll(true);
+    connectSSE();
+  } catch (err) {
+    openAuthModal(`Authentication request error: ${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function escapeHtml(raw) {
@@ -111,12 +212,23 @@ async function apiFetch(url, options = {}) {
     headers.set('Content-Type', 'application/json');
   }
   headers.set('X-Requested-With', 'XMLHttpRequest');
-  return fetch(url, {
+  const res = await fetch(url, {
     cache: 'no-store',
     credentials: 'same-origin',
     ...options,
     headers,
   });
+  if (res.status === 401 && !String(url).includes('/api/v1/auth/login')) {
+    state.authRequired = true;
+    if (state.sse) {
+      try {
+        state.sse.close();
+      } catch (_) {}
+      state.sse = null;
+    }
+    openAuthModal();
+  }
+  return res;
 }
 
 /* ============================================================================
@@ -225,28 +337,25 @@ async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
   if ((pid > 0 && state.closingPositionIds.has(pid)) || (sym && state.closingSymbols.has(sym))) {
     return;
   }
+
+  const confirmMsg = applyCooldown
+    ? `Close open position ${sym || '#' + pid} at market (with cooldown)?`
+    : `Cancel working order ${sym || '#' + pid}?`;
+  if (!window.confirm(confirmMsg)) {
+    return;
+  }
+
   if (pid > 0) state.closingPositionIds.add(pid);
   if (sym) state.closingSymbols.add(sym);
   state.closeInFlightCount += 1;
 
-  // Immediate visual feedback on button + optimistic removal
+  // Immediate visual feedback on button while request is in flight
   document
-    .querySelectorAll(`.close-btn[data-close-pos-id="${pid}"]`)
+    .querySelectorAll(`.close-btn[data-position-id="${pid}"]`)
     .forEach((btn) => {
       btn.disabled = true;
       btn.textContent = 'Closing...';
     });
-
-  if (state.dashboard) {
-    state.dashboard.v_assets_held = (state.dashboard.v_assets_held || []).filter(
-      (h) => Number(h.position_id) !== pid && h.symbol !== sym
-    );
-    state.dashboard.v_assets_ordered = (state.dashboard.v_assets_ordered || []).filter(
-      (o) => Number(o.position_id) !== pid && o.symbol !== sym
-    );
-    renderOpenHoldingsTable(state.dashboard, true);
-    renderPriorityAndWorkingTable(state.dashboard, true);
-  }
 
   try {
     const res = await apiFetch('/api/v1/positions/close', {
@@ -263,6 +372,13 @@ async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
       showToast(`Close failed: ${data.detail || data.error || res.status}`, true);
       return;
     }
+    if (data.new_status === 'OPEN') {
+      showToast(
+        `Close order for ${data.symbol || sym} (#${data.position_id || pid}) did not fill; position remains OPEN`,
+        true
+      );
+      return;
+    }
     showToast(
       `Closed ${data.symbol || sym} (#${data.position_id || pid}) -> ${
         data.new_status || 'CLOSED'
@@ -272,15 +388,16 @@ async function closePositionOrOrder(positionId, symbol, applyCooldown = true) {
     showToast(`Error closing position: ${err.message}`, true);
   } finally {
     state.closeInFlightCount = Math.max(0, state.closeInFlightCount - 1);
-    setTimeout(() => {
-      if (pid > 0) state.closingPositionIds.delete(pid);
-      if (sym) state.closingSymbols.delete(sym);
-    }, 2500);
+    if (pid > 0) state.closingPositionIds.delete(pid);
+    if (sym) state.closingSymbols.delete(sym);
     await refreshAll(true);
   }
 }
 
 async function closeAllOpenPositions() {
+  if (!window.confirm('Close ALL open positions and cancel ALL working orders?')) {
+    return;
+  }
   const btn = document.getElementById('btn-close-all-open');
   if (btn) {
     btn.disabled = true;
@@ -303,8 +420,8 @@ async function closeAllOpenPositions() {
       return;
     }
     showToast(
-      `Closed ${Number(data.closed_count || 0)} position(s)/order(s) (Realized PnL: ${fmtSignedUsd(
-        data.realized_pnl_usdc || 0
+      `Closed ${Number(data.closed_count ?? 0)} position(s)/order(s) (Realized PnL: ${fmtSignedUsd(
+        data.realized_pnl_usdc ?? 0
       )})`
     );
   } catch (err) {
@@ -399,11 +516,15 @@ function classifyConfigKeyCategory(key) {
   if (
     k === 'max_open_positions' ||
     k === 'min_entry_interval_sec' ||
+    k === 'min_position_hold_sec' ||
     k.includes('risk_tier') ||
+    k.includes('risk_capital') ||
     k.includes('leverage') ||
     k.includes('weight') ||
     k.includes('stop') ||
     k.includes('cooldown') ||
+    k.includes('drawdown') ||
+    k.includes('spread') ||
     k.includes('equity') ||
     k.includes('max_open')
   ) {
@@ -511,10 +632,10 @@ function renderHealthAndTopBar(health, dash) {
 function renderPnlHorizonRibbon(dash) {
   const summary = (dash && dash.pnl_summary) || {};
   const fallbackUpnl = ((dash && dash.v_assets_held) || []).reduce(
-    (acc, h) => acc + Number(h.unrealized_pnl_usdc || 0),
+    (acc, h) => acc + Number(h.unrealized_pnl_usdc ?? 0),
     0
   );
-  const totalEq = Number((dash && dash.snapshot && dash.snapshot.total_equity_usdc) || 10000);
+  const totalEq = Number(dash?.snapshot?.total_equity_usdc ?? 0);
 
   const paintHorizon = (key, defaultObj) => {
     const h = summary[key] || defaultObj;
@@ -522,10 +643,10 @@ function renderPnlHorizonRibbon(dash) {
     const retPct = Number(
       h.return_pct ?? (totalEq > 0 ? (netPnl / totalEq) * 100.0 : 0.0)
     );
-    const rpnl = Number(h.realized_pnl_usdc || 0);
+    const rpnl = Number(h.realized_pnl_usdc ?? 0);
     const upnl = Number(h.unrealized_pnl_usdc ?? fallbackUpnl);
-    const trades = Number(h.trade_count || 0);
-    const wins = Number(h.win_count || 0);
+    const trades = Number(h.trade_count ?? 0);
+    const wins = Number(h.win_count ?? 0);
 
     const tone = netPnl > 0.005 ? 'pos' : netPnl < -0.005 ? 'neg' : 'flat';
 
@@ -571,22 +692,30 @@ function renderPnlHorizonRibbon(dash) {
   paintHorizon('ytd', fallback);
 }
 
+function getConfigFloatFromDash(dash, key, fallback) {
+  const row = (dash?.system_config || []).find((r) => r.config_key === key);
+  if (!row) return fallback;
+  const n = Number(row.config_value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function renderKpiCards(dash) {
   const snap = (dash && dash.snapshot) || {};
-  const totalEq = Number(snap.total_equity_usdc || 10000.0);
+  const totalEq = Number(snap.total_equity_usdc ?? 0);
   const availCash = Number(snap.available_cash_usdc ?? totalEq);
-  const reservedMargin = Number(snap.reserved_order_cash_usdc || 0.0);
-  const committedNotional = Number(snap.committed_notional_usdc || 0.0);
-  const netNotional = Number(snap.net_notional_usdc || 0.0);
-  const grossLev = Number(snap.gross_leverage_x || 0.0);
-  const netLev = Number(snap.net_leverage_x || 0.0);
+  const reservedMargin = Number(snap.reserved_order_cash_usdc ?? 0.0);
+  const committedNotional = Number(snap.committed_notional_usdc ?? 0.0);
+  const netNotional = Number(snap.net_notional_usdc ?? 0.0);
+  const grossLev = Number(snap.gross_leverage_x ?? 0.0);
+  const netLev = Number(snap.net_leverage_x ?? 0.0);
   const tier = String(snap.risk_tier || dash.risk_tier || 'extreme').toUpperCase();
   const mult = Number(
-    snap.leverage_multiplier || dash.target_leverage_multiplier || 1.85
+    snap.leverage_multiplier ?? dash.target_leverage_multiplier ?? 1.85
   );
   const breadth = Number(snap.market_breadth_bull ?? 0.5);
-  const beta = Number(snap.market_beta_exposure || 0.0);
+  const beta = Number(snap.market_beta_exposure ?? 0.0);
   const regime = String(snap.market_regime_label || 'NEUTRAL');
+  const maxGrossCap = getConfigFloatFromDash(dash, 'max_gross_leverage_x', 2.5);
 
   const setTxt = (id, text) => {
     const el = document.getElementById(id);
@@ -609,10 +738,10 @@ function renderKpiCards(dash) {
   setTxt('kpi-tier-badge', `${tierIcon} ${tier} (${mult.toFixed(2)}x)`);
   setTxt(
     'kpi-eligible-coins',
-    `${Number(snap.eligible_coin_count || (dash.exchange_assets || []).length)} Eligible Perps`
+    `${Number(snap.eligible_coin_count ?? (dash.exchange_assets || []).length)} Eligible Perps`
   );
 
-  const cashPct = totalEq > 0 ? (availCash / totalEq) * 100.0 : 100.0;
+  const cashPct = totalEq > 0 ? (availCash / totalEq) * 100.0 : 0.0;
   setTxt('kpi-avail-cash', fmtUsd(availCash));
   setTxt('kpi-cash-pct', `${cashPct.toFixed(1)}% of Equity`);
   setWidth('kpi-cash-meter', cashPct);
@@ -631,8 +760,8 @@ function renderKpiCards(dash) {
   setTxt('kpi-committed-notional', fmtUsd(committedNotional));
   setTxt(
     'kpi-open-counts',
-    `${Number(snap.open_long_count || 0)} Long · ${Number(
-      snap.open_short_count || 0
+    `${Number(snap.open_long_count ?? 0)} Long · ${Number(
+      snap.open_short_count ?? 0
     )} Short`
   );
   setTxt('kpi-net-notional', `Net: ${fmtUsd(netNotional)}`);
@@ -641,7 +770,8 @@ function renderKpiCards(dash) {
   setTxt('kpi-gross-leverage', `${grossLev.toFixed(2)}x`);
   setTxt('kpi-net-leverage', `${netLev >= 0 ? '+' : ''}${netLev.toFixed(2)}x`);
   setTxt('kpi-leverage-target', `Target: ${mult.toFixed(2)}x ${tier}`);
-  setWidth('kpi-leverage-meter', (grossLev / 2.5) * 100.0);
+  setTxt('kpi-leverage-cap', `Cap: ${maxGrossCap.toFixed(2)}x`);
+  setWidth('kpi-leverage-meter', (grossLev / Math.max(0.2, maxGrossCap)) * 100.0);
 
   setTxt('kpi-regime-label', regime);
   setTxt('kpi-breadth-pct', `Bull Breadth: ${(breadth * 100.0).toFixed(1)}%`);
@@ -649,9 +779,9 @@ function renderKpiCards(dash) {
   setWidth('kpi-breadth-meter', breadth * 100.0);
 
   // Sleeve attribution stat boxes
-  setTxt('sleeve-s1-weight', fmtPct(snap.s1_gross_weight || 0, true, 1));
-  setTxt('sleeve-s2-weight', fmtPct(snap.s2_gross_weight || 0, true, 1));
-  setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight || 0, true, 1));
+  setTxt('sleeve-s1-weight', fmtPct(snap.s1_gross_weight ?? 0, true, 1));
+  setTxt('sleeve-s2-weight', fmtPct(snap.s2_gross_weight ?? 0, true, 1));
+  setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight ?? 0, true, 1));
 }
 
 function renderPriorityAndWorkingTable(dash, forceRender = false) {
@@ -722,10 +852,10 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
           <button
             type="button"
             class="close-btn"
-            data-close-pos-id="${o.position_id}"
-            data-close-symbol="${escapeHtml(o.symbol)}"
-            data-close-cooldown="false"
-            onclick="closePositionOrOrder(${o.position_id}, '${escapeHtml(o.symbol)}', false)"
+            data-action="close-position"
+            data-position-id="${Number(o.position_id)}"
+            data-symbol="${escapeHtml(o.symbol)}"
+            data-cooldown="false"
           >Cancel</button>
         </td>
       </tr>
@@ -835,10 +965,10 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
             <button
               type="button"
               class="close-btn"
-              data-close-pos-id="${h.position_id}"
-              data-close-symbol="${escapeHtml(h.symbol)}"
-              data-close-cooldown="true"
-              onclick="closePositionOrOrder(${h.position_id}, '${escapeHtml(h.symbol)}', true)"
+              data-action="close-position"
+              data-position-id="${Number(h.position_id)}"
+              data-symbol="${escapeHtml(h.symbol)}"
+              data-cooldown="true"
             >Close</button>
           </td>
         </tr>
@@ -847,11 +977,54 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     .join('');
 }
 
-function buildInlineConfigControlHtml(row, idPrefix) {
+function formatCooldownRemaining(secRaw) {
+  const sec = Math.max(0, Math.floor(Number(secRaw ?? 0)));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function renderCooldownsPanel(dash) {
+  const listEl = document.getElementById('cooldown-badges-list');
+  const pillEl = document.getElementById('cooldown-count-pill');
+  if (!listEl) return;
+
+  const cooldowns = (dash && dash.v_assets_in_cooldown) || [];
+  if (pillEl) {
+    pillEl.textContent = `${cooldowns.length} ACTIVE`;
+  }
+
+  if (cooldowns.length === 0) {
+    listEl.innerHTML =
+      '<span class="pnl-flat" style="font-family: var(--font-mono); font-size: 11px;">No assets currently in cooldown.</span>';
+    return;
+  }
+
+  listEl.innerHTML = cooldowns
+    .map((c) => {
+      const rem = formatCooldownRemaining(c.remaining_seconds);
+      const expStr = fmtLocalTime(c.expires_at_ms);
+      return `
+        <div class="t-badge pulse-3s" title="${escapeHtml(c.reason || '')}" style="gap: 8px; padding: 6px 10px;">
+          <span class="sym-badge">${escapeHtml(c.symbol)}</span>
+          <span class="sp-tag s3">${escapeHtml(c.cooldown_type || 'COOLDOWN')}</span>
+          <span style="color: #fbbf24;">${escapeHtml(rem)} left</span>
+          <span style="color: var(--text-muted); font-size: 10px;">until ${escapeHtml(expStr)}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function buildInlineConfigControlHtml(row, idPrefix, rowIdx = 0) {
   const key = String(row.config_key || '');
   const val = String(row.config_value ?? '');
   const vtype = String(row.value_type || 'string').toLowerCase();
-  const inputId = `${idPrefix}-cfg-input-${key.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+  const safeSlug = key.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const inputId = `${idPrefix}-cfg-input-${rowIdx}-${safeSlug}`;
 
   if (IMMUTABLE_SECURITY_KEYS.has(key.toLowerCase())) {
     return `<span class="pnl-flat" title="Immutable security policy key">Locked Policy</span>`;
@@ -880,8 +1053,14 @@ function buildInlineConfigControlHtml(row, idPrefix) {
       .join('');
     return `
       <div class="cfg-inline-controls">
-        <select id="${inputId}" class="cfg-inline-select">${optsHtml}</select>
-        <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+        <select id="${escapeHtml(inputId)}" class="cfg-inline-select">${optsHtml}</select>
+        <button
+          type="button"
+          class="cfg-save-btn"
+          data-action="save-config"
+          data-key="${escapeHtml(key)}"
+          data-input-id="${escapeHtml(inputId)}"
+        >Save</button>
       </div>
     `;
   }
@@ -899,13 +1078,21 @@ function buildInlineConfigControlHtml(row, idPrefix) {
       <div class="cfg-inline-controls">
         <input
           type="password"
-          id="${inputId}"
+          id="${escapeHtml(inputId)}"
           class="cfg-inline-input"
           data-is-secret="true"
+          data-action="save-config-enter"
+          data-key="${escapeHtml(key)}"
+          data-input-id="${escapeHtml(inputId)}"
           placeholder="Enter new secret to overwrite..."
-          onkeydown="if(event.key==='Enter') saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')"
         />
-        <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+        <button
+          type="button"
+          class="cfg-save-btn"
+          data-action="save-config"
+          data-key="${escapeHtml(key)}"
+          data-input-id="${escapeHtml(inputId)}"
+        >Save</button>
       </div>
     `;
   }
@@ -916,13 +1103,21 @@ function buildInlineConfigControlHtml(row, idPrefix) {
     <div class="cfg-inline-controls">
       <input
         type="text"
-        id="${inputId}"
+        id="${escapeHtml(inputId)}"
         class="cfg-inline-input"
+        data-action="save-config-enter"
+        data-key="${escapeHtml(key)}"
+        data-input-id="${escapeHtml(inputId)}"
         value="${escapeHtml(prefill)}"
         placeholder="${escapeHtml(placeholder)}"
-        onkeydown="if(event.key==='Enter') saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')"
       />
-      <button type="button" class="cfg-save-btn" onclick="saveSingleConfigRow('${escapeHtml(key)}', '${inputId}')">Save</button>
+      <button
+        type="button"
+        class="cfg-save-btn"
+        data-action="save-config"
+        data-key="${escapeHtml(key)}"
+        data-input-id="${escapeHtml(inputId)}"
+      >Save</button>
     </div>
   `;
 }
@@ -997,14 +1192,14 @@ function renderSystemConfigTables(force = false) {
   const renderRows = (rows, prefix) =>
     rows
       .map(
-        (c) => `
+        (c, idx) => `
         <tr>
           <td><strong style="color:var(--neon-cyan)">${escapeHtml(c.config_key)}</strong></td>
           <td><code>${escapeHtml(c.config_value)}</code></td>
-          <td>${buildInlineConfigControlHtml(c, prefix)}</td>
+          <td>${buildInlineConfigControlHtml(c, prefix, idx)}</td>
           <td><span class="tab-count">${escapeHtml(c.value_type)}</span></td>
           <td style="color:var(--text-muted); white-space: normal; max-width: 340px;">${escapeHtml(c.description)}</td>
-          <td>${fmtUtcTime(c.updated_at_ms)}</td>
+          <td>${fmtLocalTime(c.updated_at_ms)}</td>
         </tr>
       `
       )
@@ -1076,7 +1271,7 @@ function renderActiveExplorerTab(forceConfig = false) {
               <td>${(Number(r.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
               <td class="${r.funding_apr_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
               <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
-              <td>${Number(r.market_beta || 1).toFixed(2)}</td>
+              <td>${Number(r.market_beta ?? 1).toFixed(2)}</td>
               <td>${Number(r.s1_mom_score || 0).toFixed(3)}</td>
               <td>${Number(r.s1_carry_score || 0).toFixed(3)}</td>
               <td class="${wCls}">${fmtPct(r.w_s1_carry_mom)}</td>
@@ -1115,7 +1310,7 @@ function renderActiveExplorerTab(forceConfig = false) {
               <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
               <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
               <td>${alignBadge}</td>
-              <td style="color:var(--neon-cyan);font-weight:700;">${Number(r.s2_vol_surge_ratio || 1).toFixed(2)}x</td>
+              <td style="color:var(--neon-cyan);font-weight:700;">${Number(r.s2_vol_surge_ratio ?? 1).toFixed(2)}x</td>
               <td>${r.event_trigger ? `<span class="status-pill watch">${escapeHtml(r.event_trigger)}</span>` : '—'}</td>
               <td class="${wCls}">${fmtPct(r.w_s2_trend_breakout)}</td>
               <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
@@ -1183,7 +1378,7 @@ function renderActiveExplorerTab(forceConfig = false) {
               <td>${fmtUsd(a.day_volume_usdc, 0)}</td>
               <td>${fmtUsd(a.open_interest_usdc, 0)}</td>
               <td>${(Number(a.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
-              <td>${Number(a.max_leverage || 20).toFixed(0)}x</td>
+              <td>${Number(a.max_leverage ?? 20).toFixed(0)}x</td>
               <td><div class="sleeve-mix-pills">${tags.join('') || '<span class="pnl-flat">SCAN</span>'}</div></td>
             </tr>
           `;
@@ -1203,7 +1398,7 @@ function renderActiveExplorerTab(forceConfig = false) {
             String(a.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
           return `
             <tr>
-              <td>${fmtUtcTime(a.created_at_ms)}</td>
+              <td>${fmtLocalTime(a.created_at_ms)}</td>
               <td><code>${escapeHtml(a.client_order_id)}</code></td>
               <td><span class="side-pill ${sideCls}">${escapeHtml(a.side)}</span></td>
               <td><span class="status-pill watch">${escapeHtml(a.from_state)} → ${escapeHtml(a.to_state)}</span></td>
@@ -1228,7 +1423,7 @@ function renderActiveExplorerTab(forceConfig = false) {
             <div class="t-log-item">
               <div class="t-log-meta">
                 <span><span class="t-log-lvl ${escapeHtml(lvl)}">${escapeHtml(lvl)}</span> · <strong>${escapeHtml(l.component)}</strong></span>
-                <span>${fmtUtcTime(l.created_at_ms)}</span>
+                <span>${fmtLocalTime(l.created_at_ms)}</span>
               </div>
               <div style="color: var(--text-primary);">${escapeHtml(l.message)}</div>
             </div>
@@ -1274,7 +1469,7 @@ function drawEquityCurveCanvas(dash) {
   }
   if (history.length === 1) {
     history = [
-      { ...history[0], created_at_ms: history[0].created_at_ms - 60000 },
+      { ...history[0], created_at_ms: Number(history[0].created_at_ms ?? Date.now()) - 60000 },
       history[0],
     ];
   }
@@ -1288,14 +1483,15 @@ function drawEquityCurveCanvas(dash) {
 
   const vals = [];
   history.forEach((pt) => {
-    vals.push(Number(pt.total_equity_usdc || 10000));
-    vals.push(Number(pt.committed_notional_usdc || 0));
-    vals.push(Number(pt.reserved_order_cash_usdc || 0));
+    vals.push(Number(pt.total_equity_usdc ?? 0));
+    vals.push(Number(pt.committed_notional_usdc ?? 0));
+    vals.push(Number(pt.reserved_order_cash_usdc ?? 0));
   });
   const minVal = 0;
-  const maxVal = Math.max(10500, ...vals) * 1.06;
+  const rawMax = Math.max(0, ...vals);
+  const maxVal = rawMax > 0 ? rawMax * 1.08 : 100;
 
-  // Grid lines
+  // Grid lines & Y-axis labels
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)';
   ctx.lineWidth = 1;
   ctx.font = '10px "JetBrains Mono", monospace';
@@ -1308,13 +1504,48 @@ function drawEquityCurveCanvas(dash) {
     ctx.lineTo(padL + plotW, y);
     ctx.stroke();
     const labelVal = minVal + frac * (maxVal - minVal);
-    ctx.fillText('$' + Math.round(labelVal).toLocaleString(), 6, y + 3);
+    const labelStr =
+      maxVal < 500
+        ? '$' + labelVal.toFixed(2)
+        : '$' + Math.round(labelVal).toLocaleString();
+    ctx.fillText(labelStr, 6, y + 3);
   }
 
   const xFor = (idx) =>
     padL + (history.length <= 1 ? 0 : (idx / (history.length - 1)) * plotW);
   const yFor = (v) =>
-    padT + plotH - ((v - minVal) / Math.max(1, maxVal - minVal)) * plotH;
+    padT + plotH - ((v - minVal) / Math.max(1e-6, maxVal - minVal)) * plotH;
+
+  // Store point coordinates for local-time hover tooltip
+  state.equityChartPoints = history.map((pt, idx) => ({
+    x: xFor(idx),
+    y: yFor(Number(pt.total_equity_usdc ?? 0)),
+    pt,
+  }));
+
+  // Local-timezone X-axis timestamps (start, mid, end)
+  if (history.length > 0) {
+    const indices =
+      history.length >= 3
+        ? [0, Math.floor((history.length - 1) / 2), history.length - 1]
+        : [0, history.length - 1];
+    indices.forEach((idx, posIdx) => {
+      const pt = history[idx];
+      if (!pt || !pt.created_at_ms) return;
+      const baseTime = fmtLocalShortTime(pt.created_at_ms);
+      if (!baseTime) return;
+      const tzSuffix =
+        posIdx === indices.length - 1
+          ? ` ${getLocalTzAbbrev(new Date(Number(pt.created_at_ms)))}`
+          : '';
+      const txt = baseTime + tzSuffix;
+      const x = xFor(idx);
+      ctx.textAlign =
+        posIdx === 0 ? 'left' : posIdx === indices.length - 1 ? 'right' : 'center';
+      ctx.fillText(txt, x, padT + plotH + 17);
+    });
+    ctx.textAlign = 'left';
+  }
 
   const drawSeries = (getter, strokeColor, fillTop) => {
     ctx.beginPath();
@@ -1342,19 +1573,19 @@ function drawEquityCurveCanvas(dash) {
 
   // 1. Total Equity Curve (Neon Cyan)
   drawSeries(
-    (p) => Number(p.total_equity_usdc || 10000),
+    (p) => Number(p.total_equity_usdc ?? 0),
     '#00f2fe',
     'rgba(0, 242, 254, 0.22)'
   );
   // 2. Committed Notional Curve (Neon Emerald)
   drawSeries(
-    (p) => Number(p.committed_notional_usdc || 0),
+    (p) => Number(p.committed_notional_usdc ?? 0),
     '#10b981',
     'rgba(16, 185, 129, 0.16)'
   );
   // 3. Reserved Working Order Margin (Neon Amber)
   drawSeries(
-    (p) => Number(p.reserved_order_cash_usdc || 0),
+    (p) => Number(p.reserved_order_cash_usdc ?? 0),
     '#f59e0b',
     null
   );
@@ -1367,9 +1598,12 @@ function drawSleeveAttributionCanvas(dash) {
   ctx.clearRect(0, 0, w, h);
 
   const snap = (dash && dash.snapshot) || {};
-  const s1 = Math.abs(Number(snap.s1_gross_weight || 0.45));
-  const s2 = Math.abs(Number(snap.s2_gross_weight || 0.40));
-  const s3 = Math.abs(Number(snap.s3_gross_weight || 0.25));
+  const rawS1 = Number(snap.s1_gross_weight ?? 0);
+  const rawS2 = Number(snap.s2_gross_weight ?? 0);
+  const rawS3 = Number(snap.s3_gross_weight ?? 0);
+  const s1 = Number.isFinite(rawS1) ? Math.abs(rawS1) : 0;
+  const s2 = Number.isFinite(rawS2) ? Math.abs(rawS2) : 0;
+  const s3 = Number.isFinite(rawS3) ? Math.abs(rawS3) : 0;
 
   const bars = [
     { label: 'S1 CARRY-MOM', val: s1, budget: 0.45, color: '#00f2fe' },
@@ -1397,10 +1631,12 @@ function drawSleeveAttributionCanvas(dash) {
     ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
     ctx.fillRect(padL, barY, trackW, barH);
 
-    // Active weight fill
-    const fillW = Math.min(trackW, (b.val / maxW) * trackW);
-    ctx.fillStyle = b.color;
-    ctx.fillRect(padL, barY, Math.max(4, fillW), barH);
+    // Active weight fill (0.0 renders 0 width, never fake fallback bars)
+    const fillW = b.val > 0 ? Math.min(trackW, (b.val / maxW) * trackW) : 0;
+    if (fillW > 0) {
+      ctx.fillStyle = b.color;
+      ctx.fillRect(padL, barY, Math.max(3, fillW), barH);
+    }
 
     ctx.fillStyle = '#ffffff';
     ctx.fillText(`${(b.val * 100).toFixed(1)}%`, padL + trackW + 8, yCenter + 4);
@@ -1408,7 +1644,7 @@ function drawSleeveAttributionCanvas(dash) {
 }
 
 /* ============================================================================
-   DATA FETCHING & 1s/2s SSE STREAM WIRING
+   DATA FETCHING & 1.5s SSE STREAM WIRING
    ============================================================================ */
 
 function applyDashboardPayload(dash, forceConfig = false) {
@@ -1419,12 +1655,14 @@ function applyDashboardPayload(dash, forceConfig = false) {
   renderKpiCards(dash);
   renderPriorityAndWorkingTable(dash);
   renderOpenHoldingsTable(dash);
+  renderCooldownsPanel(dash);
   renderActiveExplorerTab(forceConfig);
   drawEquityCurveCanvas(dash);
   drawSleeveAttributionCanvas(dash);
 }
 
 async function refreshAll(forceConfig = false) {
+  if (state.authRequired) return;
   try {
     const [hRes, dRes] = await Promise.all([
       apiFetch('/api/v1/health'),
@@ -1443,10 +1681,12 @@ async function refreshAll(forceConfig = false) {
 }
 
 function connectSSE() {
+  if (state.authRequired) return;
   if (state.sse) {
     try {
       state.sse.close();
     } catch (_) {}
+    state.sse = null;
   }
   try {
     const es = new EventSource('/api/v1/stream');
@@ -1459,8 +1699,13 @@ function connectSSE() {
         }
       } catch (_) {}
     };
-    es.onerror = () => {
-      // Fallback polling handles transient reconnects cleanly
+    es.onerror = async () => {
+      if (state.sse === es && es.readyState === EventSource.CLOSED && !state.authRequired) {
+        // Probe once to surface 401 prompt if auth became required
+        try {
+          await apiFetch('/api/v1/dashboard');
+        } catch (_) {}
+      }
     };
   } catch (_) {}
 }
@@ -1475,27 +1720,158 @@ window.addEventListener('resize', () => {
 document.addEventListener('keydown', (evt) => {
   if (evt.key === 'Escape') {
     closeConfigModal();
+    return;
+  }
+  if (evt.key === 'Enter') {
+    const target = evt.target;
+    if (
+      target &&
+      target.matches &&
+      target.matches('.cfg-inline-input[data-action="save-config-enter"]')
+    ) {
+      evt.preventDefault();
+      const key = target.getAttribute('data-key') || '';
+      const inputId = target.getAttribute('data-input-id') || target.id;
+      if (key && inputId) {
+        saveSingleConfigRow(key, inputId);
+      }
+    }
+  }
+});
+
+document.addEventListener('click', (evt) => {
+  const target = evt.target;
+  if (!target || !target.closest) return;
+
+  // Backdrop close on config modal
+  if (target.id === 'config-settings-modal') {
+    closeConfigModal();
+    return;
+  }
+
+  const tierBtn = target.closest('.tier-btn[data-tier]');
+  if (tierBtn) {
+    switchRiskTier(tierBtn.getAttribute('data-tier'));
+    return;
+  }
+
+  if (target.closest('#btn-sync-hyperliquid')) {
+    triggerHyperliquidReconcile();
+    return;
+  }
+  if (target.closest('#btn-telegram-test')) {
+    triggerTelegramTestAlert();
+    return;
+  }
+  if (target.closest('#btn-open-config-modal')) {
+    openConfigModal();
+    return;
+  }
+  if (target.closest('#btn-close-config-modal')) {
+    closeConfigModal();
+    return;
+  }
+  if (target.closest('#btn-toggle-watch-all')) {
+    toggleShowAllPriorityWatch();
+    return;
+  }
+  if (target.closest('#btn-close-all-open')) {
+    closeAllOpenPositions();
+    return;
+  }
+  if (target.closest('#btn-submit-config-update')) {
+    submitConfigUpdate();
+    return;
+  }
+
+  const tabBtn = target.closest('.tab-btn[data-tab]');
+  if (tabBtn) {
+    switchExplorerTab(tabBtn.getAttribute('data-tab'));
+    return;
+  }
+
+  const catBtn = target.closest('.cfg-cat-btn[data-cat]');
+  if (catBtn) {
+    setConfigCategory(catBtn.getAttribute('data-cat'));
+    return;
+  }
+
+  const closeBtn = target.closest('.close-btn[data-action="close-position"]');
+  if (closeBtn && !closeBtn.disabled) {
+    const pid = Number(closeBtn.getAttribute('data-position-id') || 0);
+    const sym = closeBtn.getAttribute('data-symbol') || '';
+    const applyCd = closeBtn.getAttribute('data-cooldown') !== 'false';
+    closePositionOrOrder(pid, sym, applyCd);
+    return;
+  }
+
+  const saveCfgBtn = target.closest('.cfg-save-btn[data-action="save-config"]');
+  if (saveCfgBtn) {
+    const key = saveCfgBtn.getAttribute('data-key') || '';
+    const inputId = saveCfgBtn.getAttribute('data-input-id') || '';
+    if (key && inputId) {
+      saveSingleConfigRow(key, inputId);
+    }
   }
 });
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Attach delegated pointerdown listeners on surveillance tables so button presses trigger immediately before any 1.5s SSE DOM swap
-  ['tbody-assets-held', 'tbody-priority-ordered'].forEach((tbodyId) => {
-    const el = document.getElementById(tbodyId);
-    if (!el) return;
-    el.addEventListener('pointerdown', (evt) => {
-      const btn = evt.target && evt.target.closest ? evt.target.closest('.close-btn[data-close-pos-id]') : null;
-      if (!btn || btn.disabled) return;
-      evt.preventDefault();
-      const pid = Number(btn.getAttribute('data-close-pos-id') || 0);
-      const sym = btn.getAttribute('data-close-symbol') || '';
-      const applyCd = btn.getAttribute('data-close-cooldown') !== 'false';
-      closePositionOrOrder(pid, sym, applyCd);
+  const scannerSearch = document.getElementById('scanner-search-input');
+  if (scannerSearch) {
+    scannerSearch.addEventListener('input', () => renderActiveExplorerTab());
+  }
+  const modalSearch = document.getElementById('modal-cfg-search');
+  if (modalSearch) {
+    modalSearch.addEventListener('input', () => renderSystemConfigTables());
+  }
+  const authForm = document.getElementById('auth-login-form');
+  if (authForm) {
+    authForm.addEventListener('submit', submitAuthLogin);
+  }
+
+  // Interactive local-timezone hover tooltip on Equity Curve canvas
+  const eqCanvas = document.getElementById('equity-curve-canvas');
+  const eqTooltip = document.getElementById('equity-chart-tooltip');
+  if (eqCanvas && eqTooltip) {
+    eqCanvas.addEventListener('mousemove', (evt) => {
+      const pts = state.equityChartPoints || [];
+      if (pts.length === 0) return;
+      const rect = eqCanvas.getBoundingClientRect();
+      const mouseX = evt.clientX - rect.left;
+      let nearest = pts[0];
+      let bestDist = Math.abs(mouseX - nearest.x);
+      for (let i = 1; i < pts.length; i++) {
+        const d = Math.abs(mouseX - pts[i].x);
+        if (d < bestDist) {
+          bestDist = d;
+          nearest = pts[i];
+        }
+      }
+      const pt = nearest.pt;
+      eqTooltip.innerHTML = `
+        <div style="color: var(--neon-cyan); font-weight: 700; margin-bottom: 3px;">${escapeHtml(fmtLocalTime(pt.created_at_ms))}</div>
+        <div>Equity: <strong>${escapeHtml(fmtUsd(pt.total_equity_usdc ?? 0))}</strong></div>
+        <div style="color: #34d399;">Committed: ${escapeHtml(fmtUsd(pt.committed_notional_usdc ?? 0))}</div>
+        <div style="color: #fbbf24;">Reserved: ${escapeHtml(fmtUsd(pt.reserved_order_cash_usdc ?? 0))}</div>
+      `;
+      eqTooltip.style.display = 'block';
+      const tipX = Math.min(rect.width - 170, Math.max(8, nearest.x + 12));
+      const tipY = Math.max(8, Math.min(rect.height - 80, nearest.y - 24));
+      eqTooltip.style.left = `${tipX}px`;
+      eqTooltip.style.top = `${tipY}px`;
     });
-  });
+    eqCanvas.addEventListener('mouseleave', () => {
+      eqTooltip.style.display = 'none';
+    });
+  }
 
   await refreshAll(true);
   connectSSE();
-  // 2.5-second fallback sync
-  setInterval(() => refreshAll(false), 2500);
+
+  // 2.5-second fallback poll ONLY when EventSource SSE is not OPEN
+  setInterval(() => {
+    if (state.authRequired) return;
+    if (state.sse && state.sse.readyState === EventSource.OPEN) return;
+    refreshAll(false);
+  }, 2500);
 });

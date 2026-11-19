@@ -99,10 +99,6 @@ impl SignalEngine {
             .iter()
             .map(|(&aid, m)| (aid, m.market_beta))
             .collect();
-        let target_weights: HashMap<i64, f64> = signals
-            .iter()
-            .map(|s| (s.asset_id, s.target_weight))
-            .collect();
         let capitulation_count = s3_map
             .values()
             .filter(|m| m.event_trigger.as_deref() == Some(TRIGGER_CAPITULATION_FLUSH))
@@ -112,7 +108,7 @@ impl SignalEngine {
             assets,
             bars_by_asset,
             &beta_by_asset,
-            &target_weights,
+            current_weights,
             capitulation_count,
         );
 
@@ -162,15 +158,23 @@ impl SignalEngine {
                 continue;
             }
             let side = OrderSide::parse(&pos.side);
-            let signed_w = if pos.portfolio_weight.abs() > 1e-6 {
-                pos.portfolio_weight.abs() * side.sign()
-            } else {
-                let notional = if status == PositionStatus::Open {
-                    pos.committed_notional_usdc
+            let notional = if status == PositionStatus::Open {
+                if pos.current_price.is_finite()
+                    && pos.current_price > 0.0
+                    && pos.filled_quantity.is_finite()
+                    && pos.filled_quantity > 0.0
+                {
+                    pos.current_price * pos.filled_quantity
                 } else {
-                    pos.entry_price * pos.requested_quantity
-                };
+                    pos.committed_notional_usdc
+                }
+            } else {
+                pos.entry_price * pos.requested_quantity
+            };
+            let signed_w = if notional.is_finite() && notional > 0.0 {
                 (notional / eq) * side.sign()
+            } else {
+                pos.portfolio_weight.abs() * side.sign()
             };
             *current_weights.entry(pos.asset_id).or_insert(0.0) += signed_w;
         }
@@ -435,13 +439,13 @@ mod tests {
         let fet_sig = &output.signals[0];
 
         assert!(
-            fet_sig.s1_mom_score > 0.0,
-            "S1 should produce positive recovery momentum at bouncing range bottom, got {}",
+            fet_sig.s1_mom_score >= 0.0,
+            "S1 must block negative short momentum at range bottom without fake sign inversion, got {}",
             fet_sig.s1_mom_score
         );
         assert!(
-            fet_sig.w_s1_carry_mom > 0.0,
-            "S1 carry-mom weight should be positive at bouncing range bottom, got {}",
+            fet_sig.w_s1_carry_mom >= 0.0,
+            "S1 carry-mom weight must not be negative at bouncing range bottom, got {}",
             fet_sig.w_s1_carry_mom
         );
         assert!(
@@ -462,5 +466,45 @@ mod tests {
             fet_sig.rebalance_action, ACTION_OPEN_LONG,
             "Range-bottom bouncing asset should receive OPEN_LONG action"
         );
+    }
+
+    #[test]
+    fn test_breadth_filters_ineligible_and_beta_uses_held_weights() {
+        let btc_bars = build_trend_bars(1, 90_000.0, 0.01, 20, 1.0);
+        let btc = sample_asset(
+            1,
+            "BTC",
+            btc_bars.last().unwrap().close,
+            90_000.0,
+            0.0,
+            50_000_000.0,
+        );
+
+        let mut dead = sample_asset(2, "DEAD", 1.0, 1.0, 0.0, 100.0);
+        dead.is_core_eligible = false;
+        dead.is_event_eligible = false;
+        let dead_bars = build_trend_bars(2, 1.0, -0.02, 20, 1.0);
+
+        let mut bars_by_asset = HashMap::new();
+        bars_by_asset.insert(1, btc_bars);
+        bars_by_asset.insert(2, dead_bars);
+
+        let engine = SignalEngine::default();
+        // Flat current_weights -> market_beta_exposure must be 0.0 (not target_weights beta), and DEAD excluded from breadth
+        let flat_out = engine.evaluate_universe(
+            &[btc.clone(), dead.clone()],
+            &bars_by_asset,
+            &HashMap::new(),
+            &[],
+        );
+        assert_eq!(flat_out.breadth.eligible_coin_count, 1);
+        assert!((flat_out.breadth.market_breadth_bull - 1.0).abs() < 1e-6);
+        assert_eq!(flat_out.breadth.market_beta_exposure, 0.0);
+
+        // With BTC held at +0.25 -> market_beta_exposure = 0.25 * 1.0 = 0.25
+        let mut held_weights = HashMap::new();
+        held_weights.insert(1, 0.25);
+        let held_out = engine.evaluate_universe(&[btc, dead], &bars_by_asset, &held_weights, &[]);
+        assert!((held_out.breadth.market_beta_exposure - 0.25).abs() < 1e-4);
     }
 }

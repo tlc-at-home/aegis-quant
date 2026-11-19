@@ -135,6 +135,36 @@ impl RiskEngine {
         ledger: &CapitalLedgerState,
         atr_opt: Option<f64>,
     ) -> WorkingOrderSizingPlan {
+        if !target_weight.is_finite()
+            || !current_weight.is_finite()
+            || !asset.mark_price.is_finite()
+            || !ledger.total_equity_usdc.is_finite()
+            || !ledger.available_cash_usdc.is_finite()
+            || !ledger.reserved_order_cash_usdc.is_finite()
+            || !ledger.committed_notional_usdc.is_finite()
+        {
+            return WorkingOrderSizingPlan {
+                approved: false,
+                rejection_reason: Some("NON_FINITE_RISK_INPUT".to_string()),
+                asset_id: asset.id,
+                symbol: asset.symbol.clone(),
+                side: OrderSide::Long,
+                limit_price: 0.0,
+                requested_quantity: 0.0,
+                target_notional_usdc: 0.0,
+                reserved_margin_usdc: 0.0,
+                committed_notional_usdc: 0.0,
+                portfolio_weight: 0.0,
+                s1_weight_contrib: 0.0,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 0.0,
+                stop_distance_pct: 0.0,
+                take_profit_px: 0.0,
+                tp_distance_pct: 0.0,
+            };
+        }
+
         let clamped_target_w = target_weight.clamp(
             -self.limits.max_single_asset_weight,
             self.limits.max_single_asset_weight,
@@ -146,7 +176,7 @@ impl RiskEngine {
             OrderSide::Short
         };
 
-        let raw_px = if asset.mid_price > 0.0 {
+        let raw_px = if asset.mid_price.is_finite() && asset.mid_price > 0.0 {
             asset.mid_price
         } else {
             asset.mark_price
@@ -187,9 +217,13 @@ impl RiskEngine {
         }
 
         let equity = ledger.total_equity_usdc.max(1.0);
+        let eff_lev = if self.limits.target_leverage_multiplier.is_finite() {
+            self.limits.target_leverage_multiplier.max(0.1)
+        } else {
+            1.0
+        };
         let max_gross_notional = equity * self.limits.max_gross_leverage_x;
-        let existing_reserved_notional =
-            ledger.reserved_order_cash_usdc * self.limits.target_leverage_multiplier.max(1.0);
+        let existing_reserved_notional = ledger.reserved_order_cash_usdc.max(0.0) * eff_lev;
         let remaining_gross_notional =
             (max_gross_notional - ledger.committed_notional_usdc - existing_reserved_notional)
                 .max(0.0);
@@ -201,12 +235,19 @@ impl RiskEngine {
             ));
         }
 
-        let max_notional_from_cash =
-            ledger.available_cash_usdc * self.limits.target_leverage_multiplier.max(1.0);
+        let avail_cash = ledger.available_cash_usdc.max(0.0);
+        let max_notional_from_cash = avail_cash * eff_lev;
+        let asset_max_lev = if asset.max_leverage.is_finite() {
+            asset.max_leverage.max(1.0)
+        } else {
+            1.0
+        };
+        let max_asset_lev_notional = avail_cash * asset_max_lev;
         let desired_notional = equity * delta_w.abs();
         let capped_notional = desired_notional
             .min(remaining_gross_notional)
             .min(max_notional_from_cash)
+            .min(max_asset_lev_notional)
             .min(equity * self.limits.max_single_asset_weight);
 
         let raw_qty = capped_notional / limit_price;
@@ -246,13 +287,8 @@ impl RiskEngine {
         } else {
             0.0
         };
-        let take_profit_px = compute_initial_take_profit(
-            side,
-            limit_price,
-            atr_opt,
-            asset.tick_size,
-            &self.limits,
-        );
+        let take_profit_px =
+            compute_initial_take_profit(side, limit_price, atr_opt, asset.tick_size, &self.limits);
         let tp_distance_pct = if take_profit_px > 0.0 {
             round_dp(
                 ((take_profit_px - limit_price).abs() / limit_price) * 100.0,
@@ -263,13 +299,26 @@ impl RiskEngine {
         };
 
         let achieved_weight = round_dp((target_notional_usdc / equity) * side.sign(), 4);
-        let raw_sleeve_sum =
-            (w_s1_carry_mom.abs() + w_s2_trend_breakout.abs() + w_s3_event_reversion.abs())
-                .max(1e-8);
+        let safe_s1 = if w_s1_carry_mom.is_finite() {
+            w_s1_carry_mom
+        } else {
+            0.0
+        };
+        let safe_s2 = if w_s2_trend_breakout.is_finite() {
+            w_s2_trend_breakout
+        } else {
+            0.0
+        };
+        let safe_s3 = if w_s3_event_reversion.is_finite() {
+            w_s3_event_reversion
+        } else {
+            0.0
+        };
+        let raw_sleeve_sum = (safe_s1.abs() + safe_s2.abs() + safe_s3.abs()).max(1e-8);
         let scale = achieved_weight.abs() / raw_sleeve_sum;
-        let s1_weight_contrib = round_dp(w_s1_carry_mom * scale, 4);
-        let s2_weight_contrib = round_dp(w_s2_trend_breakout * scale, 4);
-        let s3_weight_contrib = round_dp(w_s3_event_reversion * scale, 4);
+        let s1_weight_contrib = round_dp(safe_s1 * scale, 4);
+        let s2_weight_contrib = round_dp(safe_s2 * scale, 4);
+        let s3_weight_contrib = round_dp(safe_s3 * scale, 4);
 
         WorkingOrderSizingPlan {
             approved: true,
@@ -603,5 +652,169 @@ mod tests {
         assert!(eval3.triggered);
         assert_eq!(eval3.exit_reason.as_deref(), Some("PROTECTIVE_STOP_LONG"));
         assert_eq!(eval3.cooldown_duration_ms, 1_800_000);
+    }
+
+    #[test]
+    fn test_nan_and_non_finite_inputs_rejected_immediately() {
+        let risk = RiskEngine::default();
+        let mut sol = sample_sol_asset();
+        let ledger = risk.evaluate_ledger(10_000.0, &[]);
+
+        let nan_target = risk.size_working_order_from_weights(
+            &sol,
+            f64::NAN,
+            0.0,
+            0.1,
+            0.0,
+            0.0,
+            &ledger,
+            Some(3.0),
+        );
+        assert!(!nan_target.approved);
+        assert_eq!(nan_target.requested_quantity, 0.0);
+
+        let nan_current = risk.size_working_order_from_weights(
+            &sol,
+            0.2,
+            f64::NAN,
+            0.1,
+            0.0,
+            0.0,
+            &ledger,
+            Some(3.0),
+        );
+        assert!(!nan_current.approved);
+        assert_eq!(nan_current.requested_quantity, 0.0);
+
+        sol.mark_price = f64::NAN;
+        let nan_mark =
+            risk.size_working_order_from_weights(&sol, 0.2, 0.0, 0.1, 0.0, 0.0, &ledger, Some(3.0));
+        assert!(!nan_mark.approved);
+
+        let mut bad_ledger = ledger.clone();
+        bad_ledger.total_equity_usdc = f64::INFINITY;
+        let sol_ok = sample_sol_asset();
+        let inf_eq = risk.size_working_order_from_weights(
+            &sol_ok,
+            0.2,
+            0.0,
+            0.1,
+            0.0,
+            0.0,
+            &bad_ledger,
+            Some(3.0),
+        );
+        assert!(!inf_eq.approved);
+
+        let mut nan_cash_ledger = ledger;
+        nan_cash_ledger.available_cash_usdc = f64::NAN;
+        let nan_cash = risk.size_working_order_from_weights(
+            &sol_ok,
+            0.2,
+            0.0,
+            0.1,
+            0.0,
+            0.0,
+            &nan_cash_ledger,
+            Some(3.0),
+        );
+        assert!(!nan_cash.approved);
+    }
+
+    #[test]
+    fn test_conservative_sub_1x_leverage_and_asset_max_leverage_cap() {
+        let mut limits = RiskLimitsConfig {
+            risk_tier: RiskTier::Conservative,
+            target_leverage_multiplier: 0.65,
+            max_single_asset_weight: 1.0,
+            max_gross_leverage_x: 2.50,
+            ..RiskLimitsConfig::default()
+        };
+        let risk = RiskEngine::new(limits.clone());
+        let sol = sample_sol_asset();
+        let ledger = risk.evaluate_ledger(10_000.0, &[]);
+
+        // Request 90% weight -> Conservative 0.65x caps notional to $6,500 and reserves $10,000 margin
+        let plan_cap = risk.size_working_order_from_weights(
+            &sol,
+            0.90,
+            0.0,
+            0.90,
+            0.0,
+            0.0,
+            &ledger,
+            Some(3.0),
+        );
+        assert!(plan_cap.approved);
+        assert!(plan_cap.target_notional_usdc <= 6_500.0 + 1e-2);
+        assert!(plan_cap.target_notional_usdc >= 6_480.0);
+        assert!(plan_cap.reserved_margin_usdc <= 10_000.0 + 1e-4);
+
+        // Two-step sizing under 0.65x: first order 0.40 ($4,000 notional, $6,153.85 margin), second capped at $2,500
+        let plan1 = risk.size_working_order_from_weights(
+            &sol,
+            0.40,
+            0.0,
+            0.40,
+            0.0,
+            0.0,
+            &ledger,
+            Some(3.0),
+        );
+        assert!(plan1.approved);
+        assert!((plan1.target_notional_usdc - 4_000.0).abs() < 20.0);
+
+        let mut ledger_after_1 = ledger;
+        ledger_after_1.reserved_order_cash_usdc = plan1.reserved_margin_usdc;
+        ledger_after_1.available_cash_usdc =
+            (ledger_after_1.total_equity_usdc - plan1.reserved_margin_usdc).max(0.0);
+
+        let plan2 = risk.size_working_order_from_weights(
+            &sol,
+            0.40,
+            0.0,
+            0.40,
+            0.0,
+            0.0,
+            &ledger_after_1,
+            Some(3.0),
+        );
+        assert!(plan2.approved);
+        assert!(
+            plan1.target_notional_usdc + plan2.target_notional_usdc <= 6_500.0 + 1.0,
+            "Combined Conservative 0.65x notional exceeded $6,500: {}",
+            plan1.target_notional_usdc + plan2.target_notional_usdc
+        );
+
+        // Per-asset max_leverage cap (e.g. target 2.50x, asset.max_leverage = 2.0, available_cash = $1,000)
+        limits.risk_tier = RiskTier::Custom;
+        limits.target_leverage_multiplier = 2.50;
+        limits.max_single_asset_weight = 0.50;
+        let custom_risk = RiskEngine::new(limits);
+        let mut low_lev = sample_sol_asset();
+        low_lev.max_leverage = 2.0;
+        let cash_tight_ledger = CapitalLedgerState {
+            total_equity_usdc: 10_000.0,
+            available_cash_usdc: 1_000.0,
+            reserved_order_cash_usdc: 0.0,
+            committed_notional_usdc: 0.0,
+            ..CapitalLedgerState::default()
+        };
+        let plan_asset_cap = custom_risk.size_working_order_from_weights(
+            &low_lev,
+            0.30,
+            0.0,
+            0.30,
+            0.0,
+            0.0,
+            &cash_tight_ledger,
+            Some(3.0),
+        );
+        assert!(plan_asset_cap.approved);
+        assert!(
+            plan_asset_cap.target_notional_usdc <= 2_000.0 + 1e-2,
+            "Asset max_leverage=2.0 should cap $1k cash order at $2,000, got {}",
+            plan_asset_cap.target_notional_usdc
+        );
     }
 }

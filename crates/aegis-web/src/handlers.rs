@@ -77,14 +77,34 @@ pub async fn serve_app_js(State(state): State<AppState>) -> Response {
     resp
 }
 
-/// `GET /api/v1/health` — Returns MariaDB 13.0 version, 7 SQL Views status, risk tier (`extreme`, `1.85x`), execution mode, and loop cadence (`1s Priority / 3s Scanner`).
+/// Converts a `build_health_payload` result into `200 OK` or `503 Service Unavailable`.
+pub fn health_result_to_response(
+    res: aegis_core::Result<crate::payloads::HealthPayload>,
+) -> Response {
+    match res {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "error": "Service Unavailable",
+                "detail": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/health` — Returns MariaDB 13.0 version, 7 SQL Views status, risk tier, execution mode, and loop cadence.
+/// Returns HTTP `503 Service Unavailable` whenever MariaDB ping/query fails.
 pub async fn get_health_handler(State(state): State<AppState>) -> Response {
     let db = state.db.clone();
     let res = tokio::task::spawn_blocking(move || build_health_payload(&db)).await;
     match res {
-        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
-        Ok(Err(e)) => map_aegis_error_response(e),
-        Err(e) => map_aegis_error_response(AegisError::Database(format!("Health task error: {e}"))),
+        Ok(inner) => health_result_to_response(inner),
+        Err(e) => {
+            health_result_to_response(Err(AegisError::Database(format!("Health task error: {e}"))))
+        }
     }
 }
 
@@ -109,7 +129,10 @@ pub async fn post_risk_tier_handler(
     let db = state.db.clone();
     let res = tokio::task::spawn_blocking(move || execute_risk_tier_switch(&db, &req)).await;
     match res {
-        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
+        Ok(Ok(payload)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(payload)).into_response()
+        }
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => {
             map_aegis_error_response(AegisError::Database(format!("Risk tier task error: {e}")))
@@ -117,14 +140,14 @@ pub async fn post_risk_tier_handler(
     }
 }
 
-/// `POST /api/v1/config` — Updates runtime config keys or Fernet-encrypted credentials in `system_config`.
+/// `POST /api/v1/config` — Updates validated runtime config keys or Fernet-encrypted credentials in `system_config`.
 pub async fn post_config_handler(
     State(state): State<AppState>,
     Json(req): Json<ConfigUpdateRequest>,
 ) -> Response {
     let db = state.db.clone();
     let res = tokio::task::spawn_blocking(move || -> aegis_core::Result<ConfigUpdateResponse> {
-        let mut updated_keys = Vec::new();
+        let mut pending_writes: Vec<(String, String, Option<String>)> = Vec::new();
 
         if let Some(ref k) = req.config_key {
             let val_str = req
@@ -133,31 +156,59 @@ pub async fn post_config_handler(
                 .map(json_value_to_config_string)
                 .unwrap_or_default();
             validate_config_key_value(k, &val_str)?;
-            db.set_config_value(k, &val_str, req.description.as_deref())?;
-            updated_keys.push(k.trim().to_string());
+            pending_writes.push((k.trim().to_string(), val_str, req.description.clone()));
         }
 
         if let Some(ref map) = req.updates {
             for (k, v) in map {
                 let val_str = json_value_to_config_string(v);
                 validate_config_key_value(k, &val_str)?;
-                db.set_config_value(k, &val_str, None)?;
-                updated_keys.push(k.trim().to_string());
+                pending_writes.push((k.trim().to_string(), val_str, None));
             }
         }
 
-        if updated_keys.is_empty() {
+        if pending_writes.is_empty() {
             return Err(AegisError::Validation(
                 "No config_key or updates map provided".to_string(),
             ));
         }
 
+        let mut updated_keys = Vec::with_capacity(pending_writes.len());
+        let mut risk_tier_updated: Option<String> = None;
+        let mut explicit_mult_updated = false;
+        for (k, val_str, desc) in &pending_writes {
+            if k == "risk_tier" {
+                risk_tier_updated = Some(val_str.clone());
+            } else if k == "target_leverage_multiplier" {
+                explicit_mult_updated = true;
+            }
+            db.set_config_value(k, val_str, desc.as_deref())?;
+            updated_keys.push(k.clone());
+        }
+
+        // Keep target_leverage_multiplier synchronized if risk_tier was changed directly
+        if let Some(raw_tier) = risk_tier_updated {
+            if !explicit_mult_updated && !raw_tier.eq_ignore_ascii_case("custom") {
+                let tier = aegis_core::RiskTier::parse(&raw_tier);
+                let mult = tier.leverage_multiplier(None);
+                db.set_config_value(
+                    "target_leverage_multiplier",
+                    &format!("{mult:.2}"),
+                    Some("Synchronized with risk_tier update"),
+                )?;
+                updated_keys.push("target_leverage_multiplier".to_string());
+            }
+        }
+
         updated_keys.sort();
+        updated_keys.dedup();
         if updated_keys.iter().any(|k| {
             matches!(
                 k.as_str(),
                 "live_exchange_equity_usdc"
                     | "initial_paper_equity_usdc"
+                    | "risk_capital_cap_usdc"
+                    | "risk_tier"
                     | "max_open_positions"
                     | "target_leverage_multiplier"
                     | "max_gross_leverage_x"
@@ -186,7 +237,10 @@ pub async fn post_config_handler(
     .await;
 
     match res {
-        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
+        Ok(Ok(payload)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(payload)).into_response()
+        }
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => map_aegis_error_response(AegisError::Database(format!("Config task error: {e}"))),
     }
@@ -229,7 +283,10 @@ pub async fn post_positions_close_handler(
     let db = state.db.clone();
     let res = tokio::task::spawn_blocking(move || execute_close_position_or_order(&db, &req)).await;
     match res {
-        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
+        Ok(Ok(payload)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(payload)).into_response()
+        }
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => map_aegis_error_response(AegisError::Database(format!(
             "Close position task error: {e}"
@@ -253,7 +310,10 @@ pub async fn post_reconcile_handler(
     .await;
 
     match res {
-        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Ok(report)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(report)).into_response()
+        }
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => {
             map_aegis_error_response(AegisError::Database(format!("Reconcile task error: {e}")))
@@ -261,7 +321,7 @@ pub async fn post_reconcile_handler(
     }
 }
 
-/// `POST /api/v1/auth/login` — Exchanges bearer token for a session cookie.
+/// `POST /api/v1/auth/login` — Exchanges bearer token for an HttpOnly session cookie.
 pub async fn post_auth_login_handler(
     State(state): State<AppState>,
     Json(req): Json<AuthLoginPayload>,
@@ -282,7 +342,7 @@ pub async fn post_auth_login_handler(
             .into_response();
     }
     let cookie = format!(
-        "aegis_session={}; Path=/; HttpOnly; SameSite=Strict",
+        "aegis_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200",
         state.session_token
     );
     let mut resp = (

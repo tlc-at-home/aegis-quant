@@ -1,12 +1,35 @@
 //! Config-switchable Discord Webhook dispatcher for Aegis Quant v2.0 (`aegis-alerts::discord`).
 
-use crate::formatter::html_to_discord_markdown;
+use crate::formatter::{
+    html_to_discord_markdown, truncate_discord_markdown, DISCORD_MAX_MESSAGE_CHARS,
+};
+use crate::telegram::is_loopback_url;
 use aegis_core::{sanitize_telemetry_message, AegisError, Result};
+use parking_lot::Mutex;
 use reqwest::blocking::Client as BlockingClient;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
+
+static DISCORD_CLIENTS: OnceLock<Mutex<HashMap<(u64, bool), BlockingClient>>> = OnceLock::new();
+
+fn get_discord_client(timeout_sec: u64, is_loopback: bool) -> BlockingClient {
+    let key = (timeout_sec.max(2), is_loopback);
+    let cache = DISCORD_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(client) = cache.lock().get(&key) {
+        return client.clone();
+    }
+    let mut builder = BlockingClient::builder().timeout(Duration::from_secs(key.0));
+    if is_loopback {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().unwrap_or_else(|_| BlockingClient::new());
+    cache.lock().insert(key, client.clone());
+    client
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordSendOutcome {
@@ -33,16 +56,14 @@ pub fn send_discord_webhook(
         };
     }
 
-    let markdown = html_to_discord_markdown(html_or_markdown_message);
-    let is_loopback = url.contains("127.0.0.1") || url.contains("localhost");
+    let markdown = truncate_discord_markdown(
+        &html_to_discord_markdown(html_or_markdown_message),
+        DISCORD_MAX_MESSAGE_CHARS,
+    );
+    let is_loopback = is_loopback_url(&url);
 
     let run_blocking = move || -> DiscordSendOutcome {
-        let mut builder =
-            BlockingClient::builder().timeout(Duration::from_secs(timeout_sec.max(2)));
-        if is_loopback {
-            builder = builder.no_proxy();
-        }
-        let client = builder.build().unwrap_or_else(|_| BlockingClient::new());
+        let client = get_discord_client(timeout_sec, is_loopback);
         let payload = json!({
             "username": "Aegis Quant v2.0",
             "content": markdown,

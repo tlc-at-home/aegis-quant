@@ -1,13 +1,15 @@
 //! Integration tests for Aegis Quant v2.0 Web Dashboard & REST/SSE API (`aegis-web`).
 
-use aegis_core::OrderSide;
+use aegis_core::{AegisError, OrderSide};
 use aegis_db::{AssetUpsertInput, DatabaseManager, WorkingOrderInput};
 use aegis_web::{
-    create_web_router, ClosePositionRequest, ConfigUpdateRequest, RiskTierUpdateRequest,
+    create_web_router, create_web_router_for_host, health_result_to_response,
+    validate_config_key_value, AuthLoginPayload, ClosePositionRequest, ConfigUpdateRequest,
+    RiskTierUpdateRequest, DEFAULT_CSP_POLICY,
 };
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
 };
 use serde_json::Value;
 use std::path::Path;
@@ -17,6 +19,8 @@ use tower::ServiceExt;
 async fn test_web_health_dashboard_risk_tier_and_position_close() {
     let db = tokio::task::spawn_blocking(|| {
         let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
         let btc_id = mgr
             .upsert_exchange_asset(&AssetUpsertInput {
                 raw_symbol_or_coin: "BTC".to_string(),
@@ -112,6 +116,7 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
         .unwrap();
     let health_json: Value = serde_json::from_slice(&health_bytes).unwrap();
     assert_eq!(health_json["status"], "ok");
+    assert_eq!(health_json["execution_mode"], "PAPER");
     assert_eq!(health_json["risk_tier"], "extreme");
     assert_eq!(health_json["views_healthy_count"], 7);
 
@@ -229,4 +234,248 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
     let close_json: Value = serde_json::from_slice(&close_bytes).unwrap();
     assert_eq!(close_json["new_status"], "CANCELLED");
     assert_eq!(close_json["cooldown_applied_sec"], 600);
+}
+
+#[tokio::test]
+async fn test_web_auth_enforced_on_get_and_mutating_routes_and_csp() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    // Non-loopback bind with token also fails closed to require_bearer_auth=true
+    let app = create_web_router_for_host(db.clone(), None, Some("0.0.0.0"));
+
+    // 1. Static / and /api/v1/health remain reachable, CSP omits 'unsafe-inline' in script-src
+    let res_idx = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res_idx.status(), StatusCode::OK);
+    let csp = res_idx
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'self';"));
+    assert!(!DEFAULT_CSP_POLICY.contains("script-src 'self' 'unsafe-inline'"));
+
+    let res_health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_health.status(), StatusCode::OK);
+
+    // 2. Unauthenticated GET /api/v1/dashboard, /api/v1/state, /api/v1/stream, and POST return 401
+    for uri in ["/api/v1/dashboard", "/api/v1/state", "/api/v1/stream"] {
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "Expected 401 for {uri}"
+        );
+    }
+
+    let res_post_noauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk-tier")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"risk_tier":"standard"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_post_noauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Invalid login -> 401; Valid login -> 200 + Set-Cookie; Bearer & Cookie unlock GET routes
+    let bad_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&AuthLoginPayload {
+                        token: "wrong-token".to_string(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_login.status(), StatusCode::UNAUTHORIZED);
+
+    let ok_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&AuthLoginPayload {
+                        token: "aegis-secret-token-123".to_string(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_login.status(), StatusCode::OK);
+    let set_cookie = ok_login
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_kv = set_cookie.split(';').next().unwrap().to_string();
+
+    let res_dash_bearer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::AUTHORIZATION, "Bearer aegis-secret-token-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_dash_bearer.status(), StatusCode::OK);
+
+    let res_state_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/state")
+                .header(header::COOKIE, &cookie_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_state_cookie.status(), StatusCode::OK);
+
+    let res_stream_bearer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .header(header::AUTHORIZATION, "Bearer aegis-secret-token-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_stream_bearer.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_web_csrf_origin_mismatch_rejected() {
+    let db = tokio::task::spawn_blocking(|| {
+        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
+    })
+    .await
+    .unwrap();
+    let app = create_web_router(db, None);
+
+    // Cross-origin Origin -> 403 Forbidden
+    let res_bad_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk-tier")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "https://evil.example")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"risk_tier":"standard"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_origin.status(), StatusCode::FORBIDDEN);
+
+    // Cross-origin Referer -> 403 Forbidden
+    let res_bad_referer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/alerts/test")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::REFERER, "https://evil.example/csrf.html")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_referer.status(), StatusCode::FORBIDDEN);
+
+    // Matching Origin == Host -> 200 OK
+    let res_same_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk-tier")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"risk_tier":"standard"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_same_origin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_web_health_503_and_config_validation() {
+    // 1. Verify health 503 error reporting when MariaDB fails
+    let err_resp = health_result_to_response(Err(AegisError::Database(
+        "MariaDB connection lost".to_string(),
+    )));
+    assert_eq!(err_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(err_resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let json_body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json_body["status"], "unavailable");
+
+    // 2. Verify config validation rejects dangerous keys, unknown keys, out-of-range bounds, and raw gAAAAAB strings
+    assert!(validate_config_key_value("'alert(1)", "1").is_err());
+    assert!(validate_config_key_value("unknown_arbitrary_key", "val").is_err());
+    assert!(validate_config_key_value("web_require_auth", "false").is_err());
+    assert!(validate_config_key_value("max_open_positions", "999").is_err());
+    assert!(validate_config_key_value("max_gross_leverage_x", "-1.0").is_err());
+    assert!(validate_config_key_value("execution_mode", "INVALID").is_err());
+    assert!(validate_config_key_value("private_key", "gAAAAABrawinvalid").is_err());
+    assert!(validate_config_key_value("risk_capital_cap_usdc", "1000.0").is_ok());
 }

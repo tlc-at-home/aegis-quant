@@ -16,6 +16,9 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/backups/
+data/mariadb_dumps/
+data/*.sql
+data/*.sql.gz
 data/.aegis_master_key
 .aegis_master_key
 **/.aegis_master_key

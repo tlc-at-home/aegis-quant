@@ -1,39 +1,140 @@
-//! Real-time 1s/2s Server-Sent Events (SSE) stream backed by MariaDB 13.0 and the 7 SQL Views (`aegis-web::stream`).
+//! Real-time 1.5s Server-Sent Events (SSE) stream backed by a shared `tokio::sync::watch` broadcaster (`aegis-web::stream`).
 
-use crate::payloads::build_dashboard_payload;
+use crate::payloads::{build_dashboard_payload, ApiErrorBody};
 use crate::server::AppState;
 use axum::{
     extract::State,
-    response::sse::{Event, KeepAlive, Sse},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    Json,
 };
-use std::{convert::Infallible, time::Duration};
-use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use std::{
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio_stream::wrappers::ReceiverStream;
 
-/// `GET /api/v1/stream` — Real-time Server-Sent Events (SSE) stream pushing unified MariaDB 13.0 + 7 SQL Views state every 1.5 seconds.
-pub async fn sse_stream_handler(
-    State(state): State<AppState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let interval = tokio::time::interval(Duration::from_millis(1500));
-    let stream = IntervalStream::new(interval).then(move |_| {
-        let st = state.clone();
-        async move {
-            let db = st.db.clone();
-            let payload_json = tokio::task::spawn_blocking(move || {
-                build_dashboard_payload(&db)
-                    .ok()
-                    .and_then(|p| serde_json::to_string(&p).ok())
-                    .unwrap_or_else(|| "{}".to_string())
-            })
-            .await
-            .unwrap_or_else(|_| "{}".to_string());
+pub const MAX_SSE_CLIENTS: usize = 64;
 
-            Ok::<Event, Infallible>(Event::default().data(payload_json))
+struct SseClientGuard(Arc<AtomicUsize>);
+
+impl Drop for SseClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// `GET /api/v1/stream` — Real-time Server-Sent Events (SSE) stream subscribing to the shared
+/// 1.5s `tokio::sync::watch` `DashboardPayload` broadcaster (1 DB refresh per 1.5s across all tabs).
+pub async fn sse_stream_handler(State(state): State<AppState>) -> Response {
+    // Atomically acquire a client slot under MAX_SSE_CLIENTS
+    let mut prev = state.sse_client_count.load(Ordering::SeqCst);
+    loop {
+        if prev >= MAX_SSE_CLIENTS {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiErrorBody {
+                    error: "Service Unavailable".to_string(),
+                    detail: format!(
+                        "Maximum concurrent SSE connections ({MAX_SSE_CLIENTS}) reached"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+        match state.sse_client_count.compare_exchange_weak(
+            prev,
+            prev + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(actual) => prev = actual,
+        }
+    }
+
+    let guard = SseClientGuard(Arc::clone(&state.sse_client_count));
+    state.ensure_broadcaster_running();
+
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(2);
+    let mut rx = state.dashboard_rx.clone();
+    let mut shutdown_rx = state.subscribe_shutdown();
+    let notify = Arc::clone(&state.refresh_notify);
+    let db_fallback = state.db.clone();
+
+    tokio::spawn(async move {
+        let _client_guard = guard;
+
+        let initial_payload = {
+            let current = rx.borrow_and_update().clone();
+            if !current.is_empty() {
+                Some(current)
+            } else {
+                notify.notify_one();
+                tokio::task::spawn_blocking(move || {
+                    build_dashboard_payload(&db_fallback)
+                        .ok()
+                        .and_then(|p| serde_json::to_string(&p).ok())
+                        .map(Arc::new)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+
+        if let Some(payload) = initial_payload {
+            if ev_tx
+                .send(Ok(Event::default().data(payload.as_str())))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = ev_tx.closed() => break,
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                res = rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                    let payload = rx.borrow_and_update().clone();
+                    if !payload.is_empty()
+                        && ev_tx
+                            .send(Ok(Event::default().data(payload.as_str())))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
         }
     });
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(10))
-            .text("aegis-v2-heartbeat"),
-    )
+    let stream = ReceiverStream::new(ev_rx);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("aegis-v2-heartbeat"),
+        )
+        .into_response()
 }

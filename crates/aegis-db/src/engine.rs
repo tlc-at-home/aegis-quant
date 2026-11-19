@@ -1,9 +1,14 @@
 //! MariaDB 13.0 Rolling / 12.3 LTS InnoDB Connection Pool & Schema Engine (`aegis-db::engine`).
 
-use crate::fernet::{resolve_fernet_master_key, FernetCipher};
-use aegis_core::{resolve_project_root, AegisError, Result};
+use crate::fernet::{
+    is_enforce_master_key_disabled_env, is_enforce_master_key_env, master_key_file_for_db,
+    resolve_fernet_master_key, FernetCipher,
+};
+use aegis_core::{now_ms, resolve_project_root, AegisError, Result};
+use mysql::params;
 use mysql::prelude::*;
 use mysql::{Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, PooledConn};
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +17,22 @@ pub const DEFAULT_MARIADB_URL: &str = "mysql://aegis:aegis_v2_local@127.0.0.1:33
 pub const CANONICAL_V2_SCHEMA_SQL: &str = include_str!("../../../sql/schema_v2_mariadb.sql");
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn redact_db_url(raw_url: &str) -> String {
+    let s = raw_url.trim();
+    if let Some(scheme_end) = s.find("://") {
+        let after_scheme = scheme_end + 3;
+        if let Some(at_rel) = s[after_scheme..].rfind('@') {
+            let at_idx = after_scheme + at_rel;
+            let userinfo = &s[after_scheme..at_idx];
+            if let Some(colon_rel) = userinfo.find(':') {
+                let user = &userinfo[..colon_rel];
+                return format!("{}{user}:***{}", &s[..after_scheme], &s[at_idx..]);
+            }
+        }
+    }
+    s.to_string()
+}
 
 struct EphemeralDbDropGuard {
     pool: Pool,
@@ -32,7 +53,7 @@ pub struct DatabaseManager {
     pool: Pool,
     db_name: String,
     key_file_anchor: PathBuf,
-    fernet: FernetCipher,
+    fernet: Arc<RwLock<FernetCipher>>,
     has_external_master_key: bool,
     ephemeral_drop_guard: Option<Arc<EphemeralDbDropGuard>>,
 }
@@ -52,6 +73,12 @@ impl DatabaseManager {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| root.join("data").join("aegis_quant.db"));
         let (key_b64, has_ext) = resolve_fernet_master_key(explicit_master_key, Some(&anchor));
+        if !has_ext && is_enforce_master_key_env() {
+            return Err(AegisError::SecurityViolation(format!(
+                "Fernet master key missing while AEGIS_ENFORCE_MASTER_KEY is enabled: provision '{}' or set AEGIS_MASTER_KEY",
+                master_key_file_for_db(&anchor).display()
+            )));
+        }
         let fernet = FernetCipher::from_key_str(&key_b64)?;
 
         let db_url = std::env::var("AEGIS_DB_URL")
@@ -59,18 +86,47 @@ impl DatabaseManager {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MARIADB_URL.to_string());
 
-        let base_opts = Opts::from_url(&db_url)
-            .map_err(|e| AegisError::Database(format!("Invalid MariaDB URL '{db_url}': {e}")))?;
+        let base_opts = Opts::from_url(&db_url).map_err(|e| {
+            AegisError::Database(format!(
+                "Invalid MariaDB URL '{}': {e}",
+                redact_db_url(&db_url)
+            ))
+        })?;
         let db_name = base_opts.get_db_name().unwrap_or("aegis_quant").to_string();
 
         let pool = Self::build_pool(&base_opts, Some(&db_name))?;
+        if !has_ext && !is_enforce_master_key_disabled_env() {
+            let enforce = Self::query_enforce_master_key(&pool).unwrap_or(true);
+            if enforce {
+                return Err(AegisError::SecurityViolation(format!(
+                    "Fernet master key missing while enforce_master_key=true: provision '{}' or set AEGIS_MASTER_KEY",
+                    master_key_file_for_db(&anchor).display()
+                )));
+            }
+        }
         Ok(Self {
             pool,
             db_name,
             key_file_anchor: anchor,
-            fernet,
+            fernet: Arc::new(RwLock::new(fernet)),
             has_external_master_key: has_ext,
             ephemeral_drop_guard: None,
+        })
+    }
+
+    fn query_enforce_master_key(pool: &Pool) -> Option<bool> {
+        let mut conn = pool.get_conn().ok()?;
+        let raw: Option<String> = conn
+            .query_first(
+                "SELECT config_value FROM system_config WHERE config_key = 'enforce_master_key' LIMIT 1",
+            )
+            .ok()
+            .flatten();
+        raw.map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
         })
     }
 
@@ -88,8 +144,12 @@ impl DatabaseManager {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_MARIADB_URL.to_string());
-        let base_opts = Opts::from_url(&db_url)
-            .map_err(|e| AegisError::Database(format!("Invalid MariaDB URL '{db_url}': {e}")))?;
+        let base_opts = Opts::from_url(&db_url).map_err(|e| {
+            AegisError::Database(format!(
+                "Invalid MariaDB URL '{}': {e}",
+                redact_db_url(&db_url)
+            ))
+        })?;
 
         // First connect without a default DB to create the isolated test database
         let bootstrap_pool = Self::build_pool(&base_opts, None)?;
@@ -116,7 +176,7 @@ impl DatabaseManager {
             pool,
             db_name: test_db_name,
             key_file_anchor: PathBuf::from(":memory:"),
-            fernet,
+            fernet: Arc::new(RwLock::new(fernet)),
             has_external_master_key: has_ext,
             ephemeral_drop_guard: Some(guard),
         };
@@ -156,8 +216,12 @@ impl DatabaseManager {
         &self.db_name
     }
 
-    pub fn fernet(&self) -> &FernetCipher {
-        &self.fernet
+    pub fn fernet(&self) -> RwLockReadGuard<'_, FernetCipher> {
+        self.fernet.read()
+    }
+
+    pub(crate) fn update_fernet_cipher(&self, cipher: FernetCipher) {
+        *self.fernet.write() = cipher;
     }
 
     pub fn has_external_master_key(&self) -> bool {
@@ -244,28 +308,29 @@ impl DatabaseManager {
                     "ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_oid VARCHAR(64) NULL AFTER take_profit_px",
                 )
                 .map_err(|e| AegisError::Database(format!("Schema migration take_profit_oid failed: {e}")))?;
+                Self::migrate_order_audit_fk(&mut conn)?;
+                Self::ensure_composite_indexes(&mut conn)?;
             }
             conn.query_drop(trimmed).map_err(|e| {
                 AegisError::Database(format!("Schema DDL execution failed on `{trimmed}`: {e}"))
             })?;
         }
 
+        if !migrated_columns {
+            Self::migrate_order_audit_fk(&mut conn)?;
+            Self::ensure_composite_indexes(&mut conn)?;
+        }
+
         drop(conn);
+        self.backfill_risk_capital_cap_config()?;
         self.seed_default_config()?;
 
-        if !self.is_ephemeral_test_db() {
+        if !self.is_ephemeral_test_db() && self.needs_legacy_sqlite_migration()? {
             let sqlite_candidate = if self.key_file_anchor.is_file() {
                 Some(self.key_file_anchor.clone())
             } else {
                 let fallback = resolve_project_root().join("data").join("aegis_quant.db");
-                let host_fallback = PathBuf::from("/home/tony/dev/AEGIS-LOCAL/data/aegis_quant.db");
-                if fallback.is_file() {
-                    Some(fallback)
-                } else if host_fallback.is_file() {
-                    Some(host_fallback)
-                } else {
-                    None
-                }
+                fallback.is_file().then_some(fallback)
             };
             if let Some(sqlite_path) = sqlite_candidate {
                 let _ = self.migrate_legacy_sqlite_credentials(&sqlite_path);
@@ -273,6 +338,175 @@ impl DatabaseManager {
         }
 
         Ok(())
+    }
+
+    fn migrate_order_audit_fk(conn: &mut PooledConn) -> Result<()> {
+        let is_nullable: Option<String> = conn
+            .query_first(
+                r#"SELECT IS_NULLABLE
+                   FROM information_schema.COLUMNS
+                   WHERE TABLE_SCHEMA = DATABASE()
+                     AND TABLE_NAME = 'order_audit'
+                     AND COLUMN_NAME = 'position_id'
+                   LIMIT 1"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "Failed checking order_audit.position_id nullability: {e}"
+                ))
+            })?;
+
+        let delete_rule: Option<String> = conn
+            .query_first(
+                r#"SELECT DELETE_RULE
+                   FROM information_schema.REFERENTIAL_CONSTRAINTS
+                   WHERE CONSTRAINT_SCHEMA = DATABASE()
+                     AND TABLE_NAME = 'order_audit'
+                     AND CONSTRAINT_NAME = 'fk_audit_position'
+                   LIMIT 1"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("Failed checking fk_audit_position rule: {e}"))
+            })?;
+
+        let nullable_ok = is_nullable
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("YES"));
+        let fk_ok = delete_rule
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("SET NULL"));
+
+        if nullable_ok && fk_ok {
+            return Ok(());
+        }
+
+        if delete_rule.is_some() {
+            conn.query_drop("ALTER TABLE order_audit DROP FOREIGN KEY fk_audit_position")
+                .map_err(|e| {
+                    AegisError::Database(format!("Failed dropping legacy fk_audit_position: {e}"))
+                })?;
+        }
+        if !nullable_ok {
+            conn.query_drop("ALTER TABLE order_audit MODIFY COLUMN position_id BIGINT NULL")
+                .map_err(|e| {
+                    AegisError::Database(format!("Failed making order_audit.position_id NULL: {e}"))
+                })?;
+        }
+        conn.query_drop(
+            "ALTER TABLE order_audit ADD CONSTRAINT fk_audit_position FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE SET NULL",
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("Failed adding fk_audit_position ON DELETE SET NULL: {e}"))
+        })?;
+        Ok(())
+    }
+
+    fn ensure_composite_indexes(conn: &mut PooledConn) -> Result<()> {
+        let indexes = [
+            (
+                "positions",
+                "idx_positions_status_closed",
+                "CREATE INDEX IF NOT EXISTS idx_positions_status_closed ON positions (status, closed_at_ms DESC)",
+            ),
+            (
+                "positions",
+                "idx_positions_asset_status",
+                "CREATE INDEX IF NOT EXISTS idx_positions_asset_status ON positions (asset_id, status)",
+            ),
+            (
+                "order_audit",
+                "idx_audit_created_id",
+                "CREATE INDEX IF NOT EXISTS idx_audit_created_id ON order_audit (created_at_ms DESC, id DESC)",
+            ),
+            (
+                "portfolio_snapshots",
+                "idx_snapshots_created_id",
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_created_id ON portfolio_snapshots (created_at_ms DESC, id DESC)",
+            ),
+            (
+                "telemetry_logs",
+                "idx_telemetry_created_id",
+                "CREATE INDEX IF NOT EXISTS idx_telemetry_created_id ON telemetry_logs (created_at_ms DESC, id DESC)",
+            ),
+            (
+                "alert_queue",
+                "idx_alerts_event_created",
+                "CREATE INDEX IF NOT EXISTS idx_alerts_event_created ON alert_queue (event_type, created_at_ms DESC)",
+            ),
+            (
+                "asset_cooldowns",
+                "idx_cooldowns_asset_active_exp",
+                "CREATE INDEX IF NOT EXISTS idx_cooldowns_asset_active_exp ON asset_cooldowns (asset_id, is_active, expires_at_ms)",
+            ),
+        ];
+
+        for (table, idx_name, ddl) in indexes {
+            let exists: Option<mysql::Row> = conn
+                .query_first(format!(
+                    "SHOW INDEX FROM `{table}` WHERE Key_name = '{idx_name}'"
+                ))
+                .map_err(|e| {
+                    AegisError::Database(format!(
+                        "SHOW INDEX failed on `{table}`.`{idx_name}`: {e}"
+                    ))
+                })?;
+            if exists.is_none() {
+                conn.query_drop(ddl).map_err(|e| {
+                    AegisError::Database(format!(
+                        "Failed creating index `{idx_name}` on `{table}`: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn backfill_risk_capital_cap_config(&self) -> Result<()> {
+        let mut conn = self.get_conn()?;
+        let cap_exists: Option<String> = conn
+            .query_first(
+                "SELECT config_value FROM system_config WHERE config_key = 'risk_capital_cap_usdc' LIMIT 1",
+            )
+            .map_err(|e| AegisError::Database(format!("backfill cap lookup failed: {e}")))?;
+
+        if cap_exists.is_none() {
+            let legacy_cap: Option<String> = conn
+                .query_first(
+                    "SELECT config_value FROM system_config WHERE config_key = 'live_exchange_equity_usdc' LIMIT 1",
+                )
+                .map_err(|e| AegisError::Database(format!("backfill legacy equity lookup failed: {e}")))?;
+            if let Some(raw_val) = legacy_cap {
+                if let Ok(v) = raw_val.trim().parse::<f64>() {
+                    if v.is_finite() && v > 10.0 {
+                        let ts = now_ms();
+                        conn.exec_drop(
+                            r#"INSERT IGNORE INTO system_config
+                               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+                               VALUES ('risk_capital_cap_usdc', :val, 'float', 'Optional user portfolio capital sizing cap in USDC (0 disables cap)', :ts, :ts)"#,
+                            params! { "val" => raw_val.trim(), "ts" => ts },
+                        )
+                        .map_err(|e| {
+                            AegisError::Database(format!("Failed backfilling risk_capital_cap_usdc: {e}"))
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn needs_legacy_sqlite_migration(&self) -> Result<bool> {
+        let mut conn = self.get_conn()?;
+        let creds_count: Option<i64> = conn
+            .query_first(
+                r#"SELECT COUNT(*) FROM system_config
+                   WHERE config_key IN ('wallet_address', 'private_key', 'legacy_sqlite_migrated')
+                     AND TRIM(config_value) != ''"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("Failed checking MariaDB credential presence: {e}"))
+            })?;
+        Ok(creds_count.unwrap_or(0) == 0)
     }
 
     /// Lists all base tables and SQL views in the active MariaDB database.

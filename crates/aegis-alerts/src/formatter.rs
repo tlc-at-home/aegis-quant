@@ -9,6 +9,36 @@ use aegis_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub const TELEGRAM_MAX_MESSAGE_CHARS: usize = 4096;
+pub const DISCORD_MAX_MESSAGE_CHARS: usize = 2000;
+
+#[inline]
+fn clean_finite(val: f64) -> f64 {
+    if val.is_finite() {
+        val
+    } else {
+        0.0
+    }
+}
+
+fn format_price_usd(px: f64) -> String {
+    let clean = clean_finite(px);
+    if clean > 0.0 && clean < 1.0 {
+        format!("${clean:.6}")
+    } else {
+        format!("${clean:.4}")
+    }
+}
+
+fn format_qty(qty: f64) -> String {
+    let clean = clean_finite(qty);
+    if clean.abs() > 0.0 && clean.abs() < 1.0 {
+        format!("{clean:.4}")
+    } else {
+        format!("{clean:.2}")
+    }
+}
+
 /// Escapes dynamic text for safe inclusion inside Telegram `parse_mode = "HTML"` tags.
 pub fn escape_html(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 8);
@@ -172,38 +202,35 @@ pub fn format_order_filled_open_html(alert: &OrderFilledOpenAlert) -> String {
         alert.trigger.trim()
     });
 
-    let eq = if alert.total_equity_usdc > 0.0 {
+    let fill_px = clean_finite(alert.fill_price);
+    let stop_px = clean_finite(alert.protective_stop_px);
+    let tp_px = clean_finite(alert.take_profit_px);
+    let eq = if alert.total_equity_usdc.is_finite() && alert.total_equity_usdc > 0.0 {
         alert.total_equity_usdc
     } else {
-        (alert.committed_notional_usdc + alert.available_cash_usdc).max(1.0)
+        (clean_finite(alert.committed_notional_usdc) + clean_finite(alert.available_cash_usdc))
+            .max(1.0)
     };
-    let eq_pct = (alert.committed_notional_usdc / eq) * 100.0;
+    let eq_pct = (clean_finite(alert.committed_notional_usdc) / eq) * 100.0;
 
-    let stop_dist_pct = if alert.fill_price > 0.0 && alert.protective_stop_px > 0.0 {
+    let stop_dist_pct = if fill_px > 0.0 && stop_px > 0.0 {
         match alert.side {
-            OrderSide::Long => {
-                ((alert.protective_stop_px - alert.fill_price) / alert.fill_price) * 100.0
-            }
-            OrderSide::Short => {
-                ((alert.fill_price - alert.protective_stop_px) / alert.fill_price) * 100.0
-            }
+            OrderSide::Long => ((stop_px - fill_px) / fill_px) * 100.0,
+            OrderSide::Short => ((fill_px - stop_px) / fill_px) * 100.0,
         }
     } else {
         -4.00
     };
 
-    let tp_line = if alert.fill_price > 0.0 && alert.take_profit_px > 0.0 {
+    let tp_line = if fill_px > 0.0 && tp_px > 0.0 {
         let tp_dist_pct = match alert.side {
-            OrderSide::Long => {
-                ((alert.take_profit_px - alert.fill_price) / alert.fill_price) * 100.0
-            }
-            OrderSide::Short => {
-                ((alert.fill_price - alert.take_profit_px) / alert.fill_price) * 100.0
-            }
+            OrderSide::Long => ((tp_px - fill_px) / fill_px) * 100.0,
+            OrderSide::Short => ((fill_px - tp_px) / fill_px) * 100.0,
         };
         format!(
-            "\nTake Profit  : ${:.4} ({:+.2}%)",
-            alert.take_profit_px, tp_dist_pct
+            "\nTake Profit  : {} ({:+.2}%)",
+            format_price_usd(tp_px),
+            tp_dist_pct
         )
     } else {
         String::new()
@@ -223,19 +250,19 @@ pub fn format_order_filled_open_html(alert: &OrderFilledOpenAlert) -> String {
 <b>Trigger:</b> <code>{safe_trigger}</code>\n\
 \n\
 <pre>\n\
-Fill Price   : ${fill_px:.4}\n\
-Filled Qty   : {qty:.2} {safe_coin}\n\
+Fill Price   : {fill_px_str}\n\
+Filled Qty   : {qty_str} {safe_coin}\n\
 Committed    : {committed} USDC ({eq_pct:.1}% Eq)\n\
 Avail Cash   : {avail} USDC\n\
-Protect Stop : ${stop_px:.4} ({stop_dist:+.2}%){tp_line}\n\
+Protect Stop : {stop_px_str} ({stop_dist:+.2}%){tp_line}\n\
 </pre>\n\
 <b>Sleeve Mix:</b> <code>S1 Carry {s1}</code> · <code>S2 Trend {s2}</code> · <code>S3 Event {s3}</code>\n\
 ⏱ <i>{ts_str} · 1s Priority Watch Active</i>",
-        fill_px = alert.fill_price,
-        qty = alert.filled_qty,
+        fill_px_str = format_price_usd(fill_px),
+        qty_str = format_qty(alert.filled_qty),
         committed = format_usdc(alert.committed_notional_usdc),
         avail = format_usdc(alert.available_cash_usdc),
-        stop_px = alert.protective_stop_px,
+        stop_px_str = format_price_usd(stop_px),
         stop_dist = stop_dist_pct,
         tp_line = tp_line,
         s1 = format_sleeve_pct(alert.s1_weight),
@@ -319,19 +346,19 @@ pub fn format_working_order_placed_html(alert: &WorkingOrderPlacedAlert) -> Stri
 <b>Order FSM:</b> <code>{safe_fsm}</code>\n\
 \n\
 <pre>\n\
-Limit Price  : ${lim_px:.4}\n\
-Requested Qty: {qty:.2} {safe_coin}\n\
+Limit Price  : {lim_px_str}\n\
+Requested Qty: {qty_str} {safe_coin}\n\
 Reserved     : {reserved} USDC (WORKING)\n\
 Avail Cash   : {avail} USDC\n\
 Mid Distance : {dist_bps:+.2} bps\n\
 </pre>\n\
 <b>Sleeve Mix:</b> <code>S1 Carry {s1}</code> · <code>S2 Trend {s2}</code> · <code>S3 Event {s3}</code>\n\
 ⏱ <i>{ts_str} · 1s Maker Limit Chaser Active</i>",
-        lim_px = alert.limit_price,
-        qty = alert.requested_qty,
+        lim_px_str = format_price_usd(alert.limit_price),
+        qty_str = format_qty(alert.requested_qty),
         reserved = format_usdc(alert.reserved_margin_usdc),
         avail = format_usdc(alert.available_cash_usdc),
-        dist_bps = alert.distance_from_mid_bps,
+        dist_bps = clean_finite(alert.distance_from_mid_bps),
         s1 = format_sleeve_pct(alert.s1_weight),
         s2 = format_sleeve_pct(alert.s2_weight),
         s3 = format_sleeve_pct(alert.s3_weight),
@@ -392,16 +419,16 @@ pub fn format_position_closed_html(alert: &PositionClosedAlert) -> String {
 <b>Cooldown:</b> <code>{cd_summary}</code>\n\
 \n\
 <pre>\n\
-Entry Price  : ${entry_px:.4}\n\
-Exit Price   : ${exit_px:.4}\n\
-Closed Qty   : {qty:.2} {safe_coin}\n\
+Entry Price  : {entry_px_str}\n\
+Exit Price   : {exit_px_str}\n\
+Closed Qty   : {qty_str} {safe_coin}\n\
 Realized PnL : {rpnl} USDC\n\
 Avail Cash   : {avail} USDC\n\
 </pre>\n\
 ⏱ <i>{ts_str} · Cooldown Guard Active</i>",
-        entry_px = alert.entry_price,
-        exit_px = alert.exit_price,
-        qty = alert.filled_qty,
+        entry_px_str = format_price_usd(alert.entry_price),
+        exit_px_str = format_price_usd(alert.exit_price),
+        qty_str = format_qty(alert.filled_qty),
         rpnl = format_signed_usdc(alert.realized_pnl_usdc),
         avail = format_usdc(alert.available_cash_usdc),
     )
@@ -514,6 +541,7 @@ Universe     : {perps} Hyperliquid Perps\n\
 }
 
 /// Converts an HTML Telegram card into clean Discord markdown for `alert_provider == "discord"` or `"both"`.
+/// Unescapes `&lt;`, `&gt;`, `&quot;`, `&#39;` BEFORE `&amp;` to prevent double-unescaping.
 pub fn html_to_discord_markdown(html: &str) -> String {
     html.replace("<b>", "**")
         .replace("</b>", "**")
@@ -525,10 +553,119 @@ pub fn html_to_discord_markdown(html: &str) -> String {
         .replace("<pre>", "```text\n")
         .replace("\n</pre>", "\n```")
         .replace("</pre>", "\n```")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Safely truncates a Telegram `parse_mode = "HTML"` message to at most `max_chars` Unicode chars,
+/// avoiding cutting inside HTML tags (`<...>`) or HTML entities (`&...;`), and closing any open formatting tags.
+pub fn truncate_telegram_html(html: &str, max_chars: usize) -> String {
+    if html.chars().count() <= max_chars {
+        return html.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let suffix = "\n…[truncated]";
+    let max_closing_reserve = "</pre></code></i></b>".len();
+    let reserve = suffix.chars().count() + max_closing_reserve;
+    let budget = max_chars.saturating_sub(reserve);
+
+    let mut cut_byte = 0usize;
+    let mut chars_seen = 0usize;
+    let mut in_entity = false;
+    let mut last_safe_byte = 0usize;
+    let mut open_tags: Vec<&'static str> = Vec::new();
+    let mut safe_open_tags: Vec<&'static str> = Vec::new();
+
+    let mut idx = 0usize;
+    while idx < html.len() && chars_seen < budget {
+        let rest = &html[idx..];
+        if rest.starts_with('<') {
+            in_entity = false;
+            if let Some(end_rel) = rest.find('>') {
+                let tag = &rest[1..end_rel];
+                let tag_lower = tag.trim().to_ascii_lowercase();
+                if let Some(closing) = tag_lower.strip_prefix('/') {
+                    let name = closing.trim();
+                    if let Some(pos) = open_tags.iter().rposition(|&t| t == name) {
+                        open_tags.remove(pos);
+                    }
+                } else {
+                    let name = tag_lower.split_whitespace().next().unwrap_or("");
+                    match name {
+                        "b" => open_tags.push("b"),
+                        "i" => open_tags.push("i"),
+                        "code" => open_tags.push("code"),
+                        "pre" => open_tags.push("pre"),
+                        _ => {}
+                    }
+                }
+                let tag_chars = rest[..=end_rel].chars().count();
+                if chars_seen + tag_chars <= budget {
+                    idx += end_rel + 1;
+                    chars_seen += tag_chars;
+                    cut_byte = idx;
+                    last_safe_byte = idx;
+                    safe_open_tags = open_tags.clone();
+                    continue;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        let ch = rest.chars().next().unwrap();
+        if ch == '&' {
+            in_entity = true;
+        } else if in_entity && (ch == ';' || ch.is_whitespace()) {
+            in_entity = false;
+        }
+        idx += ch.len_utf8();
+        chars_seen += 1;
+        if !in_entity {
+            cut_byte = idx;
+            last_safe_byte = idx;
+            safe_open_tags = open_tags.clone();
+        }
+    }
+
+    let final_byte = if in_entity { last_safe_byte } else { cut_byte };
+    let mut out = html[..final_byte].to_string();
+    for tag in safe_open_tags.into_iter().rev() {
+        out.push_str("</");
+        out.push_str(tag);
+        out.push('>');
+    }
+    out.push_str(suffix);
+    if out.chars().count() > max_chars {
+        out.chars().take(max_chars).collect()
+    } else {
+        out
+    }
+}
+
+/// Safely truncates a Discord Markdown message to at most `max_chars` characters,
+/// closing any unclosed triple-backtick code fence.
+pub fn truncate_discord_markdown(md: &str, max_chars: usize) -> String {
+    if md.chars().count() <= max_chars {
+        return md.to_string();
+    }
+    let suffix = "\n…[truncated]";
+    let fence_close = "\n```";
+    let budget = max_chars.saturating_sub(suffix.chars().count() + fence_close.chars().count());
+    let mut prefix: String = md.chars().take(budget).collect();
+    if prefix.matches("```").count() % 2 == 1 {
+        prefix.push_str(fence_close);
+    }
+    prefix.push_str(suffix);
+    prefix
 }
 
 #[cfg(test)]
@@ -541,6 +678,23 @@ mod tests {
             escape_html("AEGIS <v2.0> & \"LIVE\""),
             "AEGIS &lt;v2.0&gt; &amp; &quot;LIVE&quot;"
         );
+    }
+
+    #[test]
+    fn test_html_to_discord_markdown_unescape_order() {
+        let html = "<b>Header</b> &amp;lt;script&amp;gt; &lt;safe&gt; &amp;";
+        let md = html_to_discord_markdown(html);
+        assert_eq!(md, "**Header** &lt;script&gt; <safe> &");
+    }
+
+    #[test]
+    fn test_truncate_telegram_html_preserves_tag_balance_and_limit() {
+        let body = "A &amp; B ".repeat(600);
+        let msg = format!("<b>Title</b>\n<pre>{body}</pre>");
+        let truncated = truncate_telegram_html(&msg, TELEGRAM_MAX_MESSAGE_CHARS);
+        assert!(truncated.chars().count() <= TELEGRAM_MAX_MESSAGE_CHARS);
+        assert!(truncated.ends_with("</pre>\n…[truncated]") || truncated.contains("</pre>"));
+        assert!(!truncated.ends_with("&amp"));
     }
 
     #[test]

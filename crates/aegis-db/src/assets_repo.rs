@@ -60,7 +60,7 @@ impl DatabaseManager {
                    prev_day_price = VALUES(prev_day_price),
                    is_core_eligible = VALUES(is_core_eligible),
                    is_event_eligible = VALUES(is_event_eligible),
-                   is_priority_watched = GREATEST(is_priority_watched, VALUES(is_priority_watched)),
+                   is_priority_watched = VALUES(is_priority_watched),
                    updated_at_ms = VALUES(updated_at_ms)"#,
             params! {
                 "symbol" => &symbol,
@@ -93,6 +93,126 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("Failed to lookup asset '{symbol}': {e}")))?;
 
         id.ok_or_else(|| AegisError::Database(format!("Asset '{symbol}' missing after upsert")))
+    }
+
+    /// Batch upserts multiple Hyperliquid perpetual assets inside a single MariaDB transaction,
+    /// returning their `exchange_assets.id` primary keys in input order.
+    pub fn upsert_exchange_assets_batch(&self, inputs: &[AssetUpsertInput]) -> Result<Vec<i64>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut normalized = Vec::with_capacity(inputs.len());
+        for inp in inputs {
+            let (symbol, coin) = normalize_hyperliquid_symbol(&inp.raw_symbol_or_coin)?;
+            normalized.push((symbol, coin, inp));
+        }
+
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| AegisError::Database(format!("Failed to start assets batch tx: {e}")))?;
+
+        let stmt = tx
+            .prep(
+                r#"INSERT INTO exchange_assets (
+                       symbol, coin, asset_index, sz_decimals, tick_size, lot_step_size, max_leverage,
+                       mark_price, mid_price, oracle_price, funding_rate_hourly, day_volume_usdc,
+                       open_interest_usdc, prev_day_price, is_core_eligible, is_event_eligible,
+                       is_priority_watched, created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :symbol, :coin, :idx, :sz_dec, :tick, :lot, :max_lev,
+                       :mark, :mid, :oracle, :funding, :vol,
+                       :oi, :prev_px, :core, :event,
+                       :prio, :ts, :ts
+                   )
+                   ON DUPLICATE KEY UPDATE
+                       asset_index = VALUES(asset_index),
+                       sz_decimals = VALUES(sz_decimals),
+                       tick_size = VALUES(tick_size),
+                       lot_step_size = VALUES(lot_step_size),
+                       max_leverage = VALUES(max_leverage),
+                       mark_price = VALUES(mark_price),
+                       mid_price = VALUES(mid_price),
+                       oracle_price = VALUES(oracle_price),
+                       funding_rate_hourly = VALUES(funding_rate_hourly),
+                       day_volume_usdc = VALUES(day_volume_usdc),
+                       open_interest_usdc = VALUES(open_interest_usdc),
+                       prev_day_price = VALUES(prev_day_price),
+                       is_core_eligible = VALUES(is_core_eligible),
+                       is_event_eligible = VALUES(is_event_eligible),
+                       is_priority_watched = VALUES(is_priority_watched),
+                       updated_at_ms = VALUES(updated_at_ms)"#,
+            )
+            .map_err(|e| AegisError::Database(format!("Failed preparing batch asset upsert: {e}")))?;
+
+        tx.exec_batch(
+            &stmt,
+            normalized.iter().map(|(symbol, coin, input)| {
+                params! {
+                    "symbol" => symbol,
+                    "coin" => coin,
+                    "idx" => input.asset_index,
+                    "sz_dec" => input.sz_decimals,
+                    "tick" => input.tick_size,
+                    "lot" => input.lot_step_size,
+                    "max_lev" => input.max_leverage,
+                    "mark" => input.mark_price,
+                    "mid" => input.mid_price,
+                    "oracle" => input.oracle_price,
+                    "funding" => input.funding_rate_hourly,
+                    "vol" => input.day_volume_usdc,
+                    "oi" => input.open_interest_usdc,
+                    "prev_px" => input.prev_day_price,
+                    "core" => i32::from(input.is_core_eligible),
+                    "event" => i32::from(input.is_event_eligible),
+                    "prio" => i32::from(input.is_priority_watched),
+                    "ts" => ts,
+                }
+            }),
+        )
+        .map_err(|e| AegisError::Database(format!("Batch asset upsert failed: {e}")))?;
+        drop(stmt);
+
+        let all_rows: Vec<(String, i64)> = tx
+            .query("SELECT symbol, id FROM exchange_assets")
+            .map_err(|e| AegisError::Database(format!("Batch asset id lookup failed: {e}")))?;
+        let id_map: std::collections::HashMap<String, i64> = all_rows.into_iter().collect();
+
+        tx.commit()
+            .map_err(|e| AegisError::Database(format!("Batch asset commit failed: {e}")))?;
+
+        let mut ids = Vec::with_capacity(normalized.len());
+        for (symbol, ..) in normalized {
+            let id = id_map.get(&symbol).copied().ok_or_else(|| {
+                AegisError::Database(format!("Asset '{symbol}' missing after batch upsert"))
+            })?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Updates ONLY `mid_price` and `updated_at_ms` from `allMids`, preserving oracle-anchored `mark_price`.
+    pub fn update_asset_live_mid(&self, asset_id: i64, mid_price: f64) -> Result<()> {
+        if !mid_price.is_finite() || mid_price <= 0.0 {
+            return Ok(());
+        }
+        let mut conn = self.get_conn()?;
+        let ts = now_ms();
+        conn.exec_drop(
+            r#"UPDATE exchange_assets
+               SET mid_price = :mid, updated_at_ms = :ts
+               WHERE id = :id"#,
+            params! {
+                "mid" => mid_price,
+                "ts" => ts,
+                "id" => asset_id,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("Failed to update live mid for {asset_id}: {e}"))
+        })?;
+        Ok(())
     }
 
     /// Updates live mark/mid price on an existing asset during the 1s Priority Watchlist loop.

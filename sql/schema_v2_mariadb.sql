@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS asset_cooldowns (
     created_at_ms   BIGINT NOT NULL,
     updated_at_ms   BIGINT NOT NULL,
     CONSTRAINT fk_cooldowns_asset FOREIGN KEY (asset_id) REFERENCES exchange_assets(id) ON DELETE CASCADE,
-    KEY idx_cooldowns_active_exp (is_active, expires_at_ms, asset_id)
+    KEY idx_cooldowns_active_exp (is_active, expires_at_ms, asset_id),
+    KEY idx_cooldowns_asset_active_exp (asset_id, is_active, expires_at_ms)
 ) ENGINE=InnoDB;
 
 -- 4. Historical & Live OHLCV Candle Series (1h and 4h)
@@ -158,13 +159,15 @@ CREATE TABLE IF NOT EXISTS positions (
     CONSTRAINT fk_positions_asset FOREIGN KEY (asset_id) REFERENCES exchange_assets(id),
     UNIQUE KEY uq_positions_client_oid (client_order_id),
     KEY idx_positions_status_asset (status, asset_id),
+    KEY idx_positions_status_closed (status, closed_at_ms DESC),
+    KEY idx_positions_asset_status (asset_id, status),
     KEY idx_positions_opened (opened_at_ms DESC)
 ) ENGINE=InnoDB;
 
 -- 7. Maker Limit Chaser 1s Order Monitoring & State Transition Audit
 CREATE TABLE IF NOT EXISTS order_audit (
     id                BIGINT PRIMARY KEY AUTO_INCREMENT,
-    position_id       BIGINT NOT NULL,
+    position_id       BIGINT NULL,
     asset_id          BIGINT NOT NULL,
     client_order_id   VARCHAR(64) NOT NULL,
     side              ENUM('LONG', 'SHORT') NOT NULL,
@@ -180,9 +183,10 @@ CREATE TABLE IF NOT EXISTS order_audit (
     reason            VARCHAR(255) NOT NULL DEFAULT '',
     created_at_ms     BIGINT NOT NULL,
     updated_at_ms     BIGINT NOT NULL,
-    CONSTRAINT fk_audit_position FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE CASCADE,
+    CONSTRAINT fk_audit_position FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE SET NULL,
     CONSTRAINT fk_audit_asset FOREIGN KEY (asset_id) REFERENCES exchange_assets(id),
     KEY idx_audit_position_created (position_id, created_at_ms DESC),
+    KEY idx_audit_created_id (created_at_ms DESC, id DESC),
     KEY idx_audit_client_oid (client_order_id)
 ) ENGINE=InnoDB;
 
@@ -210,7 +214,8 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     eligible_coin_count       INT NOT NULL DEFAULT 0,
     created_at_ms             BIGINT NOT NULL,
     updated_at_ms             BIGINT NOT NULL,
-    KEY idx_snapshots_created (created_at_ms DESC)
+    KEY idx_snapshots_created (created_at_ms DESC),
+    KEY idx_snapshots_created_id (created_at_ms DESC, id DESC)
 ) ENGINE=InnoDB;
 
 -- 9. Operational Telemetry Logs
@@ -222,7 +227,8 @@ CREATE TABLE IF NOT EXISTS telemetry_logs (
     details_json  JSON,
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL,
-    KEY idx_telemetry_level_created (level, created_at_ms DESC)
+    KEY idx_telemetry_level_created (level, created_at_ms DESC),
+    KEY idx_telemetry_created_id (created_at_ms DESC, id DESC)
 ) ENGINE=InnoDB;
 
 -- 10. Alert Queue (Telegram Primary, Config-Switchable to Discord)
@@ -238,7 +244,8 @@ CREATE TABLE IF NOT EXISTS alert_queue (
     next_retry_ms BIGINT NOT NULL DEFAULT 0,
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL,
-    KEY idx_alerts_status_retry (status, next_retry_ms)
+    KEY idx_alerts_status_retry (status, next_retry_ms),
+    KEY idx_alerts_event_created (event_type, created_at_ms DESC)
 ) ENGINE=InnoDB;
 
 -- ============================================================================
@@ -262,15 +269,19 @@ SELECT
     p.protective_stop_px,
     p.protective_stop_oid,
     CASE
-        WHEN p.protective_stop_px > 0 AND a.mark_price > 0
-        THEN ROUND(ABS(a.mark_price - p.protective_stop_px) / a.mark_price * 100.0, 2)
+        WHEN p.protective_stop_px > 0 AND a.mark_price > 0 AND p.side = 'LONG'
+        THEN ROUND(GREATEST(0.0, (a.mark_price - p.protective_stop_px) / a.mark_price * 100.0), 2)
+        WHEN p.protective_stop_px > 0 AND a.mark_price > 0 AND p.side = 'SHORT'
+        THEN ROUND(GREATEST(0.0, (p.protective_stop_px - a.mark_price) / a.mark_price * 100.0), 2)
         ELSE NULL
     END AS stop_distance_pct,
     p.take_profit_px,
     p.take_profit_oid,
     CASE
-        WHEN p.take_profit_px > 0 AND a.mark_price > 0
-        THEN ROUND(ABS(p.take_profit_px - a.mark_price) / a.mark_price * 100.0, 2)
+        WHEN p.take_profit_px > 0 AND a.mark_price > 0 AND p.side = 'LONG'
+        THEN ROUND((p.take_profit_px - a.mark_price) / a.mark_price * 100.0, 2)
+        WHEN p.take_profit_px > 0 AND a.mark_price > 0 AND p.side = 'SHORT'
+        THEN ROUND((a.mark_price - p.take_profit_px) / a.mark_price * 100.0, 2)
         ELSE NULL
     END AS tp_distance_pct,
     p.highest_price_seen,
@@ -309,6 +320,8 @@ SELECT
     a.mid_price,
     a.mark_price,
     CASE
+        WHEN a.mid_price > 0 AND p.side = 'SHORT'
+        THEN ROUND((p.entry_price - a.mid_price) / a.mid_price * 10000.0, 2)
         WHEN a.mid_price > 0
         THEN ROUND((a.mid_price - p.entry_price) / a.mid_price * 10000.0, 2)
         ELSE 0.0
@@ -436,7 +449,19 @@ SELECT
     s.event_trigger,
     a.updated_at_ms
 FROM exchange_assets a
-LEFT JOIN positions p ON p.asset_id = a.id AND p.status IN ('WORKING', 'OPEN')
+LEFT JOIN (
+    SELECT
+        id, asset_id, status, side, fsm_state, entry_price,
+        requested_quantity, filled_quantity, reserved_margin_usdc,
+        committed_notional_usdc, protective_stop_px, protective_stop_oid,
+        take_profit_px, take_profit_oid, unrealized_pnl_usdc,
+        ROW_NUMBER() OVER (
+            PARTITION BY asset_id
+            ORDER BY FIELD(status, 'OPEN', 'WORKING'), id DESC
+        ) AS rn
+    FROM positions
+    WHERE status IN ('WORKING', 'OPEN')
+) p ON p.asset_id = a.id AND p.rn = 1
 LEFT JOIN sleeve_signals s ON s.asset_id = a.id
 WHERE a.is_priority_watched = 1
    OR p.id IS NOT NULL

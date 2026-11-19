@@ -131,7 +131,7 @@ pub fn validate_bind_host(
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    let db_allow = cfg.get_bool("web_allow_remote_bind", true);
+    let db_allow = cfg.get_bool("web_allow_remote_bind", false);
 
     if allow_remote_bind_flag || env_allow || db_allow {
         Ok(effective_host)
@@ -139,6 +139,33 @@ pub fn validate_bind_host(
         Err(AegisError::SecurityViolation(format!(
             "Refusing to bind WebUI to non-loopback address '{effective_host}' without --allow-remote-bind"
         )))
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received SIGINT/Ctrl-C; shutting down Aegis Quant v2.0 daemon...");
+            }
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                tracing::info!("Received SIGTERM; shutting down Aegis Quant v2.0 daemon...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received Ctrl-C; shutting down Aegis Quant v2.0 daemon...");
     }
 }
 
@@ -405,7 +432,9 @@ async fn main() -> anyhow::Result<()> {
             );
 
             if cli.no_web {
-                tokio::signal::ctrl_c().await?;
+                wait_for_shutdown_signal().await;
+                let _ = runtime_shutdown_tx.send(true);
+                let _ = web_shutdown_tx.send(true);
             } else {
                 let web_db = db.clone();
                 let host_clone = bind_host.clone();
@@ -413,21 +442,51 @@ async fn main() -> anyhow::Result<()> {
                 let mut web_task = tokio::spawn(async move {
                     serve_web_with_shutdown(web_db, &host_clone, port, web_shutdown_rx).await
                 });
+                let mut web_already_exited = false;
 
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("Received SIGINT/Ctrl-C; shutting down Aegis Quant v2.0 daemon...");
-                    }
+                    _ = wait_for_shutdown_signal() => {}
                     res = &mut web_task => {
+                        web_already_exited = true;
                         if let Ok(Err(e)) = res {
                             tracing::error!(error = %e, "Web server terminated with error");
                         }
                     }
                 }
+
+                let _ = runtime_shutdown_tx.send(true);
+                let _ = web_shutdown_tx.send(true);
+
+                if !web_already_exited {
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), web_task).await {
+                        Ok(Ok(Err(e))) => {
+                            tracing::error!(error = %e, "Web server shutdown error");
+                        }
+                        Err(_) => {
+                            tracing::warn!("Timed out waiting for Web server teardown");
+                        }
+                        _ => {}
+                    }
+                }
             }
 
-            let _ = runtime_shutdown_tx.send(true);
-            let _ = web_shutdown_tx.send(true);
+            // Wait for background 1s/3s runtime thread to finish its current tick and drop its receiver
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                runtime_shutdown_tx.closed(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("Timed out waiting for background runtime thread teardown");
+            }
+
+            let _ = telemetry.log_sync(
+                "INFO",
+                "aegis-cli.daemon",
+                "Aegis Quant v2.0 daemon shut down cleanly",
+                None,
+            );
         }
     }
 
@@ -496,6 +555,7 @@ mod tests {
             validate_bind_host(&db, "127.0.0.1", false).unwrap(),
             "127.0.0.1"
         );
+        assert!(validate_bind_host(&db, "0.0.0.0", false).is_err());
         assert_eq!(validate_bind_host(&db, "0.0.0.0", true).unwrap(), "0.0.0.0");
     }
 }

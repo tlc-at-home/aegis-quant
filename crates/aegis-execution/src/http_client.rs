@@ -123,9 +123,23 @@ pub fn validate_hyperliquid_endpoint_url(url: &str, cfg: &ConfigMap) -> bool {
     is_allowed
 }
 
-/// Returns `true` when Hyperliquid requests should route to Testnet.
+/// Returns `true` when Hyperliquid requests should route to Testnet (strictly `execution_mode != LIVE`).
 pub fn is_testnet_configured(cfg: &ConfigMap) -> bool {
-    cfg.get_bool("hyperliquid_testnet", true) || cfg.execution_mode() == ExecutionMode::Testnet
+    cfg.execution_mode() != ExecutionMode::Live
+}
+
+/// Returns `true` when both resolved `/info` and `/exchange` endpoints point to loopback (`127.0.0.1`, `localhost`, `[::1]`).
+pub(crate) fn endpoints_are_loopback(cfg: &ConfigMap) -> bool {
+    let is_lb = |u: &str| {
+        let lower = u.trim().to_ascii_lowercase();
+        lower.starts_with("http://127.0.0.1")
+            || lower.starts_with("https://127.0.0.1")
+            || lower.starts_with("http://localhost")
+            || lower.starts_with("https://localhost")
+            || lower.starts_with("http://[::1]")
+            || lower.starts_with("https://[::1]")
+    };
+    is_lb(&resolve_info_url(cfg)) && is_lb(&resolve_exchange_url(cfg))
 }
 
 /// Resolves and validates the Hyperliquid `/info` endpoint URL from `system_config`.
@@ -225,35 +239,28 @@ pub fn http_post_json(
         owned_client = shared_blocking_client_opts(timeout_sec, is_loopback);
         &owned_client
     };
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let resp = match client_ref.post(url).json(payload).send() {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST request failed");
-                    return None;
-                }
-            };
-            if !resp.status().is_success() {
-                tracing::warn!(
-                    url = url,
-                    status = %resp.status(),
-                    "Hyperliquid endpoint returned non-2xx HTTP status"
-                );
-                return None;
-            }
-            match resp.json::<Value>() {
-                Ok(val) => Some(val),
-                Err(e) => {
-                    tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid endpoint");
-                    None
-                }
-            }
-        })
-        .join()
-        .ok()
-        .flatten()
-    })
+    let resp = match client_ref.post(url).json(payload).send() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST request failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(
+            url = url,
+            status = %resp.status(),
+            "Hyperliquid endpoint returned non-2xx HTTP status"
+        );
+        return None;
+    }
+    match resp.json::<Value>() {
+        Ok(val) => Some(val),
+        Err(e) => {
+            tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid endpoint");
+            None
+        }
+    }
 }
 
 /// Parsed acknowledgment from a Hyperliquid `/exchange` order submission.
@@ -616,6 +623,26 @@ impl HyperliquidHttpClient {
         Ok(raw.as_array().cloned().unwrap_or_default())
     }
 
+    /// Polls `userFunding` for `user_wallet` returning historical funding ledger entries from Hyperliquid L1.
+    pub fn fetch_user_funding(
+        &self,
+        user_wallet: &str,
+        start_time_ms: Option<i64>,
+        cfg: &ConfigMap,
+    ) -> Result<Vec<Value>> {
+        let start =
+            start_time_ms.unwrap_or_else(|| (aegis_core::now_ms() - 90 * 86_400_000).max(0));
+        let raw = self.post_info(
+            &json!({
+                "type": "userFunding",
+                "user": user_wallet.trim(),
+                "startTime": start,
+            }),
+            cfg,
+        )?;
+        Ok(raw.as_array().cloned().unwrap_or_default())
+    }
+
     /// Signs and posts an EIP-712 L1 action to `/exchange` with automatic single-retry on nonce collision.
     pub fn post_exchange_action<T: Serialize>(
         &self,
@@ -697,9 +724,7 @@ impl HyperliquidHttpClient {
                 orders: vec![order],
                 grouping: "na".to_string(),
             };
-            if let Ok(fb_resp) =
-                self.post_exchange_action(&fallback_action, private_key, db, cfg)
-            {
+            if let Ok(fb_resp) = self.post_exchange_action(&fallback_action, private_key, db, cfg) {
                 return Ok(parse_exchange_order_ack(
                     &fb_resp,
                     requested_qty,
@@ -807,5 +832,20 @@ mod tests {
         assert_eq!(f_ack.exchange_order_id.as_deref(), Some("hl-123456"));
         assert!((f_ack.filled_quantity - 14.5).abs() < 1e-9);
         assert!((f_ack.avg_fill_price - 184.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_live_mode_routes_to_mainnet_even_with_stale_testnet_flag() {
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "LIVE");
+        cfg.insert("hyperliquid_testnet", "true");
+        assert!(!is_testnet_configured(&cfg));
+        assert_eq!(resolve_info_url(&cfg), HYPERLIQUID_INFO_URL);
+        assert_eq!(resolve_exchange_url(&cfg), HYPERLIQUID_EXCHANGE_URL);
+
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_testnet", "false");
+        assert!(is_testnet_configured(&cfg));
+        assert_eq!(resolve_info_url(&cfg), HYPERLIQUID_TESTNET_INFO_URL);
     }
 }

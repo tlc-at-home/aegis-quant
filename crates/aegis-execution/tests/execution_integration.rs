@@ -1,9 +1,17 @@
 //! End-to-End Integration Tests for Aegis Quant v2.0 Execution Engine (`aegis-execution`).
 
-use aegis_core::OrderSide;
-use aegis_db::DatabaseManager;
+use aegis_core::{now_ms, OrderSide, RiskTier};
+use aegis_db::{AssetUpsertInput, DatabaseManager};
 use aegis_execution::{ChaseStepOutcome, ExecutionEngine, NewWorkingOrderRequest};
+use aegis_signals::{
+    MarketBreadthSnapshot, SignalCycleOutput, SleeveSignalInput, ACTION_FLIP, ACTION_OPEN_LONG,
+};
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
+use std::sync::Arc;
 
 #[test]
 fn test_3s_market_watcher_and_order_to_open_capital_lifecycle() {
@@ -37,6 +45,7 @@ fn test_3s_market_watcher_and_order_to_open_capital_lifecycle() {
             s3_weight_contrib: 0.0,
             protective_stop_px: 176.80,
             reason: "LIVE_BREAKOUT_SURGE".to_string(),
+            bypass_entry_interval: false,
         })
         .unwrap();
     assert!(pos_id > 0);
@@ -199,6 +208,7 @@ fn test_take_profit_trigger_exit_and_live_equity_preservation() {
             s3_weight_contrib: 0.0,
             protective_stop_px: 174.00,
             reason: "TP_TEST_ENTRY".to_string(),
+            bypass_entry_interval: false,
         })
         .unwrap();
 
@@ -234,4 +244,917 @@ fn test_take_profit_trigger_exit_and_live_equity_preservation() {
 
     let cfg = db.load_config().unwrap();
     assert!((cfg.get_f64("live_exchange_equity_usdc", 0.0) - 1000.0).abs() < 1e-6);
+}
+
+fn spawn_mock_hl_server<F>(handler: F) -> (u16, std::sync::mpsc::Sender<()>)
+where
+    F: FnMut(&str, &Value) -> (u16, Value) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let handler_arc = Arc::new(Mutex::new(handler));
+
+    std::thread::spawn(move || {
+        while stop_rx.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 2048];
+                    let header_end;
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) => {
+                                header_end = None;
+                                break;
+                            }
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                header_end = None;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(hdr_end) = header_end else {
+                        continue;
+                    };
+                    let hdr_str = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                    let path = hdr_str
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let content_len: usize = hdr_str
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < hdr_end + content_len {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    let body_bytes = &buf[hdr_end..buf.len().min(hdr_end + content_len)];
+                    let req_json: Value = serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
+                    let (status, resp_json) = (handler_arc.lock())(&path, &req_json);
+                    let resp_body = resp_json.to_string();
+                    let status_line = match status {
+                        200 => "HTTP/1.1 200 OK",
+                        500 => "HTTP/1.1 500 Internal Server Error",
+                        _ => "HTTP/1.1 200 OK",
+                    };
+                    let header = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(resp_body.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (port, stop_tx)
+}
+
+fn make_signal_output(signals: Vec<SleeveSignalInput>) -> SignalCycleOutput {
+    SignalCycleOutput {
+        signals,
+        breadth: MarketBreadthSnapshot::default(),
+        risk_tier: RiskTier::Extreme,
+        leverage_multiplier: 1.85,
+        s1_gross_weight: 0.4,
+        s2_gross_weight: 0.2,
+        s3_gross_weight: 0.1,
+        total_gross_weight: 0.7,
+        total_net_weight: 0.3,
+    }
+}
+
+fn make_signal_input(
+    asset: &aegis_core::ExchangeAsset,
+    target_weight: f64,
+    current_weight: f64,
+    action: &str,
+) -> SleeveSignalInput {
+    SleeveSignalInput {
+        asset_id: asset.id,
+        symbol: asset.symbol.clone(),
+        coin: asset.coin.clone(),
+        mark_price: asset.mark_price,
+        day_volume_usdc: asset.day_volume_usdc,
+        funding_rate_hourly: asset.funding_rate_hourly,
+        annualized_vol: 0.50,
+        market_beta: 1.0,
+        s1_mom_score: target_weight.signum(),
+        s1_carry_score: 0.1,
+        s2_trend_alignment: if target_weight >= 0.0 { 1 } else { -1 },
+        s2_vol_surge_ratio: 1.2,
+        s3_funding_zscore: 0.0,
+        s3_flush_atr_mult: 0.0,
+        w_s1_carry_mom: target_weight * 0.6,
+        w_s2_trend_breakout: target_weight * 0.4,
+        w_s3_event_reversion: 0.0,
+        raw_combined_weight: target_weight,
+        target_weight,
+        current_weight,
+        delta_weight: target_weight - current_weight,
+        event_trigger: None,
+        rebalance_action: action.to_string(),
+    }
+}
+
+fn seed_test_assets(db: &DatabaseManager) {
+    let specs = [
+        ("BTC", 0, 4, 1.0, 0.0001, 40.0, 95_000.0),
+        ("ETH", 1, 3, 0.1, 0.001, 25.0, 3_400.0),
+        ("SOL", 2, 2, 0.01, 0.01, 20.0, 184.25),
+        ("AVAX", 3, 2, 0.01, 0.01, 20.0, 35.0),
+        ("LINK", 4, 1, 0.001, 0.1, 20.0, 18.5),
+        ("ARB", 5, 1, 0.0001, 0.1, 10.0, 0.85),
+        ("SUI", 6, 1, 0.0001, 0.1, 10.0, 3.42),
+    ];
+    for (coin, asset_index, sz_decimals, tick_size, lot_step_size, max_leverage, px) in specs {
+        db.upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: coin.to_string(),
+            asset_index,
+            sz_decimals,
+            tick_size,
+            lot_step_size,
+            max_leverage,
+            mark_price: px,
+            mid_price: px,
+            oracle_price: px,
+            funding_rate_hourly: 0.0000125,
+            day_volume_usdc: 25_000_000.0,
+            open_interest_usdc: 10_000_000.0,
+            prev_day_price: px * 0.98,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_pre_cap_cutoff_isolation_and_illiquid_backoff_no_phantom_headroom() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    // Switch to TESTNET config (without private_key so DB transitions run synchronously offline)
+    let cap_epoch = now_ms() - 1_200_000;
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("risk_tier", "extreme", None).unwrap();
+    db.set_config_value("live_exchange_equity_usdc", "931.72", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+        .unwrap();
+    db.set_config_value(
+        "risk_capital_cap_updated_at_ms",
+        &cap_epoch.to_string(),
+        None,
+    )
+    .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("min_position_hold_sec", "300", None)
+        .unwrap();
+
+    let cfg = db.load_config_or_default();
+    assert!((engine.resolve_effective_base_equity_usdc(&cfg) - 931.72).abs() < 1e-6);
+
+    // Insert 3 pre-cap legacy holdings totaling $3,100 (> 3.3x equity) opened BEFORE cap_epoch
+    let pre_ts = cap_epoch - 3_600_000;
+    for (sym, notional) in [
+        ("ETH-USDC", 1800.0),
+        ("AVAX-USDC", 700.0),
+        ("LINK-USDC", 600.0),
+    ] {
+        let a = db.get_asset_by_symbol(sym).unwrap().unwrap();
+        let qty = notional / a.mark_price;
+        db.sync_open_position_from_exchange_v2(
+            a.id,
+            &a.coin,
+            OrderSide::Short,
+            a.mark_price,
+            a.mark_price,
+            qty,
+            notional,
+            0.0,
+            -(notional / 931.72),
+            a.mark_price * 1.05,
+            a.mark_price * 0.90,
+            0.0,
+            Some(pre_ts),
+        )
+        .unwrap();
+    }
+
+    // 1. Pre-cap legacy positions must NOT trigger AUTO_DELEVERAGE_RISK_CAP
+    let deleveraged = engine.enforce_leverage_and_position_caps().unwrap();
+    assert!(deleveraged.is_empty());
+    assert_eq!(db.get_assets_held().unwrap().len(), 3);
+
+    // 2. New post-cap entry (`ARB-USDC`) CAN open under the active-epoch $931.72 cap
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    let arb_sig = make_signal_output(vec![make_signal_input(&arb, 0.20, 0.0, ACTION_OPEN_LONG)]);
+    let reb = engine.execute_signal_rebalance(&arb_sig, 931.72).unwrap();
+    assert_eq!(reb.working_orders_placed, 1);
+    assert_eq!(db.get_assets_ordered().unwrap().len(), 1);
+    engine
+        .close_or_cancel_position(reb.placed_position_ids[0], "TEST_CLEANUP", Some(0))
+        .unwrap();
+
+    // 3. Active-epoch illiquid-backoff holding must NOT create phantom leverage headroom
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol.id,
+            &sol.coin,
+            OrderSide::Long,
+            sol.mark_price,
+            sol.mark_price,
+            10.0,
+            1842.50,
+            0.0,
+            1.5,
+            sol.mark_price * 0.96,
+            sol.mark_price * 1.08,
+            0.0,
+            Some(now_ms() - 600_000),
+        )
+        .unwrap();
+    engine
+        .illiquid_close_backoff_ms
+        .lock()
+        .insert(sol_pid, now_ms());
+
+    let sui = db.get_asset_by_symbol("SUI-USDC").unwrap().unwrap();
+    let sui_sig = make_signal_output(vec![make_signal_input(&sui, 0.20, 0.0, ACTION_OPEN_LONG)]);
+    let blocked_reb = engine.execute_signal_rebalance(&sui_sig, 931.72).unwrap();
+    assert_eq!(blocked_reb.working_orders_placed, 0);
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+
+    // 4. Young post-cap position protection: older over-cap active holding is protected against collateral liquidation when backed off, and closed first when cleared
+    let (sui_young_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sui.id,
+            &sui.coin,
+            OrderSide::Long,
+            sui.mark_price,
+            sui.mark_price,
+            250.0,
+            855.0,
+            0.0,
+            0.8,
+            sui.mark_price * 0.96,
+            sui.mark_price * 1.08,
+            0.0,
+            Some(now_ms() - 20_000),
+        )
+        .unwrap();
+    // While older SOL is backed off, young SUI must NOT be liquidated in its place
+    let backed_off_caps = engine.enforce_leverage_and_position_caps().unwrap();
+    assert!(backed_off_caps.is_empty());
+    assert_eq!(
+        db.get_position_by_id(sui_young_pid)
+            .unwrap()
+            .unwrap()
+            .status,
+        "OPEN"
+    );
+
+    engine.illiquid_close_backoff_ms.lock().clear();
+    let cap_reports = engine.enforce_leverage_and_position_caps().unwrap();
+    assert!(cap_reports
+        .iter()
+        .any(|r| r.position_id == sol_pid && r.final_status == "CLOSED"));
+    assert!(
+        db.get_position_by_id(sui_young_pid)
+            .unwrap()
+            .unwrap()
+            .status
+            == "OPEN",
+        "Young post-cap position should be protected when older active candidate exists"
+    );
+}
+
+#[test]
+fn test_symbol_scoped_action_flip_cooldown_bypass() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+
+    db.set_config_value("min_entry_interval_sec", "150", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+    db.record_position_entry_timestamp_ms(now_ms() - 10_000)
+        .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+
+    // Case A: Non-held / unflipped ACTION_FLIP signal does NOT allow ARB-USDC to bypass 150s entry cooldown
+    let sig_unflipped = make_signal_output(vec![
+        make_signal_input(&sol, -0.20, 0.0, ACTION_FLIP),
+        make_signal_input(&arb, 0.28, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb_a = engine
+        .execute_signal_rebalance(&sig_unflipped, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_a.working_orders_placed, 0);
+
+    // Directly verify bypass_entry_interval: false is blocked
+    let err = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: arb.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 100.0,
+            reserved_margin_usdc: 50.0,
+            portfolio_weight: 0.1,
+            s1_weight_contrib: 0.1,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: arb.mark_price * 0.95,
+            reason: "TEST_COOLDOWN".to_string(),
+            bypass_entry_interval: false,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("MIN_ENTRY_INTERVAL_COOLDOWN"));
+
+    // Case B: Confirmed ACTION_FLIP on held SOL-USDC with target_weight=0.0 still does NOT let ARB-USDC bypass cooldown
+    db.sync_open_position_from_exchange_v2(
+        sol.id,
+        &sol.coin,
+        OrderSide::Long,
+        sol.mark_price,
+        sol.mark_price,
+        5.0,
+        5.0 * sol.mark_price,
+        0.0,
+        0.10,
+        sol.mark_price * 0.95,
+        sol.mark_price * 1.10,
+        0.0,
+        Some(now_ms() - 600_000),
+    )
+    .unwrap();
+    let sig_flip_zero = make_signal_output(vec![
+        make_signal_input(&sol, 0.0, 0.10, ACTION_FLIP),
+        make_signal_input(&arb, 0.28, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb_zero = engine
+        .execute_signal_rebalance(&sig_flip_zero, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_zero.positions_closed, 1);
+    assert_eq!(
+        reb_zero.working_orders_placed, 0,
+        "Unrelated ARB-USDC must stay blocked by min_entry_interval_sec even when SOL flipped"
+    );
+
+    // Case C: Confirmed ACTION_FLIP on held SOL-USDC bypasses cooldown strictly for SOL-USDC
+    db.sync_open_position_from_exchange_v2(
+        sol.id,
+        &sol.coin,
+        OrderSide::Long,
+        sol.mark_price,
+        sol.mark_price,
+        5.0,
+        5.0 * sol.mark_price,
+        0.0,
+        0.10,
+        sol.mark_price * 0.95,
+        sol.mark_price * 1.10,
+        0.0,
+        Some(now_ms() - 600_000),
+    )
+    .unwrap();
+
+    let sig_flip = make_signal_output(vec![
+        make_signal_input(&sol, -0.20, 0.10, ACTION_FLIP),
+        make_signal_input(&arb, 0.28, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb_b = engine
+        .execute_signal_rebalance(&sig_flip, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_b.positions_closed, 1);
+    assert_eq!(reb_b.working_orders_placed, 1);
+    let ordered = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].symbol, "SOL-USDC");
+    assert_eq!(ordered[0].side, "SHORT");
+}
+
+#[test]
+fn test_live_close_fee_no_double_counting_and_http_error_safety() {
+    let fail_ch = Arc::new(Mutex::new(true));
+    let fail_ch_srv = fail_ch.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "clearinghouseState" {
+                if *fail_ch_srv.lock() {
+                    return (500, json!({ "error": "upstream timeout" }));
+                }
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "931.72" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ARB",
+                                "szi": "646.1",
+                                "entryPx": "0.12697",
+                                "positionValue": "81.90"
+                            }
+                        }]
+                    }),
+                );
+            }
+            if typ == "l2Book" {
+                return (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": "0.12676", "sz": "1000.0"}],
+                            [{"px": "0.12680", "sz": "1000.0"}]
+                        ]
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+        // /exchange
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "order" {
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{
+                                "filled": {
+                                    "oid": 998877u64,
+                                    "totalSz": "646.1",
+                                    "avgPx": "0.12676",
+                                    "fee": "0.0369"
+                                }
+                            }]
+                        }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    db.update_asset_live_quote(arb.id, 0.12697, 0.12697)
+        .unwrap();
+    let pos_id = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: arb.id,
+            client_order_id: "v2-arb-long-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 0.12697,
+            requested_quantity: 646.1,
+            reserved_margin_usdc: 44.35,
+            portfolio_weight: 0.088,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.038,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.12467,
+            exchange_order_id: Some("hl-111".to_string()),
+            reason: "TEST_ENTRY".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        pos_id,
+        0.12697,
+        646.1,
+        0.0123,
+        0.12467,
+        Some("hl-111"),
+        "TEST_FILL",
+    )
+    .unwrap();
+
+    // 1. HTTP 500 on clearinghouseState -> must stay OPEN (never mark DB CLOSED blindly)
+    let err_rep = engine
+        .close_or_cancel_position(pos_id, "MANUAL_CLOSE", Some(300))
+        .unwrap();
+    assert_eq!(err_rep.final_status, "OPEN");
+    assert_eq!(
+        db.get_position_by_id(pos_id).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert!(!db.is_asset_in_cooldown(arb.id).unwrap());
+
+    // 2. Healthy HL fill -> close fee NOT double-counted (0.0123 open + 0.0369 close = 0.0492)
+    *fail_ch.lock() = false;
+    let ok_rep = engine
+        .close_or_cancel_position(pos_id, "AUTO_DELEVERAGE_RISK_CAP", Some(900))
+        .unwrap();
+    assert_eq!(ok_rep.final_status, "CLOSED");
+    assert!((ok_rep.exit_price.unwrap() - 0.12676).abs() < 1e-6);
+
+    let closed_pos = db.get_position_by_id(pos_id).unwrap().unwrap();
+    assert_eq!(closed_pos.status, "CLOSED");
+    assert_eq!(closed_pos.client_order_id, "hl-closed-arb-998877");
+    assert_eq!(closed_pos.exchange_order_id.as_deref(), Some("hl-998877"));
+    assert!((closed_pos.fees_paid_usdc - 0.0492).abs() < 1e-4);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_duplicate_sl_cleanup_cloid_resolution_and_empty_snapshot() {
+    let empty_orders = Arc::new(Mutex::new(false));
+    let empty_orders_srv = empty_orders.clone();
+    let cancelled_oids = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let cancelled_oids_srv = cancelled_oids.clone();
+    let submitted_orders = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let submitted_orders_srv = submitted_orders.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "frontendOpenOrders" || typ == "openOrders" {
+                if *empty_orders_srv.lock() {
+                    return (200, json!([]));
+                }
+                return (
+                    200,
+                    json!([
+                        {
+                            "coin": "SOL",
+                            "oid": 11111u64,
+                            "cloid": "0xaaaa",
+                            "isTrigger": true,
+                            "orderType": "Stop Market",
+                            "triggerPx": "174.0",
+                            "sz": "5.0"
+                        },
+                        {
+                            "coin": "SOL",
+                            "oid": 22222u64,
+                            "cloid": "0xbbbb",
+                            "isTrigger": true,
+                            "orderType": "Stop Market",
+                            "triggerPx": "174.0",
+                            "sz": "5.0"
+                        },
+                        {
+                            "coin": "SOL",
+                            "oid": 33333u64,
+                            "cloid": "0xcccc",
+                            "isTrigger": true,
+                            "orderType": "Take Profit Market",
+                            "triggerPx": "196.0",
+                            "sz": "5.0"
+                        }
+                    ]),
+                );
+            }
+            return (200, json!([]));
+        }
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "cancel" {
+            if let Some(arr) = body.pointer("/action/cancels").and_then(Value::as_array) {
+                for c in arr {
+                    if let Some(o) = c.get("o").and_then(Value::as_u64) {
+                        cancelled_oids_srv.lock().push(o);
+                    }
+                }
+            }
+            return (200, json!({ "status": "ok" }));
+        }
+        if action_type == "order" {
+            submitted_orders_srv.lock().push(body.clone());
+            let idx = submitted_orders_srv.lock().len() as u64;
+            let oid = 44000 + idx;
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{ "resting": { "oid": oid } }]
+                        }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+
+    let cfg = db.load_config_or_default();
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let (pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol.id,
+            &sol.coin,
+            OrderSide::Long,
+            180.0,
+            180.0,
+            5.0,
+            900.0,
+            0.0,
+            0.2,
+            174.0,
+            196.0,
+            0.0,
+            Some(now_ms()),
+        )
+        .unwrap();
+
+    // 1. Duplicate SL cleanup + cloid resolution (`0xaaaa` -> `hl-11111`, duplicate `22222` cancelled)
+    let (_s_px, sl_oid, _t_px, tp_oid) = engine
+        .chaser
+        .ensure_exchange_tpsl_orders(
+            pid,
+            &sol,
+            OrderSide::Long,
+            5.0,
+            180.0,
+            174.0,
+            196.0,
+            Some("0xaaaa"),
+            Some("hl-33333"),
+            false,
+            false,
+            None,
+            &cfg,
+        )
+        .unwrap();
+    assert_eq!(sl_oid.as_deref(), Some("hl-11111"));
+    assert_eq!(tp_oid.as_deref(), Some("hl-33333"));
+    assert_eq!(*cancelled_oids.lock(), vec![22222u64]);
+    assert!(submitted_orders.lock().is_empty());
+
+    // 2. Empty frontendOpenOrders snapshot (0 resting orders) -> must NOT assume existing OIDs still rest
+    *empty_orders.lock() = true;
+    cancelled_oids.lock().clear();
+    let (_s2, sl_oid2, _t2, tp_oid2) = engine
+        .chaser
+        .ensure_exchange_tpsl_orders(
+            pid,
+            &sol,
+            OrderSide::Long,
+            5.0,
+            180.0,
+            174.0,
+            196.0,
+            Some("hl-11111"),
+            Some("hl-33333"),
+            false,
+            false,
+            None,
+            &cfg,
+        )
+        .unwrap();
+    assert_eq!(sl_oid2.as_deref(), Some("hl-44001"));
+    assert_eq!(tp_oid2.as_deref(), Some("hl-44002"));
+    assert_eq!(submitted_orders.lock().len(), 2);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_reconcile_user_fills_flip_funding_and_opened_at_ms() {
+    let open_ts = 1_700_000_000_000i64;
+    let funding_ts = 1_700_000_050_000i64;
+    let flip_ts = 1_700_000_100_000i64;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "950.50" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ETH",
+                                "szi": "2.0",
+                                "entryPx": "3000.0",
+                                "positionValue": "6100.0",
+                                "unrealizedPnl": "100.0",
+                                "cumFunding": { "sinceOpen": "1.25" }
+                            }
+                        }]
+                    }),
+                ),
+                "spotClearinghouseState" => (
+                    200,
+                    json!({
+                        "balances": [{ "coin": "USDC", "total": "5000.0", "hold": "0.0" }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH",
+                            "side": "B",
+                            "px": "3000.0",
+                            "sz": "2.0",
+                            "fee": "0.90",
+                            "closedPnl": "0.0",
+                            "dir": "Open Long",
+                            "time": open_ts,
+                            "oid": 1001u64,
+                            "tid": 1u64,
+                            "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "SOL",
+                            "side": "B",
+                            "px": "178.0",
+                            "sz": "10.0",
+                            "fee": "0.50",
+                            "closedPnl": "0.0",
+                            "dir": "Open Long",
+                            "time": open_ts,
+                            "oid": 2001u64,
+                            "tid": 2u64,
+                            "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "SOL",
+                            "side": "A",
+                            "px": "180.0",
+                            "sz": "15.0",
+                            "fee": "0.75",
+                            "closedPnl": "20.0",
+                            "dir": "Long > Short",
+                            "time": flip_ts,
+                            "oid": 777u64,
+                            "tid": 3u64,
+                            "startPosition": "10.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => (
+                    200,
+                    json!([
+                        {
+                            "time": funding_ts,
+                            "hash": "0xabc",
+                            "delta": {
+                                "type": "funding",
+                                "coin": "SOL",
+                                "usdc": "2.50",
+                                "szi": "10.0",
+                                "fundingRate": "0.0001"
+                            }
+                        }
+                    ]),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+
+    let rep = engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert!((rep.exchange_equity_usdc - 950.50).abs() < 1e-6);
+
+    let cfg = db.load_config_or_default();
+    assert!((cfg.get_f64("live_exchange_equity_usdc", 0.0) - 950.50).abs() < 1e-6);
+
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].symbol, "ETH-USDC");
+    assert_eq!(held[0].opened_at_ms, Some(open_ts));
+    assert!((held[0].funding_accrued_usdc - (-1.25)).abs() < 1e-6);
+
+    let closed = db.list_closed_positions(20).unwrap();
+    let sol_closed = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-sol-777")
+        .expect("reconciled SOL flip trade");
+    assert_eq!(sol_closed.side, "LONG");
+    assert!((sol_closed.filled_quantity - 10.0).abs() < 1e-6);
+    assert!((sol_closed.fees_paid_usdc - 1.0).abs() < 1e-4);
+    assert!((sol_closed.funding_accrued_usdc - 2.50).abs() < 1e-4);
+    assert!((sol_closed.realized_pnl_usdc - 21.50).abs() < 1e-4);
+
+    let _ = stop_tx.send(());
 }

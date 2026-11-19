@@ -28,7 +28,7 @@ impl RiskTier {
             "aggressive" | "1.35x" => Self::Aggressive,
             "extreme" | "1.85x" => Self::Extreme,
             "custom" => Self::Custom,
-            _ => Self::Extreme,
+            _ => Self::Standard,
         }
     }
 
@@ -125,6 +125,10 @@ impl AlertProvider {
     }
 }
 
+const HYPERLIQUID_K_PREFIX_COINS: &[&str] = &[
+    "kPEPE", "kBONK", "kSHIB", "kFLOKI", "kLUNC", "kNEIRO", "kDOGS",
+];
+
 /// Normalizes any Hyperliquid coin or legacy symbol (`"BTC"`, `"BTC/USDC:USDC"`, `"BTC-USDC"`, `"kPEPE"`)
 /// into canonical v2.0 `(symbol, coin)` tuple: `("BTC-USDC", "BTC")`.
 pub fn normalize_hyperliquid_symbol(raw: &str) -> Result<(String, String)> {
@@ -146,7 +150,12 @@ pub fn normalize_hyperliquid_symbol(raw: &str) -> Result<(String, String)> {
             "Invalid Hyperliquid coin symbol '{raw}'"
         )));
     }
-    let coin = if coin_part.starts_with('k')
+    let coin = if let Some(canonical_k) = HYPERLIQUID_K_PREFIX_COINS
+        .iter()
+        .find(|&&c| c.eq_ignore_ascii_case(coin_part))
+    {
+        (*canonical_k).to_string()
+    } else if coin_part.starts_with('k')
         && coin_part.len() > 1
         && coin_part
             .chars()
@@ -232,7 +241,7 @@ impl ConfigMap {
         let custom = self
             .0
             .get("target_leverage_multiplier")
-            .and_then(|v| v.parse::<f64>().ok());
+            .and_then(|v| v.trim().parse::<f64>().ok());
         if tier == RiskTier::Custom {
             tier.leverage_multiplier(custom)
         } else {
@@ -287,7 +296,12 @@ pub fn default_v2_system_config_seeds(
         ("min_rebalance_delta_weight", "0.025", "float", "Minimum weight delta (2.5% of equity) required to submit a rebalance order"),
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),
         ("initial_paper_equity_usdc", "10000.0", "float", "Default starting equity in USDC for PAPER mode or empty account fallback"),
-        ("live_exchange_equity_usdc", "0.0", "float", "Active portfolio capital limit in USDC for TESTNET/LIVE sizing (set > 0 to cap portfolio funds; never auto-overwritten once set)"),
+        ("live_exchange_equity_usdc", "0.0", "float", "Live Hyperliquid perp accountValue in USDC continuously synced by reconciler"),
+        ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
+        ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
+        ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
+        ("max_entry_spread_bps", "45.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders"),
+        ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough equity drawdown fraction before halting new entries"),
         ("scanner_interval_ms", "3000", "int", "Full-exchange 150+ perp scanner cadence in milliseconds (3s)"),
         ("priority_monitor_interval_ms", "1000", "int", "High-frequency priority watchlist & active order monitor cadence in milliseconds (1s)"),
         ("core_min_day_volume_usdc", "2000000.0", "float", "Minimum 24h USDC volume on Mainnet ($2M; $1k on Testnet) for Core S1/S2 eligibility"),
@@ -314,7 +328,7 @@ pub fn default_v2_system_config_seeds(
         ("web_api_token", "", "secret", "Fernet-encrypted Web API Bearer token"),
         ("web_bind_host", "127.0.0.1", "string", "WebUI listening interface"),
         ("web_server_port", "8000", "int", "WebUI REST + SSE server listening port"),
-        ("web_allow_remote_bind", "true", "bool", "Allow WebUI binding to 0.0.0.0 inside the sandbox VM"),
+        ("web_allow_remote_bind", "false", "bool", "Allow WebUI binding to non-loopback address without --allow-remote-bind"),
         ("enforce_master_key", "true", "bool", "Require external or keyfile Fernet master key"),
     ]
 }
@@ -341,12 +355,72 @@ mod tests {
             normalize_hyperliquid_symbol("kPEPE/USDC:USDC").unwrap(),
             ("kPEPE-USDC".to_string(), "kPEPE".to_string())
         );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kpepe").unwrap(),
+            ("kPEPE-USDC".to_string(), "kPEPE".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("KPEPE-USDC").unwrap(),
+            ("kPEPE-USDC".to_string(), "kPEPE".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kbonk").unwrap(),
+            ("kBONK-USDC".to_string(), "kBONK".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("KSHIB").unwrap(),
+            ("kSHIB-USDC".to_string(), "kSHIB".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kfloki").unwrap(),
+            ("kFLOKI-USDC".to_string(), "kFLOKI".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("klunc").unwrap(),
+            ("kLUNC-USDC".to_string(), "kLUNC".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kneiro").unwrap(),
+            ("kNEIRO-USDC".to_string(), "kNEIRO".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kdogs").unwrap(),
+            ("kDOGS-USDC".to_string(), "kDOGS".to_string())
+        );
+        assert_eq!(
+            normalize_hyperliquid_symbol("kaito").unwrap(),
+            ("KAITO-USDC".to_string(), "KAITO".to_string())
+        );
     }
 
     #[test]
-    fn test_risk_tier_extreme_default() {
+    fn test_risk_tier_extreme_default_and_safe_parse_fallback() {
         let cfg = ConfigMap::new();
         assert_eq!(cfg.risk_tier(), RiskTier::Extreme);
         assert!((cfg.target_leverage_multiplier() - 1.85).abs() < 1e-9);
+
+        assert_eq!(RiskTier::parse("unknown_tier"), RiskTier::Standard);
+        assert_eq!(RiskTier::parse(""), RiskTier::Standard);
+
+        let mut custom_cfg = ConfigMap::new();
+        custom_cfg.insert("risk_tier", "custom");
+        custom_cfg.insert("target_leverage_multiplier", " 1.25 ");
+        assert!((custom_cfg.target_leverage_multiplier() - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_default_seeds_contain_cap_and_safe_bind() {
+        let seeds = default_v2_system_config_seeds();
+        let find = |k: &str| seeds.iter().find(|(key, ..)| *key == k).map(|s| s.1);
+        assert_eq!(find("risk_capital_cap_usdc"), Some("1000.0"));
+        assert_eq!(
+            find("risk_capital_cap_updated_at_ms"),
+            Some("1795035600000")
+        );
+        assert_eq!(find("min_position_hold_sec"), Some("300"));
+        assert_eq!(find("max_entry_spread_bps"), Some("45.0"));
+        assert_eq!(find("max_daily_drawdown_pct"), Some("0.15"));
+        assert_eq!(find("web_allow_remote_bind"), Some("false"));
+        assert_eq!(find("stop_out_cooldown_sec"), Some("1800"));
     }
 }

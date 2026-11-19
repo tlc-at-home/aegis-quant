@@ -30,8 +30,8 @@ impl DatabaseManager {
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| AegisError::Database(format!("Failed to start bars tx: {e}")))?;
 
-        for b in bars {
-            tx.exec_drop(
+        let stmt = tx
+            .prep(
                 r#"INSERT INTO ohlcv_bars
                    (asset_id, timeframe, timestamp_ms, open, high, low, close, volume, funding_rate, created_at_ms, updated_at_ms)
                    VALUES (:aid, :tf, :ts_ms, :o, :h, :l, :c, :v, :fr, :now, :now)
@@ -43,6 +43,12 @@ impl DatabaseManager {
                    volume = VALUES(volume),
                    funding_rate = VALUES(funding_rate),
                    updated_at_ms = VALUES(updated_at_ms)"#,
+            )
+            .map_err(|e| AegisError::Database(format!("Failed to prepare OHLCV bar upsert: {e}")))?;
+
+        tx.exec_batch(
+            &stmt,
+            bars.iter().map(|b| {
                 params! {
                     "aid" => b.asset_id,
                     "tf" => &b.timeframe,
@@ -54,10 +60,12 @@ impl DatabaseManager {
                     "v" => b.volume,
                     "fr" => b.funding_rate,
                     "now" => ts,
-                },
-            )
-            .map_err(|e| AegisError::Database(format!("Failed to upsert OHLCV bar: {e}")))?;
-        }
+                }
+            }),
+        )
+        .map_err(|e| AegisError::Database(format!("Failed to upsert OHLCV bars batch: {e}")))?;
+        drop(stmt);
+
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Failed to commit OHLCV bars: {e}")))?;
         Ok(bars.len())

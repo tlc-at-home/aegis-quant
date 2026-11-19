@@ -33,6 +33,7 @@ pub fn is_sensitive_config_key(key: &str) -> bool {
 pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "enforce_master_key",
     "web_auth_enabled",
+    "web_require_auth",
     "web_allow_remote_bind",
     "web_bind_host",
     "web_csp_policy",
@@ -40,6 +41,7 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "web_allowed_hosts",
     "web_api_token",
     "telegram_api_base_url",
+    "hyperliquid_testnet",
     "hyperliquid_mainnet_url",
     "hyperliquid_testnet_url",
     "hyperliquid_info_url",
@@ -119,13 +121,18 @@ pub fn mask_identifier(raw: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
-    if s.len() <= 6 {
+    let char_count = s.chars().count();
+    if char_count <= 6 {
         return "***".to_string();
     }
-    if s.len() <= 12 {
-        return format!("{}***{}", &s[..2], &s[s.len() - 2..]);
+    if char_count <= 12 {
+        let prefix: String = s.chars().take(2).collect();
+        let suffix: String = s.chars().skip(char_count - 2).collect();
+        return format!("{prefix}***{suffix}");
     }
-    format!("{}...{}", &s[..6], &s[s.len() - 4..])
+    let prefix: String = s.chars().take(6).collect();
+    let suffix: String = s.chars().skip(char_count - 4).collect();
+    format!("{prefix}...{suffix}")
 }
 
 /// Redacts Fernet tokens (`gAAAAAB...`) and raw 64-hex private keys from log/telemetry strings.
@@ -195,5 +202,17 @@ mod tests {
         let addr = derive_evm_address_from_private_key(pk).unwrap();
         assert_eq!(addr, "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23");
         assert!(validate_evm_address(&addr).is_ok());
+    }
+
+    #[test]
+    fn test_immutable_keys_and_utf8_mask_identifier() {
+        assert!(is_immutable_security_config_key("web_require_auth"));
+        assert!(is_immutable_security_config_key("hyperliquid_testnet"));
+        assert_eq!(mask_identifier(""), "");
+        assert_eq!(mask_identifier("αβγδ"), "***");
+        assert_eq!(mask_identifier("🔥🚀αβγδε"), "🔥🚀***δε");
+        assert_eq!(mask_identifier("🔥🚀αβγδεζηθικλμ"), "🔥🚀αβγδ...ικλμ");
+        // Variation-selector emoji never panics on char-boundary slicing
+        assert!(!mask_identifier("🔥🛡️αβγδε").is_empty());
     }
 }

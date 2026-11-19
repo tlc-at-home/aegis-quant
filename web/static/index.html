@@ -59,13 +59,13 @@
     <div class="telemetry-controls">
       <div class="risk-tier-group" id="risk-tier-selector" title="Dynamically Switch Portfolio Leverage Multiplier Tier">
         <span class="risk-tier-label">Risk Tier</span>
-        <button type="button" class="tier-btn" data-tier="conservative" onclick="switchRiskTier('conservative')">Conservative 0.65x</button>
-        <button type="button" class="tier-btn" data-tier="standard" onclick="switchRiskTier('standard')">Standard 1.00x</button>
-        <button type="button" class="tier-btn" data-tier="aggressive" onclick="switchRiskTier('aggressive')">Aggressive 1.35x</button>
-        <button type="button" class="tier-btn active" data-tier="extreme" onclick="switchRiskTier('extreme')">🔥 Extreme 1.85x</button>
+        <button type="button" class="tier-btn" data-tier="conservative">Conservative 0.65x</button>
+        <button type="button" class="tier-btn" data-tier="standard">Standard 1.00x</button>
+        <button type="button" class="tier-btn" data-tier="aggressive">Aggressive 1.35x</button>
+        <button type="button" class="tier-btn active" data-tier="extreme">🔥 Extreme 1.85x</button>
       </div>
 
-      <button type="button" class="action-btn cycle-btn" id="btn-sync-hyperliquid" onclick="triggerHyperliquidReconcile()" title="Synchronize MariaDB 1:1 with Live Hyperliquid Clearinghouse State & Open Orders">
+      <button type="button" class="action-btn cycle-btn" id="btn-sync-hyperliquid" title="Synchronize MariaDB 1:1 with Live Hyperliquid Clearinghouse State & Open Orders">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="23 4 23 10 17 10"></polyline>
           <polyline points="1 20 1 14 7 14"></polyline>
@@ -74,7 +74,7 @@
         <span>⟳ Sync Hyperliquid</span>
       </button>
 
-      <button type="button" class="action-btn telegram-btn" id="btn-telegram-test" onclick="triggerTelegramTestAlert()">
+      <button type="button" class="action-btn telegram-btn" id="btn-telegram-test">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="22" y1="2" x2="11" y2="13"></line>
           <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -82,7 +82,7 @@
         <span>Send Telegram HTML Alert</span>
       </button>
 
-      <button type="button" class="action-btn config-btn" id="btn-open-config-modal" onclick="openConfigModal()">
+      <button type="button" class="action-btn config-btn" id="btn-open-config-modal">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="3"></circle>
           <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
@@ -256,7 +256,7 @@
         <div class="kpi-value"><span id="kpi-gross-leverage">0.00x</span> <small style="font-size: 13px; color: var(--text-muted);">/ <span id="kpi-net-leverage">0.00x</span></small></div>
         <div class="kpi-sub">
           <span id="kpi-leverage-target">Target: 1.85x Extreme</span>
-          <span>Cap: 2.50x</span>
+          <span id="kpi-leverage-cap">Cap: 2.50x</span>
         </div>
         <div class="kpi-meter">
           <div class="kpi-meter-fill amber" id="kpi-leverage-meter" style="width: 0%"></div>
@@ -310,6 +310,7 @@
         </div>
         <div class="canvas-wrapper">
           <canvas id="equity-curve-canvas"></canvas>
+          <div id="equity-chart-tooltip" style="display: none; position: absolute; pointer-events: none; z-index: 20; padding: 8px 10px; border-radius: 7px; background: rgba(10, 15, 29, 0.95); border: 1px solid rgba(0, 242, 254, 0.45); font-family: var(--font-mono); font-size: 10.5px; color: var(--text-primary); box-shadow: 0 8px 20px rgba(0,0,0,0.6); white-space: nowrap;"></div>
         </div>
       </div>
 
@@ -371,12 +372,12 @@
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px;">
-            <button type="button" class="cfg-cat-btn" id="btn-toggle-watch-all" onclick="toggleShowAllPriorityWatch()" style="display: none;">Show All</button>
+            <button type="button" class="cfg-cat-btn" id="btn-toggle-watch-all" style="display: none;">Show All</button>
             <span class="status-pill working"><span class="pulse-dot emerald"></span>1000ms Loop</span>
           </div>
         </div>
 
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="1s Priority Watchlist and Working Orders">
           <table class="quant-table">
             <thead>
               <tr>
@@ -416,12 +417,12 @@
             </div>
           </div>
           <div style="display: flex; align-items: center; gap: 8px;">
-            <button type="button" class="close-btn" id="btn-close-all-open" onclick="closeAllOpenPositions()" style="display: none; padding: 4px 10px;">Close All</button>
+            <button type="button" class="close-btn" id="btn-close-all-open" style="display: none; padding: 4px 10px;">Close All</button>
             <span class="status-pill open" id="held-count-pill">0 OPEN</span>
           </div>
         </div>
 
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Active Open Holdings">
           <table class="quant-table">
             <thead>
               <tr>
@@ -449,32 +450,54 @@
     </section>
 
     <!-- ======================================================================
+         ACTIVE ASSET COOLDOWNS (v_assets_in_cooldown)
+         ====================================================================== -->
+    <section class="glass-panel" id="cooldown-panel" style="padding: 12px 18px; gap: 10px;">
+      <div class="panel-header" style="padding-bottom: 8px;">
+        <div class="panel-title-cluster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"></circle>
+            <polyline points="12 6 12 12 16 14"></polyline>
+          </svg>
+          <div>
+            <div class="panel-title">Active Asset Cooldowns</div>
+            <div class="panel-subtitle">Post-stop, manual close, and churn-guard entry blocks (Local Expiry Time)</div>
+          </div>
+        </div>
+        <span class="status-pill working" id="cooldown-count-pill">0 ACTIVE</span>
+      </div>
+      <div id="cooldown-badges-list" style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+        <span class="pnl-flat" style="font-family: var(--font-mono); font-size: 11px;">No assets currently in cooldown.</span>
+      </div>
+    </section>
+
+    <!-- ======================================================================
          MULTI-SLEEVE EXPLORER TABS & 150+ HYPERLIQUID PERP SCANNER
          ====================================================================== -->
     <section class="glass-panel">
       <div class="explorer-tabs-bar">
         <div class="tab-buttons">
-          <button type="button" class="tab-btn active" data-tab="s1" onclick="switchExplorerTab('s1')">
+          <button type="button" class="tab-btn active" data-tab="s1">
             <span>S1 Carry-Momentum</span>
             <span class="tab-count" id="tab-count-s1">0</span>
           </button>
-          <button type="button" class="tab-btn" data-tab="s2" onclick="switchExplorerTab('s2')">
+          <button type="button" class="tab-btn" data-tab="s2">
             <span>S2 Trend & 3s Breakout</span>
             <span class="tab-count" id="tab-count-s2">0</span>
           </button>
-          <button type="button" class="tab-btn" data-tab="s3" onclick="switchExplorerTab('s3')">
+          <button type="button" class="tab-btn" data-tab="s3">
             <span>S3 Event & Funding Flush</span>
             <span class="tab-count" id="tab-count-s3">0</span>
           </button>
-          <button type="button" class="tab-btn" data-tab="scanner" onclick="switchExplorerTab('scanner')">
+          <button type="button" class="tab-btn" data-tab="scanner">
             <span>150+ Hyperliquid Perp Scanner</span>
             <span class="tab-count" id="tab-count-scanner">0</span>
           </button>
-          <button type="button" class="tab-btn" data-tab="console" onclick="switchExplorerTab('console')">
+          <button type="button" class="tab-btn" data-tab="console">
             <span>Order Audit & Telemetry Console</span>
             <span class="tab-count" id="tab-count-console">0</span>
           </button>
-          <button type="button" class="tab-btn" data-tab="config" onclick="switchExplorerTab('config')">
+          <button type="button" class="tab-btn" data-tab="config">
             <span>⚙ System Config & Vault</span>
           </button>
         </div>
@@ -485,14 +508,13 @@
             id="scanner-search-input"
             class="search-input"
             placeholder="Filter symbol or config key (e.g. BTC-USDC, SOL, HYPE)..."
-            oninput="renderActiveExplorerTab()"
           />
         </div>
       </div>
 
       <!-- TAB 1: Sleeve 1 Carry-Momentum -->
       <div class="tab-pane active" id="tab-pane-s1">
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 1 Carry-Momentum">
           <table class="quant-table">
             <thead>
               <tr>
@@ -516,7 +538,7 @@
 
       <!-- TAB 2: Sleeve 2 Trend & 3s Breakout -->
       <div class="tab-pane" id="tab-pane-s2">
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 2 Trend and Breakout">
           <table class="quant-table">
             <thead>
               <tr>
@@ -539,7 +561,7 @@
 
       <!-- TAB 3: Sleeve 3 Event & Funding Flush -->
       <div class="tab-pane" id="tab-pane-s3">
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 3 Event and Funding Flush">
           <table class="quant-table">
             <thead>
               <tr>
@@ -562,7 +584,7 @@
 
       <!-- TAB 4: Full 150+ Hyperliquid Perp Scanner -->
       <div class="tab-pane" id="tab-pane-scanner">
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Hyperliquid Perp Scanner">
           <table class="quant-table">
             <thead>
               <tr>
@@ -590,11 +612,11 @@
             <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: var(--neon-cyan);">
               1-SECOND MAKER LIMIT CHASER EXECUTION AUDIT
             </div>
-            <div class="table-scroll">
+            <div class="table-scroll" tabindex="0" role="region" aria-label="1-Second Maker Limit Chaser Execution Audit">
               <table class="quant-table">
                 <thead>
                   <tr>
-                    <th>Time (UTC)</th>
+                    <th>Time (Local)</th>
                     <th>Client OID</th>
                     <th>Side</th>
                     <th>Transition</th>
@@ -621,20 +643,20 @@
       <div class="tab-pane" id="tab-pane-config">
         <div class="config-toolbar" style="margin-bottom: 14px;">
           <div class="config-category-pills" id="tab-config-cat-pills">
-            <button type="button" class="cfg-cat-btn active" data-cat="all" onclick="setConfigCategory('all')">All Settings</button>
-            <button type="button" class="cfg-cat-btn" data-cat="risk" onclick="setConfigCategory('risk')">Risk & Leverage</button>
-            <button type="button" class="cfg-cat-btn" data-cat="execution" onclick="setConfigCategory('execution')">Execution & Chaser</button>
-            <button type="button" class="cfg-cat-btn" data-cat="sleeves" onclick="setConfigCategory('sleeves')">Sleeves S1/S2/S3</button>
-            <button type="button" class="cfg-cat-btn" data-cat="alerts" onclick="setConfigCategory('alerts')">Alerts & Telegram</button>
-            <button type="button" class="cfg-cat-btn" data-cat="wallet" onclick="setConfigCategory('wallet')">Wallet & Vault</button>
+            <button type="button" class="cfg-cat-btn active" data-cat="all">All Settings</button>
+            <button type="button" class="cfg-cat-btn" data-cat="risk">Risk & Leverage</button>
+            <button type="button" class="cfg-cat-btn" data-cat="execution">Execution & Chaser</button>
+            <button type="button" class="cfg-cat-btn" data-cat="sleeves">Sleeves S1/S2/S3</button>
+            <button type="button" class="cfg-cat-btn" data-cat="alerts">Alerts & Telegram</button>
+            <button type="button" class="cfg-cat-btn" data-cat="wallet">Wallet & Vault</button>
           </div>
           <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
             <input type="text" id="cfg-key-input" class="search-input" placeholder="Config key (e.g. max_gross_leverage_x)" style="min-width: 220px;" />
             <input type="text" id="cfg-val-input" class="search-input" placeholder="New value..." style="min-width: 200px;" />
-            <button type="button" class="action-btn cycle-btn" onclick="submitConfigUpdate()">Update Key</button>
+            <button type="button" class="action-btn cycle-btn" id="btn-submit-config-update">Update Key</button>
           </div>
         </div>
-        <div class="table-scroll">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="System Configuration and Encrypted Vault">
           <table class="quant-table">
             <thead>
               <tr>
@@ -643,7 +665,7 @@
                 <th>Inline Edit & Save</th>
                 <th>Type</th>
                 <th>Description</th>
-                <th>Updated (UTC)</th>
+                <th>Updated (Local)</th>
               </tr>
             </thead>
             <tbody id="tbody-system-config"></tbody>
@@ -657,7 +679,7 @@
   <!-- ========================================================================
        SYSTEM CONFIGURATION & CREDENTIALS MODAL (OPENED VIA TOP-BAR ⚙ BUTTON)
        ======================================================================== -->
-  <div class="config-modal-backdrop" id="config-settings-modal" onclick="handleConfigModalBackdropClick(event)">
+  <div class="config-modal-backdrop" id="config-settings-modal">
     <div class="config-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="config-modal-title">
       <div class="config-modal-header">
         <div class="panel-title-cluster">
@@ -670,29 +692,28 @@
             <div class="panel-subtitle">Edit runtime parameters, sleeve budgets, risk limits, and Fernet-encrypted API credentials</div>
           </div>
         </div>
-        <button type="button" class="close-btn" onclick="closeConfigModal()" style="padding: 6px 12px; font-size: 11.5px;">✕ Close</button>
+        <button type="button" class="close-btn" id="btn-close-config-modal" style="padding: 6px 12px; font-size: 11.5px;">✕ Close</button>
       </div>
 
       <div class="config-modal-body">
         <div class="config-toolbar">
           <div class="config-category-pills" id="modal-config-cat-pills">
-            <button type="button" class="cfg-cat-btn active" data-cat="all" onclick="setConfigCategory('all')">All Settings</button>
-            <button type="button" class="cfg-cat-btn" data-cat="risk" onclick="setConfigCategory('risk')">Risk & Leverage</button>
-            <button type="button" class="cfg-cat-btn" data-cat="execution" onclick="setConfigCategory('execution')">Execution & Chaser</button>
-            <button type="button" class="cfg-cat-btn" data-cat="sleeves" onclick="setConfigCategory('sleeves')">Sleeves S1/S2/S3</button>
-            <button type="button" class="cfg-cat-btn" data-cat="alerts" onclick="setConfigCategory('alerts')">Alerts & Telegram</button>
-            <button type="button" class="cfg-cat-btn" data-cat="wallet" onclick="setConfigCategory('wallet')">Wallet & Vault</button>
+            <button type="button" class="cfg-cat-btn active" data-cat="all">All Settings</button>
+            <button type="button" class="cfg-cat-btn" data-cat="risk">Risk & Leverage</button>
+            <button type="button" class="cfg-cat-btn" data-cat="execution">Execution & Chaser</button>
+            <button type="button" class="cfg-cat-btn" data-cat="sleeves">Sleeves S1/S2/S3</button>
+            <button type="button" class="cfg-cat-btn" data-cat="alerts">Alerts & Telegram</button>
+            <button type="button" class="cfg-cat-btn" data-cat="wallet">Wallet & Vault</button>
           </div>
           <input
             type="text"
             id="modal-cfg-search"
             class="search-input"
             placeholder="Search config key or description..."
-            oninput="renderSystemConfigTables()"
           />
         </div>
 
-        <div class="table-scroll" style="max-height: 60vh; overflow-y: auto;">
+        <div class="table-scroll" tabindex="0" role="region" aria-label="System Configuration Modal" style="max-height: 60vh; overflow-y: auto;">
           <table class="quant-table">
             <thead>
               <tr>
@@ -701,13 +722,47 @@
                 <th>Inline Edit & Save</th>
                 <th>Type</th>
                 <th>Description</th>
-                <th>Updated (UTC)</th>
+                <th>Updated (Local)</th>
               </tr>
             </thead>
             <tbody id="tbody-modal-system-config"></tbody>
           </table>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       AUTHENTICATION / BEARER TOKEN MODAL (SHOWN ON 401 UNAUTHORIZED)
+       ======================================================================== -->
+  <div class="config-modal-backdrop" id="auth-login-modal">
+    <div class="config-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title" style="max-width: 460px;">
+      <div class="config-modal-header">
+        <div class="panel-title-cluster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+          </svg>
+          <div>
+            <div class="panel-title" id="auth-modal-title">Operator Authentication Required</div>
+            <div class="panel-subtitle">Enter your Web API Bearer Token to access live terminal feeds</div>
+          </div>
+        </div>
+      </div>
+      <form id="auth-login-form" class="config-modal-body" style="gap: 12px;">
+        <input
+          type="password"
+          id="auth-token-input"
+          class="search-input"
+          placeholder="Enter Web API Bearer Token..."
+          autocomplete="current-password"
+          style="width: 100%;"
+        />
+        <div id="auth-login-error" class="pnl-neg" style="font-family: var(--font-mono); font-size: 11px; display: none;"></div>
+        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <button type="submit" class="action-btn cycle-btn" id="btn-auth-login-submit">Unlock Terminal</button>
+        </div>
+      </form>
     </div>
   </div>
 

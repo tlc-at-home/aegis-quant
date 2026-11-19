@@ -1,9 +1,13 @@
 [mysqld]
-# Memory & InnoDB Low-Latency Tuning for 1s Priority Loop
+# Network & Timezone Discipline
+bind-address                    = 127.0.0.1
+default_time_zone               = '+00:00'
+
+# Memory & InnoDB Durability / Low-Latency Tuning for 1s Priority Loop
 innodb_buffer_pool_size         = 1G
 innodb_log_file_size            = 256M
-innodb_flush_log_at_trx_commit  = 2
-innodb_flush_method             = O_DIRECT
+innodb_flush_log_at_trx_commit  = 1
+innodb_lock_wait_timeout        = 10
 innodb_io_capacity              = 2000
 innodb_io_capacity_max          = 4000
 innodb_read_io_threads          = 4

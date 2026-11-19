@@ -2,12 +2,67 @@
 
 use crate::engine::DatabaseManager;
 use aegis_core::{
-    now_ms, round_dp, sanitize_telemetry_message, ytd_start_ms, AegisError, AlertQueueRecord,
-    PnlHorizonMetrics, PnlSummary, PortfolioSnapshot, Result, TelemetryLogRecord,
+    is_sensitive_config_key, mask_identifier, now_ms, round_dp, sanitize_telemetry_message,
+    ytd_start_ms, AegisError, AlertQueueRecord, OrderSide, PnlHorizonMetrics, PnlSummary,
+    PortfolioSnapshot, Result, TelemetryLogRecord,
 };
 use mysql::params;
 use mysql::prelude::*;
 use serde_json::Value;
+
+fn sanitize_telemetry_string(raw: &str) -> String {
+    let mut out = sanitize_telemetry_message(raw);
+    for prefix in ["ENC:gAAAAAB", "gAAAAAB"] {
+        while let Some(start) = out.find(prefix) {
+            let tail = &out[start + prefix.len()..];
+            let token_len = tail
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != '=')
+                .unwrap_or(tail.len());
+            let end = start + prefix.len() + token_len;
+            out.replace_range(start..end, "[REDACTED_FERNET_TOKEN]");
+        }
+    }
+    if let Some(scheme_pos) = out.find("mysql://") {
+        let after_scheme = scheme_pos + 8;
+        if let Some(at_rel) = out[after_scheme..].find('@') {
+            let at_pos = after_scheme + at_rel;
+            if let Some(colon_rel) = out[after_scheme..at_pos].find(':') {
+                let colon_pos = after_scheme + colon_rel;
+                out.replace_range(colon_pos + 1..at_pos, "***");
+            }
+        }
+    }
+    out
+}
+
+fn sanitize_json_value(val: Value) -> Value {
+    match val {
+        Value::String(s) => Value::String(sanitize_telemetry_string(&s)),
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sanitize_json_value).collect()),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if is_sensitive_config_key(&k) && !k.eq_ignore_ascii_case("telegram_chat_id") {
+                    out.insert(k, Value::String("[REDACTED]".to_string()));
+                } else if k.eq_ignore_ascii_case("telegram_chat_id")
+                    || k.eq_ignore_ascii_case("wallet_address")
+                {
+                    let masked = match &v {
+                        Value::String(s) if !s.trim().is_empty() => {
+                            Value::String(mask_identifier(s))
+                        }
+                        _ => sanitize_json_value(v),
+                    };
+                    out.insert(k, masked);
+                } else {
+                    out.insert(k, sanitize_json_value(v));
+                }
+            }
+            Value::Object(out)
+        }
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotInsertInput {
@@ -169,8 +224,8 @@ impl DatabaseManager {
         details: Option<Value>,
     ) -> Result<()> {
         let ts = now_ms();
-        let safe_msg = sanitize_telemetry_message(message);
-        let details_str = details.map(|d| d.to_string());
+        let safe_msg = sanitize_telemetry_string(message);
+        let details_str = details.map(|d| sanitize_json_value(d).to_string());
         let mut conn = self.get_conn()?;
         conn.exec_drop(
             r#"INSERT INTO telemetry_logs
@@ -286,8 +341,51 @@ impl DatabaseManager {
             .collect())
     }
 
+    /// Deletes `portfolio_snapshots` and `telemetry_logs` older than `keep_days` in bounded batches,
+    /// returning `(snapshots_deleted, telemetry_logs_deleted)`.
+    pub fn prune_old_snapshots_and_logs(&self, keep_days: i64) -> Result<(u64, u64)> {
+        let cutoff_ms = now_ms() - keep_days.max(1) * 86_400_000;
+        let mut conn = self.get_conn()?;
+
+        let mut snaps_deleted = 0u64;
+        loop {
+            conn.exec_drop(
+                "DELETE FROM portfolio_snapshots WHERE created_at_ms < :cutoff ORDER BY id ASC LIMIT 5000",
+                params! { "cutoff" => cutoff_ms },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("prune_old_snapshots_and_logs snapshots failed: {e}"))
+            })?;
+            let aff = conn.affected_rows();
+            snaps_deleted += aff;
+            if aff < 5000 {
+                break;
+            }
+        }
+
+        let mut logs_deleted = 0u64;
+        loop {
+            conn.exec_drop(
+                "DELETE FROM telemetry_logs WHERE created_at_ms < :cutoff ORDER BY id ASC LIMIT 5000",
+                params! { "cutoff" => cutoff_ms },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("prune_old_snapshots_and_logs logs failed: {e}"))
+            })?;
+            let aff = conn.affected_rows();
+            logs_deleted += aff;
+            if aff < 5000 {
+                break;
+            }
+        }
+
+        Ok((snaps_deleted, logs_deleted))
+    }
+
     /// Computes multi-horizon PnL metrics (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`)
-    /// combining closed positions in each horizon window with active `OPEN` unrealized PnL.
+    /// respecting `risk_capital_cap_updated_at_ms`, anchoring baseline equity to `portfolio_snapshots`
+    /// around each horizon start, attributing only the horizon uPnL delta (`current_upnl - start_upnl`),
+    /// and including funding accrued + open fees without fabricated `anchor - net_pnl` baselines.
     pub fn compute_pnl_summary(
         &self,
         current_unrealized_pnl: f64,
@@ -296,22 +394,53 @@ impl DatabaseManager {
     ) -> Result<PnlSummary> {
         let now = now_ms();
         let cfg = self.load_config_or_default();
+        let is_live_or_testnet = cfg.execution_mode().is_live_or_testnet();
+        let cap_updated_at_ms = if is_live_or_testnet {
+            cfg.get_i64("risk_capital_cap_updated_at_ms", 0)
+                .max(0)
+                .min(now)
+        } else {
+            0
+        };
+
         let live_eq_cfg = cfg.get_f64("live_exchange_equity_usdc", 0.0);
-        let anchor_equity = if live_eq_cfg > 0.0 {
-            live_eq_cfg
-        } else if current_total_equity > 0.0 {
+        let cap_cfg = cfg.get_f64("risk_capital_cap_usdc", 0.0);
+        let fallback_equity = if current_total_equity.is_finite() && current_total_equity > 0.0 {
             current_total_equity
+        } else if live_eq_cfg.is_finite() && live_eq_cfg > 0.0 {
+            live_eq_cfg
+        } else if is_live_or_testnet && cap_cfg.is_finite() && cap_cfg > 0.0 {
+            cap_cfg
         } else {
             cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
         }
-        .max(100.0);
+        .max(1.0);
 
         let mut conn = self.get_conn()?;
+        let open_positions: Vec<(i64, String, f64, f64, f64, i64)> = conn
+            .query(
+                r#"SELECT asset_id, side, entry_price, filled_quantity, unrealized_pnl_usdc,
+                          COALESCE(opened_at_ms, created_at_ms)
+                   FROM positions
+                   WHERE status = 'OPEN'"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "compute_pnl_summary open positions query failed: {e}"
+                ))
+            })?;
+
         let build_horizon = |conn: &mut mysql::PooledConn,
                              label: &str,
-                             start_ms: i64|
+                             raw_start_ms: i64|
          -> Result<PnlHorizonMetrics> {
-            let row: Option<(f64, f64, i64, i64)> = conn
+            let eff_start_ms = if cap_updated_at_ms > 0 {
+                raw_start_ms.max(cap_updated_at_ms)
+            } else {
+                raw_start_ms
+            };
+
+            let closed_row: Option<(f64, f64, i64, i64)> = conn
                 .exec_first(
                     r#"SELECT
                            COALESCE(SUM(realized_pnl_usdc), 0.0),
@@ -321,21 +450,98 @@ impl DatabaseManager {
                        FROM positions
                        WHERE status = 'CLOSED'
                          AND COALESCE(closed_at_ms, updated_at_ms) >= :start_ms"#,
-                    params! { "start_ms" => start_ms },
+                    params! { "start_ms" => eff_start_ms },
                 )
                 .map_err(|e| {
-                    AegisError::Database(format!("compute_pnl_summary query failed: {e}"))
+                    AegisError::Database(format!("compute_pnl_summary closed query failed: {e}"))
                 })?;
 
             let (closed_rpnl, closed_fees_funding, trade_cnt, win_cnt) =
-                row.unwrap_or((0.0, 0.0, 0, 0));
+                closed_row.unwrap_or((0.0, 0.0, 0, 0));
 
+            // Query portfolio_snapshots around eff_start_ms for true baseline_equity_usdc
+            let pre_snap: Option<(f64, f64, i64)> = conn
+                .exec_first(
+                    r#"SELECT total_equity_usdc, committed_notional_usdc, created_at_ms
+                       FROM portfolio_snapshots
+                       WHERE created_at_ms <= :start_ms
+                       ORDER BY created_at_ms DESC, id DESC
+                       LIMIT 1"#,
+                    params! { "start_ms" => eff_start_ms },
+                )
+                .map_err(|e| {
+                    AegisError::Database(format!("compute_pnl_summary pre_snap query failed: {e}"))
+                })?;
+
+            let snap_opt = if pre_snap.is_some() {
+                pre_snap
+            } else {
+                conn.exec_first(
+                    r#"SELECT total_equity_usdc, committed_notional_usdc, created_at_ms
+                       FROM portfolio_snapshots
+                       WHERE created_at_ms >= :start_ms
+                       ORDER BY created_at_ms ASC, id ASC
+                       LIMIT 1"#,
+                    params! { "start_ms" => eff_start_ms },
+                )
+                .map_err(|e| {
+                    AegisError::Database(format!("compute_pnl_summary post_snap query failed: {e}"))
+                })?
+            };
+
+            let (snap_eq_opt, snap_comm_opt, snap_ts_opt) = match snap_opt {
+                Some((eq, comm, st)) => (Some(eq), Some(comm), Some(st)),
+                None => (None, None, None),
+            };
+
+            let baseline_equity_usdc = round_dp(
+                snap_eq_opt
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(fallback_equity)
+                    .max(1.0),
+                2,
+            );
+
+            // Compute unrealized PnL already present at eff_start_ms (`start_upnl`)
+            let mut start_upnl = 0.0;
+            for (asset_id, side_str, entry_price, qty, cur_pos_upnl, open_ts) in &open_positions {
+                if *open_ts >= eff_start_ms {
+                    // Position opened inside this horizon: start unrealized PnL was 0
+                    continue;
+                }
+                let bar_close_opt: Option<f64> = conn
+                    .exec_first(
+                        r#"SELECT close
+                           FROM ohlcv_bars
+                           WHERE asset_id = :aid
+                             AND timeframe IN ('1h', '4h')
+                             AND timestamp_ms <= :start_ms
+                           ORDER BY CASE WHEN timeframe = '1h' THEN 0 ELSE 1 END,
+                                    timestamp_ms DESC
+                           LIMIT 1"#,
+                        params! { "aid" => *asset_id, "start_ms" => eff_start_ms },
+                    )
+                    .map_err(|e| {
+                        AegisError::Database(format!("compute_pnl_summary bar lookup failed: {e}"))
+                    })?;
+
+                if let Some(bar_close) = bar_close_opt.filter(|&px| px.is_finite() && px > 0.0) {
+                    let side = OrderSide::parse(side_str);
+                    start_upnl += (bar_close - *entry_price) * *qty * side.sign();
+                } else if snap_ts_opt.is_some_and(|st| st <= eff_start_ms)
+                    && snap_comm_opt.unwrap_or(0.0) <= 1e-6
+                {
+                    // Snapshot at eff_start_ms had no open positions
+                } else {
+                    start_upnl += *cur_pos_upnl;
+                }
+            }
+
+            let horizon_upnl_delta = current_unrealized_pnl - start_upnl;
             let realized_pnl_usdc = round_dp(closed_rpnl, 2);
-            let unrealized_pnl_usdc = round_dp(current_unrealized_pnl, 2);
-            let net_pnl_usdc = round_dp(realized_pnl_usdc + unrealized_pnl_usdc, 2);
+            let unrealized_pnl_usdc = round_dp(horizon_upnl_delta + open_fees_funding, 2);
+            let net_pnl_usdc = round_dp(closed_rpnl + horizon_upnl_delta + open_fees_funding, 2);
             let fees_funding_usdc = round_dp(closed_fees_funding + open_fees_funding, 2);
-
-            let baseline_equity_usdc = round_dp((anchor_equity - net_pnl_usdc).max(100.0), 2);
 
             let return_pct = if baseline_equity_usdc > 0.0 {
                 round_dp((net_pnl_usdc / baseline_equity_usdc) * 100.0, 2)
@@ -345,7 +551,7 @@ impl DatabaseManager {
 
             Ok(PnlHorizonMetrics {
                 horizon_label: label.to_string(),
-                window_start_ms: start_ms,
+                window_start_ms: eff_start_ms,
                 baseline_equity_usdc,
                 net_pnl_usdc,
                 return_pct,

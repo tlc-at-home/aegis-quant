@@ -173,7 +173,7 @@ pub fn classify_rebalance_action(
             return ACTION_COOLDOWN_BLOCKED.to_string();
         }
         if !is_flat {
-            // While in cooldown, never increase or flip an existing position; only allow closing/reducing
+            // While in cooldown, never increase or flip an existing position; only allow closing/reducing/holding
             if target_weight.abs() < 1e-4 {
                 return ACTION_CLOSE.to_string();
             }
@@ -182,6 +182,11 @@ pub fn classify_rebalance_action(
                 && target_weight * current_weight >= 0.0
             {
                 return ACTION_REDUCE.to_string();
+            }
+            if (unblocked_desired_weight - current_weight).abs() < min_delta
+                && unblocked_desired_weight * current_weight >= 0.0
+            {
+                return ACTION_HOLD.to_string();
             }
             return ACTION_COOLDOWN_BLOCKED.to_string();
         }
@@ -198,8 +203,12 @@ pub fn classify_rebalance_action(
         }
     } else if target_weight.abs() < 1e-4 {
         ACTION_CLOSE.to_string()
-    } else if current_weight * target_weight < 0.0 && delta.abs() >= min_delta {
-        ACTION_FLIP.to_string()
+    } else if current_weight * target_weight < 0.0 {
+        if target_weight.abs() >= min_delta * 1.5 && delta.abs() >= min_delta {
+            ACTION_FLIP.to_string()
+        } else {
+            ACTION_CLOSE.to_string()
+        }
     } else if delta.abs() < min_delta {
         ACTION_HOLD.to_string()
     } else if target_weight.abs() > current_weight.abs() {
@@ -276,8 +285,16 @@ pub fn allocate_multi_sleeve_weights(
             && s3_flush_atr_mult < 0.0
             && (s1_mom_score >= 0.0 || s2_trend_alignment >= 0))
             || (s3_flush_atr_mult <= -3.5 && s3_funding_zscore < 0.5);
-        let w_s1 = if is_downward_flush { w_s1.max(0.0) } else { w_s1 };
-        let w_s2 = if is_downward_flush { w_s2.max(0.0) } else { w_s2 };
+        let w_s1 = if is_downward_flush {
+            w_s1.max(0.0)
+        } else {
+            w_s1
+        };
+        let w_s2 = if is_downward_flush {
+            w_s2.max(0.0)
+        } else {
+            w_s2
+        };
 
         let event_trigger = s3
             .and_then(|x| x.event_trigger.clone())
@@ -334,27 +351,35 @@ pub fn allocate_multi_sleeve_weights(
     if drafts.len() > 12 {
         let mut keep_ids: HashSet<i64> = HashSet::new();
         for d in &drafts {
-            if d.current_weight.abs() >= 1e-4
-                || (d.w_s1 > 0.0 && d.w_s3 > 0.0 && d.s3_flush_atr_mult < 0.0)
-            {
+            if d.current_weight.abs() >= 1e-4 {
                 keep_ids.insert(d.asset.id);
             }
         }
         let mut ranked: Vec<(i64, f64, f64)> = drafts
             .iter()
-            .map(|d| (d.asset.id, d.capped_single_weight.abs(), d.asset.day_volume_usdc))
+            .map(|d| {
+                (
+                    d.asset.id,
+                    d.capped_single_weight.abs(),
+                    d.asset.day_volume_usdc,
+                )
+            })
             .collect();
-        ranked.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-        });
-        for (id, _, _) in ranked.into_iter().take(12) {
-            keep_ids.insert(id);
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.2.total_cmp(&a.2)));
+        for (id, weight_abs, _) in ranked {
+            if keep_ids.len() >= 12 {
+                break;
+            }
+            if weight_abs > 1e-6 {
+                keep_ids.insert(id);
+            }
         }
         for d in &mut drafts {
             if !keep_ids.contains(&d.asset.id) {
                 d.capped_single_weight = 0.0;
+                d.w_s1 = 0.0;
+                d.w_s2 = 0.0;
+                d.w_s3 = 0.0;
             }
         }
     }
@@ -371,6 +396,17 @@ pub fn allocate_multi_sleeve_weights(
     for d in drafts {
         let target_weight = round_dp(d.capped_single_weight * gross_scale, 4);
         let delta_weight = round_dp(target_weight - d.current_weight, 4);
+        let eff_sleeve_scale =
+            if target_weight.abs() <= 1e-8 || d.unblocked_scaled_weight.abs() <= 1e-8 {
+                0.0
+            } else if target_weight * d.unblocked_scaled_weight > 0.0 {
+                (target_weight.abs() / d.unblocked_scaled_weight.abs()).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+        let w_s1_scaled = round_dp(d.w_s1 * eff_sleeve_scale, 4);
+        let w_s2_scaled = round_dp(d.w_s2 * eff_sleeve_scale, 4);
+        let w_s3_scaled = round_dp(d.w_s3 * eff_sleeve_scale, 4);
         let rebalance_action = classify_rebalance_action(
             d.current_weight,
             target_weight,
@@ -394,9 +430,9 @@ pub fn allocate_multi_sleeve_weights(
             s2_vol_surge_ratio: d.s2_vol_surge_ratio,
             s3_funding_zscore: d.s3_funding_zscore,
             s3_flush_atr_mult: d.s3_flush_atr_mult,
-            w_s1_carry_mom: d.w_s1,
-            w_s2_trend_breakout: d.w_s2,
-            w_s3_event_reversion: d.w_s3,
+            w_s1_carry_mom: w_s1_scaled,
+            w_s2_trend_breakout: w_s2_scaled,
+            w_s3_event_reversion: w_s3_scaled,
             raw_combined_weight: d.raw_combined_weight,
             target_weight,
             current_weight: d.current_weight,
@@ -409,14 +445,137 @@ pub fn allocate_multi_sleeve_weights(
     results.sort_by(|a, b| {
         b.target_weight
             .abs()
-            .partial_cmp(&a.target_weight.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.day_volume_usdc
-                    .partial_cmp(&a.day_volume_usdc)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .total_cmp(&a.target_weight.abs())
+            .then_with(|| b.day_volume_usdc.total_cmp(&a.day_volume_usdc))
     });
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_asset(id: i64, vol: f64) -> ExchangeAsset {
+        ExchangeAsset {
+            id,
+            symbol: format!("A{id}-USDC"),
+            coin: format!("A{id}"),
+            asset_index: id as u32,
+            sz_decimals: 2,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+            max_leverage: 20.0,
+            mark_price: 100.0,
+            mid_price: 100.0,
+            oracle_price: 100.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: vol,
+            open_interest_usdc: vol * 0.4,
+            prev_day_price: 100.0,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_flip_hysteresis_closes_small_opposite_targets() {
+        let min_delta = 0.025;
+        // Opposite sign below 1.5 * min_delta (0.0375) must CLOSE rather than FLIP
+        assert_eq!(
+            classify_rebalance_action(0.15, -0.03, -0.03, false, min_delta),
+            ACTION_CLOSE
+        );
+        assert_eq!(
+            classify_rebalance_action(-0.10, 0.02, 0.02, false, min_delta),
+            ACTION_CLOSE
+        );
+        // Opposite sign >= 1.5 * min_delta flips cleanly
+        assert_eq!(
+            classify_rebalance_action(0.15, -0.05, -0.05, false, min_delta),
+            ACTION_FLIP
+        );
+    }
+
+    #[test]
+    fn test_top_12_cap_removes_s1_s3_exemption_and_scales_sleeve_weights() {
+        let cfg = AllocatorConfig {
+            max_gross_leverage_x: 1.50,
+            max_single_asset_weight: 0.30,
+            ..AllocatorConfig::default()
+        };
+        let mut assets = Vec::new();
+        let mut s1 = HashMap::new();
+        let mut s2 = HashMap::new();
+        let mut s3 = HashMap::new();
+
+        // 20 flat assets ALL meeting old exemption (w_s1 > 0 && w_s3 > 0 && s3_flush_atr_mult < 0)
+        // and exceeding gross leverage so gross_scale < 1.0 applies
+        for i in 1..=20i64 {
+            let a = test_asset(i, 10_000_000.0 - (i as f64) * 100_000.0);
+            assets.push(a.clone());
+            s1.insert(
+                i,
+                CarryMomentumMetrics {
+                    asset_id: i,
+                    symbol: a.symbol.clone(),
+                    annualized_vol: 0.5,
+                    market_beta: 1.0,
+                    s1_mom_score: 0.4,
+                    s1_carry_score: 0.1,
+                    w_s1_carry_mom: 0.08,
+                },
+            );
+            s2.insert(
+                i,
+                TrendBreakoutMetrics {
+                    asset_id: i,
+                    symbol: a.symbol.clone(),
+                    s2_trend_alignment: 1,
+                    s2_vol_surge_ratio: 1.2,
+                    w_s2_trend_breakout: 0.04,
+                    event_trigger: None,
+                },
+            );
+            s3.insert(
+                i,
+                EventReversionMetrics {
+                    asset_id: i,
+                    symbol: a.symbol.clone(),
+                    s3_funding_zscore: -0.5,
+                    s3_flush_atr_mult: -1.5,
+                    w_s3_event_reversion: 0.05,
+                    event_trigger: None,
+                },
+            );
+        }
+
+        let signals =
+            allocate_multi_sleeve_weights(&assets, &s1, &s2, &s3, &HashMap::new(), &[], &cfg);
+        let non_zero: Vec<&SleeveSignalInput> = signals
+            .iter()
+            .filter(|s| s.target_weight.abs() > 1e-6)
+            .collect();
+        assert_eq!(non_zero.len(), 12, "Top-12 cap must reject S1+S3 exemption");
+
+        let lev = cfg.effective_leverage_multiplier();
+        for s in &signals {
+            let sleeve_sum =
+                (s.w_s1_carry_mom + s.w_s2_trend_breakout + s.w_s3_event_reversion) * lev;
+            if s.target_weight.abs() <= 1e-6 {
+                assert_eq!(s.w_s1_carry_mom, 0.0);
+                assert_eq!(s.w_s2_trend_breakout, 0.0);
+                assert_eq!(s.w_s3_event_reversion, 0.0);
+            } else {
+                assert!(
+                    (sleeve_sum - s.target_weight).abs() < 2e-3,
+                    "Scaled sleeve weights ({sleeve_sum}) must match target_weight ({})",
+                    s.target_weight
+                );
+            }
+        }
+    }
 }

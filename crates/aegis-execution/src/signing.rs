@@ -10,28 +10,38 @@ use k256::ecdsa::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use zeroize::Zeroizing;
 
 /// Hyperliquid L1 oracle price band margin (`±3.95%`), safely inside the exchange's `±4.0%`
 /// (`Price too far from oracle`) rejection boundary.
 pub const HL_ORACLE_BAND_PCT: f64 = 0.0395;
 
-static LAST_NONCE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+static LAST_NONCE_HIGH_WATER: AtomicI64 = AtomicI64::new(0);
+static NONCE_DB_SEEDED: AtomicBool = AtomicBool::new(false);
+static LAST_NONCE_PERSISTED_MS: AtomicI64 = AtomicI64::new(0);
+const NONCE_LAZY_PERSIST_INTERVAL_MS: i64 = 30_000;
 
-/// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicU64`
-/// high-water floor and optional persistence in MariaDB `system_config` (`hyperliquid_last_nonce`).
+/// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicI64`
+/// high-water floor (seeded once from `now_ms().max(db_nonce)` and persisted lazily to MariaDB).
 pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
-    let wall_ms = now_ms().max(1) as u64;
-    let db_floor = db
-        .and_then(|d| d.load_config().ok())
-        .map(|cfg| cfg.get_i64("hyperliquid_last_nonce", 0).max(0) as u64)
-        .unwrap_or(0);
-    let candidate_floor = wall_ms.max(db_floor);
+    let wall_ms = now_ms().max(1);
+    if !NONCE_DB_SEEDED.load(Ordering::Acquire) {
+        if let Some(d) = db {
+            if let Ok(cfg) = d.load_config() {
+                let db_floor = cfg.get_i64("hyperliquid_last_nonce", 0).max(0);
+                if db_floor > 0 {
+                    LAST_NONCE_HIGH_WATER.fetch_max(db_floor, Ordering::SeqCst);
+                }
+            }
+            NONCE_DB_SEEDED.store(true, Ordering::Release);
+        }
+    }
+
     let mut prev = LAST_NONCE_HIGH_WATER.load(Ordering::SeqCst);
     let next = loop {
-        let n = if candidate_floor > prev {
-            candidate_floor
+        let n = if wall_ms > prev {
+            wall_ms
         } else {
             prev.saturating_add(1)
         };
@@ -40,14 +50,24 @@ pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
             Err(actual) => prev = actual,
         }
     };
+
     if let Some(d) = db {
-        let _ = d.set_config_value(
-            "hyperliquid_last_nonce",
-            &next.to_string(),
-            Some("Monotonic Hyperliquid L1 EIP-712 action nonce"),
-        );
+        if !d.is_ephemeral_test_db() {
+            let last_persist = LAST_NONCE_PERSISTED_MS.load(Ordering::Relaxed);
+            if wall_ms.saturating_sub(last_persist) >= NONCE_LAZY_PERSIST_INTERVAL_MS
+                && LAST_NONCE_PERSISTED_MS
+                    .compare_exchange(last_persist, wall_ms, Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let _ = d.set_config_value(
+                    "hyperliquid_last_nonce",
+                    &next.to_string(),
+                    Some("Monotonic Hyperliquid L1 EIP-712 action nonce"),
+                );
+            }
+        }
     }
-    next
+    next as u64
 }
 
 /// Formats a float into a wire string matching Hyperliquid's `float_to_wire` specification.

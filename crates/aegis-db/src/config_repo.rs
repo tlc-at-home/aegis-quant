@@ -10,6 +10,7 @@ use mysql::params;
 use mysql::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+use zeroize::Zeroize;
 
 impl DatabaseManager {
     /// Seeds all default v2.0 `system_config` entries (`risk_tier = "extreme"`, `target_leverage_multiplier = "1.85"`, etc.)
@@ -138,6 +139,7 @@ impl DatabaseManager {
     }
 
     /// Loads all `system_config` rows, transparently decrypting any Fernet-encrypted values (`gAAAAAB...`).
+    /// Per-row Fernet decryption failures are isolated and logged so a single corrupt entry never drops the whole map.
     pub fn load_config(&self) -> Result<ConfigMap> {
         let mut conn = self.get_conn()?;
         let rows: Vec<(String, String)> = conn
@@ -145,20 +147,37 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("Failed to query system_config: {e}")))?;
 
         let mut map = HashMap::with_capacity(rows.len());
+        let cipher = self.fernet();
         for (k, raw_v) in rows {
-            let val = if is_encrypted_value(&raw_v) {
-                self.fernet().decrypt(&raw_v)?
+            if is_encrypted_value(&raw_v) || raw_v.trim().starts_with("ENC:") {
+                match cipher.decrypt(&raw_v) {
+                    Ok(val) => {
+                        map.insert(k, val);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            config_key = %k,
+                            error = %e,
+                            "Skipping undecryptable system_config entry during load_config"
+                        );
+                    }
+                }
             } else {
-                raw_v
-            };
-            map.insert(k, val);
+                map.insert(k, raw_v);
+            }
         }
         Ok(ConfigMap::from_map(map))
     }
 
-    /// Loads config with fallback to default `ConfigMap` on error.
+    /// Loads config with fallback to default `ConfigMap` on DB query error.
     pub fn load_config_or_default(&self) -> ConfigMap {
-        self.load_config().unwrap_or_default()
+        match self.load_config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(error = %e, "load_config failed; falling back to empty ConfigMap");
+                ConfigMap::default()
+            }
+        }
     }
 
     /// Lists raw `SystemConfigRow` entries (without decrypting secrets; suitable for Web UI display with redaction).
@@ -211,18 +230,52 @@ impl DatabaseManager {
                 "Config key cannot be empty".to_string(),
             ));
         }
+        let trimmed_val = value.trim();
+        let looks_encrypted = is_encrypted_value(trimmed_val) || trimmed_val.starts_with("ENC:");
+        if looks_encrypted {
+            let mut decrypted = self.fernet().decrypt(trimmed_val).map_err(|e| {
+                AegisError::Validation(format!(
+                    "Invalid or undecryptable Fernet ciphertext for '{clean_key}': {e}"
+                ))
+            })?;
+            decrypted.zeroize();
+        }
         let is_secret = is_sensitive_config_key(clean_key) && clean_key != "telegram_chat_id";
-        let stored_val = if is_secret && !value.trim().is_empty() && !is_encrypted_value(value) {
-            self.fernet().encrypt(value.trim().as_bytes())?
+        let stored_val = if is_secret && !trimmed_val.is_empty() && !looks_encrypted {
+            self.fernet().encrypt(trimmed_val.as_bytes())?
         } else {
-            value.trim().to_string()
+            trimmed_val.to_string()
         };
         let vtype = if is_secret { "secret" } else { "string" };
         let desc = description.unwrap_or("");
         let ts = now_ms();
 
         let mut conn = self.get_conn()?;
-        conn.exec_drop(
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| AegisError::Database(format!("Failed to start set_config tx: {e}")))?;
+
+        let cap_changed = if clean_key == "risk_capital_cap_usdc" {
+            let prev: Option<String> = tx
+                .query_first(
+                    "SELECT config_value FROM system_config WHERE config_key = 'risk_capital_cap_usdc' FOR UPDATE",
+                )
+                .map_err(|e| AegisError::Database(format!("Failed checking prior risk_capital_cap_usdc: {e}")))?;
+            match prev {
+                None => true,
+                Some(old_raw) => {
+                    let old_t = old_raw.trim();
+                    match (old_t.parse::<f64>(), trimmed_val.parse::<f64>()) {
+                        (Ok(a), Ok(b)) if a.is_finite() && b.is_finite() => (a - b).abs() > 1e-9,
+                        _ => old_t != trimmed_val,
+                    }
+                }
+            }
+        } else {
+            false
+        };
+
+        tx.exec_drop(
             r#"INSERT INTO system_config
                (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
                VALUES (:k, :v, :vt, :d, :ts, :ts)
@@ -238,10 +291,34 @@ impl DatabaseManager {
             },
         )
         .map_err(|e| AegisError::Database(format!("Failed to set config '{clean_key}': {e}")))?;
+
+        if cap_changed {
+            tx.exec_drop(
+                r#"INSERT INTO system_config
+                   (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+                   VALUES ('risk_capital_cap_updated_at_ms', :cap_ts, 'int', 'Cutoff timestamp (ms) updated when risk_capital_cap_usdc changes', :ts, :ts)
+                   ON DUPLICATE KEY UPDATE
+                   config_value = VALUES(config_value),
+                   updated_at_ms = VALUES(updated_at_ms)"#,
+                params! {
+                    "cap_ts" => ts.to_string(),
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "Failed updating risk_capital_cap_updated_at_ms: {e}"
+                ))
+            })?;
+        }
+
+        tx.commit()
+            .map_err(|e| AegisError::Database(format!("set_config_value commit failed: {e}")))?;
         Ok(())
     }
 
-    /// Atomically rotates the Fernet master key across all encrypted rows in `system_config`.
+    /// Atomically rotates the Fernet master key across all encrypted rows in `system_config`
+    /// and updates the active in-memory `FernetCipher`.
     pub fn rotate_fernet_master_key(&self, old_key: &str, new_key: &str) -> Result<usize> {
         let old_cipher = FernetCipher::from_key_str(old_key)?;
         let new_cipher = FernetCipher::from_key_str(new_key)?;
@@ -258,8 +335,9 @@ impl DatabaseManager {
 
         for (k, raw_v) in rows {
             if is_encrypted_value(&raw_v) {
-                let plain = old_cipher.decrypt(&raw_v)?;
+                let mut plain = old_cipher.decrypt(&raw_v)?;
                 let re_enc = new_cipher.encrypt(plain.as_bytes())?;
+                plain.zeroize();
                 tx.exec_drop(
                     "UPDATE system_config SET config_value = :v, updated_at_ms = :ts WHERE config_key = :k",
                     params! { "v" => re_enc, "ts" => ts, "k" => k },
@@ -270,6 +348,7 @@ impl DatabaseManager {
         }
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Key rotation commit error: {e}")))?;
+        self.update_fernet_cipher(new_cipher);
         Ok(rotated)
     }
 }

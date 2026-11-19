@@ -36,7 +36,10 @@ pub fn compute_preliminary_bull_breadth(
     let mut bull_count = 0.0;
 
     for asset in assets {
-        if !asset.is_core_eligible && !asset.is_event_eligible && asset.day_volume_usdc <= 0.0 {
+        if (!asset.is_core_eligible && !asset.is_event_eligible)
+            || !asset.day_volume_usdc.is_finite()
+            || asset.day_volume_usdc <= 0.0
+        {
             continue;
         }
         eligible_count += 1;
@@ -109,22 +112,38 @@ pub fn compute_market_breadth_snapshot(
     assets: &[ExchangeAsset],
     bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
     beta_by_asset: &HashMap<i64, f64>,
-    target_weights: &HashMap<i64, f64>,
+    portfolio_weights: &HashMap<i64, f64>,
     capitulation_count: usize,
 ) -> MarketBreadthSnapshot {
     let (market_breadth_bull, eligible_coin_count) =
         compute_preliminary_bull_breadth(assets, bars_by_asset);
 
     let mut beta_exposure = 0.0;
-    for (asset_id, &w) in target_weights {
-        let beta = beta_by_asset.get(asset_id).copied().unwrap_or(1.0);
-        beta_exposure += w * beta;
+    for (asset_id, &w) in portfolio_weights {
+        if w.is_finite() {
+            let beta = beta_by_asset
+                .get(asset_id)
+                .copied()
+                .filter(|b| b.is_finite())
+                .unwrap_or(1.0);
+            beta_exposure += w * beta;
+        }
     }
 
-    let avg_funding = if assets.is_empty() {
+    let eligible_fundings: Vec<f64> = assets
+        .iter()
+        .filter(|a| {
+            (a.is_core_eligible || a.is_event_eligible)
+                && a.day_volume_usdc.is_finite()
+                && a.day_volume_usdc > 0.0
+                && a.funding_rate_hourly.is_finite()
+        })
+        .map(|a| a.funding_rate_hourly)
+        .collect();
+    let avg_funding = if eligible_fundings.is_empty() {
         0.0
     } else {
-        assets.iter().map(|a| a.funding_rate_hourly).sum::<f64>() / (assets.len() as f64)
+        eligible_fundings.iter().sum::<f64>() / (eligible_fundings.len() as f64)
     };
 
     let market_regime_label =

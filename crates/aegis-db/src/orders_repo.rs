@@ -5,6 +5,8 @@ use aegis_core::{now_ms, AegisError, OrderAuditRecord, Result};
 use mysql::params;
 use mysql::prelude::*;
 
+type LockedChaseRow = (i64, String, String, String, String, f64, f64, f64, f64, u32);
+
 impl DatabaseManager {
     /// Updates a `WORKING` order's limit price and chase counter during a 1s top-of-book chase step,
     /// recording an audit entry in `order_audit`.
@@ -16,18 +18,48 @@ impl DatabaseManager {
         exchange_order_id: Option<&str>,
         reason: &str,
     ) -> Result<u32> {
-        let pos = self
-            .get_position_by_id(position_id)?
-            .ok_or_else(|| AegisError::Database(format!("Position {position_id} not found")))?;
-        let new_chase_count = pos.chase_count.saturating_add(1);
         let ts = now_ms();
-
         let mut conn = self.get_conn()?;
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| {
                 AegisError::Database(format!("record_working_order_chase tx failed: {e}"))
             })?;
+
+        let row: Option<LockedChaseRow> = tx
+            .exec_first(
+                r#"SELECT asset_id, client_order_id, side, status, fsm_state,
+                          requested_quantity, filled_quantity, entry_price,
+                          reserved_margin_usdc, chase_count
+                   FROM positions
+                   WHERE id = :pid
+                   FOR UPDATE"#,
+                params! { "pid" => position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("record_working_order_chase lock failed: {e}"))
+            })?;
+
+        let (
+            asset_id,
+            client_order_id,
+            side,
+            status,
+            from_fsm_state,
+            requested_quantity,
+            filled_quantity,
+            prev_limit_price,
+            reserved_margin_usdc,
+            chase_count,
+        ) = row.ok_or_else(|| AegisError::Database(format!("Position {position_id} not found")))?;
+
+        if !status.eq_ignore_ascii_case("WORKING") {
+            return Err(AegisError::Database(format!(
+                "Position {position_id} is '{status}' (expected 'WORKING')"
+            )));
+        }
+
+        let new_chase_count = chase_count.saturating_add(1);
 
         tx.exec_drop(
             r#"UPDATE positions
@@ -63,15 +95,15 @@ impl DatabaseManager {
                )"#,
             params! {
                 "pid" => position_id,
-                "aid" => pos.asset_id,
-                "coid" => &pos.client_order_id,
-                "side" => &pos.side,
-                "from_st" => &pos.fsm_state,
+                "aid" => asset_id,
+                "coid" => client_order_id,
+                "side" => side,
+                "from_st" => if from_fsm_state.is_empty() { "WORKING_ALO".to_string() } else { from_fsm_state },
                 "to_st" => new_fsm_state,
-                "req_qty" => pos.requested_quantity,
-                "fill_qty" => pos.filled_quantity,
-                "lim_px" => new_limit_price,
-                "res_usdc" => pos.reserved_margin_usdc,
+                "req_qty" => requested_quantity,
+                "fill_qty" => filled_quantity,
+                "lim_px" => if new_limit_price > 0.0 { new_limit_price } else { prev_limit_price },
+                "res_usdc" => reserved_margin_usdc,
                 "reason" => reason,
                 "ts" => ts,
             },
@@ -106,7 +138,7 @@ impl DatabaseManager {
             .into_iter()
             .map(|r| OrderAuditRecord {
                 id: r.get(0).unwrap_or_default(),
-                position_id: r.get(1).unwrap_or_default(),
+                position_id: r.get::<Option<i64>, _>(1).flatten().unwrap_or(0),
                 asset_id: r.get(2).unwrap_or_default(),
                 client_order_id: r.get(3).unwrap_or_default(),
                 side: r.get(4).unwrap_or_else(|| "LONG".to_string()),

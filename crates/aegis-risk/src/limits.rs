@@ -69,9 +69,7 @@ impl RiskLimitsConfig {
             protective_stop_default_pct: cfg
                 .get_f64("protective_stop_default_pct", 0.04)
                 .clamp(0.005, 0.35),
-            take_profit_atr_mult: cfg
-                .get_f64("take_profit_atr_mult", 4.4)
-                .clamp(1.0, 20.0),
+            take_profit_atr_mult: cfg.get_f64("take_profit_atr_mult", 4.4).clamp(1.0, 20.0),
             take_profit_default_pct: cfg
                 .get_f64("take_profit_default_pct", 0.08)
                 .clamp(0.01, 0.80),
@@ -157,7 +155,11 @@ pub fn compute_reserved_margin_usdc(order_notional_usdc: f64, leverage_multiplie
     if !order_notional_usdc.is_finite() || order_notional_usdc <= 0.0 {
         return 0.0;
     }
-    let eff_lev = leverage_multiplier.clamp(1.0, 20.0);
+    let eff_lev = if leverage_multiplier.is_finite() {
+        leverage_multiplier.clamp(0.1, 20.0)
+    } else {
+        1.0
+    };
     round_dp(order_notional_usdc / eff_lev, 4)
 }
 
@@ -182,8 +184,16 @@ pub fn compute_capital_ledger(
     positions: &[PositionRecord],
     leverage_multiplier: f64,
 ) -> CapitalLedgerState {
-    let base_eq = base_cash_equity_usdc.max(1.0);
-    let eff_lev = leverage_multiplier.clamp(1.0, 20.0);
+    let base_eq = if base_cash_equity_usdc.is_finite() {
+        base_cash_equity_usdc.max(1.0)
+    } else {
+        1.0
+    };
+    let eff_lev = if leverage_multiplier.is_finite() {
+        leverage_multiplier.clamp(0.1, 20.0)
+    } else {
+        1.0
+    };
 
     let mut reserved_order_cash_usdc = 0.0;
     let mut committed_notional_usdc = 0.0;
@@ -254,8 +264,16 @@ pub fn compute_capital_ledger_from_views(
     ordered_assets: &[OrderedAssetView],
     leverage_multiplier: f64,
 ) -> CapitalLedgerState {
-    let base_eq = base_cash_equity_usdc.max(1.0);
-    let eff_lev = leverage_multiplier.clamp(1.0, 20.0);
+    let base_eq = if base_cash_equity_usdc.is_finite() {
+        base_cash_equity_usdc.max(1.0)
+    } else {
+        1.0
+    };
+    let eff_lev = if leverage_multiplier.is_finite() {
+        leverage_multiplier.clamp(0.1, 20.0)
+    } else {
+        1.0
+    };
 
     let reserved_order_cash_usdc: f64 = ordered_assets
         .iter()

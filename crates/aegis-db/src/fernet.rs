@@ -9,8 +9,10 @@ use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -18,8 +20,11 @@ type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type HmacSha256 = Hmac<Sha256>;
 
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::OnceLock;
+
+static KEYFILE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const LEGACY_PUBLIC_FERNET_SEED_V1: &[u8] = b"aegis-quant-v0.2.0-rc1-fernet-master-key";
 const LEGACY_PUBLIC_FERNET_SEED_V2: &[u8] = b"aegis-quant-v0.2.0-local-fernet-master-key-seed";
@@ -79,14 +84,95 @@ pub fn master_key_file_for_db(db_path: &Path) -> std::path::PathBuf {
     parent.join(".aegis_master_key")
 }
 
-/// Write a normalized Fernet master key to `key_file` with `0600` permissions (`S4`, `S5`).
+/// Write a normalized Fernet master key atomically to `key_file` with `0600` permissions from creation (`S4`, `S5`).
 pub fn write_master_key_file(key_file: &Path, key_b64: &str) -> Result<()> {
-    if let Some(parent) = key_file.parent() {
-        fs::create_dir_all(parent)?;
+    let parent = key_file.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let pid = std::process::id();
+    let seq = KEYFILE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = key_file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(".aegis_master_key");
+    let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{seq}"));
+
+    let mut content = format!("{}\n", key_b64.trim()).into_bytes();
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
     }
-    fs::write(key_file, format!("{}\n", key_b64.trim()))?;
-    let _ = fs::set_permissions(key_file, fs::Permissions::from_mode(0o600));
+    let write_res = (|| -> Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(&content)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    content.zeroize();
+
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, key_file) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(key_file, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
+}
+
+/// Returns true when `AEGIS_ENFORCE_MASTER_KEY` explicitly requires an external/keyfile master key (`1`/`true`/`yes`/`on`).
+pub fn is_enforce_master_key_env() -> bool {
+    std::env::var("AEGIS_ENFORCE_MASTER_KEY")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Returns true when `AEGIS_ENFORCE_MASTER_KEY` is explicitly disabled (`0`/`false`/`no`/`off`).
+pub fn is_enforce_master_key_disabled_env() -> bool {
+    std::env::var("AEGIS_ENFORCE_MASTER_KEY")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Strictly resolves the Fernet master key, failing closed if `enforce_master_key` or `AEGIS_ENFORCE_MASTER_KEY=1`
+/// is active and no external key or keyfile exists.
+pub fn resolve_fernet_master_key_strict(
+    master_key: Option<&str>,
+    db_path: Option<&Path>,
+    enforce_master_key: bool,
+) -> Result<(String, bool)> {
+    let (key, has_ext) = resolve_fernet_master_key(master_key, db_path);
+    if !has_ext && (enforce_master_key || is_enforce_master_key_env()) {
+        let expected_path = db_path
+            .map(master_key_file_for_db)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".aegis_master_key".to_string());
+        return Err(AegisError::SecurityViolation(format!(
+            "Fernet master key missing while enforce_master_key=true: set AEGIS_MASTER_KEY, systemd LoadCredential, or provision '{expected_path}' (0600)"
+        )));
+    }
+    Ok((key, has_ext))
 }
 
 /// Ensures that a file-backed database has an external key source or provisions `<db_dir>/.aegis_master_key` (`0600`).
@@ -131,12 +217,16 @@ pub fn resolve_fernet_master_key(
                 for name in ["aegis_master_key", ".aegis_master_key"] {
                     let cand = dir_path.join(name);
                     if cand.is_file() {
-                        if let Ok(bytes) = fs::read(&cand) {
-                            if !trim_ascii(&bytes).is_empty() {
+                        if let Ok(mut bytes) = fs::read(&cand) {
+                            let res = if !trim_ascii(&bytes).is_empty() {
                                 let norm = normalize_fernet_key(&bytes);
-                                if !is_legacy_public_fallback_key(&norm) {
-                                    return (norm, true);
-                                }
+                                (!is_legacy_public_fallback_key(&norm)).then_some(norm)
+                            } else {
+                                None
+                            };
+                            bytes.zeroize();
+                            if let Some(norm) = res {
+                                return (norm, true);
                             }
                         }
                     }
@@ -145,7 +235,7 @@ pub fn resolve_fernet_master_key(
         }
     }
 
-    let env_key = std::env::var("AEGIS_MASTER_KEY")
+    let mut env_key = std::env::var("AEGIS_MASTER_KEY")
         .ok()
         .filter(|s| is_usable_env_key(s))
         .or_else(|| {
@@ -153,8 +243,9 @@ pub fn resolve_fernet_master_key(
                 .ok()
                 .filter(|s| is_usable_env_key(s))
         });
-    if let Some(k) = env_key {
+    if let Some(ref mut k) = env_key {
         let norm = normalize_fernet_key(k.as_bytes());
+        k.zeroize();
         if !is_legacy_public_fallback_key(&norm) {
             return (norm, true);
         }
@@ -165,12 +256,16 @@ pub fn resolve_fernet_master_key(
             if let Some(parent) = p.parent() {
                 let key_file = parent.join(".aegis_master_key");
                 if key_file.is_file() {
-                    if let Ok(bytes) = fs::read(&key_file) {
-                        if !trim_ascii(&bytes).is_empty() {
+                    if let Ok(mut bytes) = fs::read(&key_file) {
+                        let res = if !trim_ascii(&bytes).is_empty() {
                             let norm = normalize_fernet_key(&bytes);
-                            if !is_legacy_public_fallback_key(&norm) {
-                                return (norm, true);
-                            }
+                            (!is_legacy_public_fallback_key(&norm)).then_some(norm)
+                        } else {
+                            None
+                        };
+                        bytes.zeroize();
+                        if let Some(norm) = res {
+                            return (norm, true);
                         }
                     }
                 }
@@ -198,10 +293,11 @@ impl FernetCipher {
                     .to_string(),
             ));
         }
-        let decoded = URL_SAFE
+        let mut decoded = URL_SAFE
             .decode(norm_b64.as_bytes())
             .map_err(|e| AegisError::Crypto(format!("Invalid Fernet base64 key: {e}")))?;
         if decoded.len() != 32 {
+            decoded.zeroize();
             return Err(AegisError::Crypto(
                 "Fernet key must decode to 32 bytes (16 signing + 16 encryption)".to_string(),
             ));
@@ -210,6 +306,7 @@ impl FernetCipher {
         let mut encryption_key = [0u8; 16];
         signing_key.copy_from_slice(&decoded[..16]);
         encryption_key.copy_from_slice(&decoded[16..32]);
+        decoded.zeroize();
         Ok(Self {
             signing_key,
             encryption_key,
@@ -234,15 +331,26 @@ impl FernetCipher {
         let mut buf = vec![0u8; pad_len];
         buf[..plaintext.len()].copy_from_slice(plaintext);
 
-        let ciphertext = Aes128CbcEnc::new(&self.encryption_key.into(), &iv.into())
+        let ciphertext = match Aes128CbcEnc::new(&self.encryption_key.into(), &iv.into())
             .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
-            .map_err(|e| AegisError::Crypto(format!("AES-128-CBC encryption error: {e}")))?;
+        {
+            Ok(ct) => ct,
+            Err(e) => {
+                buf.zeroize();
+                iv.zeroize();
+                return Err(AegisError::Crypto(format!(
+                    "AES-128-CBC encryption error: {e}"
+                )));
+            }
+        };
 
         let mut payload = Vec::with_capacity(1 + 8 + 16 + ciphertext.len() + 32);
         payload.push(0x80); // Fernet version byte
         payload.extend_from_slice(&now_secs.to_be_bytes());
         payload.extend_from_slice(&iv);
         payload.extend_from_slice(ciphertext);
+        buf.zeroize();
+        iv.zeroize();
 
         let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.signing_key)
             .map_err(|e| AegisError::Crypto(format!("HMAC init error: {e}")))?;
@@ -250,7 +358,9 @@ impl FernetCipher {
         let tag = mac.finalize().into_bytes();
         payload.extend_from_slice(&tag);
 
-        Ok(URL_SAFE.encode(&payload))
+        let encoded = URL_SAFE.encode(&payload);
+        payload.zeroize();
+        Ok(encoded)
     }
 
     /// Decrypt a URL-safe base64 Fernet token (`gAAAAAB...`) and verify its HMAC-SHA256 tag.
@@ -319,12 +429,18 @@ impl FernetCipher {
         }
 
         let mut buf = ciphertext.to_vec();
-        let decrypted = Aes128CbcDec::new(&self.encryption_key.into(), iv.into())
+        let res = match Aes128CbcDec::new(&self.encryption_key.into(), iv.into())
             .decrypt_padded_mut::<Pkcs7>(&mut buf)
-            .map_err(|_| AegisError::Crypto("Invalid PKCS7 padding in Fernet token".to_string()))?;
-
-        String::from_utf8(decrypted.to_vec())
-            .map_err(|e| AegisError::Crypto(format!("Decrypted token is not valid UTF-8: {e}")))
+        {
+            Ok(decrypted) => String::from_utf8(decrypted.to_vec()).map_err(|e| {
+                AegisError::Crypto(format!("Decrypted token is not valid UTF-8: {e}"))
+            }),
+            Err(_) => Err(AegisError::Crypto(
+                "Invalid PKCS7 padding in Fernet token".to_string(),
+            )),
+        };
+        buf.zeroize();
+        res
     }
 }
 
@@ -365,5 +481,34 @@ mod tests {
         // Wrong key fails HMAC verification
         let other = FernetCipher::from_key_str("custom-other-master-key").unwrap();
         assert!(other.decrypt(&token).is_err());
+    }
+
+    #[test]
+    fn test_atomic_master_key_file_0600_and_strict_enforcement() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aegis_fernet_test_{}_{}",
+            std::process::id(),
+            KEYFILE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db_path = tmp_dir.join("aegis_quant.db");
+        let missing = resolve_fernet_master_key_strict(None, Some(&db_path), true);
+        assert!(
+            missing.is_err(),
+            "Missing keyfile must fail closed when enforced"
+        );
+
+        let key = generate_fernet_key();
+        let key_file = master_key_file_for_db(&db_path);
+        write_master_key_file(&key_file, &key).unwrap();
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&key_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let (resolved, has_ext) =
+            resolve_fernet_master_key_strict(None, Some(&db_path), true).unwrap();
+        assert!(has_ext);
+        assert_eq!(resolved, key);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

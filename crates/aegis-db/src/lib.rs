@@ -21,8 +21,9 @@ pub use bars_repo::*;
 pub use engine::*;
 pub use fernet::{
     default_host_fernet_key_b64, ensure_master_key_for_db, generate_fernet_key, is_encrypted_value,
-    is_legacy_public_fallback_key, is_usable_env_key, master_key_file_for_db, normalize_fernet_key,
-    resolve_fernet_master_key, write_master_key_file, FernetCipher,
+    is_enforce_master_key_disabled_env, is_enforce_master_key_env, is_legacy_public_fallback_key,
+    is_usable_env_key, master_key_file_for_db, normalize_fernet_key, resolve_fernet_master_key,
+    resolve_fernet_master_key_strict, write_master_key_file, FernetCipher,
 };
 pub use portfolio_repo::*;
 pub use positions_repo::*;

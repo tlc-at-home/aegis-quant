@@ -163,7 +163,8 @@ impl DatabaseManager {
                           funding_rate_hourly, funding_apr_pct, annualized_vol,
                           market_beta, s1_mom_score, s1_carry_score, w_s1_carry_mom,
                           target_weight, current_weight, updated_at_ms
-                   FROM v_assets_sleeve_s1"#,
+                   FROM v_assets_sleeve_s1
+                   ORDER BY ABS(w_s1_carry_mom) DESC, day_volume_usdc DESC"#,
             )
             .map_err(|e| AegisError::Database(format!("get_sleeve_s1_view query failed: {e}")))?;
 
@@ -198,7 +199,8 @@ impl DatabaseManager {
                           annualized_vol, s2_trend_alignment, s2_vol_surge_ratio,
                           w_s2_trend_breakout, event_trigger, target_weight,
                           current_weight, updated_at_ms
-                   FROM v_assets_sleeve_s2"#,
+                   FROM v_assets_sleeve_s2
+                   ORDER BY ABS(w_s2_trend_breakout) DESC, s2_vol_surge_ratio DESC"#,
             )
             .map_err(|e| AegisError::Database(format!("get_sleeve_s2_view query failed: {e}")))?;
 
@@ -231,7 +233,8 @@ impl DatabaseManager {
                           funding_rate_hourly, funding_apr_pct, s3_funding_zscore,
                           s3_flush_atr_mult, w_s3_event_reversion, event_trigger,
                           target_weight, current_weight, updated_at_ms
-                   FROM v_assets_sleeve_s3"#,
+                   FROM v_assets_sleeve_s3
+                   ORDER BY ABS(w_s3_event_reversion) DESC, s3_funding_zscore ASC"#,
             )
             .map_err(|e| AegisError::Database(format!("get_sleeve_s3_view query failed: {e}")))?;
 
