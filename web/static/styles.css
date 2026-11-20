@@ -1401,3 +1401,345 @@ html, body {
   color: #ffffff;
 }
 
+/* ============================================================================
+   ACCESSIBILITY UTILITIES & SVG SPRITE
+   ============================================================================ */
+.svg-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* ============================================================================
+   HYPERLIQUID VAULT INFO & COMBINED PORTFOLIO EQUITY PANEL
+   ============================================================================ */
+.vault-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 960px) {
+  .vault-kpi-strip {
+    grid-template-columns: 1fr;
+  }
+}
+
+.vault-kpi-card {
+  position: relative;
+  overflow: hidden;
+  padding: 13px 16px;
+  border-radius: var(--radius-md);
+  background: rgba(6, 9, 17, 0.62);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.2s ease;
+}
+
+.vault-kpi-card:hover {
+  border-color: rgba(0, 242, 254, 0.34);
+}
+
+.vault-kpi-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, var(--neon-cyan), transparent);
+  opacity: 0.8;
+}
+
+.vault-kpi-card.accent-emerald::before {
+  background: linear-gradient(90deg, var(--neon-emerald), transparent);
+}
+
+.vault-kpi-card.accent-violet::before {
+  background: linear-gradient(90deg, var(--neon-violet), var(--neon-cyan));
+}
+
+.vault-kpi-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vault-kpi-value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.3px;
+  color: var(--text-primary);
+}
+
+.vault-kpi-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.vault-segregated-tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(0, 242, 254, 0.1);
+  border: 1px solid rgba(0, 242, 254, 0.28);
+  color: var(--neon-cyan);
+  white-space: nowrap;
+}
+
+.vault-seg-note {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.vault-config-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(6, 9, 17, 0.65);
+  border: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.vault-config-badge[hidden] {
+  display: none;
+}
+
+.vault-name-cell {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.vault-closed-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--neon-rose-soft);
+  border: 1px solid var(--border-glow-rose);
+  color: #fda4af;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+/* Single-line middle/end-preserving address chip: keeps full address in DOM */
+.addr-chip {
+  display: inline-flex;
+  align-items: baseline;
+  max-inline-size: 14.5ch;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  background: rgba(6, 9, 17, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 4px;
+  padding: 1px 6px;
+  vertical-align: middle;
+}
+
+.addr-chip > .addr-head {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-inline-size: 0;
+}
+
+.cfg-val-code {
+  display: inline-block;
+  max-inline-size: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
+/* ============================================================================
+   TABLE SCROLL REGIONS, SORTABLE HEADERS & TABULAR PNL DISPLAY
+   ============================================================================ */
+.table-scroll:focus-visible {
+  outline: 2px solid var(--neon-cyan);
+  outline-offset: -2px;
+}
+
+.vault-table-scroll {
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.closed-table-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.cooldown-table-scroll {
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.closed-search-input {
+  min-width: 210px;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.quant-table {
+  min-inline-size: max-content;
+}
+
+.quant-table th:has(> button.sort-btn) {
+  padding: 0;
+}
+
+.quant-table th > button.sort-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-block-size: 32px;
+  min-inline-size: 24px;
+  padding: 9px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.quant-table th > button.sort-btn:hover {
+  color: var(--text-primary);
+  background-color: rgba(0, 242, 254, 0.08);
+}
+
+.quant-table th > button.sort-btn:focus-visible {
+  outline: 2px solid var(--neon-cyan);
+  outline-offset: -2px;
+  color: var(--text-primary);
+}
+
+.quant-table th[aria-sort] > button.sort-btn {
+  color: var(--neon-cyan);
+  background-color: rgba(0, 242, 254, 0.06);
+}
+
+@media (pointer: coarse) {
+  .quant-table th > button.sort-btn {
+    min-block-size: 40px;
+  }
+}
+
+.sort-icon {
+  width: 11px;
+  height: 13px;
+  flex: none;
+  color: currentColor;
+  pointer-events: none;
+}
+
+.sort-icon .sort-asc,
+.sort-icon .sort-desc {
+  opacity: 0.32;
+  transition: opacity 0.15s ease;
+}
+
+.quant-table th > button.sort-btn:hover .sort-icon .sort-asc,
+.quant-table th > button.sort-btn:hover .sort-icon .sort-desc {
+  opacity: 0.6;
+}
+
+.quant-table th[aria-sort="ascending"] .sort-icon .sort-asc {
+  opacity: 1;
+}
+
+.quant-table th[aria-sort="ascending"] .sort-icon .sort-desc {
+  opacity: 0.16;
+}
+
+.quant-table th[aria-sort="descending"] .sort-icon .sort-desc {
+  opacity: 1;
+}
+
+.quant-table th[aria-sort="descending"] .sort-icon .sort-asc {
+  opacity: 0.16;
+}
+
+/* Scoped View Transitions on small sortable tables; respect reduced motion */
+.quant-table[data-vt="true"] tbody tr {
+  view-transition-name: match-element;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none;
+  }
+}
+
+/* Tabular numerals & inline PnL ($ + %) cells */
+.num-cell,
+.pnl-cell,
+.kpi-value,
+.pnl-main-val {
+  font-variant-numeric: tabular-nums;
+}
+
+.pnl-cell {
+  white-space: nowrap;
+}
+
+.pnl-pct {
+  font-size: 10.5px;
+  font-weight: 600;
+  opacity: 0.88;
+}
+
+.reason-cell {
+  max-inline-size: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
