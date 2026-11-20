@@ -565,6 +565,91 @@ fn funding_event_dedup_key(ev: &Value) -> (i64, String, String, String, String) 
     (time_ms, coin, usdc, hash, n_val)
 }
 
+/// Parsed top-of-book spread and 15 bps two-sided L2 depth snapshot from Hyperliquid `l2Book`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct L2BookDepthSnapshot {
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub spread_bps: f64,
+    pub bid_depth_15bps_usdc: f64,
+    pub ask_depth_15bps_usdc: f64,
+}
+
+fn parse_l2_level_f64(level: &Value, key: &str) -> Option<f64> {
+    level
+        .get(key)
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .filter(|v| v.is_finite())
+}
+
+/// Parses a Hyperliquid `l2Book` JSON response into [`L2BookDepthSnapshot`].
+///
+/// Sums `px * sz` over bid levels within 15 bps of `best_bid` (`px >= best_bid * (1.0 - 0.0015)`)
+/// and ask levels within 15 bps of `best_ask` (`px <= best_ask * (1.0 + 0.0015)`).
+pub fn parse_l2_book_depth(raw: &Value) -> Option<L2BookDepthSnapshot> {
+    let levels = raw.get("levels").and_then(Value::as_array)?;
+    if levels.len() < 2 {
+        return None;
+    }
+    let bids = levels[0].as_array()?;
+    let asks = levels[1].as_array()?;
+
+    let best_bid = bids
+        .first()
+        .and_then(|lvl| parse_l2_level_f64(lvl, "px"))
+        .filter(|&px| px > 0.0)?;
+    let best_ask = asks
+        .first()
+        .and_then(|lvl| parse_l2_level_f64(lvl, "px"))
+        .filter(|&px| px > 0.0)?;
+
+    if best_ask < best_bid {
+        return None;
+    }
+    let mid = (best_bid + best_ask) * 0.5;
+    if !mid.is_finite() || mid <= 0.0 {
+        return None;
+    }
+    let spread_bps = ((best_ask - best_bid) / mid) * 10_000.0;
+    if !spread_bps.is_finite() {
+        return None;
+    }
+
+    let bid_min_px = best_bid * (1.0 - 0.0015 - 1e-12);
+    let ask_max_px = best_ask * (1.0 + 0.0015 + 1e-12);
+
+    let mut bid_depth_15bps_usdc = 0.0;
+    for lvl in bids {
+        if let (Some(px), Some(sz)) = (parse_l2_level_f64(lvl, "px"), parse_l2_level_f64(lvl, "sz"))
+        {
+            if px > 0.0 && sz > 0.0 && px >= bid_min_px {
+                bid_depth_15bps_usdc += px * sz;
+            }
+        }
+    }
+
+    let mut ask_depth_15bps_usdc = 0.0;
+    for lvl in asks {
+        if let (Some(px), Some(sz)) = (parse_l2_level_f64(lvl, "px"), parse_l2_level_f64(lvl, "sz"))
+        {
+            if px > 0.0 && sz > 0.0 && px <= ask_max_px {
+                ask_depth_15bps_usdc += px * sz;
+            }
+        }
+    }
+
+    Some(L2BookDepthSnapshot {
+        best_bid,
+        best_ask,
+        spread_bps,
+        bid_depth_15bps_usdc,
+        ask_depth_15bps_usdc,
+    })
+}
+
 /// High-level Hyperliquid `/info` and `/exchange` client for Aegis Quant v2.0.
 #[derive(Clone)]
 pub struct HyperliquidHttpClient {
@@ -619,30 +704,21 @@ impl HyperliquidHttpClient {
         Ok(out)
     }
 
+    /// Polls `l2Book` for `coin` and returns top-of-book spread and 15 bps depth snapshot if available.
+    pub fn fetch_l2_book_depth(
+        &self,
+        coin: &str,
+        cfg: &ConfigMap,
+    ) -> Result<Option<L2BookDepthSnapshot>> {
+        let raw = self.post_info(&json!({ "type": "l2Book", "coin": coin }), cfg)?;
+        Ok(parse_l2_book_depth(&raw))
+    }
+
     /// Polls `l2Book` for `coin` and returns `(best_bid, best_ask)` if available.
     pub fn fetch_l2_book(&self, coin: &str, cfg: &ConfigMap) -> Result<Option<(f64, f64)>> {
-        let raw = self.post_info(&json!({ "type": "l2Book", "coin": coin }), cfg)?;
-        let levels = raw.get("levels").and_then(Value::as_array);
-        let Some(levels) = levels else {
-            return Ok(None);
-        };
-        if levels.len() < 2 {
-            return Ok(None);
-        }
-        let parse_top = |side_arr: &Value| -> Option<f64> {
-            let first = side_arr.as_array()?.first()?;
-            first
-                .get("px")
-                .and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-                })
-                .filter(|v| v.is_finite() && *v > 0.0)
-        };
-        match (parse_top(&levels[0]), parse_top(&levels[1])) {
-            (Some(bid), Some(ask)) if bid <= ask => Ok(Some((bid, ask))),
-            _ => Ok(None),
-        }
+        Ok(self
+            .fetch_l2_book_depth(coin, cfg)?
+            .map(|snap| (snap.best_bid, snap.best_ask)))
     }
 
     /// Polls `candleSnapshot` for `(coin, interval)` between `start_ms` and `end_ms`.
@@ -1525,6 +1601,137 @@ mod tests {
         );
         assert!(ex_502.is_none());
         assert_eq!(exchange_calls.load(Ordering::SeqCst), 1);
+
+        let _ = stop_tx.send(());
+    }
+
+    #[test]
+    fn test_parse_l2_book_depth_multi_level_boundaries_and_malformed_books() {
+        // Multi-level book: bid levels at 100.0 (0 bps), 99.90 (10 bps), 99.85 (exact 15 bps),
+        // and 99.84 (16 bps -> excluded). Ask levels at 100.10 (0 bps), 100.25 (~14.985 bps),
+        // and 100.26 (~15.984 bps -> excluded).
+        let book = json!({
+            "coin": "SOL",
+            "levels": [
+                [
+                    { "px": "100.00", "sz": "2.0", "n": 1 },
+                    { "px": "99.90", "sz": "3.0", "n": 2 },
+                    { "px": 99.85, "sz": 1.0, "n": 1 },
+                    { "px": "99.84", "sz": "50.0", "n": 4 }
+                ],
+                [
+                    { "px": "100.10", "sz": "1.5", "n": 1 },
+                    { "px": "100.25", "sz": "2.0", "n": 2 },
+                    { "px": "100.26", "sz": "100.0", "n": 5 }
+                ]
+            ]
+        });
+        let snap = parse_l2_book_depth(&book).expect("valid multi-level l2Book should parse");
+        assert!((snap.best_bid - 100.0).abs() < 1e-9);
+        assert!((snap.best_ask - 100.10).abs() < 1e-9);
+        let expected_spread_bps = ((100.10 - 100.0) / 100.05) * 10_000.0;
+        assert!((snap.spread_bps - expected_spread_bps).abs() < 1e-6);
+        let expected_bid_depth = 100.0 * 2.0 + 99.90 * 3.0 + 99.85 * 1.0;
+        let expected_ask_depth = 100.10 * 1.5 + 100.25 * 2.0;
+        assert!((snap.bid_depth_15bps_usdc - expected_bid_depth).abs() < 1e-6);
+        assert!((snap.ask_depth_15bps_usdc - expected_ask_depth).abs() < 1e-6);
+
+        // Locked book (best_bid == best_ask) is valid with 0 bps spread
+        let locked = json!({
+            "levels": [
+                [{ "px": "10.0", "sz": "5.0" }],
+                [{ "px": "10.0", "sz": "4.0" }]
+            ]
+        });
+        let locked_snap = parse_l2_book_depth(&locked).expect("locked book should parse");
+        assert!((locked_snap.spread_bps - 0.0).abs() < 1e-9);
+        assert!((locked_snap.bid_depth_15bps_usdc - 50.0).abs() < 1e-6);
+        assert!((locked_snap.ask_depth_15bps_usdc - 40.0).abs() < 1e-6);
+
+        // Wide spread book (~54 bps like kSHIB)
+        let wide = json!({
+            "levels": [
+                [{ "px": "0.009973", "sz": "50000" }],
+                [{ "px": "0.010027", "sz": "50000" }]
+            ]
+        });
+        let wide_snap = parse_l2_book_depth(&wide).expect("wide book should parse");
+        assert!((wide_snap.spread_bps - 54.0).abs() < 1e-6);
+
+        // Missing `sz` still returns valid BBO with 0.0 depth (backward compatible for fetch_l2_book)
+        let no_sz = json!({
+            "levels": [
+                [{ "px": "100.0" }],
+                [{ "px": "100.1" }]
+            ]
+        });
+        let no_sz_snap = parse_l2_book_depth(&no_sz).expect("px-only book should parse");
+        assert!((no_sz_snap.best_bid - 100.0).abs() < 1e-9);
+        assert!((no_sz_snap.best_ask - 100.1).abs() < 1e-9);
+        assert_eq!(no_sz_snap.bid_depth_15bps_usdc, 0.0);
+        assert_eq!(no_sz_snap.ask_depth_15bps_usdc, 0.0);
+
+        // Empty, one-sided, crossed, zero, or malformed books return None
+        for bad in [
+            json!({}),
+            json!({ "levels": [] }),
+            json!({ "levels": [[{"px": "100.0", "sz": "1.0"}]] }),
+            json!({ "levels": [[], [{"px": "100.0", "sz": "1.0"}]] }),
+            json!({ "levels": [[{"px": "100.0", "sz": "1.0"}], []] }),
+            json!({ "levels": [[{"px": "101.0", "sz": "1.0"}], [{"px": "100.0", "sz": "1.0"}]] }),
+            json!({ "levels": [[{"px": "0.0", "sz": "1.0"}], [{"px": "100.0", "sz": "1.0"}]] }),
+            json!({ "levels": [[{"px": "bad", "sz": "1.0"}], [{"px": "100.0", "sz": "1.0"}]] }),
+        ] {
+            assert!(
+                parse_l2_book_depth(&bad).is_none(),
+                "Expected None for malformed/empty book: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fetch_l2_book_depth_and_bbo_delegation() {
+        let (port, stop_tx) = spawn_mock_info_server(|body| {
+            let coin = body.get("coin").and_then(Value::as_str).unwrap_or("");
+            if coin == "SOL" {
+                (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": "184.20", "sz": "2.0"}, {"px": "183.50", "sz": "50.0"}],
+                            [{"px": "184.29", "sz": "3.0"}, {"px": "185.00", "sz": "50.0"}]
+                        ]
+                    }),
+                )
+            } else {
+                (200, json!({ "levels": [[], []] }))
+            }
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert(
+            "hyperliquid_testnet_url",
+            format!("http://127.0.0.1:{port}"),
+        );
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = HyperliquidHttpClient::new(5);
+        let depth = client
+            .fetch_l2_book_depth("SOL", &cfg)
+            .unwrap()
+            .expect("SOL depth snapshot");
+        assert!((depth.best_bid - 184.20).abs() < 1e-9);
+        assert!((depth.best_ask - 184.29).abs() < 1e-9);
+        assert!((depth.bid_depth_15bps_usdc - 368.40).abs() < 1e-6);
+        assert!((depth.ask_depth_15bps_usdc - 552.87).abs() < 1e-6);
+
+        let bbo = client
+            .fetch_l2_book("SOL", &cfg)
+            .unwrap()
+            .expect("SOL BBO tuple");
+        assert_eq!(bbo, (depth.best_bid, depth.best_ask));
+        assert!(client.fetch_l2_book_depth("EMPTY", &cfg).unwrap().is_none());
 
         let _ = stop_tx.send(());
     }

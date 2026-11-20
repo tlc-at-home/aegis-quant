@@ -3,6 +3,9 @@
 //! Computes `s2_trend_alignment` (`-1`, `0`, `+1`), `s2_vol_surge_ratio`, `w_s2_trend_breakout`,
 //! and detects `"LIVE_BREAKOUT_SURGE"` events.
 
+use crate::liquidity::{
+    compute_unfloored_atr, default_passes_quality, evaluate_asset_liquidity_quality,
+};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,6 +21,8 @@ pub struct TrendBreakoutMetrics {
     pub s2_vol_surge_ratio: f64,
     pub w_s2_trend_breakout: f64,
     pub event_trigger: Option<String>,
+    #[serde(default = "default_passes_quality")]
+    pub passes_quality: bool,
 }
 
 /// Computes a strictly causal Exponential Moving Average (`alpha = 2 / (span + 1)`).
@@ -161,23 +166,44 @@ pub fn compute_asset_trend_breakout(
             0
         };
 
+        let live_px = closes[n - 1];
+        let vol_floor = (100.0 / live_px.max(1e-8)).max(1.0);
         let lookback = bars.len().min(20);
         let recent_bars = &bars[bars.len() - lookback..];
-        let avg_vol =
-            recent_bars.iter().map(|b| b.volume.max(1.0)).sum::<f64>() / (lookback as f64);
+        let mut active_vol_sum = 0.0;
+        let mut active_vol_count = 0usize;
+        for b in recent_bars {
+            if b.volume.is_finite() && b.volume > 0.0 {
+                active_vol_sum += b.volume;
+                active_vol_count += 1;
+            }
+        }
+        let avg_vol = if active_vol_count > 0 {
+            (active_vol_sum / (active_vol_count as f64)).max(vol_floor)
+        } else {
+            vol_floor
+        };
         let last_vol = recent_bars
             .last()
-            .map(|b| b.volume.max(1.0))
-            .unwrap_or(avg_vol);
+            .map(|b| {
+                if b.volume.is_finite() && b.volume > 0.0 {
+                    b.volume
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
 
         let chan_len = bars.len().saturating_sub(1).clamp(4, 18);
         let prior_slice = &bars[bars.len() - 1 - chan_len..bars.len() - 1];
         let channel_high = prior_slice.iter().map(|b| b.high).fold(f64::MIN, f64::max);
         let channel_low = prior_slice.iter().map(|b| b.low).fold(f64::MAX, f64::min);
 
-        let live_px = closes[n - 1];
-        let broke_high = channel_high > 0.0 && live_px > channel_high * 1.0015;
-        let broke_low = channel_low > 0.0 && live_px < channel_low * 0.9985;
+        let raw_atr = compute_unfloored_atr(bars, 14);
+        let high_margin = (0.20 * raw_atr).max(channel_high * 0.0015);
+        let low_margin = (0.20 * raw_atr).max(channel_low * 0.0015);
+        let broke_high = channel_high > 0.0 && live_px > channel_high + high_margin;
+        let broke_low = channel_low > 0.0 && live_px < channel_low - low_margin;
 
         let mut surge_ratio = (last_vol / avg_vol.max(1e-8)).clamp(0.25, 6.0);
         if (alignment > 0 && broke_high) || (alignment < 0 && broke_low) {
@@ -245,6 +271,16 @@ pub fn evaluate_sleeve_s2(
     market_breadth_bull: f64,
     s2_budget: f64,
 ) -> HashMap<i64, TrendBreakoutMetrics> {
+    struct RawS2Item {
+        asset_id: i64,
+        symbol: String,
+        s2_trend_alignment: i32,
+        s2_vol_surge_ratio: f64,
+        confirmed_score: f64,
+        event_trigger: Option<String>,
+        passes_quality: bool,
+    }
+
     let budget = s2_budget.clamp(0.0, 1.50);
     let breadth = market_breadth_bull.clamp(0.0, 1.0);
 
@@ -258,10 +294,12 @@ pub fn evaluate_sleeve_s2(
             .get(&asset.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let quality = evaluate_asset_liquidity_quality(asset, bars);
         let (alignment, surge_ratio, raw_score, trigger) =
             compute_asset_trend_breakout(asset, bars);
 
-        let eligible = asset.is_core_eligible || (asset.is_event_eligible && trigger.is_some());
+        let eligible = quality.passes_quality
+            && (asset.is_core_eligible || (asset.is_event_eligible && trigger.is_some()));
         let confirmed_score = if eligible && alignment != 0 {
             let b_mult = if alignment > 0 {
                 bull_breadth_mult
@@ -274,19 +312,20 @@ pub fn evaluate_sleeve_s2(
         };
         let emitted_trigger = if eligible { trigger } else { None };
 
-        raw_items.push((
-            asset.id,
-            asset.symbol.clone(),
-            alignment,
-            surge_ratio,
+        raw_items.push(RawS2Item {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
+            s2_trend_alignment: alignment,
+            s2_vol_surge_ratio: surge_ratio,
             confirmed_score,
-            emitted_trigger,
-        ));
+            event_trigger: emitted_trigger,
+            passes_quality: quality.passes_quality,
+        });
     }
 
     let mut abs_scores: Vec<f64> = raw_items
         .iter()
-        .map(|x| x.4.abs())
+        .map(|x| x.confirmed_score.abs())
         .filter(|v| v.is_finite() && *v > 1e-6)
         .collect();
     abs_scores.sort_by(|a, b| b.total_cmp(a));
@@ -294,23 +333,22 @@ pub fn evaluate_sleeve_s2(
     let denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
     let mut out = HashMap::with_capacity(raw_items.len());
 
-    for (asset_id, symbol, s2_trend_alignment, s2_vol_surge_ratio, score, event_trigger) in
-        raw_items
-    {
+    for item in raw_items {
         let w_s2 = if top_abs_sum > 1e-8 {
-            round_dp((score / denom) * budget, 4)
+            round_dp((item.confirmed_score / denom) * budget, 4)
         } else {
             0.0
         };
         out.insert(
-            asset_id,
+            item.asset_id,
             TrendBreakoutMetrics {
-                asset_id,
-                symbol,
-                s2_trend_alignment,
-                s2_vol_surge_ratio,
+                asset_id: item.asset_id,
+                symbol: item.symbol,
+                s2_trend_alignment: item.s2_trend_alignment,
+                s2_vol_surge_ratio: item.s2_vol_surge_ratio,
                 w_s2_trend_breakout: w_s2,
-                event_trigger,
+                event_trigger: item.event_trigger,
+                passes_quality: item.passes_quality,
             },
         );
     }
@@ -501,5 +539,100 @@ mod tests {
         let out_tiny = compute_asset_trend_breakout(&asset_tiny_diff, &bars);
         assert_eq!(out_exact.0, out_tiny.0);
         assert!((out_exact.2 - out_tiny.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_s2_blocks_fake_volume_surge_single_tick_bounce_and_dead_books() {
+        // 1. 19 empty bars + 1 tiny print ($8 notional on $0.008 coin) must NOT max surge_ratio to 6.0
+        let mut sparse_bars = Vec::with_capacity(20);
+        let mut px = 0.008;
+        for i in 0..20 {
+            if i == 19 {
+                px *= 1.0005;
+            }
+            sparse_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 10,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: 0.008,
+                high: px,
+                low: 0.008,
+                close: px,
+                volume: if i == 19 { 1_000.0 } else { 0.0 },
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mut sparse_asset = test_asset(10, px);
+        sparse_asset.tick_size = 0.000001;
+        sparse_asset.day_volume_usdc = 5_000.0;
+        let (_align, surge, _score, trig) =
+            compute_asset_trend_breakout(&sparse_asset, &sparse_bars);
+        assert!(
+            surge <= 1.0,
+            "19 empty bars + $8 print must not produce fake surge (got {surge})"
+        );
+        assert_eq!(trig, None);
+
+        let mut map = HashMap::new();
+        map.insert(10, sparse_bars);
+        let s2_sparse = evaluate_sleeve_s2(&[sparse_asset], &map, 0.7, 0.40);
+        assert!(!s2_sparse[&10].passes_quality);
+        assert_eq!(s2_sparse[&10].w_s2_trend_breakout, 0.0);
+        assert_eq!(s2_sparse[&10].event_trigger, None);
+
+        // 2. Breakout requires clearing channel_high + (0.20 * raw_atr).max(channel_high * 0.0015):
+        //    a tiny 0.2% poke above channel_high when raw_atr is ~2.0% must NOT fire LIVE_BREAKOUT_SURGE,
+        //    whereas clearing channel_high + 0.25 * raw_atr DOES fire LIVE_BREAKOUT_SURGE.
+        let mut trend_bars = Vec::with_capacity(20);
+        let mut p = 100.0;
+        for i in 0..20 {
+            let open = p;
+            p *= 1.006;
+            trend_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 11,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open,
+                high: p * 1.008,
+                low: open * 0.992,
+                close: p,
+                volume: 10_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let chan_high = trend_bars[1..19]
+            .iter()
+            .map(|b| b.high)
+            .fold(f64::MIN, f64::max);
+        let raw_atr = compute_unfloored_atr(&trend_bars, 14);
+        assert!(raw_atr > chan_high * 0.015);
+
+        // Tiny poke: > chan_high * 1.0015, but < chan_high + 0.20 * raw_atr (and normal 1.0x volume)
+        let small_poke_px = chan_high * 1.002;
+        assert!(small_poke_px < chan_high + 0.20 * raw_atr);
+        let poke_asset = test_asset(11, small_poke_px);
+        let (a_poke, s_poke, _sc_poke, trig_poke) =
+            compute_asset_trend_breakout(&poke_asset, &trend_bars);
+        assert_eq!(a_poke, 1);
+        assert!(s_poke < 1.75);
+        assert_eq!(
+            trig_poke, None,
+            "Sub-0.20*ATR poke must not fire LIVE_BREAKOUT_SURGE"
+        );
+
+        // Real follow-through clearing chan_high + 0.30 * raw_atr fires LIVE_BREAKOUT_SURGE
+        let real_break_px = chan_high + 0.30 * raw_atr;
+        let break_asset = test_asset(11, real_break_px);
+        let (a_brk, s_brk, _sc_brk, trig_brk) =
+            compute_asset_trend_breakout(&break_asset, &trend_bars);
+        assert_eq!(a_brk, 1);
+        assert!(s_brk >= 1.85);
+        assert_eq!(trig_brk.as_deref(), Some(TRIGGER_LIVE_BREAKOUT_SURGE));
     }
 }

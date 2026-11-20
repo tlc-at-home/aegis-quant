@@ -17,12 +17,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Canonical majors always treated as Core/Event eligible on Testnet when volume data is sparse.
-const CANONICAL_CORE_MAJORS: &[&str] = &[
-    "BTC", "ETH", "SOL", "HYPE", "SUI", "AVAX", "LINK", "DOGE", "XRP", "ADA", "BNB", "ARB", "OP",
-    "INJ", "TIA", "NEAR", "AAVE", "TAO", "RENDER", "JUP", "WIF", "PENDLE", "LTC", "DOT", "ATOM",
-];
-
 /// Summary of a single 3-second full-exchange scanner tick.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MarketScanReport {
@@ -55,17 +49,17 @@ impl MarketWatcher {
 
     /// Executes a single 3-second full-exchange scan:
     /// 1. Polls Hyperliquid `metaAndAssetCtxs` + `allMids` (or uses fallback seed if offline & DB empty).
-    /// 2. Normalizes symbols to `"<COIN>-USDC"` and ranks by 24h volume to assign `is_core_eligible` / `is_event_eligible`.
+    /// 2. Normalizes symbols to `"<COIN>-USDC"` and applies 24h volume + open-interest liquidity floors to assign `is_core_eligible` / `is_event_eligible`.
     /// 3. Upserts all assets into MariaDB `exchange_assets`.
     /// 4. Expires finished cooldowns in `asset_cooldowns`.
-    /// 5. Incrementally refreshes 1h and 4h OHLCV bars for core/priority assets.
+    /// 5. Incrementally refreshes 1h and 4h OHLCV bars for core/event/priority and active held/ordered assets.
     pub fn run_3s_exchange_scan(&self) -> Result<MarketScanReport> {
         let cfg = self.db.load_config_or_default();
         let ts = now_ms();
 
         let expired_cooldowns = self.db.expire_finished_cooldowns().unwrap_or(0);
 
-        let (raw_inputs, live_connected) = match self.fetch_live_asset_inputs(&cfg) {
+        let (mut raw_inputs, live_connected) = match self.fetch_live_asset_inputs(&cfg) {
             Some(list) if !list.is_empty() => (list, true),
             _ => {
                 let existing = self.db.list_exchange_assets().unwrap_or_default();
@@ -77,20 +71,28 @@ impl MarketWatcher {
             }
         };
 
-        let active_asset_ids: HashSet<i64> = self
-            .db
-            .get_assets_held()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|h| h.asset_id)
-            .chain(
-                self.db
-                    .get_assets_ordered()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|o| o.asset_id),
-            )
-            .collect();
+        let mut active_asset_ids: HashSet<i64> = HashSet::new();
+        let mut active_symbols: HashSet<String> = HashSet::new();
+        for h in self.db.get_assets_held().unwrap_or_default() {
+            active_asset_ids.insert(h.asset_id);
+            active_symbols.insert(h.symbol);
+        }
+        for o in self.db.get_assets_ordered().unwrap_or_default() {
+            active_asset_ids.insert(o.asset_id);
+            active_symbols.insert(o.symbol);
+        }
+
+        // Preserve 1s priority surveillance on any currently held or working-order symbol even if
+        // its live 24h volume/OI dips below Core/Event eligibility floors.
+        if !active_symbols.is_empty() {
+            for input in &mut raw_inputs {
+                if let Ok((sym, _)) = normalize_hyperliquid_symbol(&input.raw_symbol_or_coin) {
+                    if active_symbols.contains(&sym) {
+                        input.is_priority_watched = true;
+                    }
+                }
+            }
+        }
 
         let mut total_upserted = 0usize;
         let mut core_count = 0usize;
@@ -189,13 +191,22 @@ impl MarketWatcher {
     /// Parses live `metaAndAssetCtxs` + `allMids` from Hyperliquid into normalized [`AssetUpsertInput`] records.
     pub fn fetch_live_asset_inputs(&self, cfg: &ConfigMap) -> Option<Vec<AssetUpsertInput>> {
         let meta_ctxs = self.http.fetch_meta_and_asset_ctxs(cfg).ok()?;
+        let mids = self.http.fetch_all_mids(cfg).unwrap_or_default();
+        Self::parse_live_asset_inputs(&meta_ctxs, &mids, cfg)
+    }
+
+    /// Pure parser and 24h volume + open-interest liquidity gate for Hyperliquid `metaAndAssetCtxs` + `allMids`.
+    pub fn parse_live_asset_inputs(
+        meta_ctxs: &Value,
+        mids: &HashMap<String, f64>,
+        cfg: &ConfigMap,
+    ) -> Option<Vec<AssetUpsertInput>> {
         let arr = meta_ctxs.as_array()?;
         if arr.len() < 2 {
             return None;
         }
         let universe = arr[0].get("universe")?.as_array()?;
         let ctxs = arr[1].as_array()?;
-        let mids = self.http.fetch_all_mids(cfg).unwrap_or_default();
 
         let parse_f64 = |v: Option<&Value>| -> f64 {
             v.and_then(|x| {
@@ -302,50 +313,44 @@ impl MarketWatcher {
             return None;
         }
 
-        // Rank by 24h USDC volume descending to determine top-volume eligibility tiers
-        let mut vols: Vec<(String, f64)> = parsed
-            .iter()
-            .map(|p| (p.coin.clone(), p.day_volume_usdc))
-            .collect();
-        vols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let top_core_coins: HashSet<String> =
-            vols.iter().take(30).map(|(c, _)| c.clone()).collect();
-        let top_event_coins: HashSet<String> =
-            vols.iter().take(65).map(|(c, _)| c.clone()).collect();
-
         let is_testnet = is_testnet_configured(cfg);
         let core_min_vol = if is_testnet {
             cfg.get_f64("core_min_day_volume_usdc", 2_000_000.0)
-                .min(1_000.0)
+                .min(5_000.0)
         } else {
             cfg.get_f64("core_min_day_volume_usdc", 2_000_000.0)
         };
         let event_min_vol = if is_testnet {
             cfg.get_f64("event_min_day_volume_usdc", 500_000.0)
-                .min(250.0)
+                .min(2_500.0)
         } else {
             cfg.get_f64("event_min_day_volume_usdc", 500_000.0)
+        };
+        let (core_min_oi, event_min_oi) = if is_testnet {
+            (10_000.0, 5_000.0)
+        } else {
+            (250_000.0, 100_000.0)
         };
 
         let mut inputs = Vec::with_capacity(parsed.len());
         for p in parsed {
             let lot_step_size = 10_f64.powi(-(p.sz_decimals as i32)).max(1e-6);
             let tick_size = infer_tick_size(p.mark_price, p.sz_decimals);
-            let is_major = CANONICAL_CORE_MAJORS.contains(&p.coin.as_str());
-            let is_core = p.day_volume_usdc >= core_min_vol
-                || top_core_coins.contains(&p.coin)
-                || (is_testnet && is_major);
-            let is_event =
-                is_core || p.day_volume_usdc >= event_min_vol || top_event_coins.contains(&p.coin);
+            let passes_core_liquidity =
+                p.day_volume_usdc >= core_min_vol && p.open_interest_usdc >= core_min_oi;
+            let passes_event_liquidity =
+                p.day_volume_usdc >= event_min_vol && p.open_interest_usdc >= event_min_oi;
+            let is_core = passes_core_liquidity;
+            let is_event = is_core || passes_event_liquidity;
 
-            // Flag extreme funding dislocation or >8% intraday move for 1s priority surveillance
+            // Flag extreme funding dislocation or >8% intraday move on liquid assets for 1s priority surveillance
             let day_change_pct = if p.prev_day_price > 0.0 {
                 ((p.mark_price - p.prev_day_price) / p.prev_day_price).abs()
             } else {
                 0.0
             };
-            let is_prio = p.funding_rate_hourly.abs() >= 0.0004 || day_change_pct >= 0.08;
+            let is_prio =
+                is_event && (p.funding_rate_hourly.abs() >= 0.0004 || day_change_pct >= 0.08);
 
             inputs.push(AssetUpsertInput {
                 raw_symbol_or_coin: p.coin,
@@ -370,7 +375,8 @@ impl MarketWatcher {
         Some(inputs)
     }
 
-    /// Refreshes 1h and 4h OHLCV bars for up to `max_assets_per_tick` core/event/priority eligible assets.
+    /// Refreshes 1h and 4h OHLCV bars for up to `max_assets_per_tick` core/event/priority eligible
+    /// or currently held/ordered assets.
     /// When `seed_all_eligible` is needed at cutover, pass a large `max_assets_per_tick` (e.g. `40`).
     pub fn refresh_bars_for_eligible_assets(
         &self,
@@ -386,13 +392,38 @@ impl MarketWatcher {
         let now = now_ms();
         let refresh_ttl_ms = 60_000i64; // 60s bar refresh cadence per asset
 
+        let active_asset_ids: HashSet<i64> = self
+            .db
+            .get_assets_held()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.asset_id)
+            .chain(
+                self.db
+                    .get_assets_ordered()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|o| o.asset_id),
+            )
+            .collect();
+
         let mut candidates: Vec<ExchangeAsset> = assets
             .into_iter()
-            .filter(|a| a.is_core_eligible || a.is_priority_watched || a.is_event_eligible)
+            .filter(|a| {
+                a.is_core_eligible
+                    || a.is_priority_watched
+                    || a.is_event_eligible
+                    || active_asset_ids.contains(&a.id)
+            })
             .collect();
         {
             let guard = self.last_bar_sync_ms.lock();
-            candidates.sort_by_key(|a| guard.get(&(a.id, "1h".to_string())).copied().unwrap_or(0));
+            candidates.sort_by_key(|a| {
+                (
+                    !active_asset_ids.contains(&a.id),
+                    guard.get(&(a.id, "1h".to_string())).copied().unwrap_or(0),
+                )
+            });
         }
 
         let mut refreshed_assets = 0usize;
@@ -842,5 +873,247 @@ impl MarketWatcher {
                 },
             )
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_core::OrderSide;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn build_meta_and_ctxs(rows: &[(&str, f64, f64, f64, f64, f64)]) -> Value {
+        let mut universe = Vec::with_capacity(rows.len());
+        let mut ctxs = Vec::with_capacity(rows.len());
+        for (name, mark_px, prev_day_px, funding, day_vol_usdc, oi_usdc) in rows {
+            let oi_coins = if *mark_px > 0.0 {
+                oi_usdc / mark_px
+            } else {
+                0.0
+            };
+            universe.push(json!({
+                "name": name,
+                "szDecimals": 2,
+                "maxLeverage": 20,
+            }));
+            ctxs.push(json!({
+                "markPx": format!("{mark_px}"),
+                "midPx": format!("{mark_px}"),
+                "oraclePx": format!("{mark_px}"),
+                "prevDayPx": format!("{prev_day_px}"),
+                "funding": format!("{funding}"),
+                "dayNtlVlm": format!("{day_vol_usdc}"),
+                "openInterest": format!("{oi_coins}"),
+            }));
+        }
+        json!([{ "universe": universe }, ctxs])
+    }
+
+    #[test]
+    fn test_testnet_liquidity_and_oi_eligibility_gating() {
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("core_min_day_volume_usdc", "2000000.0");
+        cfg.insert("event_min_day_volume_usdc", "500000.0");
+
+        let payload = build_meta_and_ctxs(&[
+            // Dead Testnet majors must NEVER be eligible despite former major/top-rank bypasses
+            ("WIF", 2.24, 2.00, 0.0005, 79.0, 100_000.0),
+            ("kSHIB", 0.02, 0.02, 0.00001, 1_750.0, 120_000.0),
+            // Active Testnet coins meeting >= $5k vol & >= $10k OI
+            ("BTC", 90_000.0, 89_000.0, 0.00001, 250_000.0, 1_000_000.0),
+            ("ARB", 1.0, 1.0, 0.00001, 5_000.0, 10_000.0),
+            ("INJ", 27.5, 25.0, 0.00002, 12_000.0, 25_000.0),
+            // Event-only band ($2.5k..$5k vol, $5k..$10k OI)
+            ("EVONLY", 10.0, 10.0, 0.00001, 3_200.0, 6_000.0),
+            // High volume but OI below Testnet $5k floor -> rejected
+            ("LOWOI", 10.0, 10.0, 0.00001, 80_000.0, 4_500.0),
+            // Core volume but OI in [$5k, $10k) -> Event-only, not Core
+            ("MIDOI", 10.0, 10.0, 0.00001, 80_000.0, 8_000.0),
+        ]);
+
+        let parsed = MarketWatcher::parse_live_asset_inputs(&payload, &HashMap::new(), &cfg)
+            .expect("parsed testnet inputs");
+        let by_coin: HashMap<&str, &AssetUpsertInput> = parsed
+            .iter()
+            .map(|a| (a.raw_symbol_or_coin.as_str(), a))
+            .collect();
+
+        assert!(!by_coin["WIF"].is_core_eligible);
+        assert!(!by_coin["WIF"].is_event_eligible);
+        assert!(!by_coin["WIF"].is_priority_watched);
+
+        assert!(!by_coin["kSHIB"].is_core_eligible);
+        assert!(!by_coin["kSHIB"].is_event_eligible);
+
+        assert!(by_coin["BTC"].is_core_eligible);
+        assert!(by_coin["BTC"].is_event_eligible);
+
+        assert!(by_coin["ARB"].is_core_eligible);
+        assert!(by_coin["ARB"].is_event_eligible);
+
+        assert!(by_coin["INJ"].is_core_eligible);
+        assert!(by_coin["INJ"].is_event_eligible);
+        assert!(by_coin["INJ"].is_priority_watched);
+
+        assert!(!by_coin["EVONLY"].is_core_eligible);
+        assert!(by_coin["EVONLY"].is_event_eligible);
+
+        assert!(!by_coin["LOWOI"].is_core_eligible);
+        assert!(!by_coin["LOWOI"].is_event_eligible);
+
+        assert!(!by_coin["MIDOI"].is_core_eligible);
+        assert!(by_coin["MIDOI"].is_event_eligible);
+
+        // Verify all 45 active Testnet coins meeting >= $5k vol & >= $10k OI remain Core-eligible
+        let active_names: Vec<String> = (0..45).map(|i| format!("ACT{i}")).collect();
+        let active_rows: Vec<(&str, f64, f64, f64, f64, f64)> = active_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.as_str(),
+                    10.0,
+                    10.0,
+                    0.0,
+                    5_000.0 + (i as f64) * 500.0,
+                    12_000.0,
+                )
+            })
+            .collect();
+        let bulk_payload = build_meta_and_ctxs(&active_rows);
+        let bulk = MarketWatcher::parse_live_asset_inputs(&bulk_payload, &HashMap::new(), &cfg)
+            .expect("parsed bulk testnet inputs");
+        assert_eq!(bulk.iter().filter(|a| a.is_core_eligible).count(), 45);
+    }
+
+    #[test]
+    fn test_mainnet_liquidity_and_oi_eligibility_gating() {
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "LIVE");
+        cfg.insert("core_min_day_volume_usdc", "2000000.0");
+        cfg.insert("event_min_day_volume_usdc", "500000.0");
+
+        let payload = build_meta_and_ctxs(&[
+            (
+                "BTC",
+                90_000.0,
+                89_000.0,
+                0.00001,
+                500_000_000.0,
+                200_000_000.0,
+            ),
+            ("ARB", 1.0, 1.0, 0.00001, 2_000_000.0, 250_000.0),
+            ("INJ", 25.0, 25.0, 0.00001, 1_200_000.0, 150_000.0),
+            // High volume, OI below Mainnet $100k Event floor -> rejected
+            ("LOWOIMAIN", 5.0, 5.0, 0.00001, 5_000_000.0, 99_000.0),
+            // Core volume, OI in [$100k, $250k) -> Event-only
+            ("MIDMAIN", 5.0, 5.0, 0.00001, 3_000_000.0, 150_000.0),
+            // Testnet-grade volume/OI must NOT qualify on Mainnet even in a tiny universe
+            ("THINMAIN", 2.0, 2.0, 0.00001, 50_000.0, 50_000.0),
+        ]);
+
+        let parsed = MarketWatcher::parse_live_asset_inputs(&payload, &HashMap::new(), &cfg)
+            .expect("parsed mainnet inputs");
+        let by_coin: HashMap<&str, &AssetUpsertInput> = parsed
+            .iter()
+            .map(|a| (a.raw_symbol_or_coin.as_str(), a))
+            .collect();
+
+        assert!(by_coin["BTC"].is_core_eligible);
+        assert!(by_coin["BTC"].is_event_eligible);
+
+        assert!(by_coin["ARB"].is_core_eligible);
+        assert!(by_coin["ARB"].is_event_eligible);
+
+        assert!(!by_coin["INJ"].is_core_eligible);
+        assert!(by_coin["INJ"].is_event_eligible);
+
+        assert!(!by_coin["LOWOIMAIN"].is_core_eligible);
+        assert!(!by_coin["LOWOIMAIN"].is_event_eligible);
+
+        assert!(!by_coin["MIDMAIN"].is_core_eligible);
+        assert!(by_coin["MIDMAIN"].is_event_eligible);
+
+        assert!(!by_coin["THINMAIN"].is_core_eligible);
+        assert!(!by_coin["THINMAIN"].is_event_eligible);
+    }
+
+    #[test]
+    fn test_refresh_bars_preserves_active_held_ineligible_position() {
+        let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        db.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        let watcher = MarketWatcher::new(db.clone(), HyperliquidHttpClient::new(5));
+
+        // Insert two assets that have fallen below Core/Event eligibility and are not priority-watched
+        let met_id = db
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "MET".to_string(),
+                asset_index: 42,
+                sz_decimals: 1,
+                tick_size: 0.001,
+                lot_step_size: 0.1,
+                max_leverage: 10.0,
+                mark_price: 1.25,
+                mid_price: 1.25,
+                oracle_price: 1.25,
+                funding_rate_hourly: 0.0,
+                day_volume_usdc: 800.0,
+                open_interest_usdc: 2_000.0,
+                prev_day_price: 1.24,
+                is_core_eligible: false,
+                is_event_eligible: false,
+                is_priority_watched: false,
+            })
+            .unwrap();
+        let wif_id = db
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "WIF".to_string(),
+                asset_index: 43,
+                sz_decimals: 0,
+                tick_size: 0.001,
+                lot_step_size: 1.0,
+                max_leverage: 10.0,
+                mark_price: 2.0,
+                mid_price: 2.0,
+                oracle_price: 2.0,
+                funding_rate_hourly: 0.0,
+                day_volume_usdc: 79.0,
+                open_interest_usdc: 100_000.0,
+                prev_day_price: 2.0,
+                is_core_eligible: false,
+                is_event_eligible: false,
+                is_priority_watched: false,
+            })
+            .unwrap();
+
+        // Hold an open position on MET so protective stops/closes still require fresh ATR bars
+        db.sync_open_position_from_exchange_v2(
+            met_id,
+            "MET",
+            OrderSide::Long,
+            1.20,
+            1.25,
+            50.0,
+            62.5,
+            0.0,
+            0.06,
+            1.15,
+            1.35,
+            0.0,
+            Some(now_ms() - 600_000),
+        )
+        .unwrap();
+
+        let cfg = db.load_config_or_default();
+        let refreshed = watcher
+            .refresh_bars_for_eligible_assets(4, 48, false, &cfg)
+            .unwrap();
+        assert_eq!(refreshed, 1);
+        assert!(db.get_ohlcv_bars(met_id, "1h", 72).unwrap().len() >= 24);
+        assert!(db.get_ohlcv_bars(met_id, "4h", 72).unwrap().len() >= 24);
+        assert!(db.get_ohlcv_bars(wif_id, "1h", 72).unwrap().is_empty());
     }
 }

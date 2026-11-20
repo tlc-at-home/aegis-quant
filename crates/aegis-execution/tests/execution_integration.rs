@@ -2507,3 +2507,313 @@ fn test_l2book_passive_clamp_and_bad_alo_rejection_recovery_to_fill() {
 
     let _ = stop_tx.send(());
 }
+
+#[test]
+fn test_rebalance_skips_wide_spread_and_thin_l2_books_to_place_liquid_candidate() {
+    use std::collections::HashMap;
+
+    let books_by_coin: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+    let books_srv = books_by_coin.clone();
+    let l2_requested_coins: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l2_req_srv = l2_requested_coins.clone();
+    let submitted_asset_indices: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let submitted_srv = submitted_asset_indices.clone();
+    let next_oid: Arc<Mutex<u64>> = Arc::new(Mutex::new(81_000));
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "l2Book" {
+                let coin = body
+                    .get("coin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                l2_req_srv.lock().push(coin.clone());
+                let resp = books_srv
+                    .lock()
+                    .get(&coin)
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "levels": [[], []] }));
+                return (200, resp);
+            }
+            if typ == "clearinghouseState" {
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "1000.0" },
+                        "assetPositions": []
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "order" {
+            let a_idx = body
+                .pointer("/action/orders/0/a")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            submitted_srv.lock().push(a_idx);
+            let mut oid_guard = next_oid.lock();
+            *oid_guard += 1;
+            let oid = *oid_guard;
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": { "statuses": [{ "resting": { "oid": oid } }] }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    // Seed kSHIB (wide spread) plus extra assets to test the 6-candidate L2 cap
+    for (coin, idx, sz_dec, tick, lot, px) in [
+        ("kSHIB", 7u32, 0u32, 1e-6, 1.0, 0.01000),
+        ("OP", 8u32, 1u32, 0.0001, 0.1, 1.50),
+        ("INJ", 9u32, 1u32, 0.001, 0.1, 20.0),
+    ] {
+        db.upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: coin.to_string(),
+            asset_index: idx,
+            sz_decimals: sz_dec,
+            tick_size: tick,
+            lot_step_size: lot,
+            max_leverage: 10.0,
+            mark_price: px,
+            mid_price: px,
+            oracle_price: px,
+            funding_rate_hourly: 0.00001,
+            day_volume_usdc: 15_000_000.0,
+            open_interest_usdc: 5_000_000.0,
+            prev_day_price: px * 0.98,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+    }
+
+    configure_testnet_mock(&db, port);
+    db.set_config_value("live_exchange_equity_usdc", "1000.0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+    db.set_config_value("max_entry_spread_bps", "20.0", None)
+        .unwrap();
+
+    let kshib = db.get_asset_by_symbol("kSHIB-USDC").unwrap().unwrap();
+    let avax = db.get_asset_by_symbol("AVAX-USDC").unwrap().unwrap();
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let link = db.get_asset_by_symbol("LINK-USDC").unwrap().unwrap();
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    let sui = db.get_asset_by_symbol("SUI-USDC").unwrap().unwrap();
+    let op = db.get_asset_by_symbol("OP-USDC").unwrap().unwrap();
+    let inj = db.get_asset_by_symbol("INJ-USDC").unwrap().unwrap();
+
+    // Scenario 1:
+    // - #1 kSHIB has wide 54 bps spread (> 20 bps) -> MUST be skipped
+    // - #2 AVAX has tight 5 bps spread & deep bids ($700), but thin one-sided ask ($17.50 < $25 within 15 bps;
+    //      decoy ask at $35.15 is ~40 bps away so ignored) -> MUST be skipped
+    // - #3 SOL has tight ~5 bps spread and ~$550 depth on BOTH sides within 15 bps -> MUST be placed in same cycle!
+    {
+        let mut books = books_by_coin.lock();
+        books.insert(
+            "kSHIB".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "0.009973", "sz": "50000"}],
+                    [{"px": "0.010027", "sz": "50000"}]
+                ]
+            }),
+        );
+        books.insert(
+            "AVAX".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "34.99125", "sz": "20.0"}],
+                    [
+                        {"px": "35.00875", "sz": "0.5"},
+                        {"px": "35.15000", "sz": "100.0"}
+                    ]
+                ]
+            }),
+        );
+        books.insert(
+            "SOL".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "184.20", "sz": "2.0"}, {"px": "184.05", "sz": "1.0"}],
+                    [{"px": "184.29", "sz": "2.0"}, {"px": "184.45", "sz": "1.0"}]
+                ]
+            }),
+        );
+    }
+
+    let sig_s1 = make_signal_output(vec![
+        make_signal_input(&kshib, 0.28, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&avax, 0.24, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&sol, 0.20, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb1 = engine.execute_signal_rebalance(&sig_s1, 1000.0).unwrap();
+    assert_eq!(reb1.working_orders_placed, 1);
+
+    let ordered1 = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered1.len(), 1);
+    assert_eq!(ordered1[0].symbol, "SOL-USDC");
+    assert_eq!(
+        *submitted_asset_indices.lock(),
+        vec![sol.asset_index as u64]
+    );
+    {
+        let reqs = l2_requested_coins.lock();
+        assert!(reqs.len() >= 3);
+        assert_eq!(reqs[0], "kSHIB");
+        assert_eq!(reqs[1], "AVAX");
+        assert_eq!(reqs[2], "SOL");
+    }
+
+    // Cleanup Scenario 1 order
+    engine
+        .close_or_cancel_position(reb1.placed_position_ids[0], "TEST_CLEANUP", Some(0))
+        .unwrap();
+    l2_requested_coins.lock().clear();
+    submitted_asset_indices.lock().clear();
+
+    // Scenario 2:
+    // - #1 LINK has 28 bps spread (rejected under tighter 20 bps cap, would have passed old 45 bps cap)
+    // - #2 ARB has an empty L2 book (`Ok(None)`) -> skipped safely
+    // - #3 SUI has tight ~5 bps spread and $500+ depth each side -> placed in same cycle
+    {
+        let mut books = books_by_coin.lock();
+        books.insert(
+            "LINK".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "18.474", "sz": "30.0"}],
+                    [{"px": "18.526", "sz": "30.0"}]
+                ]
+            }),
+        );
+        books.insert("ARB".to_string(), json!({ "levels": [[], []] }));
+        books.insert(
+            "SUI".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "3.4191", "sz": "160.0"}],
+                    [{"px": "3.4209", "sz": "160.0"}]
+                ]
+            }),
+        );
+    }
+
+    let sig_s2 = make_signal_output(vec![
+        make_signal_input(&link, 0.27, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&arb, 0.24, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&sui, 0.20, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb2 = engine.execute_signal_rebalance(&sig_s2, 1000.0).unwrap();
+    assert_eq!(reb2.working_orders_placed, 1);
+    let ordered2 = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered2.len(), 1);
+    assert_eq!(ordered2[0].symbol, "SUI-USDC");
+    assert_eq!(
+        *submitted_asset_indices.lock(),
+        vec![sui.asset_index as u64]
+    );
+
+    engine
+        .close_or_cancel_position(reb2.placed_position_ids[0], "TEST_CLEANUP", Some(0))
+        .unwrap();
+    l2_requested_coins.lock().clear();
+    submitted_asset_indices.lock().clear();
+
+    // Scenario 3: Cap L2 depth fetches per rebalance cycle at 6 so HL /info is never spammed
+    {
+        let mut books = books_by_coin.lock();
+        books.insert(
+            "OP".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "1.495", "sz": "400.0"}],
+                    [{"px": "1.505", "sz": "400.0"}]
+                ]
+            }),
+        );
+        books.insert(
+            "INJ".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "19.90", "sz": "30.0"}],
+                    [{"px": "20.10", "sz": "30.0"}]
+                ]
+            }),
+        );
+        // Make SUI & SOL wide too for ranks #5/#6, then leave BTC/ETH liquid at ranks #7/#8 (past cap=6)
+        books.insert(
+            "SUI".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "3.4000", "sz": "200.0"}],
+                    [{"px": "3.4400", "sz": "200.0"}]
+                ]
+            }),
+        );
+        books.insert(
+            "BTC".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "94990.0", "sz": "1.0"}],
+                    [{"px": "95010.0", "sz": "1.0"}]
+                ]
+            }),
+        );
+        books.insert(
+            "ETH".to_string(),
+            json!({
+                "levels": [
+                    [{"px": "3399.5", "sz": "1.0"}],
+                    [{"px": "3400.5", "sz": "1.0"}]
+                ]
+            }),
+        );
+    }
+    let btc = db.get_asset_by_symbol("BTC-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+
+    let sig_s3 = make_signal_output(vec![
+        make_signal_input(&kshib, 0.29, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&avax, 0.28, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&link, 0.27, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&arb, 0.26, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&op, 0.25, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&inj, 0.24, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&btc, 0.23, 0.0, ACTION_OPEN_LONG),
+        make_signal_input(&eth, 0.22, 0.0, ACTION_OPEN_LONG),
+    ]);
+    let reb3 = engine.execute_signal_rebalance(&sig_s3, 1000.0).unwrap();
+    assert_eq!(reb3.working_orders_placed, 0);
+    assert_eq!(
+        l2_requested_coins.lock().len(),
+        6,
+        "Per-rebalance L2 depth check cap must stop after 6 candidates"
+    );
+    assert!(submitted_asset_indices.lock().is_empty());
+
+    let _ = stop_tx.send(());
+}

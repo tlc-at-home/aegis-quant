@@ -3,6 +3,9 @@
 //! Computes `s3_funding_zscore`, `s3_flush_atr_mult`, `w_s3_event_reversion`,
 //! and detects `"CAPITULATION_FLUSH"` and `"FUNDING_SQUEEZE"` triggers.
 
+use crate::liquidity::{
+    default_passes_quality, evaluate_asset_liquidity_quality, AssetLiquidityQuality,
+};
 use crate::trend_breakout::{causal_ema, compute_rsi_and_range_position};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,8 @@ pub struct EventReversionMetrics {
     pub s3_flush_atr_mult: f64,
     pub w_s3_event_reversion: f64,
     pub event_trigger: Option<String>,
+    #[serde(default = "default_passes_quality")]
+    pub passes_quality: bool,
 }
 
 /// Computes Average True Range (ATR) over `period` bars with a safe price-percentage floor.
@@ -79,16 +84,36 @@ pub fn evaluate_sleeve_s3(
     bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
     s3_budget: f64,
 ) -> HashMap<i64, EventReversionMetrics> {
+    struct RawS3Item {
+        asset_id: i64,
+        symbol: String,
+        s3_funding_zscore: f64,
+        s3_flush_atr_mult: f64,
+        raw_score: f64,
+        event_trigger: Option<String>,
+        passes_quality: bool,
+    }
+
     let budget = s3_budget.clamp(0.0, 1.50);
     if assets.is_empty() {
         return HashMap::new();
     }
 
-    // Cross-sectional funding rate distribution over eligible assets only
+    let qualities: HashMap<i64, AssetLiquidityQuality> = assets
+        .iter()
+        .map(|a| {
+            let bars = bars_by_asset.get(&a.id).map(Vec::as_slice).unwrap_or(&[]);
+            (a.id, evaluate_asset_liquidity_quality(a, bars))
+        })
+        .collect();
+
+    // Cross-sectional funding rate distribution over quality-passing eligible assets only
     let eligible_fundings: Vec<f64> = assets
         .iter()
         .filter(|a| {
-            (a.is_core_eligible || a.is_event_eligible) && a.funding_rate_hourly.is_finite()
+            (a.is_core_eligible || a.is_event_eligible)
+                && qualities.get(&a.id).is_some_and(|q| q.passes_quality)
+                && a.funding_rate_hourly.is_finite()
         })
         .map(|a| a.funding_rate_hourly)
         .collect();
@@ -115,6 +140,10 @@ pub fn evaluate_sleeve_s3(
             .get(&asset.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let quality = qualities
+            .get(&asset.id)
+            .copied()
+            .unwrap_or_else(|| evaluate_asset_liquidity_quality(asset, bars));
         let funding = if asset.funding_rate_hourly.is_finite() {
             asset.funding_rate_hourly
         } else {
@@ -133,7 +162,8 @@ pub fn evaluate_sleeve_s3(
             (50.0, 0.5, false)
         };
 
-        let eligible = asset.is_event_eligible || asset.is_core_eligible;
+        let eligible =
+            (asset.is_event_eligible || asset.is_core_eligible) && quality.passes_quality;
         let is_capitulation = flush_atr <= -2.0 || (flush_atr >= 2.0 && range_pos > 0.55);
         let is_funding_squeeze =
             f_zscore <= -1.8 || (f_zscore >= 1.8 && flush_atr > 0.25 && range_pos > 0.35);
@@ -180,19 +210,20 @@ pub fn evaluate_sleeve_s3(
             0.0
         };
 
-        raw_items.push((
-            asset.id,
-            asset.symbol.clone(),
-            f_zscore,
-            flush_atr,
+        raw_items.push(RawS3Item {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
+            s3_funding_zscore: f_zscore,
+            s3_flush_atr_mult: flush_atr,
             raw_score,
-            trigger,
-        ));
+            event_trigger: trigger,
+            passes_quality: quality.passes_quality,
+        });
     }
 
     let mut abs_scores: Vec<f64> = raw_items
         .iter()
-        .map(|x| x.4.abs())
+        .map(|x| x.raw_score.abs())
         .filter(|v| v.is_finite() && *v > 1e-6)
         .collect();
     abs_scores.sort_by(|a, b| b.total_cmp(a));
@@ -200,22 +231,22 @@ pub fn evaluate_sleeve_s3(
     let denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
     let mut out = HashMap::with_capacity(raw_items.len());
 
-    for (asset_id, symbol, s3_funding_zscore, s3_flush_atr_mult, score, event_trigger) in raw_items
-    {
-        let w_s3 = if top_abs_sum > 1e-8 && score.abs() > 1e-6 {
-            round_dp((score / denom) * budget, 4)
+    for item in raw_items {
+        let w_s3 = if top_abs_sum > 1e-8 && item.raw_score.abs() > 1e-6 {
+            round_dp((item.raw_score / denom) * budget, 4)
         } else {
             0.0
         };
         out.insert(
-            asset_id,
+            item.asset_id,
             EventReversionMetrics {
-                asset_id,
-                symbol,
-                s3_funding_zscore,
-                s3_flush_atr_mult,
+                asset_id: item.asset_id,
+                symbol: item.symbol,
+                s3_funding_zscore: item.s3_funding_zscore,
+                s3_flush_atr_mult: item.s3_flush_atr_mult,
                 w_s3_event_reversion: w_s3,
-                event_trigger,
+                event_trigger: item.event_trigger,
+                passes_quality: item.passes_quality,
             },
         );
     }
@@ -387,5 +418,49 @@ mod tests {
             out_both[&3].w_s3_event_reversion,
             out_both[&2].w_s3_event_reversion
         );
+    }
+
+    #[test]
+    fn test_s3_suppresses_triggers_on_dead_books_and_ghost_volume() {
+        let btc = test_asset(1, "BTC", 0.00001, 90_000.0, true);
+        let eth = test_asset(2, "ETH", 0.00001, 3_000.0, true);
+        // Dead EIGEN (0/12 active bars) with extreme negative funding & downward mark move
+        let mut eigen = test_asset(3, "EIGEN", -0.0050, 1.50, true);
+        eigen.tick_size = 0.0001;
+        eigen.prev_day_price = 1.80;
+        let eigen_bars: Vec<OhlcvBar> = (0..16)
+            .map(|i| OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 3,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: 1.80,
+                high: 1.80,
+                low: 1.80,
+                close: 1.80,
+                volume: 0.0,
+                funding_rate: -0.0050,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .collect();
+
+        // Ghost WIF ($79 volume, no bars) with extreme funding & crash
+        let mut wif = test_asset(4, "WIF", -0.0040, 0.70, true);
+        wif.tick_size = 0.0001;
+        wif.day_volume_usdc = 79.0;
+        wif.prev_day_price = 0.90;
+
+        let mut bars = HashMap::new();
+        bars.insert(3, eigen_bars);
+
+        let res = evaluate_sleeve_s3(&[btc, eth, eigen, wif], &bars, 0.25);
+        assert!(!res[&3].passes_quality);
+        assert_eq!(res[&3].event_trigger, None);
+        assert_eq!(res[&3].w_s3_event_reversion, 0.0);
+
+        assert!(!res[&4].passes_quality);
+        assert_eq!(res[&4].event_trigger, None);
+        assert_eq!(res[&4].w_s3_event_reversion, 0.0);
     }
 }

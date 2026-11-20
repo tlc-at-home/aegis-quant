@@ -205,13 +205,20 @@ mod tests {
         funding_rate_hourly: f64,
         day_volume_usdc: f64,
     ) -> ExchangeAsset {
+        let tick_size = if mark_price < 1.0 {
+            0.0001
+        } else if mark_price < 10.0 {
+            0.001
+        } else {
+            0.01
+        };
         ExchangeAsset {
             id,
             symbol: format!("{coin}-USDC"),
             coin: coin.to_string(),
             asset_index: id as u32,
             sz_decimals: 2,
-            tick_size: 0.01,
+            tick_size,
             lot_step_size: 0.01,
             max_leverage: 20.0,
             mark_price,
@@ -506,5 +513,65 @@ mod tests {
         held_weights.insert(1, 0.25);
         let held_out = engine.evaluate_universe(&[btc, dead], &bars_by_asset, &held_weights, &[]);
         assert!((held_out.breadth.market_beta_exposure - 0.25).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_held_dead_coin_failing_bar_liveness_emits_close_end_to_end() {
+        let btc_bars = build_trend_bars(1, 90_000.0, 0.008, 25, 1.5);
+        let btc = sample_asset(
+            1,
+            "BTC",
+            btc_bars.last().unwrap().close,
+            90_000.0,
+            0.00001,
+            50_000_000.0,
+        );
+
+        // EIGEN rose earlier then completely froze for the trailing 12 bars (0/12 active),
+        // while still marked eligible with $8k 24h volume and negative funding carry.
+        let mut eigen_bars = build_trend_bars(2, 1.80, 0.012, 12, 1.0);
+        let frozen_px = eigen_bars.last().unwrap().close;
+        let last_ts = eigen_bars.last().unwrap().timestamp_ms;
+        for i in 0..12 {
+            eigen_bars.push(OhlcvBar {
+                id: (13 + i) as i64,
+                asset_id: 2,
+                timeframe: "1h".to_string(),
+                timestamp_ms: last_ts + ((i + 1) as i64) * 3_600_000,
+                open: frozen_px,
+                high: frozen_px,
+                low: frozen_px,
+                close: frozen_px,
+                volume: 0.0,
+                funding_rate: -0.0006,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let eigen = sample_asset(2, "EIGEN", frozen_px, 1.80, -0.0006, 8_000.0);
+
+        let mut bars_by_asset = HashMap::new();
+        bars_by_asset.insert(1, btc_bars);
+        bars_by_asset.insert(2, eigen_bars);
+
+        let mut held = HashMap::new();
+        held.insert(2, 0.12);
+
+        let engine = SignalEngine::default();
+        let out = engine.evaluate_universe(&[btc, eigen], &bars_by_asset, &held, &[]);
+        let eigen_sig = out
+            .signals
+            .iter()
+            .find(|s| s.symbol == "EIGEN-USDC")
+            .unwrap();
+        assert_eq!(eigen_sig.w_s1_carry_mom, 0.0);
+        assert_eq!(eigen_sig.w_s2_trend_breakout, 0.0);
+        assert_eq!(eigen_sig.w_s3_event_reversion, 0.0);
+        assert_eq!(eigen_sig.event_trigger, None);
+        assert_eq!(eigen_sig.target_weight, 0.0);
+        assert_eq!(
+            eigen_sig.rebalance_action, ACTION_CLOSE,
+            "Held dead coin failing bar-liveness must emit ACTION_CLOSE, never trapped in HOLD"
+        );
     }
 }

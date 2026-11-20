@@ -7,6 +7,7 @@
 
 use crate::carry_momentum::CarryMomentumMetrics;
 use crate::event_reversion::EventReversionMetrics;
+use crate::liquidity::{compute_one_tick_bps, MAX_ONE_TICK_BPS, MIN_FALLBACK_DAY_VOLUME_USDC};
 use crate::trend_breakout::TrendBreakoutMetrics;
 use aegis_core::{round_dp, ConfigMap, CooldownAssetView, ExchangeAsset, RiskTier, SleeveSignal};
 use serde::{Deserialize, Serialize};
@@ -359,15 +360,28 @@ pub fn allocate_multi_sleeve_weights(
         let market_beta = s1.map(|x| x.market_beta).unwrap_or(1.0);
         let s1_mom_score = s1.map(|x| x.s1_mom_score).unwrap_or(0.0);
         let s1_carry_score = s1.map(|x| x.s1_carry_score).unwrap_or(0.0);
-        let w_s1 = s1.map(|x| x.w_s1_carry_mom).unwrap_or(0.0);
+        let raw_w_s1 = s1.map(|x| x.w_s1_carry_mom).unwrap_or(0.0);
 
         let s2_trend_alignment = s2.map(|x| x.s2_trend_alignment).unwrap_or(0);
         let s2_vol_surge_ratio = s2.map(|x| x.s2_vol_surge_ratio).unwrap_or(1.0);
-        let w_s2 = s2.map(|x| x.w_s2_trend_breakout).unwrap_or(0.0);
+        let raw_w_s2 = s2.map(|x| x.w_s2_trend_breakout).unwrap_or(0.0);
 
         let s3_funding_zscore = s3.map(|x| x.s3_funding_zscore).unwrap_or(0.0);
         let s3_flush_atr_mult = s3.map(|x| x.s3_flush_atr_mult).unwrap_or(0.0);
-        let w_s3 = s3.map(|x| x.w_s3_event_reversion).unwrap_or(0.0);
+        let raw_w_s3 = s3.map(|x| x.w_s3_event_reversion).unwrap_or(0.0);
+
+        let asset_eligible = asset.is_core_eligible || asset.is_event_eligible;
+        let sleeve_quality_ok = s1.is_none_or(|x| x.passes_quality)
+            && s2.is_none_or(|x| x.passes_quality)
+            && s3.is_none_or(|x| x.passes_quality);
+        let tick_ok = asset.mark_price.is_finite()
+            && asset.mark_price > 0.0
+            && compute_one_tick_bps(asset, asset.mark_price) <= MAX_ONE_TICK_BPS;
+        let quality_ok = sleeve_quality_ok && tick_ok;
+
+        let w_s1 = if quality_ok { raw_w_s1 } else { 0.0 };
+        let w_s2 = if quality_ok { raw_w_s2 } else { 0.0 };
+        let w_s3 = if quality_ok { raw_w_s3 } else { 0.0 };
 
         let is_downward_flush = (w_s3 > 0.0
             && s3_flush_atr_mult < 0.0
@@ -384,9 +398,12 @@ pub fn allocate_multi_sleeve_weights(
             w_s2
         };
 
-        let event_trigger = s3
-            .and_then(|x| x.event_trigger.clone())
-            .or_else(|| s2.and_then(|x| x.event_trigger.clone()));
+        let event_trigger = if quality_ok {
+            s3.and_then(|x| x.event_trigger.clone())
+                .or_else(|| s2.and_then(|x| x.event_trigger.clone()))
+        } else {
+            None
+        };
 
         let raw_combined_weight = round_dp(w_s1 + w_s2 + w_s3, 4);
         let unblocked_scaled_weight = round_dp(raw_combined_weight * lev_mult, 4);
@@ -395,11 +412,19 @@ pub fn allocate_multi_sleeve_weights(
         let in_cooldown = cooldown_ids.contains(&asset.id)
             || cooldown_symbols.contains(&asset.symbol.to_ascii_uppercase());
 
+        // Never allow hysteresis to trap a held dead/illiquid coin forever when eligibility drops,
+        // sleeve quality fails, tick size exceeds cap, or a ghost-volume book reports zero sleeve alpha.
+        let all_sleeves_zero = w_s1.abs() <= 1e-6 && w_s2.abs() <= 1e-6 && w_s3.abs() <= 1e-6;
+        let ghost_zero_alpha = all_sleeves_zero
+            && (!asset.day_volume_usdc.is_finite()
+                || asset.day_volume_usdc < MIN_FALLBACK_DAY_VOLUME_USDC);
+        let hysteresis_eligible = asset_eligible && quality_ok && !ghost_zero_alpha;
+
         let (effective_desired_weight, hysteresis_held) = apply_held_exit_hysteresis(
             cur_w,
             unblocked_scaled_weight,
             raw_combined_weight,
-            asset.is_core_eligible || asset.is_event_eligible,
+            hysteresis_eligible,
             s1.is_some() || s2.is_some() || s3.is_some(),
             is_downward_flush,
             s1_mom_score,
@@ -636,6 +661,7 @@ mod tests {
                     s1_mom_score: 0.4,
                     s1_carry_score: 0.1,
                     w_s1_carry_mom: 0.08,
+                    passes_quality: true,
                 },
             );
             s2.insert(
@@ -647,6 +673,7 @@ mod tests {
                     s2_vol_surge_ratio: 1.2,
                     w_s2_trend_breakout: 0.04,
                     event_trigger: None,
+                    passes_quality: true,
                 },
             );
             s3.insert(
@@ -658,6 +685,7 @@ mod tests {
                     s3_flush_atr_mult: -1.5,
                     w_s3_event_reversion: 0.05,
                     event_trigger: None,
+                    passes_quality: true,
                 },
             );
         }
@@ -714,6 +742,7 @@ mod tests {
                 s1_mom_score: s1_mom,
                 s1_carry_score: s1_carry,
                 w_s1_carry_mom: w_s1,
+                passes_quality: true,
             },
         );
         let mut s2 = HashMap::new();
@@ -726,6 +755,7 @@ mod tests {
                 s2_vol_surge_ratio: 1.1,
                 w_s2_trend_breakout: w_s2,
                 event_trigger: None,
+                passes_quality: true,
             },
         );
         let mut s3 = HashMap::new();
@@ -738,6 +768,7 @@ mod tests {
                 s3_flush_atr_mult: s3_flush_atr,
                 w_s3_event_reversion: w_s3,
                 event_trigger: None,
+                passes_quality: true,
             },
         );
         let mut cur = HashMap::new();
@@ -945,5 +976,91 @@ mod tests {
         let cd_close = run_single_alloc(a, -0.12, &[cd], 0.0, 0.0, 0.0, 0, 0.0, -2.0, -2.6, 0.05);
         assert_eq!(cd_close.rebalance_action, ACTION_CLOSE);
         assert_eq!(cd_close.target_weight, 0.0);
+    }
+
+    #[test]
+    fn test_hysteresis_does_not_trap_held_dead_or_illiquid_coins() {
+        let cfg = AllocatorConfig::default();
+
+        // 1. Held LONG still marked core-eligible in DB, but failed bar-liveness quality across sleeves
+        //    even with stale supportive momentum/trend/flush scores -> must CLOSE (never trapped!)
+        let dead_live_flag = test_asset(10, 8_000.0);
+        let mut s1 = HashMap::new();
+        s1.insert(
+            10,
+            CarryMomentumMetrics {
+                asset_id: 10,
+                symbol: dead_live_flag.symbol.clone(),
+                annualized_vol: 0.25,
+                market_beta: 1.0,
+                s1_mom_score: 0.45,
+                s1_carry_score: 0.20,
+                w_s1_carry_mom: 0.0,
+                passes_quality: false,
+            },
+        );
+        let mut s2 = HashMap::new();
+        s2.insert(
+            10,
+            TrendBreakoutMetrics {
+                asset_id: 10,
+                symbol: dead_live_flag.symbol.clone(),
+                s2_trend_alignment: 1,
+                s2_vol_surge_ratio: 1.0,
+                w_s2_trend_breakout: 0.0,
+                event_trigger: None,
+                passes_quality: false,
+            },
+        );
+        let mut s3 = HashMap::new();
+        s3.insert(
+            10,
+            EventReversionMetrics {
+                asset_id: 10,
+                symbol: dead_live_flag.symbol.clone(),
+                s3_funding_zscore: -1.5,
+                s3_flush_atr_mult: -1.2,
+                w_s3_event_reversion: 0.0,
+                event_trigger: None,
+                passes_quality: false,
+            },
+        );
+        let mut cur_long = HashMap::new();
+        cur_long.insert(10, 0.12);
+        let out_long = allocate_multi_sleeve_weights(
+            std::slice::from_ref(&dead_live_flag),
+            &s1,
+            &s2,
+            &s3,
+            &cur_long,
+            &[],
+            &cfg,
+        );
+        assert_eq!(out_long[0].rebalance_action, ACTION_CLOSE);
+        assert_eq!(out_long[0].target_weight, 0.0);
+
+        // Same for held SHORT on a dead quality-failing book
+        let mut cur_short = HashMap::new();
+        cur_short.insert(10, -0.12);
+        let out_short =
+            allocate_multi_sleeve_weights(&[dead_live_flag], &s1, &s2, &s3, &cur_short, &[], &cfg);
+        assert_eq!(out_short[0].rebalance_action, ACTION_CLOSE);
+        assert_eq!(out_short[0].target_weight, 0.0);
+
+        // 2. Held coin with coarse tick (> 15 bps) -> must CLOSE
+        let mut coarse = test_asset(11, 500_000.0);
+        coarse.mark_price = 0.003;
+        coarse.tick_size = 0.00001; // 33.3 bps
+        let close_coarse =
+            run_single_alloc(coarse, 0.10, &[], 0.30, 0.10, 0.0, 1, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(close_coarse.rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_coarse.target_weight, 0.0);
+
+        // 3. Ghost volume (< $2,500) with zero sleeve weights -> must CLOSE
+        let ghost = test_asset(12, 79.0);
+        let close_ghost =
+            run_single_alloc(ghost, 0.10, &[], 0.03, 0.05, 0.0, 0, 0.0, 0.0, -1.2, 0.0);
+        assert_eq!(close_ghost.rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_ghost.target_weight, 0.0);
     }
 }

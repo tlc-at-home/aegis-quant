@@ -8,7 +8,7 @@
 //! - Dynamic Cutover & Live Hyperliquid Exchange Reconciliation (`CutoverReconciler`)
 //! - Rich HTML Telegram Alerting (`aegis-alerts`)
 
-use crate::http_client::{endpoints_are_loopback, HyperliquidHttpClient};
+use crate::http_client::{endpoints_are_loopback, HyperliquidHttpClient, L2BookDepthSnapshot};
 use crate::market_watcher::{MarketScanReport, MarketWatcher};
 use crate::order_chaser::{NewWorkingOrderRequest, OrderChaser};
 use crate::priority_monitor::{PriorityMonitor, PriorityTickReport};
@@ -47,6 +47,52 @@ pub(crate) fn is_live_exchange_active(db: &DatabaseManager, cfg: &ConfigMap) -> 
     cfg.execution_mode().is_live_or_testnet()
         && !cfg.get_str("private_key", "").is_empty()
         && (!db.is_ephemeral_test_db() || endpoints_are_loopback(cfg))
+}
+
+pub const MAX_L2_DEPTH_CHECKS_PER_REBALANCE: usize = 6;
+
+/// Pure pre-entry L2 liquidity gate checking bid-ask spread and two-sided 15 bps depth.
+pub fn passes_entry_l2_liquidity_gate(
+    book: &L2BookDepthSnapshot,
+    target_notional_usdc: f64,
+    max_spread_bps: f64,
+) -> std::result::Result<(), String> {
+    let eff_max_spread = if max_spread_bps.is_finite() {
+        max_spread_bps.max(1.0)
+    } else {
+        20.0
+    };
+    if !book.best_bid.is_finite()
+        || !book.best_ask.is_finite()
+        || !book.spread_bps.is_finite()
+        || book.best_bid <= 0.0
+        || book.best_ask < book.best_bid
+    {
+        return Err("L2_BOOK_INVALID_BBO".to_string());
+    }
+    if book.spread_bps > eff_max_spread {
+        return Err(format!(
+            "ENTRY_SPREAD_TOO_WIDE: spread={:.2}bps > max={:.2}bps",
+            book.spread_bps, eff_max_spread
+        ));
+    }
+    let eff_notional = if target_notional_usdc.is_finite() && target_notional_usdc > 0.0 {
+        target_notional_usdc
+    } else {
+        0.0
+    };
+    let min_side_depth = (eff_notional * 0.25).max(25.0);
+    if !book.bid_depth_15bps_usdc.is_finite()
+        || !book.ask_depth_15bps_usdc.is_finite()
+        || book.bid_depth_15bps_usdc < min_side_depth
+        || book.ask_depth_15bps_usdc < min_side_depth
+    {
+        return Err(format!(
+            "ENTRY_L2_DEPTH_TOO_THIN: bid_15bps=${:.2}, ask_15bps=${:.2} < min_side=${:.2}",
+            book.bid_depth_15bps_usdc, book.ask_depth_15bps_usdc, min_side_depth
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn is_active_cap_holding(h: &HeldAssetView, cap_epoch_ms: i64) -> bool {
@@ -947,6 +993,10 @@ impl ExecutionEngine {
                 .then_with(|| b.target_weight.abs().total_cmp(&a.target_weight.abs()))
         });
 
+        let is_live_exchange = is_live_exchange_active(&self.db, &cfg);
+        let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 20.0).max(1.0);
+        let mut l2_depth_checks: usize = 0;
+
         // 3. Place at most 1 new WORKING order per cycle when all gates pass
         for sig in &candidate_signals {
             if report.working_orders_placed >= 1
@@ -1024,6 +1074,50 @@ impl ExecutionEngine {
                 > max_allowed_gross_notional + 1e-2
             {
                 continue;
+            }
+
+            // Pre-Entry L2 Spread & Two-Sided Top-of-Book Depth Gate (live exchange only)
+            if is_live_exchange {
+                if l2_depth_checks >= MAX_L2_DEPTH_CHECKS_PER_REBALANCE {
+                    tracing::debug!(
+                        checked = l2_depth_checks,
+                        "Reached per-cycle L2 depth check cap; deferring remaining candidates"
+                    );
+                    break;
+                }
+                l2_depth_checks += 1;
+                match self.http.fetch_l2_book_depth(&asset.coin, &cfg) {
+                    Ok(Some(book)) => {
+                        if let Err(reason) = passes_entry_l2_liquidity_gate(
+                            &book,
+                            plan.target_notional_usdc,
+                            max_entry_spread_bps,
+                        ) {
+                            tracing::debug!(
+                                symbol = %asset.symbol,
+                                reason = %reason,
+                                "Skipping candidate due to thin/wide L2 book"
+                            );
+                            continue;
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            symbol = %asset.symbol,
+                            reason = "EMPTY_L2_BOOK",
+                            "Skipping candidate due to thin/wide L2 book"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            symbol = %asset.symbol,
+                            error = %err,
+                            "Skipping candidate due to transient L2 book fetch error"
+                        );
+                        continue;
+                    }
+                }
             }
 
             let reason = sig
@@ -2567,5 +2661,68 @@ mod tests {
         }
 
         let _ = stop_tx.send(());
+    }
+
+    #[test]
+    fn test_passes_entry_l2_liquidity_gate() {
+        let healthy = L2BookDepthSnapshot {
+            best_bid: 100.0,
+            best_ask: 100.05,
+            spread_bps: 5.0,
+            bid_depth_15bps_usdc: 500.0,
+            ask_depth_15bps_usdc: 500.0,
+        };
+        assert!(passes_entry_l2_liquidity_gate(&healthy, 200.0, 20.0).is_ok());
+
+        // Exact boundary spread (20.0 bps) and exact min_side_depth ($25 floor for $60 notional) pass
+        let exact_floor = L2BookDepthSnapshot {
+            best_bid: 100.0,
+            best_ask: 100.20,
+            spread_bps: 20.0,
+            bid_depth_15bps_usdc: 25.0,
+            ask_depth_15bps_usdc: 25.0,
+        };
+        assert!(passes_entry_l2_liquidity_gate(&exact_floor, 60.0, 20.0).is_ok());
+
+        // Wide spread (> 20 bps, e.g. 54 bps like kSHIB) rejects
+        let wide = L2BookDepthSnapshot {
+            spread_bps: 54.0,
+            ..healthy
+        };
+        let err_wide = passes_entry_l2_liquidity_gate(&wide, 200.0, 20.0).unwrap_err();
+        assert!(err_wide.contains("ENTRY_SPREAD_TOO_WIDE"));
+
+        // One-sided thin ask depth (< $25 floor) rejects even with deep bids
+        let thin_ask = L2BookDepthSnapshot {
+            ask_depth_15bps_usdc: 24.99,
+            ..healthy
+        };
+        let err_ask = passes_entry_l2_liquidity_gate(&thin_ask, 60.0, 20.0).unwrap_err();
+        assert!(err_ask.contains("ENTRY_L2_DEPTH_TOO_THIN"));
+
+        // One-sided thin bid depth (< 25% of $400 notional = $100) rejects even with deep asks
+        let thin_bid = L2BookDepthSnapshot {
+            bid_depth_15bps_usdc: 99.9,
+            ask_depth_15bps_usdc: 800.0,
+            ..healthy
+        };
+        let err_bid = passes_entry_l2_liquidity_gate(&thin_bid, 400.0, 20.0).unwrap_err();
+        assert!(err_bid.contains("ENTRY_L2_DEPTH_TOO_THIN"));
+        let ok_bid = L2BookDepthSnapshot {
+            bid_depth_15bps_usdc: 100.0,
+            ask_depth_15bps_usdc: 100.0,
+            ..healthy
+        };
+        assert!(passes_entry_l2_liquidity_gate(&ok_bid, 400.0, 20.0).is_ok());
+
+        // Invalid / crossed BBO rejects
+        let crossed = L2BookDepthSnapshot {
+            best_bid: 101.0,
+            best_ask: 100.0,
+            spread_bps: -99.0,
+            bid_depth_15bps_usdc: 500.0,
+            ask_depth_15bps_usdc: 500.0,
+        };
+        assert!(passes_entry_l2_liquidity_gate(&crossed, 100.0, 20.0).is_err());
     }
 }

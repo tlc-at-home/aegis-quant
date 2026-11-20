@@ -3,6 +3,7 @@
 //! Computes per-asset `s1_mom_score`, `s1_carry_score`, `market_beta`, `annualized_vol`,
 //! and risk-adjusted inverse-volatility weight `w_s1_carry_mom` across core-eligible Hyperliquid perps.
 
+use crate::liquidity::{default_passes_quality, evaluate_asset_liquidity_quality};
 use crate::trend_breakout::compute_rsi_and_range_position;
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ pub struct CarryMomentumMetrics {
     pub s1_mom_score: f64,
     pub s1_carry_score: f64,
     pub w_s1_carry_mom: f64,
+    #[serde(default = "default_passes_quality")]
+    pub passes_quality: bool,
 }
 
 /// Estimates annualized realized volatility from historical OHLCV bars (or 24h price change fallback).
@@ -194,6 +197,18 @@ pub fn evaluate_sleeve_s1(
     btc_bars: &[OhlcvBar],
     s1_budget: f64,
 ) -> HashMap<i64, CarryMomentumMetrics> {
+    struct RawS1Metric {
+        asset_id: i64,
+        symbol: String,
+        annualized_vol: f64,
+        market_beta: f64,
+        s1_mom_score: f64,
+        s1_carry_score: f64,
+        inv_vol_score: f64,
+        at_range_bottom: bool,
+        passes_quality: bool,
+    }
+
     let budget = s1_budget.clamp(0.0, 1.50);
     let mut raw_metrics = Vec::with_capacity(assets.len());
 
@@ -202,6 +217,7 @@ pub fn evaluate_sleeve_s1(
             .get(&asset.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let quality = evaluate_asset_liquidity_quality(asset, bars);
         let annualized_vol = compute_annualized_vol(bars, asset);
         let market_beta = compute_market_beta(bars, btc_bars, asset);
         let s1_mom_score = compute_s1_momentum_score(bars, asset, annualized_vol);
@@ -229,32 +245,34 @@ pub fn evaluate_sleeve_s1(
         if at_range_bottom && composite_alpha < 0.0 {
             composite_alpha = 0.0;
         }
-        let eff_vol = annualized_vol.max(0.25);
+        let eff_vol = annualized_vol.max(0.45);
         let inv_vol_score = if asset.is_core_eligible
+            && quality.passes_quality
             && composite_alpha.is_finite()
             && composite_alpha.abs() >= 0.05
         {
-            composite_alpha / eff_vol
+            (composite_alpha / eff_vol) * quality.activity_scale
         } else {
             0.0
         };
 
-        raw_metrics.push((
-            asset.id,
-            asset.symbol.clone(),
+        raw_metrics.push(RawS1Metric {
+            asset_id: asset.id,
+            symbol: asset.symbol.clone(),
             annualized_vol,
             market_beta,
             s1_mom_score,
             s1_carry_score,
             inv_vol_score,
             at_range_bottom,
-        ));
+            passes_quality: quality.passes_quality,
+        });
     }
 
     let eligible_scores: Vec<f64> = raw_metrics
         .iter()
-        .filter(|m| m.6.is_finite() && m.6.abs() > 1e-6)
-        .map(|m| m.6)
+        .filter(|m| m.inv_vol_score.is_finite() && m.inv_vol_score.abs() > 1e-6)
+        .map(|m| m.inv_vol_score)
         .collect();
     let mean_score = if eligible_scores.len() >= 3 {
         eligible_scores.iter().sum::<f64>() / (eligible_scores.len() as f64)
@@ -264,15 +282,15 @@ pub fn evaluate_sleeve_s1(
 
     let mut adjusted_scores: Vec<(i64, f64)> = Vec::with_capacity(raw_metrics.len());
     for m in &raw_metrics {
-        let mut adj = if m.6.is_finite() && m.6.abs() > 1e-6 {
-            0.65 * m.6 + 0.35 * (m.6 - mean_score)
+        let mut adj = if m.inv_vol_score.is_finite() && m.inv_vol_score.abs() > 1e-6 {
+            0.65 * m.inv_vol_score + 0.35 * (m.inv_vol_score - mean_score)
         } else {
             0.0
         };
-        if m.7 && adj < 0.0 {
+        if m.at_range_bottom && adj < 0.0 {
             adj = 0.0;
         }
-        adjusted_scores.push((m.0, adj));
+        adjusted_scores.push((m.asset_id, adj));
     }
 
     let mut abs_scores: Vec<f64> = adjusted_scores
@@ -286,10 +304,8 @@ pub fn evaluate_sleeve_s1(
     let score_lookup: HashMap<i64, f64> = adjusted_scores.into_iter().collect();
 
     let mut out = HashMap::with_capacity(raw_metrics.len());
-    for (asset_id, symbol, annualized_vol, market_beta, s1_mom_score, s1_carry_score, _, _) in
-        raw_metrics
-    {
-        let adj = score_lookup.get(&asset_id).copied().unwrap_or(0.0);
+    for m in raw_metrics {
+        let adj = score_lookup.get(&m.asset_id).copied().unwrap_or(0.0);
         let w_s1 = if top_abs_sum > 1e-8 {
             round_dp((adj / norm_denom) * budget, 4)
         } else {
@@ -297,15 +313,16 @@ pub fn evaluate_sleeve_s1(
         };
 
         out.insert(
-            asset_id,
+            m.asset_id,
             CarryMomentumMetrics {
-                asset_id,
-                symbol,
-                annualized_vol,
-                market_beta,
-                s1_mom_score,
-                s1_carry_score,
+                asset_id: m.asset_id,
+                symbol: m.symbol,
+                annualized_vol: m.annualized_vol,
+                market_beta: m.market_beta,
+                s1_mom_score: m.s1_mom_score,
+                s1_carry_score: m.s1_carry_score,
                 w_s1_carry_mom: w_s1,
+                passes_quality: m.passes_quality,
             },
         );
     }
@@ -576,5 +593,174 @@ mod tests {
             .collect();
         let fallback_beta = compute_market_beta(&disjoint_asset, &btc_bars, &sol);
         assert!((fallback_beta - 1.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_s1_zeros_dead_books_and_prevents_low_vol_amplification() {
+        // 1. Dead sparse book (kSHIB: 3/12 active bars) must get 0.0 weight even with strong funding carry
+        let mut kshib_bars = Vec::with_capacity(20);
+        let mut px = 0.012;
+        for i in 0..20 {
+            let active = i >= 17;
+            if active {
+                px *= 1.015;
+            }
+            kshib_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 100,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: px,
+                high: if active { px * 1.005 } else { px },
+                low: if active { px * 0.995 } else { px },
+                close: px,
+                volume: if active { 50_000.0 } else { 0.0 },
+                funding_rate: -0.0004,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mut kshib = test_asset(100, "kSHIB", px, -0.0004);
+        kshib.tick_size = 0.000001;
+        kshib.day_volume_usdc = 12_000.0;
+
+        // 2. Stagnant thin low-vol asset (6/12 active, $6k vol, low realized vol ~0.18 -> floored at 0.45)
+        //    vs active liquid mover (12/12 active, $500k vol, ~0.55 vol) with comparable upward drift
+        let mut thin_bars = Vec::with_capacity(20);
+        let mut active_bars = Vec::with_capacity(20);
+        let mut p_thin = 10.0;
+        let mut p_act = 10.0;
+        for i in 0..20 {
+            let thin_live = !(8..14).contains(&i); // 6/12 active in trailing 12 bars
+            if thin_live {
+                p_thin *= 1.006;
+            }
+            thin_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 101,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: p_thin,
+                high: if thin_live { p_thin * 1.006 } else { p_thin },
+                low: if thin_live { p_thin * 0.994 } else { p_thin },
+                close: p_thin,
+                volume: if thin_live { 500.0 } else { 0.0 },
+                funding_rate: -0.0002,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+
+            let step = if i % 2 == 0 { 0.998 } else { 1.012 };
+            let open_a = p_act;
+            p_act *= step;
+            active_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 102,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: open_a,
+                high: open_a.max(p_act) * 1.004,
+                low: open_a.min(p_act) * 0.996,
+                close: p_act,
+                volume: 50_000.0,
+                funding_rate: -0.0002,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mut thin = test_asset(101, "THIN", p_thin, -0.0002);
+        thin.tick_size = 0.001;
+        thin.day_volume_usdc = 6_000.0;
+
+        let mut active = test_asset(102, "ACTV", p_act, -0.0002);
+        active.tick_size = 0.001;
+        active.day_volume_usdc = 500_000.0;
+
+        let mut bars_map = HashMap::new();
+        bars_map.insert(100, kshib_bars);
+        bars_map.insert(101, thin_bars);
+        bars_map.insert(102, active_bars);
+
+        let res = evaluate_sleeve_s1(&[kshib, thin, active], &bars_map, &[], 0.45);
+        assert!(!res[&100].passes_quality);
+        assert_eq!(res[&100].w_s1_carry_mom, 0.0);
+        assert!(res[&101].passes_quality);
+        assert!(res[&102].passes_quality);
+        assert!(res[&101].annualized_vol < 0.45);
+        assert!(res[&102].annualized_vol > 0.55);
+        assert!(
+            res[&102].w_s1_carry_mom > res[&101].w_s1_carry_mom,
+            "Active liquid mover ({}) must outweigh stagnant thin low-vol coin ({})",
+            res[&102].w_s1_carry_mom,
+            res[&101].w_s1_carry_mom
+        );
+
+        // 3. Verify eff_vol >= 0.45 floor: two liquid 12/12 coins at range bottom with identical
+        //    positive carry (and zero momentum) at vol=0.18 vs vol=0.40 must receive equal weight
+        //    (no 1.8x/4x low-vol amplification below 0.45).
+        let mk_bottom_bars = |id: i64, swing: f64| -> Vec<OhlcvBar> {
+            let mut out = Vec::with_capacity(26);
+            let mut p = 100.0;
+            for i in 0..25 {
+                let mult = if i % 2 == 0 {
+                    0.992 - swing
+                } else {
+                    0.992 + swing
+                };
+                let open = p;
+                p *= mult;
+                out.push(OhlcvBar {
+                    id: (i + 1) as i64,
+                    asset_id: id,
+                    timeframe: "4h".to_string(),
+                    timestamp_ms: 1_700_000_000_000 + (i as i64) * 14_400_000,
+                    open,
+                    high: open.max(p) * 1.005,
+                    low: open.min(p) * 0.995,
+                    close: p,
+                    volume: 50_000.0,
+                    funding_rate: -0.0005,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                });
+            }
+            let prev = out.last().unwrap().close;
+            let bounce = prev * 1.004;
+            out.push(OhlcvBar {
+                id: 26,
+                asset_id: id,
+                timeframe: "4h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + 25 * 14_400_000,
+                open: prev,
+                high: bounce * 1.002,
+                low: prev * 0.998,
+                close: bounce,
+                volume: 50_000.0,
+                funding_rate: -0.0005,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+            out
+        };
+        let b_v18 = mk_bottom_bars(201, 0.0);
+        let b_v40 = mk_bottom_bars(202, 0.0075);
+        let a_v18 = test_asset(201, "V18", b_v18.last().unwrap().close, -0.0005);
+        let a_v40 = test_asset(202, "V40", b_v40.last().unwrap().close, -0.0005);
+        let mut floor_map = HashMap::new();
+        floor_map.insert(201, b_v18);
+        floor_map.insert(202, b_v40);
+        let floor_res = evaluate_sleeve_s1(&[a_v18, a_v40], &floor_map, &[], 0.45);
+        assert!(floor_res[&201].annualized_vol < 0.25);
+        assert!(
+            floor_res[&202].annualized_vol > 0.30 && floor_res[&202].annualized_vol <= 0.45,
+            "Expected second coin vol in (0.30, 0.45], got {}",
+            floor_res[&202].annualized_vol
+        );
+        assert!(
+            (floor_res[&201].w_s1_carry_mom - floor_res[&202].w_s1_carry_mom).abs() < 1e-6,
+            "Coins below 0.45 eff_vol floor must receive equal weight ({} vs {})",
+            floor_res[&201].w_s1_carry_mom,
+            floor_res[&202].w_s1_carry_mom
+        );
     }
 }

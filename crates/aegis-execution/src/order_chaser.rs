@@ -374,7 +374,7 @@ impl OrderChaser {
         let mut live_filled_immediately: Option<(f64, f64, f64)> = None;
 
         let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
-        let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 45.0).max(1.0);
+        let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 20.0).max(1.0);
 
         if is_live_exchange {
             if let Ok(Some((bid, ask))) = self.http.fetch_l2_book(&req.asset.coin, &cfg) {

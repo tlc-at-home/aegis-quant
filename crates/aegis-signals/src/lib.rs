@@ -6,6 +6,7 @@ pub mod breadth;
 pub mod carry_momentum;
 pub mod engine;
 pub mod event_reversion;
+pub mod liquidity;
 pub mod trend_breakout;
 
 pub use allocator::*;
@@ -13,4 +14,5 @@ pub use breadth::*;
 pub use carry_momentum::*;
 pub use engine::*;
 pub use event_reversion::*;
+pub use liquidity::*;
 pub use trend_breakout::*;

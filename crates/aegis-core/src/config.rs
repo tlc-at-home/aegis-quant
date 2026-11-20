@@ -300,12 +300,12 @@ pub fn default_v2_system_config_seeds(
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
         ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
-        ("max_entry_spread_bps", "45.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders"),
+        ("max_entry_spread_bps", "20.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders (20.0 bps default)"),
         ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough equity drawdown fraction before halting new entries"),
         ("scanner_interval_ms", "3000", "int", "Full-exchange 150+ perp scanner cadence in milliseconds (3s)"),
         ("priority_monitor_interval_ms", "1000", "int", "High-frequency priority watchlist & active order monitor cadence in milliseconds (1s)"),
-        ("core_min_day_volume_usdc", "2000000.0", "float", "Minimum 24h USDC volume on Mainnet ($2M; $1k on Testnet) for Core S1/S2 eligibility"),
-        ("event_min_day_volume_usdc", "500000.0", "float", "Minimum 24h USDC volume on Mainnet ($500k; $250 on Testnet) for Event S3 eligibility"),
+        ("core_min_day_volume_usdc", "2000000.0", "float", "Minimum 24h USDC volume on Mainnet ($2M; $5k on Testnet) for Core S1/S2 eligibility"),
+        ("event_min_day_volume_usdc", "500000.0", "float", "Minimum 24h USDC volume on Mainnet ($500k; $2.5k on Testnet) for Event S3 eligibility"),
         ("s1_carry_mom_budget", "0.45", "float", "Sleeve 1 (Cross-Sectional Carry-Momentum & Beta Hedge) base portfolio weight budget"),
         ("s2_trend_breakout_budget", "0.40", "float", "Sleeve 2 (Breadth-Confirmed Multi-Speed Trend & Live 3s Breakout) base portfolio weight budget"),
         ("s3_event_reversion_budget", "0.25", "float", "Sleeve 3 (Live Capitulation Flush & Funding Dislocation) base portfolio weight budget"),
@@ -418,7 +418,9 @@ mod tests {
             Some("1795035600000")
         );
         assert_eq!(find("min_position_hold_sec"), Some("300"));
-        assert_eq!(find("max_entry_spread_bps"), Some("45.0"));
+        assert_eq!(find("max_entry_spread_bps"), Some("20.0"));
+        assert_eq!(find("core_min_day_volume_usdc"), Some("2000000.0"));
+        assert_eq!(find("event_min_day_volume_usdc"), Some("500000.0"));
         assert_eq!(find("max_daily_drawdown_pct"), Some("0.15"));
         assert_eq!(find("web_allow_remote_bind"), Some("false"));
         assert_eq!(find("stop_out_cooldown_sec"), Some("1800"));
