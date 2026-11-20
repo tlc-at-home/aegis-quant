@@ -7,6 +7,16 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <!-- Reusable local SVG symbol definitions for decorative sort indicators -->
+  <svg class="svg-sprite" aria-hidden="true" focusable="false">
+    <symbol id="aegis-sort-up" viewBox="0 0 12 14">
+      <path d="M6 1.5L10 5.5H2L6 1.5Z" fill="currentColor"></path>
+    </symbol>
+    <symbol id="aegis-sort-down" viewBox="0 0 12 14">
+      <path d="M6 12.5L2 8.5H10L6 12.5Z" fill="currentColor"></path>
+    </symbol>
+  </svg>
+
   <!-- ========================================================================
        TOP TELEMETRY BAR
        ======================================================================== -->
@@ -96,6 +106,7 @@
        MAIN TERMINAL WORKSPACE
        ======================================================================== -->
   <main class="terminal-container">
+    <p id="table-sort-status" role="status" class="visually-hidden"></p>
 
     <!-- ======================================================================
          4-CARD PNL HORIZON RIBBON (DAILY 24H · WEEKLY 7D · MONTHLY 30D · YTD)
@@ -286,6 +297,150 @@
     </section>
 
     <!-- ======================================================================
+         HYPERLIQUID VAULT INFO & COMBINED PORTFOLIO EQUITY
+         ====================================================================== -->
+    <section class="glass-panel" id="vault-info-panel">
+      <div class="panel-header">
+        <div class="panel-title-cluster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+            <circle cx="12" cy="12" r="3"></circle>
+            <line x1="12" y1="9" x2="12" y2="7"></line>
+            <line x1="12" y1="17" x2="12" y2="15"></line>
+            <line x1="9" y1="12" x2="7" y2="12"></line>
+            <line x1="17" y1="12" x2="15" y2="12"></line>
+          </svg>
+          <div>
+            <div class="panel-title">Hyperliquid Vaults &amp; Combined Portfolio Equity</div>
+            <div class="panel-subtitle">Segregated vault deposits · Vault funds are excluded from perp margin, leverage, and drawdown breaker calculations</div>
+          </div>
+        </div>
+        <div class="panel-actions">
+          <span class="vault-config-badge" id="vault-configured-badge" hidden></span>
+          <span class="status-pill watch" id="vault-sync-pill">0 VAULTS</span>
+        </div>
+      </div>
+
+      <div class="vault-kpi-strip">
+        <article class="vault-kpi-card accent-cyan">
+          <div class="vault-kpi-header">
+            <span class="kpi-title">Total Vault Equity</span>
+            <span class="vault-segregated-tag">Segregated</span>
+          </div>
+          <div class="vault-kpi-value num-cell" id="vault-total-equity">$0.00</div>
+          <div class="vault-kpi-sub">
+            <span id="vault-count-sub">0 Active Vaults</span>
+            <span id="vault-synced-sub">Awaiting sync</span>
+          </div>
+        </article>
+
+        <article class="vault-kpi-card accent-emerald">
+          <div class="vault-kpi-header">
+            <span class="kpi-title">Combined Equity (Perp + Vault)</span>
+            <span class="vault-segregated-tag">Informational</span>
+          </div>
+          <div class="vault-kpi-value num-cell" id="vault-combined-equity">$0.00</div>
+          <div class="vault-kpi-sub">
+            <span id="vault-combined-breakdown">Perp $0.00 + Vault $0.00</span>
+            <span class="vault-seg-note">Vault segregated from perp margin</span>
+          </div>
+        </article>
+
+        <article class="vault-kpi-card accent-violet">
+          <div class="vault-kpi-header">
+            <span class="kpi-title">Vault Net PnL / All-Time</span>
+            <span class="vault-segregated-tag" id="vault-avg-apr">APR: —</span>
+          </div>
+          <div class="vault-kpi-value pnl-cell pnl-flat" id="vault-total-pnl">$0.00</div>
+          <div class="vault-kpi-sub">
+            <span id="vault-alltime-pnl">All-Time: $0.00</span>
+            <span id="vault-lock-summary">All Unlocked</span>
+          </div>
+        </article>
+      </div>
+
+      <div class="table-scroll vault-table-scroll" tabindex="0" role="region" aria-labelledby="caption-vaults">
+        <table class="quant-table" id="table-vaults" data-vt="true">
+          <caption id="caption-vaults" class="visually-hidden">Hyperliquid Vault Positions</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-sort-key="name" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>Vault</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="equity_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>Equity (USDC)</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="pnl_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>PnL ($ / %)</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="all_time_pnl_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>All-Time PnL ($ / %)</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="apr_pct" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>APR %</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="days_following" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>Days Following</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="locked_until_ms" data-type="date">
+                <button type="button" class="sort-btn" commandfor="table-vaults" command="--sort">
+                  <span>Lockup Status</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="tbody-vaults">
+            <tr data-empty-row="true">
+              <td colspan="7" class="table-empty-cell">
+                No active Hyperliquid vault deposits synced yet.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ======================================================================
          DUAL HTML5 CANVAS INTERACTIVE CHARTS
          ====================================================================== -->
     <section class="charts-grid">
@@ -377,23 +532,80 @@
           </div>
         </div>
 
-        <div class="table-scroll" tabindex="0" role="region" aria-label="1s Priority Watchlist and Working Orders">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-priority-ordered">
+          <table class="quant-table" id="table-priority-ordered" data-vt="true">
+            <caption id="caption-priority-ordered" class="visually-hidden">1s Priority Watchlist and Active Working Orders</caption>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>State / Trigger</th>
-                <th>Side</th>
-                <th>Limit / Mark</th>
-                <th>Mid Dist (bps)</th>
-                <th>Reserved USDC</th>
-                <th>Chases</th>
-                <th>Action</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="state" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>State / Trigger</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="side" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Side</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Limit / Mark</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mid_dist_bps" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Mid Dist (bps)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="reserved_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Reserved USDC</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="chases" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-priority-ordered" command="--sort">
+                    <span>Chases</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col">Action</th>
               </tr>
             </thead>
             <tbody id="tbody-priority-ordered">
-              <tr>
-                <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+              <tr data-empty-row="true">
+                <td colspan="8" class="table-empty-cell">
                   No active WORKING orders or priority triggers — monitoring 1s watchlist stream...
                 </td>
               </tr>
@@ -422,23 +634,88 @@
           </div>
         </div>
 
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Active Open Holdings">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-assets-held">
+          <table class="quant-table" id="table-assets-held" data-vt="true">
+            <caption id="caption-assets-held" class="visually-hidden">Active Open Holdings</caption>
             <thead>
               <tr>
-                <th scope="col">Symbol</th>
-                <th scope="col">Side</th>
-                <th scope="col">Committed</th>
-                <th scope="col">Entry / Mark</th>
-                <th scope="col">Stop Loss (SL)</th>
-                <th scope="col">Take Profit (TP)</th>
-                <th scope="col">Unrealized PnL</th>
-                <th scope="col">Sleeve Mix</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="side" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Side</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="committed_notional_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Committed</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="entry_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Entry / Mark</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="protective_stop_px" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Stop Loss (SL)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="take_profit_px" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Take Profit (TP)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="unrealized_pnl_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Unrealized PnL</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="sleeve_mix" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-assets-held" command="--sort">
+                    <span>Sleeve Mix</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
                 <th scope="col">Action</th>
               </tr>
             </thead>
             <tbody id="tbody-assets-held">
-              <tr>
+              <tr data-empty-row="true">
                 <td colspan="9" class="table-empty-cell">
                   No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
                 </td>
@@ -450,12 +727,128 @@
     </section>
 
     <!-- ======================================================================
+         TRADE HISTORY / RECENT CLOSED POSITIONS
+         ====================================================================== -->
+    <section class="glass-panel" id="closed-positions-panel">
+      <div class="panel-header">
+        <div class="panel-title-cluster">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+          </svg>
+          <div>
+            <div class="panel-title">Trade History &amp; Closed Positions</div>
+            <div class="panel-subtitle">Reconciled closed trades · Realized PnL ($ and % of entry notional, Local Time)</div>
+          </div>
+        </div>
+        <div class="panel-actions">
+          <input
+            type="text"
+            id="closed-search-input"
+            class="search-input closed-search-input"
+            placeholder="Filter closed trades (symbol, reason)..."
+            aria-label="Filter closed trades"
+          />
+          <span class="status-pill watch" id="closed-count-pill">0 CLOSED</span>
+        </div>
+      </div>
+
+      <div class="table-scroll closed-table-scroll" tabindex="0" role="region" aria-labelledby="caption-closed-positions">
+        <table class="quant-table" id="table-closed-positions" data-vt="true">
+          <caption id="caption-closed-positions" class="visually-hidden">Trade History and Closed Positions</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-sort-key="closed_at_ms" data-type="date">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Closed (Local)</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="symbol" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Symbol</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="side" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Side</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="entry_notional_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Entry Notional</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="entry_price" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Entry / Exit</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="realized_pnl_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Realized PnL</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="fees_funding_usdc" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Fees / Funding</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="exit_reason" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-closed-positions" command="--sort">
+                  <span>Exit Reason</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="tbody-closed-positions">
+            <tr data-empty-row="true">
+              <td colspan="8" class="table-empty-cell">
+                No closed trades recorded yet.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ======================================================================
          ACTIVE ASSET COOLDOWNS (v_assets_in_cooldown)
          ====================================================================== -->
     <section class="glass-panel" id="cooldown-panel" style="padding: 12px 18px; gap: 10px;">
       <div class="panel-header" style="padding-bottom: 8px;">
         <div class="panel-title-cluster">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <circle cx="12" cy="12" r="10"></circle>
             <polyline points="12 6 12 12 16 14"></polyline>
           </svg>
@@ -466,8 +859,64 @@
         </div>
         <span class="status-pill working" id="cooldown-count-pill">0 ACTIVE</span>
       </div>
-      <div id="cooldown-badges-list" style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
-        <span class="pnl-flat" style="font-family: var(--font-mono); font-size: 11px;">No assets currently in cooldown.</span>
+      <div class="table-scroll cooldown-table-scroll" tabindex="0" role="region" aria-labelledby="caption-cooldowns">
+        <table class="quant-table" id="table-cooldowns" data-vt="true">
+          <caption id="caption-cooldowns" class="visually-hidden">Active Asset Cooldowns</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-sort-key="symbol" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-cooldowns" command="--sort">
+                  <span>Symbol</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="cooldown_type" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-cooldowns" command="--sort">
+                  <span>Type</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="remaining_seconds" data-type="number">
+                <button type="button" class="sort-btn" commandfor="table-cooldowns" command="--sort">
+                  <span>Remaining</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="expires_at_ms" data-type="date">
+                <button type="button" class="sort-btn" commandfor="table-cooldowns" command="--sort">
+                  <span>Expires (Local)</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+              <th scope="col" data-sort-key="reason" data-type="string">
+                <button type="button" class="sort-btn" commandfor="table-cooldowns" command="--sort">
+                  <span>Reason</span>
+                  <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                    <use class="sort-asc" href="#aegis-sort-up"></use>
+                    <use class="sort-desc" href="#aegis-sort-down"></use>
+                  </svg>
+                </button>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="tbody-cooldowns">
+            <tr data-empty-row="true">
+              <td colspan="5" class="table-empty-cell">No assets currently in cooldown.</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -514,21 +963,110 @@
 
       <!-- TAB 1: Sleeve 1 Carry-Momentum -->
       <div class="tab-pane active" id="tab-pane-s1">
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 1 Carry-Momentum">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-sleeve-s1">
+          <table class="quant-table" id="table-sleeve-s1" data-vt="true">
+            <caption id="caption-sleeve-s1" class="visually-hidden">Sleeve 1 Carry-Momentum</caption>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Mark Price</th>
-                <th>24h Volume (USDC)</th>
-                <th>Hourly Funding</th>
-                <th>Funding APR</th>
-                <th>Annual Vol</th>
-                <th>Market Beta</th>
-                <th>Mom Score</th>
-                <th>Carry Score</th>
-                <th>S1 Weight (w_s1)</th>
-                <th>Net Target Weight</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mark_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Mark Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="day_volume_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>24h Volume (USDC)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="funding_rate_hourly" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Hourly Funding</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="funding_apr_pct" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Funding APR</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="annualized_vol" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Annual Vol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="market_beta" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Market Beta</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s1_mom_score" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Mom Score</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s1_carry_score" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Carry Score</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="w_s1_carry_mom" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>S1 Weight (w_s1)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="target_weight" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s1" command="--sort">
+                    <span>Net Target Weight</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-sleeve-s1"></tbody>
@@ -538,20 +1076,101 @@
 
       <!-- TAB 2: Sleeve 2 Trend & 3s Breakout -->
       <div class="tab-pane" id="tab-pane-s2">
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 2 Trend and Breakout">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-sleeve-s2">
+          <table class="quant-table" id="table-sleeve-s2" data-vt="true">
+            <caption id="caption-sleeve-s2" class="visually-hidden">Sleeve 2 Trend and Breakout</caption>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Mark Price</th>
-                <th>24h Volume (USDC)</th>
-                <th>Annual Vol</th>
-                <th>Trend Alignment</th>
-                <th>Vol Surge Ratio</th>
-                <th>Event Trigger</th>
-                <th>S2 Weight (w_s2)</th>
-                <th>Net Target Weight</th>
-                <th>Current Weight</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mark_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Mark Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="day_volume_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>24h Volume (USDC)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="annualized_vol" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Annual Vol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s2_trend_alignment" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Trend Alignment</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s2_vol_surge_ratio" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Vol Surge Ratio</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="event_trigger" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Event Trigger</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="w_s2_trend_breakout" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>S2 Weight (w_s2)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="target_weight" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Net Target Weight</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="current_weight" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s2" command="--sort">
+                    <span>Current Weight</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-sleeve-s2"></tbody>
@@ -561,20 +1180,101 @@
 
       <!-- TAB 3: Sleeve 3 Event & Funding Flush -->
       <div class="tab-pane" id="tab-pane-s3">
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Sleeve 3 Event and Funding Flush">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-sleeve-s3">
+          <table class="quant-table" id="table-sleeve-s3" data-vt="true">
+            <caption id="caption-sleeve-s3" class="visually-hidden">Sleeve 3 Event and Funding Flush</caption>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Mark Price</th>
-                <th>24h Volume (USDC)</th>
-                <th>Funding APR</th>
-                <th>Funding Z-Score</th>
-                <th>Flush ATR Mult</th>
-                <th>Event Trigger</th>
-                <th>S3 Weight (w_s3)</th>
-                <th>Net Target Weight</th>
-                <th>Current Weight</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mark_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Mark Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="day_volume_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>24h Volume (USDC)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="funding_apr_pct" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Funding APR</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s3_funding_zscore" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Funding Z-Score</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="s3_flush_atr_mult" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Flush ATR Mult</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="event_trigger" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Event Trigger</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="w_s3_event_reversion" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>S3 Weight (w_s3)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="target_weight" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Net Target Weight</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="current_weight" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-sleeve-s3" command="--sort">
+                    <span>Current Weight</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-sleeve-s3"></tbody>
@@ -584,20 +1284,101 @@
 
       <!-- TAB 4: Full 150+ Hyperliquid Perp Scanner -->
       <div class="tab-pane" id="tab-pane-scanner">
-        <div class="table-scroll" tabindex="0" role="region" aria-label="Hyperliquid Perp Scanner">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-perp-scanner">
+          <table class="quant-table" id="table-perp-scanner">
+            <caption id="caption-perp-scanner" class="visually-hidden">Hyperliquid Perp Scanner</caption>
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Coin</th>
-                <th>Mark Price</th>
-                <th>Mid Price</th>
-                <th>Oracle Price</th>
-                <th>24h Volume (USDC)</th>
-                <th>Open Interest (USDC)</th>
-                <th>Funding / Hr</th>
-                <th>Max Lev</th>
-                <th>Eligibility</th>
+                <th scope="col" data-sort-key="symbol" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Symbol</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="coin" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Coin</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mark_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Mark Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="mid_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Mid Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="oracle_price" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Oracle Price</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="day_volume_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>24h Volume (USDC)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="open_interest_usdc" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Open Interest (USDC)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="funding_rate_hourly" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Funding / Hr</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="max_leverage" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Max Lev</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="eligibility_rank" data-type="number">
+                  <button type="button" class="sort-btn" commandfor="table-perp-scanner" command="--sort">
+                    <span>Eligibility</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-perp-scanner"></tbody>
@@ -612,17 +1393,74 @@
             <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: var(--neon-cyan);">
               1-SECOND MAKER LIMIT CHASER EXECUTION AUDIT
             </div>
-            <div class="table-scroll" tabindex="0" role="region" aria-label="1-Second Maker Limit Chaser Execution Audit">
-              <table class="quant-table">
+            <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-order-audit">
+              <table class="quant-table" id="table-order-audit" data-vt="true">
+                <caption id="caption-order-audit" class="visually-hidden">1-Second Maker Limit Chaser Execution Audit</caption>
                 <thead>
                   <tr>
-                    <th>Time (Local)</th>
-                    <th>Client OID</th>
-                    <th>Side</th>
-                    <th>Transition</th>
-                    <th>Limit / Fill Px</th>
-                    <th>Reserved / Committed</th>
-                    <th>Reason</th>
+                    <th scope="col" data-sort-key="created_at_ms" data-type="date">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Time (Local)</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="client_order_id" data-type="string">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Client OID</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="side" data-type="string">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Side</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="transition" data-type="string">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Transition</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="limit_price" data-type="number">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Limit / Fill Px</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="committed_usdc" data-type="number">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Reserved / Committed</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
+                    <th scope="col" data-sort-key="reason" data-type="string">
+                      <button type="button" class="sort-btn" commandfor="table-order-audit" command="--sort">
+                        <span>Reason</span>
+                        <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                          <use class="sort-asc" href="#aegis-sort-up"></use>
+                          <use class="sort-desc" href="#aegis-sort-down"></use>
+                        </svg>
+                      </button>
+                    </th>
                   </tr>
                 </thead>
                 <tbody id="tbody-order-audit"></tbody>
@@ -656,16 +1494,57 @@
             <button type="button" class="action-btn cycle-btn" id="btn-submit-config-update">Update Key</button>
           </div>
         </div>
-        <div class="table-scroll" tabindex="0" role="region" aria-label="System Configuration and Encrypted Vault">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-system-config">
+          <table class="quant-table" id="table-system-config" data-vt="true">
+            <caption id="caption-system-config" class="visually-hidden">System Configuration and Encrypted Vault</caption>
             <thead>
               <tr>
-                <th>Config Key</th>
-                <th>Current Value</th>
-                <th>Inline Edit & Save</th>
-                <th>Type</th>
-                <th>Description</th>
-                <th>Updated (Local)</th>
+                <th scope="col" data-sort-key="config_key" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-system-config" command="--sort">
+                    <span>Config Key</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="config_value" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-system-config" command="--sort">
+                    <span>Current Value</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col">Inline Edit &amp; Save</th>
+                <th scope="col" data-sort-key="value_type" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-system-config" command="--sort">
+                    <span>Type</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="description" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-system-config" command="--sort">
+                    <span>Description</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="updated_at_ms" data-type="date">
+                  <button type="button" class="sort-btn" commandfor="table-system-config" command="--sort">
+                    <span>Updated (Local)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-system-config"></tbody>
@@ -713,16 +1592,57 @@
           />
         </div>
 
-        <div class="table-scroll" tabindex="0" role="region" aria-label="System Configuration Modal" style="max-height: 60vh; overflow-y: auto;">
-          <table class="quant-table">
+        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-modal-system-config" style="max-height: 60vh; overflow-y: auto;">
+          <table class="quant-table" id="table-modal-system-config" data-vt="true">
+            <caption id="caption-modal-system-config" class="visually-hidden">System Configuration Modal</caption>
             <thead>
               <tr>
-                <th>Config Key</th>
-                <th>Current Value</th>
-                <th>Inline Edit & Save</th>
-                <th>Type</th>
-                <th>Description</th>
-                <th>Updated (Local)</th>
+                <th scope="col" data-sort-key="config_key" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-modal-system-config" command="--sort">
+                    <span>Config Key</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="config_value" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-modal-system-config" command="--sort">
+                    <span>Current Value</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col">Inline Edit &amp; Save</th>
+                <th scope="col" data-sort-key="value_type" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-modal-system-config" command="--sort">
+                    <span>Type</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="description" data-type="string">
+                  <button type="button" class="sort-btn" commandfor="table-modal-system-config" command="--sort">
+                    <span>Description</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
+                <th scope="col" data-sort-key="updated_at_ms" data-type="date">
+                  <button type="button" class="sort-btn" commandfor="table-modal-system-config" command="--sort">
+                    <span>Updated (Local)</span>
+                    <svg class="sort-icon" width="11" height="13" aria-hidden="true" focusable="false">
+                      <use class="sort-asc" href="#aegis-sort-up"></use>
+                      <use class="sort-desc" href="#aegis-sort-down"></use>
+                    </svg>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="tbody-modal-system-config"></tbody>

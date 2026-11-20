@@ -9,6 +9,7 @@ const state = {
   activeTab: 's1',
   configCategory: 'all',
   showAllPriorityWatch: false,
+  tableSort: {},
   closingPositionIds: new Set(),
   closingSymbols: new Set(),
   closeInFlightCount: 0,
@@ -37,7 +38,26 @@ const IMMUTABLE_SECURITY_KEYS = new Set([
   'hyperliquid_allowed_hosts',
   'hyperliquid_testnet',
   'risk_capital_cap_updated_at_ms',
+  'live_vault_info_json',
 ]);
+
+const SORT_COLLATOR = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: 'base',
+});
+
+const ROW_SORT_DATA = new WeakMap();
+
+const SUPPORTS_INVOKER_COMMANDS =
+  typeof HTMLButtonElement !== 'undefined' &&
+  'commandForElement' in HTMLButtonElement.prototype &&
+  'command' in HTMLButtonElement.prototype;
+
+function toFiniteNumber(val) {
+  if (val === null || val === undefined || val === '') return null;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : null;
+}
 
 function fmtUsd(val, decimals = 2) {
   const num = Number(val || 0);
@@ -63,6 +83,363 @@ function fmtSignedUsd(val, decimals = 2) {
       maximumFractionDigits: decimals,
     })
   );
+}
+
+function fmtSignedPct(pct, decimals = 2) {
+  const n = toFiniteNumber(pct);
+  if (n === null) return null;
+  const eps = 0.5 * Math.pow(10, -decimals);
+  const sign = n >= eps ? '+' : n <= -eps ? '-' : '';
+  return `${sign}${Math.abs(n).toFixed(decimals)}%`;
+}
+
+function pnlToneClass(val, eps = 0.001) {
+  const n = toFiniteNumber(val);
+  if (n === null) return 'pnl-flat';
+  if (n > eps) return 'pnl-pos';
+  if (n < -eps) return 'pnl-neg';
+  return 'pnl-flat';
+}
+
+function computeOpenPnlPct(h) {
+  const pnl = toFiniteNumber(h?.unrealized_pnl_usdc);
+  const entryPx = toFiniteNumber(h?.entry_price);
+  const qty = toFiniteNumber(h?.quantity ?? h?.filled_quantity);
+  let notional =
+    entryPx !== null && qty !== null && entryPx > 0 && Math.abs(qty) > 0
+      ? entryPx * Math.abs(qty)
+      : null;
+  if (!(notional > 0)) {
+    const committed = toFiniteNumber(h?.committed_notional_usdc);
+    notional = committed !== null && committed > 0 ? committed : null;
+  }
+
+  const backendPct = toFiniteNumber(h?.unrealized_pnl_pct);
+  if (backendPct !== null) {
+    if (backendPct === 0 && pnl !== null && Math.abs(pnl) > 0.005 && !(notional > 0)) {
+      return null;
+    }
+    return backendPct;
+  }
+  if (pnl === null || !(notional > 0)) return null;
+  const pct = (pnl / notional) * 100.0;
+  return Number.isFinite(pct) ? pct : null;
+}
+
+function computeClosedEntryNotional(p) {
+  const entryPx = toFiniteNumber(p?.entry_price);
+  const qty = toFiniteNumber(p?.filled_quantity ?? p?.quantity ?? p?.requested_quantity);
+  if (entryPx !== null && qty !== null && entryPx > 0 && Math.abs(qty) > 0) {
+    const prod = entryPx * Math.abs(qty);
+    if (Number.isFinite(prod) && prod > 0) return prod;
+  }
+  const serverNotional = toFiniteNumber(p?.entry_notional_usdc);
+  if (serverNotional !== null && serverNotional > 0) return serverNotional;
+  const committed = toFiniteNumber(p?.committed_notional_usdc);
+  if (committed !== null && committed > 0) return committed;
+  return null;
+}
+
+function computeClosedPnlPct(p) {
+  const pnl = toFiniteNumber(p?.realized_pnl_usdc);
+  const notional = computeClosedEntryNotional(p);
+
+  const backendPct = toFiniteNumber(p?.realized_pnl_pct);
+  if (backendPct !== null) {
+    if (backendPct === 0 && pnl !== null && Math.abs(pnl) > 0.005 && !(notional > 0)) {
+      return null;
+    }
+    return backendPct;
+  }
+  if (pnl === null || !(notional > 0)) return null;
+  const pct = (pnl / notional) * 100.0;
+  return Number.isFinite(pct) ? pct : null;
+}
+
+function computeVaultPnlPct(v, pctKey, pnlKey) {
+  const eq = toFiniteNumber(v?.equity_usdc);
+  const pnl = toFiniteNumber(v?.[pnlKey]);
+  const basis = eq !== null && pnl !== null ? eq - pnl : null;
+
+  const backendPct = toFiniteNumber(v?.[pctKey]);
+  if (backendPct !== null) {
+    if (backendPct === 0 && pnl !== null && Math.abs(pnl) > 0.005 && !(basis > 1e-6)) {
+      return null;
+    }
+    return backendPct;
+  }
+  if (pnl === null || !(basis > 1e-6)) return null;
+  const pct = (pnl / basis) * 100.0;
+  return Number.isFinite(pct) ? pct : null;
+}
+
+function populatePnlElement(el, pnlUsdc, pnlPct, extraClass = '') {
+  const numPnl = toFiniteNumber(pnlUsdc);
+  const tone = pnlToneClass(numPnl);
+  el.className = extraClass ? `${extraClass} pnl-cell ${tone}` : `pnl-cell ${tone}`;
+  const valSpan = document.createElement('span');
+  valSpan.className = 'pnl-val';
+  valSpan.textContent = numPnl !== null ? fmtSignedUsd(numPnl, 2) : '—';
+  const pctStr = fmtSignedPct(pnlPct, 2);
+  if (pctStr !== null && numPnl !== null) {
+    const pctSpan = document.createElement('span');
+    pctSpan.className = 'pnl-pct';
+    pctSpan.textContent = `(${pctStr})`;
+    el.replaceChildren(valSpan, document.createTextNode(' '), pctSpan);
+  } else {
+    el.replaceChildren(valSpan);
+  }
+}
+
+function createAddressChip(rawAddress) {
+  const full = String(rawAddress || '').trim();
+  const code = document.createElement('code');
+  code.className = 'addr-chip';
+  if (!full) {
+    code.textContent = '—';
+    return code;
+  }
+  code.title = full;
+  if (full.length <= 10) {
+    code.textContent = full;
+    return code;
+  }
+  // Keep full address intact in the DOM; CSS truncates the head while preserving the last 4 hex chars
+  const head = document.createElement('span');
+  head.className = 'addr-head';
+  head.textContent = full.slice(0, -4);
+  const tail = document.createTextNode(full.slice(-4));
+  code.append(head, tail);
+  return code;
+}
+
+/* ============================================================================
+   ACCESSIBLE TYPE-AWARE TABLE SORTING ENGINE (SSE-PERSISTENT)
+   ============================================================================ */
+
+function parseSortValue(raw, type) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (type === 'number' || type === 'date') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  const s = String(raw).trim();
+  return s.length > 0 && s !== '—' ? s : null;
+}
+
+function compareSortValues(rawA, rawB, type, dir) {
+  const a = parseSortValue(rawA, type);
+  const b = parseSortValue(rawB, type);
+  const aMissing = a === null;
+  const bMissing = b === null;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+
+  const factor = dir === 'ascending' ? 1 : -1;
+  if (type === 'number' || type === 'date') {
+    if (a === b) return 0;
+    return factor * (a < b ? -1 : 1);
+  }
+  return factor * SORT_COLLATOR.compare(a, b);
+}
+
+function syncTableSortHeaders(tableId) {
+  const table = document.getElementById(tableId);
+  if (!table || !table.tHead || !table.tHead.rows[0]) return;
+  const sortSpec = state.tableSort[tableId];
+  for (const th of table.tHead.rows[0].cells) {
+    const key = th.dataset.sortKey;
+    if (sortSpec && key && key === sortSpec.key) {
+      if (th.getAttribute('aria-sort') !== sortSpec.dir) {
+        th.setAttribute('aria-sort', sortSpec.dir);
+      }
+    } else if (th.hasAttribute('aria-sort')) {
+      th.removeAttribute('aria-sort');
+    }
+  }
+}
+
+function sortItemsForTable(items, tableId, extractors) {
+  syncTableSortHeaders(tableId);
+  const sortSpec = state.tableSort[tableId];
+  if (!sortSpec || !extractors || typeof extractors[sortSpec.key] !== 'function') {
+    return items;
+  }
+  const getter = extractors[sortSpec.key];
+  const indexed = items.map((item, idx) => ({
+    item,
+    idx,
+    val: getter(item),
+  }));
+  indexed.sort((a, b) => {
+    const cmp = compareSortValues(a.val, b.val, sortSpec.type, sortSpec.dir);
+    return cmp !== 0 ? cmp : a.idx - b.idx;
+  });
+  return indexed.map((entry) => entry.item);
+}
+
+function attachRowSortData(tbody, items, extractors) {
+  if (!tbody || !Array.isArray(items)) return;
+  const rows = tbody.rows;
+  const keys = Object.keys(extractors);
+  const count = Math.min(rows.length, items.length);
+  for (let i = 0; i < count; i++) {
+    const tr = rows[i];
+    if (tr.dataset.emptyRow === 'true') continue;
+    const item = items[i];
+    const data = {};
+    for (const key of keys) {
+      data[key] = extractors[key](item);
+    }
+    ROW_SORT_DATA.set(tr, data);
+  }
+}
+
+function reorderDomRows(tbody, orderedRows) {
+  const canMoveBefore =
+    typeof Element !== 'undefined' &&
+    Object.hasOwn(Element.prototype, 'moveBefore');
+  for (const row of orderedRows) {
+    if (canMoveBefore) {
+      tbody.moveBefore(row, null);
+    } else {
+      tbody.append(row);
+    }
+  }
+}
+
+function reorderTableRows(table, tbody, orderedRows) {
+  const update = () => reorderDomRows(tbody, orderedRows);
+  const reduceMotion =
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (
+    !reduceMotion &&
+    table.dataset.vt === 'true' &&
+    orderedRows.length > 1 &&
+    orderedRows.length <= 80 &&
+    typeof table.startViewTransition === 'function'
+  ) {
+    table.startViewTransition(update);
+  } else {
+    update();
+  }
+}
+
+function rerenderTableById(tableId) {
+  const dash = state.dashboard;
+  if (!dash) return;
+  switch (tableId) {
+    case 'table-vaults':
+      renderVaultPanel(dash);
+      break;
+    case 'table-priority-ordered':
+      renderPriorityAndWorkingTable(dash, true);
+      break;
+    case 'table-assets-held':
+      renderOpenHoldingsTable(dash, true);
+      break;
+    case 'table-closed-positions':
+      renderClosedPositionsTable(dash);
+      break;
+    case 'table-cooldowns':
+      renderCooldownsPanel(dash);
+      break;
+    case 'table-system-config':
+    case 'table-modal-system-config':
+      renderSystemConfigTables(true);
+      break;
+    default:
+      renderActiveExplorerTab(false);
+      break;
+  }
+}
+
+function handleTableSortActivation(table, button) {
+  if (!table || !button) return;
+  const th = button.closest('th');
+  if (!th || !th.dataset.sortKey) return;
+
+  const tableId = table.id;
+  const key = th.dataset.sortKey;
+  const type = th.dataset.type || 'string';
+  const prev = state.tableSort[tableId];
+  let dir;
+  if (prev && prev.key === key) {
+    dir = prev.dir === 'ascending' ? 'descending' : 'ascending';
+  } else {
+    dir = type === 'number' || type === 'date' ? 'descending' : 'ascending';
+  }
+
+  state.tableSort[tableId] = { key, type, dir };
+  syncTableSortHeaders(tableId);
+
+  const tbody = table.tBodies[0];
+  let rowCount = 0;
+  if (tbody) {
+    if (tbody.dataset.truncated === 'true' && state.dashboard) {
+      rerenderTableById(tableId);
+      rowCount = Array.from(tbody.rows).filter((r) => r.dataset.emptyRow !== 'true').length;
+    } else {
+      const dataRows = Array.from(tbody.rows).filter((r) => r.dataset.emptyRow !== 'true');
+      rowCount = dataRows.length;
+      if (dataRows.length > 1) {
+        const keyed = dataRows.map((tr, idx) => ({
+          tr,
+          idx,
+          val: ROW_SORT_DATA.get(tr)?.[key] ?? null,
+        }));
+        keyed.sort((a, b) => {
+          const cmp = compareSortValues(a.val, b.val, type, dir);
+          return cmp !== 0 ? cmp : a.idx - b.idx;
+        });
+        reorderTableRows(
+          table,
+          tbody,
+          keyed.map((entry) => entry.tr)
+        );
+      }
+    }
+  }
+
+  const statusEl = document.getElementById('table-sort-status');
+  if (statusEl) {
+    const tableLabel = table.caption?.textContent?.trim() || tableId;
+    const colLabel = button.textContent.trim();
+    statusEl.textContent = `Sorted ${tableLabel} by ${colLabel}, ${dir}, ${rowCount} rows`;
+  }
+}
+
+function initSortableTables() {
+  document.querySelectorAll('table.quant-table[id]').forEach((table) => {
+    if (table.dataset.sortWired === 'true') return;
+    table.dataset.sortWired = 'true';
+
+    if (SUPPORTS_INVOKER_COMMANDS) {
+      table.addEventListener('command', (evt) => {
+        if (evt.command !== '--sort') return;
+        const btn =
+          evt.source && evt.source.closest
+            ? evt.source.closest('button.sort-btn')
+            : null;
+        if (btn && table.contains(btn)) {
+          handleTableSortActivation(table, btn);
+        }
+      });
+    } else {
+      table.addEventListener('click', (evt) => {
+        const btn =
+          evt.target && evt.target.closest
+            ? evt.target.closest('button.sort-btn[command="--sort"]')
+            : null;
+        if (btn && table.contains(btn)) {
+          handleTableSortActivation(table, btn);
+        }
+      });
+    }
+  });
 }
 
 function fmtPrice(px) {
@@ -784,6 +1161,432 @@ function renderKpiCards(dash) {
   setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight ?? 0, true, 1));
 }
 
+/* ============================================================================
+   PER-TABLE SORT EXTRACTORS & VAULT / SURVEILLANCE / TRADE HISTORY RENDERERS
+   ============================================================================ */
+
+const VAULT_SORT_EXTRACTORS = {
+  name: (v) => String(v?.name || v?.vault_address || ''),
+  equity_usdc: (v) => toFiniteNumber(v?.equity_usdc),
+  pnl_usdc: (v) => toFiniteNumber(v?.pnl_usdc),
+  all_time_pnl_usdc: (v) => toFiniteNumber(v?.all_time_pnl_usdc),
+  apr_pct: (v) => toFiniteNumber(v?.apr_pct),
+  days_following: (v) => toFiniteNumber(v?.days_following),
+  locked_until_ms: (v) => {
+    if (!v) return null;
+    if (v.is_locked) {
+      const ts = toFiniteNumber(v.locked_until_ms);
+      return ts !== null && ts > 0 ? ts : null;
+    }
+    return 0;
+  },
+};
+
+const PRIORITY_ORDERED_SORT_EXTRACTORS = {
+  symbol: (r) => r.symbol,
+  state: (r) => r.state,
+  side: (r) => r.side,
+  price: (r) => r.price,
+  mid_dist_bps: (r) => r.mid_dist_bps,
+  reserved_usdc: (r) => r.reserved_usdc,
+  chases: (r) => r.chases,
+};
+
+const HELD_SORT_EXTRACTORS = {
+  symbol: (h) => String(h?.symbol ?? ''),
+  side: (h) => String(h?.side ?? ''),
+  committed_notional_usdc: (h) => toFiniteNumber(h?.committed_notional_usdc),
+  entry_price: (h) => toFiniteNumber(h?.entry_price),
+  protective_stop_px: (h) => {
+    const px = toFiniteNumber(h?.protective_stop_px);
+    return px !== null && px > 0 ? px : null;
+  },
+  take_profit_px: (h) => {
+    const px = toFiniteNumber(h?.take_profit_px);
+    return px !== null && px > 0 ? px : null;
+  },
+  unrealized_pnl_usdc: (h) => toFiniteNumber(h?.unrealized_pnl_usdc),
+  sleeve_mix: (h) =>
+    Math.abs(toFiniteNumber(h?.s1_weight_contrib) ?? 0) +
+    Math.abs(toFiniteNumber(h?.s2_weight_contrib) ?? 0) +
+    Math.abs(toFiniteNumber(h?.s3_weight_contrib) ?? 0),
+};
+
+const CLOSED_SORT_EXTRACTORS = {
+  closed_at_ms: (p) => {
+    const ts = toFiniteNumber(p?.closed_at_ms ?? p?.updated_at_ms);
+    return ts !== null && ts > 0 ? ts : null;
+  },
+  symbol: (p) => String(p?._resolved_symbol ?? p?.symbol ?? ''),
+  side: (p) => String(p?.side ?? ''),
+  entry_notional_usdc: (p) => computeClosedEntryNotional(p),
+  entry_price: (p) => {
+    const px = toFiniteNumber(p?.entry_price);
+    return px !== null && px > 0 ? px : null;
+  },
+  realized_pnl_usdc: (p) => toFiniteNumber(p?.realized_pnl_usdc),
+  fees_funding_usdc: (p) => {
+    const funding = toFiniteNumber(p?.funding_accrued_usdc) ?? 0;
+    const fees = toFiniteNumber(p?.fees_paid_usdc) ?? 0;
+    return funding - fees;
+  },
+  exit_reason: (p) => {
+    const r = String(p?.exit_reason || '').trim();
+    return r || null;
+  },
+};
+
+const COOLDOWN_SORT_EXTRACTORS = {
+  symbol: (c) => String(c?.symbol ?? ''),
+  cooldown_type: (c) => String(c?.cooldown_type ?? ''),
+  remaining_seconds: (c) => toFiniteNumber(c?.remaining_seconds),
+  expires_at_ms: (c) => {
+    const ts = toFiniteNumber(c?.expires_at_ms);
+    return ts !== null && ts > 0 ? ts : null;
+  },
+  reason: (c) => {
+    const r = String(c?.reason || '').trim();
+    return r || null;
+  },
+};
+
+const S1_SORT_EXTRACTORS = {
+  symbol: (r) => String(r?.symbol ?? ''),
+  mark_price: (r) => toFiniteNumber(r?.mark_price),
+  day_volume_usdc: (r) => toFiniteNumber(r?.day_volume_usdc),
+  funding_rate_hourly: (r) => toFiniteNumber(r?.funding_rate_hourly),
+  funding_apr_pct: (r) => toFiniteNumber(r?.funding_apr_pct),
+  annualized_vol: (r) => toFiniteNumber(r?.annualized_vol),
+  market_beta: (r) => toFiniteNumber(r?.market_beta),
+  s1_mom_score: (r) => toFiniteNumber(r?.s1_mom_score),
+  s1_carry_score: (r) => toFiniteNumber(r?.s1_carry_score),
+  w_s1_carry_mom: (r) => toFiniteNumber(r?.w_s1_carry_mom),
+  target_weight: (r) => toFiniteNumber(r?.target_weight),
+};
+
+const S2_SORT_EXTRACTORS = {
+  symbol: (r) => String(r?.symbol ?? ''),
+  mark_price: (r) => toFiniteNumber(r?.mark_price),
+  day_volume_usdc: (r) => toFiniteNumber(r?.day_volume_usdc),
+  annualized_vol: (r) => toFiniteNumber(r?.annualized_vol),
+  s2_trend_alignment: (r) => toFiniteNumber(r?.s2_trend_alignment),
+  s2_vol_surge_ratio: (r) => toFiniteNumber(r?.s2_vol_surge_ratio),
+  event_trigger: (r) => (r?.event_trigger ? String(r.event_trigger) : null),
+  w_s2_trend_breakout: (r) => toFiniteNumber(r?.w_s2_trend_breakout),
+  target_weight: (r) => toFiniteNumber(r?.target_weight),
+  current_weight: (r) => toFiniteNumber(r?.current_weight),
+};
+
+const S3_SORT_EXTRACTORS = {
+  symbol: (r) => String(r?.symbol ?? ''),
+  mark_price: (r) => toFiniteNumber(r?.mark_price),
+  day_volume_usdc: (r) => toFiniteNumber(r?.day_volume_usdc),
+  funding_apr_pct: (r) => toFiniteNumber(r?.funding_apr_pct),
+  s3_funding_zscore: (r) => toFiniteNumber(r?.s3_funding_zscore),
+  s3_flush_atr_mult: (r) => toFiniteNumber(r?.s3_flush_atr_mult),
+  event_trigger: (r) => (r?.event_trigger ? String(r.event_trigger) : null),
+  w_s3_event_reversion: (r) => toFiniteNumber(r?.w_s3_event_reversion),
+  target_weight: (r) => toFiniteNumber(r?.target_weight),
+  current_weight: (r) => toFiniteNumber(r?.current_weight),
+};
+
+const SCANNER_SORT_EXTRACTORS = {
+  symbol: (a) => String(a?.symbol ?? ''),
+  coin: (a) => String(a?.coin ?? ''),
+  mark_price: (a) => toFiniteNumber(a?.mark_price),
+  mid_price: (a) => toFiniteNumber(a?.mid_price),
+  oracle_price: (a) => toFiniteNumber(a?.oracle_price),
+  day_volume_usdc: (a) => toFiniteNumber(a?.day_volume_usdc),
+  open_interest_usdc: (a) => toFiniteNumber(a?.open_interest_usdc),
+  funding_rate_hourly: (a) => toFiniteNumber(a?.funding_rate_hourly),
+  max_leverage: (a) => toFiniteNumber(a?.max_leverage),
+  eligibility_rank: (a) =>
+    (a?.is_priority_watched ? 4 : 0) +
+    (a?.is_core_eligible ? 2 : 0) +
+    (a?.is_event_eligible ? 1 : 0),
+};
+
+const AUDIT_SORT_EXTRACTORS = {
+  created_at_ms: (a) => {
+    const ts = toFiniteNumber(a?.created_at_ms);
+    return ts !== null && ts > 0 ? ts : null;
+  },
+  client_order_id: (a) => String(a?.client_order_id ?? ''),
+  side: (a) => String(a?.side ?? ''),
+  transition: (a) => `${a?.from_state ?? ''} -> ${a?.to_state ?? ''}`,
+  limit_price: (a) => {
+    const lp = toFiniteNumber(a?.limit_price);
+    if (lp !== null && lp > 0) return lp;
+    const fp = toFiniteNumber(a?.avg_fill_price);
+    return fp !== null && fp > 0 ? fp : null;
+  },
+  committed_usdc: (a) => {
+    const comm = toFiniteNumber(a?.committed_usdc);
+    if (comm !== null && comm > 0) return comm;
+    return toFiniteNumber(a?.reserved_usdc);
+  },
+  reason: (a) => {
+    const r = String(a?.reason || '').trim();
+    return r || null;
+  },
+};
+
+const CONFIG_SORT_EXTRACTORS = {
+  config_key: (c) => String(c?.config_key ?? ''),
+  config_value: (c) => String(c?.config_value ?? ''),
+  value_type: (c) => String(c?.value_type ?? ''),
+  description: (c) => String(c?.description ?? ''),
+  updated_at_ms: (c) => {
+    const ts = toFiniteNumber(c?.updated_at_ms);
+    return ts !== null && ts > 0 ? ts : null;
+  },
+};
+
+function renderVaultPanel(dash) {
+  const tbody = document.getElementById('tbody-vaults');
+  if (!tbody) return;
+
+  const vi = (dash && dash.vault_info) || {};
+  const perpEq = toFiniteNumber(dash?.snapshot?.total_equity_usdc) ?? 0;
+  const totalVaultEq = toFiniteNumber(vi.total_vault_equity_usdc) ?? 0;
+  const combinedEq =
+    toFiniteNumber(vi.combined_portfolio_equity_usdc) ?? perpEq + totalVaultEq;
+  const rawVaults = Array.isArray(vi.vaults) ? vi.vaults : [];
+  const vaultCount = toFiniteNumber(vi.vault_count) ?? rawVaults.length;
+  const configuredAddr = String(vi.configured_vault_address || '').trim();
+  const syncedAtMs = toFiniteNumber(vi.synced_at_ms) ?? 0;
+
+  const setTxt = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+
+  // Configured vault badge in header
+  const cfgBadge = document.getElementById('vault-configured-badge');
+  if (cfgBadge) {
+    if (configuredAddr) {
+      cfgBadge.hidden = false;
+      const lbl = document.createElement('span');
+      lbl.textContent = 'Configured:';
+      cfgBadge.replaceChildren(lbl, createAddressChip(configuredAddr));
+    } else {
+      cfgBadge.hidden = true;
+      cfgBadge.replaceChildren();
+    }
+  }
+
+  // Sync pill in header
+  const syncPill = document.getElementById('vault-sync-pill');
+  if (syncPill) {
+    const countLabel = `${vaultCount} ${vaultCount === 1 ? 'VAULT' : 'VAULTS'}`;
+    const shortSync = syncedAtMs > 0 ? fmtLocalShortTime(syncedAtMs) : '';
+    syncPill.textContent = shortSync ? `${countLabel} · ${shortSync}` : countLabel;
+    syncPill.title = syncedAtMs > 0 ? `Last synced: ${fmtLocalTime(syncedAtMs)}` : 'No vault sync recorded yet';
+  }
+
+  // KPI cards
+  const closedCount = rawVaults.filter((v) => Boolean(v?.is_closed)).length;
+  const activeCount = Math.max(0, rawVaults.length - closedCount);
+  const lockedCount = rawVaults.filter((v) => Boolean(v?.is_locked)).length;
+
+  setTxt('vault-total-equity', fmtUsd(totalVaultEq, 2));
+  setTxt(
+    'vault-count-sub',
+    closedCount > 0
+      ? `${activeCount} Active · ${closedCount} Closed`
+      : `${vaultCount} ${vaultCount === 1 ? 'Active Vault' : 'Active Vaults'}`
+  );
+  setTxt(
+    'vault-synced-sub',
+    syncedAtMs > 0 ? `Synced ${fmtLocalTime(syncedAtMs)}` : 'Awaiting vault sync'
+  );
+
+  setTxt('vault-combined-equity', fmtUsd(combinedEq, 2));
+  setTxt(
+    'vault-combined-breakdown',
+    `Perp ${fmtUsd(perpEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
+  );
+
+  // Aggregate vault PnL & weighted APR
+  const sumPnl = rawVaults.reduce((acc, v) => acc + (toFiniteNumber(v?.pnl_usdc) ?? 0), 0);
+  const sumAllTime = rawVaults.reduce(
+    (acc, v) => acc + (toFiniteNumber(v?.all_time_pnl_usdc) ?? 0),
+    0
+  );
+  const aggBasis = totalVaultEq - sumPnl;
+  const aggPnlPct = aggBasis > 1e-6 ? (sumPnl / aggBasis) * 100.0 : null;
+  const aggAtBasis = totalVaultEq - sumAllTime;
+  const aggAtPct = aggAtBasis > 1e-6 ? (sumAllTime / aggAtBasis) * 100.0 : null;
+
+  let weightedApr = null;
+  if (rawVaults.length > 0) {
+    let weightSum = 0;
+    let aprWeightedSum = 0;
+    let aprSimpleSum = 0;
+    let aprCount = 0;
+    for (const v of rawVaults) {
+      const apr = toFiniteNumber(v?.apr_pct);
+      const eq = toFiniteNumber(v?.equity_usdc) ?? 0;
+      if (apr !== null) {
+        aprSimpleSum += apr;
+        aprCount += 1;
+        if (eq > 0) {
+          weightSum += eq;
+          aprWeightedSum += apr * eq;
+        }
+      }
+    }
+    if (weightSum > 0) {
+      weightedApr = aprWeightedSum / weightSum;
+    } else if (aprCount > 0) {
+      weightedApr = aprSimpleSum / aprCount;
+    }
+  }
+
+  const totalPnlEl = document.getElementById('vault-total-pnl');
+  if (totalPnlEl) {
+    populatePnlElement(
+      totalPnlEl,
+      rawVaults.length > 0 ? sumPnl : 0,
+      rawVaults.length > 0 ? aggPnlPct : null,
+      'vault-kpi-value'
+    );
+  }
+
+  const allTimeEl = document.getElementById('vault-alltime-pnl');
+  if (allTimeEl) {
+    const atPctStr = rawVaults.length > 0 ? fmtSignedPct(aggAtPct, 2) : null;
+    allTimeEl.textContent =
+      rawVaults.length > 0
+        ? `All-Time: ${fmtSignedUsd(sumAllTime, 2)}${atPctStr ? ` (${atPctStr})` : ''}`
+        : 'All-Time: $0.00';
+  }
+
+  const avgAprStr = weightedApr !== null ? fmtSignedPct(weightedApr, 2) : null;
+  setTxt('vault-avg-apr', avgAprStr ? `APR: ${avgAprStr}` : 'APR: —');
+  setTxt(
+    'vault-lock-summary',
+    rawVaults.length === 0
+      ? 'No active deposits'
+      : lockedCount > 0
+      ? `${lockedCount} Locked · ${rawVaults.length - lockedCount} Unlocked`
+      : 'All Unlocked'
+  );
+
+  // Sort vault rows using persistent sort state
+  const sortedVaults = sortItemsForTable(rawVaults, 'table-vaults', VAULT_SORT_EXTRACTORS);
+  tbody.dataset.truncated = 'false';
+
+  if (sortedVaults.length === 0) {
+    const tr = document.createElement('tr');
+    tr.dataset.emptyRow = 'true';
+    const td = document.createElement('td');
+    td.colSpan = 7;
+    td.className = 'table-empty-cell';
+    if (configuredAddr) {
+      td.append(
+        document.createTextNode('No active Hyperliquid vault deposits synced yet · Configured Vault: '),
+        createAddressChip(configuredAddr)
+      );
+      if (syncedAtMs > 0) {
+        td.append(document.createTextNode(` · Last checked ${fmtLocalTime(syncedAtMs)}`));
+      }
+    } else {
+      td.textContent =
+        'No active Hyperliquid vault deposits synced yet — vault funds remain segregated from perp margin.';
+    }
+    tr.appendChild(td);
+    tbody.replaceChildren(tr);
+    return;
+  }
+
+  const rows = sortedVaults.map((v) => {
+    const tr = document.createElement('tr');
+
+    // 1. Vault Name + truncated address with full address tooltip (full address kept in DOM)
+    const tdName = document.createElement('td');
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'vault-name-cell';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'sym-badge';
+    nameSpan.textContent = String(v?.name || 'Hyperliquid Vault');
+    if (v?.leader) {
+      nameSpan.title = `Leader: ${String(v.leader)}`;
+    }
+    nameWrap.appendChild(nameSpan);
+    if (v?.is_closed) {
+      const closedBadge = document.createElement('span');
+      closedBadge.className = 'vault-closed-badge';
+      closedBadge.textContent = 'CLOSED';
+      nameWrap.appendChild(closedBadge);
+    }
+    if (v?.vault_address) {
+      nameWrap.appendChild(createAddressChip(v.vault_address));
+    }
+    tdName.appendChild(nameWrap);
+
+    // 2. Equity USDC
+    const tdEq = document.createElement('td');
+    tdEq.className = 'num-cell cell-committed';
+    tdEq.textContent = fmtUsd(v?.equity_usdc ?? 0, 2);
+
+    // 3. PnL ($ and %)
+    const tdPnl = document.createElement('td');
+    populatePnlElement(
+      tdPnl,
+      v?.pnl_usdc,
+      computeVaultPnlPct(v, 'pnl_pct', 'pnl_usdc')
+    );
+
+    // 4. All-Time PnL ($ and %)
+    const tdAtPnl = document.createElement('td');
+    populatePnlElement(
+      tdAtPnl,
+      v?.all_time_pnl_usdc,
+      computeVaultPnlPct(v, 'all_time_pnl_pct', 'all_time_pnl_usdc')
+    );
+
+    // 5. APR %
+    const tdApr = document.createElement('td');
+    const aprVal = toFiniteNumber(v?.apr_pct);
+    const aprStr = fmtSignedPct(aprVal, 2);
+    tdApr.className = `num-cell ${pnlToneClass(aprVal, 0.005)}`;
+    tdApr.textContent = aprStr ?? '—';
+
+    // 6. Days Following
+    const tdDays = document.createElement('td');
+    const daysVal = toFiniteNumber(v?.days_following);
+    tdDays.className = 'num-cell';
+    tdDays.textContent =
+      daysVal !== null ? `${Math.max(0, Math.floor(daysVal))}d` : '—';
+
+    // 7. Lockup Status
+    const tdLock = document.createElement('td');
+    const lockedUntil = toFiniteNumber(v?.locked_until_ms) ?? 0;
+    const pill = document.createElement('span');
+    if (v?.is_locked) {
+      pill.className = 'status-pill working';
+      pill.textContent =
+        lockedUntil > 0
+          ? `Locked · ${fmtLocalTime(lockedUntil)}`
+          : 'Locked';
+    } else {
+      pill.className = 'status-pill open';
+      pill.textContent = 'Unlocked';
+      if (lockedUntil > 0) {
+        pill.title = `Unlocked since ${fmtLocalTime(lockedUntil)}`;
+      }
+    }
+    tdLock.appendChild(pill);
+
+    tr.append(tdName, tdEq, tdPnl, tdAtPnl, tdApr, tdDays, tdLock);
+    return tr;
+  });
+
+  tbody.replaceChildren(...rows);
+  attachRowSortData(tbody, sortedVaults, VAULT_SORT_EXTRACTORS);
+}
+
 function renderPriorityAndWorkingTable(dash, forceRender = false) {
   const tbody = document.getElementById('tbody-priority-ordered');
   const toggleBtn = document.getElementById('btn-toggle-watch-all');
@@ -830,70 +1633,119 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
     }
   }
 
-  const rowsHtml = [];
+  const unifiedAll = [
+    ...ordered.map((o) => ({
+      kind: 'working',
+      item: o,
+      symbol: String(o.symbol ?? ''),
+      state: String(o.fsm_state || 'WORKING_ALO'),
+      side: String(o.side ?? ''),
+      price: toFiniteNumber(o.limit_price) ?? toFiniteNumber(o.mark_price),
+      mid_dist_bps: toFiniteNumber(o.distance_from_mid_bps),
+      reserved_usdc: toFiniteNumber(o.reserved_margin_usdc),
+      chases: toFiniteNumber(o.chase_count) ?? 0,
+    })),
+    ...passiveWatched.map((p) => ({
+      kind: 'watch',
+      item: p,
+      symbol: String(p.symbol ?? ''),
+      state: String(p.event_trigger || 'PRIORITY_WATCH'),
+      side: null,
+      price: toFiniteNumber(p.mark_price),
+      mid_dist_bps: 0,
+      reserved_usdc: 0,
+      chases: null,
+    })),
+  ];
 
-  // 1. Render active WORKING orders first
-  ordered.forEach((o) => {
-    const sideCls = String(o.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
-    const hasTpsl = Number(o.protective_stop_px || 0) > 0 || Number(o.take_profit_px || 0) > 0;
-    const tpslHint = hasTpsl
-      ? `<br><small style="color:var(--text-muted)">SL ${fmtPrice(o.protective_stop_px)} · TP ${fmtPrice(o.take_profit_px)}</small>`
-      : '';
-    rowsHtml.push(`
-      <tr>
-        <td><span class="sym-badge">${escapeHtml(o.symbol)}</span></td>
-        <td><span class="status-pill working">${escapeHtml(o.fsm_state || 'WORKING_ALO')}</span></td>
-        <td><span class="side-pill ${sideCls}">${escapeHtml(o.side)}</span></td>
-        <td>${fmtPrice(o.limit_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(o.mark_price)}</small>${tpslHint}</td>
-        <td style="color: var(--neon-cyan); font-weight: 700;">${Number(o.distance_from_mid_bps || 0).toFixed(2)} bps</td>
-        <td style="color: #fbbf24; font-weight: 700;">${fmtUsd(o.reserved_margin_usdc)}</td>
-        <td><span class="tab-count">${Number(o.chase_count || 0)}</span></td>
-        <td>
-          <button
-            type="button"
-            class="close-btn"
-            data-action="close-position"
-            data-position-id="${Number(o.position_id)}"
-            data-symbol="${escapeHtml(o.symbol)}"
-            data-cooldown="false"
-          >Cancel</button>
-        </td>
-      </tr>
-    `);
-  });
+  const isSorted = Boolean(state.tableSort['table-priority-ordered']);
+  let visibleEntries;
+  let truncated = false;
 
-  // 2. Render pre-entry priority watched items (capped unless toggled)
-  const visibleWatched = state.showAllPriorityWatch
-    ? passiveWatched
-    : passiveWatched.slice(0, maxPassiveDefault);
+  if (isSorted) {
+    const sortedAll = sortItemsForTable(
+      unifiedAll,
+      'table-priority-ordered',
+      PRIORITY_ORDERED_SORT_EXTRACTORS
+    );
+    const cap = state.showAllPriorityWatch
+      ? sortedAll.length
+      : ordered.length + maxPassiveDefault;
+    visibleEntries = sortedAll.slice(0, Math.max(ordered.length, cap));
+    truncated = sortedAll.length > visibleEntries.length;
+  } else {
+    syncTableSortHeaders('table-priority-ordered');
+    const visiblePassiveCount = state.showAllPriorityWatch
+      ? passiveWatched.length
+      : Math.min(passiveWatched.length, maxPassiveDefault);
+    visibleEntries = [
+      ...unifiedAll.slice(0, ordered.length),
+      ...unifiedAll.slice(ordered.length, ordered.length + visiblePassiveCount),
+    ];
+    truncated = passiveWatched.length > visiblePassiveCount;
+  }
 
-  visibleWatched.forEach((p) => {
-    const statusLabel = p.event_trigger || 'PRIORITY_WATCH';
-    rowsHtml.push(`
-      <tr>
-        <td><span class="sym-badge">${escapeHtml(p.symbol)}</span></td>
-        <td><span class="status-pill watch">${escapeHtml(statusLabel)}</span></td>
-        <td><span class="pnl-flat">—</span></td>
-        <td>${fmtPrice(p.mark_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(p.mid_price || p.mark_price)}</small></td>
-        <td>0.00 bps</td>
-        <td>$0.00</td>
-        <td><span class="tab-count">1s</span></td>
-        <td><span class="pnl-flat">1s Watch</span></td>
-      </tr>
-    `);
-  });
+  tbody.dataset.truncated = truncated ? 'true' : 'false';
 
-  if (rowsHtml.length === 0) {
+  if (visibleEntries.length === 0) {
     tbody.innerHTML = `
-      <tr>
-        <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 18px;">
+      <tr data-empty-row="true">
+        <td colspan="8" class="table-empty-cell">
           No active WORKING orders or priority triggers — monitoring 1s watchlist stream...
         </td>
       </tr>
     `;
-  } else {
-    tbody.innerHTML = rowsHtml.join('');
+    return;
   }
+
+  const rowsHtml = visibleEntries.map((entry) => {
+    if (entry.kind === 'working') {
+      const o = entry.item;
+      const sideCls = String(o.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
+      const hasTpsl = Number(o.protective_stop_px || 0) > 0 || Number(o.take_profit_px || 0) > 0;
+      const tpslHint = hasTpsl
+        ? `<br><small style="color:var(--text-muted)">SL ${fmtPrice(o.protective_stop_px)} · TP ${fmtPrice(o.take_profit_px)}</small>`
+        : '';
+      return `
+        <tr>
+          <td><span class="sym-badge">${escapeHtml(o.symbol)}</span></td>
+          <td><span class="status-pill working">${escapeHtml(o.fsm_state || 'WORKING_ALO')}</span></td>
+          <td><span class="side-pill ${sideCls}">${escapeHtml(o.side)}</span></td>
+          <td class="num-cell">${fmtPrice(o.limit_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(o.mark_price)}</small>${tpslHint}</td>
+          <td class="num-cell" style="color: var(--neon-cyan); font-weight: 700;">${Number(o.distance_from_mid_bps || 0).toFixed(2)} bps</td>
+          <td class="num-cell" style="color: #fbbf24; font-weight: 700;">${fmtUsd(o.reserved_margin_usdc)}</td>
+          <td class="num-cell"><span class="tab-count">${Number(o.chase_count || 0)}</span></td>
+          <td>
+            <button
+              type="button"
+              class="close-btn"
+              data-action="close-position"
+              data-position-id="${Number(o.position_id)}"
+              data-symbol="${escapeHtml(o.symbol)}"
+              data-cooldown="false"
+            >Cancel</button>
+          </td>
+        </tr>
+      `;
+    }
+    const p = entry.item;
+    const statusLabel = p.event_trigger || 'PRIORITY_WATCH';
+    return `
+      <tr>
+        <td><span class="sym-badge">${escapeHtml(p.symbol)}</span></td>
+        <td><span class="status-pill watch">${escapeHtml(statusLabel)}</span></td>
+        <td><span class="pnl-flat">—</span></td>
+        <td class="num-cell">${fmtPrice(p.mark_price)} <small style="color:var(--text-muted)">/ ${fmtPrice(p.mid_price || p.mark_price)}</small></td>
+        <td class="num-cell">0.00 bps</td>
+        <td class="num-cell">$0.00</td>
+        <td><span class="tab-count">1s</span></td>
+        <td><span class="pnl-flat">1s Watch</span></td>
+      </tr>
+    `;
+  });
+
+  tbody.innerHTML = rowsHtml.join('');
+  attachRowSortData(tbody, visibleEntries, PRIORITY_ORDERED_SORT_EXTRACTORS);
 }
 
 function isPreCapHolding(h, capEpochMs) {
@@ -927,11 +1779,14 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
   if (!forceRender && state.closeInFlightCount > 0) return;
 
   const rawHeld = (dash && dash.v_assets_held) || [];
-  const held = rawHeld.filter(
+  const heldFiltered = rawHeld.filter(
     (h) =>
       !state.closingPositionIds.has(Number(h.position_id)) &&
       !state.closingSymbols.has(String(h.symbol))
   );
+  const held = sortItemsForTable(heldFiltered, 'table-assets-held', HELD_SORT_EXTRACTORS);
+  tbody.dataset.truncated = 'false';
+
   const capEpochMs = Number(dash?.risk_capital_cap_updated_at_ms ?? 0);
   const maxOpenPositions = Math.max(
     1,
@@ -962,6 +1817,7 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
 
   if (held.length === 0) {
     const emptyRow = document.createElement('tr');
+    emptyRow.dataset.emptyRow = 'true';
     const emptyCell = document.createElement('td');
     emptyCell.colSpan = 9;
     emptyCell.className = 'table-empty-cell';
@@ -976,8 +1832,8 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     const isPreCap = isPreCapHolding(h, capEpochMs);
     const sideStr = String(h.side ?? '');
     const sideCls = sideStr.toUpperCase() === 'SHORT' ? 'short' : 'long';
-    const upnl = Number(h.unrealized_pnl_usdc || 0);
-    const pnlCls = upnl > 0.001 ? 'pnl-pos' : upnl < -0.001 ? 'pnl-neg' : 'pnl-flat';
+    const upnl = toFiniteNumber(h.unrealized_pnl_usdc) ?? 0;
+    const upnlPct = computeOpenPnlPct(h);
     const stopDist =
       h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
         ? `${Number(h.stop_distance_pct).toFixed(2)}%`
@@ -1016,19 +1872,21 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     tdSide.appendChild(sidePill);
 
     const tdCommitted = document.createElement('td');
-    tdCommitted.className = 'cell-committed';
+    tdCommitted.className = 'num-cell cell-committed';
     tdCommitted.append(
       document.createTextNode(`${fmtUsd(h.committed_notional_usdc)} `),
       createTableSmall('cell-muted-sub', `(${fmtPct(h.portfolio_weight || 0)})`)
     );
 
     const tdEntryMark = document.createElement('td');
+    tdEntryMark.className = 'num-cell';
     tdEntryMark.append(
       document.createTextNode(`${fmtPrice(h.entry_price)} `),
       createTableSmall('cell-mark-price', `→ ${fmtPrice(h.mark_price)}`)
     );
 
     const tdSl = document.createElement('td');
+    tdSl.className = 'num-cell';
     const slBadge = createSleeveTag(
       slOid ? 's1' : 's3',
       slOid ? `Exchange SL Order: ${slOid}` : 'SL Order Pending',
@@ -1042,6 +1900,7 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     );
 
     const tdTp = document.createElement('td');
+    tdTp.className = 'num-cell';
     const tpPxText = Number(h.take_profit_px || 0) > 0 ? fmtPrice(h.take_profit_px) : '—';
     const tpBadge = createSleeveTag(
       tpOid ? 's2' : 's3',
@@ -1056,8 +1915,7 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     );
 
     const tdPnl = document.createElement('td');
-    tdPnl.className = pnlCls;
-    tdPnl.textContent = fmtSignedUsd(upnl);
+    populatePnlElement(tdPnl, upnl, upnlPct);
 
     const tdSleeves = document.createElement('td');
     const sleeveDiv = document.createElement('div');
@@ -1095,6 +1953,134 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
   });
 
   tbody.replaceChildren(...rows);
+  attachRowSortData(tbody, held, HELD_SORT_EXTRACTORS);
+}
+
+function renderClosedPositionsTable(dash) {
+  const tbody = document.getElementById('tbody-closed-positions');
+  const pill = document.getElementById('closed-count-pill');
+  if (!tbody) return;
+
+  const rawClosed =
+    (dash && (dash.recent_closed_positions || dash.closed_positions)) || [];
+  const assetById = new Map();
+  ((dash && dash.exchange_assets) || []).forEach((a) => {
+    if (a && a.id != null) assetById.set(Number(a.id), String(a.symbol || a.coin || ''));
+  });
+
+  const enriched = rawClosed.map((p) => {
+    const resolvedSym =
+      String(p?.symbol || '').trim() ||
+      assetById.get(Number(p?.asset_id)) ||
+      (p?.coin ? `${p.coin}-USDC` : '—');
+    return { ...p, _resolved_symbol: resolvedSym };
+  });
+
+  const query = (document.getElementById('closed-search-input')?.value || '')
+    .trim()
+    .toUpperCase();
+  const filtered = query
+    ? enriched.filter((p) => {
+        const sym = String(p._resolved_symbol || '').toUpperCase();
+        const coin = String(p.coin || '').toUpperCase();
+        const reason = String(p.exit_reason || '').toUpperCase();
+        const side = String(p.side || '').toUpperCase();
+        return (
+          sym.includes(query) ||
+          coin.includes(query) ||
+          reason.includes(query) ||
+          side.includes(query)
+        );
+      })
+    : enriched;
+
+  if (pill) {
+    pill.textContent =
+      query && filtered.length !== enriched.length
+        ? `${filtered.length}/${enriched.length} CLOSED`
+        : `${enriched.length} CLOSED`;
+  }
+
+  const sorted = sortItemsForTable(
+    filtered,
+    'table-closed-positions',
+    CLOSED_SORT_EXTRACTORS
+  );
+  tbody.dataset.truncated = 'false';
+
+  if (sorted.length === 0) {
+    const emptyRow = document.createElement('tr');
+    emptyRow.dataset.emptyRow = 'true';
+    const emptyCell = document.createElement('td');
+    emptyCell.colSpan = 8;
+    emptyCell.className = 'table-empty-cell';
+    emptyCell.textContent = query
+      ? 'No closed trades matching search filter.'
+      : 'No closed trades recorded yet.';
+    emptyRow.appendChild(emptyCell);
+    tbody.replaceChildren(emptyRow);
+    return;
+  }
+
+  const rows = sorted.map((p) => {
+    const tr = document.createElement('tr');
+
+    const tdTime = document.createElement('td');
+    tdTime.className = 'num-cell';
+    tdTime.textContent = fmtLocalTime(p.closed_at_ms ?? p.updated_at_ms);
+
+    const tdSym = document.createElement('td');
+    const symBadge = document.createElement('span');
+    symBadge.className = 'sym-badge';
+    symBadge.textContent = String(p._resolved_symbol || '—');
+    tdSym.appendChild(symBadge);
+
+    const tdSide = document.createElement('td');
+    const sideStr = String(p.side || 'LONG');
+    const sidePill = document.createElement('span');
+    sidePill.className = `side-pill ${sideStr.toUpperCase() === 'SHORT' ? 'short' : 'long'}`;
+    sidePill.textContent = sideStr;
+    tdSide.appendChild(sidePill);
+
+    const notional = computeClosedEntryNotional(p);
+    const tdNotional = document.createElement('td');
+    tdNotional.className = 'num-cell cell-committed';
+    tdNotional.textContent = notional !== null && notional > 0 ? fmtUsd(notional, 2) : '—';
+
+    const tdPx = document.createElement('td');
+    tdPx.className = 'num-cell';
+    const entryPx = toFiniteNumber(p.entry_price);
+    const exitPx = toFiniteNumber(p.exit_price ?? p.current_price);
+    tdPx.append(
+      document.createTextNode(`${entryPx !== null && entryPx > 0 ? fmtPrice(entryPx) : '—'} `),
+      createTableSmall(
+        'cell-mark-price',
+        `→ ${exitPx !== null && exitPx > 0 ? fmtPrice(exitPx) : '—'}`
+      )
+    );
+
+    const tdRpnl = document.createElement('td');
+    populatePnlElement(tdRpnl, p.realized_pnl_usdc, computeClosedPnlPct(p));
+
+    const netFeesFunding =
+      (toFiniteNumber(p.funding_accrued_usdc) ?? 0) -
+      (toFiniteNumber(p.fees_paid_usdc) ?? 0);
+    const tdFees = document.createElement('td');
+    tdFees.className = `num-cell ${pnlToneClass(netFeesFunding, 0.001)}`;
+    tdFees.textContent = fmtSignedUsd(netFeesFunding, 2);
+
+    const tdReason = document.createElement('td');
+    tdReason.className = 'reason-cell';
+    const reasonText = String(p.exit_reason || '').trim() || '—';
+    tdReason.title = reasonText;
+    tdReason.textContent = reasonText;
+
+    tr.append(tdTime, tdSym, tdSide, tdNotional, tdPx, tdRpnl, tdFees, tdReason);
+    return tr;
+  });
+
+  tbody.replaceChildren(...rows);
+  attachRowSortData(tbody, sorted, CLOSED_SORT_EXTRACTORS);
 }
 
 function formatCooldownRemaining(secRaw) {
@@ -1108,35 +2094,69 @@ function formatCooldownRemaining(secRaw) {
 }
 
 function renderCooldownsPanel(dash) {
-  const listEl = document.getElementById('cooldown-badges-list');
+  const tbody = document.getElementById('tbody-cooldowns');
   const pillEl = document.getElementById('cooldown-count-pill');
-  if (!listEl) return;
+  if (!tbody) return;
 
-  const cooldowns = (dash && dash.v_assets_in_cooldown) || [];
+  const rawCooldowns = (dash && dash.v_assets_in_cooldown) || [];
   if (pillEl) {
-    pillEl.textContent = `${cooldowns.length} ACTIVE`;
+    pillEl.textContent = `${rawCooldowns.length} ACTIVE`;
   }
 
+  const cooldowns = sortItemsForTable(
+    rawCooldowns,
+    'table-cooldowns',
+    COOLDOWN_SORT_EXTRACTORS
+  );
+  tbody.dataset.truncated = 'false';
+
   if (cooldowns.length === 0) {
-    listEl.innerHTML =
-      '<span class="pnl-flat" style="font-family: var(--font-mono); font-size: 11px;">No assets currently in cooldown.</span>';
+    const emptyRow = document.createElement('tr');
+    emptyRow.dataset.emptyRow = 'true';
+    const emptyCell = document.createElement('td');
+    emptyCell.colSpan = 5;
+    emptyCell.className = 'table-empty-cell';
+    emptyCell.textContent = 'No assets currently in cooldown.';
+    emptyRow.appendChild(emptyCell);
+    tbody.replaceChildren(emptyRow);
     return;
   }
 
-  listEl.innerHTML = cooldowns
-    .map((c) => {
-      const rem = formatCooldownRemaining(c.remaining_seconds);
-      const expStr = fmtLocalTime(c.expires_at_ms);
-      return `
-        <div class="t-badge pulse-3s" title="${escapeHtml(c.reason || '')}" style="gap: 8px; padding: 6px 10px;">
-          <span class="sym-badge">${escapeHtml(c.symbol)}</span>
-          <span class="sp-tag s3">${escapeHtml(c.cooldown_type || 'COOLDOWN')}</span>
-          <span style="color: #fbbf24;">${escapeHtml(rem)} left</span>
-          <span style="color: var(--text-muted); font-size: 10px;">until ${escapeHtml(expStr)}</span>
-        </div>
-      `;
-    })
-    .join('');
+  const rows = cooldowns.map((c) => {
+    const tr = document.createElement('tr');
+
+    const tdSym = document.createElement('td');
+    const symBadge = document.createElement('span');
+    symBadge.className = 'sym-badge';
+    symBadge.textContent = String(c.symbol ?? '');
+    tdSym.appendChild(symBadge);
+
+    const tdType = document.createElement('td');
+    const typeTag = document.createElement('span');
+    typeTag.className = 'sp-tag s3';
+    typeTag.textContent = String(c.cooldown_type || 'COOLDOWN');
+    tdType.appendChild(typeTag);
+
+    const tdRem = document.createElement('td');
+    tdRem.className = 'num-cell cell-sl-dist';
+    tdRem.textContent = `${formatCooldownRemaining(c.remaining_seconds)} left`;
+
+    const tdExp = document.createElement('td');
+    tdExp.className = 'num-cell';
+    tdExp.textContent = fmtLocalTime(c.expires_at_ms);
+
+    const tdReason = document.createElement('td');
+    tdReason.className = 'reason-cell';
+    const reasonStr = String(c.reason || '').trim() || '—';
+    tdReason.title = reasonStr;
+    tdReason.textContent = reasonStr;
+
+    tr.append(tdSym, tdType, tdRem, tdExp, tdReason);
+    return tr;
+  });
+
+  tbody.replaceChildren(...rows);
+  attachRowSortData(tbody, cooldowns, COOLDOWN_SORT_EXTRACTORS);
 }
 
 function buildInlineConfigControlHtml(row, idPrefix, rowIdx = 0) {
@@ -1315,25 +2335,39 @@ function renderSystemConfigTables(force = false) {
         (c, idx) => `
         <tr>
           <td><strong style="color:var(--neon-cyan)">${escapeHtml(c.config_key)}</strong></td>
-          <td><code>${escapeHtml(c.config_value)}</code></td>
+          <td><code class="cfg-val-code" title="${escapeHtml(c.config_value)}">${escapeHtml(c.config_value)}</code></td>
           <td>${buildInlineConfigControlHtml(c, prefix, idx)}</td>
           <td><span class="tab-count">${escapeHtml(c.value_type)}</span></td>
           <td style="color:var(--text-muted); white-space: normal; max-width: 340px;">${escapeHtml(c.description)}</td>
-          <td>${fmtLocalTime(c.updated_at_ms)}</td>
+          <td class="num-cell">${fmtLocalTime(c.updated_at_ms)}</td>
         </tr>
       `
       )
       .join('') ||
-    '<tr><td colspan="6" style="text-align:center;padding:16px;color:var(--text-muted)">No configuration keys matching filter.</td></tr>';
+    '<tr data-empty-row="true"><td colspan="6" class="table-empty-cell">No configuration keys matching filter.</td></tr>';
 
   const tbTab = document.getElementById('tbody-system-config');
   if (tbTab) {
-    tbTab.innerHTML = renderRows(filterRows(tabQuery), 'tab');
+    const tabRows = sortItemsForTable(
+      filterRows(tabQuery),
+      'table-system-config',
+      CONFIG_SORT_EXTRACTORS
+    );
+    tbTab.dataset.truncated = 'false';
+    tbTab.innerHTML = renderRows(tabRows, 'tab');
+    attachRowSortData(tbTab, tabRows, CONFIG_SORT_EXTRACTORS);
   }
 
   const tbModal = document.getElementById('tbody-modal-system-config');
   if (tbModal) {
-    tbModal.innerHTML = renderRows(filterRows(modalQuery), 'modal');
+    const modalRows = sortItemsForTable(
+      filterRows(modalQuery),
+      'table-modal-system-config',
+      CONFIG_SORT_EXTRACTORS
+    );
+    tbModal.dataset.truncated = 'false';
+    tbModal.innerHTML = renderRows(modalRows, 'modal');
+    attachRowSortData(tbModal, modalRows, CONFIG_SORT_EXTRACTORS);
   }
 }
 
@@ -1373,9 +2407,11 @@ function renderActiveExplorerTab(forceConfig = false) {
   // Render S1
   const tbS1 = document.getElementById('tbody-sleeve-s1');
   if (tbS1) {
+    const sortedS1 = sortItemsForTable(s1, 'table-sleeve-s1', S1_SORT_EXTRACTORS);
+    const slicedS1 = sortedS1.slice(0, 60);
+    tbS1.dataset.truncated = sortedS1.length > slicedS1.length ? 'true' : 'false';
     tbS1.innerHTML =
-      s1
-        .slice(0, 60)
+      slicedS1
         .map((r) => {
           const wCls =
             r.w_s1_carry_mom > 0.001
@@ -1386,29 +2422,32 @@ function renderActiveExplorerTab(forceConfig = false) {
           return `
             <tr>
               <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
-              <td>${fmtPrice(r.mark_price)}</td>
-              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
-              <td>${(Number(r.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
-              <td class="${r.funding_apr_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
-              <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
-              <td>${Number(r.market_beta ?? 1).toFixed(2)}</td>
-              <td>${Number(r.s1_mom_score || 0).toFixed(3)}</td>
-              <td>${Number(r.s1_carry_score || 0).toFixed(3)}</td>
-              <td class="${wCls}">${fmtPct(r.w_s1_carry_mom)}</td>
-              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+              <td class="num-cell">${fmtPrice(r.mark_price)}</td>
+              <td class="num-cell">${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td class="num-cell">${(Number(r.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
+              <td class="num-cell ${r.funding_apr_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}">${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
+              <td class="num-cell">${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
+              <td class="num-cell">${Number(r.market_beta ?? 1).toFixed(2)}</td>
+              <td class="num-cell">${Number(r.s1_mom_score || 0).toFixed(3)}</td>
+              <td class="num-cell">${Number(r.s1_carry_score || 0).toFixed(3)}</td>
+              <td class="num-cell ${wCls}">${fmtPct(r.w_s1_carry_mom)}</td>
+              <td class="num-cell" style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
             </tr>
           `;
         })
         .join('') ||
-      '<tr><td colspan="11" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 1 assets matching filter.</td></tr>';
+      '<tr data-empty-row="true"><td colspan="11" class="table-empty-cell">No Sleeve 1 assets matching filter.</td></tr>';
+    attachRowSortData(tbS1, slicedS1, S1_SORT_EXTRACTORS);
   }
 
   // Render S2
   const tbS2 = document.getElementById('tbody-sleeve-s2');
   if (tbS2) {
+    const sortedS2 = sortItemsForTable(s2, 'table-sleeve-s2', S2_SORT_EXTRACTORS);
+    const slicedS2 = sortedS2.slice(0, 60);
+    tbS2.dataset.truncated = sortedS2.length > slicedS2.length ? 'true' : 'false';
     tbS2.innerHTML =
-      s2
-        .slice(0, 60)
+      slicedS2
         .map((r) => {
           const align = Number(r.s2_trend_alignment || 0);
           const alignBadge =
@@ -1426,28 +2465,31 @@ function renderActiveExplorerTab(forceConfig = false) {
           return `
             <tr>
               <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
-              <td>${fmtPrice(r.mark_price)}</td>
-              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
-              <td>${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
+              <td class="num-cell">${fmtPrice(r.mark_price)}</td>
+              <td class="num-cell">${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td class="num-cell">${(Number(r.annualized_vol || 0) * 100).toFixed(1)}%</td>
               <td>${alignBadge}</td>
-              <td style="color:var(--neon-cyan);font-weight:700;">${Number(r.s2_vol_surge_ratio ?? 1).toFixed(2)}x</td>
+              <td class="num-cell" style="color:var(--neon-cyan);font-weight:700;">${Number(r.s2_vol_surge_ratio ?? 1).toFixed(2)}x</td>
               <td>${r.event_trigger ? `<span class="status-pill watch">${escapeHtml(r.event_trigger)}</span>` : '—'}</td>
-              <td class="${wCls}">${fmtPct(r.w_s2_trend_breakout)}</td>
-              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
-              <td>${fmtPct(r.current_weight)}</td>
+              <td class="num-cell ${wCls}">${fmtPct(r.w_s2_trend_breakout)}</td>
+              <td class="num-cell" style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+              <td class="num-cell">${fmtPct(r.current_weight)}</td>
             </tr>
           `;
         })
         .join('') ||
-      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 2 assets matching filter.</td></tr>';
+      '<tr data-empty-row="true"><td colspan="10" class="table-empty-cell">No Sleeve 2 assets matching filter.</td></tr>';
+    attachRowSortData(tbS2, slicedS2, S2_SORT_EXTRACTORS);
   }
 
   // Render S3
   const tbS3 = document.getElementById('tbody-sleeve-s3');
   if (tbS3) {
+    const sortedS3 = sortItemsForTable(s3, 'table-sleeve-s3', S3_SORT_EXTRACTORS);
+    const slicedS3 = sortedS3.slice(0, 60);
+    tbS3.dataset.truncated = sortedS3.length > slicedS3.length ? 'true' : 'false';
     tbS3.innerHTML =
-      s3
-        .slice(0, 60)
+      slicedS3
         .map((r) => {
           const wCls =
             r.w_s3_event_reversion > 0.001
@@ -1458,28 +2500,36 @@ function renderActiveExplorerTab(forceConfig = false) {
           return `
             <tr>
               <td><span class="sym-badge">${escapeHtml(r.symbol)}</span></td>
-              <td>${fmtPrice(r.mark_price)}</td>
-              <td>${fmtUsd(r.day_volume_usdc, 0)}</td>
-              <td>${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
-              <td style="color:#fbbf24;font-weight:700;">${Number(r.s3_funding_zscore || 0).toFixed(2)}σ</td>
-              <td>${Number(r.s3_flush_atr_mult || 0).toFixed(2)} ATR</td>
+              <td class="num-cell">${fmtPrice(r.mark_price)}</td>
+              <td class="num-cell">${fmtUsd(r.day_volume_usdc, 0)}</td>
+              <td class="num-cell">${Number(r.funding_apr_pct || 0).toFixed(2)}%</td>
+              <td class="num-cell" style="color:#fbbf24;font-weight:700;">${Number(r.s3_funding_zscore || 0).toFixed(2)}σ</td>
+              <td class="num-cell">${Number(r.s3_flush_atr_mult || 0).toFixed(2)} ATR</td>
               <td>${r.event_trigger ? `<span class="status-pill working">${escapeHtml(r.event_trigger)}</span>` : '—'}</td>
-              <td class="${wCls}">${fmtPct(r.w_s3_event_reversion)}</td>
-              <td style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
-              <td>${fmtPct(r.current_weight)}</td>
+              <td class="num-cell ${wCls}">${fmtPct(r.w_s3_event_reversion)}</td>
+              <td class="num-cell" style="font-weight:700;color:#fff;">${fmtPct(r.target_weight)}</td>
+              <td class="num-cell">${fmtPct(r.current_weight)}</td>
             </tr>
           `;
         })
         .join('') ||
-      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Sleeve 3 assets matching filter.</td></tr>';
+      '<tr data-empty-row="true"><td colspan="10" class="table-empty-cell">No Sleeve 3 assets matching filter.</td></tr>';
+    attachRowSortData(tbS3, slicedS3, S3_SORT_EXTRACTORS);
   }
 
   // Render 150+ Perp Scanner
   const tbScan = document.getElementById('tbody-perp-scanner');
   if (tbScan) {
+    const sortedScanner = sortItemsForTable(
+      scanner,
+      'table-perp-scanner',
+      SCANNER_SORT_EXTRACTORS
+    );
+    const slicedScanner = sortedScanner.slice(0, 200);
+    tbScan.dataset.truncated =
+      sortedScanner.length > slicedScanner.length ? 'true' : 'false';
     tbScan.innerHTML =
-      scanner
-        .slice(0, 200)
+      slicedScanner
         .map((a) => {
           const tags = [];
           if (a.is_priority_watched)
@@ -1492,44 +2542,53 @@ function renderActiveExplorerTab(forceConfig = false) {
             <tr>
               <td><span class="sym-badge">${escapeHtml(a.symbol)}</span></td>
               <td>${escapeHtml(a.coin)}</td>
-              <td>${fmtPrice(a.mark_price)}</td>
-              <td>${fmtPrice(a.mid_price)}</td>
-              <td>${fmtPrice(a.oracle_price)}</td>
-              <td>${fmtUsd(a.day_volume_usdc, 0)}</td>
-              <td>${fmtUsd(a.open_interest_usdc, 0)}</td>
-              <td>${(Number(a.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
-              <td>${Number(a.max_leverage ?? 20).toFixed(0)}x</td>
+              <td class="num-cell">${fmtPrice(a.mark_price)}</td>
+              <td class="num-cell">${fmtPrice(a.mid_price)}</td>
+              <td class="num-cell">${fmtPrice(a.oracle_price)}</td>
+              <td class="num-cell">${fmtUsd(a.day_volume_usdc, 0)}</td>
+              <td class="num-cell">${fmtUsd(a.open_interest_usdc, 0)}</td>
+              <td class="num-cell">${(Number(a.funding_rate_hourly || 0) * 100).toFixed(4)}%</td>
+              <td class="num-cell">${Number(a.max_leverage ?? 20).toFixed(0)}x</td>
               <td><div class="sleeve-mix-pills">${tags.join('') || '<span class="pnl-flat">SCAN</span>'}</div></td>
             </tr>
           `;
         })
         .join('') ||
-      '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text-muted)">No Hyperliquid perp assets matching search filter.</td></tr>';
+      '<tr data-empty-row="true"><td colspan="10" class="table-empty-cell">No Hyperliquid perp assets matching search filter.</td></tr>';
+    attachRowSortData(tbScan, slicedScanner, SCANNER_SORT_EXTRACTORS);
   }
 
   // Render Order Audit & Telemetry Console
   const tbAudit = document.getElementById('tbody-order-audit');
   if (tbAudit) {
+    const sortedAudits = sortItemsForTable(
+      audits,
+      'table-order-audit',
+      AUDIT_SORT_EXTRACTORS
+    );
+    const slicedAudits = sortedAudits.slice(0, 40);
+    tbAudit.dataset.truncated =
+      sortedAudits.length > slicedAudits.length ? 'true' : 'false';
     tbAudit.innerHTML =
-      audits
-        .slice(0, 40)
+      slicedAudits
         .map((a) => {
           const sideCls =
             String(a.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
           return `
             <tr>
-              <td>${fmtLocalTime(a.created_at_ms)}</td>
+              <td class="num-cell">${fmtLocalTime(a.created_at_ms)}</td>
               <td><code>${escapeHtml(a.client_order_id)}</code></td>
               <td><span class="side-pill ${sideCls}">${escapeHtml(a.side)}</span></td>
               <td><span class="status-pill watch">${escapeHtml(a.from_state)} → ${escapeHtml(a.to_state)}</span></td>
-              <td>${fmtPrice(a.limit_price)} / ${fmtPrice(a.avg_fill_price)}</td>
-              <td>${fmtUsd(a.reserved_usdc)} / <strong style="color:#34d399">${fmtUsd(a.committed_usdc)}</strong></td>
-              <td>${escapeHtml(a.reason)}</td>
+              <td class="num-cell">${fmtPrice(a.limit_price)} / ${fmtPrice(a.avg_fill_price)}</td>
+              <td class="num-cell">${fmtUsd(a.reserved_usdc)} / <strong style="color:#34d399">${fmtUsd(a.committed_usdc)}</strong></td>
+              <td class="reason-cell" title="${escapeHtml(a.reason)}">${escapeHtml(a.reason)}</td>
             </tr>
           `;
         })
         .join('') ||
-      '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--text-muted)">No order audit state transitions recorded yet.</td></tr>';
+      '<tr data-empty-row="true"><td colspan="7" class="table-empty-cell">No order audit state transitions recorded yet.</td></tr>';
+    attachRowSortData(tbAudit, slicedAudits, AUDIT_SORT_EXTRACTORS);
   }
 
   const logStream = document.getElementById('telemetry-log-container');
@@ -1773,8 +2832,10 @@ function applyDashboardPayload(dash, forceConfig = false) {
   renderHealthAndTopBar(state.health, dash);
   renderPnlHorizonRibbon(dash);
   renderKpiCards(dash);
+  renderVaultPanel(dash);
   renderPriorityAndWorkingTable(dash);
   renderOpenHoldingsTable(dash);
+  renderClosedPositionsTable(dash);
   renderCooldownsPanel(dash);
   renderActiveExplorerTab(forceConfig);
   drawEquityCurveCanvas(dash);
@@ -1814,7 +2875,7 @@ function connectSSE() {
     es.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data);
-        if (data && (data.snapshot || data.v_assets_held)) {
+        if (data && (data.snapshot || data.v_assets_held || data.vault_info)) {
           applyDashboardPayload(data, false);
         }
       } catch (_) {}
@@ -1936,9 +2997,17 @@ document.addEventListener('click', (evt) => {
 });
 
 document.addEventListener('DOMContentLoaded', async () => {
+  initSortableTables();
+
   const scannerSearch = document.getElementById('scanner-search-input');
   if (scannerSearch) {
     scannerSearch.addEventListener('input', () => renderActiveExplorerTab());
+  }
+  const closedSearch = document.getElementById('closed-search-input');
+  if (closedSearch) {
+    closedSearch.addEventListener('input', () => {
+      if (state.dashboard) renderClosedPositionsTable(state.dashboard);
+    });
   }
   const modalSearch = document.getElementById('modal-cfg-search');
   if (modalSearch) {
