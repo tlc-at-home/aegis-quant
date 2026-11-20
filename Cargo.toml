@@ -38,7 +38,7 @@ serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
-mysql = "25.0"
+mysql = "28.0"
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros"] }
