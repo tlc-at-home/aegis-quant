@@ -9,7 +9,7 @@ AEGIS_ROOT="/home/fedora/aegis"
 DATA_DIR="${AEGIS_ROOT}/data"
 LOG_DIR="${AEGIS_ROOT}/logs"
 BIN_DIR="${AEGIS_ROOT}/bin"
-BACKUP_DIR="${DATA_DIR}/mariadb_dumps"
+BACKUP_DIR="/var/backups/aegis-mariadb"
 KEY_PATH="${DATA_DIR}/.aegis_master_key"
 ENV_FILE="/etc/aegis-quant.env"
 DEPLOY_DIR="${AEGIS_ROOT}/deploy"
@@ -72,10 +72,11 @@ SQL
 sudo mariadb aegis_quant < "${SQL_SCHEMA}"
 
 echo "[4/8] Preparing Aegis Quant directories & 0600 environment secret file (${ENV_FILE})..."
-mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BIN_DIR}" "${BACKUP_DIR}"
-chmod 700 "${DATA_DIR}" "${BACKUP_DIR}"
+mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BIN_DIR}"
+chmod 700 "${DATA_DIR}"
 chmod 750 "${LOG_DIR}"
 chmod 755 "${BIN_DIR}"
+sudo install -d -m 0700 -o root -g root "${BACKUP_DIR}"
 
 if [ ! -f "${ENV_FILE}" ]; then
     sudo install -m 0600 -o root -g root /dev/null "${ENV_FILE}"
@@ -107,15 +108,19 @@ echo "[7/8] Installing daily mariadb-dump backup script & systemd timer..."
 sudo tee /usr/local/bin/aegis-mariadb-backup.sh >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-mkdir -p "${BACKUP_DIR}"
-chmod 700 "${BACKUP_DIR}"
+umask 0077
+[ ! -L "${BACKUP_DIR}" ] || {
+    echo "ERROR: Refusing symlink backup directory: ${BACKUP_DIR}" >&2
+    exit 1
+}
+install -d -m 0700 -o root -g root "${BACKUP_DIR}"
 STAMP="\$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${BACKUP_DIR}/aegis_quant_\${STAMP}.sql.gz"
-TMP="\${OUT}.tmp"
-umask 0077
-mariadb-dump --single-transaction --routines --events aegis_quant | gzip -c > "\${TMP}"
-mv -f "\${TMP}" "\${OUT}"
-chmod 0600 "\${OUT}"
+TMP="\$(mktemp "${BACKUP_DIR}/.aegis_quant_\${STAMP}.XXXXXX.tmp")"
+trap 'rm -f "\${TMP:-}"' EXIT
+mariadb-dump --single-transaction --routines --events aegis_quant | gzip -c >| "\${TMP}"
+chmod 0600 "\${TMP}"
+mv -n "\${TMP}" "\${OUT}"
 find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'aegis_quant_*.sql.gz' -mtime +14 -delete
 EOF
 sudo chmod 750 /usr/local/bin/aegis-mariadb-backup.sh
@@ -128,6 +133,9 @@ After=mariadb.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/aegis-mariadb-backup.sh
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
 EOF
 sudo chmod 644 "${SYSTEMD_DIR}/aegis-mariadb-backup.service"
 

@@ -3,16 +3,19 @@
 use aegis_core::{now_ms, AegisError, OrderSide};
 use aegis_db::{AssetUpsertInput, DatabaseManager, WorkingOrderInput};
 use aegis_web::{
-    create_web_router, create_web_router_for_host, health_result_to_response,
-    validate_config_key_value, AuthLoginPayload, ClosePositionRequest, ConfigUpdateRequest,
-    RiskTierUpdateRequest, DEFAULT_CSP_POLICY,
+    build_router, create_web_router, create_web_router_for_host, health_result_to_response,
+    serve_web_with_shutdown, validate_config_key_value, AppState, AuthLoginPayload,
+    ClosePositionRequest, ConfigUpdateRequest, RiskTierUpdateRequest, DEFAULT_CSP_POLICY,
 };
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
 };
+use mysql::params;
+use mysql::prelude::*;
 use serde_json::Value;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -658,4 +661,985 @@ async fn test_web_dashboard_separates_pre_cap_and_active_cap_holdings() {
     assert_eq!(paper_json["max_open_positions"], 6);
     assert_eq!(paper_json["active_cap_open_count"], 8);
     assert_eq!(paper_json["pre_cap_open_count"], 0);
+}
+
+#[tokio::test]
+async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
+    // 1. Empty token with web_auth_enabled=true fails closed (401 on routes, 503 on login, startup Err)
+    let db_empty = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "", None).unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_empty = create_web_router(db_empty.clone(), None);
+    let res_empty_dash = app_empty
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_empty_dash.status(), StatusCode::UNAUTHORIZED);
+
+    let res_empty_login = app_empty
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":""}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_empty_login.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let (_sd_tx1, sd_rx1) = tokio::sync::watch::channel(false);
+    let err_empty = serve_web_with_shutdown(db_empty, "127.0.0.1", 0, sd_rx1).await;
+    assert!(matches!(err_empty, Err(AegisError::SecurityViolation(_))));
+
+    // 2. Corrupt encrypted web_api_token with web_auth_enabled unset fails closed
+    let db_corrupt = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mut conn = mgr.get_conn().unwrap();
+        let ts = now_ms();
+        conn.exec_drop(
+            r#"INSERT INTO system_config
+               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+               VALUES ('web_api_token', 'gAAAAABcorrupt_cipher', 'secret', 'bad', :ts, :ts)
+               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)"#,
+            params! { "ts" => ts },
+        )
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_corrupt = create_web_router(db_corrupt.clone(), None);
+    let res_corrupt = app_corrupt
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_corrupt.status(), StatusCode::UNAUTHORIZED);
+
+    let res_corrupt_login = app_corrupt
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"anything"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_corrupt_login.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let (_sd_tx2, sd_rx2) = tokio::sync::watch::channel(false);
+    let err_corrupt = serve_web_with_shutdown(db_corrupt, "127.0.0.1", 0, sd_rx2).await;
+    assert!(matches!(err_corrupt, Err(AegisError::SecurityViolation(_))));
+
+    // 3. Unset web_auth_enabled + unset token on non-loopback 0.0.0.0 fails closed
+    let db_unset_remote = tokio::task::spawn_blocking(|| {
+        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
+    })
+    .await
+    .unwrap();
+
+    let app_unset_remote =
+        create_web_router_for_host(db_unset_remote.clone(), None, Some("0.0.0.0"));
+    let res_unset_remote = app_unset_remote
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unset_remote.status(), StatusCode::UNAUTHORIZED);
+
+    let (_sd_tx3, sd_rx3) = tokio::sync::watch::channel(false);
+    let err_remote = serve_web_with_shutdown(db_unset_remote, "0.0.0.0", 0, sd_rx3).await;
+    assert!(matches!(err_remote, Err(AegisError::SecurityViolation(_))));
+
+    // 4. Loopback bind with web_api_token configured enforces auth even when web_auth_enabled is unset
+    let db_loopback_tok = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_api_token", "loopback-tok-99", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_loopback_tok = create_web_router_for_host(db_loopback_tok, None, Some("127.0.0.1"));
+    let res_lb_noauth = app_loopback_tok
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_lb_noauth.status(), StatusCode::UNAUTHORIZED);
+
+    let res_lb_auth = app_loopback_tok
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::AUTHORIZATION, "Bearer loopback-tok-99")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_lb_auth.status(), StatusCode::OK);
+
+    // 5. KVM bridge: explicit DB-immutable web_auth_enabled=false on 0.0.0.0 + Host 192.168.122.254:8000 stays 200
+    let db_kvm = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "false", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_kvm = create_web_router_for_host(db_kvm, None, Some("0.0.0.0"));
+    let res_kvm_get = app_kvm
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::HOST, "192.168.122.254:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_kvm_get.status(), StatusCode::OK);
+
+    let res_kvm_post = app_kvm
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk-tier")
+                .header(header::HOST, "192.168.122.254:8000")
+                .header(header::ORIGIN, "http://192.168.122.254:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"risk_tier":"standard"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_kvm_post.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_web_dns_rebinding_host_allowlist_and_ipv6() {
+    let db_kvm = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "false", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app_kvm = create_web_router_for_host(db_kvm, None, Some("0.0.0.0"));
+
+    // Untrusted Host on GET and POST -> 403 Forbidden (blocks DNS rebinding)
+    let res_rebind_get = app_kvm
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::HOST, "evil.example:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_rebind_get.status(), StatusCode::FORBIDDEN);
+
+    let res_rebind_health = app_kvm
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .header(header::HOST, "evil.example:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_rebind_health.status(), StatusCode::FORBIDDEN);
+
+    let res_rebind_post = app_kvm
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/risk-tier")
+                .header(header::HOST, "evil.example:8000")
+                .header(header::ORIGIN, "http://evil.example:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"risk_tier":"standard"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_rebind_post.status(), StatusCode::FORBIDDEN);
+
+    // Missing Host with Origin -> 403 Forbidden
+    let res_no_host_origin = app_kvm
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_no_host_origin.status(), StatusCode::FORBIDDEN);
+
+    // Bracketed IPv6 loopback -> 200 OK
+    let res_ipv6 = app_kvm
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::HOST, "[::1]:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_ipv6.status(), StatusCode::OK);
+
+    // Explicit CSV web_allowed_hosts disables wildcard IP literals
+    let db_allow = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "false", None)
+            .unwrap();
+        mgr.set_config_value("web_allowed_hosts", "aegis.lan:8000", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_allow = create_web_router_for_host(db_allow, None, Some("0.0.0.0"));
+
+    let res_listed = app_allow
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::HOST, "aegis.lan:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_listed.status(), StatusCode::OK);
+
+    let res_unlisted_ip = app_allow
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::HOST, "192.168.122.254:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unlisted_ip.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_web_session_channel_separation_rotation_and_expiry() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "api-master-secret-20", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let state = AppState::new_with_bind_host(db, None, Some("127.0.0.1"));
+    let app = build_router(state.clone());
+
+    // 1. Login -> receive cookie 1
+    let login1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&AuthLoginPayload {
+                        token: "api-master-secret-20".to_string(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login1.status(), StatusCode::OK);
+    let set_cookie1 = login1
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie1_kv = set_cookie1.split(';').next().unwrap().to_string();
+    let tok1 = cookie1_kv
+        .strip_prefix("aegis_session=")
+        .unwrap()
+        .to_string();
+
+    // 2. Session cookie rejected in Bearer / X-Aegis-Token headers
+    let res_cookie_as_bearer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::AUTHORIZATION, format!("Bearer {tok1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_cookie_as_bearer.status(), StatusCode::UNAUTHORIZED);
+
+    let res_cookie_as_xtok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header("x-aegis-token", &tok1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_cookie_as_xtok.status(), StatusCode::UNAUTHORIZED);
+
+    // API token rejected when sent directly as session cookie
+    let res_api_as_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::COOKIE, "aegis_session=api-master-secret-20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_api_as_cookie.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Re-login rotates session and revokes prior cookie
+    let login2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header(header::COOKIE, &cookie1_kv)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&AuthLoginPayload {
+                        token: "api-master-secret-20".to_string(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login2.status(), StatusCode::OK);
+    let set_cookie2 = login2
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie2_kv = set_cookie2.split(';').next().unwrap().to_string();
+    assert_ne!(cookie1_kv, cookie2_kv);
+
+    let res_old_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::COOKIE, &cookie1_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_old_cookie.status(), StatusCode::UNAUTHORIZED);
+
+    let res_new_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::COOKIE, &cookie2_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_new_cookie.status(), StatusCode::OK);
+
+    // 4. Expired session is rejected and evicted
+    {
+        let mut guard = state.sessions.lock();
+        let past = Instant::now() - Duration::from_secs(5);
+        for exp in guard.values_mut() {
+            *exp = past;
+        }
+    }
+    let res_expired = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::COOKIE, &cookie2_kv)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_expired.status(), StatusCode::UNAUTHORIZED);
+    assert!(state.sessions.lock().is_empty());
+}
+
+#[tokio::test]
+async fn test_web_cookie_secure_and_immutable_proxy_headers() {
+    assert!(matches!(
+        validate_config_key_value("web_trust_proxy_headers", "true"),
+        Err(AegisError::SecurityViolation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("web_cookie_secure", "true"),
+        Err(AegisError::SecurityViolation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("allow_web_live_mode", "true"),
+        Err(AegisError::SecurityViolation(_))
+    ));
+
+    let db_plain = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "tok-cookie-30", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_plain = create_web_router(db_plain, None);
+
+    // Mutating web_trust_proxy_headers via Web API -> 403 Forbidden
+    let res_mut_proxy = app_plain
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header(header::AUTHORIZATION, "Bearer tok-cookie-30")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"web_trust_proxy_headers","config_value":"true"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_mut_proxy.status(), StatusCode::FORBIDDEN);
+
+    // Plain HTTP login omits ; Secure
+    let login_http = app_plain
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"tok-cookie-30"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_http.status(), StatusCode::OK);
+    let cookie_http = login_http
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!cookie_http.contains("; Secure"));
+
+    // Origin https:// sets ; Secure
+    let login_https_origin = app_plain
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "https://127.0.0.1:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"tok-cookie-30"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_https_origin.status(), StatusCode::OK);
+    let cookie_https = login_https_origin
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cookie_https.contains("; Secure"));
+
+    // Trusted proxy headers honor X-Forwarded-Proto: https
+    let db_proxy = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "tok-cookie-30", None)
+            .unwrap();
+        mgr.set_config_value("web_trust_proxy_headers", "true", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_proxy = create_web_router(db_proxy, None);
+
+    let login_xfp = app_proxy
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("x-forwarded-proto", "https")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"tok-cookie-30"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_xfp.status(), StatusCode::OK);
+    let cookie_xfp = login_xfp
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cookie_xfp.contains("; Secure"));
+}
+
+#[tokio::test]
+async fn test_web_auth_rate_limiting_429_and_reset() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "real-token-36", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. Credential-less probes never trigger 429 rate limiting
+    for _ in 0..8 {
+        let res_probe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_probe.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 2. 4 bad logins followed by 1 valid login resets failure bucket
+    for _ in 0..4 {
+        let res_bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"bad-guess"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let res_reset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"real-token-36"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_reset.status(), StatusCode::OK);
+
+    // 3. 5 consecutive failed logins trigger 429 + Retry-After on subsequent attempt (even with valid token)
+    for _ in 0..5 {
+        let res_fail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("x-forwarded-for", "1.2.3.4") // Ignored because trust_proxy_headers=false
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"bad-guess"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_fail.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let res_locked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("x-forwarded-for", "9.9.9.9") // Spoofed XFF ignored
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"real-token-36"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_locked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = res_locked
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(retry_after >= 1);
+
+    // Middleware bearer brute-force while locked out also returns 429
+    let res_bearer_locked = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .header(header::AUTHORIZATION, "Bearer wrong-guess")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bearer_locked.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_web_execution_mode_transition_guards() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        let btc_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "BTC".to_string(),
+                asset_index: 0,
+                sz_decimals: 4,
+                tick_size: 0.1,
+                lot_step_size: 0.001,
+                max_leverage: 40.0,
+                mark_price: 94000.0,
+                mid_price: 94000.0,
+                oracle_price: 94000.0,
+                funding_rate_hourly: 0.0,
+                day_volume_usdc: 50_000_000.0,
+                open_interest_usdc: 20_000_000.0,
+                prev_day_price: 93000.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: false,
+            })
+            .unwrap();
+        mgr.create_working_order(&WorkingOrderInput {
+            asset_id: btc_id,
+            client_order_id: "mode-guard-oid-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 93900.0,
+            requested_quantity: 0.02,
+            reserved_margin_usdc: 1878.0,
+            portfolio_weight: 0.18,
+            s1_weight_contrib: 0.18,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 90000.0,
+            exchange_order_id: None,
+            reason: "TEST_GUARD".to_string(),
+        })
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. Active WORKING order blocks PAPER -> TESTNET (400 Bad Request)
+    let res_active_block = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"execution_mode","config_value":"TESTNET"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_active_block.status(), StatusCode::BAD_REQUEST);
+
+    // Cancel working order so portfolio is flat
+    let res_close = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/positions/close")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&ClosePositionRequest {
+                        close_all: true,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_close.status(), StatusCode::OK);
+
+    // 2. -> LIVE blocked (403 Forbidden) without DB-immutable allow_web_live_mode=true
+    let res_live_blocked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"execution_mode","config_value":"LIVE"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_live_blocked.status(), StatusCode::FORBIDDEN);
+
+    // 3. Flat PAPER -> testnet (lowercase) succeeds, normalizes to TESTNET, and syncs hyperliquid_testnet=true
+    let res_to_testnet = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"execution_mode","config_value":"testnet"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_to_testnet.status(), StatusCode::OK);
+    let cfg_testnet = db.load_config().unwrap();
+    assert_eq!(cfg_testnet.get_str("execution_mode", ""), "TESTNET");
+    assert_eq!(cfg_testnet.get_str("hyperliquid_testnet", ""), "true");
+
+    // 4. Flat TESTNET -> paper succeeds and keeps hyperliquid_testnet=true
+    let res_to_paper = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"execution_mode","config_value":"paper"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_to_paper.status(), StatusCode::OK);
+    let cfg_paper = db.load_config().unwrap();
+    assert_eq!(cfg_paper.get_str("execution_mode", ""), "PAPER");
+    assert_eq!(cfg_paper.get_str("hyperliquid_testnet", ""), "true");
+
+    // 5. With allow_web_live_mode=true in DB, flat -> live succeeds and sets hyperliquid_testnet=false
+    let db_allow_live = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_allow_live
+            .set_config_value("allow_web_live_mode", "true", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_to_live = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"execution_mode","config_value":"live"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_to_live.status(), StatusCode::OK);
+    let cfg_live = db.load_config().unwrap();
+    assert_eq!(cfg_live.get_str("execution_mode", ""), "LIVE");
+    assert_eq!(cfg_live.get_str("hyperliquid_testnet", ""), "false");
+}
+
+#[tokio::test]
+async fn test_web_discord_webhook_ssrf_rejected_and_uppercase_config_normalized() {
+    // 1. SSRF Discord webhook URLs rejected (#19)
+    for bad_url in [
+        "https://127.0.0.1/api/webhooks/123/abc",
+        "https://169.254.169.254/latest/meta-data",
+        "https://discord.com@evil.com/api/webhooks/123/abc",
+        "http://discord.com/api/webhooks/123/abc",
+        "https://discord.com:8443/api/webhooks/123/abc",
+        "https://evil.example/api/webhooks/123/abc",
+    ] {
+        assert!(
+            validate_config_key_value("discord_webhook_url", bad_url).is_err(),
+            "Expected SSRF rejection for {bad_url}"
+        );
+    }
+    assert!(validate_config_key_value(
+        "discord_webhook_url",
+        "https://discord.com/api/webhooks/123456789/valid_Token-abc"
+    )
+    .is_ok());
+    assert!(validate_config_key_value("discord_webhook_url", "").is_ok());
+
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+            .unwrap();
+        mgr.set_config_value("risk_capital_cap_updated_at_ms", "100", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app = create_web_router(db.clone(), None);
+
+    // POST /api/v1/config with SSRF URL -> 400 Bad Request
+    let res_ssrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"discord_webhook_url","config_value":"https://169.254.169.254/api/webhooks/1/a"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_ssrf.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Uppercase RISK_CAPITAL_CAP_USDC normalizes to lowercase and updates epoch (#26)
+    let res_cap = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"RISK_CAPITAL_CAP_USDC","config_value":"2500.0"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_cap.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(res_cap.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(body_json["updated_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "risk_capital_cap_usdc"));
+
+    let cfg = db.load_config().unwrap();
+    assert_eq!(cfg.get_str("risk_capital_cap_usdc", ""), "2500.0");
+    assert!(cfg.get_i64("risk_capital_cap_updated_at_ms", 0) > 100);
 }

@@ -1,15 +1,16 @@
 //! Web API authentication, CSRF origin checks, bearer token verification, and security header middleware (`aegis-web::auth`).
 
 use crate::payloads::ApiErrorBody;
-use crate::server::AppState;
+use crate::server::{normalize_host_without_port, AppState, ClientIpKey};
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 
 pub const DEFAULT_CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
 
@@ -155,64 +156,7 @@ pub fn validate_csrf_for_mutation(
     Ok(())
 }
 
-/// Security headers, CSRF validation, and unified bearer/cookie authentication middleware.
-/// When `require_bearer_auth` is enabled and `web_api_token` is configured, requires valid auth
-/// on ALL `/api/v1/*` routes (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`) except `/api/v1/health` and `/api/v1/auth/login`.
-pub async fn security_and_auth_middleware(
-    State(state): State<AppState>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let path = req.uri().path().to_string();
-    let method = req.method().clone();
-    let is_mutation = matches!(
-        method,
-        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
-    );
-
-    if path.starts_with("/api/v1/") && is_mutation {
-        if let Err(csrf_reason) = validate_csrf_for_mutation(req.headers(), req.uri()) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ApiErrorBody {
-                    error: "Forbidden".to_string(),
-                    detail: csrf_reason.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    if state.require_bearer_auth
-        && path.starts_with("/api/v1/")
-        && path != "/api/v1/health"
-        && path != "/api/v1/auth/login"
-    {
-        if let Some(ref expected) = state.configured_api_token {
-            if !expected.is_empty() {
-                let provided = extract_request_token(req.headers());
-                let valid = provided
-                    .as_deref()
-                    .map(|p| {
-                        constant_time_eq(p, expected) || constant_time_eq(p, &state.session_token)
-                    })
-                    .unwrap_or(false);
-                if !valid {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(ApiErrorBody {
-                            error: "Unauthorized".to_string(),
-                            detail: "Valid Bearer token, X-Aegis-Token, or session cookie required"
-                                .to_string(),
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
-    let mut resp = next.run(req).await;
+fn with_security_headers(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -224,4 +168,172 @@ pub async fn security_and_auth_middleware(
         HeaderValue::from_static(DEFAULT_CSP_POLICY),
     );
     resp
+}
+
+pub(crate) fn auth_error_response(status: StatusCode, detail: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiErrorBody {
+            error: status.canonical_reason().unwrap_or("Error").to_string(),
+            detail: detail.into(),
+        }),
+    )
+        .into_response()
+}
+
+pub(crate) fn too_many_requests_response(retry_after_secs: u64) -> Response {
+    let mut resp = auth_error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("Too many failed authentication attempts. Retry after {retry_after_secs}s"),
+    );
+    if let Ok(hv) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, hv);
+    }
+    resp
+}
+
+fn extract_client_ip(state: &AppState, req: &Request) -> ClientIpKey {
+    if state.trust_proxy_headers {
+        if let Some(xff) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(ip) = xff
+                .split(',')
+                .next()
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            {
+                return ClientIpKey::Ip(ip);
+            }
+        }
+        if let Some(xri) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            if let Ok(ip) = xri.trim().parse::<IpAddr>() {
+                return ClientIpKey::Ip(ip);
+            }
+        }
+    }
+    if let Some(connect_info) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return ClientIpKey::Ip(connect_info.0.ip());
+    }
+    ClientIpKey::Local
+}
+
+fn validate_api_host_header(
+    state: &AppState,
+    req: &Request,
+) -> std::result::Result<(), &'static str> {
+    let host_count = req.headers().get_all(header::HOST).iter().count();
+    if host_count > 1 {
+        return Err("Host rejected: multiple Host headers are not permitted");
+    }
+    if host_count == 1 {
+        let host_raw = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .ok_or("Host rejected: invalid Host header encoding")?;
+        let host_no_port =
+            normalize_host_without_port(host_raw).ok_or("Host rejected: malformed Host header")?;
+        if !state.is_trusted_host(&host_no_port) {
+            return Err("Host rejected: untrusted Host header");
+        }
+        return Ok(());
+    }
+
+    // Host absent: allow ONLY when neither Origin nor Referer is present (preserves header-less oneshot tests).
+    if req.headers().contains_key(header::ORIGIN) || req.headers().contains_key(header::REFERER) {
+        return Err("Host rejected: Origin or Referer requires a valid Host header");
+    }
+    if let Some(auth) = req.uri().authority() {
+        let valid_auth =
+            normalize_host_without_port(auth.as_str()).is_some_and(|h| state.is_trusted_host(&h));
+        if !valid_auth {
+            return Err("Host rejected: untrusted request URI authority");
+        }
+    }
+    Ok(())
+}
+
+/// Security headers, Host allowlist, CSRF validation, rate limiting, and separated bearer/cookie authentication middleware.
+/// When `require_bearer_auth` is enabled, requires valid auth on ALL `/api/v1/*` routes except `/api/v1/health` and `/api/v1/auth/login`.
+pub async fn security_and_auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let client_ip = extract_client_ip(&state, &req);
+    req.extensions_mut().insert(client_ip);
+
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let is_mutation = matches!(
+        method,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+
+    if path.starts_with("/api/v1/") {
+        if let Err(host_reason) = validate_api_host_header(&state, &req) {
+            return with_security_headers(auth_error_response(StatusCode::FORBIDDEN, host_reason));
+        }
+
+        if is_mutation {
+            if let Err(csrf_reason) = validate_csrf_for_mutation(req.headers(), req.uri()) {
+                return with_security_headers(auth_error_response(
+                    StatusCode::FORBIDDEN,
+                    csrf_reason,
+                ));
+            }
+        }
+    }
+
+    if state.require_bearer_auth
+        && path.starts_with("/api/v1/")
+        && path != "/api/v1/health"
+        && path != "/api/v1/auth/login"
+    {
+        let Some(expected) = state
+            .configured_api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return with_security_headers(auth_error_response(
+                StatusCode::UNAUTHORIZED,
+                "Authentication required but web_api_token is missing or undecryptable",
+            ));
+        };
+
+        let header_tok = extract_header_token(req.headers());
+        let cookie_tok = extract_cookie_token(req.headers());
+        let supplied_credentials = header_tok.is_some() || cookie_tok.is_some();
+
+        if supplied_credentials {
+            if let Err(retry_after) = state.auth_rate_limiter.check_allowed(client_ip) {
+                return with_security_headers(too_many_requests_response(retry_after));
+            }
+        }
+
+        let valid = if let Some(ref h) = header_tok {
+            constant_time_eq(h, expected)
+        } else if let Some(ref c) = cookie_tok {
+            state.validate_session_cookie(c)
+        } else {
+            false
+        };
+
+        if !valid {
+            if supplied_credentials {
+                state.auth_rate_limiter.record_failure(client_ip);
+            }
+            return with_security_headers(auth_error_response(
+                StatusCode::UNAUTHORIZED,
+                "Valid Bearer token, X-Aegis-Token, or session cookie required",
+            ));
+        }
+
+        state.auth_rate_limiter.reset(client_ip);
+    }
+
+    with_security_headers(next.run(req).await)
 }

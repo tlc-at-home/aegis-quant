@@ -39,7 +39,10 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "web_csp_policy",
     "web_cors_allowed_origins",
     "web_allowed_hosts",
+    "web_trust_proxy_headers",
+    "web_cookie_secure",
     "web_api_token",
+    "allow_web_live_mode",
     "telegram_api_base_url",
     "hyperliquid_testnet",
     "hyperliquid_mainnet_url",
@@ -208,6 +211,13 @@ mod tests {
     fn test_immutable_keys_and_utf8_mask_identifier() {
         assert!(is_immutable_security_config_key("web_require_auth"));
         assert!(is_immutable_security_config_key("hyperliquid_testnet"));
+        assert!(is_immutable_security_config_key("web_trust_proxy_headers"));
+        assert!(is_immutable_security_config_key("web_cookie_secure"));
+        assert!(is_immutable_security_config_key("allow_web_live_mode"));
+        assert!(is_immutable_security_config_key(
+            " WEB_TRUST_PROXY_HEADERS "
+        ));
+        assert!(is_immutable_security_config_key("ALLOW_WEB_LIVE_MODE"));
         assert_eq!(mask_identifier(""), "");
         assert_eq!(mask_identifier("αβγδ"), "***");
         assert_eq!(mask_identifier("🔥🚀αβγδε"), "🔥🚀***δε");

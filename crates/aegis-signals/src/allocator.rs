@@ -72,7 +72,7 @@ impl AllocatorConfig {
             max_gross_leverage_x: cfg.get_f64("max_gross_leverage_x", 2.50).clamp(0.20, 5.00),
             max_single_asset_weight: cfg
                 .get_f64("max_single_asset_weight", 0.30)
-                .clamp(0.05, 1.00),
+                .clamp(0.01, 1.00),
             min_rebalance_delta_weight: cfg
                 .get_f64("min_rebalance_delta_weight", 0.025)
                 .clamp(0.005, 0.25),

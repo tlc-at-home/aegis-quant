@@ -12,7 +12,7 @@ use crate::queue::{
     enqueue_pending_alert, poll_and_dispatch_pending_alerts, update_alert_queue_status,
     AlertRetryQueue,
 };
-use crate::telegram::{discover_telegram_chat_id_guarded, send_telegram_html};
+use crate::telegram::send_telegram_html;
 use aegis_core::{
     format_ms_human_utc, mask_identifier, now_iso8601_utc, now_ms, AegisError, AlertProvider,
     ConfigMap, Result,
@@ -355,7 +355,7 @@ impl AlertEngine {
         let provider = cfg.alert_provider();
         let tg_base = cfg.get_str("telegram_api_base_url", "https://api.telegram.org");
         let tg_token = self.decrypt_from_config(&cfg, "telegram_bot_token", "");
-        let mut tg_chat_id = self.decrypt_from_config(&cfg, "telegram_chat_id", "");
+        let tg_chat_id = self.decrypt_from_config(&cfg, "telegram_chat_id", "");
         let discord_url = self.decrypt_from_config(&cfg, "discord_webhook_url", "");
         let ts_utc = now_iso8601_utc();
 
@@ -397,34 +397,6 @@ impl AlertEngine {
         let mut error_detail: Option<String> = None;
 
         if use_telegram && !tg_token.is_empty() {
-            // Never overwrite an already-configured non-empty `telegram_chat_id` (even if raw in DB)
-            if tg_chat_id.trim().is_empty() {
-                let raw_has_chat_id = self
-                    .db
-                    .list_system_config_rows()
-                    .map(|rows| {
-                        rows.iter().any(|r| {
-                            r.config_key == "telegram_chat_id" && !r.config_value.trim().is_empty()
-                        })
-                    })
-                    .unwrap_or(false);
-                if !raw_has_chat_id {
-                    if let Some(discovered) = discover_telegram_chat_id_guarded(
-                        &tg_base,
-                        &tg_token,
-                        &tg_chat_id,
-                        active_timeout_sec,
-                    ) {
-                        let _ = self.db.set_config_value(
-                            "telegram_chat_id",
-                            &discovered,
-                            Some("Auto-discovered Telegram chat_id"),
-                        );
-                        tg_chat_id = discovered;
-                    }
-                }
-            }
-
             let tg_outcome = send_telegram_html(
                 &tg_base,
                 &tg_token,
@@ -1039,5 +1011,35 @@ mod tests {
         );
         let _ = srv_handle.join();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_empty_telegram_chat_id_never_auto_discovers_or_persists() {
+        let _guard = DEDUP_TEST_LOCK.lock();
+        clear_alert_dedup_cache_for_tests();
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        db.set_config_value("telegram_api_base_url", &format!("http://{addr}"), None)
+            .unwrap();
+        db.set_config_value("telegram_bot_token", "123456:TOKEN", None)
+            .unwrap();
+        db.set_config_value("telegram_chat_id", "", None).unwrap();
+
+        let engine = AlertEngine::new(db.clone());
+        let res = engine.send_test_alert();
+        assert_eq!(res.status, "ERROR");
+        assert!(!res.telegram_sent);
+        assert!(!res.queued_for_retry);
+        assert_eq!(
+            db.load_config().unwrap().get_str("telegram_chat_id", ""),
+            ""
+        );
+        assert!(
+            listener.accept().is_err(),
+            "AlertEngine must not issue /getUpdates or any outbound request when telegram_chat_id is empty"
+        );
     }
 }

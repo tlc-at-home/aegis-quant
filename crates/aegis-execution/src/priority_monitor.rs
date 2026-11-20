@@ -95,7 +95,7 @@ impl PriorityMonitor {
     /// Runs a single 1-second surveillance tick over `v_priority_watchlist`, `v_assets_ordered`, and `v_assets_held`.
     pub fn run_1s_priority_tick(&self) -> Result<PriorityTickReport> {
         let ts = now_ms();
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let watchlist = self.db.get_priority_watchlist()?;
 
         // Poll Hyperliquid `allMids` outside the execution lock so slow network responses never block closes
@@ -292,7 +292,7 @@ impl PriorityMonitor {
         exit_reason: &str,
         risk: &RiskEngine,
     ) -> Result<Option<f64>> {
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let side = OrderSide::parse(&held.side);
         let is_tp_exit = exit_reason.starts_with("TAKE_PROFIT");
         let taker_fee_bps = risk.limits.taker_fee_bps;
@@ -307,11 +307,13 @@ impl PriorityMonitor {
         if is_live_exchange {
             let pk = cfg.get_str("private_key", "");
             let wallet = cfg.get_str("wallet_address", "");
-            if wallet.trim().is_empty() {
-                tracing::warn!(
+            if wallet.trim().is_empty() || pk.trim().is_empty() {
+                tracing::error!(
                     position_id = held.position_id,
                     symbol = %held.symbol,
-                    "wallet_address is empty; skipping live protective stop close"
+                    wallet_empty = wallet.trim().is_empty(),
+                    pk_empty = pk.trim().is_empty(),
+                    "wallet_address or private_key is empty in live mode; skipping live protective stop close"
                 );
                 return Ok(None);
             }

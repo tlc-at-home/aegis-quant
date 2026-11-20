@@ -22,7 +22,9 @@ fn get_telegram_client(timeout_sec: u64, is_loopback: bool) -> BlockingClient {
     if let Some(client) = cache.lock().get(&key) {
         return client.clone();
     }
-    let mut builder = BlockingClient::builder().timeout(Duration::from_secs(key.0));
+    let mut builder = BlockingClient::builder()
+        .timeout(Duration::from_secs(key.0))
+        .redirect(reqwest::redirect::Policy::none());
     if is_loopback {
         builder = builder.no_proxy();
     }
@@ -225,74 +227,6 @@ pub async fn send_telegram_html_async(
     tokio::task::spawn_blocking(move || send_telegram_html(&base, &token, &cid, &html, timeout_sec))
         .await
         .map_err(|e| AegisError::Alert(format!("Async Telegram dispatch join error: {e}")))
-}
-
-/// Queries Telegram `/bot<token>/getUpdates` to auto-discover the most recent user or group `chat.id`
-/// ONLY when `configured_chat_id` is empty. Refuses to overwrite an already configured non-empty `telegram_chat_id`.
-pub fn discover_telegram_chat_id_guarded(
-    api_base_url: &str,
-    bot_token: &str,
-    configured_chat_id: &str,
-    timeout_sec: u64,
-) -> Option<String> {
-    if !configured_chat_id.trim().is_empty() {
-        return None;
-    }
-    discover_telegram_chat_id_from_updates(api_base_url, bot_token, timeout_sec)
-}
-
-/// Queries Telegram `/bot<token>/getUpdates` to auto-discover the most recent user or group `chat.id`
-/// when `telegram_chat_id` is unconfigured.
-pub fn discover_telegram_chat_id_from_updates(
-    api_base_url: &str,
-    bot_token: &str,
-    timeout_sec: u64,
-) -> Option<String> {
-    let base = api_base_url.trim().trim_end_matches('/').to_string();
-    let token = bot_token.trim().to_string();
-    if token.is_empty() {
-        return None;
-    }
-    let is_loopback = is_loopback_url(&base);
-    let bot_id_prefix = token.split(':').next().unwrap_or("").trim().to_string();
-
-    let run_discovery = move || -> Option<String> {
-        let client = get_telegram_client(timeout_sec, is_loopback);
-        let url = format!("{base}/bot{token}/getUpdates");
-        let resp = client.get(&url).send().ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let body: Value = resp.json().ok()?;
-        let updates = body.get("result")?.as_array()?;
-        for upd in updates.iter().rev() {
-            let chat_id_val = upd
-                .pointer("/message/chat/id")
-                .or_else(|| upd.pointer("/edited_message/chat/id"))
-                .or_else(|| upd.pointer("/channel_post/chat/id"))
-                .or_else(|| upd.pointer("/my_chat_member/chat/id"))
-                .or_else(|| upd.pointer("/callback_query/message/chat/id"));
-            if let Some(id_val) = chat_id_val {
-                let cid = if let Some(n) = id_val.as_i64() {
-                    n.to_string()
-                } else if let Some(s) = id_val.as_str() {
-                    s.trim().to_string()
-                } else {
-                    continue;
-                };
-                if !cid.is_empty() && cid != bot_id_prefix {
-                    return Some(cid);
-                }
-            }
-        }
-        None
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        thread::spawn(run_discovery).join().ok().flatten()
-    } else {
-        run_discovery()
-    }
 }
 
 #[cfg(test)]

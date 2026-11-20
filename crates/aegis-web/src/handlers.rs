@@ -1,18 +1,21 @@
 //! REST and static asset route handlers for Aegis Quant v2.0 (`aegis-web::handlers`).
 
-use crate::auth::{constant_time_eq, AuthLoginPayload, AuthLoginResponse};
+use crate::auth::{
+    auth_error_response, constant_time_eq, extract_cookie_token, too_many_requests_response,
+    AuthLoginPayload, AuthLoginResponse,
+};
 use crate::payloads::{
     build_dashboard_payload, build_health_payload, execute_close_position_or_order,
     execute_risk_tier_switch, json_value_to_config_string, map_aegis_error_response,
-    validate_config_key_value, ApiErrorBody, ClosePositionRequest, ConfigUpdateRequest,
-    ConfigUpdateResponse, ReconcileRequest, RiskTierUpdateRequest,
+    validate_config_key_value, ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse,
+    ReconcileRequest, RiskTierUpdateRequest,
 };
-use crate::server::AppState;
+use crate::server::{AppState, ClientIpKey, SESSION_TTL_SECS};
 use aegis_alerts::send_test_alert_async;
-use aegis_core::{now_ms, AegisError};
+use aegis_core::{now_ms, AegisError, ExecutionMode};
 use axum::{
-    extract::State,
-    http::{header, HeaderValue, StatusCode},
+    extract::{Extension, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     Json,
 };
@@ -140,6 +143,20 @@ pub async fn post_risk_tier_handler(
     }
 }
 
+fn normalize_pending_config_write(
+    key: &str,
+    raw_val: String,
+) -> aegis_core::Result<(String, String)> {
+    validate_config_key_value(key, &raw_val)?;
+    let clean_k = key.trim().to_ascii_lowercase();
+    let norm_val = if clean_k == "execution_mode" {
+        raw_val.trim().to_ascii_uppercase()
+    } else {
+        raw_val
+    };
+    Ok((clean_k, norm_val))
+}
+
 /// `POST /api/v1/config` — Updates validated runtime config keys or Fernet-encrypted credentials in `system_config`.
 pub async fn post_config_handler(
     State(state): State<AppState>,
@@ -155,15 +172,15 @@ pub async fn post_config_handler(
                 .as_ref()
                 .map(json_value_to_config_string)
                 .unwrap_or_default();
-            validate_config_key_value(k, &val_str)?;
-            pending_writes.push((k.trim().to_string(), val_str, req.description.clone()));
+            let (clean_k, norm_val) = normalize_pending_config_write(k, val_str)?;
+            pending_writes.push((clean_k, norm_val, req.description.clone()));
         }
 
         if let Some(ref map) = req.updates {
             for (k, v) in map {
                 let val_str = json_value_to_config_string(v);
-                validate_config_key_value(k, &val_str)?;
-                pending_writes.push((k.trim().to_string(), val_str, None));
+                let (clean_k, norm_val) = normalize_pending_config_write(k, val_str)?;
+                pending_writes.push((clean_k, norm_val, None));
             }
         }
 
@@ -171,6 +188,46 @@ pub async fn post_config_handler(
             return Err(AegisError::Validation(
                 "No config_key or updates map provided".to_string(),
             ));
+        }
+
+        let _exec_guard = aegis_execution::execution_lock().lock();
+        let requested_modes: Vec<&str> = pending_writes
+            .iter()
+            .filter(|(k, _, _)| k == "execution_mode")
+            .map(|(_, v, _)| v.as_str())
+            .collect();
+        if requested_modes.windows(2).any(|w| w[0] != w[1]) {
+            return Err(AegisError::Validation(
+                "Conflicting execution_mode values in single config update".to_string(),
+            ));
+        }
+
+        let mut hyperliquid_testnet_sync: Option<&'static str> = None;
+        if let Some(&target_mode_str) = requested_modes.first() {
+            let current_cfg = db.load_config()?;
+            let current_mode = current_cfg.execution_mode();
+            let target_mode = ExecutionMode::parse(target_mode_str);
+            if target_mode != current_mode {
+                if !db.get_assets_held()?.is_empty() || !db.get_assets_ordered()?.is_empty() {
+                    return Err(AegisError::Validation(format!(
+                        "Cannot switch execution_mode from {} to {} while OPEN positions or WORKING orders exist",
+                        current_mode.as_str(),
+                        target_mode.as_str(),
+                    )));
+                }
+                if target_mode == ExecutionMode::Live
+                    && !current_cfg.get_bool("allow_web_live_mode", false)
+                {
+                    return Err(AegisError::SecurityViolation(
+                        "Switching execution_mode to LIVE via Web API requires DB-immutable allow_web_live_mode=true".to_string(),
+                    ));
+                }
+                hyperliquid_testnet_sync = Some(if target_mode == ExecutionMode::Live {
+                    "false"
+                } else {
+                    "true"
+                });
+            }
         }
 
         let mut updated_keys = Vec::with_capacity(pending_writes.len());
@@ -184,6 +241,15 @@ pub async fn post_config_handler(
             }
             db.set_config_value(k, val_str, desc.as_deref())?;
             updated_keys.push(k.clone());
+        }
+
+        if let Some(testnet_val) = hyperliquid_testnet_sync {
+            db.set_config_value(
+                "hyperliquid_testnet",
+                testnet_val,
+                Some("Synchronized with execution_mode transition"),
+            )?;
+            updated_keys.push("hyperliquid_testnet".to_string());
         }
 
         // Keep target_leverage_multiplier synchronized if risk_tier was changed directly
@@ -321,29 +387,104 @@ pub async fn post_reconcile_handler(
     }
 }
 
-/// `POST /api/v1/auth/login` — Exchanges bearer token for an HttpOnly session cookie.
+fn should_set_secure_cookie(state: &AppState, headers: &HeaderMap, uri: &Uri) -> bool {
+    if state.cookie_secure {
+        return true;
+    }
+    if uri
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("https"))
+    {
+        return true;
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if origin
+            .trim()
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        {
+            return true;
+        }
+    }
+    if state.trust_proxy_headers {
+        if let Some(xfp) = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+        {
+            if xfp
+                .split(',')
+                .next()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+            {
+                return true;
+            }
+        }
+        if let Some(fwd) = headers.get(header::FORWARDED).and_then(|v| v.to_str().ok()) {
+            for part in fwd.split(';') {
+                for kv in part.split(',') {
+                    if let Some((k, v)) = kv.trim().split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("proto")
+                            && v.trim().trim_matches('"').eq_ignore_ascii_case("https")
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `POST /api/v1/auth/login` — Exchanges bearer token for a rotating, expiring HttpOnly session cookie.
 pub async fn post_auth_login_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    client_ip_ext: Option<Extension<ClientIpKey>>,
     Json(req): Json<AuthLoginPayload>,
 ) -> Response {
-    let expected = state
+    let Some(expected) = state
         .configured_api_token
         .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(&state.session_token);
-    if !constant_time_eq(req.token.trim(), expected) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ApiErrorBody {
-                error: "Unauthorized".to_string(),
-                detail: "Invalid API token".to_string(),
-            }),
-        )
-            .into_response();
+    else {
+        return auth_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authentication token is not configured or undecryptable",
+        );
+    };
+
+    let client_ip = client_ip_ext
+        .map(|Extension(k)| k)
+        .unwrap_or(ClientIpKey::Local);
+    if state.require_bearer_auth {
+        if let Err(retry_after) = state.auth_rate_limiter.check_allowed(client_ip) {
+            return too_many_requests_response(retry_after);
+        }
     }
+
+    if !constant_time_eq(req.token.trim(), expected) {
+        if state.require_bearer_auth {
+            state.auth_rate_limiter.record_failure(client_ip);
+        }
+        return auth_error_response(StatusCode::UNAUTHORIZED, "Invalid API token");
+    }
+
+    if state.require_bearer_auth {
+        state.auth_rate_limiter.reset(client_ip);
+    }
+
+    let prior_cookie = extract_cookie_token(&headers);
+    let session_tok = state.mint_session(prior_cookie.as_deref());
+    let secure_attr = if should_set_secure_cookie(&state, &headers, &uri) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
-        "aegis_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200",
-        state.session_token
+        "aegis_session={session_tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECS}{secure_attr}"
     );
     let mut resp = (
         StatusCode::OK,

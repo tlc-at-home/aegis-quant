@@ -4,6 +4,7 @@
 //! - `OPEN` positions commit funds (`committed_notional_usdc > 0.0`), `reserved_margin_usdc = 0.0`.
 
 use crate::engine::DatabaseManager;
+use crate::orders_repo::truncate_audit_reason;
 use aegis_core::{now_ms, round_dp, AegisError, OrderSide, PositionRecord, Result};
 use mysql::params;
 use mysql::prelude::*;
@@ -60,6 +61,10 @@ struct ActiveSyncRow {
     client_order_id: String,
     fsm_state: String,
     requested_quantity: f64,
+}
+
+fn truncate_exit_reason(reason: &str) -> String {
+    reason.chars().take(64).collect()
 }
 
 fn derive_take_profit_px(side: OrderSide, entry_price: f64, protective_stop_px: f64) -> f64 {
@@ -123,6 +128,7 @@ impl DatabaseManager {
         .map_err(|e| AegisError::Database(format!("create_working_order insert failed: {e}")))?;
 
         let pos_id = tx.last_insert_id().unwrap_or(0) as i64;
+        let safe_reason = truncate_audit_reason(&input.reason);
 
         tx.exec_drop(
             r#"INSERT INTO order_audit (
@@ -142,7 +148,7 @@ impl DatabaseManager {
                 "qty" => input.requested_quantity,
                 "px" => input.limit_price,
                 "res_usdc" => round_dp(input.reserved_margin_usdc, 4),
-                "reason" => &input.reason,
+                "reason" => &safe_reason,
                 "ts" => ts,
             },
         )
@@ -235,6 +241,7 @@ impl DatabaseManager {
             )));
         }
 
+        let safe_reason = truncate_audit_reason(reason);
         tx.exec_drop(
             r#"INSERT INTO order_audit (
                    position_id, asset_id, client_order_id, side, from_state, to_state,
@@ -257,7 +264,7 @@ impl DatabaseManager {
                 "fill_px" => fill_price,
                 "comm_usdc" => committed_usdc,
                 "fees" => round_dp(fees_paid_usdc, 4),
-                "reason" => reason,
+                "reason" => &safe_reason,
                 "ts" => ts,
             },
         )
@@ -532,6 +539,9 @@ impl DatabaseManager {
         let total_fees = existing_fees_paid + fees_paid_usdc;
         let net_realized_pnl = round_dp(gross_pnl - total_fees + funding_accrued_usdc, 4);
 
+        let safe_exit_reason = truncate_exit_reason(exit_reason);
+        let safe_audit_reason = truncate_audit_reason(exit_reason);
+
         tx.exec_drop(
             r#"UPDATE positions
                SET status = 'CLOSED',
@@ -552,7 +562,7 @@ impl DatabaseManager {
                 "rpnl" => net_realized_pnl,
                 "fees" => round_dp(total_fees, 4),
                 "ts" => ts,
-                "reason" => exit_reason,
+                "reason" => &safe_exit_reason,
                 "pid" => position_id,
             },
         )
@@ -584,7 +594,7 @@ impl DatabaseManager {
                 "fill_qty" => qty,
                 "exit_px" => exit_price,
                 "fees" => round_dp(fees_paid_usdc, 4),
-                "reason" => exit_reason,
+                "reason" => &safe_audit_reason,
                 "ts" => ts,
             },
         )
@@ -622,6 +632,9 @@ impl DatabaseManager {
             )));
         }
 
+        let safe_exit_reason = truncate_exit_reason(reason);
+        let safe_audit_reason = truncate_audit_reason(reason);
+
         tx.exec_drop(
             r#"UPDATE positions
                SET status = 'CANCELLED',
@@ -632,7 +645,7 @@ impl DatabaseManager {
                    updated_at_ms = :ts,
                    exit_reason = :reason
                WHERE id = :pid AND status = 'WORKING'"#,
-            params! { "ts" => ts, "reason" => reason, "pid" => position_id },
+            params! { "ts" => ts, "reason" => &safe_exit_reason, "pid" => position_id },
         )
         .map_err(|e| AegisError::Database(format!("cancel_working_order update failed: {e}")))?;
 
@@ -660,7 +673,7 @@ impl DatabaseManager {
                 "from_st" => fsm_state,
                 "req_qty" => requested_qty,
                 "lim_px" => entry_price,
-                "reason" => reason,
+                "reason" => &safe_audit_reason,
                 "ts" => ts,
             },
         )
@@ -1071,6 +1084,7 @@ impl DatabaseManager {
                 AegisError::Database(format!("promote working on exchange sync failed: {e}"))
             })?;
 
+            let promote_reason = truncate_audit_reason("HL_WORKING_PROMOTED_ON_RECONCILE");
             tx.exec_drop(
                 r#"INSERT INTO order_audit (
                        position_id, asset_id, client_order_id, side, from_state, to_state,
@@ -1079,7 +1093,7 @@ impl DatabaseManager {
                    ) VALUES (
                        :pid, :aid, :coid, :side, :from_st, 'FILLED_OPEN',
                        :req_qty, :qty, :entry_px, :entry_px,
-                       0.0, :comm_usdc, 0.0, 'HL_WORKING_PROMOTED_ON_RECONCILE', :ts, :ts
+                       0.0, :comm_usdc, 0.0, :reason, :ts, :ts
                    )"#,
                 params! {
                     "pid" => w.id,
@@ -1091,6 +1105,7 @@ impl DatabaseManager {
                     "qty" => quantity,
                     "entry_px" => entry_price,
                     "comm_usdc" => comm_usdc,
+                    "reason" => &promote_reason,
                     "ts" => ts,
                 },
             )
@@ -1177,6 +1192,7 @@ impl DatabaseManager {
         })?;
 
         let new_id = tx.last_insert_id().unwrap_or(0) as i64;
+        let sync_reason = truncate_audit_reason("HYPERLIQUID_CLEARINGHOUSE_1_TO_1_SYNC");
         tx.exec_drop(
             r#"INSERT INTO order_audit (
                    position_id, asset_id, client_order_id, side, from_state, to_state,
@@ -1185,7 +1201,7 @@ impl DatabaseManager {
                ) VALUES (
                    :pid, :aid, :coid, :side, 'RECONCILED', 'FILLED_OPEN',
                    :qty, :qty, :entry_px, :entry_px,
-                   0.0, :comm_usdc, 0.0, 'HYPERLIQUID_CLEARINGHOUSE_1_TO_1_SYNC', :ts, :ts
+                   0.0, :comm_usdc, 0.0, :reason, :ts, :ts
                )"#,
             params! {
                 "pid" => new_id,
@@ -1195,6 +1211,7 @@ impl DatabaseManager {
                 "qty" => quantity,
                 "entry_px" => entry_price,
                 "comm_usdc" => round_dp(committed_notional_usdc, 4),
+                "reason" => &sync_reason,
                 "ts" => ts,
             },
         )
@@ -1319,6 +1336,7 @@ impl DatabaseManager {
 
             if let Some(pid) = matched_id {
                 matched_ids.insert(pid);
+                let safe_exit_reason = truncate_exit_reason(&t.exit_reason);
                 tx.exec_drop(
                     r#"UPDATE positions
                        SET entry_price = :entry_px,
@@ -1350,7 +1368,7 @@ impl DatabaseManager {
                         "eoid" => &t.exchange_order_id,
                         "cts" => t.created_at_ms,
                         "clts" => t.closed_at_ms,
-                        "reason" => &t.exit_reason,
+                        "reason" => &safe_exit_reason,
                         "pid" => pid,
                     },
                 )
@@ -1361,6 +1379,7 @@ impl DatabaseManager {
                     ))
                 })?;
             } else {
+                let safe_exit_reason = truncate_exit_reason(&t.exit_reason);
                 tx.exec_drop(
                     r#"INSERT INTO positions (
                            asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
@@ -1394,7 +1413,7 @@ impl DatabaseManager {
                         "eoid" => &t.exchange_order_id,
                         "cts" => t.created_at_ms,
                         "clts" => t.closed_at_ms,
-                        "reason" => &t.exit_reason,
+                        "reason" => &safe_exit_reason,
                     },
                 )
                 .map_err(|e| {

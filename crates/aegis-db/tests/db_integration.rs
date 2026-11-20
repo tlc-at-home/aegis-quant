@@ -1293,3 +1293,377 @@ fn test_exchange_assets_concurrent_batch_updates_no_deadlock() {
         h_prio.join().unwrap();
     });
 }
+
+#[test]
+fn test_critical_secret_load_config_fails_closed_while_non_critical_stays_isolated() {
+    let key = aegis_db::generate_fernet_key();
+    let db = DatabaseManager::new_isolated_test(Some(&key)).expect("isolated test DB");
+    let ts = now_ms();
+
+    // Non-critical broken_secret remains isolated and returns Ok
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            r#"INSERT INTO system_config
+               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+               VALUES ('broken_secret', 'gAAAAABcorrupt_non_critical', 'secret', 'bad', :ts, :ts)"#,
+            params! { "ts" => ts },
+        )
+        .unwrap();
+    }
+    let cfg_ok = db.load_config().expect("non-critical broken row isolated");
+    assert!(cfg_ok.get("broken_secret").is_none());
+
+    // Corrupt web_api_token must fail closed
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            r#"INSERT INTO system_config
+               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+               VALUES ('web_api_token', 'gAAAAABcorrupt_web_token', 'secret', 'bad', :ts, :ts)
+               ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)"#,
+            params! { "ts" => ts },
+        )
+        .unwrap();
+    }
+    let err_web = db
+        .load_config()
+        .expect_err("corrupt web_api_token must fail closed");
+    assert!(
+        err_web.to_string().contains("web_api_token"),
+        "Unexpected error for web_api_token: {err_web}"
+    );
+
+    // Fix web_api_token, corrupt private_key -> must also fail closed
+    db.set_config_value("web_api_token", "valid-bearer-token-1234", None)
+        .unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            r#"INSERT INTO system_config
+               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+               VALUES ('PRIVATE_KEY', 'ENC:gAAAAABcorrupt_private_key', 'secret', 'bad', :ts, :ts)
+               ON DUPLICATE KEY UPDATE config_key = VALUES(config_key), config_value = VALUES(config_value)"#,
+            params! { "ts" => ts },
+        )
+        .unwrap();
+    }
+    let err_pk = db
+        .load_config()
+        .expect_err("corrupt private_key must fail closed");
+    assert!(
+        err_pk.to_string().contains("private_key"),
+        "Unexpected error for private_key: {err_pk}"
+    );
+}
+
+#[test]
+fn test_set_config_value_normalizes_case_and_updates_cap_epoch() {
+    let key = aegis_db::generate_fernet_key();
+    let db = DatabaseManager::new_isolated_test(Some(&key)).expect("isolated test DB");
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+
+    // Seed an uppercase legacy row in MariaDB directly to confirm ON DUPLICATE KEY UPDATE self-heals config_key
+    {
+        let mut conn = db.get_conn().unwrap();
+        let ts = now_ms();
+        conn.exec_drop(
+            r#"INSERT INTO system_config
+               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+               VALUES ('AUTO_REBALANCE_ENABLED', 'false', 'bool', 'legacy uppercase', :ts, :ts)"#,
+            params! { "ts" => ts },
+        )
+        .unwrap();
+    }
+    db.set_config_value("  Auto_Rebalance_Enabled  ", "true", None)
+        .unwrap();
+
+    let before_cap = now_ms();
+    db.set_config_value("RISK_CAPITAL_CAP_USDC", "2750.0", None)
+        .unwrap();
+    db.set_config_value("TELEGRAM_CHAT_ID", "99887766", None)
+        .unwrap();
+
+    let rows = db.list_system_config_rows().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.config_key == "auto_rebalance_enabled" && r.config_value == "true"),
+        "Mixed-case row should self-heal to lowercase config_key"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.config_key == "risk_capital_cap_usdc" && r.config_value == "2750.0"),
+        "RISK_CAPITAL_CAP_USDC must normalize to lowercase"
+    );
+    let chat_row = rows
+        .iter()
+        .find(|r| r.config_key == "telegram_chat_id")
+        .expect("telegram_chat_id row");
+    assert_eq!(chat_row.value_type, "string");
+    assert_eq!(chat_row.config_value, "99887766");
+
+    let cfg = db.load_config().unwrap();
+    assert!((cfg.get_f64("risk_capital_cap_usdc", 0.0) - 2750.0).abs() < 1e-9);
+    assert!((cfg.get_f64("RISK_CAPITAL_CAP_USDC", 0.0) - 2750.0).abs() < 1e-9);
+    assert!(cfg.get_i64("risk_capital_cap_updated_at_ms", 0) >= before_cap);
+    assert!(cfg.get_bool("auto_rebalance_enabled", false));
+}
+
+#[test]
+fn test_migrate_legacy_sqlite_encrypts_plaintext_and_skips_corrupt_ciphertext() {
+    let key = aegis_db::generate_fernet_key();
+    let db = DatabaseManager::new_isolated_test(Some(&key)).expect("isolated test DB");
+    let cipher = db.fernet().clone();
+    let already_enc_token = cipher.encrypt(b"existing-bot-token").unwrap();
+
+    let sqlite_path = std::env::temp_dir().join(format!(
+        "aegis_legacy_migration_test_{}_{}.db",
+        std::process::id(),
+        now_ms()
+    ));
+    {
+        let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        conn.execute(
+            "CREATE TABLE system_config (config_key TEXT PRIMARY KEY, config_value TEXT NOT NULL, value_type TEXT, description TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_config (config_key, config_value, value_type, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "PRIVATE_KEY",
+                "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+                "secret",
+                "plaintext legacy private key"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_config (config_key, config_value, value_type, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "telegram_bot_token",
+                &already_enc_token,
+                "secret",
+                "valid encrypted bot token"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_config (config_key, config_value, value_type, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "web_api_token",
+                "gAAAAABcorrupt_legacy_ciphertext",
+                "secret",
+                "corrupt encrypted token"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_config (config_key, config_value, value_type, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "telegram_chat_id",
+                "-10099887766",
+                "secret",
+                "chat id"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO system_config (config_key, config_value, value_type, description) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "discord_webhook_url",
+                "https://discord.com/api/webhooks/123456/plain_webhook_secret",
+                "string",
+                "plaintext discord webhook"
+            ],
+        )
+        .unwrap();
+    }
+
+    let migrated = db
+        .migrate_legacy_sqlite_credentials(&sqlite_path)
+        .expect("migration should succeed cleanly");
+    let _ = std::fs::remove_file(&sqlite_path);
+    assert_eq!(migrated, 4);
+
+    let rows = db.list_system_config_rows().unwrap();
+    let pk_row = rows.iter().find(|r| r.config_key == "private_key").unwrap();
+    assert!(
+        aegis_db::is_encrypted_value(&pk_row.config_value),
+        "Plaintext legacy private_key must be Fernet-encrypted during migration"
+    );
+    assert_eq!(pk_row.value_type, "secret");
+
+    let discord_row = rows
+        .iter()
+        .find(|r| r.config_key == "discord_webhook_url")
+        .unwrap();
+    assert!(aegis_db::is_encrypted_value(&discord_row.config_value));
+    assert_eq!(discord_row.value_type, "secret");
+
+    let chat_row = rows
+        .iter()
+        .find(|r| r.config_key == "telegram_chat_id")
+        .unwrap();
+    assert!(!aegis_db::is_encrypted_value(&chat_row.config_value));
+    assert_eq!(chat_row.config_value, "-10099887766");
+    assert_eq!(chat_row.value_type, "string");
+
+    let web_row = rows
+        .iter()
+        .find(|r| r.config_key == "web_api_token")
+        .unwrap();
+    assert!(
+        web_row.config_value.is_empty(),
+        "Corrupt legacy ciphertext must not be copied blindly into MariaDB"
+    );
+
+    let cfg = db.load_config().unwrap();
+    assert_eq!(
+        cfg.get_str("private_key", ""),
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+    );
+    assert_eq!(cfg.get_str("telegram_bot_token", ""), "existing-bot-token");
+    assert_eq!(cfg.get_str("telegram_chat_id", ""), "-10099887766");
+    assert_eq!(
+        cfg.get_str("discord_webhook_url", ""),
+        "https://discord.com/api/webhooks/123456/plain_webhook_secret"
+    );
+}
+
+#[test]
+fn test_get_peak_and_latest_equity_since_windows_and_empty() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    assert_eq!(db.get_peak_and_latest_equity_since(0).unwrap(), None);
+
+    let now = now_ms();
+    let t1 = now - 7_200_000;
+    let t2 = now - 3_600_000;
+    let t3 = now - 600_000;
+    let t4 = now - 60_000;
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        for (eq, ts) in [(2_000.0, t1), (1_500.0, t2), (1_400.0, t3), (1_150.0, t4)] {
+            conn.exec_drop(
+                r#"INSERT INTO portfolio_snapshots (
+                       total_equity_usdc, available_cash_usdc, reserved_order_cash_usdc,
+                       committed_notional_usdc, net_notional_usdc, gross_leverage_x, net_leverage_x,
+                       market_beta_exposure, market_breadth_bull, market_regime_label, risk_tier,
+                       leverage_multiplier, s1_gross_weight, s2_gross_weight, s3_gross_weight,
+                       working_order_count, open_long_count, open_short_count, eligible_coin_count,
+                       created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :eq, :eq, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 'NEUTRAL', 'extreme',
+                       1.85, 0.0, 0.0, 0.0, 0, 0, 0, 0, :ts, :ts
+                   )"#,
+                params! { "eq" => eq, "ts" => ts },
+            )
+            .unwrap();
+        }
+    }
+
+    let (peak_all, latest_all) = db
+        .get_peak_and_latest_equity_since(t1 - 1)
+        .unwrap()
+        .unwrap();
+    assert!((peak_all - 2_000.0).abs() < 1e-6);
+    assert!((latest_all - 1_150.0).abs() < 1e-6);
+
+    let (peak_recent, latest_recent) = db.get_peak_and_latest_equity_since(t2).unwrap().unwrap();
+    assert!((peak_recent - 1_500.0).abs() < 1e-6);
+    assert!((latest_recent - 1_150.0).abs() < 1e-6);
+
+    // Future since_ms with no matching positive rows falls back to latest_equity.max(0.0)
+    let (peak_future, latest_future) = db
+        .get_peak_and_latest_equity_since(now + 10_000)
+        .unwrap()
+        .unwrap();
+    assert!((peak_future - 1_150.0).abs() < 1e-6);
+    assert!((latest_future - 1_150.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_order_audit_reason_clamping_prevents_mysql_1406() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = db
+        .upsert_exchange_asset(&sample_asset_input("SOL", 4, 180.0, true))
+        .unwrap();
+
+    let long_utf8_reason = "🔥".repeat(280);
+    assert!(long_utf8_reason.chars().count() == 280);
+    assert!(long_utf8_reason.len() > 1000);
+
+    let pos_id = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "coid-audit-clamp-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 180.0,
+            requested_quantity: 1.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.1,
+            s1_weight_contrib: 0.1,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 170.0,
+            exchange_order_id: Some("hl-oid-clamp-1".to_string()),
+            reason: long_utf8_reason.clone(),
+        })
+        .expect("create_working_order with >255 char reason must succeed");
+
+    db.record_working_order_chase(
+        pos_id,
+        180.5,
+        "CHASING_ALO",
+        Some("hl-oid-clamp-2"),
+        &long_utf8_reason,
+    )
+    .expect("record_working_order_chase with >255 char reason must succeed");
+
+    db.promote_working_to_open(
+        pos_id,
+        180.5,
+        1.0,
+        0.1,
+        170.0,
+        Some("hl-oid-clamp-2"),
+        &long_utf8_reason,
+    )
+    .expect("promote_working_to_open with >255 char reason must succeed");
+
+    db.close_position(pos_id, 182.0, 0.1, &long_utf8_reason)
+        .expect("close_position with >255 char reason must succeed");
+
+    let pos2_id = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "coid-audit-clamp-2".to_string(),
+            side: OrderSide::Short,
+            limit_price: 182.0,
+            requested_quantity: 1.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.1,
+            s1_weight_contrib: 0.1,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 190.0,
+            exchange_order_id: Some("hl-oid-clamp-3".to_string()),
+            reason: "short entry".to_string(),
+        })
+        .unwrap();
+    db.cancel_working_order(pos2_id, &long_utf8_reason)
+        .expect("cancel_working_order with >255 char reason must succeed");
+
+    let audits = db.list_recent_order_audits(10).unwrap();
+    let clamped: Vec<_> = audits
+        .iter()
+        .filter(|a| a.position_id == pos_id || a.position_id == pos2_id)
+        .collect();
+    assert!(clamped.len() >= 5);
+    assert!(clamped
+        .iter()
+        .filter(|a| a.reason.starts_with('🔥'))
+        .all(|a| a.reason.chars().count() == 250));
+}

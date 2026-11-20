@@ -39,13 +39,12 @@ use std::time::Duration;
 
 static GLOBAL_EXECUTION_LOCK: OnceLock<Arc<ReentrantMutex<()>>> = OnceLock::new();
 
-pub(crate) fn execution_lock() -> &'static Arc<ReentrantMutex<()>> {
+pub fn execution_lock() -> &'static Arc<ReentrantMutex<()>> {
     GLOBAL_EXECUTION_LOCK.get_or_init(|| Arc::new(ReentrantMutex::new(())))
 }
 
 pub(crate) fn is_live_exchange_active(db: &DatabaseManager, cfg: &ConfigMap) -> bool {
     cfg.execution_mode().is_live_or_testnet()
-        && !cfg.get_str("private_key", "").is_empty()
         && (!db.is_ephemeral_test_db() || endpoints_are_loopback(cfg))
 }
 
@@ -113,11 +112,14 @@ fn parse_hl_f64(val: Option<&Value>) -> f64 {
 }
 
 fn parse_hl_oid_val(ord: &Value) -> Option<u64> {
-    ord.get("oid").and_then(Value::as_u64).or_else(|| {
-        ord.get("oid")
-            .and_then(Value::as_str)
-            .and_then(|s| s.trim().parse::<u64>().ok())
-    })
+    ord.get("oid")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            ord.get("oid")
+                .and_then(Value::as_str)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .filter(|&o| o > 0)
 }
 
 fn is_hl_trigger_order(ord: &Value) -> bool {
@@ -277,6 +279,34 @@ fn collect_coin_non_trigger_cancels(
         }
     }
     cancels
+}
+
+fn cancel_batch_response_ok(resp: &Value) -> std::result::Result<(), String> {
+    if resp.get("status").and_then(Value::as_str) != Some("ok") {
+        return Err(format!("non-ok cancel status: {resp}"));
+    }
+    if let Some(statuses) = resp
+        .pointer("/response/data/statuses")
+        .and_then(Value::as_array)
+    {
+        for st in statuses {
+            if let Some(err_val) = st.get("error") {
+                let err_str = err_val
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| err_val.to_string());
+                let err_lower = err_str.to_ascii_lowercase();
+                if err_lower.contains("filled")
+                    || (!err_lower.contains("canceled")
+                        && !err_lower.contains("cancelled")
+                        && !err_lower.contains("never placed"))
+                {
+                    return Err(err_str);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct CloseFillAccumulator {
@@ -463,7 +493,7 @@ impl ExecutionEngine {
         &self,
         close_legacy_positions: bool,
     ) -> Result<CutoverFullReport> {
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let market_scan = self.watcher.run_3s_exchange_scan()?;
         let _ = self.watcher.refresh_bars_for_eligible_assets(
             35,
@@ -477,8 +507,9 @@ impl ExecutionEngine {
             .reconciler
             .run_cutover_reconciliation(close_legacy_positions)?;
 
+        let post_reconcile_cfg = self.db.load_config()?;
         let signal_out = self.evaluate_and_persist_signals(
-            self.resolve_effective_base_equity_usdc(&self.db.load_config_or_default()),
+            self.resolve_effective_base_equity_usdc(&post_reconcile_cfg),
         )?;
         let snapshot = self.record_portfolio_snapshot(None, Some(&signal_out))?;
 
@@ -513,7 +544,7 @@ impl ExecutionEngine {
     /// Evaluates all three alpha sleeves (`S1 Carry-Momentum`, `S2 Trend-Breakout`, `S3 Event-Reversion`)
     /// across all discovered `exchange_assets`, persists `sleeve_signals`, and returns [`SignalCycleOutput`].
     pub fn evaluate_and_persist_signals(&self, base_equity_usdc: f64) -> Result<SignalCycleOutput> {
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let assets = self.db.list_exchange_assets()?;
         let held = self.db.get_assets_held()?;
         let ordered = self.db.get_assets_ordered()?;
@@ -638,33 +669,40 @@ impl ExecutionEngine {
         Ok(output)
     }
 
+    /// Resolves the live/testnet base equity override (`Some(usdc)`) if active, or `None` to use paper equity.
+    pub fn resolve_live_base_equity_usdc(
+        cfg: &aegis_core::ConfigMap,
+        is_ephemeral_test_db: bool,
+    ) -> Option<f64> {
+        if !cfg.execution_mode().is_live_or_testnet() {
+            return None;
+        }
+        let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        let cap_eq = cfg.get_f64("risk_capital_cap_usdc", 0.0);
+        if live_eq > 0.0 {
+            return Some(if cap_eq >= 10.0 {
+                live_eq.min(cap_eq)
+            } else {
+                live_eq
+            });
+        }
+        let has_wallet = !cfg.get_str("wallet_address", "").trim().is_empty();
+        if has_wallet && !is_ephemeral_test_db && cap_eq >= 10.0 {
+            return Some(cap_eq);
+        }
+        None
+    }
+
     /// Resolves the active base portfolio equity in USDC:
     /// - In `TESTNET`/`LIVE` mode: reads `live_eq = live_exchange_equity_usdc` and `cap_eq = risk_capital_cap_usdc`;
-    ///   caps `live_eq` with `live_eq.min(cap_eq)` when configured, falling back to `cap_eq` only when a live
+    ///   caps `live_eq` with `live_eq.min(cap_eq)` when configured (`cap_eq >= 10.0`), falling back to `cap_eq` only when a live
     ///   non-ephemeral wallet is configured before initial exchange reconciliation.
     /// - In `PAPER` (or unconfigured local test DBs without `live_exchange_equity_usdc`): uses `initial_paper_equity_usdc + realized_pnl`.
     pub fn resolve_effective_base_equity_usdc(&self, cfg: &aegis_core::ConfigMap) -> f64 {
-        if cfg.execution_mode().is_live_or_testnet() {
-            let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
-            let cap_eq = cfg.get_f64("risk_capital_cap_usdc", 0.0);
-            if live_eq > 10.0 {
-                return if cap_eq > 10.0 {
-                    live_eq.min(cap_eq)
-                } else {
-                    live_eq
-                };
-            }
-            if live_eq > 0.0 {
-                return if cap_eq > 0.0 {
-                    live_eq.min(cap_eq)
-                } else {
-                    live_eq
-                };
-            }
-            let has_wallet = !cfg.get_str("wallet_address", "").trim().is_empty();
-            if has_wallet && !self.db.is_ephemeral_test_db() && cap_eq > 0.0 {
-                return cap_eq.max(100.0);
-            }
+        if let Some(live_base) =
+            Self::resolve_live_base_equity_usdc(cfg, self.db.is_ephemeral_test_db())
+        {
+            return live_base;
         }
         let seed_eq = cfg.get_f64("initial_paper_equity_usdc", 10_000.0);
         let closed_realized_pnl: f64 = self
@@ -678,16 +716,17 @@ impl ExecutionEngine {
     }
 
     /// Enforces `max_open_positions` (default `6`) and the hard gross-leverage ceiling
-    /// (`base_equity_usdc * target_leverage_multiplier`) over active-epoch positions/orders
+    /// (`base_equity_usdc * min(target_leverage_multiplier, max_gross_leverage_x)`) over active-epoch positions/orders
     /// (`>= risk_capital_cap_updated_at_ms` in `LIVE`/`TESTNET`), automatically cancelling excess `WORKING` orders
     /// and closing excess `OPEN` positions (protecting young positions when older candidates exist).
     pub fn enforce_leverage_and_position_caps(&self) -> Result<Vec<ManualCloseReport>> {
         let _exec_guard = execution_lock().lock();
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
         let base_equity_usdc = self.resolve_effective_base_equity_usdc(&cfg);
-        let target_mult = cfg.target_leverage_multiplier();
-        let max_gross_notional = base_equity_usdc * target_mult;
+        let max_gross_lev = cfg.get_f64("max_gross_leverage_x", 2.50).clamp(0.20, 5.00);
+        let eff_lev_cap = cfg.target_leverage_multiplier().min(max_gross_lev);
+        let max_gross_notional = base_equity_usdc * eff_lev_cap;
         let cap_epoch_ms = if cfg.execution_mode().is_live_or_testnet() {
             cfg.get_i64("risk_capital_cap_updated_at_ms", 0)
         } else {
@@ -813,7 +852,7 @@ impl ExecutionEngine {
         base_equity_usdc: f64,
     ) -> Result<RebalanceExecutionReport> {
         let _exec_guard = execution_lock().lock();
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let eff_equity = if cfg.execution_mode().is_live_or_testnet() {
             self.resolve_effective_base_equity_usdc(&cfg)
         } else {
@@ -915,29 +954,24 @@ impl ExecutionEngine {
         } else {
             rebalance_now - 86_400_000
         };
-        if let Ok(snaps) = self.db.list_portfolio_snapshots(10_000) {
-            if let Some(latest) = snaps.last() {
-                let peak_24h = snaps
-                    .iter()
-                    .filter(|s| {
-                        s.created_at_ms >= dd_window_start
-                            && s.total_equity_usdc.is_finite()
-                            && s.total_equity_usdc > 0.0
-                    })
-                    .map(|s| s.total_equity_usdc)
-                    .fold(0.0_f64, f64::max);
-                if peak_24h > 0.0 && latest.total_equity_usdc > 0.0 {
-                    let dd_pct = (peak_24h - latest.total_equity_usdc) / peak_24h;
-                    if dd_pct >= max_dd_pct {
-                        tracing::warn!(
-                            latest_equity = latest.total_equity_usdc,
-                            peak_24h = peak_24h,
-                            drawdown_pct = dd_pct * 100.0,
-                            max_daily_drawdown_pct = max_dd_pct * 100.0,
-                            "Daily drawdown breaker tripped; halting new entries"
-                        );
-                        return Ok(report);
-                    }
+        if let Some((peak_24h, latest_equity)) =
+            self.db.get_peak_and_latest_equity_since(dd_window_start)?
+        {
+            if peak_24h.is_finite()
+                && latest_equity.is_finite()
+                && peak_24h > 0.0
+                && latest_equity > 0.0
+            {
+                let dd_pct = (peak_24h - latest_equity) / peak_24h;
+                if dd_pct >= max_dd_pct {
+                    tracing::warn!(
+                        latest_equity = latest_equity,
+                        peak_24h = peak_24h,
+                        drawdown_pct = dd_pct * 100.0,
+                        max_daily_drawdown_pct = max_dd_pct * 100.0,
+                        "Daily drawdown breaker tripped; halting new entries"
+                    );
+                    return Ok(report);
                 }
             }
         }
@@ -960,7 +994,8 @@ impl ExecutionEngine {
         let risk = RiskEngine::from_config_map(&cfg);
         let ledger = risk.evaluate_ledger_from_views(eff_equity, &active_held, &active_ordered);
         let target_mult = cfg.target_leverage_multiplier();
-        let max_allowed_gross_notional = eff_equity * target_mult;
+        let eff_lev_cap = target_mult.min(risk.limits.max_gross_leverage_x);
+        let max_allowed_gross_notional = eff_equity * eff_lev_cap;
         let current_reserved_notional: f64 = active_ordered
             .iter()
             .map(|o| (o.limit_price * o.requested_quantity).max(0.0))
@@ -969,7 +1004,7 @@ impl ExecutionEngine {
         {
             return Ok(report);
         }
-        let max_per_pos_weight = ((target_mult / (max_open_positions as f64)) * 1.25)
+        let max_per_pos_weight = ((eff_lev_cap / (max_open_positions as f64)) * 1.25)
             .min(risk.limits.max_single_asset_weight);
 
         let assets = self.db.list_exchange_assets()?;
@@ -994,6 +1029,12 @@ impl ExecutionEngine {
         });
 
         let is_live_exchange = is_live_exchange_active(&self.db, &cfg);
+        if is_live_exchange && cfg.get_str("private_key", "").trim().is_empty() {
+            tracing::error!(
+                "private_key is empty/missing in live mode; refusing to place new rebalance orders"
+            );
+            return Ok(report);
+        }
         let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 20.0).max(1.0);
         let mut l2_depth_checks: usize = 0;
 
@@ -1067,7 +1108,7 @@ impl ExecutionEngine {
                 continue;
             }
 
-            // Hard Gross-Leverage Gate anchored strictly to effective equity * target_leverage_multiplier
+            // Hard Gross-Leverage Gate anchored strictly to effective equity * min(target_leverage_multiplier, max_gross_leverage_x)
             if ledger.committed_notional_usdc
                 + current_reserved_notional
                 + plan.target_notional_usdc
@@ -1155,7 +1196,7 @@ impl ExecutionEngine {
         base_equity_override: Option<f64>,
         signal_out: Option<&SignalCycleOutput>,
     ) -> Result<PortfolioSnapshot> {
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let risk = RiskEngine::from_config_map(&cfg);
         let held = self.db.get_assets_held()?;
         let ordered = self.db.get_assets_ordered()?;
@@ -1266,7 +1307,7 @@ impl ExecutionEngine {
     /// Runs a single unified execution cycle (3s Market Scan + 1s Priority Tick + Multi-Sleeve Signal Evaluation + Optional Order Placement + Snapshot).
     pub fn run_single_cycle(&self, execute_orders: bool) -> Result<ExecutionCycleReport> {
         let ts = now_ms();
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let market_scan = self.watcher.run_3s_exchange_scan()?;
         let priority_tick = self.priority_monitor.run_1s_priority_tick()?;
 
@@ -1320,7 +1361,7 @@ impl ExecutionEngine {
             .db
             .get_asset_by_id(pos.asset_id)?
             .ok_or_else(|| AegisError::Database(format!("Asset #{} not found", pos.asset_id)))?;
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let status = PositionStatus::parse(&pos.status);
         let cd_sec = cooldown_seconds.unwrap_or(3600).max(0);
         let is_live_exchange = is_live_exchange_active(&self.db, &cfg);
@@ -1337,51 +1378,96 @@ impl ExecutionEngine {
                 if is_live_exchange {
                     let pk = cfg.get_str("private_key", "");
                     let wallet = cfg.get_str("wallet_address", "");
-                    let mut cancels = Vec::new();
-                    if let Some(oid) = pos
-                        .exchange_order_id
-                        .as_deref()
-                        .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
-                        .and_then(|s| s.parse::<u64>().ok())
-                    {
-                        cancels.push(CancelWire {
-                            a: asset.asset_index,
-                            o: oid,
-                        });
-                    } else if !wallet.is_empty() {
-                        if let Ok(open_orders) = self
-                            .http
-                            .fetch_frontend_open_orders(&wallet, &cfg)
-                            .or_else(|_| self.http.fetch_open_orders(&wallet, &cfg))
+                    if pk.trim().is_empty() {
+                        exchange_close_unfilled = true;
+                        tracing::error!(
+                            position_id = position_id,
+                            symbol = %asset.symbol,
+                            "private_key is empty/missing in live mode; refusing to mark WORKING order CANCELLED without exchange cancel"
+                        );
+                    } else {
+                        let mut cancels = Vec::new();
+                        if let Some(oid) = pos
+                            .exchange_order_id
+                            .as_deref()
+                            .map(str::trim)
+                            .and_then(|s| s.strip_prefix("hl-").or(Some(s)))
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .filter(|&o| o > 0)
                         {
-                            for ord in open_orders {
-                                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-                                if c.eq_ignore_ascii_case(&asset.coin) {
-                                    if let Some(oid) =
-                                        ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
-                                            ord.get("oid")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<u64>().ok())
-                                        })
-                                    {
-                                        cancels.push(CancelWire {
-                                            a: asset.asset_index,
-                                            o: oid,
-                                        });
+                            cancels.push(CancelWire {
+                                a: asset.asset_index,
+                                o: oid,
+                            });
+                        } else if wallet.trim().is_empty() {
+                            exchange_close_unfilled = true;
+                            tracing::warn!(
+                                position_id = position_id,
+                                symbol = %asset.symbol,
+                                "Working order lacks numeric exchange_order_id and wallet_address is empty in live mode; keeping WORKING"
+                            );
+                        } else {
+                            match self
+                                .http
+                                .fetch_frontend_open_orders(&wallet, &cfg)
+                                .or_else(|_| self.http.fetch_open_orders(&wallet, &cfg))
+                            {
+                                Ok(open_orders) => {
+                                    cancels = collect_coin_non_trigger_cancels(
+                                        &open_orders,
+                                        &asset,
+                                        None,
+                                    );
+                                }
+                                Err(e) => {
+                                    exchange_close_unfilled = true;
+                                    tracing::warn!(
+                                        position_id = position_id,
+                                        symbol = %asset.symbol,
+                                        error = %e,
+                                        "Failed to fetch openOrders for unlinked WORKING order; keeping WORKING"
+                                    );
+                                }
+                            }
+                        }
+
+                        if !exchange_close_unfilled && !cancels.is_empty() {
+                            match self
+                                .http
+                                .cancel_orders_batch(cancels, &pk, Some(&self.db), &cfg)
+                            {
+                                Ok(resp) => {
+                                    if let Err(err_detail) = cancel_batch_response_ok(&resp) {
+                                        exchange_close_unfilled = true;
+                                        tracing::warn!(
+                                            position_id = position_id,
+                                            symbol = %asset.symbol,
+                                            error = %err_detail,
+                                            response = %resp,
+                                            "Hyperliquid WORKING order cancel not confirmed; keeping WORKING"
+                                        );
                                     }
+                                }
+                                Err(e) => {
+                                    exchange_close_unfilled = true;
+                                    tracing::warn!(
+                                        position_id = position_id,
+                                        symbol = %asset.symbol,
+                                        error = %e,
+                                        "Hyperliquid cancel_orders_batch failed; keeping WORKING"
+                                    );
                                 }
                             }
                         }
                     }
-                    if !cancels.is_empty() {
-                        let _ = self
-                            .http
-                            .cancel_orders_batch(cancels, &pk, Some(&self.db), &cfg);
-                    }
                 }
-                released_reserved = pos.reserved_margin_usdc;
-                self.db.cancel_working_order(position_id, reason)?;
-                final_status = "CANCELLED".to_string();
+                if exchange_close_unfilled {
+                    final_status = "WORKING".to_string();
+                } else {
+                    released_reserved = pos.reserved_margin_usdc;
+                    self.db.cancel_working_order(position_id, reason)?;
+                    final_status = "CANCELLED".to_string();
+                }
             }
             PositionStatus::Open => {
                 let side = OrderSide::parse(&pos.side);
@@ -1398,7 +1484,14 @@ impl ExecutionEngine {
                     let pk = cfg.get_str("private_key", "");
                     let wallet = cfg.get_str("wallet_address", "");
 
-                    if wallet.trim().is_empty() {
+                    if pk.trim().is_empty() {
+                        exchange_close_unfilled = true;
+                        tracing::error!(
+                            position_id = position_id,
+                            symbol = %asset.symbol,
+                            "private_key is empty/missing in live mode; refusing to mark DB position CLOSED without exchange close"
+                        );
+                    } else if wallet.trim().is_empty() {
                         exchange_close_unfilled = true;
                         tracing::warn!(
                             position_id = position_id,
@@ -1893,7 +1986,7 @@ impl ExecutionEngine {
             exit_price: exit_price_opt,
             realized_pnl_usdc: realized_pnl,
             released_reserved_usdc: released_reserved,
-            cooldown_inserted_sec: cd_sec,
+            cooldown_inserted_sec: if exchange_close_unfilled { 0 } else { cd_sec },
             reason: reason.to_string(),
         })
     }
@@ -1968,7 +2061,14 @@ impl ExecutionEngine {
         std::thread::spawn(move || {
             while !*prio_rx.borrow() {
                 let tick_start = std::time::Instant::now();
-                let cfg = prio_engine.db.load_config_or_default();
+                let cfg = match prio_engine.db.load_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "1s priority watchlist failed to load config; skipping tick");
+                        sleep_interruptible(&prio_rx, 1000);
+                        continue;
+                    }
+                };
                 let prio_ms = cfg
                     .get_i64("priority_monitor_interval_ms", 1000)
                     .clamp(250, 5000) as u64;
@@ -1986,7 +2086,14 @@ impl ExecutionEngine {
         let scan_rx = rx.clone();
         std::thread::spawn(move || {
             while !*scan_rx.borrow() {
-                let cfg = scan_engine.db.load_config_or_default();
+                let cfg = match scan_engine.db.load_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "3s scanner failed to load config; skipping cycle");
+                        sleep_interruptible(&scan_rx, 3000);
+                        continue;
+                    }
+                };
                 let scan_ms = cfg.get_i64("scanner_interval_ms", 3000).max(1000) as u64;
                 let execute_orders = cfg.get_bool("auto_rebalance_enabled", true);
                 let eff_eq = scan_engine.resolve_effective_base_equity_usdc(&cfg);
@@ -2026,7 +2133,14 @@ impl ExecutionEngine {
         let rec_rx = rx;
         std::thread::spawn(move || {
             while !*rec_rx.borrow() {
-                let cfg = rec_engine.db.load_config_or_default();
+                let cfg = match rec_engine.db.load_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(error = %e, "15s reconciler failed to load config; skipping reconcile");
+                        sleep_interruptible(&rec_rx, 15_000);
+                        continue;
+                    }
+                };
                 let scan_ms = cfg.get_i64("scanner_interval_ms", 3000).max(1000) as u64;
                 let reconcile_ms = (scan_ms * 5).max(5000);
                 if cfg.execution_mode().is_live_or_testnet() {

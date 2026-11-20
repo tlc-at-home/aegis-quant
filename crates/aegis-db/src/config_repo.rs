@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use zeroize::Zeroize;
 
+const CRITICAL_SECRET_KEYS: &[&str] = &["web_api_token", "private_key"];
+
 impl DatabaseManager {
     /// Seeds all default v2.0 `system_config` entries (`risk_tier = "extreme"`, `target_leverage_multiplier = "1.85"`, etc.)
     /// without overwriting existing customized values.
@@ -89,17 +91,27 @@ impl DatabaseManager {
         let ts = now_ms();
 
         for row in rows.flatten() {
-            let (k, v, vtype, desc) = row;
-            if !keys_to_preserve.contains(&k.as_str()) || v.trim().is_empty() {
+            let (k, mut v, vtype, desc) = row;
+            let clean_k = k.trim().to_ascii_lowercase();
+            let trimmed_v = v.trim();
+            if !keys_to_preserve.contains(&clean_k.as_str()) || trimmed_v.is_empty() {
+                v.zeroize();
                 continue;
             }
             // Only overwrite if current MariaDB value is empty
-            let current: Option<String> = conn
+            let current_res: Result<Option<String>> = conn
                 .exec_first(
                     "SELECT config_value FROM system_config WHERE config_key = :k",
-                    params! { "k" => &k },
+                    params! { "k" => &clean_k },
                 )
-                .map_err(|e| AegisError::Database(format!("Config lookup error: {e}")))?;
+                .map_err(|e| AegisError::Database(format!("Config lookup error: {e}")));
+            let current = match current_res {
+                Ok(c) => c,
+                Err(e) => {
+                    v.zeroize();
+                    return Err(e);
+                }
+            };
 
             let should_write = match current {
                 None => true,
@@ -108,38 +120,82 @@ impl DatabaseManager {
             };
 
             if should_write {
-                let effective_type = if is_sensitive_config_key(&k) {
+                let is_secret = is_sensitive_config_key(&clean_k) && clean_k != "telegram_chat_id";
+                let looks_encrypted =
+                    is_encrypted_value(trimmed_v) || trimmed_v.starts_with("ENC:");
+
+                let mut stored_val = if looks_encrypted {
+                    match self.fernet().decrypt(trimmed_v) {
+                        Ok(mut plain) => {
+                            plain.zeroize();
+                            trimmed_v.to_string()
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                config_key = %clean_k,
+                                error = %e,
+                                "Skipping undecryptable legacy SQLite credential during migration"
+                            );
+                            v.zeroize();
+                            continue;
+                        }
+                    }
+                } else if is_secret {
+                    match self.fernet().encrypt(trimmed_v.as_bytes()) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            v.zeroize();
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    trimmed_v.to_string()
+                };
+
+                let effective_type = if is_secret {
                     "secret"
+                } else if clean_k == "telegram_chat_id" {
+                    "string"
                 } else {
                     vtype.as_str()
                 };
-                conn.exec_drop(
-                    r#"INSERT INTO system_config
-                       (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
-                       VALUES (:k, :v, :vt, :d, :ts, :ts)
-                       ON DUPLICATE KEY UPDATE
-                       config_value = VALUES(config_value),
-                       value_type = VALUES(value_type),
-                       updated_at_ms = VALUES(updated_at_ms)"#,
-                    params! {
-                        "k" => &k,
-                        "v" => &v,
-                        "vt" => effective_type,
-                        "d" => &desc,
-                        "ts" => ts,
-                    },
-                )
-                .map_err(|e| {
-                    AegisError::Database(format!("Failed to migrate key '{k}' to MariaDB: {e}"))
-                })?;
+                let write_res = conn
+                    .exec_drop(
+                        r#"INSERT INTO system_config
+                           (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+                           VALUES (:k, :v, :vt, :d, :ts, :ts)
+                           ON DUPLICATE KEY UPDATE
+                           config_key = VALUES(config_key),
+                           config_value = VALUES(config_value),
+                           value_type = VALUES(value_type),
+                           updated_at_ms = VALUES(updated_at_ms)"#,
+                        params! {
+                            "k" => &clean_k,
+                            "v" => &stored_val,
+                            "vt" => effective_type,
+                            "d" => &desc,
+                            "ts" => ts,
+                        },
+                    )
+                    .map_err(|e| {
+                        AegisError::Database(format!(
+                            "Failed to migrate key '{clean_k}' to MariaDB: {e}"
+                        ))
+                    });
+                stored_val.zeroize();
+                v.zeroize();
+                write_res?;
                 migrated += 1;
+            } else {
+                v.zeroize();
             }
         }
         Ok(migrated)
     }
 
     /// Loads all `system_config` rows, transparently decrypting any Fernet-encrypted values (`gAAAAAB...`).
-    /// Per-row Fernet decryption failures are isolated and logged so a single corrupt entry never drops the whole map.
+    /// Fails closed for critical secrets (`web_api_token`, `private_key`), while isolating non-critical
+    /// per-row decryption failures so a single corrupt non-critical entry never drops the whole map.
     pub fn load_config(&self) -> Result<ConfigMap> {
         let mut conn = self.get_conn()?;
         let rows: Vec<(String, String)> = conn
@@ -149,21 +205,30 @@ impl DatabaseManager {
         let mut map = HashMap::with_capacity(rows.len());
         let cipher = self.fernet();
         for (k, raw_v) in rows {
+            let clean_k = k.trim().to_ascii_lowercase();
             if is_encrypted_value(&raw_v) || raw_v.trim().starts_with("ENC:") {
                 match cipher.decrypt(&raw_v) {
                     Ok(val) => {
-                        map.insert(k, val);
+                        map.insert(clean_k, val);
                     }
                     Err(e) => {
+                        if CRITICAL_SECRET_KEYS.contains(&clean_k.as_str()) {
+                            for (_, mut v) in map {
+                                v.zeroize();
+                            }
+                            return Err(AegisError::Crypto(format!(
+                                "Failed to decrypt critical secret '{clean_k}': {e}"
+                            )));
+                        }
                         tracing::warn!(
-                            config_key = %k,
+                            config_key = %clean_k,
                             error = %e,
                             "Skipping undecryptable system_config entry during load_config"
                         );
                     }
                 }
             } else {
-                map.insert(k, raw_v);
+                map.insert(clean_k, raw_v);
             }
         }
         Ok(ConfigMap::from_map(map))
@@ -224,7 +289,7 @@ impl DatabaseManager {
         value: &str,
         description: Option<&str>,
     ) -> Result<()> {
-        let clean_key = key.trim();
+        let clean_key = key.trim().to_ascii_lowercase();
         if clean_key.is_empty() {
             return Err(AegisError::Validation(
                 "Config key cannot be empty".to_string(),
@@ -240,7 +305,7 @@ impl DatabaseManager {
             })?;
             decrypted.zeroize();
         }
-        let is_secret = is_sensitive_config_key(clean_key) && clean_key != "telegram_chat_id";
+        let is_secret = is_sensitive_config_key(&clean_key) && clean_key != "telegram_chat_id";
         let stored_val = if is_secret && !trimmed_val.is_empty() && !looks_encrypted {
             self.fernet().encrypt(trimmed_val.as_bytes())?
         } else {
@@ -280,10 +345,11 @@ impl DatabaseManager {
                (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
                VALUES (:k, :v, :vt, :d, :ts, :ts)
                ON DUPLICATE KEY UPDATE
+               config_key = VALUES(config_key),
                config_value = VALUES(config_value),
                updated_at_ms = VALUES(updated_at_ms)"#,
             params! {
-                "k" => clean_key,
+                "k" => &clean_key,
                 "v" => stored_val,
                 "vt" => vtype,
                 "d" => desc,

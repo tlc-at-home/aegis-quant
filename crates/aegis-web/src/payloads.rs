@@ -303,7 +303,7 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
                 )));
             }
         }
-        "auto_rebalance_enabled" | "web_trust_proxy_headers" => {
+        "auto_rebalance_enabled" => {
             parse_bool_strict(clean_key, clean_val)?;
         }
         "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
@@ -343,14 +343,8 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
             }
         }
         "discord_webhook_url" => {
-            if !clean_val.is_empty()
-                && (!clean_val.starts_with("https://")
-                    || clean_val.chars().any(char::is_whitespace))
-            {
-                return Err(AegisError::Validation(
-                    "discord_webhook_url must be a valid https:// URL without whitespace"
-                        .to_string(),
-                ));
+            if !clean_val.is_empty() {
+                let _ = aegis_alerts::validate_discord_webhook_url(clean_val)?;
             }
         }
         "gemini_api_key" => {
@@ -577,12 +571,14 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
             {
                 if r.config_value.trim().is_empty() {
                     r.config_value = "[UNSET]".to_string();
-                } else if r.config_key == "telegram_chat_id" {
+                } else if r.config_key.trim().eq_ignore_ascii_case("telegram_chat_id") {
                     r.config_value = mask_identifier(&r.config_value);
                 } else {
                     r.config_value = "[FERNET_ENCRYPTED_SECRET]".to_string();
                 }
-            } else if r.config_key == "wallet_address" && !r.config_value.trim().is_empty() {
+            } else if r.config_key.trim().eq_ignore_ascii_case("wallet_address")
+                && !r.config_value.trim().is_empty()
+            {
                 r.config_value = mask_identifier(&r.config_value);
             }
             r

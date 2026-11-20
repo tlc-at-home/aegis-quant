@@ -281,7 +281,7 @@ impl OrderChaser {
             )));
         }
 
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
         let min_entry_interval_sec = cfg.get_i64("min_entry_interval_sec", 150).max(0);
         let cap_epoch_ms = if cfg.execution_mode().is_live_or_testnet() {
@@ -377,6 +377,17 @@ impl OrderChaser {
         let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 20.0).max(1.0);
 
         if is_live_exchange {
+            let pk = cfg.get_str("private_key", "");
+            if pk.trim().is_empty() {
+                tracing::error!(
+                    symbol = %req.asset.symbol,
+                    "private_key is empty/missing in live mode; refusing to place WORKING order"
+                );
+                return Err(AegisError::SecurityViolation(format!(
+                    "private_key is empty in live mode; refusing to place order on {}",
+                    req.asset.symbol
+                )));
+            }
             if let Ok(Some((bid, ask))) = self.http.fetch_l2_book(&req.asset.coin, &cfg) {
                 let mid_bbo = (bid + ask) * 0.5;
                 if mid_bbo > 0.0 && ask >= bid {
@@ -392,7 +403,6 @@ impl OrderChaser {
                     limit_price = clamp_initial_alo_price(req.side, ref_mid, bid, ask, tick);
                 }
             }
-            let pk = cfg.get_str("private_key", "");
             let wire = build_limit_order_wire(
                 req.asset.asset_index,
                 req.side.is_buy(),
@@ -526,7 +536,7 @@ impl OrderChaser {
 
     /// Advances a single `WORKING` order from `v_assets_ordered` during the 1-second surveillance loop.
     pub fn advance_working_order(&self, ordered: &OrderedAssetView) -> Result<ChaseStepOutcome> {
-        let cfg = self.db.load_config_or_default();
+        let cfg = self.db.load_config()?;
         let max_chases = cfg.get_usize("max_alo_chase_ticks", 5).max(1) as u32;
         let chase_threshold_bps = cfg.get_f64("alo_chase_threshold_bps", 4.0).max(0.5);
         let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
@@ -568,6 +578,19 @@ impl OrderChaser {
         };
 
         let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
+        if is_live_exchange && cfg.get_str("private_key", "").trim().is_empty() {
+            tracing::error!(
+                position_id = ordered.position_id,
+                symbol = %ordered.symbol,
+                "private_key is empty/missing in live mode; keeping WORKING order resting"
+            );
+            return Ok(ChaseStepOutcome::Resting {
+                position_id: ordered.position_id,
+                symbol: ordered.symbol.clone(),
+                limit_price: ordered.limit_price,
+                distance_from_mid_bps: ordered.distance_from_mid_bps,
+            });
+        }
 
         // Only use simulated price_touched / paper IOC promotion in PAPER mode or isolated unit tests!
         // In live Testnet/Mainnet mode, orders are only promoted WORKING -> OPEN when Hyperliquid confirms a fill.
@@ -1420,6 +1443,14 @@ impl OrderChaser {
             };
         };
         let pk = cfg.get_str("private_key", "");
+        if pk.trim().is_empty() {
+            tracing::error!(
+                symbol = %ordered.symbol,
+                oid = old_oid,
+                "private_key is empty/missing in live mode; aborting WORKING order cancel"
+            );
+            return CancelEntryOutcome::Aborted;
+        }
         match self
             .http
             .cancel_order_wire(asset.asset_index, old_oid, &pk, Some(&self.db), cfg)
@@ -1910,6 +1941,19 @@ impl OrderChaser {
         }
 
         let pk = cfg.get_str("private_key", "");
+        if pk.trim().is_empty() {
+            tracing::warn!(
+                position_id = position_id,
+                symbol = %asset.symbol,
+                "private_key is empty/missing in live mode; skipping TP/SL exchange sync without writing paper OIDs"
+            );
+            return Ok((
+                stop_px,
+                existing_sl_oid.map(str::to_string),
+                tp_px,
+                existing_tp_oid.map(str::to_string),
+            ));
+        }
         let wallet = cfg.get_str("wallet_address", "");
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
 

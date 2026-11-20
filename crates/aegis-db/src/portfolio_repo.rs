@@ -215,6 +215,49 @@ impl DatabaseManager {
         Ok(list)
     }
 
+    /// Returns `(peak_equity, latest_equity)` across `portfolio_snapshots` since `since_ms`,
+    /// or `None` if `portfolio_snapshots` has no rows.
+    pub fn get_peak_and_latest_equity_since(&self, since_ms: i64) -> Result<Option<(f64, f64)>> {
+        let mut conn = self.get_conn()?;
+        let latest_opt: Option<f64> = conn
+            .query_first(
+                "SELECT total_equity_usdc FROM portfolio_snapshots ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "get_peak_and_latest_equity_since latest query failed: {e}"
+                ))
+            })?;
+
+        let Some(latest_equity) = latest_opt else {
+            return Ok(None);
+        };
+
+        let peak_raw: Option<Option<f64>> = conn
+            .exec_first(
+                "SELECT MAX(total_equity_usdc) FROM portfolio_snapshots WHERE created_at_ms >= :since_ms AND total_equity_usdc > 0.0",
+                params! { "since_ms" => since_ms },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "get_peak_and_latest_equity_since peak query failed: {e}"
+                ))
+            })?;
+
+        let peak_equity = peak_raw
+            .flatten()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| {
+                if latest_equity.is_finite() {
+                    latest_equity.max(0.0)
+                } else {
+                    0.0
+                }
+            });
+
+        Ok(Some((peak_equity, latest_equity)))
+    }
+
     /// Appends a sanitized operational telemetry log event into `telemetry_logs`.
     pub fn log_telemetry(
         &self,

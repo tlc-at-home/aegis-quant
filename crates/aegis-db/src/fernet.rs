@@ -7,7 +7,6 @@ use aegis_core::{AegisError, Result};
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -48,8 +47,7 @@ pub fn is_legacy_public_fallback_key(candidate_b64: &str) -> bool {
 
 /// Generate a fresh CSPRNG 32-byte URL-safe base64 Fernet master key.
 pub fn generate_fernet_key() -> String {
-    let mut raw = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut raw);
+    let mut raw: [u8; 32] = rand::random();
     let encoded = URL_SAFE.encode(raw);
     raw.zeroize();
     encoded
@@ -302,10 +300,14 @@ impl FernetCipher {
                 "Fernet key must decode to 32 bytes (16 signing + 16 encryption)".to_string(),
             ));
         }
-        let mut signing_key = [0u8; 16];
-        let mut encryption_key = [0u8; 16];
-        signing_key.copy_from_slice(&decoded[..16]);
-        encryption_key.copy_from_slice(&decoded[16..32]);
+        let signing_key = <[u8; 16]>::try_from(&decoded[..16]).map_err(|_| {
+            decoded.zeroize();
+            AegisError::Crypto("Invalid Fernet signing key length".to_string())
+        })?;
+        let encryption_key = <[u8; 16]>::try_from(&decoded[16..32]).map_err(|_| {
+            decoded.zeroize();
+            AegisError::Crypto("Invalid Fernet encryption key length".to_string())
+        })?;
         decoded.zeroize();
         Ok(Self {
             signing_key,
@@ -324,8 +326,7 @@ impl FernetCipher {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let mut iv = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut iv);
+        let mut iv: [u8; 16] = rand::random();
 
         let pad_len = ((plaintext.len() / 16) + 1) * 16;
         let mut buf = vec![0u8; pad_len];
@@ -510,5 +511,20 @@ mod tests {
         assert!(has_ext);
         assert_eq!(resolved, key);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_random_iv_and_slice_key_conversion() {
+        let key1 = generate_fernet_key();
+        let key2 = generate_fernet_key();
+        assert_ne!(key1, key2);
+        assert_eq!(URL_SAFE.decode(key1.as_bytes()).unwrap().len(), 32);
+
+        let cipher = FernetCipher::from_key_str(&key1).unwrap();
+        let tok_a = cipher.encrypt(b"same-secret-payload").unwrap();
+        let tok_b = cipher.encrypt(b"same-secret-payload").unwrap();
+        assert_ne!(tok_a, tok_b, "Fresh random IV must randomize ciphertexts");
+        assert_eq!(cipher.decrypt(&tok_a).unwrap(), "same-secret-payload");
+        assert_eq!(cipher.decrypt(&tok_b).unwrap(), "same-secret-payload");
     }
 }

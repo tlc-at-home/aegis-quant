@@ -25,7 +25,7 @@ const NONCE_LAZY_PERSIST_INTERVAL_MS: i64 = 30_000;
 /// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicI64`
 /// high-water floor (seeded once from `now_ms().max(db_nonce)` and persisted lazily to MariaDB).
 pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
-    let wall_ms = now_ms().max(1);
+    let wall_ms = now_ms();
     if !NONCE_DB_SEEDED.load(Ordering::Acquire) {
         if let Some(d) = db {
             if let Ok(cfg) = d.load_config() {

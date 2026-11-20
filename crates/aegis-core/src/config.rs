@@ -180,50 +180,52 @@ impl ConfigMap {
     }
 
     pub fn from_map(map: HashMap<String, String>) -> Self {
-        Self(map)
+        Self(
+            map.into_iter()
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v))
+                .collect(),
+        )
     }
 
     pub fn insert(&mut self, key: impl Into<String>, val: impl Into<String>) {
-        self.0.insert(key.into(), val.into());
+        self.0
+            .insert(key.into().trim().to_ascii_lowercase(), val.into());
     }
 
     pub fn get(&self, key: &str) -> Option<&String> {
-        self.0.get(key)
+        self.0
+            .get(key)
+            .or_else(|| self.0.get(&key.trim().to_ascii_lowercase()))
     }
 
     pub fn get_str(&self, key: &str, default: &str) -> String {
-        self.0
-            .get(key)
+        self.get(key)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| default.to_string())
     }
 
     pub fn get_f64(&self, key: &str, default: f64) -> f64 {
-        self.0
-            .get(key)
+        self.get(key)
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(default)
     }
 
     pub fn get_i64(&self, key: &str, default: i64) -> i64 {
-        self.0
-            .get(key)
+        self.get(key)
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(default)
     }
 
     pub fn get_usize(&self, key: &str, default: usize) -> usize {
-        self.0
-            .get(key)
+        self.get(key)
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(default)
     }
 
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
-        self.0
-            .get(key)
+        self.get(key)
             .map(|s| match s.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "on" => true,
                 "false" | "0" | "no" | "off" => false,
@@ -239,7 +241,6 @@ impl ConfigMap {
     pub fn target_leverage_multiplier(&self) -> f64 {
         let tier = self.risk_tier();
         let custom = self
-            .0
             .get("target_leverage_multiplier")
             .and_then(|v| v.trim().parse::<f64>().ok());
         if tier == RiskTier::Custom {
@@ -426,5 +427,27 @@ mod tests {
         assert_eq!(find("stop_out_cooldown_sec"), Some("1800"));
         assert_eq!(find("take_profit_atr_mult"), Some("2.8"));
         assert_eq!(find("take_profit_default_pct"), Some("0.055"));
+    }
+
+    #[test]
+    fn test_config_map_case_insensitive_normalization() {
+        let mut raw = HashMap::new();
+        raw.insert(" RISK_TIER ".to_string(), "custom".to_string());
+        raw.insert("TARGET_LEVERAGE_MULTIPLIER".to_string(), "1.45".to_string());
+        raw.insert("MAX_OPEN_POSITIONS".to_string(), "4".to_string());
+        raw.insert("WEB_AUTH_ENABLED".to_string(), "true".to_string());
+        let mut cfg = ConfigMap::from_map(raw);
+        cfg.insert(" Risk_Capital_Cap_Usdc ", "2500.5");
+        cfg.insert("MIN_ENTRY_INTERVAL_SEC", "90");
+
+        assert_eq!(cfg.get("risk_tier").map(String::as_str), Some("custom"));
+        assert_eq!(cfg.get("RISK_TIER").map(String::as_str), Some("custom"));
+        assert_eq!(cfg.get_str("RISK_TIER", ""), "custom");
+        assert!((cfg.target_leverage_multiplier() - 1.45).abs() < 1e-9);
+        assert!((cfg.get_f64("RISK_CAPITAL_CAP_USDC", 0.0) - 2500.5).abs() < 1e-9);
+        assert_eq!(cfg.get_i64("min_entry_interval_sec", 0), 90);
+        assert_eq!(cfg.get_usize("max_open_positions", 0), 4);
+        assert!(cfg.get_bool("web_auth_enabled", false));
+        assert!(cfg.get_bool("WEB_AUTH_ENABLED", false));
     }
 }

@@ -7,6 +7,12 @@ use mysql::prelude::*;
 
 type LockedChaseRow = (i64, String, String, String, String, f64, f64, f64, f64, u32);
 
+/// Clamps an `order_audit.reason` string to at most 250 UTF-8 characters so inserts into
+/// `VARCHAR(255)` never trigger `MySqlError` 1406.
+pub fn truncate_audit_reason(reason: &str) -> String {
+    reason.chars().take(250).collect()
+}
+
 impl DatabaseManager {
     /// Updates a `WORKING` order's limit price and chase counter during a 1s top-of-book chase step,
     /// recording an audit entry in `order_audit`.
@@ -83,6 +89,7 @@ impl DatabaseManager {
             AegisError::Database(format!("record_working_order_chase update failed: {e}"))
         })?;
 
+        let safe_reason = truncate_audit_reason(reason);
         tx.exec_drop(
             r#"INSERT INTO order_audit (
                    position_id, asset_id, client_order_id, side, from_state, to_state,
@@ -104,7 +111,7 @@ impl DatabaseManager {
                 "fill_qty" => filled_quantity,
                 "lim_px" => if new_limit_price > 0.0 { new_limit_price } else { prev_limit_price },
                 "res_usdc" => reserved_margin_usdc,
-                "reason" => reason,
+                "reason" => &safe_reason,
                 "ts" => ts,
             },
         )

@@ -1,14 +1,16 @@
 //! End-to-End Integration Tests for Aegis Quant v2.0 Execution Engine (`aegis-execution`).
 
-use aegis_core::{now_ms, OrderSide, RiskTier};
-use aegis_db::{AssetUpsertInput, DatabaseManager};
+use aegis_core::{now_ms, ConfigMap, OrderSide, RiskTier};
+use aegis_db::{AssetUpsertInput, DatabaseManager, SnapshotInsertInput};
 use aegis_execution::{ChaseStepOutcome, ExecutionEngine, NewWorkingOrderRequest};
+use aegis_risk::{RiskEngine, RiskLimitsConfig};
 use aegis_signals::{
-    MarketBreadthSnapshot, SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP,
-    ACTION_OPEN_LONG,
+    allocate_multi_sleeve_weights, AllocatorConfig, CarryMomentumMetrics, MarketBreadthSnapshot,
+    SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP, ACTION_OPEN_LONG,
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -2816,4 +2818,643 @@ fn test_rebalance_skips_wide_spread_and_thin_l2_books_to_place_liquid_candidate(
     assert!(submitted_asset_indices.lock().is_empty());
 
     let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_single_asset_weight_floor_001_preserved_for_alert_38() {
+    let mut cfg = ConfigMap::new();
+    cfg.insert("max_single_asset_weight", "0.01");
+    cfg.insert("min_rebalance_delta_weight", "0.005");
+
+    let limits = RiskLimitsConfig::from_config_map(&cfg);
+    assert!(
+        (limits.max_single_asset_weight - 0.01).abs() < 1e-9,
+        "RiskLimitsConfig must preserve 0.01 instead of inflating to 0.05"
+    );
+
+    let alloc_cfg = AllocatorConfig::from_config_map(&cfg);
+    assert!(
+        (alloc_cfg.max_single_asset_weight - 0.01).abs() < 1e-9,
+        "AllocatorConfig must preserve 0.01 instead of inflating to 0.05"
+    );
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    db.set_config_value("initial_paper_equity_usdc", "10000.0", None)
+        .unwrap();
+    db.set_config_value("max_single_asset_weight", "0.01", None)
+        .unwrap();
+    db.set_config_value("min_rebalance_delta_weight", "0.005", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let mut s1 = HashMap::new();
+    s1.insert(
+        eth.id,
+        CarryMomentumMetrics {
+            asset_id: eth.id,
+            symbol: eth.symbol.clone(),
+            annualized_vol: 0.40,
+            market_beta: 1.0,
+            s1_mom_score: 0.90,
+            s1_carry_score: 0.25,
+            w_s1_carry_mom: 0.35,
+            passes_quality: true,
+        },
+    );
+    let allocated = allocate_multi_sleeve_weights(
+        std::slice::from_ref(&eth),
+        &s1,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+        &alloc_cfg,
+    );
+    assert_eq!(allocated.len(), 1);
+    assert!(
+        (allocated[0].target_weight - 0.01).abs() < 1e-6,
+        "Allocated target_weight must cap at 0.01, got {}",
+        allocated[0].target_weight
+    );
+
+    let sig_out = make_signal_output(vec![make_signal_input(&eth, 0.25, 0.0, ACTION_OPEN_LONG)]);
+    let reb = engine.execute_signal_rebalance(&sig_out, 10_000.0).unwrap();
+    assert_eq!(reb.working_orders_placed, 1);
+
+    let ordered = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered.len(), 1);
+    let order_notional = ordered[0].limit_price * ordered[0].requested_quantity;
+    assert!(
+        order_notional <= 100.0 + 1e-2,
+        "Order notional ${order_notional:.2} exceeded 1% of $10,000 ($100.00)"
+    );
+    let pos_record = db
+        .get_position_by_id(ordered[0].position_id)
+        .unwrap()
+        .unwrap();
+    assert!(pos_record.portfolio_weight <= 0.0101);
+}
+
+#[test]
+fn test_max_gross_leverage_below_target_multiplier_enforced_for_alert_37() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    db.set_config_value("risk_tier", "extreme", None).unwrap(); // 1.85x target_leverage_multiplier
+    db.set_config_value("max_gross_leverage_x", "0.50", None)
+        .unwrap();
+    db.set_config_value("max_single_asset_weight", "1.00", None)
+        .unwrap();
+    db.set_config_value("initial_paper_equity_usdc", "1000.0", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("min_position_hold_sec", "0", None)
+        .unwrap();
+
+    let btc = db.get_asset_by_symbol("BTC-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+
+    // Seed $495 committed on BTC (< 0.50 * 1000 = $500, leaving $5 < $12 min order notional)
+    db.sync_open_position_from_exchange_v2(
+        btc.id,
+        &btc.coin,
+        OrderSide::Long,
+        btc.mark_price,
+        btc.mark_price,
+        495.0 / btc.mark_price,
+        495.0,
+        0.0,
+        0.495,
+        btc.mark_price * 0.95,
+        btc.mark_price * 1.10,
+        0.0,
+        Some(now_ms() - 600_000),
+    )
+    .unwrap();
+
+    // Rebalance must block ETH entry because effective gross ceiling is $1000 * min(1.85, 0.50) = $500
+    let sig_eth = make_signal_output(vec![make_signal_input(&eth, 0.20, 0.0, ACTION_OPEN_LONG)]);
+    let reb = engine.execute_signal_rebalance(&sig_eth, 1000.0).unwrap();
+    assert_eq!(reb.working_orders_placed, 0);
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+
+    // Add $400 SOL position -> $895 total (< $1850 target_mult ceiling, > $500 max_gross_leverage_x ceiling)
+    db.sync_open_position_from_exchange_v2(
+        sol.id,
+        &sol.coin,
+        OrderSide::Long,
+        sol.mark_price,
+        sol.mark_price,
+        400.0 / sol.mark_price,
+        400.0,
+        0.0,
+        0.40,
+        sol.mark_price * 0.95,
+        sol.mark_price * 1.10,
+        0.0,
+        Some(now_ms() - 600_000),
+    )
+    .unwrap();
+
+    let closed_reports = engine.enforce_leverage_and_position_caps().unwrap();
+    assert!(
+        !closed_reports.is_empty(),
+        "enforce_leverage_and_position_caps must deleverage when gross > equity * max_gross_leverage_x"
+    );
+    let rem_committed: f64 = db
+        .get_assets_held()
+        .unwrap()
+        .iter()
+        .map(|h| h.committed_notional_usdc)
+        .sum();
+    assert!(rem_committed <= 500.0 + 1e-6);
+}
+
+#[test]
+fn test_risk_capital_cap_10_usd_and_pre_reconcile_no_100_inflation_for_alert_33() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("live_exchange_equity_usdc", "5000.0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_usdc", "10.0", None)
+        .unwrap();
+
+    let cfg = db.load_config().unwrap();
+    assert!(
+        (engine.resolve_effective_base_equity_usdc(&cfg) - 10.0).abs() < 1e-9,
+        "risk_capital_cap_usdc = 10.0 must be enforced when live_eq > 10.0"
+    );
+
+    // Small live equity ($50) with cap = $10 must still cap to $10
+    db.set_config_value("live_exchange_equity_usdc", "50.0", None)
+        .unwrap();
+    let cfg_small_live = db.load_config().unwrap();
+    assert!((engine.resolve_effective_base_equity_usdc(&cfg_small_live) - 10.0).abs() < 1e-9);
+
+    // Pre-reconcile (live_eq == 0.0, non-ephemeral DB with wallet) must not inflate < $100 cap to $100
+    let mut pre_rec_cfg = ConfigMap::new();
+    pre_rec_cfg.insert("execution_mode", "TESTNET");
+    pre_rec_cfg.insert(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+    );
+    pre_rec_cfg.insert("live_exchange_equity_usdc", "0.0");
+    pre_rec_cfg.insert("risk_capital_cap_usdc", "25.0");
+    assert_eq!(
+        ExecutionEngine::resolve_live_base_equity_usdc(&pre_rec_cfg, false),
+        Some(25.0)
+    );
+    pre_rec_cfg.insert("risk_capital_cap_usdc", "10.0");
+    assert_eq!(
+        ExecutionEngine::resolve_live_base_equity_usdc(&pre_rec_cfg, false),
+        Some(10.0)
+    );
+    pre_rec_cfg.insert("risk_capital_cap_usdc", "0.0");
+    assert_eq!(
+        ExecutionEngine::resolve_live_base_equity_usdc(&pre_rec_cfg, false),
+        None
+    );
+}
+
+#[test]
+fn test_empty_private_key_in_live_testnet_fails_closed_for_alert_31() {
+    let exchange_calls = Arc::new(Mutex::new(0usize));
+    let exchange_calls_srv = exchange_calls.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "1000.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "SOL",
+                                "szi": "5.0",
+                                "entryPx": "180.0",
+                                "positionValue": "921.25"
+                            }
+                        }]
+                    }),
+                ),
+                "l2Book" => (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": "184.20", "sz": "100.0"}],
+                            [{"px": "184.30", "sz": "100.0"}]
+                        ]
+                    }),
+                ),
+                "allMids" => (200, json!({ "SOL": "184.25", "ETH": "3400.0" })),
+                _ => (200, json!([])),
+            };
+        }
+        *exchange_calls_srv.lock() += 1;
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+    // Deliberately leave `private_key` empty!
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+
+    // 1. OPEN position must NOT paper-close via close_or_cancel_position or execute_protective_stop_exit,
+    //    and ensure_exchange_tpsl_orders must NOT write `paper-sl` / `paper-tp`.
+    let (open_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol.id,
+            &sol.coin,
+            OrderSide::Long,
+            180.0,
+            184.25,
+            5.0,
+            921.25,
+            0.0,
+            0.20,
+            175.0,
+            200.0,
+            0.0,
+            Some(now_ms() - 600_000),
+        )
+        .unwrap();
+
+    let cfg = db.load_config().unwrap();
+    let (_, sl_oid, _, tp_oid) = engine
+        .chaser
+        .ensure_exchange_tpsl_orders(
+            open_pid,
+            &sol,
+            OrderSide::Long,
+            5.0,
+            184.25,
+            175.0,
+            200.0,
+            None,
+            None,
+            false,
+            false,
+            None,
+            &cfg,
+        )
+        .unwrap();
+    assert_eq!(sl_oid, None);
+    assert_eq!(tp_oid, None);
+    let pos_after_tpsl = db.get_position_by_id(open_pid).unwrap().unwrap();
+    assert_eq!(pos_after_tpsl.protective_stop_oid, None);
+    assert_eq!(pos_after_tpsl.take_profit_oid, None);
+
+    let close_rep = engine
+        .close_or_cancel_position(open_pid, "MANUAL_CLOSE", Some(300))
+        .unwrap();
+    assert_eq!(close_rep.final_status, "OPEN");
+    assert_eq!(
+        db.get_position_by_id(open_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert!(!db.is_asset_in_cooldown(sol.id).unwrap());
+
+    let held_view = db.get_assets_held().unwrap().remove(0);
+    let risk = RiskEngine::from_config_map(&cfg);
+    let stop_exit = engine
+        .priority_monitor
+        .execute_protective_stop_exit(&held_view, 174.0, "PROTECTIVE_STOP_BREACH", &risk)
+        .unwrap();
+    assert_eq!(stop_exit, None);
+    assert_eq!(
+        db.get_position_by_id(open_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert!(!db.is_asset_in_cooldown(sol.id).unwrap());
+
+    // 2. WORKING order must NOT paper-cancel or enter paper fill simulation in advance_working_order
+    let work_pid = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: eth.id,
+            client_order_id: "v2-eth-long-empty-pk".to_string(),
+            side: OrderSide::Long,
+            limit_price: 3_400.0,
+            requested_quantity: 0.1,
+            reserved_margin_usdc: 185.0,
+            portfolio_weight: 0.15,
+            s1_weight_contrib: 0.15,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 3_250.0,
+            exchange_order_id: Some("hl-77701".to_string()),
+            reason: "EMPTY_PK_TEST".to_string(),
+        })
+        .unwrap();
+    let cancel_rep = engine
+        .close_or_cancel_position(work_pid, "MANUAL_CANCEL", Some(300))
+        .unwrap();
+    assert_eq!(cancel_rep.final_status, "WORKING");
+    assert_eq!(cancel_rep.released_reserved_usdc, 0.0);
+    assert_eq!(
+        db.get_position_by_id(work_pid).unwrap().unwrap().status,
+        "WORKING"
+    );
+
+    let ordered_view = db.get_assets_ordered().unwrap().remove(0);
+    let adv_res = engine.chaser.advance_working_order(&ordered_view).unwrap();
+    assert!(
+        matches!(adv_res, ChaseStepOutcome::Resting { .. }),
+        "advance_working_order must stay Resting without private_key, got {adv_res:?}"
+    );
+    assert_eq!(
+        db.get_position_by_id(work_pid).unwrap().unwrap().status,
+        "WORKING"
+    );
+
+    // 3. place_working_order & execute_signal_rebalance must refuse new entries without private_key
+    let place_res = engine.chaser.place_working_order(&NewWorkingOrderRequest {
+        asset: arb.clone(),
+        side: OrderSide::Long,
+        requested_quantity: 20.0,
+        reserved_margin_usdc: 10.0,
+        portfolio_weight: 0.05,
+        s1_weight_contrib: 0.05,
+        s2_weight_contrib: 0.0,
+        s3_weight_contrib: 0.0,
+        protective_stop_px: 0.80,
+        reason: "EMPTY_PK_BLOCK".to_string(),
+        bypass_entry_interval: true,
+    });
+    assert!(place_res.is_err());
+
+    let sig_out = make_signal_output(vec![make_signal_input(&arb, 0.15, 0.0, ACTION_OPEN_LONG)]);
+    let reb = engine.execute_signal_rebalance(&sig_out, 1000.0).unwrap();
+    assert_eq!(reb.working_orders_placed, 0);
+    assert_eq!(reb.positions_closed, 0);
+    assert_eq!(*exchange_calls.lock(), 0);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_failed_cancel_orders_batch_keeps_working_and_margin_for_alert_23() {
+    #[derive(Clone)]
+    enum CancelMode {
+        PerOrderError(String),
+        Http500,
+        OpenOrders500,
+        OkSuccess,
+    }
+
+    let cancel_mode = Arc::new(Mutex::new(CancelMode::PerOrderError(
+        "Rate limit exceeded".to_string(),
+    )));
+    let cancel_mode_srv = cancel_mode.clone();
+    let cancelled_oids = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let cancelled_srv = cancelled_oids.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        let mode = cancel_mode_srv.lock().clone();
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "frontendOpenOrders" || typ == "openOrders" {
+                if matches!(mode, CancelMode::OpenOrders500) {
+                    return (500, json!({ "error": "upstream timeout" }));
+                }
+                return (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH",
+                            "oid": 99001u64,
+                            "isTrigger": true,
+                            "orderType": "Stop Market",
+                            "triggerPx": "3200.0",
+                            "sz": "0.1"
+                        },
+                        {
+                            "coin": "ETH",
+                            "oid": 55002u64,
+                            "isTrigger": false,
+                            "orderType": "Limit",
+                            "sz": "0.1"
+                        }
+                    ]),
+                );
+            }
+            return (200, json!([]));
+        }
+
+        if body.pointer("/action/type").and_then(Value::as_str) == Some("cancel") {
+            match mode {
+                CancelMode::Http500 => return (500, json!({ "error": "exchange error" })),
+                CancelMode::PerOrderError(msg) => {
+                    return (
+                        200,
+                        json!({
+                            "status": "ok",
+                            "response": {
+                                "type": "cancel",
+                                "data": { "statuses": [{ "error": msg }] }
+                            }
+                        }),
+                    );
+                }
+                CancelMode::OkSuccess | CancelMode::OpenOrders500 => {
+                    if let Some(arr) = body.pointer("/action/cancels").and_then(Value::as_array) {
+                        for c in arr {
+                            if let Some(o) = c.get("o").and_then(Value::as_u64) {
+                                cancelled_srv.lock().push(o);
+                            }
+                        }
+                    }
+                    return (
+                        200,
+                        json!({
+                            "status": "ok",
+                            "response": {
+                                "type": "cancel",
+                                "data": { "statuses": ["success"] }
+                            }
+                        }),
+                    );
+                }
+            }
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock(&db, port);
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+
+    // 1. WORKING order with numeric OID: per-order error, "filled" hint, and HTTP 500 must keep WORKING
+    let sol_work_id = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: sol.id,
+            client_order_id: "v2-sol-long-cancel-fail".to_string(),
+            side: OrderSide::Long,
+            limit_price: 184.0,
+            requested_quantity: 2.0,
+            reserved_margin_usdc: 200.0,
+            portfolio_weight: 0.10,
+            s1_weight_contrib: 0.10,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 175.0,
+            exchange_order_id: Some("hl-55001".to_string()),
+            reason: "CANCEL_FAIL_TEST".to_string(),
+        })
+        .unwrap();
+
+    for mode in [
+        CancelMode::PerOrderError("Rate limit exceeded".to_string()),
+        CancelMode::PerOrderError(
+            "Order was never placed, already canceled, or filled.".to_string(),
+        ),
+        CancelMode::Http500,
+    ] {
+        *cancel_mode.lock() = mode;
+        let rep = engine
+            .close_or_cancel_position(sol_work_id, "MANUAL_CANCEL", Some(300))
+            .unwrap();
+        assert_eq!(rep.final_status, "WORKING");
+        assert_eq!(rep.released_reserved_usdc, 0.0);
+        let pos = db.get_position_by_id(sol_work_id).unwrap().unwrap();
+        assert_eq!(pos.status, "WORKING");
+        assert!((pos.reserved_margin_usdc - 200.0).abs() < 1e-6);
+        assert!(!db.is_asset_in_cooldown(sol.id).unwrap());
+    }
+
+    // Confirming "already canceled" (without "filled") DOES cancel and release margin
+    *cancel_mode.lock() = CancelMode::PerOrderError("Order was already canceled".to_string());
+    let ok_rep = engine
+        .close_or_cancel_position(sol_work_id, "MANUAL_CANCEL", Some(300))
+        .unwrap();
+    assert_eq!(ok_rep.final_status, "CANCELLED");
+    assert!((ok_rep.released_reserved_usdc - 200.0).abs() < 1e-6);
+    assert_eq!(
+        db.get_position_by_id(sol_work_id).unwrap().unwrap().status,
+        "CANCELLED"
+    );
+
+    // 2. WORKING order lacking numeric OID: failed openOrders keeps WORKING; healthy openOrders cancels non-trigger only
+    let eth_work_id = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: eth.id,
+            client_order_id: "v2-eth-long-no-oid".to_string(),
+            side: OrderSide::Long,
+            limit_price: 3_400.0,
+            requested_quantity: 0.1,
+            reserved_margin_usdc: 180.0,
+            portfolio_weight: 0.10,
+            s1_weight_contrib: 0.10,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 3_250.0,
+            exchange_order_id: None,
+            reason: "NO_OID_CANCEL_TEST".to_string(),
+        })
+        .unwrap();
+
+    *cancel_mode.lock() = CancelMode::OpenOrders500;
+    let err_no_oid = engine
+        .close_or_cancel_position(eth_work_id, "MANUAL_CANCEL", Some(300))
+        .unwrap();
+    assert_eq!(err_no_oid.final_status, "WORKING");
+    assert_eq!(err_no_oid.released_reserved_usdc, 0.0);
+
+    *cancel_mode.lock() = CancelMode::OkSuccess;
+    let ok_no_oid = engine
+        .close_or_cancel_position(eth_work_id, "MANUAL_CANCEL", Some(300))
+        .unwrap();
+    assert_eq!(ok_no_oid.final_status, "CANCELLED");
+    assert!((ok_no_oid.released_reserved_usdc - 180.0).abs() < 1e-6);
+    assert_eq!(*cancelled_oids.lock(), vec![55002u64]);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_daily_drawdown_breaker_uses_indexed_peak_and_latest_equity_for_alert_32() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    db.set_config_value("max_daily_drawdown_pct", "0.15", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+
+    let base_snap = |eq: f64| SnapshotInsertInput {
+        total_equity_usdc: eq,
+        available_cash_usdc: eq,
+        reserved_order_cash_usdc: 0.0,
+        committed_notional_usdc: 0.0,
+        net_notional_usdc: 0.0,
+        gross_leverage_x: 0.0,
+        net_leverage_x: 0.0,
+        market_beta_exposure: 1.0,
+        market_breadth_bull: 0.5,
+        market_regime_label: "NEUTRAL".to_string(),
+        risk_tier: "extreme".to_string(),
+        leverage_multiplier: 1.85,
+        s1_gross_weight: 0.0,
+        s2_gross_weight: 0.0,
+        s3_gross_weight: 0.0,
+        working_order_count: 0,
+        open_long_count: 0,
+        open_short_count: 0,
+        eligible_coin_count: 7,
+    };
+
+    db.insert_portfolio_snapshot(&base_snap(10_000.0)).unwrap();
+    db.insert_portfolio_snapshot(&base_snap(8_000.0)).unwrap();
+
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let sig_out = make_signal_output(vec![make_signal_input(&eth, 0.20, 0.0, ACTION_OPEN_LONG)]);
+    let reb_tripped = engine.execute_signal_rebalance(&sig_out, 8_000.0).unwrap();
+    assert_eq!(reb_tripped.working_orders_placed, 0);
+    assert!(db.get_assets_ordered().unwrap().is_empty());
 }
