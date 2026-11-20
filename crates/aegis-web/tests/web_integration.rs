@@ -1,6 +1,6 @@
 //! Integration tests for Aegis Quant v2.0 Web Dashboard & REST/SSE API (`aegis-web`).
 
-use aegis_core::{AegisError, OrderSide};
+use aegis_core::{now_ms, AegisError, OrderSide};
 use aegis_db::{AssetUpsertInput, DatabaseManager, WorkingOrderInput};
 use aegis_web::{
     create_web_router, create_web_router_for_host, health_result_to_response,
@@ -138,6 +138,10 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
     let dash_json: Value = serde_json::from_slice(&dash_bytes).unwrap();
     assert_eq!(dash_json["v_assets_ordered"].as_array().unwrap().len(), 1);
     assert_eq!(dash_json["v_assets_ordered"][0]["symbol"], "BTC-USDC");
+    assert_eq!(dash_json["risk_capital_cap_updated_at_ms"], 0);
+    assert_eq!(dash_json["max_open_positions"], 6);
+    assert_eq!(dash_json["active_cap_open_count"], 0);
+    assert_eq!(dash_json["pre_cap_open_count"], 0);
     assert!(dash_json["pnl_summary"]["daily"].is_object());
     assert!(dash_json["pnl_summary"]["weekly"].is_object());
     assert!(dash_json["pnl_summary"]["monthly"].is_object());
@@ -527,4 +531,131 @@ async fn test_web_auth_explicit_disable_on_non_loopback_respects_operator_opt_ou
         .await
         .unwrap();
     assert_eq!(res_disabled.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_web_dashboard_separates_pre_cap_and_active_cap_holdings() {
+    let cap_epoch_ms = now_ms() - 600_000;
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("max_open_positions", "6", None)
+            .unwrap();
+        mgr.set_config_value(
+            "risk_capital_cap_updated_at_ms",
+            &cap_epoch_ms.to_string(),
+            None,
+        )
+        .unwrap();
+
+        let coins = [
+            ("ETH", 0, 3200.0, Some(cap_epoch_ms - 120_000)),
+            ("AVAX", 1, 35.0, Some(cap_epoch_ms - 1)),
+            ("BTC", 2, 94000.0, Some(cap_epoch_ms)),
+            ("SOL", 3, 180.0, Some(cap_epoch_ms + 10_000)),
+            ("ARB", 4, 1.10, Some(cap_epoch_ms + 20_000)),
+            ("SUI", 5, 3.40, Some(cap_epoch_ms + 30_000)),
+            ("LINK", 6, 18.50, Some(cap_epoch_ms + 40_000)),
+            ("DOGE", 7, 0.38, Some(cap_epoch_ms + 50_000)),
+        ];
+
+        for (coin, idx, px, opened_at) in coins {
+            let asset_id = mgr
+                .upsert_exchange_asset(&AssetUpsertInput {
+                    raw_symbol_or_coin: coin.to_string(),
+                    asset_index: idx,
+                    sz_decimals: 3,
+                    tick_size: 0.01,
+                    lot_step_size: 0.01,
+                    max_leverage: 25.0,
+                    mark_price: px,
+                    mid_price: px,
+                    oracle_price: px,
+                    funding_rate_hourly: 0.00001,
+                    day_volume_usdc: 40_000_000.0,
+                    open_interest_usdc: 10_000_000.0,
+                    prev_day_price: px * 0.99,
+                    is_core_eligible: true,
+                    is_event_eligible: true,
+                    is_priority_watched: false,
+                })
+                .unwrap();
+
+            mgr.sync_open_position_from_exchange_v2(
+                asset_id,
+                coin,
+                OrderSide::Long,
+                px,
+                px,
+                150.0 / px,
+                150.0,
+                0.0,
+                0.15,
+                px * 0.95,
+                px * 1.10,
+                0.0,
+                opened_at,
+            )
+            .unwrap();
+        }
+
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. TESTNET: 6 active-cap holdings (>= cap_epoch_ms) and 2 pre-cap holdings (< cap_epoch_ms)
+    let res_dash = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_dash.status(), StatusCode::OK);
+    let dash_bytes = axum::body::to_bytes(res_dash.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let dash_json: Value = serde_json::from_slice(&dash_bytes).unwrap();
+    assert_eq!(dash_json["v_assets_held"].as_array().unwrap().len(), 8);
+    assert_eq!(dash_json["risk_capital_cap_updated_at_ms"], cap_epoch_ms);
+    assert_eq!(dash_json["max_open_positions"], 6);
+    assert_eq!(dash_json["active_cap_open_count"], 6);
+    assert_eq!(dash_json["pre_cap_open_count"], 2);
+
+    // 2. PAPER mode disables cap epoch isolation even if risk_capital_cap_updated_at_ms > 0 in DB
+    let db_paper = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_paper
+            .set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_paper = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paper.status(), StatusCode::OK);
+    let paper_bytes = axum::body::to_bytes(res_paper.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let paper_json: Value = serde_json::from_slice(&paper_bytes).unwrap();
+    assert_eq!(paper_json["risk_capital_cap_updated_at_ms"], 0);
+    assert_eq!(paper_json["max_open_positions"], 6);
+    assert_eq!(paper_json["active_cap_open_count"], 8);
+    assert_eq!(paper_json["pre_cap_open_count"], 0);
 }

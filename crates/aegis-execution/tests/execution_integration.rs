@@ -4,7 +4,8 @@ use aegis_core::{now_ms, OrderSide, RiskTier};
 use aegis_db::{AssetUpsertInput, DatabaseManager};
 use aegis_execution::{ChaseStepOutcome, ExecutionEngine, NewWorkingOrderRequest};
 use aegis_signals::{
-    MarketBreadthSnapshot, SignalCycleOutput, SleeveSignalInput, ACTION_FLIP, ACTION_OPEN_LONG,
+    MarketBreadthSnapshot, SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP,
+    ACTION_OPEN_LONG,
 };
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -1155,6 +1156,680 @@ fn test_reconcile_user_fills_flip_funding_and_opened_at_ms() {
     assert!((sol_closed.fees_paid_usdc - 1.0).abs() < 1e-4);
     assert!((sol_closed.funding_accrued_usdc - 2.50).abs() < 1e-4);
     assert!((sol_closed.realized_pnl_usdc - 21.50).abs() < 1e-4);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_execute_signal_rebalance_enforces_min_position_hold_sec() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+
+    db.set_config_value("min_position_hold_sec", "300", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    let avax = db.get_asset_by_symbol("AVAX-USDC").unwrap().unwrap();
+    let link = db.get_asset_by_symbol("LINK-USDC").unwrap().unwrap();
+
+    let young_opened_ms = now_ms() - 30_000; // 30s < 300s
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol.id,
+            &sol.coin,
+            OrderSide::Long,
+            sol.mark_price,
+            sol.mark_price,
+            5.0,
+            5.0 * sol.mark_price,
+            0.0,
+            0.10,
+            sol.mark_price * 0.95,
+            sol.mark_price * 1.10,
+            0.0,
+            Some(young_opened_ms),
+        )
+        .unwrap();
+    let (eth_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            eth.id,
+            &eth.coin,
+            OrderSide::Long,
+            eth.mark_price,
+            eth.mark_price,
+            0.5,
+            0.5 * eth.mark_price,
+            0.0,
+            0.15,
+            eth.mark_price * 0.95,
+            eth.mark_price * 1.10,
+            0.0,
+            Some(young_opened_ms),
+        )
+        .unwrap();
+    let (arb_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            arb.id,
+            &arb.coin,
+            OrderSide::Long,
+            arb.mark_price,
+            arb.mark_price,
+            100.0,
+            100.0 * arb.mark_price,
+            0.0,
+            0.05,
+            arb.mark_price * 0.95,
+            arb.mark_price * 1.10,
+            0.0,
+            Some(young_opened_ms),
+        )
+        .unwrap();
+
+    // 1. Both ACTION_CLOSE and ACTION_FLIP must be skipped while held < min_position_hold_sec
+    let sig_blocked = make_signal_output(vec![
+        make_signal_input(&sol, 0.0, 0.10, ACTION_CLOSE),
+        make_signal_input(&eth, -0.20, 0.15, ACTION_FLIP),
+    ]);
+    let reb_blocked = engine
+        .execute_signal_rebalance(&sig_blocked, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_blocked.positions_closed, 0);
+    assert_eq!(reb_blocked.working_orders_placed, 0);
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+
+    // 2. Manual close_or_cancel_position remains unrestricted even inside the hold window
+    let manual_rep = engine
+        .close_or_cancel_position(arb_pid, "MANUAL_OVERRIDE_TEST", Some(0))
+        .unwrap();
+    assert_eq!(manual_rep.final_status, "CLOSED");
+
+    // 3. Mature holdings (>= 300s) ARE closed by ACTION_CLOSE and flipped by ACTION_FLIP
+    let mature_opened_ms = now_ms() - 360_000;
+    let (avax_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            avax.id,
+            &avax.coin,
+            OrderSide::Long,
+            avax.mark_price,
+            avax.mark_price,
+            20.0,
+            20.0 * avax.mark_price,
+            0.0,
+            0.10,
+            avax.mark_price * 0.95,
+            avax.mark_price * 1.10,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+    let (link_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            link.id,
+            &link.coin,
+            OrderSide::Long,
+            link.mark_price,
+            link.mark_price,
+            40.0,
+            40.0 * link.mark_price,
+            0.0,
+            0.10,
+            link.mark_price * 0.95,
+            link.mark_price * 1.10,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    let sig_allowed = make_signal_output(vec![
+        make_signal_input(&avax, 0.0, 0.10, ACTION_CLOSE),
+        make_signal_input(&link, -0.20, 0.10, ACTION_FLIP),
+    ]);
+    let reb_allowed = engine
+        .execute_signal_rebalance(&sig_allowed, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_allowed.positions_closed, 2);
+    assert_eq!(reb_allowed.working_orders_placed, 1);
+    assert_eq!(
+        db.get_position_by_id(avax_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert_eq!(
+        db.get_position_by_id(link_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    let ordered = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].symbol, "LINK-USDC");
+    assert_eq!(ordered[0].side, "SHORT");
+
+    // Young SOL/ETH remain OPEN throughout
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+
+    // 4. Setting min_position_hold_sec = 0 permits immediate close/flip on young positions
+    db.set_config_value("min_position_hold_sec", "0", None)
+        .unwrap();
+    let reb_zero_hold = engine
+        .execute_signal_rebalance(&sig_blocked, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_zero_hold.positions_closed, 2);
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+}
+
+#[test]
+fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
+    use std::collections::HashMap;
+
+    #[derive(Clone, Debug)]
+    struct WireOrderRecord {
+        coin: String,
+        tif: Option<String>,
+        is_trigger: bool,
+        sz: f64,
+    }
+
+    let positions_state: Arc<Mutex<HashMap<String, (f64, f64)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let positions_srv = positions_state.clone();
+    let submitted_wires: Arc<Mutex<Vec<WireOrderRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let submitted_srv = submitted_wires.clone();
+    let cancelled_oids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let cancelled_srv = cancelled_oids.clone();
+    let ioc_should_fill: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
+    let ioc_srv = ioc_should_fill.clone();
+    let next_oid: Arc<Mutex<u64>> = Arc::new(Mutex::new(50_000));
+
+    let coin_by_idx: HashMap<u64, &'static str> = [
+        (0, "BTC"),
+        (1, "ETH"),
+        (2, "SOL"),
+        (3, "AVAX"),
+        (4, "LINK"),
+        (5, "ARB"),
+        (6, "SUI"),
+    ]
+    .into_iter()
+    .collect();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "clearinghouseState" {
+                let guard = positions_srv.lock();
+                let asset_positions: Vec<Value> = guard
+                    .iter()
+                    .filter(|(_, (szi, _))| szi.abs() > 1e-9)
+                    .map(|(coin, (szi, entry_px))| {
+                        json!({
+                            "position": {
+                                "coin": coin,
+                                "szi": format!("{szi}"),
+                                "entryPx": format!("{entry_px}"),
+                                "positionValue": format!("{}", szi.abs() * entry_px)
+                            }
+                        })
+                    })
+                    .collect();
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "10000.0" },
+                        "assetPositions": asset_positions
+                    }),
+                );
+            }
+            if typ == "l2Book" {
+                let coin = body.get("coin").and_then(Value::as_str).unwrap_or("SOL");
+                let px = match coin {
+                    "SOL" => 184.25,
+                    "AVAX" => 35.0,
+                    "LINK" => 18.5,
+                    "ARB" => 0.85,
+                    _ => 100.0,
+                };
+                return (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": format!("{:.6}", px * 0.9995), "sz": "1000.0"}],
+                            [{"px": format!("{:.6}", px * 1.0005), "sz": "1000.0"}]
+                        ]
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "cancel" {
+            if let Some(arr) = body.pointer("/action/cancels").and_then(Value::as_array) {
+                for c in arr {
+                    if let Some(o) = c.get("o").and_then(Value::as_u64) {
+                        cancelled_srv.lock().push(o);
+                    }
+                }
+            }
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": { "type": "cancel", "data": { "statuses": ["success"] } }
+                }),
+            );
+        }
+        if action_type == "order" {
+            let ord = body
+                .pointer("/action/orders/0")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let a_idx = ord.get("a").and_then(Value::as_u64).unwrap_or(0);
+            let coin = coin_by_idx
+                .get(&a_idx)
+                .copied()
+                .unwrap_or("UNK")
+                .to_string();
+            let sz_f: f64 = ord
+                .get("s")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let px_str = ord.get("p").and_then(Value::as_str).unwrap_or("0");
+            let is_trigger = ord.pointer("/t/trigger").is_some();
+            let tif = ord
+                .pointer("/t/limit/tif")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            submitted_srv.lock().push(WireOrderRecord {
+                coin,
+                tif: tif.clone(),
+                is_trigger,
+                sz: sz_f,
+            });
+            let mut oid_guard = next_oid.lock();
+            *oid_guard += 1;
+            let oid = *oid_guard;
+
+            if !is_trigger && tif.as_deref() == Some("Ioc") {
+                if *ioc_srv.lock() {
+                    return (
+                        200,
+                        json!({
+                            "status": "ok",
+                            "response": {
+                                "type": "order",
+                                "data": {
+                                    "statuses": [{
+                                        "filled": {
+                                            "oid": oid,
+                                            "totalSz": format!("{sz_f}"),
+                                            "avgPx": px_str
+                                        }
+                                    }]
+                                }
+                            }
+                        }),
+                    );
+                }
+                return (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [{ "error": "Order could not immediately match" }]
+                            }
+                        }
+                    }),
+                );
+            }
+
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{ "resting": { "oid": oid } }]
+                        }
+                    }
+                }),
+            );
+        }
+
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("max_open_positions", "10", None)
+        .unwrap();
+    db.set_config_value("max_alo_chase_ticks", "2", None)
+        .unwrap();
+
+    // Case A: SOL-USDC 30% partial fill stays WORKING (< max_chases & < 45s), chases rem_qty=7.0,
+    // and promotes to OPEN once >= 85% (8.6) with remaining OID cancelled and SL/TP sized to 8.6.
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let sol_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: sol.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 1842.4,
+            portfolio_weight: 0.18,
+            s1_weight_contrib: 0.10,
+            s2_weight_contrib: 0.08,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 176.80,
+            reason: "PARTIAL_FILL_TEST_SOL".to_string(),
+            bypass_entry_interval: true,
+        })
+        .unwrap();
+
+    // 30% fill on exchange while resting (< 4 bps drift) -> MUST stay WORKING and NOT cancel OID 50001
+    positions_state
+        .lock()
+        .insert("SOL".to_string(), (3.0, 184.24));
+    let ord_sol_1 = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == sol_pid)
+        .unwrap();
+    assert_eq!(ord_sol_1.exchange_order_id.as_deref(), Some("hl-50001"));
+    let step_resting = engine.chaser.advance_working_order(&ord_sol_1).unwrap();
+    assert!(matches!(step_resting, ChaseStepOutcome::Resting { .. }));
+    assert!(cancelled_oids.lock().is_empty());
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "WORKING"
+    );
+
+    // Mid drifts > 4 bps -> cancels 50001 and chases rem_qty=7.0 ONLY
+    db.update_asset_live_quote(sol.id, 185.20, 185.20).unwrap();
+    let ord_sol_2 = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == sol_pid)
+        .unwrap();
+    let step_chased = engine.chaser.advance_working_order(&ord_sol_2).unwrap();
+    assert!(matches!(
+        step_chased,
+        ChaseStepOutcome::Chased { chase_count: 1, .. }
+    ));
+    assert_eq!(*cancelled_oids.lock(), vec![50_001]);
+    let sol_chase_wire = submitted_wires
+        .lock()
+        .iter()
+        .rfind(|w| w.coin == "SOL" && !w.is_trigger)
+        .cloned()
+        .unwrap();
+    assert_eq!(sol_chase_wire.tif.as_deref(), Some("Alo"));
+    assert!((sol_chase_wire.sz - 7.0).abs() < 1e-6);
+
+    // Additional fill brings total to 8.6 (86% >= 85%) -> cancels resting 50002 & promotes to OPEN at 8.6
+    positions_state
+        .lock()
+        .insert("SOL".to_string(), (8.6, 184.89));
+    let ord_sol_3 = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == sol_pid)
+        .unwrap();
+    assert_eq!(ord_sol_3.exchange_order_id.as_deref(), Some("hl-50002"));
+    let step_open = engine.chaser.advance_working_order(&ord_sol_3).unwrap();
+    match step_open {
+        ChaseStepOutcome::FilledOpen {
+            filled_quantity, ..
+        } => assert!((filled_quantity - 8.6).abs() < 1e-6),
+        other => panic!("Expected FilledOpen at 86%, got {other:?}"),
+    }
+    assert!(cancelled_oids.lock().contains(&50_002));
+    let sol_pos = db.get_position_by_id(sol_pid).unwrap().unwrap();
+    assert_eq!(sol_pos.status, "OPEN");
+    assert!((sol_pos.filled_quantity - 8.6).abs() < 1e-6);
+    let sol_triggers: Vec<f64> = submitted_wires
+        .lock()
+        .iter()
+        .filter(|w| w.coin == "SOL" && w.is_trigger)
+        .map(|w| w.sz)
+        .collect();
+    assert_eq!(sol_triggers.len(), 2);
+    assert!(sol_triggers.iter().all(|&sz| (sz - 8.6).abs() < 1e-6));
+
+    // Case B1: CROSSING_IOC escalation with 30% partial fill -> submits IOC for rem_qty=7.0 ONLY & promotes 10.0
+    let avax = db.get_asset_by_symbol("AVAX-USDC").unwrap().unwrap();
+    let avax_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: avax.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 350.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 33.5,
+            reason: "IOC_PARTIAL_FILL_TEST".to_string(),
+            bypass_entry_interval: true,
+        })
+        .unwrap();
+    positions_state
+        .lock()
+        .insert("AVAX".to_string(), (3.0, 35.0));
+    for (idx, mid_px) in [35.20, 35.40].into_iter().enumerate() {
+        db.update_asset_live_quote(avax.id, mid_px, mid_px).unwrap();
+        let ord = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == avax_pid)
+            .unwrap();
+        let res = engine.chaser.advance_working_order(&ord).unwrap();
+        assert!(matches!(
+            res,
+            ChaseStepOutcome::Chased { chase_count, .. } if chase_count == (idx as u32 + 1)
+        ));
+    }
+    let ord_avax_ioc = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == avax_pid)
+        .unwrap();
+    assert_eq!(ord_avax_ioc.chase_count, 2);
+    let avax_open = engine.chaser.advance_working_order(&ord_avax_ioc).unwrap();
+    match avax_open {
+        ChaseStepOutcome::FilledOpen {
+            filled_quantity, ..
+        } => assert!((filled_quantity - 10.0).abs() < 1e-6),
+        other => panic!("Expected FilledOpen after IOC rem_qty fill, got {other:?}"),
+    }
+    let avax_ioc_wire = submitted_wires
+        .lock()
+        .iter()
+        .find(|w| w.coin == "AVAX" && w.tif.as_deref() == Some("Ioc"))
+        .cloned()
+        .unwrap();
+    assert!((avax_ioc_wire.sz - 7.0).abs() < 1e-6);
+
+    // Case B2: CROSSING_IOC unfilled with 30% existing exchange fill -> STILL promotes 3.0 to OPEN with SL/TP
+    *ioc_should_fill.lock() = false;
+    let link = db.get_asset_by_symbol("LINK-USDC").unwrap().unwrap();
+    let link_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: link.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 185.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 17.5,
+            reason: "IOC_UNFILLED_PARTIAL_PROMOTE".to_string(),
+            bypass_entry_interval: true,
+        })
+        .unwrap();
+    positions_state
+        .lock()
+        .insert("LINK".to_string(), (3.0, 18.5));
+    for mid_px in [18.70, 18.90] {
+        db.update_asset_live_quote(link.id, mid_px, mid_px).unwrap();
+        let ord = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == link_pid)
+            .unwrap();
+        let _ = engine.chaser.advance_working_order(&ord).unwrap();
+    }
+    let ord_link_ioc = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == link_pid)
+        .unwrap();
+    let link_open = engine.chaser.advance_working_order(&ord_link_ioc).unwrap();
+    match link_open {
+        ChaseStepOutcome::FilledOpen {
+            filled_quantity, ..
+        } => assert!((filled_quantity - 3.0).abs() < 1e-6),
+        other => {
+            panic!("Expected FilledOpen preserving 3.0 partial fill on IOC non-fill, got {other:?}")
+        }
+    }
+    let link_triggers: Vec<f64> = submitted_wires
+        .lock()
+        .iter()
+        .filter(|w| w.coin == "LINK" && w.is_trigger)
+        .map(|w| w.sz)
+        .collect();
+    assert_eq!(link_triggers.len(), 2);
+    assert!(link_triggers.iter().all(|&sz| (sz - 3.0).abs() < 1e-6));
+
+    // Case C: Grace timeout (>= 45_000 ms) with 30% partial fill cancels resting OID and promotes 30.0 to OPEN
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    let arb_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: arb.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 100.0,
+            reserved_margin_usdc: 85.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.80,
+            reason: "EXPIRED_PARTIAL_PROMOTE".to_string(),
+            bypass_entry_interval: true,
+        })
+        .unwrap();
+    positions_state
+        .lock()
+        .insert("ARB".to_string(), (30.0, 0.85));
+    let mut ord_arb_expired = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == arb_pid)
+        .unwrap();
+    let arb_oid_num: u64 = ord_arb_expired
+        .exchange_order_id
+        .as_deref()
+        .and_then(|s| s.strip_prefix("hl-"))
+        .and_then(|s| s.parse().ok())
+        .unwrap();
+    ord_arb_expired.created_at_ms = now_ms() - 46_000;
+    let arb_open = engine
+        .chaser
+        .advance_working_order(&ord_arb_expired)
+        .unwrap();
+    match arb_open {
+        ChaseStepOutcome::FilledOpen {
+            filled_quantity, ..
+        } => assert!((filled_quantity - 30.0).abs() < 1e-6),
+        other => panic!("Expected FilledOpen on expired partial fill, got {other:?}"),
+    }
+    assert!(cancelled_oids.lock().contains(&arb_oid_num));
+    let arb_pos = db.get_position_by_id(arb_pid).unwrap().unwrap();
+    assert_eq!(arb_pos.status, "OPEN");
+    assert!((arb_pos.filled_quantity - 30.0).abs() < 1e-6);
+    let arb_triggers: Vec<f64> = submitted_wires
+        .lock()
+        .iter()
+        .filter(|w| w.coin == "ARB" && w.is_trigger)
+        .map(|w| w.sz)
+        .collect();
+    assert_eq!(arb_triggers.len(), 2);
+    assert!(arb_triggers.iter().all(|&sz| (sz - 30.0).abs() < 1e-6));
 
     let _ = stop_tx.send(());
 }

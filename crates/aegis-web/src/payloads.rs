@@ -83,6 +83,10 @@ pub struct DashboardPayload {
     pub target_leverage_multiplier: f64,
     pub risk_tier_badge: String,
     pub loop_cadence: String,
+    pub risk_capital_cap_updated_at_ms: i64,
+    pub max_open_positions: usize,
+    pub active_cap_open_count: usize,
+    pub pre_cap_open_count: usize,
     pub pnl_summary: PnlSummary,
     pub snapshot: PortfolioSnapshot,
     pub snapshots_history: Vec<PortfolioSnapshot>,
@@ -585,6 +589,18 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         })
         .collect();
 
+    let cap_epoch_ms = if cfg.execution_mode().is_live_or_testnet() {
+        cfg.get_i64("risk_capital_cap_updated_at_ms", 0)
+    } else {
+        0
+    };
+    let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
+    let active_cap_open_count = v_assets_held
+        .iter()
+        .filter(|h| cap_epoch_ms <= 0 || h.opened_at_ms.unwrap_or(h.updated_at_ms) >= cap_epoch_ms)
+        .count();
+    let pre_cap_open_count = v_assets_held.len().saturating_sub(active_cap_open_count);
+
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
         mariadb_version,
@@ -594,6 +610,10 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         target_leverage_multiplier: mult,
         risk_tier_badge: tier.display_badge(Some(mult)),
         loop_cadence: "1s Priority / 3s Scanner".to_string(),
+        risk_capital_cap_updated_at_ms: cap_epoch_ms,
+        max_open_positions,
+        active_cap_open_count,
+        pre_cap_open_count,
         pnl_summary,
         snapshot,
         snapshots_history,

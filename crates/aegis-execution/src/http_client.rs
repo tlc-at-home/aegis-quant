@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -455,6 +455,53 @@ pub fn parse_exchange_order_ack(
     }
 }
 
+const HL_USER_FUNDING_PAGE_LIMIT: usize = 500;
+const HL_USER_FUNDING_MAX_PAGES: usize = 50;
+
+fn extract_funding_time_ms(ev: &Value) -> Option<i64> {
+    ev.get("time").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    })
+}
+
+fn funding_event_dedup_key(ev: &Value) -> (i64, String, String, String, String) {
+    let time_ms = extract_funding_time_ms(ev).unwrap_or(0);
+    let delta = ev.get("delta");
+    let coin = delta
+        .and_then(|d| d.get("coin"))
+        .or_else(|| ev.get("coin"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    let usdc = delta
+        .and_then(|d| d.get("usdc"))
+        .or_else(|| ev.get("usdc"))
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| v.to_string())
+        })
+        .unwrap_or_default();
+    let hash = ev
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let n_val = ev
+        .get("n")
+        .or_else(|| delta.and_then(|d| d.get("nSamples")))
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| v.to_string())
+        })
+        .unwrap_or_default();
+    (time_ms, coin, usdc, hash, n_val)
+}
+
 /// High-level Hyperliquid `/info` and `/exchange` client for Aegis Quant v2.0.
 #[derive(Clone)]
 pub struct HyperliquidHttpClient {
@@ -623,24 +670,101 @@ impl HyperliquidHttpClient {
         Ok(raw.as_array().cloned().unwrap_or_default())
     }
 
-    /// Polls `userFunding` for `user_wallet` returning historical funding ledger entries from Hyperliquid L1.
+    /// Polls `userFunding` for `user_wallet` returning paginated historical funding ledger entries from Hyperliquid L1.
     pub fn fetch_user_funding(
         &self,
         user_wallet: &str,
         start_time_ms: Option<i64>,
         cfg: &ConfigMap,
     ) -> Result<Vec<Value>> {
-        let start =
-            start_time_ms.unwrap_or_else(|| (aegis_core::now_ms() - 90 * 86_400_000).max(0));
-        let raw = self.post_info(
-            &json!({
-                "type": "userFunding",
-                "user": user_wallet.trim(),
-                "startTime": start,
-            }),
+        self.fetch_user_funding_paginated(
+            user_wallet,
+            start_time_ms,
+            HL_USER_FUNDING_PAGE_LIMIT,
+            HL_USER_FUNDING_MAX_PAGES,
             cfg,
-        )?;
-        Ok(raw.as_array().cloned().unwrap_or_default())
+        )
+    }
+
+    fn fetch_user_funding_paginated(
+        &self,
+        user_wallet: &str,
+        start_time_ms: Option<i64>,
+        page_limit: usize,
+        max_pages: usize,
+        cfg: &ConfigMap,
+    ) -> Result<Vec<Value>> {
+        let mut cursor_ms =
+            start_time_ms.unwrap_or_else(|| (aegis_core::now_ms() - 90 * 86_400_000).max(0));
+        let trimmed_user = user_wallet.trim();
+        let page_limit = page_limit.max(1);
+        let max_pages = max_pages.max(1);
+
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: HashSet<(i64, String, String, String, String)> = HashSet::new();
+
+        for page_idx in 0..max_pages {
+            let raw = match self.post_info(
+                &json!({
+                    "type": "userFunding",
+                    "user": trimmed_user,
+                    "startTime": cursor_ms,
+                }),
+                cfg,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    if page_idx == 0 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        page = page_idx,
+                        cursor_ms,
+                        error = %e,
+                        "Hyperliquid userFunding pagination interrupted; returning partial ledger"
+                    );
+                    break;
+                }
+            };
+            let page = raw.as_array().cloned().unwrap_or_default();
+            let page_len = page.len();
+            if page_len == 0 {
+                break;
+            }
+
+            let mut max_time_ms: Option<i64> = None;
+            let mut added_on_page = 0usize;
+            for ev in page {
+                if let Some(t) = extract_funding_time_ms(&ev) {
+                    max_time_ms = Some(max_time_ms.map_or(t, |m| m.max(t)));
+                }
+                if seen.insert(funding_event_dedup_key(&ev)) {
+                    out.push(ev);
+                    added_on_page += 1;
+                }
+            }
+
+            if page_len < page_limit {
+                break;
+            }
+            let Some(page_max) = max_time_ms else {
+                break;
+            };
+            if page_max > cursor_ms {
+                // Re-query inclusively at `page_max` so multiple coins sharing the boundary
+                // timestamp past the 500-record cutoff are never skipped; `seen` deduplicates overlap.
+                cursor_ms = page_max;
+            } else if page_max == cursor_ms {
+                // Saturated single millisecond (`>= page_limit` events at `cursor_ms`): advance past it.
+                cursor_ms = page_max.saturating_add(1);
+            } else if added_on_page > 0 {
+                cursor_ms = cursor_ms.saturating_add(1);
+            } else {
+                // `page_max < cursor_ms` and zero new items: server ignored `startTime`.
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Signs and posts an EIP-712 L1 action to `/exchange` with automatic single-retry on nonce collision.
@@ -847,5 +971,219 @@ mod tests {
         cfg.insert("hyperliquid_testnet", "false");
         assert!(is_testnet_configured(&cfg));
         assert_eq!(resolve_info_url(&cfg), HYPERLIQUID_TESTNET_INFO_URL);
+    }
+
+    fn spawn_mock_info_server<F>(handler: F) -> (u16, std::sync::mpsc::Sender<()>)
+    where
+        F: Fn(&Value) -> (u16, Value) + Send + Sync + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handler = Arc::new(handler);
+
+        std::thread::spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    while let Ok(n) = stream.read(&mut tmp) {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if header_end.is_none() {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                let headers = String::from_utf8_lossy(&buf[..pos]);
+                                for line in headers.lines() {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            content_len = v.trim().parse::<usize>().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(hend) = header_end {
+                            if buf.len() >= hend + content_len {
+                                break;
+                            }
+                        }
+                    }
+                    let body_slice = header_end
+                        .map(|h| &buf[h..buf.len().min(h + content_len)])
+                        .unwrap_or(&[]);
+                    let req_json: Value = serde_json::from_slice(body_slice).unwrap_or(Value::Null);
+                    let (status, resp_json) = handler(&req_json);
+                    let resp_body = resp_json.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+
+        (port, stop_tx)
+    }
+
+    #[test]
+    fn test_fetch_user_funding_paginates_and_deduplicates_boundary() {
+        let mut ledger: Vec<Value> = Vec::new();
+        let base_ts = 1_795_000_000_000i64;
+        // 498 single-coin entries before boundary 1
+        for i in 0..498 {
+            ledger.push(json!({
+                "time": base_ts + i,
+                "hash": format!("0x{:04x}", i),
+                "delta": { "type": "funding", "coin": "BTC", "usdc": "0.10" }
+            }));
+        }
+        // 5 coins sharing boundary 1 timestamp across the 500-record cutoff (2 on page 1, 3 overflow to page 2)
+        let boundary1 = base_ts + 500;
+        for (idx, coin) in ["ETH", "SOL", "ARB", "AVAX", "DOGE"].iter().enumerate() {
+            ledger.push(json!({
+                "time": boundary1,
+                "hash": "0x0000",
+                "delta": { "type": "funding", "coin": coin, "usdc": format!("0.2{}", idx) }
+            }));
+        }
+        // 493 entries before boundary 2 (so 5 boundary1 + 493 + 2 of 3 boundary2 = 500 on page 2)
+        for i in 0..493 {
+            ledger.push(json!({
+                "time": boundary1 + 100 + i,
+                "hash": format!("0x1{:04x}", i),
+                "delta": { "type": "funding", "coin": "OP", "usdc": "-0.05" }
+            }));
+        }
+        // 3 coins sharing boundary 2 across page 2 -> page 3, plus 4 newer entries
+        let boundary2 = boundary1 + 1_000;
+        for coin in ["SUI", "TAO", "PYTH"] {
+            ledger.push(json!({
+                "time": boundary2,
+                "hash": "0x0000",
+                "delta": { "type": "funding", "coin": coin, "usdc": "0.75" }
+            }));
+        }
+        for i in 0..4 {
+            ledger.push(json!({
+                "time": boundary2 + 100 + i,
+                "hash": format!("0x2{:04x}", i),
+                "delta": { "type": "funding", "coin": "MET", "usdc": "1.25" }
+            }));
+        }
+        let expected_total = ledger.len(); // 498 + 5 + 493 + 3 + 4 = 1003
+
+        let requested_cursors = std::sync::Arc::new(Mutex::new(Vec::<i64>::new()));
+        let cursors_clone = requested_cursors.clone();
+        let ledger_arc = std::sync::Arc::new(ledger);
+        let ledger_clone = ledger_arc.clone();
+
+        let (port, stop_tx) = spawn_mock_info_server(move |body| {
+            let start_time = body.get("startTime").and_then(Value::as_i64).unwrap_or(0);
+            cursors_clone.lock().push(start_time);
+            let slice: Vec<Value> = ledger_clone
+                .iter()
+                .filter(|ev| ev["time"].as_i64().unwrap() >= start_time)
+                .take(HL_USER_FUNDING_PAGE_LIMIT)
+                .cloned()
+                .collect();
+            (200, Value::Array(slice))
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert(
+            "hyperliquid_testnet_url",
+            format!("http://127.0.0.1:{port}"),
+        );
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = HyperliquidHttpClient::new(5);
+        let fetched = client
+            .fetch_user_funding(
+                "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                Some(base_ts),
+                &cfg,
+            )
+            .expect("paginated userFunding fetch succeeds");
+
+        let _ = stop_tx.send(());
+
+        assert_eq!(fetched.len(), expected_total);
+        // Ensure zero duplicates and zero skipped boundary coins across both 500-entry boundaries
+        let keys: HashSet<_> = fetched.iter().map(funding_event_dedup_key).collect();
+        assert_eq!(keys.len(), expected_total);
+        for coin in ["ETH", "SOL", "ARB", "AVAX", "DOGE"] {
+            assert!(keys
+                .iter()
+                .any(|(t, c, _, _, _)| *t == boundary1 && c == coin));
+        }
+        for coin in ["SUI", "TAO", "PYTH"] {
+            assert!(keys
+                .iter()
+                .any(|(t, c, _, _, _)| *t == boundary2 && c == coin));
+        }
+        let cursors = requested_cursors.lock().clone();
+        assert_eq!(cursors, vec![base_ts, boundary1, boundary2]);
+    }
+
+    #[test]
+    fn test_fetch_user_funding_saturated_ms_and_n_dedup() {
+        // Test saturated equal-millisecond page advancement and `n` field dedup
+        let ledger = std::sync::Arc::new(vec![
+            json!({ "time": 1000, "hash": "0x0", "n": 1, "delta": { "type": "funding", "coin": "BTC", "usdc": "0.1" } }),
+            json!({ "time": 1000, "hash": "0x0", "n": 2, "delta": { "type": "funding", "coin": "BTC", "usdc": "0.1" } }),
+            json!({ "time": 1000, "hash": "0x0", "n": 3, "delta": { "type": "funding", "coin": "ETH", "usdc": "0.2" } }),
+            json!({ "time": 2000, "hash": "0x1", "n": 4, "delta": { "type": "funding", "coin": "SOL", "usdc": "0.3" } }),
+        ]);
+        let ledger_clone = ledger.clone();
+        let (port, stop_tx) = spawn_mock_info_server(move |body| {
+            let start_time = body.get("startTime").and_then(Value::as_i64).unwrap_or(0);
+            let slice: Vec<Value> = ledger_clone
+                .iter()
+                .filter(|ev| ev["time"].as_i64().unwrap() >= start_time)
+                .take(3)
+                .cloned()
+                .collect();
+            (200, Value::Array(slice))
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert(
+            "hyperliquid_testnet_url",
+            format!("http://127.0.0.1:{port}"),
+        );
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = HyperliquidHttpClient::new(5);
+        let fetched = client
+            .fetch_user_funding_paginated("0xabc", Some(1000), 3, 10, &cfg)
+            .expect("saturated ms pagination succeeds");
+
+        let _ = stop_tx.send(());
+        assert_eq!(fetched.len(), 4);
     }
 }

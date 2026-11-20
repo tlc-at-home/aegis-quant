@@ -406,7 +406,7 @@
       <div class="glass-panel">
         <div class="panel-header">
           <div class="panel-title-cluster">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
               <path d="M2 17l10 5 10-5"></path>
               <path d="M2 12l10 5 10-5"></path>
@@ -416,9 +416,9 @@
               <div class="panel-subtitle">Live Exchange Positions · 1s High-Water Trailing Stop Protection</div>
             </div>
           </div>
-          <div style="display: flex; align-items: center; gap: 8px;">
-            <button type="button" class="close-btn" id="btn-close-all-open" style="display: none; padding: 4px 10px;">Close All</button>
-            <span class="status-pill open" id="held-count-pill">0 OPEN</span>
+          <div class="panel-actions">
+            <button type="button" class="close-btn close-all-btn" id="btn-close-all-open" hidden>Close All</button>
+            <span class="status-pill open" id="held-count-pill">0/6 Cap</span>
           </div>
         </div>
 
@@ -426,20 +426,20 @@
           <table class="quant-table">
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Side</th>
-                <th>Committed</th>
-                <th>Entry / Mark</th>
-                <th>Stop Loss (SL)</th>
-                <th>Take Profit (TP)</th>
-                <th>Unrealized PnL</th>
-                <th>Sleeve Mix</th>
-                <th>Action</th>
+                <th scope="col">Symbol</th>
+                <th scope="col">Side</th>
+                <th scope="col">Committed</th>
+                <th scope="col">Entry / Mark</th>
+                <th scope="col">Stop Loss (SL)</th>
+                <th scope="col">Take Profit (TP)</th>
+                <th scope="col">Unrealized PnL</th>
+                <th scope="col">Sleeve Mix</th>
+                <th scope="col">Action</th>
               </tr>
             </thead>
             <tbody id="tbody-assets-held">
               <tr>
-                <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 18px;">
+                <td colspan="9" class="table-empty-cell">
                   No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
                 </td>
               </tr>

@@ -39,8 +39,8 @@ impl Default for RiskLimitsConfig {
             min_order_notional_usdc: 12.0,
             protective_stop_atr_mult: 2.2,
             protective_stop_default_pct: 0.04,
-            take_profit_atr_mult: 4.4,
-            take_profit_default_pct: 0.08,
+            take_profit_atr_mult: 2.8,
+            take_profit_default_pct: 0.055,
             stop_out_cooldown_sec: 1800,
             maker_fee_bps: 1.5,
             taker_fee_bps: 4.5,
@@ -69,9 +69,9 @@ impl RiskLimitsConfig {
             protective_stop_default_pct: cfg
                 .get_f64("protective_stop_default_pct", 0.04)
                 .clamp(0.005, 0.35),
-            take_profit_atr_mult: cfg.get_f64("take_profit_atr_mult", 4.4).clamp(1.0, 20.0),
+            take_profit_atr_mult: cfg.get_f64("take_profit_atr_mult", 2.8).clamp(1.0, 20.0),
             take_profit_default_pct: cfg
-                .get_f64("take_profit_default_pct", 0.08)
+                .get_f64("take_profit_default_pct", 0.055)
                 .clamp(0.01, 0.80),
             stop_out_cooldown_sec: cfg.get_i64("stop_out_cooldown_sec", 1800).max(60),
             maker_fee_bps: cfg.get_f64("maker_fee_bps", 1.5).max(0.0),
@@ -329,5 +329,42 @@ pub fn compute_capital_ledger_from_views(
         working_order_count: ordered_assets.len() as i32,
         open_long_count,
         open_short_count,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_risk_limits_defaults_and_config_map_clamping() {
+        let defaults = RiskLimitsConfig::default();
+        assert!((defaults.protective_stop_atr_mult - 2.2).abs() < 1e-9);
+        assert!((defaults.protective_stop_default_pct - 0.04).abs() < 1e-9);
+        assert!((defaults.take_profit_atr_mult - 2.8).abs() < 1e-9);
+        assert!((defaults.take_profit_default_pct - 0.055).abs() < 1e-9);
+
+        let empty_cfg = ConfigMap::new();
+        let from_empty = RiskLimitsConfig::from_config_map(&empty_cfg);
+        assert!((from_empty.take_profit_atr_mult - 2.8).abs() < 1e-9);
+        assert!((from_empty.take_profit_default_pct - 0.055).abs() < 1e-9);
+
+        let mut custom = ConfigMap::new();
+        custom.insert("take_profit_atr_mult", "0.2");
+        custom.insert("take_profit_default_pct", "1.5");
+        let clamped_low_high = RiskLimitsConfig::from_config_map(&custom);
+        assert!((clamped_low_high.take_profit_atr_mult - 1.0).abs() < 1e-9);
+        assert!((clamped_low_high.take_profit_default_pct - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_tick_and_lot_rounding() {
+        assert_eq!(round_to_tick(100.123, 0.05, true), 100.10);
+        assert_eq!(round_to_tick(100.123, 0.05, false), 100.15);
+        assert_eq!(round_to_tick(100.10, 0.05, true), 100.10);
+        assert_eq!(round_to_tick(100.10, 0.05, false), 100.10);
+        assert_eq!(round_to_tick(f64::NAN, 0.01, true), 0.0);
+        assert_eq!(round_to_lot(1.299, 0.1), 1.2);
+        assert_eq!(round_to_lot(-5.0, 0.1), 0.0);
     }
 }

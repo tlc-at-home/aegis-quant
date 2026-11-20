@@ -10,12 +10,12 @@ use crate::http_client::{is_testnet_configured, HyperliquidHttpClient};
 use crate::order_chaser::{extract_order_oid, parse_hl_oid, OrderChaser};
 use crate::signing::{
     derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size_floor, infer_tick_size,
-    CancelWire, LimitOrderType, OrderTypeWire, OrderWire,
+    snap_to_lot, CancelWire, LimitOrderType, OrderTypeWire, OrderWire,
 };
 use aegis_alerts::AlertEngine;
 use aegis_core::{
     mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp, ExchangeAsset, ExecutionMode,
-    OrderSide, Result,
+    OrderSide, OrderedAssetView, Result,
 };
 use aegis_db::{AssetUpsertInput, DatabaseManager, ReconciledClosedTradeInput};
 use aegis_risk::{
@@ -24,7 +24,12 @@ use aegis_risk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+const WORKING_ENTRY_GRACE_MS: i64 = 45_000;
+const WORKING_FILL_COMPLETE_RATIO: f64 = 0.85;
+const CAUSAL_CHAIN_MAX_DFS_STEPS: usize = 4096;
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,7 +49,7 @@ pub struct CutoverReconcileReport {
     pub details: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ParsedHlFill {
     coin: String,
     side_str: String,
@@ -57,6 +62,474 @@ struct ParsedHlFill {
     oid: u64,
     tid: u64,
     start_position: Option<f64>,
+}
+
+fn fill_signed_sz(fill: &ParsedHlFill) -> f64 {
+    if fill.side_str == "B" {
+        fill.sz
+    } else {
+        -fill.sz
+    }
+}
+
+fn szi_approx_eq(a: f64, b: f64) -> bool {
+    let tol = 1e-7_f64.max(a.abs().max(b.abs()) * 1e-10);
+    (a - b).abs() <= tol
+}
+
+fn fill_is_closing_dir(fill: &ParsedHlFill) -> bool {
+    fill.closed_pnl.abs() > 1e-9 || fill.dir.starts_with("Close") || fill.dir.contains('>')
+}
+
+fn dfs_causal_chain(
+    sp: &[f64],
+    end: &[f64],
+    used: &mut [bool],
+    path: &mut Vec<usize>,
+    cur_szi: f64,
+    steps: &mut usize,
+    max_steps: usize,
+) -> bool {
+    if path.len() == sp.len() {
+        return true;
+    }
+    if *steps >= max_steps {
+        return false;
+    }
+    *steps += 1;
+
+    for idx in 0..sp.len() {
+        if used[idx] || !szi_approx_eq(sp[idx], cur_szi) {
+            continue;
+        }
+        used[idx] = true;
+        path.push(idx);
+        if dfs_causal_chain(sp, end, used, path, end[idx], steps, max_steps) {
+            return true;
+        }
+        path.pop();
+        used[idx] = false;
+        if *steps >= max_steps {
+            return false;
+        }
+    }
+    false
+}
+
+fn find_causal_chain_from_start(group: &[ParsedHlFill], start_szi: f64) -> Option<Vec<usize>> {
+    let sp: Vec<f64> = group
+        .iter()
+        .map(|f| f.start_position)
+        .collect::<Option<Vec<_>>>()?;
+    let end: Vec<f64> = group
+        .iter()
+        .zip(sp.iter())
+        .map(|(f, &s)| s + fill_signed_sz(f))
+        .collect();
+    let mut used = vec![false; group.len()];
+    let mut path = Vec::with_capacity(group.len());
+    let mut steps = 0usize;
+    dfs_causal_chain(
+        &sp,
+        &end,
+        &mut used,
+        &mut path,
+        start_szi,
+        &mut steps,
+        CAUSAL_CHAIN_MAX_DFS_STEPS,
+    )
+    .then_some(path)
+}
+
+fn resolve_same_ms_group(
+    group: &[ParsedHlFill],
+    running_szi: Option<f64>,
+    next_group: Option<&[ParsedHlFill]>,
+) -> Option<Vec<usize>> {
+    let sp: Vec<f64> = group
+        .iter()
+        .map(|f| f.start_position)
+        .collect::<Option<Vec<_>>>()?;
+    let end: Vec<f64> = group
+        .iter()
+        .zip(sp.iter())
+        .map(|(f, &s)| s + fill_signed_sz(f))
+        .collect();
+    let next_has_positions = next_group
+        .is_some_and(|ng| !ng.is_empty() && ng.iter().all(|f| f.start_position.is_some()));
+
+    let matches_next = |chain: &[usize]| -> bool {
+        let Some(last_idx) = chain.last().copied() else {
+            return false;
+        };
+        let Some(ng) = next_group else {
+            return false;
+        };
+        next_has_positions && find_causal_chain_from_start(ng, end[last_idx]).is_some()
+    };
+
+    if let Some(s0) = running_szi {
+        let mut best: Option<(bool, Vec<usize>)> = None;
+        for first_idx in 0..group.len() {
+            if !szi_approx_eq(sp[first_idx], s0) {
+                continue;
+            }
+            let mut used = vec![false; group.len()];
+            used[first_idx] = true;
+            let mut path = Vec::with_capacity(group.len());
+            path.push(first_idx);
+            let mut steps = 0usize;
+            if dfs_causal_chain(
+                &sp,
+                &end,
+                &mut used,
+                &mut path,
+                end[first_idx],
+                &mut steps,
+                CAUSAL_CHAIN_MAX_DFS_STEPS,
+            ) {
+                let next_ok = matches_next(&path);
+                let better = match &best {
+                    None => true,
+                    Some((best_next, best_path)) => {
+                        (next_ok, Reverse(&path)) > (*best_next, Reverse(best_path))
+                    }
+                };
+                if better {
+                    best = Some((next_ok, path));
+                }
+            }
+        }
+        if let Some((_, best_path)) = best {
+            return Some(best_path);
+        }
+    }
+
+    // Either `running_szi` is unknown (`None` at history start) or an upstream gap broke `running_szi`.
+    // Score candidate causal chains within the group by lookahead match, in-degree-0 root, and flat open.
+    let mut best: Option<((bool, bool, bool), Vec<usize>)> = None;
+    for first_idx in 0..group.len() {
+        let mut used = vec![false; group.len()];
+        used[first_idx] = true;
+        let mut path = Vec::with_capacity(group.len());
+        path.push(first_idx);
+        let mut steps = 0usize;
+        if dfs_causal_chain(
+            &sp,
+            &end,
+            &mut used,
+            &mut path,
+            end[first_idx],
+            &mut steps,
+            CAUSAL_CHAIN_MAX_DFS_STEPS,
+        ) {
+            let next_ok = matches_next(&path);
+            let zero_in_degree =
+                !(0..group.len()).any(|j| j != first_idx && szi_approx_eq(end[j], sp[first_idx]));
+            let starts_flat_open =
+                szi_approx_eq(sp[first_idx], 0.0) && !fill_is_closing_dir(&group[first_idx]);
+            let score = (next_ok, zero_in_degree, starts_flat_open);
+            let better = match &best {
+                None => true,
+                Some((best_score, best_path)) => {
+                    (score, Reverse(&path)) > (*best_score, Reverse(best_path))
+                }
+            };
+            if better {
+                best = Some((score, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Orders `userFills` strictly by `time_ms` ascending, resolving same-millisecond ties
+/// causally via `start_position` chaining (`prev_szi + signed_sz(fill) == next.start_position`),
+/// falling back to `tid` ascending when `startPosition` is absent or ambiguous.
+fn sort_fills_causally(fills: &mut [ParsedHlFill]) {
+    if fills.len() <= 1 {
+        return;
+    }
+    fills.sort_by_key(|f| (f.time_ms, f.tid));
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < fills.len() {
+        let t = fills[i].time_ms;
+        let mut j = i + 1;
+        while j < fills.len() && fills[j].time_ms == t {
+            j += 1;
+        }
+        ranges.push((i, j));
+        i = j;
+    }
+
+    let mut running_szi: Option<f64> = None;
+    for idx in 0..ranges.len() {
+        let (start, end_idx) = ranges[idx];
+        let next_group = ranges.get(idx + 1).map(|&(ns, ne)| &fills[ns..ne]);
+        if end_idx - start >= 2 {
+            if let Some(order) =
+                resolve_same_ms_group(&fills[start..end_idx], running_szi, next_group)
+            {
+                let original = fills[start..end_idx].to_vec();
+                for (dst_pos, &src_pos) in order.iter().enumerate() {
+                    fills[start + dst_pos] = original[src_pos].clone();
+                }
+            }
+        }
+        let last = &fills[end_idx - 1];
+        running_szi = if let Some(sp) = last.start_position {
+            Some(sp + fill_signed_sz(last))
+        } else {
+            running_szi.map(|prev| {
+                prev + fills[start..end_idx]
+                    .iter()
+                    .map(fill_signed_sz)
+                    .sum::<f64>()
+            })
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingOrderReconcileDisposition {
+    ProtectPending,
+    ProtectActivePartial,
+    AdoptOrExpire,
+}
+
+fn is_entry_fill_complete(
+    fill_qty: f64,
+    requested_qty: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+) -> bool {
+    if !fill_qty.is_finite() || fill_qty <= 1e-9 {
+        return false;
+    }
+    if !requested_qty.is_finite() || requested_qty <= 1e-9 {
+        return true;
+    }
+    let eff_lot = if lot_step_size.is_finite() && lot_step_size > 0.0 {
+        lot_step_size
+    } else {
+        10_f64.powi(-(sz_decimals.min(6) as i32))
+    };
+    let rem_qty = snap_to_lot(
+        (requested_qty - fill_qty).max(0.0),
+        eff_lot,
+        sz_decimals,
+        true,
+    );
+    fill_qty + 1e-9 >= requested_qty * WORKING_FILL_COMPLETE_RATIO
+        || rem_qty <= eff_lot * 0.5
+        || rem_qty <= 1e-9
+}
+
+fn resolve_working_entry_oid(
+    ordered: &OrderedAssetView,
+    cloid_to_oid: &HashMap<String, u64>,
+) -> Option<u64> {
+    parse_hl_oid(ordered.exchange_order_id.as_deref()).or_else(|| {
+        cloid_to_oid
+            .get(&ordered.client_order_id.trim().to_ascii_lowercase())
+            .copied()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_working_order_for_reconcile(
+    age_ms: i64,
+    order_side: &str,
+    requested_qty: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    entry_oid: Option<u64>,
+    resting_exchange_oids: &HashSet<u64>,
+    exchange_szi_opt: Option<f64>,
+) -> WorkingOrderReconcileDisposition {
+    if age_ms >= WORKING_ENTRY_GRACE_MS {
+        return WorkingOrderReconcileDisposition::AdoptOrExpire;
+    }
+    let Some(szi) = exchange_szi_opt.filter(|s| s.abs() > 1e-9) else {
+        return WorkingOrderReconcileDisposition::ProtectPending;
+    };
+    let same_side = (order_side.eq_ignore_ascii_case("LONG") && szi > 0.0)
+        || (order_side.eq_ignore_ascii_case("SHORT") && szi < 0.0);
+    if !same_side {
+        return WorkingOrderReconcileDisposition::AdoptOrExpire;
+    }
+    let is_resting = entry_oid.is_some_and(|oid| resting_exchange_oids.contains(&oid));
+    if !is_resting {
+        return WorkingOrderReconcileDisposition::AdoptOrExpire;
+    }
+    if is_entry_fill_complete(szi.abs(), requested_qty, lot_step_size, sz_decimals) {
+        WorkingOrderReconcileDisposition::AdoptOrExpire
+    } else {
+        WorkingOrderReconcileDisposition::ProtectActivePartial
+    }
+}
+
+#[derive(Default)]
+struct AggClosingOrder {
+    coin: String,
+    side: Option<OrderSide>,
+    total_sz: f64,
+    notional_sum: f64,
+    gross_closed_pnl: f64,
+    close_fees_usdc: f64,
+    open_fees_usdc: f64,
+    open_time_ms: Option<i64>,
+    min_time_ms: i64,
+    max_time_ms: i64,
+    funding_accrued_usdc: f64,
+}
+
+fn compute_fifo_closed_orders(
+    parsed_fills_by_coin: &BTreeMap<String, Vec<ParsedHlFill>>,
+) -> Vec<(u64, AggClosingOrder)> {
+    struct OpenLot {
+        rem_sz: f64,
+        orig_sz: f64,
+        fee: f64,
+        time_ms: i64,
+    }
+
+    let mut agg_by_key: BTreeMap<(String, u64), AggClosingOrder> = BTreeMap::new();
+
+    for fills in parsed_fills_by_coin.values() {
+        let mut open_lots: VecDeque<OpenLot> = VecDeque::new();
+        let mut prev_szi = 0.0_f64;
+        let mut initialized_start_pos = false;
+
+        for fill in fills {
+            if !initialized_start_pos {
+                if let Some(sp) = fill.start_position {
+                    prev_szi = sp;
+                }
+                initialized_start_pos = true;
+            }
+            let fill_signed_sz = fill_signed_sz(fill);
+            let is_closing_dir = fill_is_closing_dir(fill);
+
+            if prev_szi.abs() <= 1e-9 {
+                prev_szi = 0.0;
+            }
+            if (prev_szi == 0.0 && !is_closing_dir)
+                || (prev_szi != 0.0 && prev_szi.signum() == fill_signed_sz.signum())
+            {
+                open_lots.push_back(OpenLot {
+                    rem_sz: fill.sz,
+                    orig_sz: fill.sz,
+                    fee: fill.fee,
+                    time_ms: fill.time_ms,
+                });
+                prev_szi += fill_signed_sz;
+                continue;
+            }
+
+            // Closing or flip fill (`dir.contains('>')`): attribute only closed_sz to the closed side
+            let (closed_sz, closed_pos_side) = if prev_szi.abs() > 1e-9 {
+                (
+                    prev_szi.abs().min(fill.sz),
+                    if prev_szi > 0.0 {
+                        OrderSide::Long
+                    } else {
+                        OrderSide::Short
+                    },
+                )
+            } else {
+                let fallback_side = if fill.dir.starts_with("Close Long")
+                    || fill.dir.starts_with("Long >")
+                    || (!fill.dir.contains("Short") && fill.side_str == "A")
+                {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                };
+                (fill.sz, fallback_side)
+            };
+            let flipped_open_sz = (fill.sz - closed_sz).max(0.0);
+            let close_fee = if fill.sz > 0.0 {
+                fill.fee * (closed_sz / fill.sz)
+            } else {
+                0.0
+            };
+            let open_fee = (fill.fee - close_fee).max(0.0);
+
+            let mut matched_open_fee = 0.0_f64;
+            let mut earliest_open_time_ms: Option<i64> = None;
+            let mut rem_to_close = closed_sz;
+            while rem_to_close > 1e-9 {
+                let Some(front) = open_lots.front_mut() else {
+                    break;
+                };
+                let take = rem_to_close.min(front.rem_sz);
+                if front.orig_sz > 0.0 {
+                    matched_open_fee += front.fee * (take / front.orig_sz);
+                }
+                earliest_open_time_ms =
+                    Some(earliest_open_time_ms.map_or(front.time_ms, |t| t.min(front.time_ms)));
+                front.rem_sz -= take;
+                rem_to_close -= take;
+                if front.rem_sz <= 1e-9 {
+                    open_lots.pop_front();
+                }
+            }
+
+            if closed_sz > 1e-9 && is_closing_dir {
+                let entry = agg_by_key
+                    .entry((fill.coin.clone(), fill.oid))
+                    .or_insert_with(|| AggClosingOrder {
+                        coin: fill.coin.clone(),
+                        side: Some(closed_pos_side),
+                        min_time_ms: fill.time_ms,
+                        max_time_ms: fill.time_ms,
+                        ..Default::default()
+                    });
+                entry.total_sz += closed_sz;
+                entry.notional_sum += fill.px * closed_sz;
+                entry.gross_closed_pnl += fill.closed_pnl;
+                entry.close_fees_usdc += close_fee;
+                entry.open_fees_usdc += matched_open_fee;
+                if let Some(ot) = earliest_open_time_ms {
+                    entry.open_time_ms = Some(entry.open_time_ms.map_or(ot, |cur| cur.min(ot)));
+                }
+                entry.min_time_ms = entry.min_time_ms.min(fill.time_ms);
+                entry.max_time_ms = entry.max_time_ms.max(fill.time_ms);
+            }
+
+            if flipped_open_sz > 1e-9 {
+                open_lots.push_back(OpenLot {
+                    rem_sz: flipped_open_sz,
+                    orig_sz: flipped_open_sz,
+                    fee: open_fee,
+                    time_ms: fill.time_ms,
+                });
+            }
+
+            if prev_szi.abs() > 1e-9 || fill.start_position.is_some() {
+                prev_szi += fill_signed_sz;
+            } else if flipped_open_sz > 1e-9 {
+                prev_szi = if fill_signed_sz > 0.0 {
+                    flipped_open_sz
+                } else {
+                    -flipped_open_sz
+                };
+            } else {
+                prev_szi = 0.0;
+            }
+        }
+    }
+
+    // Order closed trades chronologically so funding events match cleanly once per trade window
+    let mut closed_list: Vec<(u64, AggClosingOrder)> = agg_by_key
+        .into_iter()
+        .map(|((_, oid), agg)| (oid, agg))
+        .collect();
+    closed_list.sort_by_key(|(_, agg)| agg.max_time_ms);
+    closed_list
 }
 
 fn derive_open_position_opened_at_ms(fills: &[ParsedHlFill], current_szi: f64) -> Option<i64> {
@@ -288,8 +761,9 @@ impl CutoverReconciler {
             );
         }
 
-        // Identify currently open coins on Hyperliquid before clearing orphan openOrders
+        // Identify currently open coins & signed szi on Hyperliquid before clearing orphan openOrders
         let mut open_coins: HashSet<String> = HashSet::new();
+        let mut open_szi_by_coin: HashMap<String, f64> = HashMap::new();
         if let Some(asset_positions) = ch_state.get("assetPositions").and_then(Value::as_array) {
             for item in asset_positions {
                 let pos = item.get("position").unwrap_or(item);
@@ -297,7 +771,9 @@ impl CutoverReconciler {
                 let szi = parse_f(pos.get("szi"));
                 if !raw_coin.is_empty() && szi.abs() > 1e-9 {
                     if let Ok((_, coin)) = normalize_hyperliquid_symbol(raw_coin) {
-                        open_coins.insert(coin.to_ascii_uppercase());
+                        let coin_upper = coin.to_ascii_uppercase();
+                        open_coins.insert(coin_upper.clone());
+                        open_szi_by_coin.insert(coin_upper, szi);
                     }
                 }
             }
@@ -325,6 +801,7 @@ impl CutoverReconciler {
         }
 
         let mut protected_oids: HashSet<u64> = HashSet::new();
+        let mut active_chasing_partial_coins: HashSet<String> = HashSet::new();
         if !close_legacy_positions {
             if let Ok(local_held) = self.db.get_assets_held() {
                 for h in local_held {
@@ -350,12 +827,38 @@ impl CutoverReconciler {
             }
             if let Ok(local_ordered) = self.db.get_assets_ordered() {
                 for o in local_ordered {
-                    if ts.saturating_sub(o.created_at_ms) < 45_000
-                        && !open_coins.contains(&o.coin.to_ascii_uppercase())
-                    {
-                        if let Some(oid) = parse_hl_oid(o.exchange_order_id.as_deref()) {
-                            protected_oids.insert(oid);
+                    let coin_upper = o.coin.to_ascii_uppercase();
+                    let entry_oid = resolve_working_entry_oid(&o, &cloid_to_oid);
+                    let (lot_step_size, sz_decimals) = self
+                        .db
+                        .get_asset_by_id(o.asset_id)
+                        .ok()
+                        .flatten()
+                        .map(|a| (a.lot_step_size, a.sz_decimals))
+                        .unwrap_or((1e-6, 6));
+                    let disposition = classify_working_order_for_reconcile(
+                        ts.saturating_sub(o.created_at_ms),
+                        &o.side,
+                        o.requested_quantity,
+                        lot_step_size,
+                        sz_decimals,
+                        entry_oid,
+                        &resting_exchange_oids,
+                        open_szi_by_coin.get(&coin_upper).copied(),
+                    );
+                    match disposition {
+                        WorkingOrderReconcileDisposition::ProtectPending => {
+                            if let Some(oid) = entry_oid {
+                                protected_oids.insert(oid);
+                            }
                         }
+                        WorkingOrderReconcileDisposition::ProtectActivePartial => {
+                            if let Some(oid) = entry_oid {
+                                protected_oids.insert(oid);
+                            }
+                            active_chasing_partial_coins.insert(coin_upper);
+                        }
+                        WorkingOrderReconcileDisposition::AdoptOrExpire => {}
                     }
                 }
             }
@@ -417,14 +920,17 @@ impl CutoverReconciler {
             .collect();
 
         // Cancel local WORKING rows only if close_legacy_positions, or (not yet open on exchange AND (expired or no longer resting))
-        // When `is_open_on_exch` is true, let `sync_open_position_from_exchange_v2` promote it in-place preserving sleeve weights.
+        // When `is_open_on_exch` is true, either keep chasing (when in `active_chasing_partial_coins`) or let
+        // `sync_open_position_from_exchange_v2` promote it in-place preserving sleeve weights.
         if let Ok(local_ordered) = self.db.get_assets_ordered() {
             for o in local_ordered {
                 let is_open_on_exch = open_coins.contains(&o.coin.to_ascii_uppercase());
-                let is_expired = ts.saturating_sub(o.created_at_ms) >= 45_000;
-                let is_resting = parse_hl_oid(o.exchange_order_id.as_deref())
+                let is_expired = ts.saturating_sub(o.created_at_ms) >= WORKING_ENTRY_GRACE_MS;
+                let is_resting = resolve_working_entry_oid(&o, &cloid_to_oid)
                     .is_some_and(|oid| resting_exchange_oids.contains(&oid));
-                if close_legacy_positions || (!is_open_on_exch && (is_expired || !is_resting)) {
+                if close_legacy_positions
+                    || (!is_open_on_exch && (is_expired || (open_orders_fetch_ok && !is_resting)))
+                {
                     let _ = self
                         .db
                         .cancel_working_order(o.position_id, "EXCHANGE_RECONCILED_WORKING_CLEARED");
@@ -498,7 +1004,7 @@ impl CutoverReconciler {
                     });
             }
             for fills in parsed_fills_by_coin.values_mut() {
-                fills.sort_by_key(|f| (f.time_ms, f.tid));
+                sort_fills_causally(fills);
             }
         }
 
@@ -700,6 +1206,19 @@ impl CutoverReconciler {
                 }
 
                 let qty = remaining_qty.max(1e-9);
+                let coin_upper = coin.to_ascii_uppercase();
+
+                if !closed_on_exchange && active_chasing_partial_coins.contains(&coin_upper) {
+                    let _ = self.db.set_asset_priority_watch(asset.id, true);
+                    exchange_open_asset_ids.insert(asset.id);
+                    report.details.push(format!(
+                        "Preserved active chasing WORKING partial fill on {} ({} {:.4} on Hyperliquid)",
+                        asset.symbol,
+                        side.as_str(),
+                        qty
+                    ));
+                    continue;
+                }
 
                 if !closed_on_exchange {
                     let tick = asset.tick_size.max(1e-8);
@@ -819,168 +1338,7 @@ impl CutoverReconciler {
 
         // 5. Reconcile historical `CLOSED` trades 1:1 from Hyperliquid `userFills` + `userFunding` (FIFO open fees + flip tracking)
         if !parsed_fills_by_coin.is_empty() {
-            struct OpenLot {
-                rem_sz: f64,
-                orig_sz: f64,
-                fee: f64,
-                time_ms: i64,
-            }
-            #[derive(Default)]
-            struct AggClosingOrder {
-                coin: String,
-                side: Option<OrderSide>,
-                total_sz: f64,
-                notional_sum: f64,
-                gross_closed_pnl: f64,
-                close_fees_usdc: f64,
-                open_fees_usdc: f64,
-                open_time_ms: Option<i64>,
-                min_time_ms: i64,
-                max_time_ms: i64,
-                funding_accrued_usdc: f64,
-            }
-
-            let mut agg_by_key: BTreeMap<(String, u64), AggClosingOrder> = BTreeMap::new();
-
-            for fills in parsed_fills_by_coin.values() {
-                let mut open_lots: VecDeque<OpenLot> = VecDeque::new();
-                let mut prev_szi = 0.0_f64;
-                let mut initialized_start_pos = false;
-
-                for fill in fills {
-                    if !initialized_start_pos {
-                        if let Some(sp) = fill.start_position {
-                            prev_szi = sp;
-                        }
-                        initialized_start_pos = true;
-                    }
-                    let fill_signed_sz = if fill.side_str == "B" {
-                        fill.sz
-                    } else {
-                        -fill.sz
-                    };
-                    let is_closing_dir = fill.closed_pnl.abs() > 1e-9
-                        || fill.dir.starts_with("Close")
-                        || fill.dir.contains('>');
-
-                    if prev_szi.abs() <= 1e-9 {
-                        prev_szi = 0.0;
-                    }
-                    if (prev_szi == 0.0 && !is_closing_dir)
-                        || (prev_szi != 0.0 && prev_szi.signum() == fill_signed_sz.signum())
-                    {
-                        open_lots.push_back(OpenLot {
-                            rem_sz: fill.sz,
-                            orig_sz: fill.sz,
-                            fee: fill.fee,
-                            time_ms: fill.time_ms,
-                        });
-                        prev_szi += fill_signed_sz;
-                        continue;
-                    }
-
-                    // Closing or flip fill (`dir.contains('>')`): attribute only closed_sz to the closed side
-                    let (closed_sz, closed_pos_side) = if prev_szi.abs() > 1e-9 {
-                        (
-                            prev_szi.abs().min(fill.sz),
-                            if prev_szi > 0.0 {
-                                OrderSide::Long
-                            } else {
-                                OrderSide::Short
-                            },
-                        )
-                    } else {
-                        let fallback_side = if fill.dir.starts_with("Close Long")
-                            || fill.dir.starts_with("Long >")
-                            || (!fill.dir.contains("Short") && fill.side_str == "A")
-                        {
-                            OrderSide::Long
-                        } else {
-                            OrderSide::Short
-                        };
-                        (fill.sz, fallback_side)
-                    };
-                    let flipped_open_sz = (fill.sz - closed_sz).max(0.0);
-                    let close_fee = if fill.sz > 0.0 {
-                        fill.fee * (closed_sz / fill.sz)
-                    } else {
-                        0.0
-                    };
-                    let open_fee = (fill.fee - close_fee).max(0.0);
-
-                    let mut matched_open_fee = 0.0_f64;
-                    let mut earliest_open_time_ms: Option<i64> = None;
-                    let mut rem_to_close = closed_sz;
-                    while rem_to_close > 1e-9 {
-                        let Some(front) = open_lots.front_mut() else {
-                            break;
-                        };
-                        let take = rem_to_close.min(front.rem_sz);
-                        if front.orig_sz > 0.0 {
-                            matched_open_fee += front.fee * (take / front.orig_sz);
-                        }
-                        earliest_open_time_ms = Some(
-                            earliest_open_time_ms.map_or(front.time_ms, |t| t.min(front.time_ms)),
-                        );
-                        front.rem_sz -= take;
-                        rem_to_close -= take;
-                        if front.rem_sz <= 1e-9 {
-                            open_lots.pop_front();
-                        }
-                    }
-
-                    if closed_sz > 1e-9 && is_closing_dir {
-                        let entry = agg_by_key
-                            .entry((fill.coin.clone(), fill.oid))
-                            .or_insert_with(|| AggClosingOrder {
-                                coin: fill.coin.clone(),
-                                side: Some(closed_pos_side),
-                                min_time_ms: fill.time_ms,
-                                max_time_ms: fill.time_ms,
-                                ..Default::default()
-                            });
-                        entry.total_sz += closed_sz;
-                        entry.notional_sum += fill.px * closed_sz;
-                        entry.gross_closed_pnl += fill.closed_pnl;
-                        entry.close_fees_usdc += close_fee;
-                        entry.open_fees_usdc += matched_open_fee;
-                        if let Some(ot) = earliest_open_time_ms {
-                            entry.open_time_ms =
-                                Some(entry.open_time_ms.map_or(ot, |cur| cur.min(ot)));
-                        }
-                        entry.min_time_ms = entry.min_time_ms.min(fill.time_ms);
-                        entry.max_time_ms = entry.max_time_ms.max(fill.time_ms);
-                    }
-
-                    if flipped_open_sz > 1e-9 {
-                        open_lots.push_back(OpenLot {
-                            rem_sz: flipped_open_sz,
-                            orig_sz: flipped_open_sz,
-                            fee: open_fee,
-                            time_ms: fill.time_ms,
-                        });
-                    }
-
-                    if prev_szi.abs() > 1e-9 || fill.start_position.is_some() {
-                        prev_szi += fill_signed_sz;
-                    } else if flipped_open_sz > 1e-9 {
-                        prev_szi = if fill_signed_sz > 0.0 {
-                            flipped_open_sz
-                        } else {
-                            -flipped_open_sz
-                        };
-                    } else {
-                        prev_szi = 0.0;
-                    }
-                }
-            }
-
-            // Order closed trades chronologically so funding events match cleanly once per trade window
-            let mut closed_list: Vec<(u64, AggClosingOrder)> = agg_by_key
-                .into_iter()
-                .map(|((_, oid), agg)| (oid, agg))
-                .collect();
-            closed_list.sort_by_key(|(_, agg)| agg.max_time_ms);
+            let closed_list = compute_fifo_closed_orders(&parsed_fills_by_coin);
 
             let mut closed_inputs = Vec::with_capacity(closed_list.len());
             for (oid, mut agg) in closed_list {
@@ -1067,5 +1425,402 @@ impl CutoverReconciler {
         );
 
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_fill(
+        coin: &str,
+        side_str: &str,
+        px: f64,
+        sz: f64,
+        fee: f64,
+        closed_pnl: f64,
+        dir: &str,
+        time_ms: i64,
+        oid: u64,
+        tid: u64,
+        start_position: Option<f64>,
+    ) -> ParsedHlFill {
+        ParsedHlFill {
+            coin: coin.to_string(),
+            side_str: side_str.to_string(),
+            px,
+            sz,
+            fee,
+            closed_pnl,
+            dir: dir.to_string(),
+            time_ms,
+            oid,
+            tid,
+            start_position,
+        }
+    }
+
+    #[test]
+    fn test_sort_fills_causally_chip_same_ms_non_monotonic_tid() {
+        // Variant A: Same-ms accumulation at 1795023372707 where startPosition=812.0 has LOWER tid than startPosition=0.0
+        let same_ms = 1_795_023_372_707i64;
+        let mut fills_a = vec![
+            make_fill(
+                "CHIP",
+                "B",
+                0.0278,
+                2773.0,
+                0.03,
+                0.0,
+                "Open Long",
+                same_ms,
+                9001,
+                100, // lower tid, but causally second!
+                Some(812.0),
+            ),
+            make_fill(
+                "CHIP",
+                "B",
+                0.0277,
+                812.0,
+                0.01,
+                0.0,
+                "Open Long",
+                same_ms,
+                9001,
+                200, // higher tid, causally first!
+                Some(0.0),
+            ),
+            make_fill(
+                "CHIP",
+                "A",
+                0.0285,
+                3585.0,
+                0.05,
+                2.80,
+                "Close Long",
+                same_ms + 60_000,
+                9002,
+                300,
+                Some(3585.0),
+            ),
+        ];
+        sort_fills_causally(&mut fills_a);
+        assert_eq!(fills_a[0].tid, 200);
+        assert_eq!(fills_a[1].tid, 100);
+        assert_eq!(fills_a[2].tid, 300);
+
+        let mut map_a = BTreeMap::new();
+        map_a.insert("CHIP".to_string(), fills_a);
+        let closed_a = compute_fifo_closed_orders(&map_a);
+        assert_eq!(closed_a.len(), 1);
+        assert!((closed_a[0].1.total_sz - 3585.0).abs() < 1e-9);
+        assert!((closed_a[0].1.open_fees_usdc - 0.04).abs() < 1e-9);
+
+        // Variant B: Same-ms open+close cycle (0 -> 812 -> 0) at 1795023372707 with inverted tid,
+        // followed by #174331 CHIP SHORT (3585 units). Naive (time_ms, tid) would place start=812 first,
+        // initializing prev_szi=812 and shrinking #174331 close qty from 3585 to 2773!
+        let mut fills_b = vec![
+            make_fill(
+                "CHIP",
+                "A",
+                0.0279,
+                812.0,
+                0.01,
+                0.15,
+                "Close Long",
+                same_ms,
+                8001,
+                101, // lower tid, causally second!
+                Some(812.0),
+            ),
+            make_fill(
+                "CHIP",
+                "B",
+                0.0277,
+                812.0,
+                0.01,
+                0.0,
+                "Open Long",
+                same_ms,
+                8000,
+                201, // higher tid, causally first!
+                Some(0.0),
+            ),
+            make_fill(
+                "CHIP",
+                "A",
+                0.027714,
+                3585.0,
+                0.045,
+                0.0,
+                "Open Short",
+                same_ms + 500_000,
+                8002,
+                301,
+                Some(0.0),
+            ),
+            make_fill(
+                "CHIP",
+                "B",
+                0.027498,
+                3585.0,
+                0.045,
+                0.77436,
+                "Close Short",
+                same_ms + 5_180_000,
+                8003,
+                302,
+                Some(-3585.0),
+            ),
+        ];
+        sort_fills_causally(&mut fills_b);
+        assert_eq!(fills_b[0].tid, 201);
+        assert_eq!(fills_b[1].tid, 101);
+
+        let mut map_b = BTreeMap::new();
+        map_b.insert("CHIP".to_string(), fills_b);
+        let closed_b = compute_fifo_closed_orders(&map_b);
+        let chip_174331 = closed_b
+            .iter()
+            .find(|(oid, _)| *oid == 8003)
+            .expect("CHIP #174331 closing order matched");
+        assert_eq!(chip_174331.1.side, Some(OrderSide::Short));
+        assert!((chip_174331.1.total_sz - 3585.0).abs() < 1e-9);
+        assert!((chip_174331.1.open_fees_usdc - 0.045).abs() < 1e-9);
+        assert!((chip_174331.1.close_fees_usdc - 0.045).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sort_fills_causally_mid_history_chain_and_fallbacks() {
+        // Multi-fill chain mid-history: running_szi=10.0 -> 25.0 -> 30.0 -> 20.0
+        let mut fills = vec![
+            make_fill(
+                "SOL",
+                "B",
+                180.0,
+                10.0,
+                0.1,
+                0.0,
+                "Open Long",
+                1000,
+                1,
+                1,
+                Some(0.0),
+            ),
+            make_fill(
+                "SOL",
+                "B",
+                182.0,
+                5.0,
+                0.1,
+                0.0,
+                "Open Long",
+                2000,
+                2,
+                10,
+                Some(25.0),
+            ),
+            make_fill(
+                "SOL",
+                "A",
+                183.0,
+                10.0,
+                0.1,
+                10.0,
+                "Close Long",
+                2000,
+                3,
+                11,
+                Some(30.0),
+            ),
+            make_fill(
+                "SOL",
+                "B",
+                181.0,
+                15.0,
+                0.1,
+                0.0,
+                "Open Long",
+                2000,
+                2,
+                20,
+                Some(10.0),
+            ),
+        ];
+        sort_fills_causally(&mut fills);
+        let tids: Vec<u64> = fills.iter().map(|f| f.tid).collect();
+        assert_eq!(tids, vec![1, 20, 10, 11]);
+        assert_eq!(derive_open_position_opened_at_ms(&fills, 20.0), Some(1000));
+
+        // Missing startPosition falls back to (time_ms, tid)
+        let mut missing_sp = vec![
+            make_fill(
+                "ETH",
+                "B",
+                3000.0,
+                1.0,
+                0.1,
+                0.0,
+                "Open Long",
+                5000,
+                10,
+                50,
+                None,
+            ),
+            make_fill(
+                "ETH",
+                "B",
+                3001.0,
+                1.0,
+                0.1,
+                0.0,
+                "Open Long",
+                5000,
+                11,
+                20,
+                Some(1.0),
+            ),
+        ];
+        sort_fills_causally(&mut missing_sp);
+        assert_eq!(missing_sp[0].tid, 20);
+        assert_eq!(missing_sp[1].tid, 50);
+
+        // Disconnected / ambiguous startPosition falls back to tid order safely
+        let mut ambiguous = vec![
+            make_fill(
+                "ARB",
+                "B",
+                1.0,
+                10.0,
+                0.1,
+                0.0,
+                "Open Long",
+                6000,
+                12,
+                30,
+                Some(100.0),
+            ),
+            make_fill(
+                "ARB",
+                "B",
+                1.0,
+                10.0,
+                0.1,
+                0.0,
+                "Open Long",
+                6000,
+                13,
+                10,
+                Some(200.0),
+            ),
+        ];
+        sort_fills_causally(&mut ambiguous);
+        assert_eq!(ambiguous[0].tid, 10);
+        assert_eq!(ambiguous[1].tid, 30);
+    }
+
+    #[test]
+    fn test_is_entry_fill_complete_and_working_reconcile_disposition() {
+        // Real observed partial fill cases from #53: TAO (36.9%) and PYTH (18.2%)
+        assert!(!is_entry_fill_complete(0.101, 0.274, 0.001, 3));
+        assert!(!is_entry_fill_complete(388.0, 2127.0, 1.0, 0));
+        assert!(is_entry_fill_complete(1808.0, 2127.0, 1.0, 0)); // 85.002%
+        assert!(!is_entry_fill_complete(1.0, 2.0, 1.0, 0)); // 50% with 1 lot left
+        assert!(is_entry_fill_complete(0.2736, 0.274, 0.001, 3)); // remaining < 0.5 lot
+
+        let mut resting = HashSet::new();
+        resting.insert(65_654_266_947u64);
+
+        // 1. Active < 45s partial fill with resting OID -> ProtectActivePartial (do not cancel OID, do not promote)
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                12_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(65_654_266_947),
+                &resting,
+                Some(-388.0),
+            ),
+            WorkingOrderReconcileDisposition::ProtectActivePartial
+        );
+
+        // 2. Active < 45s with zero fill on HL -> ProtectPending
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                12_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(65_654_266_947),
+                &resting,
+                None,
+            ),
+            WorkingOrderReconcileDisposition::ProtectPending
+        );
+
+        // 3. >= 85% filled -> AdoptOrExpire
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                12_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(65_654_266_947),
+                &resting,
+                Some(-1810.0),
+            ),
+            WorkingOrderReconcileDisposition::AdoptOrExpire
+        );
+
+        // 4. Expired >= 45_000 ms -> AdoptOrExpire
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                45_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(65_654_266_947),
+                &resting,
+                Some(-388.0),
+            ),
+            WorkingOrderReconcileDisposition::AdoptOrExpire
+        );
+
+        // 5. Entry OID no longer resting on HL -> AdoptOrExpire
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                12_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(99_999_999),
+                &resting,
+                Some(-388.0),
+            ),
+            WorkingOrderReconcileDisposition::AdoptOrExpire
+        );
+
+        // 6. Opposite-side HL position -> AdoptOrExpire
+        assert_eq!(
+            classify_working_order_for_reconcile(
+                12_000,
+                "SHORT",
+                2127.0,
+                1.0,
+                0,
+                Some(65_654_266_947),
+                &resting,
+                Some(388.0),
+            ),
+            WorkingOrderReconcileDisposition::AdoptOrExpire
+        );
     }
 }

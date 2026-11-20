@@ -896,6 +896,29 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
   }
 }
 
+function isPreCapHolding(h, capEpochMs) {
+  if (!(capEpochMs > 0)) return false;
+  const rawTs = h?.opened_at_ms ?? h?.updated_at_ms;
+  if (rawTs === null || rawTs === undefined) return false;
+  const tsMs = Number(rawTs);
+  return Number.isFinite(tsMs) && tsMs < capEpochMs;
+}
+
+function createTableSmall(cls, text) {
+  const el = document.createElement('small');
+  el.className = cls;
+  el.textContent = text;
+  return el;
+}
+
+function createSleeveTag(cls, title, text) {
+  const el = document.createElement('span');
+  el.className = `sp-tag ${cls}`;
+  el.title = title;
+  el.textContent = text;
+  return el;
+}
+
 function renderOpenHoldingsTable(dash, forceRender = false) {
   const tbody = document.getElementById('tbody-assets-held');
   const pill = document.getElementById('held-count-pill');
@@ -903,78 +926,175 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
   if (!tbody) return;
   if (!forceRender && state.closeInFlightCount > 0) return;
 
-  const held = ((dash && dash.v_assets_held) || []).filter(
+  const rawHeld = (dash && dash.v_assets_held) || [];
+  const held = rawHeld.filter(
     (h) =>
       !state.closingPositionIds.has(Number(h.position_id)) &&
       !state.closingSymbols.has(String(h.symbol))
   );
-  if (pill) pill.textContent = `${held.length} OPEN`;
+  const capEpochMs = Number(dash?.risk_capital_cap_updated_at_ms ?? 0);
+  const maxOpenPositions = Math.max(
+    1,
+    Number(dash?.max_open_positions ?? getConfigFloatFromDash(dash, 'max_open_positions', 6))
+  );
+  const hasServerCounts =
+    typeof dash?.active_cap_open_count === 'number' &&
+    typeof dash?.pre_cap_open_count === 'number' &&
+    held.length === rawHeld.length;
+  const preCapCount = hasServerCounts
+    ? dash.pre_cap_open_count
+    : held.filter((h) => isPreCapHolding(h, capEpochMs)).length;
+  const activeCapCount = hasServerCounts
+    ? dash.active_cap_open_count
+    : held.length - preCapCount;
+  const totalHeldCount = activeCapCount + preCapCount;
+
+  if (pill) {
+    pill.textContent =
+      preCapCount > 0
+        ? `${activeCapCount}/${maxOpenPositions} Cap · ${preCapCount} Pre-Cap (${totalHeldCount} Total)`
+        : `${activeCapCount}/${maxOpenPositions} Cap`;
+    pill.classList.toggle('cap-exceeded', activeCapCount > maxOpenPositions);
+  }
   if (closeAllBtn) {
-    closeAllBtn.style.display = held.length > 0 ? 'inline-flex' : 'none';
+    closeAllBtn.hidden = held.length === 0;
   }
 
   if (held.length === 0) {
-    tbody.innerHTML = `
-      <tr>
-        <td colspan="9" style="text-align: center; color: var(--text-muted); padding: 18px;">
-          No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.
-        </td>
-      </tr>
-    `;
+    const emptyRow = document.createElement('tr');
+    const emptyCell = document.createElement('td');
+    emptyCell.colSpan = 9;
+    emptyCell.className = 'table-empty-cell';
+    emptyCell.textContent =
+      'No active OPEN holdings — capital remains in Available Cash until exchange fill confirmation.';
+    emptyRow.appendChild(emptyCell);
+    tbody.replaceChildren(emptyRow);
     return;
   }
 
-  tbody.innerHTML = held
-    .map((h) => {
-      const sideCls = String(h.side).toUpperCase() === 'SHORT' ? 'short' : 'long';
-      const upnl = Number(h.unrealized_pnl_usdc || 0);
-      const pnlCls = upnl > 0.001 ? 'pnl-pos' : upnl < -0.001 ? 'pnl-neg' : 'pnl-flat';
-      const stopDist =
-        h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
-          ? `${Number(h.stop_distance_pct).toFixed(2)}%`
-          : '—';
-      const tpDist =
-        h.tp_distance_pct !== null && h.tp_distance_pct !== undefined
-          ? `${Number(h.tp_distance_pct).toFixed(2)}%`
-          : '—';
-      const slOid = h.protective_stop_oid ? String(h.protective_stop_oid).trim() : '';
-      const tpOid = h.take_profit_oid ? String(h.take_profit_oid).trim() : '';
-      const slBadge = slOid
-        ? `<span class="sp-tag s1" title="Exchange SL Order: ${escapeHtml(slOid)}">SL</span>`
-        : `<span class="sp-tag s3" title="SL Order Pending">SL?</span>`;
-      const tpBadge = tpOid
-        ? `<span class="sp-tag s2" title="Exchange TP Order: ${escapeHtml(tpOid)}">TP</span>`
-        : `<span class="sp-tag s3" title="TP Order Pending">TP?</span>`;
-      return `
-        <tr>
-          <td><span class="sym-badge">${escapeHtml(h.symbol)}</span></td>
-          <td><span class="side-pill ${sideCls}">${escapeHtml(h.side)}</span></td>
-          <td style="font-weight: 700; color: #fff;">${fmtUsd(h.committed_notional_usdc)} <small style="color:var(--text-muted)">(${fmtPct(h.portfolio_weight || 0)})</small></td>
-          <td>${fmtPrice(h.entry_price)} <small style="color:var(--neon-cyan)">→ ${fmtPrice(h.mark_price)}</small></td>
-          <td>${fmtPrice(h.protective_stop_px)} <small style="color:#fbbf24">(${stopDist})</small> ${slBadge}</td>
-          <td>${Number(h.take_profit_px || 0) > 0 ? fmtPrice(h.take_profit_px) : '—'} <small style="color:#34d399">(${tpDist})</small> ${tpBadge}</td>
-          <td class="${pnlCls}">${fmtSignedUsd(upnl)}</td>
-          <td>
-            <div class="sleeve-mix-pills">
-              <span class="sp-tag s1" title="Sleeve 1 Carry-Momentum">S1 ${fmtPct(h.s1_weight_contrib || 0)}</span>
-              <span class="sp-tag s2" title="Sleeve 2 Trend-Breakout">S2 ${fmtPct(h.s2_weight_contrib || 0)}</span>
-              <span class="sp-tag s3" title="Sleeve 3 Event-Reversion">S3 ${fmtPct(h.s3_weight_contrib || 0)}</span>
-            </div>
-          </td>
-          <td>
-            <button
-              type="button"
-              class="close-btn"
-              data-action="close-position"
-              data-position-id="${Number(h.position_id)}"
-              data-symbol="${escapeHtml(h.symbol)}"
-              data-cooldown="true"
-            >Close</button>
-          </td>
-        </tr>
-      `;
-    })
-    .join('');
+  const rows = held.map((h) => {
+    const isPreCap = isPreCapHolding(h, capEpochMs);
+    const sideStr = String(h.side ?? '');
+    const sideCls = sideStr.toUpperCase() === 'SHORT' ? 'short' : 'long';
+    const upnl = Number(h.unrealized_pnl_usdc || 0);
+    const pnlCls = upnl > 0.001 ? 'pnl-pos' : upnl < -0.001 ? 'pnl-neg' : 'pnl-flat';
+    const stopDist =
+      h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
+        ? `${Number(h.stop_distance_pct).toFixed(2)}%`
+        : '—';
+    const tpDist =
+      h.tp_distance_pct !== null && h.tp_distance_pct !== undefined
+        ? `${Number(h.tp_distance_pct).toFixed(2)}%`
+        : '—';
+    const slOid = h.protective_stop_oid ? String(h.protective_stop_oid).trim() : '';
+    const tpOid = h.take_profit_oid ? String(h.take_profit_oid).trim() : '';
+
+    const tr = document.createElement('tr');
+    if (isPreCap) {
+      tr.className = 'holding-pre-cap';
+    }
+
+    const tdSym = document.createElement('td');
+    const symWrap = document.createElement('div');
+    symWrap.className = 'holding-symbol-cell';
+    const symBadge = document.createElement('span');
+    symBadge.className = 'sym-badge';
+    symBadge.textContent = String(h.symbol ?? '');
+    symWrap.appendChild(symBadge);
+    if (isPreCap) {
+      const preCapBadge = document.createElement('span');
+      preCapBadge.className = 'pre-cap-badge';
+      preCapBadge.textContent = 'PRE-CAP';
+      symWrap.appendChild(preCapBadge);
+    }
+    tdSym.appendChild(symWrap);
+
+    const tdSide = document.createElement('td');
+    const sidePill = document.createElement('span');
+    sidePill.className = `side-pill ${sideCls}`;
+    sidePill.textContent = sideStr;
+    tdSide.appendChild(sidePill);
+
+    const tdCommitted = document.createElement('td');
+    tdCommitted.className = 'cell-committed';
+    tdCommitted.append(
+      document.createTextNode(`${fmtUsd(h.committed_notional_usdc)} `),
+      createTableSmall('cell-muted-sub', `(${fmtPct(h.portfolio_weight || 0)})`)
+    );
+
+    const tdEntryMark = document.createElement('td');
+    tdEntryMark.append(
+      document.createTextNode(`${fmtPrice(h.entry_price)} `),
+      createTableSmall('cell-mark-price', `→ ${fmtPrice(h.mark_price)}`)
+    );
+
+    const tdSl = document.createElement('td');
+    const slBadge = createSleeveTag(
+      slOid ? 's1' : 's3',
+      slOid ? `Exchange SL Order: ${slOid}` : 'SL Order Pending',
+      slOid ? 'SL' : 'SL?'
+    );
+    tdSl.append(
+      document.createTextNode(`${fmtPrice(h.protective_stop_px)} `),
+      createTableSmall('cell-sl-dist', `(${stopDist})`),
+      document.createTextNode(' '),
+      slBadge
+    );
+
+    const tdTp = document.createElement('td');
+    const tpPxText = Number(h.take_profit_px || 0) > 0 ? fmtPrice(h.take_profit_px) : '—';
+    const tpBadge = createSleeveTag(
+      tpOid ? 's2' : 's3',
+      tpOid ? `Exchange TP Order: ${tpOid}` : 'TP Order Pending',
+      tpOid ? 'TP' : 'TP?'
+    );
+    tdTp.append(
+      document.createTextNode(`${tpPxText} `),
+      createTableSmall('cell-tp-dist', `(${tpDist})`),
+      document.createTextNode(' '),
+      tpBadge
+    );
+
+    const tdPnl = document.createElement('td');
+    tdPnl.className = pnlCls;
+    tdPnl.textContent = fmtSignedUsd(upnl);
+
+    const tdSleeves = document.createElement('td');
+    const sleeveDiv = document.createElement('div');
+    sleeveDiv.className = 'sleeve-mix-pills';
+    sleeveDiv.append(
+      createSleeveTag('s1', 'Sleeve 1 Carry-Momentum', `S1 ${fmtPct(h.s1_weight_contrib || 0)}`),
+      createSleeveTag('s2', 'Sleeve 2 Trend-Breakout', `S2 ${fmtPct(h.s2_weight_contrib || 0)}`),
+      createSleeveTag('s3', 'Sleeve 3 Event-Reversion', `S3 ${fmtPct(h.s3_weight_contrib || 0)}`)
+    );
+    tdSleeves.appendChild(sleeveDiv);
+
+    const tdAction = document.createElement('td');
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'close-btn';
+    closeBtn.dataset.action = 'close-position';
+    closeBtn.dataset.positionId = String(Number(h.position_id));
+    closeBtn.dataset.symbol = String(h.symbol ?? '');
+    closeBtn.dataset.cooldown = 'true';
+    closeBtn.textContent = 'Close';
+    tdAction.appendChild(closeBtn);
+
+    tr.append(
+      tdSym,
+      tdSide,
+      tdCommitted,
+      tdEntryMark,
+      tdSl,
+      tdTp,
+      tdPnl,
+      tdSleeves,
+      tdAction
+    );
+    return tr;
+  });
+
+  tbody.replaceChildren(...rows);
 }
 
 function formatCooldownRemaining(secRaw) {

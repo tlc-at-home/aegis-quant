@@ -97,12 +97,12 @@ pub fn resolve_take_profit_distance(
         1.0
     };
     let step = tick_step(tick_size);
-    let min_tp_dist = (ref_px * 0.016).max(step * 4.0);
+    let min_tp_dist = (ref_px * 0.012).max(step * 4.0);
     let raw_dist = match atr_opt.filter(|v| v.is_finite() && *v > 0.0) {
         Some(atr) => atr * limits.take_profit_atr_mult,
         None => ref_px * limits.take_profit_default_pct,
     };
-    let stop_floor = resolve_stop_distance(ref_px, atr_opt, tick_size, limits) * 1.5;
+    let stop_floor = resolve_stop_distance(ref_px, atr_opt, tick_size, limits) * 1.25;
     raw_dist.max(min_tp_dist).max(stop_floor)
 }
 
@@ -144,10 +144,26 @@ pub fn compute_initial_take_profit(
     }
 }
 
+/// Returns `(trail_mult, lock_mult)` in multiples of `stop_dist` for stepped Chandelier profit-locking,
+/// or `None` while favorable excursion is below `0.6 * stop_dist` (leaving the initial stop untouched).
+#[inline]
+fn stepped_chandelier_params(excursion: f64, stop_dist: f64) -> Option<(f64, f64)> {
+    let tol = stop_dist * 1e-9;
+    if excursion + tol < 0.6 * stop_dist {
+        None
+    } else if excursion + tol < 1.0 * stop_dist {
+        Some((0.75, 0.10))
+    } else if excursion + tol < 1.6 * stop_dist {
+        Some((0.55, 0.45))
+    } else {
+        Some((0.40, 1.00))
+    }
+}
+
 /// Evaluates the 1-second High-Water Chandelier/ATR trailing stop ratchet on an `OPEN` holding.
 /// - Ratchets the stop monotonically in the direction of profit (`new_stop >= current_stop` for `LONG`,
 ///   `new_stop <= current_stop` for `SHORT`).
-/// - Locks in break-even + profit buffer once favorable excursion exceeds 1.0x stop distance.
+/// - Applies stepped profit locks and progressively tighter trailing stops at `0.6x`, `1.0x`, and `1.6x` stop distance.
 /// - Detects immediate stop breach when `mark_price <= active_stop` (`LONG`) or `mark_price >= active_stop` (`SHORT`).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_1s_protective_stop(
@@ -162,7 +178,7 @@ pub fn evaluate_1s_protective_stop(
     tick_size: f64,
     limits: &RiskLimitsConfig,
 ) -> StopRatchetEvaluation {
-    evaluate_1s_position_tpsl(
+    evaluate_1s_position_tpsl_inner(
         side,
         entry_price,
         mark_price,
@@ -174,6 +190,7 @@ pub fn evaluate_1s_protective_stop(
         atr_opt,
         tick_size,
         limits,
+        false,
     )
 }
 
@@ -191,6 +208,37 @@ pub fn evaluate_1s_position_tpsl(
     atr_opt: Option<f64>,
     tick_size: f64,
     limits: &RiskLimitsConfig,
+) -> StopRatchetEvaluation {
+    evaluate_1s_position_tpsl_inner(
+        side,
+        entry_price,
+        mark_price,
+        quantity,
+        current_stop_px,
+        current_tp_px,
+        highest_price_seen,
+        lowest_price_seen,
+        atr_opt,
+        tick_size,
+        limits,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_1s_position_tpsl_inner(
+    side: OrderSide,
+    entry_price: f64,
+    mark_price: f64,
+    quantity: f64,
+    current_stop_px: f64,
+    current_tp_px: f64,
+    highest_price_seen: f64,
+    lowest_price_seen: f64,
+    atr_opt: Option<f64>,
+    tick_size: f64,
+    limits: &RiskLimitsConfig,
+    check_tp: bool,
 ) -> StopRatchetEvaluation {
     if !mark_price.is_finite()
         || mark_price <= 0.0
@@ -283,7 +331,7 @@ pub fn evaluate_1s_position_tpsl(
                 };
             }
 
-            if active_tp > 0.0 && ref_mark >= active_tp {
+            if check_tp && active_tp > 0.0 && ref_mark >= active_tp {
                 let stop_dist_pct =
                     round_dp(((ref_mark - active_stop).max(0.0) / ref_mark) * 100.0, 2);
                 return StopRatchetEvaluation {
@@ -303,20 +351,18 @@ pub fn evaluate_1s_position_tpsl(
 
             let max_safe_stop = (ref_mark - min_buf).max(step);
             let mut ratcheted_stop = active_stop;
-            if new_highest > entry_price + step && active_stop < max_safe_stop {
-                let mut candidate = new_highest - stop_dist;
-                let excursion = (new_highest - entry_price).max(0.0);
-                if excursion >= stop_dist {
-                    // Break-even profit lock once +1R excursion achieved
-                    let profit_lock = entry_price + 0.25 * stop_dist;
-                    candidate = candidate.max(profit_lock);
-                }
-                let capped_candidate = candidate.min(max_safe_stop);
-                let rounded_candidate = round_to_tick(capped_candidate, tick_size, true);
-                if rounded_candidate > active_stop + step * 0.5
-                    && rounded_candidate <= max_safe_stop + 1e-12
-                {
-                    ratcheted_stop = rounded_candidate;
+            let excursion = (new_highest - entry_price).max(0.0);
+            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, stop_dist) {
+                if new_highest > entry_price + step && active_stop < max_safe_stop {
+                    let profit_lock = entry_price + lock_mult * stop_dist;
+                    let candidate = (new_highest - trail_mult * stop_dist).max(profit_lock);
+                    let capped_candidate = candidate.min(max_safe_stop);
+                    let rounded_candidate = round_to_tick(capped_candidate, tick_size, true);
+                    if rounded_candidate > active_stop + step * 0.5
+                        && rounded_candidate <= max_safe_stop + 1e-12
+                    {
+                        ratcheted_stop = rounded_candidate;
+                    }
                 }
             }
             let stop_ratcheted = ratcheted_stop > active_stop + step * 0.5;
@@ -378,7 +424,7 @@ pub fn evaluate_1s_position_tpsl(
                 };
             }
 
-            if active_tp > 0.0 && ref_mark <= active_tp {
+            if check_tp && active_tp > 0.0 && ref_mark <= active_tp {
                 let stop_dist_pct =
                     round_dp(((active_stop - ref_mark).max(0.0) / ref_mark) * 100.0, 2);
                 return StopRatchetEvaluation {
@@ -398,20 +444,21 @@ pub fn evaluate_1s_position_tpsl(
 
             let min_safe_stop = ref_mark + min_buf;
             let mut ratcheted_stop = active_stop;
-            if new_lowest > 0.0 && new_lowest < entry_price - step && active_stop > min_safe_stop {
-                let mut candidate = new_lowest + stop_dist;
-                let excursion = (entry_price - new_lowest).max(0.0);
-                if excursion >= stop_dist {
-                    // Break-even profit lock once +1R excursion achieved
-                    let profit_lock = (entry_price - 0.25 * stop_dist).max(step);
-                    candidate = candidate.min(profit_lock);
-                }
-                let capped_candidate = candidate.max(min_safe_stop);
-                let rounded_candidate = round_to_tick(capped_candidate, tick_size, false);
-                if rounded_candidate + step * 0.5 < active_stop
-                    && rounded_candidate >= min_safe_stop - 1e-12
+            let excursion = (entry_price - new_lowest).max(0.0);
+            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, stop_dist) {
+                if new_lowest > 0.0
+                    && new_lowest < entry_price - step
+                    && active_stop > min_safe_stop
                 {
-                    ratcheted_stop = rounded_candidate;
+                    let profit_lock = (entry_price - lock_mult * stop_dist).max(step);
+                    let candidate = (new_lowest + trail_mult * stop_dist).min(profit_lock);
+                    let capped_candidate = candidate.max(min_safe_stop);
+                    let rounded_candidate = round_to_tick(capped_candidate, tick_size, false);
+                    if rounded_candidate + step * 0.5 < active_stop
+                        && rounded_candidate >= min_safe_stop - 1e-12
+                    {
+                        ratcheted_stop = rounded_candidate;
+                    }
                 }
             }
             let stop_ratcheted = ratcheted_stop + step * 0.5 < active_stop;
@@ -526,8 +573,8 @@ mod tests {
     #[test]
     fn test_in_profit_ratchet_enforces_min_safety_buffer() {
         let limits = RiskLimitsConfig::default();
-        // LONG: entry 100, highest 105 (in profit), pulled back to mark 101, atr 2.0 (stop_dist = 4.4, min_buf = 1.1)
-        // Candidate = 105 - 4.4 = 100.6, which is > mark - min_buf (101 - 1.1 = 99.9) -> must clamp to 99.9 (not 100.99 1-tick!)
+        // LONG: entry 100, highest 105 (excursion 5.0 in [1.0R, 1.6R) -> trail 0.55*4.4 = 2.42 -> 102.58),
+        // pulled back to mark 101, atr 2.0 (stop_dist = 4.4, min_buf = 1.1) -> must clamp to 101 - 1.1 = 99.9!
         let eval_long = evaluate_1s_position_tpsl(
             OrderSide::Long,
             100.0,
@@ -623,5 +670,276 @@ mod tests {
             eval_hit.exit_reason.as_deref(),
             Some("PROTECTIVE_STOP_SHORT")
         );
+    }
+
+    #[test]
+    fn test_resolve_take_profit_distance_2_8x_atr_and_fallback() {
+        let limits = RiskLimitsConfig::default();
+        // With ATR=2.0 at ref_px=100: stop_dist=4.4, stop_floor=4.4*1.25=5.5, raw_tp=2.0*2.8=5.6 (not overridden!)
+        let tp_atr = resolve_take_profit_distance(100.0, Some(2.0), 0.01, &limits);
+        assert!((tp_atr - 5.6).abs() < 1e-9, "got {tp_atr}");
+
+        let long_tp = compute_initial_take_profit(OrderSide::Long, 100.0, Some(2.0), 0.01, &limits);
+        let short_tp =
+            compute_initial_take_profit(OrderSide::Short, 100.0, Some(2.0), 0.01, &limits);
+        assert!((long_tp - 105.60).abs() < 1e-9);
+        assert!((short_tp - 94.40).abs() < 1e-9);
+
+        // With ATR=None: default_pct=5.5% > stop_floor (4.0% * 1.25 = 5.0%)
+        let tp_fallback = resolve_take_profit_distance(100.0, None, 0.01, &limits);
+        assert!((tp_fallback - 5.5).abs() < 1e-9, "got {tp_fallback}");
+
+        // Tiny ATR hits min_tp_dist = 1.2% (1.2 at 100.0) when stop_floor = 0.8% * 1.25 = 1.0% < 1.2%
+        let tp_floor = resolve_take_profit_distance(100.0, Some(0.1), 0.01, &limits);
+        assert!((tp_floor - 1.2).abs() < 1e-9, "got {tp_floor}");
+
+        // 2.8x ATR TP triggers cleanly in evaluate_1s_position_tpsl
+        let tp_hit = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            105.60,
+            5.0,
+            95.60,
+            0.0,
+            105.60,
+            99.8,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(tp_hit.triggered);
+        assert_eq!(tp_hit.exit_reason.as_deref(), Some("TAKE_PROFIT_LONG"));
+        assert!((tp_hit.take_profit_px - 105.60).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stepped_chandelier_all_tiers_and_tick_rounding_long_and_short() {
+        let limits = RiskLimitsConfig::default();
+        // entry=100, atr=2.0 -> stop_dist=4.4, min_buf=1.1
+        // Tier 0 (< 0.6R = 2.64): initial stop untouched
+        let l0 = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            102.20,
+            5.0,
+            95.60,
+            120.0,
+            102.20,
+            99.5,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(!l0.stop_ratcheted);
+        assert_eq!(l0.new_protective_stop_px, 95.60);
+
+        let s0 = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            97.80,
+            5.0,
+            104.40,
+            80.0,
+            100.5,
+            97.80,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(!s0.stop_ratcheted);
+        assert_eq!(s0.new_protective_stop_px, 104.40);
+
+        // Tier 1 ([0.6R, 1.0R)): excursion=0.70R (3.08) -> lock entry +- 0.10R = +-0.44 (100.44 / 99.56)
+        let l1 = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            103.08,
+            5.0,
+            95.60,
+            120.0,
+            103.08,
+            99.5,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(l1.stop_ratcheted);
+        assert!((l1.new_protective_stop_px - 100.44).abs() < 1e-9);
+
+        let s1 = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            96.92,
+            5.0,
+            104.40,
+            80.0,
+            100.5,
+            96.92,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(s1.stop_ratcheted);
+        assert!((s1.new_protective_stop_px - 99.56).abs() < 1e-9);
+
+        // Coarse tick rounding (0.05): LONG floors 100.44 -> 100.40, SHORT ceilings 99.56 -> 99.60
+        let l1_tick = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            103.08,
+            5.0,
+            95.60,
+            120.0,
+            103.08,
+            99.5,
+            Some(2.0),
+            0.05,
+            &limits,
+        );
+        assert!((l1_tick.new_protective_stop_px - 100.40).abs() < 1e-9);
+        let s1_tick = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            96.92,
+            5.0,
+            104.40,
+            80.0,
+            100.5,
+            96.92,
+            Some(2.0),
+            0.05,
+            &limits,
+        );
+        assert!((s1_tick.new_protective_stop_px - 99.60).abs() < 1e-9);
+
+        // Tier 2 ([1.0R, 1.6R)): excursion=1.40R (6.16) -> trail 0.55*4.4=2.42 -> 103.74 / 96.26
+        let l2 = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            106.16,
+            5.0,
+            l1.new_protective_stop_px,
+            120.0,
+            106.16,
+            99.5,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(l2.stop_ratcheted);
+        assert!((l2.new_protective_stop_px - 103.74).abs() < 1e-9);
+
+        let s2 = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            93.84,
+            5.0,
+            s1.new_protective_stop_px,
+            80.0,
+            100.5,
+            93.84,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(s2.stop_ratcheted);
+        assert!((s2.new_protective_stop_px - 96.26).abs() < 1e-9);
+
+        // Tier 3 (>= 1.6R): excursion=1.70R (7.48) -> trail 0.40*4.4=1.76 -> 105.72 / 94.28
+        let l3 = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            107.48,
+            5.0,
+            l2.new_protective_stop_px,
+            120.0,
+            107.48,
+            99.5,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(l3.stop_ratcheted);
+        assert!((l3.new_protective_stop_px - 105.72).abs() < 1e-9);
+
+        let s3 = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            92.52,
+            5.0,
+            s2.new_protective_stop_px,
+            80.0,
+            100.5,
+            92.52,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(s3.stop_ratcheted);
+        assert!((s3.new_protective_stop_px - 94.28).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_stepped_chandelier_monotonic_invariance_across_path() {
+        let limits = RiskLimitsConfig::default();
+        // Long path across all tiers and pullback: stop must never move backward
+        let mut stop_l = 95.60;
+        let mut high_l = 100.0;
+        let mut low_l = 100.0;
+        for mark in [101.5, 102.64, 103.5, 104.40, 106.0, 107.04, 108.0, 106.5] {
+            let ev = evaluate_1s_position_tpsl(
+                OrderSide::Long,
+                100.0,
+                mark,
+                5.0,
+                stop_l,
+                120.0,
+                high_l,
+                low_l,
+                Some(2.0),
+                0.01,
+                &limits,
+            );
+            assert!(!ev.triggered);
+            assert!(
+                ev.new_protective_stop_px >= stop_l,
+                "LONG stop regressed at mark={mark}: {} < {stop_l}",
+                ev.new_protective_stop_px
+            );
+            stop_l = ev.new_protective_stop_px;
+            high_l = ev.highest_price_seen;
+            low_l = ev.lowest_price_seen;
+        }
+        assert!(stop_l >= 104.40);
+
+        // Short path across all tiers and bounce: stop must never move upward
+        let mut stop_s = 104.40;
+        let mut high_s = 100.0;
+        let mut low_s = 100.0;
+        for mark in [98.5, 97.36, 96.5, 95.60, 94.0, 92.96, 92.0, 93.5] {
+            let ev = evaluate_1s_position_tpsl(
+                OrderSide::Short,
+                100.0,
+                mark,
+                5.0,
+                stop_s,
+                80.0,
+                high_s,
+                low_s,
+                Some(2.0),
+                0.01,
+                &limits,
+            );
+            assert!(!ev.triggered);
+            assert!(
+                ev.new_protective_stop_px <= stop_s,
+                "SHORT stop regressed at mark={mark}: {} > {stop_s}",
+                ev.new_protective_stop_px
+            );
+            stop_s = ev.new_protective_stop_px;
+            high_s = ev.highest_price_seen;
+            low_s = ev.lowest_price_seen;
+        }
+        assert!(stop_s <= 95.60);
     }
 }

@@ -913,10 +913,79 @@ html, body {
 }
 
 /* Pills & Badges inside tables */
+.panel-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.close-all-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+}
+
+.close-all-btn[hidden] {
+  display: none;
+}
+
+.holding-symbol-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .sym-badge {
   font-weight: 800;
   color: #ffffff;
   letter-spacing: 0.3px;
+}
+
+.pre-cap-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--neon-violet-soft);
+  border: 1px solid rgba(139, 92, 246, 0.45);
+  color: #c4b5fd;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.surveillance-grid .quant-table tbody tr.holding-pre-cap td:first-child {
+  box-shadow: inset 2px 0 0 rgba(139, 92, 246, 0.72);
+}
+
+.quant-table td.table-empty-cell {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 18px;
+}
+
+.quant-table td.cell-committed {
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.cell-muted-sub {
+  color: var(--text-muted);
+}
+
+.cell-mark-price {
+  color: var(--neon-cyan);
+}
+
+.cell-sl-dist {
+  color: #fbbf24;
+}
+
+.cell-tp-dist {
+  color: #34d399;
 }
 
 .side-pill {
@@ -949,6 +1018,7 @@ html, body {
   border-radius: 5px;
   font-size: 10px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .status-pill.working {
@@ -961,6 +1031,12 @@ html, body {
   background: var(--neon-emerald-soft);
   color: #34d399;
   border: 1px solid var(--border-glow-emerald);
+}
+
+.status-pill.open.cap-exceeded {
+  background: var(--neon-amber-soft);
+  color: #fbbf24;
+  border-color: var(--border-glow-amber);
 }
 
 .status-pill.watch {

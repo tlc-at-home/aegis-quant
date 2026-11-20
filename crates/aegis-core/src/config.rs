@@ -311,8 +311,8 @@ pub fn default_v2_system_config_seeds(
         ("s3_event_reversion_budget", "0.25", "float", "Sleeve 3 (Live Capitulation Flush & Funding Dislocation) base portfolio weight budget"),
         ("protective_stop_atr_mult", "2.2", "float", "Protective trailing stop distance multiplier in ATR units"),
         ("protective_stop_default_pct", "0.04", "float", "Default protective stop distance fraction of entry price (4.0%)"),
-        ("take_profit_atr_mult", "4.4", "float", "Take-profit target distance multiplier in ATR units (2.0x reward-to-risk)"),
-        ("take_profit_default_pct", "0.08", "float", "Default take-profit target distance fraction of entry price (8.0%)"),
+        ("take_profit_atr_mult", "2.8", "float", "Take-profit target distance multiplier in ATR units (~1.27x reward-to-risk vs 2.2x ATR stop)"),
+        ("take_profit_default_pct", "0.055", "float", "Default take-profit target distance fraction of entry price (5.5%)"),
         ("stop_out_cooldown_sec", "1800", "int", "Post-stop-out asset cooldown duration in seconds (30 minutes)"),
         ("max_alo_chase_ticks", "5", "int", "Maximum 1-second ALO maker limit chase attempts before IOC crossing or cancel"),
         ("alo_chase_threshold_bps", "4.0", "float", "Mid-price drift threshold in basis points triggering a 1s ALO limit price chase"),
@@ -422,5 +422,7 @@ mod tests {
         assert_eq!(find("max_daily_drawdown_pct"), Some("0.15"));
         assert_eq!(find("web_allow_remote_bind"), Some("false"));
         assert_eq!(find("stop_out_cooldown_sec"), Some("1800"));
+        assert_eq!(find("take_profit_atr_mult"), Some("2.8"));
+        assert_eq!(find("take_profit_default_pct"), Some("0.055"));
     }
 }

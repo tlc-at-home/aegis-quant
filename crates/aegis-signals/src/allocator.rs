@@ -218,6 +218,92 @@ pub fn classify_rebalance_action(
     }
 }
 
+/// Applies asymmetric exit hysteresis for currently held positions (`cur_w.abs() >= 1e-4`) so
+/// minor 3s-tick threshold noise does not hair-trigger `ACTION_CLOSE`, while preserving real
+/// reversals (`ACTION_FLIP`), `is_downward_flush` conflict exits, and clear directional exits.
+/// Returns `(effective_desired_weight, hysteresis_held)`.
+#[allow(clippy::too_many_arguments)]
+fn apply_held_exit_hysteresis(
+    cur_w: f64,
+    unblocked_scaled_weight: f64,
+    raw_combined_weight: f64,
+    is_eligible: bool,
+    has_signal_eval: bool,
+    is_downward_flush: bool,
+    s1_mom_score: f64,
+    s1_carry_score: f64,
+    s2_trend_alignment: i32,
+    w_s3: f64,
+    s3_funding_zscore: f64,
+    s3_flush_atr_mult: f64,
+    min_rebalance_delta: f64,
+) -> (f64, bool) {
+    if cur_w.abs() < 1e-4 || !is_eligible || !has_signal_eval {
+        return (unblocked_scaled_weight, false);
+    }
+
+    let min_delta = min_rebalance_delta.max(1e-4);
+    let min_hold_band = (min_delta * 0.5).max(1e-3);
+
+    // Already meaningfully aligned on the held side -> no risk of spurious 0.0 close
+    if unblocked_scaled_weight * cur_w > 0.0 && unblocked_scaled_weight.abs() >= min_hold_band {
+        return (unblocked_scaled_weight, false);
+    }
+
+    let s1_composite = 0.65 * s1_mom_score + 0.35 * s1_carry_score;
+
+    if cur_w > 0.0 {
+        // Clear bearish reversal / exit -> never block CLOSE or FLIP
+        if unblocked_scaled_weight <= -min_hold_band
+            || w_s3 < 0.0
+            || s2_trend_alignment < 0
+            || s1_mom_score <= -0.08
+        {
+            return (unblocked_scaled_weight, false);
+        }
+
+        let has_mild_long_support = raw_combined_weight > 0.0
+            || (s1_mom_score > 0.01 && s1_composite > 0.0)
+            || s1_composite > 0.025
+            || s2_trend_alignment > 0
+            || s3_flush_atr_mult <= -0.5
+            || s3_funding_zscore <= -0.8;
+
+        if has_mild_long_support {
+            (cur_w, true)
+        } else {
+            (unblocked_scaled_weight, false)
+        }
+    } else {
+        // Held SHORT: flush conflict or clear bullish reversal / exit -> allow CLOSE or FLIP
+        if is_downward_flush
+            || w_s3 > 0.0
+            || unblocked_scaled_weight >= min_hold_band
+            || s2_trend_alignment > 0
+            || s1_mom_score >= 0.08
+        {
+            return (unblocked_scaled_weight, false);
+        }
+
+        let has_mild_short_support = raw_combined_weight < 0.0
+            || (s1_mom_score < -0.01 && s1_composite < 0.0)
+            || s1_composite < -0.025
+            || s2_trend_alignment < 0
+            || s3_flush_atr_mult >= 0.5
+            || s3_funding_zscore >= 0.8
+            || (s3_flush_atr_mult > -2.0
+                && s3_flush_atr_mult < -0.1
+                && s1_mom_score <= 0.0
+                && s2_trend_alignment <= 0);
+
+        if has_mild_short_support {
+            (cur_w, true)
+        } else {
+            (unblocked_scaled_weight, false)
+        }
+    }
+}
+
 /// Combines Sleeve 1, Sleeve 2, and Sleeve 3 weights, scales by `RiskTier` (`Extreme 1.85x` default),
 /// blocks new entries on assets in `v_assets_in_cooldown`, and enforces single-asset and gross leverage caps.
 pub fn allocate_multi_sleeve_weights(
@@ -254,6 +340,8 @@ pub fn allocate_multi_sleeve_weights(
         w_s3: f64,
         raw_combined_weight: f64,
         unblocked_scaled_weight: f64,
+        effective_desired_weight: f64,
+        hysteresis_held: bool,
         capped_single_weight: f64,
         current_weight: f64,
         in_cooldown: bool,
@@ -307,21 +395,37 @@ pub fn allocate_multi_sleeve_weights(
         let in_cooldown = cooldown_ids.contains(&asset.id)
             || cooldown_symbols.contains(&asset.symbol.to_ascii_uppercase());
 
+        let (effective_desired_weight, hysteresis_held) = apply_held_exit_hysteresis(
+            cur_w,
+            unblocked_scaled_weight,
+            raw_combined_weight,
+            asset.is_core_eligible || asset.is_event_eligible,
+            s1.is_some() || s2.is_some() || s3.is_some(),
+            is_downward_flush,
+            s1_mom_score,
+            s1_carry_score,
+            s2_trend_alignment,
+            w_s3,
+            s3_funding_zscore,
+            s3_flush_atr_mult,
+            cfg.min_rebalance_delta_weight,
+        );
+
         // Block new entries or position increases when the asset is in active cooldown
         let post_cooldown_weight = if in_cooldown {
             if cur_w.abs() < 1e-4 {
                 0.0
-            } else if unblocked_scaled_weight * cur_w > 0.0
-                && unblocked_scaled_weight.abs() > cur_w.abs()
+            } else if effective_desired_weight * cur_w > 0.0
+                && effective_desired_weight.abs() > cur_w.abs()
             {
                 cur_w
-            } else if unblocked_scaled_weight * cur_w < 0.0 {
+            } else if effective_desired_weight * cur_w < 0.0 {
                 0.0
             } else {
-                unblocked_scaled_weight
+                effective_desired_weight
             }
         } else {
-            unblocked_scaled_weight
+            effective_desired_weight
         };
 
         let capped_single = post_cooldown_weight.clamp(-max_single, max_single);
@@ -341,6 +445,8 @@ pub fn allocate_multi_sleeve_weights(
             w_s3,
             raw_combined_weight,
             unblocked_scaled_weight,
+            effective_desired_weight,
+            hysteresis_held,
             capped_single_weight: capped_single,
             current_weight: cur_w,
             in_cooldown,
@@ -394,7 +500,10 @@ pub fn allocate_multi_sleeve_weights(
 
     let mut results = Vec::with_capacity(drafts.len());
     for d in drafts {
-        let target_weight = round_dp(d.capped_single_weight * gross_scale, 4);
+        let mut target_weight = round_dp(d.capped_single_weight * gross_scale, 4);
+        if d.hysteresis_held && target_weight.abs() < 1e-4 {
+            target_weight = d.current_weight.signum() * 1e-4;
+        }
         let delta_weight = round_dp(target_weight - d.current_weight, 4);
         let eff_sleeve_scale =
             if target_weight.abs() <= 1e-8 || d.unblocked_scaled_weight.abs() <= 1e-8 {
@@ -410,7 +519,7 @@ pub fn allocate_multi_sleeve_weights(
         let rebalance_action = classify_rebalance_action(
             d.current_weight,
             target_weight,
-            d.unblocked_scaled_weight,
+            d.effective_desired_weight,
             d.in_cooldown,
             cfg.min_rebalance_delta_weight,
         );
@@ -577,5 +686,264 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_single_alloc(
+        asset: ExchangeAsset,
+        cur_w: f64,
+        cooldowns: &[CooldownAssetView],
+        s1_mom: f64,
+        s1_carry: f64,
+        w_s1: f64,
+        s2_align: i32,
+        w_s2: f64,
+        s3_fund_z: f64,
+        s3_flush_atr: f64,
+        w_s3: f64,
+    ) -> SleeveSignalInput {
+        let cfg = AllocatorConfig::default();
+        let mut s1 = HashMap::new();
+        s1.insert(
+            asset.id,
+            CarryMomentumMetrics {
+                asset_id: asset.id,
+                symbol: asset.symbol.clone(),
+                annualized_vol: 0.50,
+                market_beta: 1.0,
+                s1_mom_score: s1_mom,
+                s1_carry_score: s1_carry,
+                w_s1_carry_mom: w_s1,
+            },
+        );
+        let mut s2 = HashMap::new();
+        s2.insert(
+            asset.id,
+            TrendBreakoutMetrics {
+                asset_id: asset.id,
+                symbol: asset.symbol.clone(),
+                s2_trend_alignment: s2_align,
+                s2_vol_surge_ratio: 1.1,
+                w_s2_trend_breakout: w_s2,
+                event_trigger: None,
+            },
+        );
+        let mut s3 = HashMap::new();
+        s3.insert(
+            asset.id,
+            EventReversionMetrics {
+                asset_id: asset.id,
+                symbol: asset.symbol.clone(),
+                s3_funding_zscore: s3_fund_z,
+                s3_flush_atr_mult: s3_flush_atr,
+                w_s3_event_reversion: w_s3,
+                event_trigger: None,
+            },
+        );
+        let mut cur = HashMap::new();
+        if cur_w.abs() > 0.0 {
+            cur.insert(asset.id, cur_w);
+        }
+        allocate_multi_sleeve_weights(&[asset], &s1, &s2, &s3, &cur, cooldowns, &cfg)
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_held_long_hysteresis_blocks_noise_close_but_preserves_exits_and_flips() {
+        let a = test_asset(1, 10_000_000.0);
+
+        // 1. Sub-threshold S1 momentum flicker (w_s1 snapped to 0.0) -> HOLD instead of CLOSE
+        let hold_s1 =
+            run_single_alloc(a.clone(), 0.12, &[], 0.03, 0.05, 0.0, 0, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(hold_s1.rebalance_action, ACTION_HOLD);
+        assert!((hold_s1.target_weight - 0.12).abs() < 1e-6);
+
+        // 2. Event-only S2 breakout trigger lost (w_s2 = 0.0) while s2_trend_alignment == +1 -> HOLD
+        let mut ev_only = a.clone();
+        ev_only.is_core_eligible = false;
+        let hold_s2 = run_single_alloc(ev_only, 0.10, &[], 0.0, 0.0, 0.0, 1, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(hold_s2.rebalance_action, ACTION_HOLD);
+        assert!((hold_s2.target_weight - 0.10).abs() < 1e-6);
+
+        // 3. S3 flush recovery flicker (w_s3 snapped to 0.0, flush still -1.2 ATR) -> HOLD
+        let hold_s3 = run_single_alloc(a.clone(), 0.12, &[], 0.0, 0.0, 0.0, 0, 0.0, 0.0, -1.2, 0.0);
+        assert_eq!(hold_s3.rebalance_action, ACTION_HOLD);
+
+        // 4. Completely neutral signal (including baseline 0.0-funding carry 0.0582) -> CLOSE
+        let close_flat = run_single_alloc(
+            a.clone(),
+            0.12,
+            &[],
+            0.0,
+            0.0582,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(close_flat.rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_flat.target_weight, 0.0);
+
+        // 5. Clear bearish shift -> CLOSE (small negative) or FLIP (strong negative)
+        let close_bear = run_single_alloc(
+            a.clone(),
+            0.12,
+            &[],
+            -0.12,
+            0.0,
+            -0.015,
+            -1,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(close_bear.rebalance_action, ACTION_CLOSE);
+
+        let flip_bear = run_single_alloc(
+            a.clone(),
+            0.12,
+            &[],
+            -0.40,
+            -0.20,
+            -0.06,
+            -1,
+            -0.04,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(flip_bear.rebalance_action, ACTION_FLIP);
+        assert!(flip_bear.target_weight < 0.0);
+
+        // 6. Ineligible asset must CLOSE even if metrics look positive
+        let mut dead = a;
+        dead.is_core_eligible = false;
+        dead.is_event_eligible = false;
+        let close_inelig = run_single_alloc(dead, 0.12, &[], 0.5, 0.2, 0.0, 1, 0.0, 0.0, 0.0, 0.0);
+        assert_eq!(close_inelig.rebalance_action, ACTION_CLOSE);
+    }
+
+    #[test]
+    fn test_held_short_hysteresis_and_downward_flush_conflict_and_cooldown() {
+        let a = test_asset(2, 10_000_000.0);
+
+        // 1. Short paused at range bottom (s1=0, s2=0, w_s1=0, w_s2=0, w_s3=0, -2.0 < flush < -0.1) -> HOLD
+        let hold_rb = run_single_alloc(
+            a.clone(),
+            -0.12,
+            &[],
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            -1.25,
+            0.0,
+        );
+        assert_eq!(hold_rb.rebalance_action, ACTION_HOLD);
+        assert!((hold_rb.target_weight + 0.12).abs() < 1e-6);
+
+        // 2. Downward flush conflict (w_s3 > 0 at negative flush) must CLOSE (or FLIP if strong)
+        let close_flush = run_single_alloc(
+            a.clone(),
+            -0.12,
+            &[],
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            -1.2,
+            -2.1,
+            0.015,
+        );
+        assert_eq!(close_flush.rebalance_action, ACTION_CLOSE);
+
+        let flip_flush = run_single_alloc(
+            a.clone(),
+            -0.12,
+            &[],
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            -2.0,
+            -2.6,
+            0.05,
+        );
+        assert_eq!(flip_flush.rebalance_action, ACTION_FLIP);
+        assert!(flip_flush.target_weight > 0.0);
+
+        // 3. Extreme crash flush conflict (s3_flush_atr_mult <= -3.5) must CLOSE held short
+        let close_extreme = run_single_alloc(
+            a.clone(),
+            -0.12,
+            &[],
+            -0.3,
+            0.0,
+            -0.05,
+            -1,
+            -0.04,
+            0.0,
+            -3.6,
+            0.0,
+        );
+        assert_eq!(close_extreme.rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_extreme.target_weight, 0.0);
+
+        // 4. Cooldown invariance on held short:
+        let cd = CooldownAssetView {
+            cooldown_id: 1,
+            asset_id: a.id,
+            symbol: a.symbol.clone(),
+            coin: a.coin.clone(),
+            cooldown_type: "STOP_OUT".to_string(),
+            reason: "test".to_string(),
+            triggered_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_001_800_000,
+            remaining_seconds: 1800,
+            updated_at_ms: 1_700_000_000_000,
+        };
+        // Mild noise holds cleanly under cooldown
+        let cd_hold = run_single_alloc(
+            a.clone(),
+            -0.12,
+            std::slice::from_ref(&cd),
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0.0,
+            0.0,
+            -1.25,
+            0.0,
+        );
+        assert_eq!(cd_hold.rebalance_action, ACTION_HOLD);
+        // Attempt to increase short under cooldown stays ACTION_COOLDOWN_BLOCKED
+        let cd_inc = run_single_alloc(
+            a.clone(),
+            -0.12,
+            std::slice::from_ref(&cd),
+            -0.5,
+            -0.2,
+            -0.08,
+            -1,
+            -0.05,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(cd_inc.rebalance_action, ACTION_COOLDOWN_BLOCKED);
+        // Downward flush under cooldown closes instead of flipping
+        let cd_close = run_single_alloc(a, -0.12, &[cd], 0.0, 0.0, 0.0, 0, 0.0, -2.0, -2.6, 0.05);
+        assert_eq!(cd_close.rebalance_action, ACTION_CLOSE);
+        assert_eq!(cd_close.target_weight, 0.0);
     }
 }

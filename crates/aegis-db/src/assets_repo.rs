@@ -4,6 +4,7 @@ use crate::engine::DatabaseManager;
 use aegis_core::{normalize_hyperliquid_symbol, now_ms, AegisError, ExchangeAsset, Result};
 use mysql::params;
 use mysql::prelude::*;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct AssetUpsertInput {
@@ -23,6 +24,82 @@ pub struct AssetUpsertInput {
     pub is_core_eligible: bool,
     pub is_event_eligible: bool,
     pub is_priority_watched: bool,
+}
+
+/// Normalized upsert entry kept in canonical lock order.
+#[derive(Debug, Clone)]
+pub struct CanonicalAssetUpsert<'a> {
+    pub symbol: String,
+    pub coin: String,
+    pub input: &'a AssetUpsertInput,
+}
+
+/// Canonicalized batch of asset upserts with caller-order lookup keys and
+/// deduplicated (last-wins) entries ordered by uppercase normalized `symbol`.
+#[derive(Debug)]
+pub struct CanonicalAssetUpsertBatch<'a> {
+    pub input_keys: Vec<(String, String)>,
+    pub ordered: BTreeMap<String, CanonicalAssetUpsert<'a>>,
+}
+
+/// Filters, sorts deterministically by `asset_id` ascending, and deduplicates
+/// repeated `asset_id`s (last-wins) prior to starting a batch update transaction.
+pub fn canonicalize_asset_updates<T: Copy>(
+    updates: &[(i64, T)],
+    mut keep: impl FnMut(&T) -> bool,
+) -> BTreeMap<i64, T> {
+    let mut ordered = BTreeMap::new();
+    for &(asset_id, value) in updates {
+        if keep(&value) {
+            ordered.insert(asset_id, value);
+        }
+    }
+    ordered
+}
+
+/// Normalizes and canonicalizes batch upsert inputs by uppercase normalized `symbol`
+/// (deduplicating last-wins) while preserving caller input order for ID lookup.
+pub fn canonicalize_asset_upserts(
+    inputs: &[AssetUpsertInput],
+) -> Result<CanonicalAssetUpsertBatch<'_>> {
+    let mut input_keys = Vec::with_capacity(inputs.len());
+    let mut ordered = BTreeMap::new();
+    for inp in inputs {
+        let (symbol, coin) = normalize_hyperliquid_symbol(&inp.raw_symbol_or_coin)?;
+        let sort_key = symbol.to_ascii_uppercase();
+        input_keys.push((sort_key.clone(), symbol.clone()));
+        ordered.insert(
+            sort_key,
+            CanonicalAssetUpsert {
+                symbol,
+                coin,
+                input: inp,
+            },
+        );
+    }
+    Ok(CanonicalAssetUpsertBatch {
+        input_keys,
+        ordered,
+    })
+}
+
+/// Orders deduplicated upserts deterministically by `(existing_id.unwrap_or(i64::MAX), sort_key)`
+/// ascending so existing rows acquire InnoDB locks in `exchange_assets.id` order (matching
+/// `update_assets_live_mid_batch` and `set_assets_priority_watch_batch`) while brand-new listings
+/// lock at the tail in uppercase normalized `symbol` order.
+pub fn order_asset_upserts_by_lock_key<'b, 'a>(
+    ordered: &'b BTreeMap<String, CanonicalAssetUpsert<'a>>,
+    existing_ids: &HashMap<String, i64>,
+) -> Vec<&'b CanonicalAssetUpsert<'a>> {
+    let mut items: Vec<((i64, &str), &'b CanonicalAssetUpsert<'a>)> = ordered
+        .iter()
+        .map(|(sort_key, entry)| {
+            let existing_id = existing_ids.get(sort_key).copied().unwrap_or(i64::MAX);
+            ((existing_id, sort_key.as_str()), entry)
+        })
+        .collect();
+    items.sort_by_key(|(a_key, _)| *a_key);
+    items.into_iter().map(|(_, entry)| entry).collect()
 }
 
 impl DatabaseManager {
@@ -97,18 +174,32 @@ impl DatabaseManager {
 
     /// Batch upserts multiple Hyperliquid perpetual assets inside a single MariaDB transaction,
     /// returning their `exchange_assets.id` primary keys in input order.
+    /// Inputs are deduplicated (last-wins) by uppercase normalized `symbol`, then ordered
+    /// deterministically by `(existing_id.unwrap_or(i64::MAX), uppercase_symbol)` before starting
+    /// the transaction so existing rows lock in `id` order (matching live-mid/priority batches)
+    /// and brand-new listings lock at the tail in canonical symbol order.
     pub fn upsert_exchange_assets_batch(&self, inputs: &[AssetUpsertInput]) -> Result<Vec<i64>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let mut normalized = Vec::with_capacity(inputs.len());
-        for inp in inputs {
-            let (symbol, coin) = normalize_hyperliquid_symbol(&inp.raw_symbol_or_coin)?;
-            normalized.push((symbol, coin, inp));
-        }
+        let CanonicalAssetUpsertBatch {
+            input_keys,
+            ordered,
+        } = canonicalize_asset_upserts(inputs)?;
 
         let ts = now_ms();
         let mut conn = self.get_conn()?;
+        let existing_rows: Vec<(String, i64)> = conn
+            .query("SELECT UPPER(symbol), id FROM exchange_assets")
+            .map_err(|e| {
+                AegisError::Database(format!("Batch asset existing id lookup failed: {e}"))
+            })?;
+        let existing_ids: HashMap<String, i64> = existing_rows
+            .into_iter()
+            .map(|(symbol, id)| (symbol.to_ascii_uppercase(), id))
+            .collect();
+        let lock_ordered = order_asset_upserts_by_lock_key(&ordered, &existing_ids);
+
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| AegisError::Database(format!("Failed to start assets batch tx: {e}")))?;
@@ -148,10 +239,11 @@ impl DatabaseManager {
 
         tx.exec_batch(
             &stmt,
-            normalized.iter().map(|(symbol, coin, input)| {
+            lock_ordered.into_iter().map(|entry| {
+                let input = entry.input;
                 params! {
-                    "symbol" => symbol,
-                    "coin" => coin,
+                    "symbol" => &entry.symbol,
+                    "coin" => &entry.coin,
                     "idx" => input.asset_index,
                     "sz_dec" => input.sz_decimals,
                     "tick" => input.tick_size,
@@ -177,14 +269,17 @@ impl DatabaseManager {
         let all_rows: Vec<(String, i64)> = tx
             .query("SELECT symbol, id FROM exchange_assets")
             .map_err(|e| AegisError::Database(format!("Batch asset id lookup failed: {e}")))?;
-        let id_map: std::collections::HashMap<String, i64> = all_rows.into_iter().collect();
+        let id_map: HashMap<String, i64> = all_rows
+            .into_iter()
+            .map(|(symbol, id)| (symbol.to_ascii_uppercase(), id))
+            .collect();
 
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Batch asset commit failed: {e}")))?;
 
-        let mut ids = Vec::with_capacity(normalized.len());
-        for (symbol, ..) in normalized {
-            let id = id_map.get(&symbol).copied().ok_or_else(|| {
+        let mut ids = Vec::with_capacity(input_keys.len());
+        for (sort_key, symbol) in input_keys {
+            let id = id_map.get(&sort_key).copied().ok_or_else(|| {
                 AegisError::Database(format!("Asset '{symbol}' missing after batch upsert"))
             })?;
             ids.push(id);
@@ -216,13 +311,11 @@ impl DatabaseManager {
     }
 
     /// Batch updates ONLY `mid_price` and `updated_at_ms` inside a single transaction.
+    /// Updates are sorted deterministically by `asset_id` ascending (deduplicating repeated
+    /// `asset_id`s last-wins) before starting the transaction to prevent InnoDB deadlocks.
     pub fn update_assets_live_mid_batch(&self, updates: &[(i64, f64)]) -> Result<usize> {
-        let valid: Vec<(i64, f64)> = updates
-            .iter()
-            .copied()
-            .filter(|&(_, mid)| mid.is_finite() && mid > 0.0)
-            .collect();
-        if valid.is_empty() {
+        let ordered = canonicalize_asset_updates(updates, |mid| mid.is_finite() && *mid > 0.0);
+        if ordered.is_empty() {
             return Ok(0);
         }
         let ts = now_ms();
@@ -239,7 +332,7 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("Failed preparing mid batch update: {e}")))?;
         tx.exec_batch(
             &stmt,
-            valid.iter().map(|&(asset_id, mid)| {
+            ordered.iter().map(|(&asset_id, &mid)| {
                 params! {
                     "mid" => mid,
                     "ts" => ts,
@@ -251,7 +344,7 @@ impl DatabaseManager {
         drop(stmt);
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Batch live mid commit failed: {e}")))?;
-        Ok(valid.len())
+        Ok(ordered.len())
     }
 
     /// Updates live mark/mid price on an existing asset during the 1s Priority Watchlist loop.
@@ -293,8 +386,11 @@ impl DatabaseManager {
     }
 
     /// Batch updates `is_priority_watched` inside a single transaction.
+    /// Updates are sorted deterministically by `asset_id` ascending (deduplicating repeated
+    /// `asset_id`s last-wins) before starting the transaction to prevent InnoDB deadlocks.
     pub fn set_assets_priority_watch_batch(&self, updates: &[(i64, bool)]) -> Result<usize> {
-        if updates.is_empty() {
+        let ordered = canonicalize_asset_updates(updates, |_| true);
+        if ordered.is_empty() {
             return Ok(0);
         }
         let ts = now_ms();
@@ -309,7 +405,7 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("Failed preparing priority watch batch: {e}")))?;
         tx.exec_batch(
             &stmt,
-            updates.iter().map(|&(asset_id, watched)| {
+            ordered.iter().map(|(&asset_id, &watched)| {
                 params! {
                     "w" => i32::from(watched),
                     "ts" => ts,
@@ -322,7 +418,7 @@ impl DatabaseManager {
         tx.commit().map_err(|e| {
             AegisError::Database(format!("Batch priority watch commit failed: {e}"))
         })?;
-        Ok(updates.len())
+        Ok(ordered.len())
     }
 
     /// Looks up an `ExchangeAsset` by symbol (`"BTC-USDC"`, `"BTC"`, or `"BTC/USDC:USDC"`).

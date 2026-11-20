@@ -2,8 +2,10 @@
 
 use aegis_core::{now_ms, OrderSide, RiskTier};
 use aegis_db::{
-    create_mariadb_backup, verify_latest_backup, AssetUpsertInput, BarUpsertInput, DatabaseManager,
-    ReconciledClosedTradeInput, SignalUpsertInput, SnapshotInsertInput, WorkingOrderInput,
+    canonicalize_asset_updates, canonicalize_asset_upserts, create_mariadb_backup,
+    order_asset_upserts_by_lock_key, verify_latest_backup, AssetUpsertInput, BarUpsertInput,
+    DatabaseManager, ReconciledClosedTradeInput, SignalUpsertInput, SnapshotInsertInput,
+    WorkingOrderInput,
 };
 use mysql::params;
 use mysql::prelude::*;
@@ -953,4 +955,341 @@ fn test_batch_mid_priority_open_positions_and_signals() {
         .unwrap();
     assert_eq!(up, 1);
     assert_eq!(db.list_sleeve_signals().unwrap().len(), 1);
+}
+
+fn sample_asset_input(raw: &str, asset_index: u32, mark: f64, watched: bool) -> AssetUpsertInput {
+    AssetUpsertInput {
+        raw_symbol_or_coin: raw.to_string(),
+        asset_index,
+        sz_decimals: 2,
+        tick_size: 0.001,
+        lot_step_size: 0.1,
+        max_leverage: 20.0,
+        mark_price: mark,
+        mid_price: mark,
+        oracle_price: mark,
+        funding_rate_hourly: 0.00001,
+        day_volume_usdc: 10_000_000.0,
+        open_interest_usdc: 5_000_000.0,
+        prev_day_price: mark * 0.98,
+        is_core_eligible: true,
+        is_event_eligible: false,
+        is_priority_watched: watched,
+    }
+}
+
+#[test]
+fn test_exchange_assets_batch_canonical_ordering_and_dedup() {
+    let canonical_mids: Vec<(i64, f64)> = canonicalize_asset_updates(
+        &[
+            (30, 1.25),
+            (10, 2.50),
+            (20, -1.0),
+            (30, 1.75),
+            (25, f64::NAN),
+            (10, 0.0),
+            (40, f64::INFINITY),
+        ],
+        |mid| mid.is_finite() && *mid > 0.0,
+    )
+    .into_iter()
+    .collect();
+    assert_eq!(canonical_mids, vec![(10, 2.50), (30, 1.75)]);
+
+    let canonical_prio: Vec<(i64, bool)> = canonicalize_asset_updates(
+        &[(30, true), (10, false), (30, false), (20, true), (10, true)],
+        |_| true,
+    )
+    .into_iter()
+    .collect();
+    assert_eq!(canonical_prio, vec![(10, true), (20, true), (30, false)]);
+
+    let inputs = vec![
+        sample_asset_input("VIRTUAL", 1, 1.0, false),
+        sample_asset_input("kpepe", 2, 0.010, false),
+        sample_asset_input("ASTER", 3, 2.0, true),
+        sample_asset_input("virtual/usdc:usdc", 1, 1.5, true),
+        sample_asset_input("kcat", 4, 3.0, false),
+        sample_asset_input("kCat", 4, 3.5, true),
+        sample_asset_input("KPEPE-USDC", 2, 0.015, true),
+    ];
+    let batch = canonicalize_asset_upserts(&inputs).unwrap();
+    assert_eq!(
+        batch
+            .input_keys
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "VIRTUAL-USDC",
+            "KPEPE-USDC",
+            "ASTER-USDC",
+            "VIRTUAL-USDC",
+            "KCAT-USDC",
+            "KCAT-USDC",
+            "KPEPE-USDC",
+        ]
+    );
+    assert_eq!(
+        batch.ordered.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["ASTER-USDC", "KCAT-USDC", "KPEPE-USDC", "VIRTUAL-USDC"]
+    );
+    assert!((batch.ordered["VIRTUAL-USDC"].input.mark_price - 1.5).abs() < 1e-9);
+    assert!(batch.ordered["VIRTUAL-USDC"].input.is_priority_watched);
+    assert_eq!(batch.ordered["KCAT-USDC"].symbol, "kCAT-USDC");
+    assert!((batch.ordered["KCAT-USDC"].input.mark_price - 3.5).abs() < 1e-9);
+    assert_eq!(batch.ordered["KPEPE-USDC"].symbol, "kPEPE-USDC");
+    assert_eq!(batch.ordered["KPEPE-USDC"].coin, "kPEPE");
+    assert!((batch.ordered["KPEPE-USDC"].input.mark_price - 0.015).abs() < 1e-9);
+
+    let existing_ids = std::collections::HashMap::from([
+        ("VIRTUAL-USDC".to_string(), 1i64),
+        ("ASTER-USDC".to_string(), 2i64),
+    ]);
+    let lock_ordered: Vec<&str> = order_asset_upserts_by_lock_key(&batch.ordered, &existing_ids)
+        .into_iter()
+        .map(|entry| entry.symbol.as_str())
+        .collect();
+    assert_eq!(
+        lock_ordered,
+        vec!["VIRTUAL-USDC", "ASTER-USDC", "kCAT-USDC", "kPEPE-USDC"]
+    );
+
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let ids = db.upsert_exchange_assets_batch(&inputs).unwrap();
+    assert_eq!(ids.len(), 7);
+    let virtual_id = ids[0];
+    let kpepe_id = ids[1];
+    let aster_id = ids[2];
+    let kcat_id = ids[4];
+    assert_eq!(ids[3], virtual_id);
+    assert_eq!(ids[5], kcat_id);
+    assert_eq!(ids[6], kpepe_id);
+
+    let virtual_row = db.get_asset_by_id(virtual_id).unwrap().unwrap();
+    assert_eq!(virtual_row.symbol, "VIRTUAL-USDC");
+    assert!((virtual_row.mark_price - 1.5).abs() < 1e-6);
+    assert!(virtual_row.is_priority_watched);
+
+    let kpepe_row = db.get_asset_by_id(kpepe_id).unwrap().unwrap();
+    assert_eq!(kpepe_row.symbol, "kPEPE-USDC");
+    assert_eq!(kpepe_row.coin, "kPEPE");
+    assert!((kpepe_row.mark_price - 0.015).abs() < 1e-6);
+    assert!(kpepe_row.is_priority_watched);
+
+    let kcat_row = db.get_asset_by_id(kcat_id).unwrap().unwrap();
+    assert!((kcat_row.mark_price - 3.5).abs() < 1e-6);
+    assert!(kcat_row.is_priority_watched);
+
+    // Updating an existing mixed-case row ("kCAT-USDC") via uppercase "KCAT" resolves the same id
+    let reup_ids = db
+        .upsert_exchange_assets_batch(&[sample_asset_input("KCAT", 4, 4.25, false)])
+        .unwrap();
+    assert_eq!(reup_ids, vec![kcat_id]);
+    let kcat_updated = db.get_asset_by_id(kcat_id).unwrap().unwrap();
+    assert!((kcat_updated.mark_price - 4.25).abs() < 1e-6);
+    assert!(!kcat_updated.is_priority_watched);
+
+    let mut sorted_ids = [virtual_id, aster_id, kpepe_id];
+    sorted_ids.sort_unstable();
+    let (min_id, mid_id, max_id) = (sorted_ids[0], sorted_ids[1], sorted_ids[2]);
+    let pre_min = db.get_asset_by_id(min_id).unwrap().unwrap();
+    let pre_mid = db.get_asset_by_id(mid_id).unwrap().unwrap();
+
+    let mid_count = db
+        .update_assets_live_mid_batch(&[
+            (max_id, 100.0),
+            (min_id, 200.0),
+            (mid_id, -5.0),
+            (max_id, 105.5),
+            (min_id, 205.5),
+            (min_id, f64::NAN),
+        ])
+        .unwrap();
+    assert_eq!(mid_count, 2);
+
+    let post_min = db.get_asset_by_id(min_id).unwrap().unwrap();
+    let post_mid = db.get_asset_by_id(mid_id).unwrap().unwrap();
+    let post_max = db.get_asset_by_id(max_id).unwrap().unwrap();
+    assert!((post_min.mid_price - 205.5).abs() < 1e-6);
+    assert!((post_min.mark_price - pre_min.mark_price).abs() < 1e-6);
+    assert!((post_mid.mid_price - pre_mid.mid_price).abs() < 1e-6);
+    assert!((post_max.mid_price - 105.5).abs() < 1e-6);
+
+    let prio_count = db
+        .set_assets_priority_watch_batch(&[
+            (max_id, false),
+            (min_id, true),
+            (max_id, true),
+            (min_id, false),
+        ])
+        .unwrap();
+    assert_eq!(prio_count, 2);
+    assert!(
+        !db.get_asset_by_id(min_id)
+            .unwrap()
+            .unwrap()
+            .is_priority_watched
+    );
+    assert!(
+        db.get_asset_by_id(max_id)
+            .unwrap()
+            .unwrap()
+            .is_priority_watched
+    );
+}
+
+#[test]
+fn test_exchange_assets_concurrent_batch_updates_no_deadlock() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+
+    // Insert VIRTUAL first and ASTER second so id order opposes alphabetical symbol order.
+    let virtual_id = db
+        .upsert_exchange_asset(&sample_asset_input("VIRTUAL", 1, 1.20, true))
+        .unwrap();
+    let aster_id = db
+        .upsert_exchange_asset(&sample_asset_input("ASTER", 2, 0.85, true))
+        .unwrap();
+    let sol_id = db
+        .upsert_exchange_asset(&sample_asset_input("SOL", 3, 180.0, true))
+        .unwrap();
+    let btc_id = db
+        .upsert_exchange_asset(&sample_asset_input("BTC", 4, 90_000.0, true))
+        .unwrap();
+    assert!(virtual_id < aster_id);
+
+    std::thread::scope(|scope| {
+        let db_mid = db.clone();
+        let h_mid = scope.spawn(move || {
+            for i in 0..60 {
+                let px = 1.0 + (i as f64) * 0.01;
+                let updated = db_mid
+                    .update_assets_live_mid_batch(&[
+                        (btc_id, 90_000.0 + px),
+                        (aster_id, 0.85 + px),
+                        (sol_id, 180.0 + px),
+                        (virtual_id, 1.20 + px),
+                    ])
+                    .expect("concurrent update_assets_live_mid_batch must not deadlock");
+                assert_eq!(updated, 4);
+            }
+        });
+
+        let db_prio = db.clone();
+        let h_prio = scope.spawn(move || {
+            for i in 0..60 {
+                let flag = i % 2 == 0;
+                let updated = db_prio
+                    .set_assets_priority_watch_batch(&[
+                        (virtual_id, flag),
+                        (sol_id, !flag),
+                        (aster_id, flag),
+                        (btc_id, !flag),
+                    ])
+                    .expect("concurrent set_assets_priority_watch_batch must not deadlock");
+                assert_eq!(updated, 4);
+            }
+        });
+
+        h_mid.join().unwrap();
+        h_prio.join().unwrap();
+    });
+
+    std::thread::scope(|scope| {
+        let db_a = db.clone();
+        let h_a = scope.spawn(move || {
+            for i in 0..30 {
+                let mark = 1.0 + (i as f64) * 0.01;
+                let batch = vec![
+                    sample_asset_input("VIRTUAL", 1, mark, true),
+                    sample_asset_input("ASTER", 2, mark, false),
+                    sample_asset_input("SOL", 3, 180.0 + mark, true),
+                    sample_asset_input("BTC", 4, 90_000.0 + mark, false),
+                ];
+                let ids = db_a
+                    .upsert_exchange_assets_batch(&batch)
+                    .expect("concurrent upsert_exchange_assets_batch (fwd) must not deadlock");
+                assert_eq!(ids, vec![virtual_id, aster_id, sol_id, btc_id]);
+            }
+        });
+
+        let db_b = db.clone();
+        let h_b = scope.spawn(move || {
+            for i in 0..30 {
+                let mark = 2.0 + (i as f64) * 0.01;
+                let batch = vec![
+                    sample_asset_input("BTC", 4, 90_000.0 + mark, true),
+                    sample_asset_input("SOL", 3, 180.0 + mark, false),
+                    sample_asset_input("ASTER", 2, mark, true),
+                    sample_asset_input("VIRTUAL", 1, mark, false),
+                ];
+                let ids = db_b
+                    .upsert_exchange_assets_batch(&batch)
+                    .expect("concurrent upsert_exchange_assets_batch (rev) must not deadlock");
+                assert_eq!(ids, vec![btc_id, sol_id, aster_id, virtual_id]);
+            }
+        });
+
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+    });
+
+    // Concurrent upsert_exchange_assets_batch vs update_assets_live_mid_batch & set_assets_priority_watch_batch
+    // where VIRTUAL has lower id than ASTER (opposite to alphabetical symbol order).
+    std::thread::scope(|scope| {
+        let db_upsert = db.clone();
+        let h_upsert = scope.spawn(move || {
+            for i in 0..60 {
+                let mark = 3.0 + (i as f64) * 0.01;
+                let batch = vec![
+                    sample_asset_input("ASTER", 2, mark, true),
+                    sample_asset_input("BTC", 4, 90_000.0 + mark, true),
+                    sample_asset_input("VIRTUAL", 1, mark, true),
+                    sample_asset_input("SOL", 3, 180.0 + mark, true),
+                ];
+                let ids = db_upsert.upsert_exchange_assets_batch(&batch).expect(
+                    "concurrent upsert_exchange_assets_batch vs live_mid must not deadlock",
+                );
+                assert_eq!(ids, vec![aster_id, btc_id, virtual_id, sol_id]);
+            }
+        });
+
+        let db_mid = db.clone();
+        let h_mid = scope.spawn(move || {
+            for i in 0..60 {
+                let px = 4.0 + (i as f64) * 0.01;
+                let updated = db_mid
+                    .update_assets_live_mid_batch(&[
+                        (btc_id, 90_000.0 + px),
+                        (sol_id, 180.0 + px),
+                        (aster_id, 0.85 + px),
+                        (virtual_id, 1.20 + px),
+                    ])
+                    .expect("concurrent update_assets_live_mid_batch vs upsert must not deadlock");
+                assert_eq!(updated, 4);
+            }
+        });
+
+        let db_prio = db.clone();
+        let h_prio = scope.spawn(move || {
+            for i in 0..60 {
+                let flag = i % 2 == 0;
+                let updated = db_prio
+                    .set_assets_priority_watch_batch(&[
+                        (sol_id, !flag),
+                        (btc_id, flag),
+                        (virtual_id, !flag),
+                        (aster_id, flag),
+                    ])
+                    .expect(
+                        "concurrent set_assets_priority_watch_batch vs upsert must not deadlock",
+                    );
+                assert_eq!(updated, 4);
+            }
+        });
+
+        h_upsert.join().unwrap();
+        h_mid.join().unwrap();
+        h_prio.join().unwrap();
+    });
 }

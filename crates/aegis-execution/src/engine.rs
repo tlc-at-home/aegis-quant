@@ -544,7 +544,8 @@ impl ExecutionEngine {
 
     /// Executes portfolio rebalance actions (`CLOSE`, `FLIP`, `OPEN_LONG`, `OPEN_SHORT`)
     /// while strictly enforcing active-epoch cap isolation, illiquid-backoff gating,
-    /// daily drawdown breaker, symbol-scoped `ACTION_FLIP` cooldown bypass, and gross leverage.
+    /// `min_position_hold_sec` whipsaw protection, daily drawdown breaker,
+    /// symbol-scoped `ACTION_FLIP` cooldown bypass, and gross leverage.
     pub fn execute_signal_rebalance(
         &self,
         signal_out: &SignalCycleOutput,
@@ -576,12 +577,18 @@ impl ExecutionEngine {
 
         let held = self.db.get_assets_held()?;
         let rebalance_now = now_ms();
+        let min_hold_ms = cfg.get_i64("min_position_hold_sec", 300).max(0) * 1000;
         let mut flipped_symbols: HashSet<i64> = HashSet::new();
 
-        // 1. Handle CLOSE or FLIP on currently OPEN holdings
+        // 1. Handle CLOSE or FLIP on currently OPEN holdings (respecting min_position_hold_sec)
         for sig in &signal_out.signals {
             if sig.rebalance_action == ACTION_CLOSE || sig.rebalance_action == ACTION_FLIP {
                 if let Some(h) = held.iter().find(|x| x.asset_id == sig.asset_id) {
+                    let held_ms =
+                        rebalance_now.saturating_sub(h.opened_at_ms.unwrap_or(h.updated_at_ms));
+                    if min_hold_ms > 0 && held_ms < min_hold_ms {
+                        continue;
+                    }
                     if report.closed_position_ids.contains(&h.position_id)
                         || self.is_illiquid_close_backed_off(h.position_id, rebalance_now)
                     {
