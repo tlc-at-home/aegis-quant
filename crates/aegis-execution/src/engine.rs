@@ -14,7 +14,7 @@ use crate::order_chaser::{NewWorkingOrderRequest, OrderChaser};
 use crate::priority_monitor::{PriorityMonitor, PriorityTickReport};
 use crate::reconcile::{CutoverReconcileReport, CutoverReconciler};
 use crate::signing::{
-    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size_floor, CancelWire,
+    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size_floor, snap_to_tick, CancelWire,
     LimitOrderType, OrderTypeWire, OrderWire, HL_ORACLE_BAND_PCT,
 };
 use aegis_alerts::{
@@ -32,7 +32,7 @@ use aegis_signals::{
 };
 use parking_lot::{Mutex, ReentrantMutex};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -55,6 +55,225 @@ pub(crate) fn is_active_cap_holding(h: &HeldAssetView, cap_epoch_ms: i64) -> boo
 
 pub(crate) fn is_active_cap_order(o: &OrderedAssetView, cap_epoch_ms: i64) -> bool {
     cap_epoch_ms <= 0 || o.created_at_ms >= cap_epoch_ms
+}
+
+fn parse_hl_f64(val: Option<&Value>) -> f64 {
+    val.and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    })
+    .filter(|v| v.is_finite())
+    .unwrap_or(0.0)
+}
+
+fn parse_hl_oid_val(ord: &Value) -> Option<u64> {
+    ord.get("oid").and_then(Value::as_u64).or_else(|| {
+        ord.get("oid")
+            .and_then(Value::as_str)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    })
+}
+
+fn is_hl_trigger_order(ord: &Value) -> bool {
+    if ord.get("isTrigger").and_then(Value::as_bool) == Some(true)
+        || ord.get("isPositionTpsl").and_then(Value::as_bool) == Some(true)
+    {
+        return true;
+    }
+    if parse_hl_f64(ord.get("triggerPx")) > 0.0 {
+        return true;
+    }
+    let order_type = ord
+        .get("orderType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    order_type.contains("stop") || order_type.contains("take profit")
+}
+
+fn is_ioc_no_match_error(raw_error: Option<&str>) -> bool {
+    let Some(err) = raw_error else {
+        return false;
+    };
+    let lower = err.to_ascii_lowercase();
+    lower.contains("could not immediately match") || lower.contains("ioccancelrejected")
+}
+
+fn compute_passive_close_px(
+    asset: &ExchangeAsset,
+    close_is_buy: bool,
+    l2_bbo: Option<(f64, f64)>,
+    mark_px: f64,
+    band_lo: f64,
+    band_hi: f64,
+) -> (f64, String) {
+    let eff_tick = asset.tick_size.max(1e-8);
+    let passive_raw = if close_is_buy {
+        l2_bbo
+            .map(|(bid, _)| bid + eff_tick)
+            .filter(|&px| px > 0.0)
+            .unwrap_or(mark_px)
+    } else {
+        l2_bbo
+            .map(|(_, ask)| (ask - eff_tick).max(eff_tick))
+            .filter(|&px| px > 0.0)
+            .unwrap_or(mark_px)
+    };
+    let clamped = passive_raw.clamp(band_lo, band_hi);
+    let wire_px = format_hl_wire_price(clamped, eff_tick, asset.sz_decimals);
+    let parsed_px = wire_px
+        .parse::<f64>()
+        .ok()
+        .filter(|&p| p.is_finite() && p > 0.0)
+        .unwrap_or_else(|| snap_to_tick(clamped, eff_tick));
+    (parsed_px, wire_px)
+}
+
+fn is_matching_passive_reduce_only_close(
+    ord: &Value,
+    asset: &ExchangeAsset,
+    close_is_buy: bool,
+    target_qty: f64,
+    passive_px: f64,
+    passive_wire_px: &str,
+) -> bool {
+    let ord_coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+    if !ord_coin.eq_ignore_ascii_case(&asset.coin) || is_hl_trigger_order(ord) {
+        return false;
+    }
+    if ord.get("reduceOnly").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    let order_type = ord
+        .get("orderType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !order_type.is_empty() && order_type != "limit" {
+        return false;
+    }
+    let ord_is_buy = match ord
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "B" | "BUY" | "LONG" => true,
+        "A" | "SELL" | "SHORT" => false,
+        _ => return false,
+    };
+    if ord_is_buy != close_is_buy {
+        return false;
+    }
+    let ord_sz = parse_hl_f64(ord.get("sz"));
+    let ord_px = parse_hl_f64(ord.get("limitPx"));
+    if ord_sz <= 0.0 || ord_px <= 0.0 {
+        return false;
+    }
+    let lot_tol = asset.lot_step_size.max(1e-8) * 1.05;
+    let eff_tick = asset.tick_size.max(1e-8);
+    let px_tol = eff_tick * 2.0 + 1e-12;
+    let px_matches = (ord_px - passive_px).abs() <= px_tol
+        || format_hl_wire_price(ord_px, eff_tick, asset.sz_decimals) == passive_wire_px;
+    (ord_sz - target_qty).abs() <= lot_tol && px_matches
+}
+
+fn find_newest_matching_passive_close_oid(
+    open_orders: &[Value],
+    asset: &ExchangeAsset,
+    close_is_buy: bool,
+    target_qty: f64,
+    passive_px: f64,
+    passive_wire_px: &str,
+) -> Option<u64> {
+    open_orders
+        .iter()
+        .filter_map(|ord| {
+            if !is_matching_passive_reduce_only_close(
+                ord,
+                asset,
+                close_is_buy,
+                target_qty,
+                passive_px,
+                passive_wire_px,
+            ) {
+                return None;
+            }
+            let oid = parse_hl_oid_val(ord)?;
+            let ts = ord.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
+            Some((ts, oid))
+        })
+        .max()
+        .map(|(_, oid)| oid)
+}
+
+fn collect_coin_non_trigger_cancels(
+    open_orders: &[Value],
+    asset: &ExchangeAsset,
+    keep_oid: Option<u64>,
+) -> Vec<CancelWire> {
+    let mut cancels = Vec::new();
+    for ord in open_orders {
+        let c = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+        if !c.eq_ignore_ascii_case(&asset.coin) || is_hl_trigger_order(ord) {
+            continue;
+        }
+        if let Some(oid) = parse_hl_oid_val(ord) {
+            if keep_oid != Some(oid) {
+                cancels.push(CancelWire {
+                    a: asset.asset_index,
+                    o: oid,
+                });
+            }
+        }
+    }
+    cancels
+}
+
+struct CloseFillAccumulator {
+    close_eoid_opt: Option<String>,
+    live_fee_usdc: f64,
+    fill_notional_sum: f64,
+    fill_qty_sum: f64,
+    rem_qty: f64,
+}
+
+impl CloseFillAccumulator {
+    fn new(rem_qty: f64) -> Self {
+        Self {
+            close_eoid_opt: None,
+            live_fee_usdc: 0.0,
+            fill_notional_sum: 0.0,
+            fill_qty_sum: 0.0,
+            rem_qty,
+        }
+    }
+
+    fn record_fill(
+        &mut self,
+        ack: crate::http_client::ExchangeOrderAck,
+        fallback_px: f64,
+        lot_step_size: f64,
+    ) -> bool {
+        if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+            let fill_px = if ack.avg_fill_price > 0.0 {
+                ack.avg_fill_price
+            } else {
+                fallback_px
+            };
+            self.live_fee_usdc += ack.fee_usdc;
+            self.fill_notional_sum += fill_px * ack.filled_quantity;
+            self.fill_qty_sum += ack.filled_quantity;
+            self.close_eoid_opt = ack.exchange_order_id;
+            self.rem_qty = (self.rem_qty - ack.filled_quantity).max(0.0);
+            self.rem_qty <= lot_step_size * 0.5 || self.rem_qty <= 1e-9
+        } else {
+            false
+        }
+    }
 }
 
 /// Report returned by [`ExecutionEngine::run_cutover_reconciliation`].
@@ -164,26 +383,22 @@ impl ExecutionEngine {
             .fetch_frontend_open_orders(wallet, cfg)
             .or_else(|_| self.http.fetch_open_orders(wallet, cfg))
         {
-            let mut cancels = Vec::new();
-            for ord in open_orders {
-                let c = ord.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-                let is_trig = ord
-                    .get("isTrigger")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if c.eq_ignore_ascii_case(&asset.coin) && (include_triggers || !is_trig) {
-                    if let Some(oid) = ord.get("oid").and_then(|v| v.as_u64()).or_else(|| {
-                        ord.get("oid")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<u64>().ok())
-                    }) {
-                        cancels.push(CancelWire {
+            let cancels: Vec<CancelWire> = open_orders
+                .iter()
+                .filter_map(|ord| {
+                    let c = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                    if c.eq_ignore_ascii_case(&asset.coin)
+                        && (include_triggers || !is_hl_trigger_order(ord))
+                    {
+                        parse_hl_oid_val(ord).map(|o| CancelWire {
                             a: asset.asset_index,
-                            o: oid,
-                        });
+                            o,
+                        })
+                    } else {
+                        None
                     }
-                }
-            }
+                })
+                .collect();
             if !cancels.is_empty() {
                 let _ = self
                     .http
@@ -1097,10 +1312,8 @@ impl ExecutionEngine {
                             "wallet_address is empty in live mode; refusing to mark DB position CLOSED without exchange close"
                         );
                     } else {
-                        // 1. Cancel ONLY non-trigger open orders first; preserve resting SL/TP trigger orders until close fills
-                        self.cancel_coin_exchange_orders(&asset, &wallet, &pk, &cfg, false);
-
-                        // 2. Query live Hyperliquid clearinghouseState for exact `szi` on this coin
+                        // 1. Query live Hyperliquid clearinghouseState BEFORE touching resting orders
+                        //    so any matching passive reduceOnly GTC close on an illiquid book stays intact.
                         match self.http.fetch_clearinghouse_state(&wallet, &cfg) {
                             Err(e) => {
                                 exchange_close_unfilled = true;
@@ -1112,27 +1325,17 @@ impl ExecutionEngine {
                                 );
                             }
                             Ok(ch_state) => {
-                                let parse_f = |v: Option<&serde_json::Value>| -> f64 {
-                                    v.and_then(|x| {
-                                        x.as_f64().or_else(|| {
-                                            x.as_str().and_then(|s| s.parse::<f64>().ok())
-                                        })
-                                    })
-                                    .filter(|val| val.is_finite())
-                                    .unwrap_or(0.0)
-                                };
                                 let mut live_szi = 0.0;
                                 let mut live_pos_val = 0.0;
                                 if let Some(arr) =
-                                    ch_state.get("assetPositions").and_then(|v| v.as_array())
+                                    ch_state.get("assetPositions").and_then(Value::as_array)
                                 {
                                     for item in arr {
                                         let p = item.get("position").unwrap_or(item);
-                                        let c =
-                                            p.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+                                        let c = p.get("coin").and_then(Value::as_str).unwrap_or("");
                                         if c.eq_ignore_ascii_case(&asset.coin) {
-                                            live_szi = parse_f(p.get("szi"));
-                                            live_pos_val = parse_f(p.get("positionValue"));
+                                            live_szi = parse_hl_f64(p.get("szi"));
+                                            live_pos_val = parse_hl_f64(p.get("positionValue"));
                                             break;
                                         }
                                     }
@@ -1142,139 +1345,260 @@ impl ExecutionEngine {
                                     let live_qty = live_szi.abs();
                                     closed_qty = live_qty;
                                     let close_is_buy = live_szi < 0.0;
-                                    let mark_px = if asset.mark_price > 0.0 {
-                                        asset.mark_price
-                                    } else if live_pos_val > 0.0 {
+                                    let implied_mark = if live_pos_val > 0.0 && live_qty > 0.0 {
                                         round_dp(live_pos_val / live_qty, 6)
+                                    } else {
+                                        0.0
+                                    };
+                                    let mark_px = if implied_mark > 0.0 {
+                                        implied_mark
+                                    } else if asset.mark_price > 0.0 {
+                                        asset.mark_price
                                     } else {
                                         exit_px
                                     };
-                                    if live_pos_val > 0.0 {
-                                        exit_px = round_dp(live_pos_val / live_qty, 6);
+                                    if implied_mark > 0.0 {
+                                        exit_px = implied_mark;
                                     }
 
-                                    let band_lo =
-                                        (mark_px * (1.0 - 0.038)).max(asset.tick_size.max(1e-8));
+                                    let tick = asset.tick_size.max(1e-8);
+                                    let band_lo = (mark_px * (1.0 - 0.038)).max(tick);
                                     let band_hi = mark_px * (1.0 + 0.038);
 
-                                    // Submit reduceOnly IOC order for exact live_qty clamped strictly inside oracle band
-                                    let mut filled_on_hl = false;
-                                    let mut close_eoid_opt: Option<String> = None;
-                                    let mut live_fee_usdc = 0.0_f64;
-                                    let mut fill_notional_sum = 0.0_f64;
-                                    let mut fill_qty_sum = 0.0_f64;
                                     let l2_bbo =
                                         self.http.fetch_l2_book(&asset.coin, &cfg).ok().flatten();
-                                    let bbo_anchor = l2_bbo
-                                        .map(|(bid, ask)| if close_is_buy { ask } else { bid })
-                                        .filter(|&px| px > 0.0)
-                                        .unwrap_or(mark_px);
+                                    let book_crossable_in_band =
+                                        l2_bbo.is_some_and(|(bid, ask)| {
+                                            if close_is_buy {
+                                                ask > 0.0 && ask <= band_hi
+                                            } else {
+                                                bid > 0.0 && bid >= band_lo
+                                            }
+                                        });
+                                    let (passive_px, passive_wire_px) = compute_passive_close_px(
+                                        &asset,
+                                        close_is_buy,
+                                        l2_bbo,
+                                        mark_px,
+                                        band_lo,
+                                        band_hi,
+                                    );
 
-                                    let mut rem_qty = live_qty;
-                                    for (attempt, (ref_anchor, slip)) in [
-                                        (bbo_anchor, 0.0),
-                                        (bbo_anchor, 0.008),
-                                        (bbo_anchor, 0.02),
-                                        (mark_px, HL_ORACLE_BAND_PCT.min(0.038)),
-                                    ]
-                                    .into_iter()
-                                    .enumerate()
-                                    {
-                                        if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
-                                            filled_on_hl = true;
-                                            break;
+                                    let (open_orders_opt, have_frontend_orders) =
+                                        match self.http.fetch_frontend_open_orders(&wallet, &cfg) {
+                                            Ok(orders) => (Some(orders), true),
+                                            Err(_) => {
+                                                match self.http.fetch_open_orders(&wallet, &cfg) {
+                                                    Ok(orders) => (Some(orders), false),
+                                                    Err(_) => (None, false),
+                                                }
+                                            }
+                                        };
+
+                                    let wire_sz_str = format_hl_wire_size_floor(
+                                        live_qty,
+                                        asset.lot_step_size,
+                                        asset.sz_decimals,
+                                    );
+                                    let target_qty = wire_sz_str
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|&q| q > 0.0)
+                                        .unwrap_or(live_qty);
+
+                                    let mut filled_on_hl = false;
+                                    let mut fills = CloseFillAccumulator::new(live_qty);
+                                    let mut kept_existing_passive_close = false;
+                                    let mut mutated_open_orders = false;
+
+                                    if !book_crossable_in_band {
+                                        let keep_passive_oid = if wire_sz_str != "0" {
+                                            open_orders_opt.as_deref().and_then(|orders| {
+                                                find_newest_matching_passive_close_oid(
+                                                    orders,
+                                                    &asset,
+                                                    close_is_buy,
+                                                    target_qty,
+                                                    passive_px,
+                                                    &passive_wire_px,
+                                                )
+                                            })
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(orders) = open_orders_opt.as_deref() {
+                                            let cancels = collect_coin_non_trigger_cancels(
+                                                orders,
+                                                &asset,
+                                                keep_passive_oid,
+                                            );
+                                            if !cancels.is_empty() {
+                                                mutated_open_orders = true;
+                                                let _ = self.http.cancel_orders_batch(
+                                                    cancels,
+                                                    &pk,
+                                                    Some(&self.db),
+                                                    &cfg,
+                                                );
+                                            }
                                         }
-                                        let wire_sz = format_hl_wire_size_floor(
-                                            rem_qty,
-                                            asset.lot_step_size,
+
+                                        if let Some(keep_oid) = keep_passive_oid {
+                                            kept_existing_passive_close = true;
+                                            tracing::info!(
+                                                position_id = position_id,
+                                                symbol = %asset.symbol,
+                                                oid = keep_oid,
+                                                passive_px = passive_px,
+                                                live_qty = live_qty,
+                                                "Preserving existing resting passive reduceOnly close order on illiquid Hyperliquid book"
+                                            );
+                                        }
+                                    } else {
+                                        if let Some(orders) = open_orders_opt.as_deref() {
+                                            let cancels = collect_coin_non_trigger_cancels(
+                                                orders, &asset, None,
+                                            );
+                                            if !cancels.is_empty() {
+                                                mutated_open_orders = true;
+                                                let _ = self.http.cancel_orders_batch(
+                                                    cancels,
+                                                    &pk,
+                                                    Some(&self.db),
+                                                    &cfg,
+                                                );
+                                            }
+                                        }
+
+                                        // Submit reduceOnly IOC order for exact live_qty clamped strictly inside oracle band
+                                        let bbo_anchor = l2_bbo
+                                            .map(|(bid, ask)| if close_is_buy { ask } else { bid })
+                                            .filter(|&px| px > 0.0)
+                                            .unwrap_or(mark_px);
+                                        let band_limit_px =
+                                            if close_is_buy { band_hi } else { band_lo };
+                                        let band_limit_wire = format_hl_wire_price(
+                                            band_limit_px,
+                                            tick,
                                             asset.sz_decimals,
                                         );
-                                        if wire_sz == "0" {
-                                            filled_on_hl = fill_qty_sum > 0.0;
-                                            break;
-                                        }
-                                        let raw_limit_px = if close_is_buy {
-                                            ref_anchor * (1.0 + slip)
-                                        } else {
-                                            ref_anchor * (1.0 - slip)
-                                        };
-                                        let limit_px = raw_limit_px.clamp(band_lo, band_hi);
-                                        let wire = OrderWire {
-                                            a: asset.asset_index,
-                                            b: close_is_buy,
-                                            p: format_hl_wire_price(
-                                                limit_px,
-                                                asset.tick_size,
-                                                asset.sz_decimals,
-                                            ),
-                                            s: wire_sz,
-                                            r: true,
-                                            t: OrderTypeWire {
-                                                limit: Some(LimitOrderType {
-                                                    tif: "Ioc".to_string(),
-                                                }),
-                                                trigger: None,
-                                            },
-                                            c: Some(derive_hl_cloid_hex(&format!(
-                                                "v2-close-{position_id}-{attempt}-{}",
-                                                now_ms()
-                                            ))),
-                                        };
-                                        if let Ok(ack) = self.http.submit_order_wire(
-                                            wire,
-                                            rem_qty,
-                                            ref_anchor,
-                                            taker_fee_bps,
-                                            &pk,
-                                            Some(&self.db),
-                                            &cfg,
-                                        ) {
-                                            if ack.accepted
-                                                && ack.status == "FILLED"
-                                                && ack.filled_quantity > 0.0
+                                        let mut rejected_wire_prices: HashSet<String> =
+                                            HashSet::new();
+
+                                        for (attempt, (ref_anchor, slip)) in [
+                                            (bbo_anchor, 0.0),
+                                            (bbo_anchor, 0.008),
+                                            (bbo_anchor, 0.02),
+                                            (mark_px, HL_ORACLE_BAND_PCT.min(0.038)),
+                                        ]
+                                        .into_iter()
+                                        .enumerate()
+                                        {
+                                            if fills.rem_qty <= asset.lot_step_size * 0.5
+                                                || fills.rem_qty <= 1e-9
                                             {
-                                                let fill_px = if ack.avg_fill_price > 0.0 {
-                                                    ack.avg_fill_price
-                                                } else {
-                                                    ref_anchor
-                                                };
-                                                live_fee_usdc += ack.fee_usdc;
-                                                fill_notional_sum += fill_px * ack.filled_quantity;
-                                                fill_qty_sum += ack.filled_quantity;
-                                                close_eoid_opt = ack.exchange_order_id;
-                                                rem_qty = (rem_qty - ack.filled_quantity).max(0.0);
-                                                if rem_qty <= asset.lot_step_size * 0.5
-                                                    || rem_qty <= 1e-9
-                                                {
-                                                    filled_on_hl = true;
-                                                    break;
+                                                filled_on_hl = true;
+                                                break;
+                                            }
+                                            let wire_sz = format_hl_wire_size_floor(
+                                                fills.rem_qty,
+                                                asset.lot_step_size,
+                                                asset.sz_decimals,
+                                            );
+                                            if wire_sz == "0" {
+                                                filled_on_hl = fills.fill_qty_sum > 0.0;
+                                                break;
+                                            }
+                                            let raw_limit_px = if close_is_buy {
+                                                ref_anchor * (1.0 + slip)
+                                            } else {
+                                                ref_anchor * (1.0 - slip)
+                                            };
+                                            let limit_px = raw_limit_px.clamp(band_lo, band_hi);
+                                            let wire_px = format_hl_wire_price(
+                                                limit_px,
+                                                tick,
+                                                asset.sz_decimals,
+                                            );
+                                            if rejected_wire_prices.contains(&wire_px) {
+                                                continue;
+                                            }
+                                            let at_band_limit = if close_is_buy {
+                                                raw_limit_px >= band_hi - 1e-12
+                                                    || wire_px == band_limit_wire
+                                            } else {
+                                                raw_limit_px <= band_lo + 1e-12
+                                                    || wire_px == band_limit_wire
+                                            };
+                                            let wire = OrderWire {
+                                                a: asset.asset_index,
+                                                b: close_is_buy,
+                                                p: wire_px.clone(),
+                                                s: wire_sz,
+                                                r: true,
+                                                t: OrderTypeWire {
+                                                    limit: Some(LimitOrderType {
+                                                        tif: "Ioc".to_string(),
+                                                    }),
+                                                    trigger: None,
+                                                },
+                                                c: Some(derive_hl_cloid_hex(&format!(
+                                                    "v2-close-{position_id}-{attempt}-{}",
+                                                    now_ms()
+                                                ))),
+                                            };
+                                            mutated_open_orders = true;
+                                            match self.http.submit_order_wire(
+                                                wire,
+                                                fills.rem_qty,
+                                                ref_anchor,
+                                                taker_fee_bps,
+                                                &pk,
+                                                Some(&self.db),
+                                                &cfg,
+                                            ) {
+                                                Ok(ack) => {
+                                                    let accepted = ack.accepted;
+                                                    let raw_err = ack.raw_error.clone();
+                                                    if fills.record_fill(
+                                                        ack,
+                                                        ref_anchor,
+                                                        asset.lot_step_size,
+                                                    ) {
+                                                        filled_on_hl = true;
+                                                        break;
+                                                    }
+                                                    if !accepted {
+                                                        rejected_wire_prices.insert(wire_px);
+                                                        if is_ioc_no_match_error(raw_err.as_deref())
+                                                            && at_band_limit
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        position_id = position_id,
+                                                        symbol = %asset.symbol,
+                                                        attempt = attempt,
+                                                        error = %e,
+                                                        "Hyperliquid IOC close submission error"
+                                                    );
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Fallback on illiquid books: submit a resting passive reduceOnly GTC limit order inside oracle band
+                                    // Fallback on illiquid books: submit ONE resting passive reduceOnly GTC limit order inside oracle band
                                     if !filled_on_hl
-                                        && rem_qty > asset.lot_step_size * 0.5
-                                        && rem_qty > 1e-9
+                                        && !kept_existing_passive_close
+                                        && fills.rem_qty > asset.lot_step_size * 0.5
+                                        && fills.rem_qty > 1e-9
                                     {
-                                        let passive_raw = if close_is_buy {
-                                            l2_bbo
-                                                .map(|(bid, _)| bid + asset.tick_size.max(1e-8))
-                                                .filter(|&px| px > 0.0)
-                                                .unwrap_or(mark_px)
-                                        } else {
-                                            l2_bbo
-                                                .map(|(_, ask)| {
-                                                    (ask - asset.tick_size.max(1e-8))
-                                                        .max(asset.tick_size.max(1e-8))
-                                                })
-                                                .filter(|&px| px > 0.0)
-                                                .unwrap_or(mark_px)
-                                        };
-                                        let passive_px = passive_raw.clamp(band_lo, band_hi);
                                         let passive_sz = format_hl_wire_size_floor(
-                                            rem_qty,
+                                            fills.rem_qty,
                                             asset.lot_step_size,
                                             asset.sz_decimals,
                                         );
@@ -1282,11 +1606,7 @@ impl ExecutionEngine {
                                             let passive_wire = OrderWire {
                                                 a: asset.asset_index,
                                                 b: close_is_buy,
-                                                p: format_hl_wire_price(
-                                                    passive_px,
-                                                    asset.tick_size,
-                                                    asset.sz_decimals,
-                                                ),
+                                                p: passive_wire_px,
                                                 s: passive_sz,
                                                 r: true,
                                                 t: OrderTypeWire {
@@ -1300,47 +1620,36 @@ impl ExecutionEngine {
                                                     now_ms()
                                                 ))),
                                             };
+                                            mutated_open_orders = true;
                                             if let Ok(ack) = self.http.submit_order_wire(
                                                 passive_wire,
-                                                rem_qty,
+                                                fills.rem_qty,
                                                 passive_px,
                                                 taker_fee_bps,
                                                 &pk,
                                                 Some(&self.db),
                                                 &cfg,
                                             ) {
-                                                if ack.accepted
-                                                    && ack.status == "FILLED"
-                                                    && ack.filled_quantity > 0.0
-                                                {
-                                                    let fill_px = if ack.avg_fill_price > 0.0 {
-                                                        ack.avg_fill_price
-                                                    } else {
-                                                        passive_px
-                                                    };
-                                                    live_fee_usdc += ack.fee_usdc;
-                                                    fill_notional_sum +=
-                                                        fill_px * ack.filled_quantity;
-                                                    fill_qty_sum += ack.filled_quantity;
-                                                    close_eoid_opt = ack.exchange_order_id;
-                                                    rem_qty =
-                                                        (rem_qty - ack.filled_quantity).max(0.0);
-                                                    if rem_qty <= asset.lot_step_size * 0.5
-                                                        || rem_qty <= 1e-9
-                                                    {
-                                                        filled_on_hl = true;
-                                                    }
+                                                if fills.record_fill(
+                                                    ack,
+                                                    passive_px,
+                                                    asset.lot_step_size,
+                                                ) {
+                                                    filled_on_hl = true;
                                                 }
                                             }
                                         }
                                     }
 
                                     if filled_on_hl {
-                                        if fill_qty_sum > 0.0 {
-                                            exit_px = round_dp(fill_notional_sum / fill_qty_sum, 6);
-                                            fee_usdc = round_dp(live_fee_usdc, 4);
+                                        if fills.fill_qty_sum > 0.0 {
+                                            exit_px = round_dp(
+                                                fills.fill_notional_sum / fills.fill_qty_sum,
+                                                6,
+                                            );
+                                            fee_usdc = round_dp(fills.live_fee_usdc, 4);
                                         }
-                                        if let Some(ref eoid) = close_eoid_opt {
+                                        if let Some(ref eoid) = fills.close_eoid_opt {
                                             let oid_num =
                                                 eoid.strip_prefix("hl-").unwrap_or(eoid.as_str());
                                             let coid = format!(
@@ -1362,26 +1671,34 @@ impl ExecutionEngine {
                                         self.illiquid_close_backoff_ms
                                             .lock()
                                             .insert(position_id, now_ms());
-                                        let _ = self.chaser.ensure_exchange_tpsl_orders(
-                                            position_id,
-                                            &asset,
-                                            side,
-                                            rem_qty,
-                                            exit_px,
-                                            pos.protective_stop_px,
-                                            pos.take_profit_px,
-                                            pos.protective_stop_oid.as_deref(),
-                                            pos.take_profit_oid.as_deref(),
-                                            false,
-                                            false,
-                                            None,
-                                            &cfg,
-                                        );
+                                        let tpsl_snapshot =
+                                            if !mutated_open_orders && have_frontend_orders {
+                                                open_orders_opt.as_deref()
+                                            } else {
+                                                None
+                                            };
+                                        let _ =
+                                            self.chaser.ensure_exchange_tpsl_orders_with_orders(
+                                                position_id,
+                                                &asset,
+                                                side,
+                                                fills.rem_qty,
+                                                exit_px,
+                                                pos.protective_stop_px,
+                                                pos.take_profit_px,
+                                                pos.protective_stop_oid.as_deref(),
+                                                pos.take_profit_oid.as_deref(),
+                                                false,
+                                                false,
+                                                tpsl_snapshot,
+                                                &cfg,
+                                            );
                                         tracing::warn!(
                                             symbol = %asset.symbol,
                                             live_qty = live_qty,
-                                            rem_qty = rem_qty,
-                                            "Hyperliquid reduceOnly IOC close did not completely fill due to illiquid Testnet book"
+                                            rem_qty = fills.rem_qty,
+                                            kept_passive_close = kept_existing_passive_close,
+                                            "Hyperliquid reduceOnly close did not completely fill due to illiquid Testnet book"
                                         );
                                     }
                                 } else {
@@ -1631,5 +1948,624 @@ impl ExecutionEngine {
         });
 
         tx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_db::AssetUpsertInput;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+
+    fn sample_met_asset() -> ExchangeAsset {
+        ExchangeAsset {
+            id: 142,
+            symbol: "MET-USDC".to_string(),
+            coin: "MET".to_string(),
+            asset_index: 195,
+            sz_decimals: 0,
+            tick_size: 0.00001,
+            lot_step_size: 1.0,
+            max_leverage: 3.0,
+            mark_price: 0.2137,
+            mid_price: 0.188055,
+            oracle_price: 0.25095,
+            funding_rate_hourly: 0.0000125,
+            day_volume_usdc: 1_000_000.0,
+            open_interest_usdc: 500_000.0,
+            prev_day_price: 0.22,
+            is_core_eligible: false,
+            is_event_eligible: false,
+            is_priority_watched: true,
+            created_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn spawn_mock_hl_server<F>(handler: F) -> (u16, std::sync::mpsc::Sender<()>)
+    where
+        F: FnMut(&str, &Value) -> (u16, Value) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handler_arc = Arc::new(Mutex::new(handler));
+
+        std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = Vec::with_capacity(4096);
+                        let mut tmp = [0u8; 2048];
+                        let mut header_end = None;
+                        let mut content_len = 0usize;
+                        while let Ok(n) = stream.read(&mut tmp) {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    let hdr = String::from_utf8_lossy(&buf[..pos]);
+                                    for line in hdr.lines() {
+                                        if let Some((k, v)) = line.split_once(':') {
+                                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                                content_len =
+                                                    v.trim().parse::<usize>().unwrap_or(0);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(hend) = header_end {
+                                if buf.len() >= hend + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(hdr_end) = header_end else {
+                            continue;
+                        };
+                        let hdr_str = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                        let path = hdr_str
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let body_bytes = &buf[hdr_end..buf.len().min(hdr_end + content_len)];
+                        let req_json: Value =
+                            serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
+                        let (status, resp_json) = (handler_arc.lock())(&path, &req_json);
+                        let resp_body = resp_json.to_string();
+                        let resp = format!(
+                            "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (port, stop_tx)
+    }
+
+    fn setup_live_met_engine(
+        port: u16,
+        stale_db_mark: f64,
+    ) -> (DatabaseManager, ExecutionEngine, i64) {
+        let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let engine = ExecutionEngine::new(db.clone());
+        let asset_id = db
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "MET".to_string(),
+                asset_index: 195,
+                sz_decimals: 0,
+                tick_size: 0.00001,
+                lot_step_size: 1.0,
+                max_leverage: 3.0,
+                mark_price: stale_db_mark,
+                mid_price: stale_db_mark,
+                oracle_price: 0.25095,
+                funding_rate_hourly: 0.0000125,
+                day_volume_usdc: 1_000_000.0,
+                open_interest_usdc: 500_000.0,
+                prev_day_price: 0.22,
+                is_core_eligible: false,
+                is_event_eligible: false,
+                is_priority_watched: true,
+            })
+            .unwrap();
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+            .unwrap();
+        db.set_config_value(
+            "hyperliquid_allowed_hosts",
+            "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "private_key",
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            None,
+        )
+        .unwrap();
+
+        let (pos_id, _) = db
+            .sync_open_position_from_exchange_v2(
+                asset_id,
+                "MET",
+                OrderSide::Long,
+                0.23227,
+                stale_db_mark,
+                9634.0,
+                2058.7858,
+                0.0,
+                0.5,
+                0.20111,
+                0.25086,
+                0.0,
+                Some(now_ms() - 600_000),
+            )
+            .unwrap();
+        db.update_position_tpsl_orders(
+            pos_id,
+            0.20111,
+            Some("hl-65605015926"),
+            0.25086,
+            Some("hl-65648930301"),
+        )
+        .unwrap();
+
+        (db, engine, pos_id)
+    }
+
+    #[test]
+    fn test_passive_reduce_only_close_matching_and_non_trigger_cancels() {
+        let met = sample_met_asset();
+        let band_lo = 0.2137 * (1.0 - 0.038);
+        let band_hi = 0.2137 * (1.0 + 0.038);
+        let (passive_px, passive_wire_px) = compute_passive_close_px(
+            &met,
+            false,
+            Some((0.16241, 0.21370)),
+            0.2137,
+            band_lo,
+            band_hi,
+        );
+        assert!((passive_px - 0.21369).abs() < 1e-9);
+        assert_eq!(passive_wire_px, "0.21369");
+
+        let orders = vec![
+            // Resting SL trigger (must never match passive close or get cancelled)
+            json!({
+                "coin": "MET",
+                "oid": 65605015926u64,
+                "side": "A",
+                "sz": "9634",
+                "limitPx": "0.185",
+                "reduceOnly": true,
+                "isTrigger": true,
+                "orderType": "Stop Market",
+                "triggerPx": "0.20111",
+                "timestamp": 1000
+            }),
+            // Older duplicate matching passive reduceOnly close
+            json!({
+                "coin": "MET",
+                "oid": 70001u64,
+                "side": "A",
+                "sz": "9634",
+                "limitPx": "0.21369",
+                "reduceOnly": true,
+                "isTrigger": false,
+                "orderType": "Limit",
+                "triggerPx": "0.0",
+                "timestamp": 2000
+            }),
+            // Newest matching passive reduceOnly close (within 1 lot & 2 ticks)
+            json!({
+                "coin": "MET",
+                "oid": 70002u64,
+                "side": "A",
+                "sz": "9633",
+                "limitPx": "0.21371",
+                "reduceOnly": true,
+                "isTrigger": false,
+                "orderType": "Limit",
+                "triggerPx": "0.0",
+                "timestamp": 3000
+            }),
+            // Non-reduceOnly entry order (must NOT match and MUST cancel)
+            json!({
+                "coin": "MET",
+                "oid": 70003u64,
+                "side": "B",
+                "sz": "500",
+                "limitPx": "0.21369",
+                "reduceOnly": false,
+                "isTrigger": false,
+                "orderType": "Limit",
+                "timestamp": 4000
+            }),
+        ];
+
+        let keep = find_newest_matching_passive_close_oid(
+            &orders,
+            &met,
+            false,
+            9634.0,
+            passive_px,
+            &passive_wire_px,
+        );
+        assert_eq!(keep, Some(70002));
+
+        let cancels = collect_coin_non_trigger_cancels(&orders, &met, keep);
+        let cancel_oids: Vec<u64> = cancels.iter().map(|c| c.o).collect();
+        assert_eq!(cancel_oids, vec![70001, 70003]);
+
+        // Position TPSL Limit orders (`isPositionTpsl: true` even when `isTrigger: false`) must count as triggers
+        let pos_tpsl_limit = json!({
+            "coin": "MET",
+            "oid": 70005u64,
+            "side": "A",
+            "sz": "9634",
+            "limitPx": "0.21369",
+            "reduceOnly": true,
+            "isTrigger": false,
+            "isPositionTpsl": true,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": 6000
+        });
+        assert!(is_hl_trigger_order(&pos_tpsl_limit));
+        assert_eq!(
+            find_newest_matching_passive_close_oid(
+                std::slice::from_ref(&pos_tpsl_limit),
+                &met,
+                false,
+                9634.0,
+                passive_px,
+                &passive_wire_px
+            ),
+            None
+        );
+        assert!(collect_coin_non_trigger_cancels(&[pos_tpsl_limit], &met, None).is_empty());
+        assert!((parse_hl_f64(Some(&json!(" 0.2137 "))) - 0.2137).abs() < 1e-9);
+        assert_eq!(parse_hl_oid_val(&json!({ "oid": " 70005 " })), Some(70005));
+
+        // Off-price (>2 ticks) or off-size (>1 lot) orders must NOT match
+        let too_far_px = json!({
+            "coin": "MET",
+            "oid": 70004u64,
+            "side": "A",
+            "sz": " 9634 ",
+            "limitPx": "0.21372",
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "timestamp": 5000
+        });
+        assert_eq!(
+            find_newest_matching_passive_close_oid(
+                &[too_far_px],
+                &met,
+                false,
+                9634.0,
+                passive_px,
+                &passive_wire_px
+            ),
+            None
+        );
+        assert!(is_ioc_no_match_error(Some(
+            "Order could not immediately match against any resting orders."
+        )));
+        assert!(is_ioc_no_match_error(Some("iocCancelRejected")));
+    }
+
+    #[test]
+    fn test_close_or_cancel_illiquid_book_skips_iocs_and_preserves_passive_reduce_only() {
+        let open_orders_state = Arc::new(Mutex::new(vec![
+            json!({
+                "coin": "MET",
+                "oid": 65605015926u64,
+                "isTrigger": true,
+                "orderType": "Stop Market",
+                "triggerPx": "0.20111",
+                "sz": "9634"
+            }),
+            json!({
+                "coin": "MET",
+                "oid": 65648930301u64,
+                "isTrigger": true,
+                "orderType": "Take Profit Market",
+                "triggerPx": "0.25086",
+                "sz": "9634"
+            }),
+        ]));
+        let open_orders_srv = open_orders_state.clone();
+        let submitted_orders = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let submitted_srv = submitted_orders.clone();
+        let cancelled_oids = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let cancelled_srv = cancelled_oids.clone();
+
+        let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+            if path == "/info" {
+                let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+                return match typ {
+                    "clearinghouseState" => (
+                        200,
+                        json!({
+                            "marginSummary": { "accountValue": "850.0" },
+                            "assetPositions": [{
+                                "position": {
+                                    "coin": "MET",
+                                    "szi": "9634",
+                                    "entryPx": "0.23227",
+                                    "positionValue": "2058.7858"
+                                }
+                            }]
+                        }),
+                    ),
+                    "l2Book" => (
+                        200,
+                        json!({
+                            "levels": [
+                                [{"px": "0.16241", "sz": "193"}],
+                                [{"px": "0.21370", "sz": "1400"}]
+                            ]
+                        }),
+                    ),
+                    "frontendOpenOrders" | "openOrders" => {
+                        (200, Value::Array(open_orders_srv.lock().clone()))
+                    }
+                    _ => (200, json!([])),
+                };
+            }
+            let action_type = body
+                .pointer("/action/type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if action_type == "cancel" {
+                if let Some(arr) = body.pointer("/action/cancels").and_then(Value::as_array) {
+                    for c in arr {
+                        if let Some(o) = c.get("o").and_then(Value::as_u64) {
+                            cancelled_srv.lock().push(o);
+                        }
+                    }
+                }
+                return (200, json!({ "status": "ok" }));
+            }
+            if action_type == "order" {
+                if let Some(arr) = body.pointer("/action/orders").and_then(Value::as_array) {
+                    for ord in arr {
+                        submitted_srv.lock().push(ord.clone());
+                    }
+                }
+                return (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [{ "resting": { "oid": 880001u64 } }]
+                            }
+                        }
+                    }),
+                );
+            }
+            (200, json!({ "status": "ok" }))
+        });
+
+        // Stale DB mark 0.20115 must be superseded by live clearinghouse implied mark (2058.7858/9634 = 0.2137)
+        let (_db, engine, pos_id) = setup_live_met_engine(port, 0.20115);
+
+        // Pass 1: illiquid l2Book (bid 0.16241 < band_lo 0.20558) + no resting passive close -> 0 IOCs, 1 GTC @ 0.21369
+        let rep1 = engine
+            .close_or_cancel_position(pos_id, "CLOSE", Some(300))
+            .unwrap();
+        assert_eq!(rep1.final_status, "OPEN");
+        assert!(engine
+            .illiquid_close_backoff_ms
+            .lock()
+            .contains_key(&pos_id));
+        assert!(cancelled_oids.lock().is_empty());
+        {
+            let subs = submitted_orders.lock();
+            assert_eq!(subs.len(), 1);
+            assert_eq!(subs[0].pointer("/t/limit/tif"), Some(&json!("Gtc")));
+            assert_eq!(subs[0].get("r"), Some(&json!(true)));
+            assert_eq!(subs[0].get("b"), Some(&json!(false)));
+            assert_eq!(subs[0].get("p"), Some(&json!("0.21369")));
+            assert_eq!(subs[0].get("s"), Some(&json!("9634")));
+        }
+
+        // Pass 2: resting passive reduceOnly limit order now exists on HL -> 0 IOCs, 0 GTCs, 0 cancels
+        submitted_orders.lock().clear();
+        cancelled_oids.lock().clear();
+        open_orders_state.lock().push(json!({
+            "coin": "MET",
+            "oid": 880001u64,
+            "side": "A",
+            "sz": "9634",
+            "limitPx": "0.21369",
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": now_ms()
+        }));
+
+        let rep2 = engine
+            .close_or_cancel_position(pos_id, "CLOSE", Some(300))
+            .unwrap();
+        assert_eq!(rep2.final_status, "OPEN");
+        assert!(submitted_orders.lock().is_empty());
+        assert!(cancelled_oids.lock().is_empty());
+
+        let _ = stop_tx.send(());
+    }
+
+    #[test]
+    fn test_close_or_cancel_ioc_deduplicates_clamped_prices_and_breaks_early_on_band_reject() {
+        let reject_error_msg = Arc::new(Mutex::new(
+            "Order could not immediately match against any resting orders.".to_string(),
+        ));
+        let reject_srv = reject_error_msg.clone();
+        let submitted_orders = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let submitted_srv = submitted_orders.clone();
+
+        let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+            if path == "/info" {
+                let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+                return match typ {
+                    "clearinghouseState" => (
+                        200,
+                        json!({
+                            "marginSummary": { "accountValue": "850.0" },
+                            "assetPositions": [{
+                                "position": {
+                                    "coin": "MET",
+                                    "szi": "9634",
+                                    "entryPx": "0.23227",
+                                    "positionValue": "1926.80"
+                                }
+                            }]
+                        }),
+                    ),
+                    // mark_px = 0.20000 -> band_lo = 0.19240; bid 0.19300 is inside band so IOC loop runs
+                    "l2Book" => (
+                        200,
+                        json!({
+                            "levels": [
+                                [{"px": "0.19300", "sz": "10"}],
+                                [{"px": "0.21000", "sz": "1000"}]
+                            ]
+                        }),
+                    ),
+                    "frontendOpenOrders" | "openOrders" => (
+                        200,
+                        json!([
+                            {
+                                "coin": "MET",
+                                "oid": 65605015926u64,
+                                "isTrigger": true,
+                                "orderType": "Stop Market",
+                                "triggerPx": "0.20111",
+                                "sz": "9634"
+                            },
+                            {
+                                "coin": "MET",
+                                "oid": 65648930301u64,
+                                "isTrigger": true,
+                                "orderType": "Take Profit Market",
+                                "triggerPx": "0.25086",
+                                "sz": "9634"
+                            }
+                        ]),
+                    ),
+                    _ => (200, json!([])),
+                };
+            }
+            if body.pointer("/action/type").and_then(Value::as_str) == Some("order") {
+                if let Some(arr) = body.pointer("/action/orders").and_then(Value::as_array) {
+                    let mut is_ioc = false;
+                    for ord in arr {
+                        is_ioc = ord.pointer("/t/limit/tif").and_then(Value::as_str) == Some("Ioc");
+                        submitted_srv.lock().push(ord.clone());
+                    }
+                    if is_ioc {
+                        let msg = reject_srv.lock().clone();
+                        return (
+                            200,
+                            json!({
+                                "status": "ok",
+                                "response": {
+                                    "type": "order",
+                                    "data": { "statuses": [{ "error": msg }] }
+                                }
+                            }),
+                        );
+                    }
+                }
+                return (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": { "statuses": [{ "resting": { "oid": 880002u64 } }] }
+                        }
+                    }),
+                );
+            }
+            (200, json!({ "status": "ok" }))
+        });
+
+        let (_db, engine, pos_id) = setup_live_met_engine(port, 0.20000);
+
+        // Case A: ioc no-match at clamped band_lo (0.1924) breaks early after 2 IOC attempts (0.193, 0.1924) + 1 GTC
+        let rep_a = engine
+            .close_or_cancel_position(pos_id, "CLOSE", Some(300))
+            .unwrap();
+        assert_eq!(rep_a.final_status, "OPEN");
+        {
+            let subs = submitted_orders.lock();
+            let ioc_prices: Vec<&str> = subs
+                .iter()
+                .filter(|o| o.pointer("/t/limit/tif").and_then(Value::as_str) == Some("Ioc"))
+                .filter_map(|o| o.get("p").and_then(Value::as_str))
+                .collect();
+            assert_eq!(ioc_prices, vec!["0.193", "0.1924"]);
+            let gtc_count = subs
+                .iter()
+                .filter(|o| o.pointer("/t/limit/tif").and_then(Value::as_str) == Some("Gtc"))
+                .count();
+            assert_eq!(gtc_count, 1);
+        }
+
+        // Case B: non-ioc error still deduplicates clamped band_lo across attempts 1, 2, 3 (only 2 IOC calls, never 4)
+        submitted_orders.lock().clear();
+        *reject_error_msg.lock() = "Temporary liquidity lock".to_string();
+        let rep_b = engine
+            .close_or_cancel_position(pos_id, "CLOSE", Some(300))
+            .unwrap();
+        assert_eq!(rep_b.final_status, "OPEN");
+        {
+            let subs = submitted_orders.lock();
+            let ioc_prices: Vec<&str> = subs
+                .iter()
+                .filter(|o| o.pointer("/t/limit/tif").and_then(Value::as_str) == Some("Ioc"))
+                .filter_map(|o| o.get("p").and_then(Value::as_str))
+                .collect();
+            assert_eq!(ioc_prices, vec!["0.193", "0.1924"]);
+        }
+
+        let _ = stop_tx.send(());
     }
 }

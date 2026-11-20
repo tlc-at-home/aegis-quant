@@ -69,6 +69,122 @@ struct TriggerOrderInfo {
     qty: f64,
 }
 
+pub(crate) fn compute_one_tick_bps(tick: f64, mid: f64) -> f64 {
+    if mid.is_finite() && mid > 0.0 && tick.is_finite() && tick > 0.0 {
+        (tick / mid) * 10_000.0
+    } else {
+        0.0
+    }
+}
+
+/// Anchors and clamps an initial ALO limit price onto the strictly passive side of `(bid, ask)`.
+pub(crate) fn clamp_initial_alo_price(
+    side: OrderSide,
+    ref_mid: f64,
+    bid: f64,
+    ask: f64,
+    tick: f64,
+) -> f64 {
+    let eff_tick = tick.max(1e-8);
+    if side.is_buy() {
+        let max_passive = (ask - eff_tick).max(eff_tick);
+        let raw = bid.min(ref_mid).min(max_passive).max(eff_tick);
+        let mut px = snap_to_tick(raw, eff_tick);
+        if ask > eff_tick * 1.5 && px >= ask - eff_tick * 1e-6 {
+            px = snap_to_tick((px - eff_tick).max(eff_tick), eff_tick);
+        }
+        px
+    } else {
+        let min_passive = bid + eff_tick;
+        let raw = ask.max(ref_mid).max(min_passive).max(eff_tick);
+        let mut px = snap_to_tick(raw, eff_tick);
+        if px <= bid + eff_tick * 1e-6 {
+            px = snap_to_tick(px + eff_tick, eff_tick);
+        }
+        px
+    }
+}
+
+/// Computes a chased ALO limit price from `live_mid` and clamps it strictly passive against `(bid, ask)`.
+pub(crate) fn clamp_chase_alo_price(
+    side: OrderSide,
+    live_mid: f64,
+    bbo: Option<(f64, f64)>,
+    tick: f64,
+) -> f64 {
+    let eff_tick = tick.max(1e-8);
+    let mut px = if side.is_buy() {
+        snap_to_tick((live_mid - eff_tick).max(eff_tick), eff_tick)
+    } else {
+        snap_to_tick(live_mid + eff_tick, eff_tick)
+    };
+    if let Some((bid, ask)) =
+        bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+    {
+        if side.is_buy() {
+            let mut max_passive = snap_to_tick((ask - eff_tick).max(eff_tick), eff_tick);
+            if ask > eff_tick * 1.5 && max_passive >= ask - eff_tick * 1e-6 {
+                max_passive = snap_to_tick((max_passive - eff_tick).max(eff_tick), eff_tick);
+            }
+            px = snap_to_tick(px.min(max_passive).max(eff_tick), eff_tick);
+        } else {
+            let mut min_passive = snap_to_tick(bid + eff_tick, eff_tick);
+            if min_passive <= bid + eff_tick * 1e-6 {
+                min_passive = snap_to_tick(min_passive + eff_tick, eff_tick);
+            }
+            px = snap_to_tick(px.max(min_passive).max(eff_tick), eff_tick);
+        }
+    }
+    px
+}
+
+/// Steps a rejected ALO chase price 1 extra tick passive relative to `rejected_px` and fresh `l2Book`.
+pub(crate) fn step_more_passive_alo_price(
+    side: OrderSide,
+    rejected_px: f64,
+    bbo: Option<(f64, f64)>,
+    tick: f64,
+) -> f64 {
+    let eff_tick = tick.max(1e-8);
+    if side.is_buy() {
+        let mut px = snap_to_tick((rejected_px - eff_tick).max(eff_tick), eff_tick);
+        if let Some((_bid, ask)) =
+            bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        {
+            let bbo_two_ticks = snap_to_tick((ask - 2.0 * eff_tick).max(eff_tick), eff_tick);
+            px = px.min(bbo_two_ticks).max(eff_tick);
+            if ask > eff_tick * 1.5 && px >= ask - eff_tick * 1e-6 {
+                px = snap_to_tick((px - eff_tick).max(eff_tick), eff_tick);
+            }
+        }
+        snap_to_tick(px, eff_tick)
+    } else {
+        let mut px = snap_to_tick(rejected_px + eff_tick, eff_tick);
+        if let Some((bid, _ask)) =
+            bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        {
+            let bbo_two_ticks = snap_to_tick(bid + 2.0 * eff_tick, eff_tick);
+            px = px.max(bbo_two_ticks);
+            if px <= bid + eff_tick * 1e-6 {
+                px = snap_to_tick(px + eff_tick, eff_tick);
+            }
+        }
+        snap_to_tick(px, eff_tick)
+    }
+}
+
+pub(crate) fn is_post_only_crossing_rejection(raw_error: Option<&str>) -> bool {
+    let Some(err) = raw_error else {
+        return false;
+    };
+    let lower = err.to_ascii_lowercase();
+    lower.contains("badalopx")
+        || lower.contains("post only")
+        || lower.contains("post-only")
+        || lower.contains("would immediately match")
+        || lower.contains("would have immediately matched")
+}
+
 pub(crate) fn parse_hl_oid(raw: Option<&str>) -> Option<u64> {
     raw.and_then(|s| s.trim().strip_prefix("hl-").or_else(|| Some(s.trim())))
         .and_then(|s| s.parse::<u64>().ok())
@@ -225,7 +341,7 @@ impl OrderChaser {
         }
 
         let tick = req.asset.tick_size.max(1e-8);
-        let limit_price = if req.side.is_buy() {
+        let mut limit_price = if req.side.is_buy() {
             snap_to_tick((ref_mid - tick).max(tick), tick)
         } else {
             snap_to_tick(ref_mid + tick, tick)
@@ -246,13 +362,6 @@ impl OrderChaser {
         let default_stop_pct = cfg
             .get_f64("protective_stop_default_pct", 0.04)
             .clamp(0.005, 0.25);
-        let stop_px = if req.protective_stop_px > 0.0 {
-            snap_to_tick(req.protective_stop_px, tick)
-        } else if req.side.is_buy() {
-            snap_to_tick(limit_price * (1.0 - default_stop_pct), tick)
-        } else {
-            snap_to_tick(limit_price * (1.0 + default_stop_pct), tick)
-        };
 
         let coid = format!(
             "v2-{}-{}-{}",
@@ -279,6 +388,9 @@ impl OrderChaser {
                         )));
                     }
                 }
+                if bid > 0.0 && ask >= bid {
+                    limit_price = clamp_initial_alo_price(req.side, ref_mid, bid, ask, tick);
+                }
             }
             let pk = cfg.get_str("private_key", "");
             let wire = build_limit_order_wire(
@@ -294,7 +406,7 @@ impl OrderChaser {
                 Some(&coid),
             );
             let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
-            let ack = self.http.submit_order_wire(
+            let ack = match self.http.submit_order_wire(
                 wire,
                 qty,
                 limit_price,
@@ -302,12 +414,30 @@ impl OrderChaser {
                 &pk,
                 Some(&self.db),
                 &cfg,
-            )?;
+            ) {
+                Ok(ack) => ack,
+                Err(err) => {
+                    tracing::warn!(
+                        symbol = %req.asset.symbol,
+                        limit_price = limit_price,
+                        error = %err,
+                        "Hyperliquid WORKING ALO submit_order_wire failed"
+                    );
+                    return Err(err);
+                }
+            };
             if !ack.accepted {
+                let reason = ack.raw_error.unwrap_or_else(|| "REJECTED".to_string());
+                tracing::warn!(
+                    symbol = %req.asset.symbol,
+                    limit_price = limit_price,
+                    status = %ack.status,
+                    error = %reason,
+                    "Hyperliquid rejected initial WORKING ALO order"
+                );
                 return Err(AegisError::Execution(format!(
-                    "Hyperliquid rejected WORKING ALO order on {}: {}",
-                    req.asset.symbol,
-                    ack.raw_error.unwrap_or_else(|| "REJECTED".to_string())
+                    "Hyperliquid rejected WORKING ALO order on {}: {reason}",
+                    req.asset.symbol
                 )));
             }
             exchange_oid = ack.exchange_order_id.clone();
@@ -316,6 +446,14 @@ impl OrderChaser {
                     Some((ack.avg_fill_price, ack.filled_quantity, ack.fee_usdc));
             }
         }
+
+        let stop_px = if req.protective_stop_px > 0.0 {
+            snap_to_tick(req.protective_stop_px, tick)
+        } else if req.side.is_buy() {
+            snap_to_tick(limit_price * (1.0 - default_stop_pct), tick)
+        } else {
+            snap_to_tick(limit_price * (1.0 + default_stop_pct), tick)
+        };
 
         let reserved_usdc = if req.reserved_margin_usdc > 0.0 {
             round_dp(req.reserved_margin_usdc, 4)
@@ -493,19 +631,23 @@ impl OrderChaser {
             }
         }
 
+        let one_tick_bps = compute_one_tick_bps(tick, live_mid);
+        let effective_chase_threshold_bps = chase_threshold_bps.max(one_tick_bps * 1.5);
         let abs_dist_bps = if live_mid > 0.0 {
             ((live_mid - ordered.limit_price).abs() / live_mid) * 10_000.0
         } else {
             0.0
         };
         let is_expired = now_ms().saturating_sub(ordered.created_at_ms) >= ENTRY_PARTIAL_GRACE_MS;
+        let missing_exchange_order =
+            is_live_exchange && ordered.exchange_order_id.as_deref() == Some("");
 
-        // Check for immediate exchange fills while resting (< chase_threshold_bps) and inside the 45s
+        // Check for immediate exchange fills while resting (< effective_chase_threshold_bps) and inside the 45s
         // grace window: promote >= 85% (or within 1 lot step) fills cleanly, while holding smaller partial
         // fills in WORKING so the remaining resting ALO order can finish filling.
         if is_live_exchange
             && ordered.chase_count < max_chases
-            && abs_dist_bps < chase_threshold_bps
+            && abs_dist_bps < effective_chase_threshold_bps
             && !is_expired
         {
             if let Some(outcome) = self.try_finalize_existing_exchange_fill(
@@ -621,7 +763,7 @@ impl OrderChaser {
                     "Ioc",
                     Some(&format!("{}-ioc", ordered.client_order_id)),
                 );
-                if let Ok(ack) = self.http.submit_order_wire(
+                match self.http.submit_order_wire(
                     wire,
                     rem_qty,
                     ioc_price,
@@ -630,7 +772,9 @@ impl OrderChaser {
                     Some(&self.db),
                     &cfg,
                 ) {
-                    if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                    Ok(ack)
+                        if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 =>
+                    {
                         let ioc_eoid = ack.exchange_order_id.or(ordered.exchange_order_id.clone());
                         let total_qty = live_qty + ack.filled_quantity;
                         let blended_px = if total_qty > 1e-9 {
@@ -651,7 +795,7 @@ impl OrderChaser {
                             OrderFsmState::CrossingIoc.as_str(),
                             ioc_eoid.as_deref(),
                             &format!(
-                                "Escalated to CROSSING_IOC after {} ALO chases (filled {:.4} @ ${:.4})",
+                                "Escalated to CROSSING_IOC after {} ALO chases (filled {:.4} @ ${:.6})",
                                 ordered.chase_count, total_qty, blended_px
                             ),
                         )?;
@@ -685,6 +829,28 @@ impl OrderChaser {
                             protective_stop_px: stop_px,
                             fees_paid_usdc: total_fee,
                         });
+                    }
+                    Ok(ack) => {
+                        tracing::warn!(
+                            symbol = %ordered.symbol,
+                            position_id = ordered.position_id,
+                            chase_count = ordered.chase_count,
+                            limit_price = ioc_price,
+                            accepted = ack.accepted,
+                            status = %ack.status,
+                            error = ?ack.raw_error,
+                            "Hyperliquid CROSSING_IOC order rejected or unfilled"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %ordered.symbol,
+                            position_id = ordered.position_id,
+                            chase_count = ordered.chase_count,
+                            limit_price = ioc_price,
+                            error = %e,
+                            "Hyperliquid CROSSING_IOC submit_order_wire failed"
+                        );
                     }
                 }
                 // Re-query clearinghouseState after IOC timeout/non-fill before marking CANCELLED
@@ -797,222 +963,24 @@ impl OrderChaser {
             });
         }
 
-        // Perform a 1s top-of-book ALO chase step if mid drifted >= chase_threshold_bps
-        if abs_dist_bps >= chase_threshold_bps {
-            let new_limit_price = if side.is_buy() {
-                snap_to_tick((live_mid - tick).max(tick), tick)
-            } else {
-                snap_to_tick(live_mid + tick, tick)
-            };
-            let mut new_eoid = ordered.exchange_order_id.clone();
-
-            if is_live_exchange {
-                let pk = cfg.get_str("private_key", "");
-                if matches!(
-                    self.cancel_working_entry_oid(ordered, &asset, &cfg),
-                    CancelEntryOutcome::Aborted
-                ) {
-                    return Ok(ChaseStepOutcome::Resting {
-                        position_id: ordered.position_id,
-                        symbol: ordered.symbol.clone(),
-                        limit_price: ordered.limit_price,
-                        distance_from_mid_bps: ordered.distance_from_mid_bps,
-                    });
-                }
-                let live_pos_opt = match self.query_exchange_position_state(&asset, side, &cfg) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            symbol = %ordered.symbol,
-                            error = %e,
-                            "clearinghouseState unreachable before ALO chase; keeping WORKING"
-                        );
-                        return Ok(ChaseStepOutcome::Resting {
-                            position_id: ordered.position_id,
-                            symbol: ordered.symbol.clone(),
-                            limit_price: ordered.limit_price,
-                            distance_from_mid_bps: ordered.distance_from_mid_bps,
-                        });
-                    }
-                };
-                let (live_fill_px, live_qty) = live_pos_opt.unwrap_or((live_mid, 0.0));
-                let rem_qty = remaining_entry_qty(ordered.requested_quantity, live_qty, &asset);
-                if is_entry_fill_complete(ordered.requested_quantity, live_qty, &asset) {
-                    return self.finalize_known_fill_outcome(
-                        ordered,
-                        pos.protective_stop_px,
-                        &asset,
-                        side,
-                        live_fill_px,
-                        live_qty,
-                        round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                        default_stop_pct,
-                        tick,
-                        "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
-                        &cfg,
-                    );
-                }
-                if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
-                    self.db
-                        .cancel_working_order(ordered.position_id, "HL_CHASE_ZERO_REM_CANCELLED")?;
-                    return Ok(ChaseStepOutcome::Cancelled {
-                        position_id: ordered.position_id,
-                        symbol: ordered.symbol.clone(),
-                        reason: "HL_CHASE_ZERO_REM_CANCELLED".to_string(),
-                    });
-                }
-
-                let chase_coid = format!(
-                    "{}-c{}",
-                    ordered.client_order_id,
-                    ordered.chase_count.saturating_add(1)
-                );
-                let wire = build_limit_order_wire(
-                    asset.asset_index,
-                    side.is_buy(),
-                    new_limit_price,
-                    rem_qty,
-                    tick,
-                    asset.lot_step_size,
-                    asset.sz_decimals,
-                    false,
-                    "Alo",
-                    Some(&chase_coid),
-                );
-                match self.http.submit_order_wire(
-                    wire,
-                    rem_qty,
-                    new_limit_price,
-                    maker_fee_bps,
-                    &pk,
-                    Some(&self.db),
-                    &cfg,
-                ) {
-                    Ok(ack) if ack.accepted => {
-                        if ack.status == "FILLED" && ack.filled_quantity > 0.0 {
-                            let total_qty = live_qty + ack.filled_quantity;
-                            let blended_px = if total_qty > 1e-9 {
-                                (live_fill_px * live_qty + ack.avg_fill_price * ack.filled_quantity)
-                                    / total_qty
-                            } else {
-                                ack.avg_fill_price
-                            };
-                            let prior_fee = if live_qty > 1e-9 {
-                                round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4)
-                            } else {
-                                0.0
-                            };
-                            let total_fee = round_dp(prior_fee + ack.fee_usdc, 4);
-                            let stop_px = if pos.protective_stop_px > 0.0 {
-                                pos.protective_stop_px
-                            } else if side.is_buy() {
-                                snap_to_tick(blended_px * (1.0 - default_stop_pct), tick)
-                            } else {
-                                snap_to_tick(blended_px * (1.0 + default_stop_pct), tick)
-                            };
-                            let committed_usdc = self.finalize_fill_to_open(
-                                ordered.position_id,
-                                &asset,
-                                side,
-                                blended_px,
-                                total_qty,
-                                total_fee,
-                                stop_px,
-                                ack.exchange_order_id.as_deref(),
-                                "HL_ALO_CHASE_FILLED",
-                                &cfg,
-                            )?;
-                            return Ok(ChaseStepOutcome::FilledOpen {
-                                position_id: ordered.position_id,
-                                asset_id: ordered.asset_id,
-                                symbol: ordered.symbol.clone(),
-                                side: side.as_str().to_string(),
-                                fill_price: blended_px,
-                                filled_quantity: total_qty,
-                                committed_notional_usdc: committed_usdc,
-                                protective_stop_px: stop_px,
-                                fees_paid_usdc: total_fee,
-                            });
-                        }
-                        if let Some(id) = ack.exchange_order_id {
-                            new_eoid = Some(id);
-                        }
-                    }
-                    _ => {
-                        if live_qty > 1e-9 {
-                            return self.finalize_known_fill_outcome(
-                                ordered,
-                                pos.protective_stop_px,
-                                &asset,
-                                side,
-                                live_fill_px,
-                                live_qty,
-                                round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                                default_stop_pct,
-                                tick,
-                                "HL_ALO_PARTIAL_FILL_ON_EXCHANGE",
-                                &cfg,
-                            );
-                        }
-                        match self.query_exchange_position_state(&asset, side, &cfg) {
-                            Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
-                                return self.finalize_known_fill_outcome(
-                                    ordered,
-                                    pos.protective_stop_px,
-                                    &asset,
-                                    side,
-                                    post_px,
-                                    post_qty,
-                                    round_dp(post_px * post_qty * (maker_fee_bps / 10_000.0), 4),
-                                    default_stop_pct,
-                                    tick,
-                                    "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
-                                    &cfg,
-                                );
-                            }
-                            Err(_) => {
-                                return Ok(ChaseStepOutcome::Resting {
-                                    position_id: ordered.position_id,
-                                    symbol: ordered.symbol.clone(),
-                                    limit_price: ordered.limit_price,
-                                    distance_from_mid_bps: ordered.distance_from_mid_bps,
-                                });
-                            }
-                            Ok(_) => {}
-                        }
-                        self.db.cancel_working_order(
-                            ordered.position_id,
-                            "HL_CHASE_REJECTED_CANCELLED",
-                        )?;
-                        return Ok(ChaseStepOutcome::Cancelled {
-                            position_id: ordered.position_id,
-                            symbol: ordered.symbol.clone(),
-                            reason: "HL_CHASE_REJECTED_CANCELLED".to_string(),
-                        });
-                    }
-                }
-            }
-
-            let new_cc = self.db.record_working_order_chase(
-                ordered.position_id,
-                new_limit_price,
-                OrderFsmState::ChasingAlo.as_str(),
-                new_eoid.as_deref(),
-                &format!(
-                    "1s top-of-book ALO chase #{}: mid ${:.4} drifted {:.2} bps",
-                    ordered.chase_count.saturating_add(1),
-                    live_mid,
-                    abs_dist_bps
-                ),
-            )?;
-
-            return Ok(ChaseStepOutcome::Chased {
-                position_id: ordered.position_id,
-                symbol: ordered.symbol.clone(),
-                new_limit_price,
-                chase_count: new_cc,
-                fsm_state: OrderFsmState::ChasingAlo.as_str().to_string(),
-            });
+        // Perform a 1s top-of-book ALO chase step if mid drifted >= effective_chase_threshold_bps
+        // (or if a prior rejected chase left no resting order on the exchange).
+        if abs_dist_bps >= effective_chase_threshold_bps || missing_exchange_order {
+            return self.chase_working_order(
+                ordered,
+                pos.protective_stop_px,
+                &asset,
+                side,
+                live_mid,
+                abs_dist_bps,
+                max_chases,
+                maker_fee_bps,
+                default_stop_pct,
+                tick,
+                is_live_exchange,
+                missing_exchange_order,
+                &cfg,
+            );
         }
 
         Ok(ChaseStepOutcome::Resting {
@@ -1020,6 +988,423 @@ impl OrderChaser {
             symbol: ordered.symbol.clone(),
             limit_price: ordered.limit_price,
             distance_from_mid_bps: ordered.distance_from_mid_bps,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chase_working_order(
+        &self,
+        ordered: &OrderedAssetView,
+        existing_stop_px: f64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        live_mid: f64,
+        abs_dist_bps: f64,
+        max_chases: u32,
+        maker_fee_bps: f64,
+        default_stop_pct: f64,
+        tick: f64,
+        is_live_exchange: bool,
+        missing_exchange_order: bool,
+        cfg: &ConfigMap,
+    ) -> Result<ChaseStepOutcome> {
+        let resting_outcome = || ChaseStepOutcome::Resting {
+            position_id: ordered.position_id,
+            symbol: ordered.symbol.clone(),
+            limit_price: ordered.limit_price,
+            distance_from_mid_bps: ordered.distance_from_mid_bps,
+        };
+
+        let l2_bbo = if is_live_exchange {
+            self.http
+                .fetch_l2_book(&asset.coin, cfg)
+                .ok()
+                .flatten()
+                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        } else {
+            None
+        };
+        let new_limit_price = clamp_chase_alo_price(side, live_mid, l2_bbo, tick);
+
+        // Preserve queue priority & avoid burn/self-cancels when clamped limit price did not move.
+        if (new_limit_price - ordered.limit_price).abs() < tick * 0.5 && !missing_exchange_order {
+            return Ok(resting_outcome());
+        }
+
+        let mut final_limit_price = new_limit_price;
+        let mut new_eoid = ordered.exchange_order_id.clone();
+        let mut chase_reason = format!(
+            "1s top-of-book ALO chase #{}: mid ${:.6} drifted {:.2} bps",
+            ordered.chase_count.saturating_add(1),
+            live_mid,
+            abs_dist_bps
+        );
+
+        if is_live_exchange {
+            let pk = cfg.get_str("private_key", "");
+            if matches!(
+                self.cancel_working_entry_oid(ordered, asset, cfg),
+                CancelEntryOutcome::Aborted
+            ) {
+                return Ok(resting_outcome());
+            }
+
+            let live_pos_opt = match self.query_exchange_position_state(asset, side, cfg) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        symbol = %ordered.symbol,
+                        error = %e,
+                        "clearinghouseState unreachable before ALO chase; keeping WORKING"
+                    );
+                    return Ok(resting_outcome());
+                }
+            };
+            let (live_fill_px, live_qty) = live_pos_opt.unwrap_or((live_mid, 0.0));
+            let rem_qty = remaining_entry_qty(ordered.requested_quantity, live_qty, asset);
+            if is_entry_fill_complete(ordered.requested_quantity, live_qty, asset) {
+                return self.finalize_known_fill_outcome(
+                    ordered,
+                    existing_stop_px,
+                    asset,
+                    side,
+                    live_fill_px,
+                    live_qty,
+                    round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
+                    default_stop_pct,
+                    tick,
+                    "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
+                    cfg,
+                );
+            }
+            if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
+                self.db
+                    .cancel_working_order(ordered.position_id, "HL_CHASE_ZERO_REM_CANCELLED")?;
+                return Ok(ChaseStepOutcome::Cancelled {
+                    position_id: ordered.position_id,
+                    symbol: ordered.symbol.clone(),
+                    reason: "HL_CHASE_ZERO_REM_CANCELLED".to_string(),
+                });
+            }
+
+            let chase_coid = format!(
+                "{}-c{}",
+                ordered.client_order_id,
+                ordered.chase_count.saturating_add(1)
+            );
+            let wire = build_limit_order_wire(
+                asset.asset_index,
+                side.is_buy(),
+                new_limit_price,
+                rem_qty,
+                tick,
+                asset.lot_step_size,
+                asset.sz_decimals,
+                false,
+                "Alo",
+                Some(&chase_coid),
+            );
+            match self.http.submit_order_wire(
+                wire,
+                rem_qty,
+                new_limit_price,
+                maker_fee_bps,
+                &pk,
+                Some(&self.db),
+                cfg,
+            ) {
+                Ok(ack) if ack.accepted => {
+                    if ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                        return self.finalize_accepted_chase_fill(
+                            ordered,
+                            existing_stop_px,
+                            asset,
+                            side,
+                            live_fill_px,
+                            live_qty,
+                            ack.avg_fill_price,
+                            ack.filled_quantity,
+                            ack.fee_usdc,
+                            ack.exchange_order_id.as_deref(),
+                            maker_fee_bps,
+                            default_stop_pct,
+                            tick,
+                            cfg,
+                        );
+                    }
+                    if let Some(id) = ack.exchange_order_id {
+                        new_eoid = Some(id);
+                    }
+                }
+                submit_failure => {
+                    let (is_crossing_reject, reject_summary) = match &submit_failure {
+                        Ok(ack) => {
+                            tracing::warn!(
+                                symbol = %ordered.symbol,
+                                position_id = ordered.position_id,
+                                chase_count = ordered.chase_count,
+                                limit_price = new_limit_price,
+                                status = %ack.status,
+                                error = ?ack.raw_error,
+                                "Hyperliquid rejected ALO chase order"
+                            );
+                            (
+                                is_post_only_crossing_rejection(ack.raw_error.as_deref()),
+                                ack.raw_error.clone().unwrap_or_else(|| ack.status.clone()),
+                            )
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                symbol = %ordered.symbol,
+                                position_id = ordered.position_id,
+                                chase_count = ordered.chase_count,
+                                limit_price = new_limit_price,
+                                error = %err,
+                                "Hyperliquid ALO chase submit_order_wire failed"
+                            );
+                            (false, err.to_string())
+                        }
+                    };
+
+                    if live_qty > 1e-9 {
+                        return self.finalize_known_fill_outcome(
+                            ordered,
+                            existing_stop_px,
+                            asset,
+                            side,
+                            live_fill_px,
+                            live_qty,
+                            round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
+                            default_stop_pct,
+                            tick,
+                            "HL_ALO_PARTIAL_FILL_ON_EXCHANGE",
+                            cfg,
+                        );
+                    }
+                    match self.query_exchange_position_state(asset, side, cfg) {
+                        Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
+                            return self.finalize_known_fill_outcome(
+                                ordered,
+                                existing_stop_px,
+                                asset,
+                                side,
+                                post_px,
+                                post_qty,
+                                round_dp(post_px * post_qty * (maker_fee_bps / 10_000.0), 4),
+                                default_stop_pct,
+                                tick,
+                                "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
+                                cfg,
+                            );
+                        }
+                        Err(_) => return Ok(resting_outcome()),
+                        Ok(_) => {}
+                    }
+
+                    // Confirmed 0 live fill on exchange; recover cleanly instead of fatally killing at chase_count = 0.
+                    new_eoid = Some(String::new());
+                    chase_reason = format!(
+                        "1s ALO chase #{} rejected ({}); queued retry/IOC escalation",
+                        ordered.chase_count.saturating_add(1),
+                        reject_summary
+                    );
+
+                    if is_crossing_reject && ordered.chase_count.saturating_add(1) < max_chases {
+                        let fresh_bbo = self
+                            .http
+                            .fetch_l2_book(&asset.coin, cfg)
+                            .ok()
+                            .flatten()
+                            .filter(|(b, a)| {
+                                b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b
+                            });
+                        let requote_px =
+                            step_more_passive_alo_price(side, new_limit_price, fresh_bbo, tick);
+                        let requote_coid = format!("{chase_coid}-r1");
+                        let requote_wire = build_limit_order_wire(
+                            asset.asset_index,
+                            side.is_buy(),
+                            requote_px,
+                            rem_qty,
+                            tick,
+                            asset.lot_step_size,
+                            asset.sz_decimals,
+                            false,
+                            "Alo",
+                            Some(&requote_coid),
+                        );
+                        match self.http.submit_order_wire(
+                            requote_wire,
+                            rem_qty,
+                            requote_px,
+                            maker_fee_bps,
+                            &pk,
+                            Some(&self.db),
+                            cfg,
+                        ) {
+                            Ok(re_ack) if re_ack.accepted => {
+                                final_limit_price = requote_px;
+                                if re_ack.status == "FILLED" && re_ack.filled_quantity > 0.0 {
+                                    return self.finalize_accepted_chase_fill(
+                                        ordered,
+                                        existing_stop_px,
+                                        asset,
+                                        side,
+                                        live_fill_px,
+                                        live_qty,
+                                        re_ack.avg_fill_price,
+                                        re_ack.filled_quantity,
+                                        re_ack.fee_usdc,
+                                        re_ack.exchange_order_id.as_deref(),
+                                        maker_fee_bps,
+                                        default_stop_pct,
+                                        tick,
+                                        cfg,
+                                    );
+                                }
+                                new_eoid = re_ack.exchange_order_id;
+                                chase_reason = format!(
+                                    "1s ALO chase #{} re-quoted passive @ {:.6} after post-only reject ({})",
+                                    ordered.chase_count.saturating_add(1),
+                                    requote_px,
+                                    reject_summary
+                                );
+                            }
+                            Ok(re_ack) => {
+                                tracing::warn!(
+                                    symbol = %ordered.symbol,
+                                    position_id = ordered.position_id,
+                                    chase_count = ordered.chase_count,
+                                    limit_price = requote_px,
+                                    status = %re_ack.status,
+                                    error = ?re_ack.raw_error,
+                                    "Hyperliquid rejected passive ALO re-quote; continuing chase toward IOC"
+                                );
+                                final_limit_price = requote_px;
+                                chase_reason = format!(
+                                    "1s ALO chase #{} rejected ({}) & passive re-quote @ {:.6} rejected ({}); queued retry/IOC escalation",
+                                    ordered.chase_count.saturating_add(1),
+                                    reject_summary,
+                                    requote_px,
+                                    re_ack.raw_error.unwrap_or(re_ack.status)
+                                );
+                            }
+                            Err(re_err) => {
+                                tracing::warn!(
+                                    symbol = %ordered.symbol,
+                                    position_id = ordered.position_id,
+                                    chase_count = ordered.chase_count,
+                                    limit_price = requote_px,
+                                    error = %re_err,
+                                    "Hyperliquid passive ALO re-quote submit_order_wire failed; continuing chase"
+                                );
+                                match self.query_exchange_position_state(asset, side, cfg) {
+                                    Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
+                                        return self.finalize_known_fill_outcome(
+                                            ordered,
+                                            existing_stop_px,
+                                            asset,
+                                            side,
+                                            post_px,
+                                            post_qty,
+                                            round_dp(
+                                                post_px * post_qty * (maker_fee_bps / 10_000.0),
+                                                4,
+                                            ),
+                                            default_stop_pct,
+                                            tick,
+                                            "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
+                                            cfg,
+                                        );
+                                    }
+                                    Err(_) => return Ok(resting_outcome()),
+                                    Ok(_) => {
+                                        final_limit_price = requote_px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let new_cc = self.db.record_working_order_chase(
+            ordered.position_id,
+            final_limit_price,
+            OrderFsmState::ChasingAlo.as_str(),
+            new_eoid.as_deref(),
+            &chase_reason,
+        )?;
+
+        Ok(ChaseStepOutcome::Chased {
+            position_id: ordered.position_id,
+            symbol: ordered.symbol.clone(),
+            new_limit_price: final_limit_price,
+            chase_count: new_cc,
+            fsm_state: OrderFsmState::ChasingAlo.as_str().to_string(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_accepted_chase_fill(
+        &self,
+        ordered: &OrderedAssetView,
+        existing_stop_px: f64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        live_fill_px: f64,
+        live_qty: f64,
+        ack_avg_fill_price: f64,
+        ack_filled_qty: f64,
+        ack_fee_usdc: f64,
+        ack_exchange_order_id: Option<&str>,
+        maker_fee_bps: f64,
+        default_stop_pct: f64,
+        tick: f64,
+        cfg: &ConfigMap,
+    ) -> Result<ChaseStepOutcome> {
+        let total_qty = live_qty + ack_filled_qty;
+        let blended_px = if total_qty > 1e-9 {
+            (live_fill_px * live_qty + ack_avg_fill_price * ack_filled_qty) / total_qty
+        } else {
+            ack_avg_fill_price
+        };
+        let prior_fee = if live_qty > 1e-9 {
+            round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4)
+        } else {
+            0.0
+        };
+        let total_fee = round_dp(prior_fee + ack_fee_usdc, 4);
+        let stop_px = if existing_stop_px > 0.0 {
+            existing_stop_px
+        } else if side.is_buy() {
+            snap_to_tick(blended_px * (1.0 - default_stop_pct), tick)
+        } else {
+            snap_to_tick(blended_px * (1.0 + default_stop_pct), tick)
+        };
+        let committed_usdc = self.finalize_fill_to_open(
+            ordered.position_id,
+            asset,
+            side,
+            blended_px,
+            total_qty,
+            total_fee,
+            stop_px,
+            ack_exchange_order_id,
+            "HL_ALO_CHASE_FILLED",
+            cfg,
+        )?;
+        Ok(ChaseStepOutcome::FilledOpen {
+            position_id: ordered.position_id,
+            asset_id: ordered.asset_id,
+            symbol: ordered.symbol.clone(),
+            side: side.as_str().to_string(),
+            fill_price: blended_px,
+            filled_quantity: total_qty,
+            committed_notional_usdc: committed_usdc,
+            protective_stop_px: stop_px,
+            fees_paid_usdc: total_fee,
         })
     }
 
@@ -2025,5 +2410,83 @@ impl OrderChaser {
         }
 
         Ok(committed_usdc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_one_tick_bps_and_effective_chase_threshold() {
+        let tick = 1e-6;
+        let mid = 0.002488;
+        let one_tick_bps = compute_one_tick_bps(tick, mid);
+        assert!((one_tick_bps - 4.01929).abs() < 0.01);
+        let eff_thresh = 4.0_f64.max(one_tick_bps * 1.5);
+        assert!(one_tick_bps < eff_thresh);
+        assert!((eff_thresh - 6.0289).abs() < 0.01);
+        assert_eq!(compute_one_tick_bps(tick, 0.0), 0.0);
+    }
+
+    #[test]
+    fn test_clamp_initial_and_chase_alo_prices_stay_strictly_passive() {
+        let tick = 1e-6;
+        // PUMP-like tight book: bid=0.002488, ask=0.002489
+        let buy_init = clamp_initial_alo_price(OrderSide::Long, 0.002495, 0.002488, 0.002489, tick);
+        assert!((buy_init - 0.002488).abs() < 1e-9);
+        assert!(buy_init < 0.002489);
+
+        let sell_init =
+            clamp_initial_alo_price(OrderSide::Short, 0.002485, 0.002488, 0.002489, tick);
+        assert!((sell_init - 0.002489).abs() < 1e-9);
+        assert!(sell_init > 0.002488);
+
+        // Locked book (bid == ask) still clamps strictly passive
+        let buy_locked =
+            clamp_initial_alo_price(OrderSide::Long, 0.002489, 0.002489, 0.002489, tick);
+        assert!((buy_locked - 0.002488).abs() < 1e-9);
+        let sell_locked =
+            clamp_initial_alo_price(OrderSide::Short, 0.002489, 0.002489, 0.002489, tick);
+        assert!((sell_locked - 0.002490).abs() < 1e-9);
+
+        // Chase clamp prevents stale allMids from crossing live l2Book BBO
+        let buy_chase =
+            clamp_chase_alo_price(OrderSide::Long, 0.002495, Some((0.002488, 0.002489)), tick);
+        assert!((buy_chase - 0.002488).abs() < 1e-9);
+        let sell_chase =
+            clamp_chase_alo_price(OrderSide::Short, 0.002484, Some((0.002488, 0.002489)), tick);
+        assert!((sell_chase - 0.002489).abs() < 1e-9);
+
+        // Immediate passive re-quote steps 1 extra tick passive from fresh l2Book
+        let sell_rq = step_more_passive_alo_price(
+            OrderSide::Short,
+            0.002489,
+            Some((0.002489, 0.002490)),
+            tick,
+        );
+        assert!((sell_rq - 0.002491).abs() < 1e-9);
+        let buy_rq = step_more_passive_alo_price(
+            OrderSide::Long,
+            0.002488,
+            Some((0.002487, 0.002488)),
+            tick,
+        );
+        assert!((buy_rq - 0.002486).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_post_only_crossing_rejection_detection() {
+        assert!(is_post_only_crossing_rejection(Some("badAloPxRejected")));
+        assert!(is_post_only_crossing_rejection(Some(
+            "Post only order would have immediately matched, bbo was 0.002489@0.002490"
+        )));
+        assert!(is_post_only_crossing_rejection(Some(
+            "Order would immediately match"
+        )));
+        assert!(!is_post_only_crossing_rejection(Some(
+            "Insufficient margin"
+        )));
+        assert!(!is_post_only_crossing_rejection(None));
     }
 }

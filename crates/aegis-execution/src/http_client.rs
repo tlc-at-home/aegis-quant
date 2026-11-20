@@ -218,7 +218,32 @@ pub fn resolve_exchange_url_for_network(cfg: &ConfigMap, is_testnet: bool) -> St
     }
 }
 
-/// Shared blocking JSON POST helper with endpoint validation.
+const HL_INFO_MAX_RETRIES: usize = 2;
+const HL_INFO_RETRY_BACKOFF_MS: [u64; HL_INFO_MAX_RETRIES] = [250, 650];
+const HL_INFO_MAX_RETRY_AFTER_MS: u64 = 2_000;
+
+fn is_idempotent_info_url(url: &str) -> bool {
+    url.trim().trim_end_matches('/').ends_with("/info")
+}
+
+fn is_retryable_info_status(status_code: u16) -> bool {
+    matches!(status_code, 429 | 502 | 503 | 504)
+}
+
+fn compute_info_retry_backoff_ms(attempt: usize, retry_after_header: Option<&str>) -> u64 {
+    let default_ms = HL_INFO_RETRY_BACKOFF_MS
+        .get(attempt)
+        .copied()
+        .unwrap_or(650);
+    if let Some(raw) = retry_after_header {
+        if let Ok(secs) = raw.trim().parse::<u64>() {
+            return secs.saturating_mul(1_000).min(HL_INFO_MAX_RETRY_AFTER_MS);
+        }
+    }
+    default_ms
+}
+
+/// Shared blocking JSON POST helper with endpoint validation and bounded `/info` backoff.
 pub fn http_post_json(
     http_client: &Client,
     timeout_sec: u64,
@@ -239,28 +264,66 @@ pub fn http_post_json(
         owned_client = shared_blocking_client_opts(timeout_sec, is_loopback);
         &owned_client
     };
-    let resp = match client_ref.post(url).json(payload).send() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST request failed");
-            return None;
-        }
+
+    let allow_info_retry = is_idempotent_info_url(url);
+    let max_attempts = if allow_info_retry {
+        1 + HL_INFO_MAX_RETRIES
+    } else {
+        1
     };
-    if !resp.status().is_success() {
+
+    for attempt in 0..max_attempts {
+        let resp = match client_ref.post(url).json(payload).send() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST request failed");
+                return None;
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return match resp.json::<Value>() {
+                Ok(val) => Some(val),
+                Err(e) => {
+                    tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid endpoint");
+                    None
+                }
+            };
+        }
+
+        if allow_info_retry
+            && attempt + 1 < max_attempts
+            && is_retryable_info_status(status.as_u16())
+        {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok());
+            let backoff_ms = compute_info_retry_backoff_ms(attempt, retry_after);
+            tracing::debug!(
+                url = url,
+                status = %status,
+                attempt = attempt + 1,
+                max_attempts = max_attempts,
+                backoff_ms = backoff_ms,
+                "Hyperliquid /info returned transient HTTP status; backing off before retry"
+            );
+            if backoff_ms > 0 {
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            continue;
+        }
+
         tracing::warn!(
             url = url,
-            status = %resp.status(),
+            status = %status,
+            attempts = attempt + 1,
             "Hyperliquid endpoint returned non-2xx HTTP status"
         );
         return None;
     }
-    match resp.json::<Value>() {
-        Ok(val) => Some(val),
-        Err(e) => {
-            tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid endpoint");
-            None
-        }
-    }
+
+    None
 }
 
 /// Parsed acknowledgment from a Hyperliquid `/exchange` order submission.
@@ -1185,5 +1248,284 @@ mod tests {
 
         let _ = stop_tx.send(());
         assert_eq!(fetched.len(), 4);
+    }
+
+    fn spawn_mock_path_server<F>(handler: F) -> (u16, std::sync::mpsc::Sender<()>)
+    where
+        F: Fn(&str, &Value) -> (u16, Vec<(&'static str, String)>, Value) + Send + Sync + 'static,
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock path server");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handler = Arc::new(handler);
+
+        std::thread::spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    while let Ok(n) = stream.read(&mut tmp) {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if header_end.is_none() {
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                let headers = String::from_utf8_lossy(&buf[..pos]);
+                                for line in headers.lines() {
+                                    if let Some((k, v)) = line.split_once(':') {
+                                        if k.trim().eq_ignore_ascii_case("content-length") {
+                                            content_len = v.trim().parse::<usize>().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(hend) = header_end {
+                            if buf.len() >= hend + content_len {
+                                break;
+                            }
+                        }
+                    }
+                    let req_path = header_end
+                        .and_then(|hend| {
+                            let head = String::from_utf8_lossy(&buf[..hend]);
+                            head.lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    let body_slice = header_end
+                        .map(|h| &buf[h..buf.len().min(h + content_len)])
+                        .unwrap_or(&[]);
+                    let req_json: Value = serde_json::from_slice(body_slice).unwrap_or(Value::Null);
+                    let (status, extra_headers, resp_json) = handler(&req_path, &req_json);
+                    let reason = match status {
+                        200 => "OK",
+                        429 => "Too Many Requests",
+                        502 => "Bad Gateway",
+                        503 => "Service Unavailable",
+                        504 => "Gateway Timeout",
+                        _ => "Error",
+                    };
+                    let mut header_block = String::new();
+                    for (k, v) in extra_headers {
+                        header_block.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    let resp_body = resp_json.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{header_block}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+
+        (port, stop_tx)
+    }
+
+    #[test]
+    fn test_info_retry_backoff_helpers() {
+        assert!(is_idempotent_info_url(
+            "https://api.hyperliquid-testnet.xyz/info"
+        ));
+        assert!(is_idempotent_info_url("http://127.0.0.1:18080/info/"));
+        assert!(!is_idempotent_info_url(
+            "https://api.hyperliquid-testnet.xyz/exchange"
+        ));
+        assert!(!is_idempotent_info_url("http://127.0.0.1:18080/exchange/"));
+        assert!(!is_idempotent_info_url("http://127.0.0.1:18080/info/other"));
+
+        for code in [429u16, 502, 503, 504] {
+            assert!(is_retryable_info_status(code));
+        }
+        for code in [200u16, 400, 401, 404, 500] {
+            assert!(!is_retryable_info_status(code));
+        }
+
+        assert_eq!(compute_info_retry_backoff_ms(0, None), 250);
+        assert_eq!(compute_info_retry_backoff_ms(1, None), 650);
+        assert_eq!(
+            compute_info_retry_backoff_ms(0, Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            250
+        );
+        assert_eq!(compute_info_retry_backoff_ms(0, Some("0")), 0);
+        assert_eq!(compute_info_retry_backoff_ms(0, Some("1")), 1_000);
+        assert_eq!(compute_info_retry_backoff_ms(1, Some("10")), 2_000);
+    }
+
+    #[test]
+    fn test_http_post_json_retries_info_only_and_never_retries_exchange() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let info_calls = Arc::new(AtomicUsize::new(0));
+        let exchange_calls = Arc::new(AtomicUsize::new(0));
+        let scenario = Arc::new(Mutex::new("info_429_once"));
+
+        let info_calls_srv = info_calls.clone();
+        let exchange_calls_srv = exchange_calls.clone();
+        let scenario_srv = scenario.clone();
+
+        let (port, stop_tx) = spawn_mock_path_server(move |path, _body| {
+            let mode = *scenario_srv.lock();
+            if path == "/info" {
+                let n = info_calls_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                return match mode {
+                    "info_429_once" => {
+                        if n == 1 {
+                            (
+                                429,
+                                vec![("Retry-After", "0".to_string())],
+                                json!({ "error": "rate_limited" }),
+                            )
+                        } else {
+                            (200, vec![], json!({ "ok": true, "attempt": n }))
+                        }
+                    }
+                    "info_429_then_502_then_ok" => {
+                        if n == 1 {
+                            (429, vec![], json!({ "error": "rate_limited" }))
+                        } else if n == 2 {
+                            (
+                                502,
+                                vec![("Retry-After", "0".to_string())],
+                                json!({ "error": "bad_gateway" }),
+                            )
+                        } else {
+                            (200, vec![], json!({ "ok": true, "attempt": n }))
+                        }
+                    }
+                    "info_retry_after_clamped" => {
+                        if n == 1 {
+                            (
+                                429,
+                                vec![("Retry-After", "10".to_string())],
+                                json!({ "error": "rate_limited" }),
+                            )
+                        } else {
+                            (200, vec![], json!({ "clamped_ok": true, "attempt": n }))
+                        }
+                    }
+                    "info_exhaust_503" => (503, vec![], json!({ "error": "unavailable" })),
+                    _ => (200, vec![], json!({ "ok": true })),
+                };
+            }
+            if path == "/exchange" {
+                exchange_calls_srv.fetch_add(1, Ordering::SeqCst);
+                return match mode {
+                    "exchange_429" => (
+                        429,
+                        vec![("Retry-After", "0".to_string())],
+                        json!({ "error": "rate_limited" }),
+                    ),
+                    "exchange_502" => (502, vec![], json!({ "error": "bad_gateway" })),
+                    _ => (200, vec![], json!({ "status": "ok" })),
+                };
+            }
+            (404, vec![], json!({ "error": "not_found" }))
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = shared_blocking_client_opts(5, true);
+        let info_url = format!("http://127.0.0.1:{port}/info");
+        let exchange_url = format!("http://127.0.0.1:{port}/exchange");
+        let payload = json!({ "type": "allMids" });
+
+        // 1. /info retries 429 once and succeeds with JSON
+        *scenario.lock() = "info_429_once";
+        info_calls.store(0, Ordering::SeqCst);
+        let res1 = http_post_json(&client, 5, 5, &info_url, &payload, &cfg)
+            .expect("/info should succeed after 1 retry on 429");
+        assert_eq!(res1, json!({ "ok": true, "attempt": 2 }));
+        assert_eq!(info_calls.load(Ordering::SeqCst), 2);
+
+        // 2. /info retries twice (429 -> 502 -> 200) and succeeds with JSON
+        *scenario.lock() = "info_429_then_502_then_ok";
+        info_calls.store(0, Ordering::SeqCst);
+        let res2 = http_post_json(&client, 5, 5, &info_url, &payload, &cfg)
+            .expect("/info should succeed after 2 retries across 429 and 502");
+        assert_eq!(res2, json!({ "ok": true, "attempt": 3 }));
+        assert_eq!(info_calls.load(Ordering::SeqCst), 3);
+
+        // 3. /info honors integer Retry-After clamped to <= 2000ms (10s header does NOT sleep 10s)
+        *scenario.lock() = "info_retry_after_clamped";
+        info_calls.store(0, Ordering::SeqCst);
+        let started = Instant::now();
+        let res3 = http_post_json(&client, 5, 5, &info_url, &payload, &cfg)
+            .expect("/info should succeed after clamped Retry-After");
+        let elapsed = started.elapsed();
+        assert_eq!(res3, json!({ "clamped_ok": true, "attempt": 2 }));
+        assert_eq!(info_calls.load(Ordering::SeqCst), 2);
+        assert!(elapsed >= Duration::from_millis(1_800));
+        assert!(elapsed < Duration::from_secs(5));
+
+        // 4. /info bounds retries at max 2 (3 total attempts) on persistent 503
+        *scenario.lock() = "info_exhaust_503";
+        info_calls.store(0, Ordering::SeqCst);
+        let res4 = http_post_json(
+            &client,
+            5,
+            5,
+            &info_url,
+            &json!({ "type": "frontendOpenOrders" }),
+            &cfg,
+        );
+        assert!(res4.is_none());
+        assert_eq!(info_calls.load(Ordering::SeqCst), 3);
+
+        // 5. /exchange NEVER retries on 429 or 502
+        *scenario.lock() = "exchange_429";
+        exchange_calls.store(0, Ordering::SeqCst);
+        let ex_429 = http_post_json(
+            &client,
+            5,
+            5,
+            &exchange_url,
+            &json!({ "action": { "type": "order" } }),
+            &cfg,
+        );
+        assert!(ex_429.is_none());
+        assert_eq!(exchange_calls.load(Ordering::SeqCst), 1);
+
+        *scenario.lock() = "exchange_502";
+        exchange_calls.store(0, Ordering::SeqCst);
+        let ex_502 = http_post_json(
+            &client,
+            5,
+            5,
+            &exchange_url,
+            &json!({ "action": { "type": "cancel" } }),
+            &cfg,
+        );
+        assert!(ex_502.is_none());
+        assert_eq!(exchange_calls.load(Ordering::SeqCst), 1);
+
+        let _ = stop_tx.send(());
     }
 }

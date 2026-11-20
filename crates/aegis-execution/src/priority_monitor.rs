@@ -19,6 +19,40 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StopSyncDecision {
+    persisted_stop_px: f64,
+    sl_ratcheted_materially: bool,
+    should_sync_tpsl: bool,
+    count_ratchet: bool,
+}
+
+fn resolve_stop_sync_decision(
+    current_stop_px: f64,
+    eval_new_stop_px: f64,
+    eval_stop_ratcheted: bool,
+    missing_sl: bool,
+    missing_tp: bool,
+) -> StopSyncDecision {
+    let first_stop_attach = current_stop_px <= 0.0 && eval_new_stop_px > 0.0;
+    let sl_ratcheted_materially = eval_stop_ratcheted
+        && current_stop_px > 0.0
+        && ((eval_new_stop_px - current_stop_px).abs() / current_stop_px) >= 0.0025;
+    let persisted_stop_px = if first_stop_attach || sl_ratcheted_materially {
+        eval_new_stop_px
+    } else {
+        current_stop_px
+    };
+    let should_sync_tpsl = missing_sl || missing_tp || sl_ratcheted_materially || first_stop_attach;
+    let count_ratchet = sl_ratcheted_materially || first_stop_attach;
+    StopSyncDecision {
+        persisted_stop_px,
+        sl_ratcheted_materially,
+        should_sync_tpsl,
+        count_ratchet,
+    }
+}
+
 /// Telemetry report emitted by each 1-second Priority Monitor tick.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PriorityTickReport {
@@ -182,10 +216,6 @@ impl PriorityMonitor {
                     report.stops_triggered_closed += 1;
                 }
             } else {
-                pos_updates.push((h.position_id, live_mark, eval.new_protective_stop_px));
-                if eval.stop_ratcheted {
-                    report.stops_ratcheted += 1;
-                }
                 let missing_sl = h
                     .protective_stop_oid
                     .as_deref()
@@ -199,21 +229,27 @@ impl PriorityMonitor {
                     .unwrap_or("")
                     .is_empty()
                     || h.take_profit_px <= 0.0;
-                let sl_ratcheted_materially = eval.stop_ratcheted
-                    && h.protective_stop_px > 0.0
-                    && ((eval.new_protective_stop_px - h.protective_stop_px).abs()
-                        / h.protective_stop_px)
-                        >= 0.0025;
-                if missing_sl || missing_tp || sl_ratcheted_materially {
+                let decision = resolve_stop_sync_decision(
+                    h.protective_stop_px,
+                    eval.new_protective_stop_px,
+                    eval.stop_ratcheted,
+                    missing_sl,
+                    missing_tp,
+                );
+                pos_updates.push((h.position_id, live_mark, decision.persisted_stop_px));
+                if decision.count_ratchet {
+                    report.stops_ratcheted += 1;
+                }
+                if decision.should_sync_tpsl {
                     if let Some(asset) = asset_opt {
                         tpsl_syncs.push((
                             h,
                             asset,
                             side,
                             live_mark,
-                            eval.new_protective_stop_px,
+                            decision.persisted_stop_px,
                             eval.take_profit_px,
-                            sl_ratcheted_materially,
+                            decision.sl_ratcheted_materially,
                         ));
                     }
                 }
@@ -604,5 +640,282 @@ impl PriorityMonitor {
         let _ = self.alerts.notify_position_closed(&alert);
 
         Ok(Some(realized_pnl))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_db::{AssetUpsertInput, BarUpsertInput};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn test_resolve_stop_sync_decision_gates_sub_25bps_db_writes() {
+        // Sub-0.25% tick drift (e.g. PYTH 0.050351 -> 0.050349 = 0.004%, and -> 0.050250 = 0.20%)
+        // must keep current_stop_px unchanged in DB and must not trigger tpsl_syncs or count ratchet.
+        for small_stop in [0.050349, 0.050250] {
+            let dec = resolve_stop_sync_decision(0.050351, small_stop, true, false, false);
+            assert_eq!(dec.persisted_stop_px, 0.050351);
+            assert!(!dec.sl_ratcheted_materially);
+            assert!(!dec.should_sync_tpsl);
+            assert!(!dec.count_ratchet);
+
+            // Even if TP leg is missing and triggers sync, persisted_stop_px stays pinned at 0.050351
+            let dec_missing_tp =
+                resolve_stop_sync_decision(0.050351, small_stop, true, false, true);
+            assert_eq!(dec_missing_tp.persisted_stop_px, 0.050351);
+            assert!(!dec_missing_tp.sl_ratcheted_materially);
+            assert!(dec_missing_tp.should_sync_tpsl);
+            assert!(!dec_missing_tp.count_ratchet);
+        }
+
+        // Material >= 0.25% ratchet (0.050351 -> 0.050220 = 0.26%) updates persisted stop + syncs + counts
+        let material = resolve_stop_sync_decision(0.050351, 0.050220, true, false, false);
+        assert_eq!(material.persisted_stop_px, 0.050220);
+        assert!(material.sl_ratcheted_materially);
+        assert!(material.should_sync_tpsl);
+        assert!(material.count_ratchet);
+
+        // Initial stop attachment (current_stop_px <= 0.0 -> > 0.0) updates DB + syncs + counts
+        let attach = resolve_stop_sync_decision(0.0, 0.049, false, false, false);
+        assert_eq!(attach.persisted_stop_px, 0.049);
+        assert!(!attach.sl_ratcheted_materially);
+        assert!(attach.should_sync_tpsl);
+        assert!(attach.count_ratchet);
+    }
+
+    #[test]
+    fn test_priority_tick_sub_25bps_ratchet_preserves_db_stop_and_skips_hl_replace() {
+        let stop_trigger_px = Arc::new(Mutex::new("1720.0".to_string()));
+        let stop_trigger_srv = stop_trigger_px.clone();
+        let exchange_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let exchange_srv = exchange_requests.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback mock server");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut buf = Vec::with_capacity(4096);
+                        let mut tmp = [0u8; 2048];
+                        let mut header_end = None;
+                        let mut content_len = 0usize;
+                        while let Ok(n) = stream.read(&mut tmp) {
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            if header_end.is_none() {
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = Some(pos + 4);
+                                    let hdr = String::from_utf8_lossy(&buf[..pos]);
+                                    for line in hdr.lines() {
+                                        if let Some((k, v)) = line.split_once(':') {
+                                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                                content_len =
+                                                    v.trim().parse::<usize>().unwrap_or(0);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(hend) = header_end {
+                                if buf.len() >= hend + content_len {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(hdr_end) = header_end else {
+                            continue;
+                        };
+                        let hdr_str = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+                        let path = hdr_str
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let body_bytes = &buf[hdr_end..buf.len().min(hdr_end + content_len)];
+                        let req_json: Value =
+                            serde_json::from_slice(body_bytes).unwrap_or(Value::Null);
+                        let resp_json = if path == "/info" {
+                            let typ = req_json.get("type").and_then(Value::as_str).unwrap_or("");
+                            match typ {
+                                "allMids" => json!({ "ETH": "1734.0" }),
+                                "frontendOpenOrders" | "openOrders" => json!([
+                                    {
+                                        "coin": "ETH",
+                                        "oid": 90001u64,
+                                        "isTrigger": true,
+                                        "orderType": "Stop Market",
+                                        "triggerPx": stop_trigger_srv.lock().clone(),
+                                        "sz": "0.0253"
+                                    },
+                                    {
+                                        "coin": "ETH",
+                                        "oid": 90002u64,
+                                        "isTrigger": true,
+                                        "orderType": "Take Profit Market",
+                                        "triggerPx": "1831.6",
+                                        "sz": "0.0253"
+                                    }
+                                ]),
+                                _ => json!([]),
+                            }
+                        } else {
+                            exchange_srv.lock().push(req_json.clone());
+                            if req_json.pointer("/action/type").and_then(Value::as_str)
+                                == Some("order")
+                            {
+                                json!({
+                                    "status": "ok",
+                                    "response": {
+                                        "type": "order",
+                                        "data": {
+                                            "statuses": [{ "waitingForTrigger": { "oid": 90003u64 } }]
+                                        }
+                                    }
+                                })
+                            } else {
+                                json!({ "status": "ok" })
+                            }
+                        };
+                        let resp_body = resp_json.to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let http = HyperliquidHttpClient::new(5);
+        let alerts = AlertEngine::new(db.clone());
+        let chaser = OrderChaser::new(db.clone(), http.clone(), alerts.clone());
+        let monitor = PriorityMonitor::new(db.clone(), http, chaser, alerts);
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+            .unwrap();
+        db.set_config_value(
+            "hyperliquid_allowed_hosts",
+            "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "private_key",
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            None,
+        )
+        .unwrap();
+
+        let eth_id = db
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "ETH".to_string(),
+                asset_index: 1,
+                sz_decimals: 3,
+                tick_size: 0.1,
+                lot_step_size: 0.001,
+                max_leverage: 25.0,
+                mark_price: 1734.0,
+                mid_price: 1734.0,
+                oracle_price: 1734.0,
+                funding_rate_hourly: 0.0000125,
+                day_volume_usdc: 20_000_000.0,
+                open_interest_usdc: 8_000_000.0,
+                prev_day_price: 1700.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+
+        let base_ts = now_ms() - 20 * 3_600_000;
+        let bars: Vec<BarUpsertInput> = (0..20)
+            .map(|i| BarUpsertInput {
+                asset_id: eth_id,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + i * 3_600_000,
+                open: 1718.0,
+                high: 1724.0,
+                low: 1712.0,
+                close: 1718.0,
+                volume: 1000.0,
+                funding_rate: 0.00001,
+            })
+            .collect();
+        db.upsert_ohlcv_bars(&bars).unwrap();
+
+        let (pos_id, _) = db
+            .sync_open_position_from_exchange_v2(
+                eth_id,
+                "ETH",
+                OrderSide::Long,
+                1718.0,
+                1734.0,
+                0.0253,
+                0.0253 * 1734.0,
+                0.0,
+                0.05,
+                1720.0,
+                1831.6,
+                0.0,
+                Some(now_ms() - 600_000),
+            )
+            .unwrap();
+        db.update_position_tpsl_orders(pos_id, 1720.0, Some("hl-90001"), 1831.6, Some("hl-90002"))
+            .unwrap();
+
+        // 1. Mark 1734.0 gives a sub-0.25% Tier-1 ratchet (1720.0 -> 1720.6, +0.035%):
+        //    DB protective_stop_px MUST stay 1720.0, highest_price_seen tracks 1734.0, and 0 HL requests fire.
+        let tick1 = monitor.run_1s_priority_tick().unwrap();
+        assert_eq!(tick1.stops_ratcheted, 0);
+        let pos1 = db.get_position_by_id(pos_id).unwrap().unwrap();
+        assert!((pos1.protective_stop_px - 1720.0).abs() < 1e-6);
+        assert!((pos1.highest_price_seen - 1734.0).abs() < 1e-6);
+        assert!(exchange_requests.lock().is_empty());
+
+        // 2. Mark 1746.0 crosses 1.0R (Tier 2: 1731.4 vs 1720.0 = +0.66% >= 0.25%):
+        //    DB protective_stop_px updates to 1731.4, report.stops_ratcheted == 1, and HL SL order replaces.
+        db.update_asset_live_quote(eth_id, 1746.0, 1746.0).unwrap();
+        let tick2 = monitor.run_1s_priority_tick().unwrap();
+        assert_eq!(tick2.stops_ratcheted, 1);
+        let pos2 = db.get_position_by_id(pos_id).unwrap().unwrap();
+        assert!((pos2.protective_stop_px - 1731.4).abs() < 1e-6);
+        assert!((pos2.highest_price_seen - 1746.0).abs() < 1e-6);
+        assert_eq!(pos2.protective_stop_oid.as_deref(), Some("hl-90003"));
+        let exch_reqs = exchange_requests.lock();
+        assert!(exch_reqs
+            .iter()
+            .any(|r| r.pointer("/action/type").and_then(Value::as_str) == Some("order")));
+
+        let _ = stop_tx.send(());
     }
 }

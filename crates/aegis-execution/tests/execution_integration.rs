@@ -1367,6 +1367,17 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
     let cancelled_srv = cancelled_oids.clone();
     let ioc_should_fill: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
     let ioc_srv = ioc_should_fill.clone();
+    let l2_mids: Arc<Mutex<HashMap<String, f64>>> = Arc::new(Mutex::new(
+        [
+            ("SOL".to_string(), 184.25),
+            ("AVAX".to_string(), 35.0),
+            ("LINK".to_string(), 18.5),
+            ("ARB".to_string(), 0.85),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let l2_mids_srv = l2_mids.clone();
     let next_oid: Arc<Mutex<u64>> = Arc::new(Mutex::new(50_000));
 
     let coin_by_idx: HashMap<u64, &'static str> = [
@@ -1410,19 +1421,13 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
             }
             if typ == "l2Book" {
                 let coin = body.get("coin").and_then(Value::as_str).unwrap_or("SOL");
-                let px = match coin {
-                    "SOL" => 184.25,
-                    "AVAX" => 35.0,
-                    "LINK" => 18.5,
-                    "ARB" => 0.85,
-                    _ => 100.0,
-                };
+                let px = l2_mids_srv.lock().get(coin).copied().unwrap_or(100.0);
                 return (
                     200,
                     json!({
                         "levels": [
-                            [{"px": format!("{:.6}", px * 0.9995), "sz": "1000.0"}],
-                            [{"px": format!("{:.6}", px * 1.0005), "sz": "1000.0"}]
+                            [{"px": format!("{:.6}", px * 0.9999), "sz": "1000.0"}],
+                            [{"px": format!("{:.6}", px * 1.0001), "sz": "1000.0"}]
                         ]
                     }),
                 );
@@ -1608,6 +1613,7 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
     );
 
     // Mid drifts > 4 bps -> cancels 50001 and chases rem_qty=7.0 ONLY
+    l2_mids.lock().insert("SOL".to_string(), 185.20);
     db.update_asset_live_quote(sol.id, 185.20, 185.20).unwrap();
     let ord_sol_2 = db
         .get_assets_ordered()
@@ -1683,6 +1689,7 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
         .lock()
         .insert("AVAX".to_string(), (3.0, 35.0));
     for (idx, mid_px) in [35.20, 35.40].into_iter().enumerate() {
+        l2_mids.lock().insert("AVAX".to_string(), mid_px);
         db.update_asset_live_quote(avax.id, mid_px, mid_px).unwrap();
         let ord = db
             .get_assets_ordered()
@@ -1741,6 +1748,7 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
         .lock()
         .insert("LINK".to_string(), (3.0, 18.5));
     for mid_px in [18.70, 18.90] {
+        l2_mids.lock().insert("LINK".to_string(), mid_px);
         db.update_asset_live_quote(link.id, mid_px, mid_px).unwrap();
         let ord = db
             .get_assets_ordered()
@@ -1830,6 +1838,672 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
         .collect();
     assert_eq!(arb_triggers.len(), 2);
     assert!(arb_triggers.iter().all(|&sz| (sz - 30.0).abs() < 1e-6));
+
+    let _ = stop_tx.send(());
+}
+
+fn configure_testnet_mock(db: &DatabaseManager, port: u16) {
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("max_open_positions", "10", None)
+        .unwrap();
+    db.set_config_value("alo_chase_threshold_bps", "4.0", None)
+        .unwrap();
+}
+
+#[test]
+fn test_pump_1tick_no_self_chase_and_unchanged_price_preserves_queue() {
+    type SubmittedOrders = Arc<Mutex<Vec<(String, Option<String>, f64)>>>;
+
+    let l2_bbo: Arc<Mutex<(f64, f64)>> = Arc::new(Mutex::new((0.002488, 0.002489)));
+    let l2_bbo_srv = l2_bbo.clone();
+    let submitted_orders: SubmittedOrders = Arc::new(Mutex::new(Vec::new()));
+    let submitted_srv = submitted_orders.clone();
+    let cancelled_oids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let cancelled_srv = cancelled_oids.clone();
+    let next_oid: Arc<Mutex<u64>> = Arc::new(Mutex::new(65_000));
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "clearinghouseState" {
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "1000.0" },
+                        "assetPositions": []
+                    }),
+                );
+            }
+            if typ == "l2Book" {
+                let (bid, ask) = *l2_bbo_srv.lock();
+                return (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": format!("{bid:.6}"), "sz": "50000"}],
+                            [{"px": format!("{ask:.6}"), "sz": "50000"}]
+                        ]
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "cancel" {
+            if let Some(arr) = body.pointer("/action/cancels").and_then(Value::as_array) {
+                for c in arr {
+                    if let Some(o) = c.get("o").and_then(Value::as_u64) {
+                        cancelled_srv.lock().push(o);
+                    }
+                }
+            }
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": { "type": "cancel", "data": { "statuses": ["success"] } }
+                }),
+            );
+        }
+        if action_type == "order" {
+            let ord = body
+                .pointer("/action/orders/0")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let px_f: f64 = ord
+                .get("p")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let tif = ord
+                .pointer("/t/limit/tif")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            submitted_srv.lock().push(("PUMP".to_string(), tif, px_f));
+            let mut guard = next_oid.lock();
+            *guard += 1;
+            let oid = *guard;
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": { "statuses": [{ "resting": { "oid": oid } }] }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    configure_testnet_mock(&db, port);
+    db.set_config_value("max_alo_chase_ticks", "5", None)
+        .unwrap();
+
+    db.upsert_exchange_asset(&AssetUpsertInput {
+        raw_symbol_or_coin: "PUMP".to_string(),
+        asset_index: 150,
+        sz_decimals: 0,
+        tick_size: 1e-6,
+        lot_step_size: 1.0,
+        max_leverage: 10.0,
+        mark_price: 0.002488,
+        mid_price: 0.002488,
+        oracle_price: 0.002488,
+        funding_rate_hourly: 0.0,
+        day_volume_usdc: 10_000_000.0,
+        open_interest_usdc: 2_000_000.0,
+        prev_day_price: 0.002480,
+        is_core_eligible: true,
+        is_event_eligible: true,
+        is_priority_watched: false,
+    })
+    .unwrap();
+
+    let pump = db.get_asset_by_symbol("PUMP-USDC").unwrap().unwrap();
+    let pos_id = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: pump.clone(),
+            side: OrderSide::Short,
+            requested_quantity: 31_539.0,
+            reserved_margin_usdc: 78.5,
+            portfolio_weight: -0.10,
+            s1_weight_contrib: -0.10,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.002606,
+            reason: "LIVE_BREAKOUT_SURGE".to_string(),
+            bypass_entry_interval: true,
+        })
+        .unwrap();
+
+    // Initial ALO Short placed at 0.002489 (1 tick = 4.02 bps > 4.0 config threshold)
+    let ord0 = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == pos_id)
+        .unwrap();
+    assert!((ord0.limit_price - 0.002489).abs() < 1e-9);
+    assert_eq!(submitted_orders.lock().len(), 1);
+
+    // 1. Resting 1 tick off mid (4.02 bps < 1.5 * one_tick_bps = 6.03 bps) MUST stay Resting (no cancel/burn)
+    let res_1tick = engine.chaser.advance_working_order(&ord0).unwrap();
+    assert!(matches!(res_1tick, ChaseStepOutcome::Resting { .. }));
+    assert!(cancelled_oids.lock().is_empty());
+    assert_eq!(submitted_orders.lock().len(), 1);
+    assert_eq!(
+        db.get_assets_ordered().unwrap()[0].chase_count,
+        0,
+        "1-tick PUMP offset must not self-chase"
+    );
+
+    // 2. Slight move within 1.5 * one_tick_bps (4.82 bps < 6.03 bps) STILL stays Resting
+    db.update_asset_live_quote(pump.id, 0.0024878, 0.0024878)
+        .unwrap();
+    let ord1 = db.get_assets_ordered().unwrap().remove(0);
+    let res_within_15x = engine.chaser.advance_working_order(&ord1).unwrap();
+    assert!(matches!(res_within_15x, ChaseStepOutcome::Resting { .. }));
+    assert!(cancelled_oids.lock().is_empty());
+
+    // 3. Mid breaches 1.5 * one_tick_bps (0.002487 -> 8.04 bps), while l2Book BBO still clamps
+    //    new_limit_price == 0.002489 == ordered.limit_price -> MUST NOT cancel or burn chase_count!
+    db.update_asset_live_quote(pump.id, 0.002487, 0.002487)
+        .unwrap();
+    let ord2 = db.get_assets_ordered().unwrap().remove(0);
+    let res_unchanged_px = engine.chaser.advance_working_order(&ord2).unwrap();
+    assert!(matches!(res_unchanged_px, ChaseStepOutcome::Resting { .. }));
+    assert!(cancelled_oids.lock().is_empty());
+    assert_eq!(submitted_orders.lock().len(), 1);
+    assert_eq!(db.get_assets_ordered().unwrap()[0].chase_count, 0);
+
+    // 4. Both mid and l2Book move down (0.002486 / 0.002487) -> chases cleanly once to 0.002487
+    *l2_bbo.lock() = (0.002486, 0.002487);
+    db.update_asset_live_quote(pump.id, 0.002486, 0.002486)
+        .unwrap();
+    let ord3 = db.get_assets_ordered().unwrap().remove(0);
+    let res_chased = engine.chaser.advance_working_order(&ord3).unwrap();
+    match res_chased {
+        ChaseStepOutcome::Chased {
+            new_limit_price,
+            chase_count,
+            ..
+        } => {
+            assert_eq!(chase_count, 1);
+            assert!((new_limit_price - 0.002487).abs() < 1e-9);
+        }
+        other => panic!("Expected Chased when BBO moved down, got {other:?}"),
+    }
+    assert_eq!(*cancelled_oids.lock(), vec![65_001]);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_l2book_passive_clamp_and_bad_alo_rejection_recovery_to_fill() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WarnVisit(bool);
+    impl tracing::field::Visit for WarnVisit {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                let s = format!("{value:?}");
+                if s.contains("ALO") {
+                    self.0 = true;
+                }
+            }
+        }
+    }
+    struct WarnCapture(Arc<AtomicUsize>);
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut v = WarnVisit(false);
+                event.record(&mut v);
+                if v.0 || event.metadata().target().contains("order_chaser") {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Clone, Debug)]
+    enum AloScript {
+        AcceptResting,
+        RejectPostOnlyThenAcceptRequote,
+        RejectAllAlo,
+    }
+
+    let script = Arc::new(Mutex::new(AloScript::AcceptResting));
+    let script_srv = script.clone();
+    let bbo_by_coin: Arc<Mutex<HashMap<String, (f64, f64)>>> = Arc::new(Mutex::new(
+        [
+            ("NEAR".to_string(), (2.9680, 2.9684)),
+            ("PUMP".to_string(), (0.002488, 0.002489)),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let bbo_srv = bbo_by_coin.clone();
+    let submitted_pxs: Arc<Mutex<Vec<(u64, String, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let submitted_srv = submitted_pxs.clone();
+    let next_oid: Arc<Mutex<u64>> = Arc::new(Mutex::new(70_000));
+    let reject_counter: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let reject_srv = reject_counter.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "clearinghouseState" {
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "1000.0" },
+                        "assetPositions": []
+                    }),
+                );
+            }
+            if typ == "l2Book" {
+                let coin = body.get("coin").and_then(Value::as_str).unwrap_or("PUMP");
+                let (bid, ask) = bbo_srv.lock().get(coin).copied().unwrap_or((1.0, 1.001));
+                return (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": format!("{bid:.6}"), "sz": "50000"}],
+                            [{"px": format!("{ask:.6}"), "sz": "50000"}]
+                        ]
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "cancel" {
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": { "type": "cancel", "data": { "statuses": ["success"] } }
+                }),
+            );
+        }
+        if action_type == "order" {
+            let ord = body
+                .pointer("/action/orders/0")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let a_idx = ord.get("a").and_then(Value::as_u64).unwrap_or(0);
+            let px_str = ord.get("p").and_then(Value::as_str).unwrap_or("0");
+            let px_f: f64 = px_str.parse().unwrap_or(0.0);
+            let sz_str = ord.get("s").and_then(Value::as_str).unwrap_or("0");
+            let is_trigger = ord.pointer("/t/trigger").is_some();
+            let tif = ord
+                .pointer("/t/limit/tif")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            submitted_srv.lock().push((a_idx, tif.clone(), px_f));
+
+            let mut oid_guard = next_oid.lock();
+            *oid_guard += 1;
+            let oid = *oid_guard;
+
+            if !is_trigger && tif == "Ioc" {
+                return (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [{
+                                    "filled": {
+                                        "oid": oid,
+                                        "totalSz": sz_str,
+                                        "avgPx": "0.002488"
+                                    }
+                                }]
+                            }
+                        }
+                    }),
+                );
+            }
+
+            if !is_trigger && tif == "Alo" {
+                let mut mode_guard = script_srv.lock();
+                match *mode_guard {
+                    AloScript::AcceptResting => {}
+                    AloScript::RejectPostOnlyThenAcceptRequote => {
+                        let mut cnt = reject_srv.lock();
+                        *cnt += 1;
+                        if *cnt == 1 {
+                            bbo_srv
+                                .lock()
+                                .insert("PUMP".to_string(), (0.002487, 0.002488));
+                            return (
+                                200,
+                                json!({
+                                    "status": "ok",
+                                    "response": {
+                                        "type": "order",
+                                        "data": {
+                                            "statuses": [{
+                                                "error": "Post only order would have immediately matched, bbo was 0.002487@0.002488"
+                                            }]
+                                        }
+                                    }
+                                }),
+                            );
+                        }
+                        *mode_guard = AloScript::AcceptResting;
+                    }
+                    AloScript::RejectAllAlo => {
+                        return (
+                            200,
+                            json!({
+                                "status": "ok",
+                                "response": {
+                                    "type": "order",
+                                    "data": { "statuses": [{ "error": "badAloPxRejected" }] }
+                                }
+                            }),
+                        );
+                    }
+                }
+            }
+
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": { "statuses": [{ "resting": { "oid": oid } }] }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let warn_count = Arc::new(AtomicUsize::new(0));
+    let sub = WarnCapture(warn_count.clone());
+
+    tracing::subscriber::with_default(sub, || {
+        let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let engine = ExecutionEngine::new(db.clone());
+        configure_testnet_mock(&db, port);
+        db.set_config_value("max_alo_chase_ticks", "3", None)
+            .unwrap();
+
+        db.upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "NEAR".to_string(),
+            asset_index: 74,
+            sz_decimals: 1,
+            tick_size: 0.0001,
+            lot_step_size: 0.1,
+            max_leverage: 10.0,
+            mark_price: 2.9682,
+            mid_price: 2.9682,
+            oracle_price: 2.9682,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 20_000_000.0,
+            open_interest_usdc: 5_000_000.0,
+            prev_day_price: 2.95,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+        db.upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "PUMP".to_string(),
+            asset_index: 150,
+            sz_decimals: 0,
+            tick_size: 1e-6,
+            lot_step_size: 1.0,
+            max_leverage: 10.0,
+            mark_price: 0.002488,
+            mid_price: 0.002488,
+            oracle_price: 0.002488,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 10_000_000.0,
+            open_interest_usdc: 2_000_000.0,
+            prev_day_price: 0.00248,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+
+        // Part 1: l2Book BBO clamps chased ALO Long strictly passive against stale allMids spike
+        let near = db.get_asset_by_symbol("NEAR-USDC").unwrap().unwrap();
+        let near_pid = engine
+            .chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: near.clone(),
+                side: OrderSide::Long,
+                requested_quantity: 20.0,
+                reserved_margin_usdc: 59.36,
+                portfolio_weight: 0.10,
+                s1_weight_contrib: 0.10,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 2.85,
+                reason: "BBO_CLAMP_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+
+        // Stale allMids spikes to 2.9800 while live l2Book ask is only 2.9715 -> must clamp <= 2.9714
+        bbo_by_coin
+            .lock()
+            .insert("NEAR".to_string(), (2.9710, 2.9715));
+        db.update_asset_live_quote(near.id, 2.9800, 2.9800).unwrap();
+        let near_ord = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == near_pid)
+            .unwrap();
+        match engine.chaser.advance_working_order(&near_ord).unwrap() {
+            ChaseStepOutcome::Chased {
+                new_limit_price,
+                chase_count,
+                ..
+            } => {
+                assert_eq!(chase_count, 1);
+                assert!((new_limit_price - 2.9714).abs() < 1e-6);
+            }
+            other => panic!("Expected clamped Chased outcome on NEAR, got {other:?}"),
+        }
+        engine
+            .close_or_cancel_position(near_pid, "TEST_CLEANUP", Some(0))
+            .unwrap();
+
+        // Part 2: badAloPxRejected on chase triggers warn log + 1-tick passive re-quote instead of killing
+        let pump = db.get_asset_by_symbol("PUMP-USDC").unwrap().unwrap();
+        let pump_pid_1 = engine
+            .chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: pump.clone(),
+                side: OrderSide::Short,
+                requested_quantity: 31_539.0,
+                reserved_margin_usdc: 78.5,
+                portfolio_weight: -0.10,
+                s1_weight_contrib: -0.10,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 0.002606,
+                reason: "REQUOTE_RECOVERY_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+
+        *script.lock() = AloScript::RejectPostOnlyThenAcceptRequote;
+        bbo_by_coin
+            .lock()
+            .insert("PUMP".to_string(), (0.002486, 0.002487));
+        db.update_asset_live_quote(pump.id, 0.002486, 0.002486)
+            .unwrap();
+        let pump_ord_1 = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pump_pid_1)
+            .unwrap();
+        let warns_before = warn_count.load(Ordering::SeqCst);
+        let rq_res = engine.chaser.advance_working_order(&pump_ord_1).unwrap();
+        assert!(warn_count.load(Ordering::SeqCst) > warns_before);
+        match rq_res {
+            ChaseStepOutcome::Chased {
+                new_limit_price,
+                chase_count,
+                ..
+            } => {
+                assert_eq!(chase_count, 1);
+                assert!((new_limit_price - 0.002489).abs() < 1e-9);
+            }
+            other => panic!("Expected passive re-quote Chased outcome, got {other:?}"),
+        }
+        let pump_pos_1 = db.get_position_by_id(pump_pid_1).unwrap().unwrap();
+        assert_eq!(pump_pos_1.status, "WORKING");
+        assert!(pump_pos_1.exchange_order_id.is_some());
+        engine
+            .close_or_cancel_position(pump_pid_1, "TEST_CLEANUP_2", Some(0))
+            .unwrap();
+
+        // Part 3: Even when all ALO chases reject (badAloPxRejected), order stays WORKING at chase_count=1
+        //         and escalates cleanly to CROSSING_IOC fill instead of dying at chase_count=0!
+        db.set_config_value("max_alo_chase_ticks", "2", None)
+            .unwrap();
+        *script.lock() = AloScript::AcceptResting;
+        bbo_by_coin
+            .lock()
+            .insert("PUMP".to_string(), (0.002488, 0.002489));
+        db.update_asset_live_quote(pump.id, 0.002488, 0.002488)
+            .unwrap();
+
+        let pump_pid_2 = engine
+            .chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: pump.clone(),
+                side: OrderSide::Short,
+                requested_quantity: 31_539.0,
+                reserved_margin_usdc: 78.5,
+                portfolio_weight: -0.10,
+                s1_weight_contrib: -0.10,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 0.002606,
+                reason: "IOC_RECOVERY_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+
+        *script.lock() = AloScript::RejectAllAlo;
+        bbo_by_coin
+            .lock()
+            .insert("PUMP".to_string(), (0.002486, 0.002487));
+        db.update_asset_live_quote(pump.id, 0.002486, 0.002486)
+            .unwrap();
+
+        // Chase #1 rejects primary + re-quote -> stays WORKING with chase_count = 1
+        let ord_c0 = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pump_pid_2)
+            .unwrap();
+        let c1_res = engine.chaser.advance_working_order(&ord_c0).unwrap();
+        assert!(matches!(
+            c1_res,
+            ChaseStepOutcome::Chased { chase_count: 1, .. }
+        ));
+        assert_eq!(
+            db.get_position_by_id(pump_pid_2).unwrap().unwrap().status,
+            "WORKING"
+        );
+
+        // Chase #2 rejects -> stays WORKING with chase_count = 2 (ready for CROSSING_IOC)
+        let ord_c1 = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pump_pid_2)
+            .unwrap();
+        let c2_res = engine.chaser.advance_working_order(&ord_c1).unwrap();
+        assert!(matches!(
+            c2_res,
+            ChaseStepOutcome::Chased { chase_count: 2, .. }
+        ));
+
+        // Tick 3: chase_count == max_chases (2) -> escalates to CROSSING_IOC and fills OPEN
+        let ord_ioc = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pump_pid_2)
+            .unwrap();
+        let fill_res = engine.chaser.advance_working_order(&ord_ioc).unwrap();
+        match fill_res {
+            ChaseStepOutcome::FilledOpen {
+                filled_quantity, ..
+            } => assert!((filled_quantity - 31_539.0).abs() < 1e-6),
+            other => panic!("Expected FilledOpen via CROSSING_IOC recovery, got {other:?}"),
+        }
+        assert_eq!(
+            db.get_position_by_id(pump_pid_2).unwrap().unwrap().status,
+            "OPEN"
+        );
+    });
 
     let _ = stop_tx.send(());
 }

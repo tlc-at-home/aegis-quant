@@ -371,6 +371,134 @@ fn classify_working_order_for_reconcile(
     }
 }
 
+fn parse_order_timestamp_ms(ord: &Value) -> u64 {
+    ord.get("timestamp")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn normalize_order_coin_upper(ord: &Value) -> Option<String> {
+    let raw_coin = ord.get("coin").and_then(Value::as_str)?.trim();
+    if raw_coin.is_empty() {
+        return None;
+    }
+    let coin_upper = normalize_hyperliquid_symbol(raw_coin)
+        .map(|(_, c)| c.to_ascii_uppercase())
+        .unwrap_or_else(|_| raw_coin.to_ascii_uppercase());
+    Some(coin_upper)
+}
+
+fn is_trigger_order(ord: &Value) -> bool {
+    if ord.get("isTrigger").and_then(Value::as_bool) == Some(true)
+        || ord.get("isPositionTpsl").and_then(Value::as_bool) == Some(true)
+    {
+        return true;
+    }
+    let has_trigger_px = ord
+        .get("triggerPx")
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .is_some_and(|px| px.is_finite() && px > 0.0);
+    if has_trigger_px {
+        return true;
+    }
+    ord.get("orderType")
+        .and_then(Value::as_str)
+        .is_some_and(|t| {
+            let lower = t.to_ascii_lowercase();
+            lower.contains("stop") || lower.contains("take profit")
+        })
+}
+
+/// Returns `true` when a resting `frontendOpenOrders` entry is a non-trigger `reduceOnly`
+/// passive Limit close order (e.g. `engine.rs`'s fallback GTC close on an illiquid book).
+fn is_passive_reduce_only_close_order(ord: &Value) -> bool {
+    if ord.get("reduceOnly").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    if is_trigger_order(ord) {
+        return false;
+    }
+    ord.get("orderType")
+        .and_then(Value::as_str)
+        .is_none_or(|t| {
+            let trimmed = t.trim();
+            trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Limit")
+        })
+}
+
+/// Selects the newest passive `reduceOnly` Limit close OID `(highest timestamp, oid)` per coin
+/// currently open on Hyperliquid so reconciler does not cancel active resting close orders.
+fn collect_protected_passive_close_oids(
+    open_orders: &[Value],
+    open_coins: &HashSet<String>,
+) -> HashSet<u64> {
+    let mut newest_by_coin: HashMap<String, (u64, u64)> = HashMap::new();
+    for ord in open_orders {
+        if !is_passive_reduce_only_close_order(ord) {
+            continue;
+        }
+        let Some(coin_upper) = normalize_order_coin_upper(ord) else {
+            continue;
+        };
+        if !open_coins.contains(&coin_upper) {
+            continue;
+        }
+        let Some(oid) = extract_order_oid(ord) else {
+            continue;
+        };
+        let candidate = (parse_order_timestamp_ms(ord), oid);
+        match newest_by_coin.get(&coin_upper) {
+            Some(&current) if current >= candidate => {}
+            _ => {
+                newest_by_coin.insert(coin_upper, candidate);
+            }
+        }
+    }
+    newest_by_coin.into_values().map(|(_, oid)| oid).collect()
+}
+
+/// Partitions resting exchange `open_orders` into protected OIDs and orphan `(coin, oid)` pairs to cancel.
+fn find_orphan_orders_to_cancel(
+    open_orders: &[Value],
+    open_coins: &HashSet<String>,
+    tracked_protected_oids: &HashSet<u64>,
+    close_legacy_positions: bool,
+) -> (HashSet<u64>, Vec<(String, u64)>) {
+    let protected_oids: HashSet<u64> = if close_legacy_positions {
+        HashSet::new()
+    } else {
+        let mut set = tracked_protected_oids.clone();
+        set.extend(collect_protected_passive_close_oids(
+            open_orders,
+            open_coins,
+        ));
+        set
+    };
+
+    let mut orphans = Vec::new();
+    for ord in open_orders {
+        let coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+        let Some(oid) = extract_order_oid(ord) else {
+            continue;
+        };
+        if coin.is_empty() {
+            continue;
+        }
+        if !close_legacy_positions && protected_oids.contains(&oid) {
+            continue;
+        }
+        orphans.push((coin.to_string(), oid));
+    }
+    (protected_oids, orphans)
+}
+
 #[derive(Default)]
 struct AggClosingOrder {
     coin: String,
@@ -800,7 +928,7 @@ impl CutoverReconciler {
             }
         }
 
-        let mut protected_oids: HashSet<u64> = HashSet::new();
+        let mut tracked_protected_oids: HashSet<u64> = HashSet::new();
         let mut active_chasing_partial_coins: HashSet<String> = HashSet::new();
         if !close_legacy_positions {
             if let Ok(local_held) = self.db.get_assets_held() {
@@ -820,7 +948,7 @@ impl CutoverReconciler {
                                 .get(&raw_oid.trim().to_ascii_lowercase())
                                 .copied()
                         }) {
-                            protected_oids.insert(oid);
+                            tracked_protected_oids.insert(oid);
                         }
                     }
                 }
@@ -849,12 +977,12 @@ impl CutoverReconciler {
                     match disposition {
                         WorkingOrderReconcileDisposition::ProtectPending => {
                             if let Some(oid) = entry_oid {
-                                protected_oids.insert(oid);
+                                tracked_protected_oids.insert(oid);
                             }
                         }
                         WorkingOrderReconcileDisposition::ProtectActivePartial => {
                             if let Some(oid) = entry_oid {
-                                protected_oids.insert(oid);
+                                tracked_protected_oids.insert(oid);
                             }
                             active_chasing_partial_coins.insert(coin_upper);
                         }
@@ -864,21 +992,18 @@ impl CutoverReconciler {
             }
         }
 
+        let (_protected_oids, orphan_orders) = find_orphan_orders_to_cancel(
+            &open_orders,
+            &open_coins,
+            &tracked_protected_oids,
+            close_legacy_positions,
+        );
+
         let mut batch_cancels: Vec<CancelWire> = Vec::new();
         let mut cancelled_oid_candidates: Vec<u64> = Vec::new();
-        for ord in &open_orders {
-            let coin = ord.get("coin").and_then(Value::as_str).unwrap_or("").trim();
-            let Some(oid) = extract_order_oid(ord) else {
-                continue;
-            };
-            if coin.is_empty() {
-                continue;
-            }
-            if !close_legacy_positions && protected_oids.contains(&oid) {
-                continue;
-            }
+        for (coin, oid) in orphan_orders {
             report.stale_orders_found += 1;
-            if let Ok(Some(asset)) = self.db.get_asset_by_symbol(coin) {
+            if let Ok(Some(asset)) = self.db.get_asset_by_symbol(&coin) {
                 batch_cancels.push(CancelWire {
                     a: asset.asset_index,
                     o: oid,
@@ -1821,6 +1946,215 @@ mod tests {
                 Some(388.0),
             ),
             WorkingOrderReconcileDisposition::AdoptOrExpire
+        );
+    }
+
+    #[test]
+    fn test_is_passive_reduce_only_close_order_variants() {
+        // Real HL frontendOpenOrders shape for passive GTC reduceOnly close (triggerPx: "0.0")
+        assert!(is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 65_660_647_244u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "isPositionTpsl": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": 1_795_181_186_927u64
+        })));
+        // Minimal passive reduceOnly Limit order
+        assert!(is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 100u64,
+            "reduceOnly": true,
+            "orderType": "Limit"
+        })));
+        // Non-reduceOnly resting entry Limit order -> NOT protected as passive close
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "PUMP",
+            "oid": 101u64,
+            "reduceOnly": false,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0"
+        })));
+        // Missing reduceOnly (e.g. openOrders fallback) -> false
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 102u64
+        })));
+        // Trigger orders must return false across isTrigger / triggerPx / orderType / isPositionTpsl
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 103u64,
+            "reduceOnly": true,
+            "isTrigger": true,
+            "orderType": "Stop Market",
+            "triggerPx": "0.20111"
+        })));
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 104u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.20111"
+        })));
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 105u64,
+            "reduceOnly": true,
+            "orderType": "Take Profit Market"
+        })));
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 106u64,
+            "reduceOnly": true,
+            "orderType": "Stop Limit"
+        })));
+        assert!(!is_passive_reduce_only_close_order(&json!({
+            "coin": "MET",
+            "oid": 107u64,
+            "reduceOnly": true,
+            "isPositionTpsl": true,
+            "orderType": "Limit"
+        })));
+    }
+
+    #[test]
+    fn test_passive_reduce_only_close_order_protection_and_orphan_cancellation() {
+        let passive_met = json!({
+            "coin": "MET",
+            "oid": 65_660_647_244u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": 1_795_181_186_927u64
+        });
+        let sl_met = json!({
+            "coin": "MET",
+            "oid": 65_605_015_926u64,
+            "reduceOnly": true,
+            "isTrigger": true,
+            "orderType": "Stop Market",
+            "triggerPx": "0.20111",
+            "timestamp": 1_795_181_000_000u64
+        });
+        let tp_met = json!({
+            "coin": "MET",
+            "oid": 65_648_930_301u64,
+            "reduceOnly": true,
+            "isTrigger": true,
+            "orderType": "Take Profit Market",
+            "triggerPx": "0.25086",
+            "timestamp": 1_795_181_000_500u64
+        });
+        let tracked_triggers: HashSet<u64> =
+            [65_605_015_926u64, 65_648_930_301u64].into_iter().collect();
+
+        // (a) Resting passive reduceOnly Limit order on an OPEN coin is protected when !close_legacy_positions
+        let mut open_coins: HashSet<String> = ["MET".to_string()].into_iter().collect();
+        let (protected_a, orphans_a) = find_orphan_orders_to_cancel(
+            &[sl_met.clone(), tp_met.clone(), passive_met.clone()],
+            &open_coins,
+            &tracked_triggers,
+            false,
+        );
+        assert!(protected_a.contains(&65_660_647_244u64));
+        assert!(protected_a.contains(&65_605_015_926u64));
+        assert!(protected_a.contains(&65_648_930_301u64));
+        assert!(orphans_a.is_empty());
+
+        // (b) Cancelled if open_coins does not contain coin (flat position)
+        let empty_open_coins: HashSet<String> = HashSet::new();
+        let empty_tracked: HashSet<u64> = HashSet::new();
+        let (protected_b, orphans_b) = find_orphan_orders_to_cancel(
+            std::slice::from_ref(&passive_met),
+            &empty_open_coins,
+            &empty_tracked,
+            false,
+        );
+        assert!(!protected_b.contains(&65_660_647_244u64));
+        assert_eq!(orphans_b, vec![("MET".to_string(), 65_660_647_244u64)]);
+
+        // (c) Cancelled if close_legacy_positions == true
+        let (protected_c, orphans_c) = find_orphan_orders_to_cancel(
+            &[sl_met.clone(), tp_met.clone(), passive_met.clone()],
+            &open_coins,
+            &tracked_triggers,
+            true,
+        );
+        assert!(protected_c.is_empty());
+        assert_eq!(
+            orphans_c,
+            vec![
+                ("MET".to_string(), 65_605_015_926u64),
+                ("MET".to_string(), 65_648_930_301u64),
+                ("MET".to_string(), 65_660_647_244u64),
+            ]
+        );
+
+        // (d) Duplicate passive limit orders on the same coin cancel all but the newest OID while triggers stay untouched
+        let older_passive_met = json!({
+            "coin": "MET",
+            "oid": 65_660_600_000u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": 1_795_181_100_000u64
+        });
+        let newer_passive_met = json!({
+            "coin": "MET",
+            "oid": 65_660_647_244u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "triggerPx": "0.0",
+            "timestamp": 1_795_181_186_927u64
+        });
+        // Also test k-prefix coin & equal-timestamp tiebreak by highest oid
+        open_coins.insert("KPEPE".to_string());
+        let kpepe_low_oid = json!({
+            "coin": "kPEPE",
+            "oid": 1000u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "timestamp": 2_000_000u64
+        });
+        let kpepe_high_oid = json!({
+            "coin": "kPEPE",
+            "oid": 1005u64,
+            "reduceOnly": true,
+            "isTrigger": false,
+            "orderType": "Limit",
+            "timestamp": 2_000_000u64
+        });
+        let (protected_d, orphans_d) = find_orphan_orders_to_cancel(
+            &[
+                sl_met,
+                tp_met,
+                older_passive_met,
+                newer_passive_met,
+                kpepe_low_oid,
+                kpepe_high_oid,
+            ],
+            &open_coins,
+            &tracked_triggers,
+            false,
+        );
+        assert!(protected_d.contains(&65_605_015_926u64));
+        assert!(protected_d.contains(&65_648_930_301u64));
+        assert!(protected_d.contains(&65_660_647_244u64));
+        assert!(protected_d.contains(&1005u64));
+        assert_eq!(
+            orphans_d,
+            vec![
+                ("MET".to_string(), 65_660_600_000u64),
+                ("kPEPE".to_string(), 1000u64),
+            ]
         );
     }
 }
