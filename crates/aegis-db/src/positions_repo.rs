@@ -5,7 +5,10 @@
 
 use crate::engine::DatabaseManager;
 use crate::orders_repo::truncate_audit_reason;
-use aegis_core::{now_ms, round_dp, AegisError, OrderSide, PositionRecord, Result};
+use aegis_core::{
+    compute_position_pnl_pct, now_ms, resolve_position_entry_notional_usdc, round_dp, AegisError,
+    ClosedPositionView, OrderSide, PositionRecord, Result,
+};
 use mysql::params;
 use mysql::prelude::*;
 use std::collections::HashSet;
@@ -755,6 +758,78 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(format!("list_closed_positions failed: {e}")))?;
         Ok(rows.into_iter().map(row_to_position_record).collect())
+    }
+
+    /// Lists recent `CLOSED` trades joined with `exchange_assets`, enriching each trade with
+    /// `entry_notional_usdc` and `realized_pnl_pct` (using `entry_price * filled_quantity`
+    /// because `CLOSED` rows in MariaDB zero out `committed_notional_usdc`).
+    pub fn list_recent_closed_positions_view(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ClosedPositionView>> {
+        let mut conn = self.get_conn()?;
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                r#"SELECT p.id, p.asset_id, a.symbol, a.coin, p.client_order_id, p.side,
+                          p.entry_price, COALESCE(p.exit_price, p.current_price),
+                          p.filled_quantity, p.committed_notional_usdc,
+                          p.realized_pnl_usdc, p.fees_paid_usdc, p.funding_accrued_usdc,
+                          p.opened_at_ms, COALESCE(p.closed_at_ms, p.updated_at_ms), p.exit_reason
+                   FROM positions p
+                   INNER JOIN exchange_assets a ON a.id = p.asset_id
+                   WHERE p.status = 'CLOSED'
+                   ORDER BY COALESCE(p.closed_at_ms, p.updated_at_ms) DESC, p.id DESC
+                   LIMIT :lim"#,
+                params! { "lim" => limit.max(1) as u64 },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("list_recent_closed_positions_view failed: {e}"))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let entry_price: f64 = r.get(6).unwrap_or_default();
+                let exit_price: f64 = r.get(7).unwrap_or_default();
+                let filled_quantity: f64 = r.get(8).unwrap_or_default();
+                let committed_notional_usdc: f64 = r.get(9).unwrap_or_default();
+                let realized_pnl_usdc: f64 = r.get(10).unwrap_or_default();
+                let entry_notional_usdc = round_dp(
+                    resolve_position_entry_notional_usdc(
+                        entry_price,
+                        filled_quantity,
+                        committed_notional_usdc,
+                    ),
+                    2,
+                );
+                let realized_pnl_pct = compute_position_pnl_pct(
+                    realized_pnl_usdc,
+                    entry_price,
+                    filled_quantity,
+                    committed_notional_usdc,
+                );
+                ClosedPositionView {
+                    position_id: r.get(0).unwrap_or_default(),
+                    asset_id: r.get(1).unwrap_or_default(),
+                    symbol: r.get(2).unwrap_or_default(),
+                    coin: r.get(3).unwrap_or_default(),
+                    client_order_id: r.get(4).unwrap_or_default(),
+                    side: r.get(5).unwrap_or_else(|| "LONG".to_string()),
+                    entry_price,
+                    exit_price,
+                    quantity: filled_quantity,
+                    filled_quantity,
+                    entry_notional_usdc,
+                    realized_pnl_usdc,
+                    realized_pnl_pct,
+                    fees_paid_usdc: r.get(11).unwrap_or_default(),
+                    funding_accrued_usdc: r.get(12).unwrap_or_default(),
+                    opened_at_ms: r.get::<Option<i64>, _>(13).unwrap_or(None),
+                    closed_at_ms: r.get(14).unwrap_or_default(),
+                    exit_reason: r.get::<Option<String>, _>(15).unwrap_or(None),
+                }
+            })
+            .collect())
     }
 
     /// Synchronizes MariaDB `positions` 1:1 with a live Hyperliquid `clearinghouseState` position for `asset_id`.

@@ -1643,3 +1643,417 @@ async fn test_web_discord_webhook_ssrf_rejected_and_uppercase_config_normalized(
     assert_eq!(cfg.get_str("risk_capital_cap_usdc", ""), "2500.0");
     assert!(cfg.get_i64("risk_capital_cap_updated_at_ms", 0) > 100);
 }
+
+#[tokio::test]
+async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
+    use aegis_core::{VaultInfoPayload, VaultPositionInfo};
+    use aegis_db::ReconciledClosedTradeInput;
+
+    // 1. Direct writes to live_vault_info_json are rejected as SecurityViolation (403 Forbidden)
+    assert!(matches!(
+        validate_config_key_value("live_vault_info_json", "{}"),
+        Err(AegisError::SecurityViolation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("LIVE_VAULT_INFO_JSON", "{}"),
+        Err(AegisError::SecurityViolation(_))
+    ));
+
+    let now = now_ms();
+    let locked_future = now + 86_400_000;
+    let locked_past = now - 86_400_000;
+    let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_usdc", "629.84", None)
+            .unwrap();
+        mgr.set_config_value("hyperliquid_vault_address", hlp_addr, None)
+            .unwrap();
+
+        let sol_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "SOL".to_string(),
+                asset_index: 2,
+                sz_decimals: 2,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: 186.17,
+                mid_price: 186.17,
+                oracle_price: 186.17,
+                funding_rate_hourly: 0.00001,
+                day_volume_usdc: 50_000_000.0,
+                open_interest_usdc: 20_000_000.0,
+                prev_day_price: 180.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+
+        let met_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "MET".to_string(),
+                asset_index: 195,
+                sz_decimals: 0,
+                tick_size: 0.00001,
+                lot_step_size: 1.0,
+                max_leverage: 3.0,
+                mark_price: 0.19258,
+                mid_price: 0.19258,
+                oracle_price: 0.19258,
+                funding_rate_hourly: 0.00001,
+                day_volume_usdc: 5_000_000.0,
+                open_interest_usdc: 1_000_000.0,
+                prev_day_price: 0.23,
+                is_core_eligible: false,
+                is_event_eligible: true,
+                is_priority_watched: false,
+            })
+            .unwrap();
+
+        // Open SOL position: entry=180.0, qty=2.0 (entry notional=360.0), uPnL=+12.34 -> +3.43%
+        mgr.sync_open_position_from_exchange_v2(
+            sol_id,
+            "SOL",
+            OrderSide::Long,
+            180.0,
+            186.17,
+            2.0,
+            372.34,
+            12.34,
+            0.59,
+            172.0,
+            195.0,
+            0.0,
+            Some(now - 600_000),
+        )
+        .unwrap();
+
+        // Closed MET position in MariaDB with committed_notional_usdc == 0.0!
+        // entry=0.23227, qty=9634.0 (entry notional=2237.69), realized_pnl=-382.37 -> -17.09%
+        mgr.reconcile_closed_positions_from_exchange_fills(&[ReconciledClosedTradeInput {
+            asset_id: met_id,
+            client_order_id: "hl-closed-met-9001".to_string(),
+            exchange_order_id: "hl-9001".to_string(),
+            side: OrderSide::Long,
+            entry_price: 0.23227,
+            exit_price: 0.19258,
+            filled_quantity: 9634.0,
+            realized_pnl_usdc: -382.37,
+            fees_paid_usdc: 1.25,
+            funding_accrued_usdc: -0.40,
+            created_at_ms: now - 3_600_000,
+            closed_at_ms: now - 60_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        }])
+        .unwrap();
+
+        // Cancelled unfilled order should NOT appear in recent_closed_positions
+        let cancelled_pid = mgr
+            .create_working_order(&WorkingOrderInput {
+                asset_id: met_id,
+                client_order_id: "cancelled-alo-1".to_string(),
+                side: OrderSide::Short,
+                limit_price: 0.20,
+                requested_quantity: 100.0,
+                reserved_margin_usdc: 20.0,
+                portfolio_weight: -0.05,
+                s1_weight_contrib: 0.0,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: -0.05,
+                protective_stop_px: 0.22,
+                exchange_order_id: None,
+                reason: "TEST_CANCEL".to_string(),
+            })
+            .unwrap();
+        mgr.cancel_working_order(cancelled_pid, "TEST_CANCELLED")
+            .unwrap();
+
+        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+            total_equity_usdc: 629.84,
+            available_cash_usdc: 428.58,
+            reserved_order_cash_usdc: 0.0,
+            committed_notional_usdc: 372.34,
+            net_notional_usdc: 372.34,
+            gross_leverage_x: 0.591,
+            net_leverage_x: 0.591,
+            market_beta_exposure: 0.5,
+            market_breadth_bull: 0.5,
+            market_regime_label: "NEUTRAL".to_string(),
+            risk_tier: "extreme".to_string(),
+            leverage_multiplier: 1.85,
+            s1_gross_weight: 0.59,
+            s2_gross_weight: 0.0,
+            s3_gross_weight: 0.0,
+            working_order_count: 0,
+            open_long_count: 1,
+            open_short_count: 0,
+            eligible_coin_count: 2,
+        })
+        .unwrap();
+
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 2. POST /api/v1/config rejects direct and batch writes to live_vault_info_json with 403
+    for payload in [
+        r#"{"config_key":"live_vault_info_json","config_value":"{}"}"#,
+        r#"{"updates":{"live_vault_info_json":"{}"}}"#,
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    // 3. Before vault sync, /api/v1/dashboard returns vault_info with zeros + vaults: []
+    let res_pre = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_pre.status(), StatusCode::OK);
+    let pre_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_pre.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pre_json["vault_info"]["configured_vault_address"], hlp_addr);
+    assert_eq!(pre_json["vault_info"]["total_vault_equity_usdc"], 0.0);
+    assert!(
+        (pre_json["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 629.84)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(pre_json["vault_info"]["vault_count"], 0);
+    assert_eq!(pre_json["vault_info"]["synced_at_ms"], 0);
+    assert_eq!(
+        pre_json["vault_info"]["vaults"].as_array().unwrap().len(),
+        0
+    );
+
+    // Verify open holding unrealized_pnl_pct and closed position realized_pnl_pct
+    let held = pre_json["v_assets_held"].as_array().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0]["symbol"], "SOL-USDC");
+    assert!((held[0]["unrealized_pnl_pct"].as_f64().unwrap() - 3.43).abs() < 1e-6);
+
+    let closed = pre_json["recent_closed_positions"].as_array().unwrap();
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["symbol"], "MET-USDC");
+    assert_eq!(closed[0]["coin"], "MET");
+    assert!((closed[0]["entry_price"].as_f64().unwrap() - 0.23227).abs() < 1e-6);
+    assert!((closed[0]["exit_price"].as_f64().unwrap() - 0.19258).abs() < 1e-6);
+    assert!((closed[0]["quantity"].as_f64().unwrap() - 9634.0).abs() < 1e-6);
+    assert!((closed[0]["filled_quantity"].as_f64().unwrap() - 9634.0).abs() < 1e-6);
+    assert!((closed[0]["realized_pnl_usdc"].as_f64().unwrap() - (-382.37)).abs() < 1e-4);
+    assert!((closed[0]["realized_pnl_pct"].as_f64().unwrap() - (-17.09)).abs() < 1e-6);
+
+    // 4. Persist synced vault info snapshot internally and verify /api/v1/dashboard + /api/v1/state
+    let synced_payload = VaultInfoPayload {
+        configured_vault_address: hlp_addr.to_string(),
+        total_vault_equity_usdc: 202.40,
+        combined_portfolio_equity_usdc: 832.24,
+        vault_count: 2,
+        synced_at_ms: now,
+        vaults: vec![
+            VaultPositionInfo {
+                vault_address: hlp_addr.to_string(),
+                name: "Hyperliquidity Provider (HLP)".to_string(),
+                leader: "0x677d831aef5328190852e24f13c46cac05f984e7".to_string(),
+                equity_usdc: 202.40,
+                pnl_usdc: 0.92,
+                all_time_pnl_usdc: 1.34,
+                pnl_pct: 0.46,
+                all_time_pnl_pct: 0.67,
+                apr_pct: 8.14,
+                days_following: 25,
+                locked_until_ms: locked_past,
+                is_locked: true, // stale flag should be recomputed dynamically to false!
+                is_closed: false,
+            },
+            VaultPositionInfo {
+                vault_address: "0x3333333333333333333333333333333333333333".to_string(),
+                name: "Locked Vault".to_string(),
+                leader: "0x4444444444444444444444444444444444444444".to_string(),
+                equity_usdc: 0.0,
+                pnl_usdc: 0.0,
+                all_time_pnl_usdc: 0.0,
+                pnl_pct: 0.0,
+                all_time_pnl_pct: 0.0,
+                apr_pct: 4.2,
+                days_following: 1,
+                locked_until_ms: locked_future,
+                is_locked: false, // stale flag should be recomputed dynamically to true!
+                is_closed: false,
+            },
+        ],
+    };
+    let db_sync = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_sync
+            .set_config_value(
+                "live_vault_info_json",
+                &serde_json::to_string(&synced_payload).unwrap(),
+                None,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    for uri in ["/api/v1/dashboard", "/api/v1/state"] {
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        // Perp equity strictly untouched
+        assert!((body["snapshot"]["total_equity_usdc"].as_f64().unwrap() - 629.84).abs() < 1e-6);
+
+        let vi = &body["vault_info"];
+        assert_eq!(vi["configured_vault_address"], hlp_addr);
+        assert!((vi["total_vault_equity_usdc"].as_f64().unwrap() - 202.40).abs() < 1e-6);
+        assert!((vi["combined_portfolio_equity_usdc"].as_f64().unwrap() - 832.24).abs() < 1e-6);
+        assert_eq!(vi["vault_count"], 2);
+        assert_eq!(vi["synced_at_ms"], now);
+        let vaults = vi["vaults"].as_array().unwrap();
+        assert_eq!(vaults.len(), 2);
+        assert_eq!(vaults[0]["vault_address"], hlp_addr);
+        assert_eq!(vaults[0]["name"], "Hyperliquidity Provider (HLP)");
+        assert_eq!(vaults[0]["is_locked"], false);
+        assert_eq!(vaults[0]["is_closed"], false);
+        assert_eq!(vaults[1]["is_locked"], true);
+    }
+
+    // 4b. Verify SSE broadcaster (/api/v1/stream) serializes the exact same vault_info & PnL % fields
+    let sse_state = AppState::new(db.clone(), None);
+    let mut sse_rx = sse_state.dashboard_rx.clone();
+    sse_state.notify_dashboard_refresh();
+    let sse_payload_str = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cur = sse_rx.borrow_and_update().clone();
+            if !cur.is_empty() {
+                return cur;
+            }
+            if sse_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        std::sync::Arc::new(String::new())
+    })
+    .await
+    .expect("SSE broadcaster emitted payload within 5s");
+    sse_state.shutdown();
+    let sse_json: Value = serde_json::from_str(&sse_payload_str).unwrap();
+    assert!(
+        (sse_json["vault_info"]["total_vault_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 202.40)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (sse_json["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 832.24)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (sse_json["v_assets_held"][0]["unrealized_pnl_pct"]
+            .as_f64()
+            .unwrap()
+            - 3.43)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (sse_json["recent_closed_positions"][0]["realized_pnl_pct"]
+            .as_f64()
+            .unwrap()
+            - (-17.09))
+            .abs()
+            < 1e-6
+    );
+
+    // 5. In PAPER mode, vault_info always returns zeros and vaults: []
+    let db_paper = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_paper
+            .set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_paper = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paper.status(), StatusCode::OK);
+    let paper_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_paper.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(paper_json["vault_info"]["total_vault_equity_usdc"], 0.0);
+    assert_eq!(paper_json["vault_info"]["vault_count"], 0);
+    assert_eq!(paper_json["vault_info"]["synced_at_ms"], 0);
+    assert!(paper_json["vault_info"]["vaults"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        (paper_json["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - paper_json["snapshot"]["total_equity_usdc"]
+                .as_f64()
+                .unwrap())
+        .abs()
+            < 1e-6
+    );
+}

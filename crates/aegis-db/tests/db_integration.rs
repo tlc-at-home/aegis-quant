@@ -1667,3 +1667,74 @@ fn test_order_audit_reason_clamping_prevents_mysql_1406() {
         .filter(|a| a.reason.starts_with('🔥'))
         .all(|a| a.reason.chars().count() == 250));
 }
+
+#[test]
+fn test_vault_config_seed_and_position_pnl_percentages() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let cfg = db.load_config().unwrap();
+    assert_eq!(
+        cfg.get("live_vault_info_json").map(String::as_str),
+        Some("")
+    );
+
+    let sol_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "SOL".to_string(),
+            asset_index: 2,
+            sz_decimals: 2,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+            max_leverage: 20.0,
+            mark_price: 200.0,
+            mid_price: 200.0,
+            oracle_price: 200.0,
+            funding_rate_hourly: 0.00001,
+            day_volume_usdc: 50_000_000.0,
+            open_interest_usdc: 20_000_000.0,
+            prev_day_price: 190.0,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+
+    // Open position: entry=190.0, qty=5.0 (notional=950.0), uPnL=+50.0 -> +5.26%
+    let (open_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol_id,
+            "SOL",
+            OrderSide::Long,
+            190.0,
+            200.0,
+            5.0,
+            1000.0,
+            50.0,
+            0.2,
+            180.0,
+            220.0,
+            0.0,
+            Some(now_ms() - 120_000),
+        )
+        .unwrap();
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].position_id, open_pid);
+    assert!((held[0].unrealized_pnl_pct - 5.26).abs() < 1e-6);
+
+    // Close the position (sets committed_notional_usdc = 0.0 in MariaDB!)
+    db.close_position(open_pid, 200.0, 0.5, "TEST_TP").unwrap();
+    let raw_closed = db.get_position_by_id(open_pid).unwrap().unwrap();
+    assert_eq!(raw_closed.status, "CLOSED");
+    assert_eq!(raw_closed.committed_notional_usdc, 0.0);
+
+    // list_recent_closed_positions_view computes realized_pnl_pct from entry_price * filled_quantity
+    // gross=50.0, fee=0.5 => realized_pnl=49.5; notional=190*5=950 => 49.5/950*100 = 5.21%
+    let closed_views = db.list_recent_closed_positions_view(10).unwrap();
+    assert_eq!(closed_views.len(), 1);
+    assert_eq!(closed_views[0].position_id, open_pid);
+    assert_eq!(closed_views[0].symbol, "SOL-USDC");
+    assert_eq!(closed_views[0].coin, "SOL");
+    assert!((closed_views[0].entry_notional_usdc - 950.0).abs() < 1e-6);
+    assert!((closed_views[0].realized_pnl_usdc - 49.5).abs() < 1e-4);
+    assert!((closed_views[0].realized_pnl_pct - 5.21).abs() < 1e-6);
+}

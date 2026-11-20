@@ -52,6 +52,7 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "hyperliquid_exchange_url",
     "hyperliquid_testnet_exchange_url",
     "hyperliquid_allowed_hosts",
+    "live_vault_info_json",
 ];
 
 /// Returns true if `key` is an immutable security policy key that cannot be modified via the Web API.
@@ -218,6 +219,8 @@ mod tests {
             " WEB_TRUST_PROXY_HEADERS "
         ));
         assert!(is_immutable_security_config_key("ALLOW_WEB_LIVE_MODE"));
+        assert!(is_immutable_security_config_key("live_vault_info_json"));
+        assert!(is_immutable_security_config_key(" LIVE_VAULT_INFO_JSON "));
         assert_eq!(mask_identifier(""), "");
         assert_eq!(mask_identifier("αβγδ"), "***");
         assert_eq!(mask_identifier("🔥🚀αβγδε"), "🔥🚀***δε");

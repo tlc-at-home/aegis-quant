@@ -2,10 +2,10 @@
 
 use aegis_core::{
     is_immutable_security_config_key, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
-    now_ms, round_dp, AegisError, CooldownAssetView, ExchangeAsset, HeldAssetView,
-    OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result,
-    RiskTier, SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow,
-    TelemetryLogRecord, PLATFORM_VERSION,
+    now_ms, round_dp, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView, ExchangeAsset,
+    HeldAssetView, OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot,
+    PriorityWatchView, Result, RiskTier, SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView,
+    SystemConfigRow, TelemetryLogRecord, VaultInfoPayload, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -88,10 +88,12 @@ pub struct DashboardPayload {
     pub active_cap_open_count: usize,
     pub pre_cap_open_count: usize,
     pub pnl_summary: PnlSummary,
+    pub vault_info: VaultInfoPayload,
     pub snapshot: PortfolioSnapshot,
     pub snapshots_history: Vec<PortfolioSnapshot>,
     pub v_assets_held: Vec<HeldAssetView>,
     pub v_assets_ordered: Vec<OrderedAssetView>,
+    pub recent_closed_positions: Vec<ClosedPositionView>,
     pub v_assets_in_cooldown: Vec<CooldownAssetView>,
     pub v_assets_sleeve_s1: Vec<SleeveS1AssetView>,
     pub v_assets_sleeve_s2: Vec<SleeveS2AssetView>,
@@ -259,6 +261,7 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
                 | "hyperliquid_last_nonce"
                 | "last_db_backup_ms"
                 | "last_entry_order_ms"
+                | "live_vault_info_json"
         )
     {
         return Err(AegisError::SecurityViolation(format!(
@@ -483,6 +486,88 @@ pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
     })
 }
 
+/// Builds the `vault_info` payload purely from cached `system_config` (`live_vault_info_json`)
+/// without ever issuing network calls inside HTTP/SSE handlers.
+/// Always returns zeros + `vaults: []` in PAPER mode or before initial vault sync.
+/// Vault equity is strictly segregated from perp equity (`snapshot.total_equity_usdc` is untouched).
+pub fn build_vault_info_payload(
+    cfg: &ConfigMap,
+    perp_equity_usdc: f64,
+    now_ms_val: i64,
+) -> VaultInfoPayload {
+    let configured_vault_address = cfg.get_str("hyperliquid_vault_address", "");
+    let safe_perp_eq = if perp_equity_usdc.is_finite() {
+        perp_equity_usdc
+    } else {
+        0.0
+    };
+
+    if !cfg.execution_mode().is_live_or_testnet() {
+        return VaultInfoPayload {
+            configured_vault_address,
+            total_vault_equity_usdc: 0.0,
+            combined_portfolio_equity_usdc: round_dp(safe_perp_eq, 2),
+            vault_count: 0,
+            synced_at_ms: 0,
+            vaults: Vec::new(),
+        };
+    }
+
+    let raw_json = cfg.get_str("live_vault_info_json", "");
+    let parsed = (!raw_json.is_empty())
+        .then(|| serde_json::from_str::<VaultInfoPayload>(&raw_json).ok())
+        .flatten();
+
+    let Some(mut info) = parsed else {
+        return VaultInfoPayload {
+            configured_vault_address,
+            total_vault_equity_usdc: 0.0,
+            combined_portfolio_equity_usdc: round_dp(safe_perp_eq, 2),
+            vault_count: 0,
+            synced_at_ms: 0,
+            vaults: Vec::new(),
+        };
+    };
+
+    let mut sum_vault_eq = 0.0_f64;
+    for v in &mut info.vaults {
+        if !v.equity_usdc.is_finite() {
+            v.equity_usdc = 0.0;
+        }
+        if !v.pnl_usdc.is_finite() {
+            v.pnl_usdc = 0.0;
+        }
+        if !v.all_time_pnl_usdc.is_finite() {
+            v.all_time_pnl_usdc = 0.0;
+        }
+        if !v.pnl_pct.is_finite() {
+            v.pnl_pct = 0.0;
+        }
+        if !v.all_time_pnl_pct.is_finite() {
+            v.all_time_pnl_pct = 0.0;
+        }
+        if !v.apr_pct.is_finite() {
+            v.apr_pct = 0.0;
+        }
+        v.is_locked = v.locked_until_ms > now_ms_val;
+        sum_vault_eq += v.equity_usdc;
+    }
+
+    let total_vault_equity_usdc = if info.vaults.is_empty() {
+        0.0
+    } else if info.total_vault_equity_usdc.is_finite() && info.total_vault_equity_usdc > 0.0 {
+        round_dp(info.total_vault_equity_usdc, 2)
+    } else {
+        round_dp(sum_vault_eq, 2)
+    };
+
+    info.configured_vault_address = configured_vault_address;
+    info.total_vault_equity_usdc = total_vault_equity_usdc;
+    info.combined_portfolio_equity_usdc = round_dp(safe_perp_eq + total_vault_equity_usdc, 2);
+    info.vault_count = info.vaults.len();
+    info
+}
+
 /// Builds the unified `DashboardPayload` querying MariaDB 13.0 tables and all 7 SQL Views.
 /// Uses a 30-second cache for the `SHOW FULL TABLES` view-health check and performs zero writes.
 pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload> {
@@ -491,9 +576,13 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     let cfg = db.load_config_or_default();
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
+    let ts = now_ms();
 
     let v_assets_held = db.get_assets_held().unwrap_or_default();
     let v_assets_ordered = db.get_assets_ordered().unwrap_or_default();
+    let recent_closed_positions = db
+        .list_recent_closed_positions_view(100)
+        .unwrap_or_default();
     let v_assets_in_cooldown = db.get_assets_in_cooldown().unwrap_or_default();
     let v_assets_sleeve_s1 = db.get_sleeve_s1_view().unwrap_or_default();
     let v_assets_sleeve_s2 = db.get_sleeve_s2_view().unwrap_or_default();
@@ -596,6 +685,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .filter(|h| cap_epoch_ms <= 0 || h.opened_at_ms.unwrap_or(h.updated_at_ms) >= cap_epoch_ms)
         .count();
     let pre_cap_open_count = v_assets_held.len().saturating_sub(active_cap_open_count);
+    let vault_info = build_vault_info_payload(&cfg, snapshot.total_equity_usdc, ts);
 
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
@@ -611,10 +701,12 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         active_cap_open_count,
         pre_cap_open_count,
         pnl_summary,
+        vault_info,
         snapshot,
         snapshots_history,
         v_assets_held,
         v_assets_ordered,
+        recent_closed_positions,
         v_assets_in_cooldown,
         v_assets_sleeve_s1,
         v_assets_sleeve_s2,
@@ -624,7 +716,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         order_audit,
         telemetry_logs,
         system_config,
-        timestamp_ms: now_ms(),
+        timestamp_ms: ts,
     })
 }
 

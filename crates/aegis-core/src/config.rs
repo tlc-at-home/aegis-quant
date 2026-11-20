@@ -298,6 +298,7 @@ pub fn default_v2_system_config_seeds(
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),
         ("initial_paper_equity_usdc", "10000.0", "float", "Default starting equity in USDC for PAPER mode or empty account fallback"),
         ("live_exchange_equity_usdc", "0.0", "float", "Live Hyperliquid perp accountValue in USDC continuously synced by reconciler"),
+        ("live_vault_info_json", "", "json", "Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
         ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
@@ -427,6 +428,7 @@ mod tests {
         assert_eq!(find("stop_out_cooldown_sec"), Some("1800"));
         assert_eq!(find("take_profit_atr_mult"), Some("2.8"));
         assert_eq!(find("take_profit_default_pct"), Some("0.055"));
+        assert_eq!(find("live_vault_info_json"), Some(""));
     }
 
     #[test]

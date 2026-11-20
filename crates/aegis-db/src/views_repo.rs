@@ -10,8 +10,8 @@
 
 use crate::engine::DatabaseManager;
 use aegis_core::{
-    AegisError, CooldownAssetView, HeldAssetView, OrderedAssetView, PriorityWatchView, Result,
-    SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView,
+    compute_position_pnl_pct, AegisError, CooldownAssetView, HeldAssetView, OrderedAssetView,
+    PriorityWatchView, Result, SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView,
 };
 use mysql::prelude::*;
 
@@ -36,37 +36,50 @@ impl DatabaseManager {
 
         Ok(rows
             .into_iter()
-            .map(|r| HeldAssetView {
-                position_id: r.get(0).unwrap_or_default(),
-                asset_id: r.get(1).unwrap_or_default(),
-                symbol: r.get(2).unwrap_or_default(),
-                coin: r.get(3).unwrap_or_default(),
-                client_order_id: r.get(4).unwrap_or_default(),
-                side: r.get(5).unwrap_or_else(|| "LONG".to_string()),
-                quantity: r.get(6).unwrap_or_default(),
-                committed_notional_usdc: r.get(7).unwrap_or_default(),
-                portfolio_weight: r.get(8).unwrap_or_default(),
-                entry_price: r.get(9).unwrap_or_default(),
-                mark_price: r.get(10).unwrap_or_default(),
-                protective_stop_px: r.get(11).unwrap_or_default(),
-                protective_stop_oid: r.get::<Option<String>, _>(12).unwrap_or(None),
-                stop_distance_pct: r.get::<Option<f64>, _>(13).unwrap_or(None),
-                take_profit_px: r.get(14).unwrap_or_default(),
-                take_profit_oid: r.get::<Option<String>, _>(15).unwrap_or(None),
-                tp_distance_pct: r.get::<Option<f64>, _>(16).unwrap_or(None),
-                highest_price_seen: r.get(17).unwrap_or_default(),
-                lowest_price_seen: r.get(18).unwrap_or_default(),
-                unrealized_pnl_usdc: r.get(19).unwrap_or_default(),
-                realized_pnl_usdc: r.get(20).unwrap_or_default(),
-                funding_accrued_usdc: r.get(21).unwrap_or_default(),
-                fees_paid_usdc: r.get(22).unwrap_or_default(),
-                s1_weight_contrib: r.get(23).unwrap_or_default(),
-                s2_weight_contrib: r.get(24).unwrap_or_default(),
-                s3_weight_contrib: r.get(25).unwrap_or_default(),
-                latest_target_weight: r.get(26).unwrap_or_default(),
-                latest_delta_weight: r.get(27).unwrap_or_default(),
-                opened_at_ms: r.get::<Option<i64>, _>(28).unwrap_or(None),
-                updated_at_ms: r.get(29).unwrap_or_default(),
+            .map(|r| {
+                let quantity: f64 = r.get(6).unwrap_or_default();
+                let committed_notional_usdc: f64 = r.get(7).unwrap_or_default();
+                let entry_price: f64 = r.get(9).unwrap_or_default();
+                let unrealized_pnl_usdc: f64 = r.get(19).unwrap_or_default();
+                let unrealized_pnl_pct = compute_position_pnl_pct(
+                    unrealized_pnl_usdc,
+                    entry_price,
+                    quantity,
+                    committed_notional_usdc,
+                );
+                HeldAssetView {
+                    position_id: r.get(0).unwrap_or_default(),
+                    asset_id: r.get(1).unwrap_or_default(),
+                    symbol: r.get(2).unwrap_or_default(),
+                    coin: r.get(3).unwrap_or_default(),
+                    client_order_id: r.get(4).unwrap_or_default(),
+                    side: r.get(5).unwrap_or_else(|| "LONG".to_string()),
+                    quantity,
+                    committed_notional_usdc,
+                    portfolio_weight: r.get(8).unwrap_or_default(),
+                    entry_price,
+                    mark_price: r.get(10).unwrap_or_default(),
+                    protective_stop_px: r.get(11).unwrap_or_default(),
+                    protective_stop_oid: r.get::<Option<String>, _>(12).unwrap_or(None),
+                    stop_distance_pct: r.get::<Option<f64>, _>(13).unwrap_or(None),
+                    take_profit_px: r.get(14).unwrap_or_default(),
+                    take_profit_oid: r.get::<Option<String>, _>(15).unwrap_or(None),
+                    tp_distance_pct: r.get::<Option<f64>, _>(16).unwrap_or(None),
+                    highest_price_seen: r.get(17).unwrap_or_default(),
+                    lowest_price_seen: r.get(18).unwrap_or_default(),
+                    unrealized_pnl_usdc,
+                    unrealized_pnl_pct,
+                    realized_pnl_usdc: r.get(20).unwrap_or_default(),
+                    funding_accrued_usdc: r.get(21).unwrap_or_default(),
+                    fees_paid_usdc: r.get(22).unwrap_or_default(),
+                    s1_weight_contrib: r.get(23).unwrap_or_default(),
+                    s2_weight_contrib: r.get(24).unwrap_or_default(),
+                    s3_weight_contrib: r.get(25).unwrap_or_default(),
+                    latest_target_weight: r.get(26).unwrap_or_default(),
+                    latest_delta_weight: r.get(27).unwrap_or_default(),
+                    opened_at_ms: r.get::<Option<i64>, _>(28).unwrap_or(None),
+                    updated_at_ms: r.get(29).unwrap_or_default(),
+                }
             })
             .collect())
     }

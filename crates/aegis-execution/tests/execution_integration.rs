@@ -318,6 +318,7 @@ where
                     let resp_body = resp_json.to_string();
                     let status_line = match status {
                         200 => "HTTP/1.1 200 OK",
+                        429 => "HTTP/1.1 429 Too Many Requests",
                         500 => "HTTP/1.1 500 Internal Server Error",
                         _ => "HTTP/1.1 200 OK",
                     };
@@ -3457,4 +3458,189 @@ fn test_daily_drawdown_breaker_uses_indexed_peak_and_latest_equity_for_alert_32(
     let reb_tripped = engine.execute_signal_rebalance(&sig_out, 8_000.0).unwrap();
     assert_eq!(reb_tripped.working_orders_placed, 0);
     assert!(db.get_assets_ordered().unwrap().is_empty());
+}
+
+#[test]
+fn test_reconcile_vault_info_sync_segregation_throttling_and_429_resilience() {
+    use aegis_core::VaultInfoPayload;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let vault_eq_calls = Arc::new(AtomicUsize::new(0));
+    let vault_details_calls = Arc::new(AtomicUsize::new(0));
+    let fail_vault_requests = Arc::new(AtomicBool::new(false));
+
+    let veq_srv = vault_eq_calls.clone();
+    let vdet_srv = vault_details_calls.clone();
+    let fail_srv = fail_vault_requests.clone();
+
+    let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+    let extra_cfg_vault = "0x1111111111111111111111111111111111111111";
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "629.84" },
+                        "assetPositions": []
+                    }),
+                ),
+                "userVaultEquities" => {
+                    veq_srv.fetch_add(1, Ordering::SeqCst);
+                    if fail_srv.load(Ordering::SeqCst) {
+                        return (429, json!({ "error": "rate_limited" }));
+                    }
+                    (
+                        200,
+                        json!([{
+                            "vaultAddress": hlp_addr,
+                            "equity": "202.400584",
+                            "lockedUntilTimestamp": 1_793_779_590_878i64
+                        }]),
+                    )
+                }
+                "vaultDetails" => {
+                    vdet_srv.fetch_add(1, Ordering::SeqCst);
+                    if fail_srv.load(Ordering::SeqCst) {
+                        return (429, json!({ "error": "rate_limited" }));
+                    }
+                    let addr = body
+                        .get("vaultAddress")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if addr.eq_ignore_ascii_case(hlp_addr) {
+                        (
+                            200,
+                            json!({
+                                "name": "Hyperliquidity Provider (HLP)",
+                                "vaultAddress": hlp_addr,
+                                "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                                "isClosed": false,
+                                "apr": 0.0814,
+                                "followerState": {
+                                    "vaultEquity": "202.400584",
+                                    "pnl": "0.92",
+                                    "allTimePnl": "1.34",
+                                    "daysFollowing": 25,
+                                    "lockupUntil": 1_793_779_590_878i64
+                                }
+                            }),
+                        )
+                    } else {
+                        (
+                            200,
+                            json!({
+                                "name": "Configured Secondary Vault",
+                                "vaultAddress": extra_cfg_vault,
+                                "leader": "0x2222222222222222222222222222222222222222",
+                                "isClosed": false,
+                                "apr": 0.05,
+                                "followerState": null
+                            }),
+                        )
+                    }
+                }
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("hyperliquid_vault_address", extra_cfg_vault, None)
+        .unwrap();
+
+    // 1. First reconciliation syncs perp equity (629.84) AND vault info (202.40) strictly segregated
+    let rep1 = engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert!((rep1.exchange_equity_usdc - 629.84).abs() < 1e-6);
+
+    let cfg1 = db.load_config_or_default();
+    assert!(
+        (cfg1.get_f64("live_exchange_equity_usdc", 0.0) - 629.84).abs() < 1e-6,
+        "Vault equity MUST NOT be added into live_exchange_equity_usdc"
+    );
+
+    let snap = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!(
+        (snap.total_equity_usdc - 629.84).abs() < 1e-6,
+        "Vault equity MUST NOT be added into portfolio_snapshots.total_equity_usdc"
+    );
+
+    let raw_vault_json = cfg1.get_str("live_vault_info_json", "");
+    assert!(!raw_vault_json.is_empty());
+    let parsed: VaultInfoPayload = serde_json::from_str(&raw_vault_json).unwrap();
+    assert_eq!(parsed.configured_vault_address, extra_cfg_vault);
+    assert!((parsed.total_vault_equity_usdc - 202.40).abs() < 1e-6);
+    assert!((parsed.combined_portfolio_equity_usdc - 832.24).abs() < 1e-6);
+    assert_eq!(parsed.vault_count, 2);
+    assert_eq!(parsed.vaults[0].name, "Hyperliquidity Provider (HLP)");
+    assert!((parsed.vaults[0].equity_usdc - 202.40).abs() < 1e-6);
+    assert!((parsed.vaults[0].pnl_pct - 0.46).abs() < 1e-6);
+    assert!((parsed.vaults[0].all_time_pnl_pct - 0.67).abs() < 1e-6);
+    assert!((parsed.vaults[0].apr_pct - 8.14).abs() < 1e-6);
+    assert_eq!(parsed.vaults[0].days_following, 25);
+    assert_eq!(parsed.vaults[1].name, "Configured Secondary Vault");
+    assert_eq!(parsed.vaults[1].equity_usdc, 0.0);
+
+    assert_eq!(vault_eq_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(vault_details_calls.load(Ordering::SeqCst), 2);
+
+    // 2. Immediate second reconciliation (< 60s) MUST NOT hit userVaultEquities or vaultDetails again
+    let rep2 = engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert!((rep2.exchange_equity_usdc - 629.84).abs() < 1e-6);
+    assert_eq!(
+        vault_eq_calls.load(Ordering::SeqCst),
+        1,
+        "Vault sync must be throttled to at most once every 60s"
+    );
+    assert_eq!(vault_details_calls.load(Ordering::SeqCst), 2);
+
+    // 3. After >= 60s, if vault fetch hits HTTP 429, last known cached value is preserved without error
+    fail_vault_requests.store(true, Ordering::SeqCst);
+    let future_ts = parsed.synced_at_ms + aegis_execution::VAULT_SYNC_MIN_INTERVAL_MS + 1_000;
+    let res_fail = engine
+        .reconciler
+        .sync_vault_info_if_due(&cfg1, future_ts, Some(629.84));
+    assert!(res_fail.is_none());
+    let calls_after_429 = vault_eq_calls.load(Ordering::SeqCst);
+    assert!(calls_after_429 >= 2);
+
+    let cfg_after_fail = db.load_config_or_default();
+    assert_eq!(
+        cfg_after_fail.get_str("live_vault_info_json", ""),
+        raw_vault_json,
+        "Cached live_vault_info_json must remain intact after 429 vault fetch failure"
+    );
+
+    // Immediate retry after 429 failure is still throttled for 60s (no 429 storm)
+    let res_throttled =
+        engine
+            .reconciler
+            .sync_vault_info_if_due(&cfg_after_fail, future_ts + 5_000, Some(629.84));
+    assert!(res_throttled.is_none());
+    assert_eq!(vault_eq_calls.load(Ordering::SeqCst), calls_after_429);
+
+    let _ = stop_tx.send(());
 }

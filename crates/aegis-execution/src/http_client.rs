@@ -769,6 +769,54 @@ impl HyperliquidHttpClient {
         )
     }
 
+    /// Polls `userVaultEquities` for `user_wallet` returning Hyperliquid vault equity records.
+    pub fn fetch_user_vault_equities(
+        &self,
+        user_wallet: &str,
+        cfg: &ConfigMap,
+    ) -> Result<Vec<Value>> {
+        let raw = self.post_info(
+            &json!({
+                "type": "userVaultEquities",
+                "user": user_wallet.trim(),
+            }),
+            cfg,
+        )?;
+        raw.as_array().cloned().ok_or_else(|| {
+            AegisError::Execution(
+                "Hyperliquid userVaultEquities response was not a JSON array".to_string(),
+            )
+        })
+    }
+
+    /// Polls `vaultDetails` for `(vault_address, user_wallet)`.
+    /// Returns `Ok(None)` when Hyperliquid responds with JSON `null` (unknown vault).
+    pub fn fetch_vault_details(
+        &self,
+        vault_address: &str,
+        user_wallet: &str,
+        cfg: &ConfigMap,
+    ) -> Result<Option<Value>> {
+        let mut payload = json!({
+            "type": "vaultDetails",
+            "vaultAddress": vault_address.trim(),
+        });
+        if !user_wallet.trim().is_empty() {
+            payload["user"] = json!(user_wallet.trim());
+        }
+        let raw = self.post_info(&payload, cfg)?;
+        if raw.is_null() {
+            return Ok(None);
+        }
+        if raw.is_object() {
+            return Ok(Some(raw));
+        }
+        Err(AegisError::Execution(format!(
+            "Hyperliquid vaultDetails response for '{}' was not a JSON object",
+            vault_address.trim()
+        )))
+    }
+
     /// Polls `openOrders` for `user_wallet`.
     pub fn fetch_open_orders(&self, user_wallet: &str, cfg: &ConfigMap) -> Result<Vec<Value>> {
         let raw = self.post_info(
@@ -1732,6 +1780,100 @@ mod tests {
             .expect("SOL BBO tuple");
         assert_eq!(bbo, (depth.best_bid, depth.best_ask));
         assert!(client.fetch_l2_book_depth("EMPTY", &cfg).unwrap().is_none());
+
+        let _ = stop_tx.send(());
+    }
+
+    #[test]
+    fn test_fetch_user_vault_equities_and_vault_details() {
+        let (port, stop_tx) = spawn_mock_info_server(|body| {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            match typ {
+                "userVaultEquities" => {
+                    let user = body.get("user").and_then(Value::as_str).unwrap_or("");
+                    if user == "0xbad" {
+                        (200, json!({ "error": "unexpected object" }))
+                    } else {
+                        (
+                            200,
+                            json!([{
+                                "vaultAddress": "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
+                                "equity": "202.400584",
+                                "lockedUntilTimestamp": 1_793_779_590_878i64
+                            }]),
+                        )
+                    }
+                }
+                "vaultDetails" => {
+                    let addr = body
+                        .get("vaultAddress")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if addr == "0x0000000000000000000000000000000000000000" {
+                        (200, Value::Null)
+                    } else {
+                        (
+                            200,
+                            json!({
+                                "name": "Hyperliquidity Provider (HLP)",
+                                "vaultAddress": addr,
+                                "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                                "isClosed": false,
+                                "apr": 0.0814,
+                                "followerState": {
+                                    "vaultEquity": "202.400584",
+                                    "pnl": "0.92",
+                                    "allTimePnl": "1.34",
+                                    "daysFollowing": 25,
+                                    "lockupUntil": 1_793_779_590_878i64
+                                }
+                            }),
+                        )
+                    }
+                }
+                _ => (404, json!({ "error": "unknown" })),
+            }
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert(
+            "hyperliquid_testnet_url",
+            format!("http://127.0.0.1:{port}"),
+        );
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = HyperliquidHttpClient::new(5);
+        let eqs = client
+            .fetch_user_vault_equities("0x2c7536e3605d9c16a7a3d7b1898e529396a65c23", &cfg)
+            .expect("userVaultEquities succeeds");
+        assert_eq!(eqs.len(), 1);
+        assert_eq!(
+            eqs[0]["vaultAddress"],
+            "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+        );
+
+        // Non-array response errors cleanly instead of wiping cache
+        assert!(client.fetch_user_vault_equities("0xbad", &cfg).is_err());
+
+        let det = client
+            .fetch_vault_details(
+                "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
+                "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                &cfg,
+            )
+            .expect("vaultDetails succeeds")
+            .expect("vaultDetails object present");
+        assert_eq!(det["name"], "Hyperliquidity Provider (HLP)");
+
+        let null_det = client
+            .fetch_vault_details(
+                "0x0000000000000000000000000000000000000000",
+                "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                &cfg,
+            )
+            .expect("null vaultDetails returns Ok(None)");
+        assert!(null_det.is_none());
 
         let _ = stop_tx.send(());
     }

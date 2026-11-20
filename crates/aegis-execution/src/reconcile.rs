@@ -14,22 +14,169 @@ use crate::signing::{
 };
 use aegis_alerts::AlertEngine;
 use aegis_core::{
-    mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp, ExchangeAsset, ExecutionMode,
-    OrderSide, OrderedAssetView, Result,
+    compute_vault_pnl_pct, mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp,
+    ConfigMap, ExchangeAsset, ExecutionMode, OrderSide, OrderedAssetView, Result, VaultInfoPayload,
+    VaultPositionInfo,
 };
 use aegis_db::{AssetUpsertInput, DatabaseManager, ReconciledClosedTradeInput};
 use aegis_risk::{
     compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
     RiskLimitsConfig,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 const WORKING_ENTRY_GRACE_MS: i64 = 45_000;
 const WORKING_FILL_COMPLETE_RATIO: f64 = 0.85;
 const CAUSAL_CHAIN_MAX_DFS_STEPS: usize = 4096;
+pub const VAULT_SYNC_MIN_INTERVAL_MS: i64 = 60_000;
+const MAX_VAULTS_TO_FETCH: usize = 20;
+
+type VaultSyncThrottleKey = (String, String, String);
+static LAST_VAULT_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<VaultSyncThrottleKey, i64>>> =
+    OnceLock::new();
+
+fn parse_hl_f64_opt(val: Option<&Value>) -> Option<f64> {
+    val.and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+    })
+    .filter(|v| v.is_finite())
+}
+
+fn parse_hl_i64_opt(val: Option<&Value>) -> Option<i64> {
+    val.and_then(|x| {
+        x.as_i64()
+            .or_else(|| x.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            .or_else(|| {
+                x.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.floor() as i64)
+            })
+    })
+}
+
+fn parse_hl_u64_opt(val: Option<&Value>) -> Option<u64> {
+    val.and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_i64().and_then(|n| u64::try_from(n).ok()))
+            .or_else(|| {
+                x.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.floor() as u64)
+            })
+            .or_else(|| {
+                x.as_str()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.floor() as u64)
+            })
+    })
+}
+
+/// Parses a Hyperliquid `vaultDetails` JSON object (plus optional `userVaultEquities` fallback)
+/// into a [`VaultPositionInfo`] and the raw unrounded vault equity in USDC.
+pub fn parse_vault_position_info_with_raw_equity(
+    vault_address: &str,
+    details: &Value,
+    equity_fallback: Option<(f64, i64)>,
+    now_ms_val: i64,
+) -> (VaultPositionInfo, f64) {
+    let resolved_addr = details
+        .get("vaultAddress")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| vault_address.trim())
+        .to_string();
+
+    let name = details
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| mask_identifier(&resolved_addr));
+
+    let leader = details
+        .get("leader")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    let is_closed = details
+        .get("isClosed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let raw_apr = parse_hl_f64_opt(details.get("apr")).unwrap_or(0.0);
+    let apr_pct = {
+        let pct = raw_apr * 100.0;
+        if pct.is_finite() {
+            round_dp(pct, 2)
+        } else {
+            0.0
+        }
+    };
+
+    let follower = details.get("followerState").filter(|v| v.is_object());
+    let raw_equity = follower
+        .and_then(|f| parse_hl_f64_opt(f.get("vaultEquity")))
+        .or_else(|| equity_fallback.map(|(eq, _)| eq).filter(|v| v.is_finite()))
+        .unwrap_or(0.0)
+        .max(0.0);
+    let raw_pnl = follower
+        .and_then(|f| parse_hl_f64_opt(f.get("pnl")))
+        .unwrap_or(0.0);
+    let raw_all_time_pnl = follower
+        .and_then(|f| parse_hl_f64_opt(f.get("allTimePnl")))
+        .unwrap_or(0.0);
+
+    let pnl_pct = compute_vault_pnl_pct(raw_equity, raw_pnl);
+    let all_time_pnl_pct = compute_vault_pnl_pct(raw_equity, raw_all_time_pnl);
+    let days_following = follower
+        .and_then(|f| parse_hl_u64_opt(f.get("daysFollowing")))
+        .unwrap_or(0);
+
+    let locked_until_ms = follower
+        .and_then(|f| parse_hl_i64_opt(f.get("lockupUntil")))
+        .filter(|&ts| ts > 0)
+        .or_else(|| equity_fallback.map(|(_, lock)| lock).filter(|&ts| ts > 0))
+        .unwrap_or(0);
+
+    let info = VaultPositionInfo {
+        vault_address: resolved_addr,
+        name,
+        leader,
+        equity_usdc: round_dp(raw_equity, 2),
+        pnl_usdc: round_dp(raw_pnl, 2),
+        all_time_pnl_usdc: round_dp(raw_all_time_pnl, 2),
+        pnl_pct,
+        all_time_pnl_pct,
+        apr_pct,
+        days_following,
+        locked_until_ms,
+        is_locked: locked_until_ms > now_ms_val,
+        is_closed,
+    };
+    (info, raw_equity)
+}
+
+/// Parses a Hyperliquid `vaultDetails` JSON object into a [`VaultPositionInfo`].
+pub fn parse_vault_position_info(
+    vault_address: &str,
+    details: &Value,
+    equity_fallback: Option<(f64, i64)>,
+    now_ms_val: i64,
+) -> VaultPositionInfo {
+    parse_vault_position_info_with_raw_equity(vault_address, details, equity_fallback, now_ms_val).0
+}
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1534,6 +1681,16 @@ impl CutoverReconciler {
             }
         }
 
+        // 6. Throttled Hyperliquid vault info sync (at most once per 60s; strictly segregated from perp equity/margin)
+        if let Some(vault_snap) =
+            self.sync_vault_info_if_due(&cfg, ts, Some(report.exchange_equity_usdc))
+        {
+            report.details.push(format!(
+                "Synced {} Hyperliquid vault(s) (vault_equity=${:.2}, segregated from perp margin)",
+                vault_snap.vault_count, vault_snap.total_vault_equity_usdc
+            ));
+        }
+
         let _ = self.db.log_telemetry(
             "INFO",
             "execution.reconcile",
@@ -1550,6 +1707,238 @@ impl CutoverReconciler {
         );
 
         Ok(report)
+    }
+
+    /// Syncs Hyperliquid vault equities and vault details at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s).
+    /// Persists the snapshot to `system_config` key `live_vault_info_json`.
+    /// On fetch errors/timeouts/429s, logs WARN and preserves the last known cached snapshot without failing reconciliation.
+    /// Vault funds are strictly segregated from perp margin and never modify `live_exchange_equity_usdc`.
+    pub fn sync_vault_info_if_due(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        perp_equity_override: Option<f64>,
+    ) -> Option<VaultInfoPayload> {
+        self.sync_vault_info_with_interval(
+            cfg,
+            now_ms_val,
+            VAULT_SYNC_MIN_INTERVAL_MS,
+            perp_equity_override,
+        )
+    }
+
+    /// Interval-parameterized vault sync helper used by [`Self::sync_vault_info_if_due`] and tests.
+    pub fn sync_vault_info_with_interval(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        min_interval_ms: i64,
+        perp_equity_override: Option<f64>,
+    ) -> Option<VaultInfoPayload> {
+        if !cfg.execution_mode().is_live_or_testnet() {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "");
+        let wallet_trimmed = wallet.trim();
+        if wallet_trimmed.is_empty() {
+            return None;
+        }
+        let configured_vault = cfg.get_str("hyperliquid_vault_address", "");
+        let configured_vault_trimmed = configured_vault.trim();
+        let key: VaultSyncThrottleKey = (
+            self.db.db_name().to_string(),
+            wallet_trimmed.to_ascii_lowercase(),
+            configured_vault_trimmed.to_ascii_lowercase(),
+        );
+        let eff_min_interval = min_interval_ms.max(0);
+
+        let cached_snapshot: Option<VaultInfoPayload> = {
+            let raw = cfg.get_str("live_vault_info_json", "");
+            (!raw.is_empty())
+                .then(|| serde_json::from_str::<VaultInfoPayload>(&raw).ok())
+                .flatten()
+        };
+
+        if eff_min_interval > 0 {
+            let map = LAST_VAULT_SYNC_ATTEMPT_MS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = map.lock();
+            if let Some(&last_attempt) = guard.get(&key) {
+                if now_ms_val >= last_attempt
+                    && now_ms_val.saturating_sub(last_attempt) < eff_min_interval
+                {
+                    tracing::debug!(
+                        elapsed_ms = now_ms_val.saturating_sub(last_attempt),
+                        min_interval_ms = eff_min_interval,
+                        "Skipping Hyperliquid vault sync (in-memory 60s throttle active)"
+                    );
+                    return None;
+                }
+            }
+            if let Some(ref prev) = cached_snapshot {
+                let same_cfg_vault = prev
+                    .configured_vault_address
+                    .trim()
+                    .eq_ignore_ascii_case(configured_vault_trimmed);
+                if same_cfg_vault
+                    && prev.synced_at_ms > 0
+                    && now_ms_val >= prev.synced_at_ms
+                    && now_ms_val.saturating_sub(prev.synced_at_ms) < eff_min_interval
+                {
+                    guard.insert(key, prev.synced_at_ms);
+                    tracing::debug!(
+                        elapsed_ms = now_ms_val.saturating_sub(prev.synced_at_ms),
+                        min_interval_ms = eff_min_interval,
+                        "Skipping Hyperliquid vault sync (persisted 60s throttle active)"
+                    );
+                    return None;
+                }
+            }
+            if guard.len() > 256 {
+                guard.clear();
+            }
+            // Record attempt BEFORE issuing HTTP requests so 429/timeout failures still honor the 60s cooldown.
+            guard.insert(key, now_ms_val);
+        }
+
+        let raw_equities = match self.http.fetch_user_vault_equities(wallet_trimmed, cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid userVaultEquities fetch failed; keeping last known cached vault info"
+                );
+                return None;
+            }
+        };
+
+        let mut equity_fallback_by_addr: HashMap<String, (String, f64, i64)> = HashMap::new();
+        let mut ordered_addrs: Vec<String> = Vec::new();
+        for item in &raw_equities {
+            let raw_addr = item
+                .get("vaultAddress")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if raw_addr.is_empty() {
+                continue;
+            }
+            let norm = raw_addr.to_ascii_lowercase();
+            let eq = parse_hl_f64_opt(item.get("equity")).unwrap_or(0.0).max(0.0);
+            let locked_until = parse_hl_i64_opt(item.get("lockedUntilTimestamp"))
+                .unwrap_or(0)
+                .max(0);
+            if !equity_fallback_by_addr.contains_key(&norm) {
+                ordered_addrs.push(norm.clone());
+            }
+            equity_fallback_by_addr.insert(norm, (raw_addr.to_string(), eq, locked_until));
+        }
+
+        if !configured_vault_trimmed.is_empty() {
+            let norm_cfg = configured_vault_trimmed.to_ascii_lowercase();
+            if !equity_fallback_by_addr.contains_key(&norm_cfg) {
+                ordered_addrs.push(norm_cfg);
+            }
+        }
+
+        let mut vaults: Vec<VaultPositionInfo> = Vec::with_capacity(ordered_addrs.len());
+        let mut raw_total_vault_eq = 0.0_f64;
+
+        for norm_addr in ordered_addrs.into_iter().take(MAX_VAULTS_TO_FETCH) {
+            let fallback = equity_fallback_by_addr.get(&norm_addr);
+            let query_addr = fallback
+                .map(|(orig, _, _)| orig.as_str())
+                .unwrap_or(configured_vault_trimmed);
+            let details_opt = match self
+                .http
+                .fetch_vault_details(query_addr, wallet_trimmed, cfg)
+            {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!(
+                        vault_address = %mask_identifier(query_addr),
+                        error = %e,
+                        "Hyperliquid vaultDetails fetch failed; keeping last known cached vault info"
+                    );
+                    return None;
+                }
+            };
+            let Some(details) = details_opt else {
+                if let Some((orig_addr, eq, locked_until)) = fallback {
+                    if *eq > 0.0 {
+                        raw_total_vault_eq += *eq;
+                        vaults.push(VaultPositionInfo {
+                            vault_address: orig_addr.clone(),
+                            name: mask_identifier(orig_addr),
+                            leader: String::new(),
+                            equity_usdc: round_dp(*eq, 2),
+                            pnl_usdc: 0.0,
+                            all_time_pnl_usdc: 0.0,
+                            pnl_pct: 0.0,
+                            all_time_pnl_pct: 0.0,
+                            apr_pct: 0.0,
+                            days_following: 0,
+                            locked_until_ms: *locked_until,
+                            is_locked: *locked_until > now_ms_val,
+                            is_closed: false,
+                        });
+                    }
+                }
+                continue;
+            };
+
+            let (info, raw_eq) = parse_vault_position_info_with_raw_equity(
+                query_addr,
+                &details,
+                fallback.map(|(_, eq, lock)| (*eq, *lock)),
+                now_ms_val,
+            );
+            raw_total_vault_eq += raw_eq;
+            vaults.push(info);
+        }
+
+        vaults.sort_by(|a, b| {
+            b.equity_usdc
+                .total_cmp(&a.equity_usdc)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.vault_address.cmp(&b.vault_address))
+        });
+
+        let total_vault_equity_usdc = round_dp(raw_total_vault_eq, 2);
+        let perp_eq = perp_equity_override
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| cfg.get_f64("live_exchange_equity_usdc", 0.0).max(0.0));
+        let combined_portfolio_equity_usdc = round_dp(perp_eq + total_vault_equity_usdc, 2);
+
+        let snapshot = VaultInfoPayload {
+            configured_vault_address: configured_vault_trimmed.to_string(),
+            total_vault_equity_usdc,
+            combined_portfolio_equity_usdc,
+            vault_count: vaults.len(),
+            synced_at_ms: now_ms_val,
+            vaults,
+        };
+
+        match serde_json::to_string(&snapshot) {
+            Ok(json_str) => {
+                if let Err(e) = self.db.set_config_value(
+                    "live_vault_info_json",
+                    &json_str,
+                    Some("Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed persisting live_vault_info_json to system_config; keeping prior snapshot"
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed serializing VaultInfoPayload");
+                return None;
+            }
+        }
+
+        Some(snapshot)
     }
 }
 
@@ -2156,5 +2545,75 @@ mod tests {
                 ("kPEPE".to_string(), 1000u64),
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_vault_position_info_calculations_and_fallbacks() {
+        let now = 1_795_199_000_000i64;
+        let past_lock = 1_793_779_590_878i64;
+        let future_lock = now + 86_400_000;
+
+        let details = json!({
+            "name": "Hyperliquidity Provider (HLP)",
+            "vaultAddress": "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
+            "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+            "isClosed": false,
+            "apr": 0.0814,
+            "followerState": {
+                "vaultEquity": "202.400584",
+                "pnl": "0.92",
+                "allTimePnl": "1.34",
+                "daysFollowing": 25,
+                "lockupUntil": past_lock
+            }
+        });
+        let info = parse_vault_position_info(
+            "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303",
+            &details,
+            Some((202.400584, past_lock)),
+            now,
+        );
+        assert_eq!(
+            info.vault_address,
+            "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+        );
+        assert_eq!(info.name, "Hyperliquidity Provider (HLP)");
+        assert_eq!(info.leader, "0x677d831aef5328190852e24f13c46cac05f984e7");
+        assert!((info.equity_usdc - 202.40).abs() < 1e-6);
+        assert!((info.pnl_usdc - 0.92).abs() < 1e-6);
+        assert!((info.all_time_pnl_usdc - 1.34).abs() < 1e-6);
+        assert!((info.pnl_pct - 0.46).abs() < 1e-6);
+        assert!((info.all_time_pnl_pct - 0.67).abs() < 1e-6);
+        assert!((info.apr_pct - 8.14).abs() < 1e-6);
+        assert_eq!(info.days_following, 25);
+        assert_eq!(info.locked_until_ms, past_lock);
+        assert!(!info.is_locked);
+        assert!(!info.is_closed);
+
+        // Null followerState falls back to userVaultEquities equity + future lockupTimestamp
+        let details_no_follower = json!({
+            "name": "Alpha Vault",
+            "leader": "0x1111111111111111111111111111111111111111",
+            "isClosed": true,
+            "apr": "0.125",
+            "followerState": null
+        });
+        let info_fb = parse_vault_position_info(
+            "0x2222222222222222222222222222222222222222",
+            &details_no_follower,
+            Some((50.0, future_lock)),
+            now,
+        );
+        assert_eq!(
+            info_fb.vault_address,
+            "0x2222222222222222222222222222222222222222"
+        );
+        assert!((info_fb.equity_usdc - 50.0).abs() < 1e-6);
+        assert_eq!(info_fb.pnl_pct, 0.0);
+        assert_eq!(info_fb.all_time_pnl_pct, 0.0);
+        assert!((info_fb.apr_pct - 12.5).abs() < 1e-6);
+        assert_eq!(info_fb.locked_until_ms, future_lock);
+        assert!(info_fb.is_locked);
+        assert!(info_fb.is_closed);
     }
 }

@@ -378,6 +378,8 @@ pub struct HeldAssetView {
     pub highest_price_seen: f64,
     pub lowest_price_seen: f64,
     pub unrealized_pnl_usdc: f64,
+    #[serde(default)]
+    pub unrealized_pnl_pct: f64,
     pub realized_pnl_usdc: f64,
     pub funding_accrued_usdc: f64,
     pub fees_paid_usdc: f64,
@@ -554,4 +556,184 @@ pub struct PnlSummary {
     pub weekly: PnlHorizonMetrics,
     pub monthly: PnlHorizonMetrics,
     pub ytd: PnlHorizonMetrics,
+}
+
+/// Closed trade summary enriched with canonical symbol/coin and computed `realized_pnl_pct`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosedPositionView {
+    pub position_id: i64,
+    pub asset_id: i64,
+    pub symbol: String,
+    pub coin: String,
+    pub client_order_id: String,
+    pub side: String,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub quantity: f64,
+    pub filled_quantity: f64,
+    pub entry_notional_usdc: f64,
+    pub realized_pnl_usdc: f64,
+    pub realized_pnl_pct: f64,
+    pub fees_paid_usdc: f64,
+    pub funding_accrued_usdc: f64,
+    pub opened_at_ms: Option<i64>,
+    pub closed_at_ms: i64,
+    pub exit_reason: Option<String>,
+}
+
+/// Individual Hyperliquid vault follower position details.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VaultPositionInfo {
+    #[serde(default)]
+    pub vault_address: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub leader: String,
+    #[serde(default)]
+    pub equity_usdc: f64,
+    #[serde(default)]
+    pub pnl_usdc: f64,
+    #[serde(default)]
+    pub all_time_pnl_usdc: f64,
+    #[serde(default)]
+    pub pnl_pct: f64,
+    #[serde(default)]
+    pub all_time_pnl_pct: f64,
+    #[serde(default)]
+    pub apr_pct: f64,
+    #[serde(default)]
+    pub days_following: u64,
+    #[serde(default)]
+    pub locked_until_ms: i64,
+    #[serde(default)]
+    pub is_locked: bool,
+    #[serde(default)]
+    pub is_closed: bool,
+}
+
+/// Aggregated Hyperliquid vault portfolio summary (segregated from perp margin).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VaultInfoPayload {
+    #[serde(default)]
+    pub configured_vault_address: String,
+    #[serde(default)]
+    pub total_vault_equity_usdc: f64,
+    #[serde(default)]
+    pub combined_portfolio_equity_usdc: f64,
+    #[serde(default)]
+    pub vault_count: usize,
+    #[serde(default)]
+    pub synced_at_ms: i64,
+    #[serde(default)]
+    pub vaults: Vec<VaultPositionInfo>,
+}
+
+/// Resolves position entry notional from `entry_price * quantity`, falling back to
+/// `committed_notional_usdc` only when `entry_price * quantity <= 1e-6` and `committed_notional_usdc > 1e-6`.
+/// Handles MariaDB `CLOSED` rows where `committed_notional_usdc == 0.0`.
+pub fn resolve_position_entry_notional_usdc(
+    entry_price: f64,
+    quantity: f64,
+    committed_notional_usdc: f64,
+) -> f64 {
+    let entry_notional =
+        if entry_price.is_finite() && quantity.is_finite() && entry_price > 0.0 && quantity > 0.0 {
+            entry_price * quantity
+        } else {
+            0.0
+        };
+    if entry_notional.is_finite() && entry_notional > 1e-6 {
+        entry_notional
+    } else if committed_notional_usdc.is_finite() && committed_notional_usdc > 1e-6 {
+        committed_notional_usdc
+    } else {
+        0.0
+    }
+}
+
+/// Computes position PnL percentage (`pnl_usdc / entry_notional * 100.0`, rounded to 2dp).
+/// Never produces `NaN` or `Infinity`.
+pub fn compute_position_pnl_pct(
+    pnl_usdc: f64,
+    entry_price: f64,
+    quantity: f64,
+    committed_notional_usdc: f64,
+) -> f64 {
+    if !pnl_usdc.is_finite() {
+        return 0.0;
+    }
+    let base_notional =
+        resolve_position_entry_notional_usdc(entry_price, quantity, committed_notional_usdc);
+    if !base_notional.is_finite() || base_notional <= 1e-6 {
+        return 0.0;
+    }
+    let pct = (pnl_usdc / base_notional) * 100.0;
+    if pct.is_finite() {
+        round_dp(pct, 2)
+    } else {
+        0.0
+    }
+}
+
+/// Computes vault PnL percentage (`pnl_usdc / (equity_usdc - pnl_usdc) * 100.0`, rounded to 2dp)
+/// when `(equity_usdc - pnl_usdc) > 1e-6`, else `0.0`.
+pub fn compute_vault_pnl_pct(equity_usdc: f64, pnl_usdc: f64) -> f64 {
+    if !equity_usdc.is_finite() || !pnl_usdc.is_finite() {
+        return 0.0;
+    }
+    let basis = equity_usdc - pnl_usdc;
+    if !basis.is_finite() || basis <= 1e-6 {
+        return 0.0;
+    }
+    let pct = (pnl_usdc / basis) * 100.0;
+    if pct.is_finite() {
+        round_dp(pct, 2)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_position_pnl_pct_open_closed_and_edge_cases() {
+        // Closed row with committed_notional_usdc == 0.0 must use entry_price * filled_quantity
+        let closed_pct = compute_position_pnl_pct(-382.37, 0.23227, 9634.0, 0.0);
+        assert!((closed_pct - (-17.09)).abs() < 1e-6);
+
+        // Open row with valid entry_price * quantity
+        let open_pct = compute_position_pnl_pct(12.34, 180.0, 2.0, 380.0);
+        assert!((open_pct - 3.43).abs() < 1e-6);
+
+        // Fallback to committed_notional_usdc when entry_price * quantity is 0
+        let fallback_pct = compute_position_pnl_pct(25.0, 0.0, 0.0, 500.0);
+        assert!((fallback_pct - 5.0).abs() < 1e-6);
+
+        // Zero notional / NaN / Inf safely return 0.0
+        assert_eq!(compute_position_pnl_pct(10.0, 0.0, 0.0, 0.0), 0.0);
+        assert_eq!(compute_position_pnl_pct(f64::NAN, 100.0, 1.0, 100.0), 0.0);
+        assert_eq!(
+            compute_position_pnl_pct(f64::INFINITY, 100.0, 1.0, 100.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_compute_vault_pnl_pct_formulas_and_edge_cases() {
+        // Spec example: equity=202.400584, pnl=0.92 -> 0.46%; all_time_pnl=1.34 -> 0.67%
+        assert!((compute_vault_pnl_pct(202.400584, 0.92) - 0.46).abs() < 1e-6);
+        assert!((compute_vault_pnl_pct(202.400584, 1.34) - 0.67).abs() < 1e-6);
+
+        // Negative PnL: equity=95.0, pnl=-5.0 -> basis=100.0 -> -5.0%
+        assert!((compute_vault_pnl_pct(95.0, -5.0) - (-5.0)).abs() < 1e-6);
+
+        // Basis <= 1e-6 (e.g. equity == pnl or 0) -> 0.0
+        assert_eq!(compute_vault_pnl_pct(10.0, 10.0), 0.0);
+        assert_eq!(compute_vault_pnl_pct(0.0, 0.0), 0.0);
+        assert_eq!(compute_vault_pnl_pct(0.0, 5.0), 0.0);
+        assert_eq!(compute_vault_pnl_pct(f64::NAN, 1.0), 0.0);
+    }
 }
