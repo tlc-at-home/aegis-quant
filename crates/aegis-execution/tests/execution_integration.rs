@@ -4020,6 +4020,22 @@ fn test_reconcile_prehistory_start_position_partial_close() {
     assert_eq!(held.len(), 1);
     assert!((held[0].funding_accrued_usdc - 96.34).abs() < 1e-4);
 
+    // Second reconcile must remain idempotent even when DB stored opened_at_ms >= first_fill.time_ms
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    let closed_2 = db.list_closed_positions(10).unwrap();
+    let sol_closed_2 = closed_2
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-sol-3001")
+        .expect("SOL pre-history partial close on second reconcile");
+    assert!((sol_closed_2.funding_accrued_usdc - 0.20).abs() < 1e-4);
+    let held_2 = db.get_assets_held().unwrap();
+    assert_eq!(held_2.len(), 1);
+    assert!((held_2[0].funding_accrued_usdc - 96.34).abs() < 1e-4);
+    let sol_id = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap().id;
+    let sol_evs = db.list_funding_events_for_asset(sol_id).unwrap();
+    assert_eq!(sol_evs.len(), 1);
+    assert!((sol_evs[0].remaining_usdc - 96.34).abs() < 1e-4);
+
     let _ = stop_tx.send(());
 }
 
@@ -4331,6 +4347,111 @@ fn test_option_b_snapshot_capping_spot_60s_sync_and_15s_sleeve_preservation() {
         .unwrap();
     let snap_capped_cash = engine.record_portfolio_snapshot(None, None).unwrap();
     assert!((snap_capped_cash.available_cash_usdc - 150.0).abs() < 1e-6);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_reconcile_multi_lot_dca_partial_close_funding_conservation_and_pnl() {
+    let now = now_ms();
+    let t_open_1 = now - 8 * 86_400_000;
+    let t_fund_e1 = now - 2 * 86_400_000;
+    let t_add_2 = now - 86_400_000;
+    let t_close_1 = now - 12 * 3_600_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "5000.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ETH",
+                                "szi": "300.0",
+                                "entryPx": "100.0",
+                                "positionValue": "30000.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "-100.0" }
+                            }
+                        }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH", "side": "B", "px": "100.0", "sz": "100.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Open Long",
+                            "time": t_open_1, "oid": 6001u64, "tid": 1u64, "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "ETH", "side": "B", "px": "100.0", "sz": "300.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Open Long",
+                            "time": t_add_2, "oid": 6002u64, "tid": 2u64, "startPosition": "100.0"
+                        },
+                        {
+                            "coin": "ETH", "side": "A", "px": "100.0", "sz": "100.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Close Long",
+                            "time": t_close_1, "oid": 6003u64, "tid": 3u64, "startPosition": "400.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => (
+                    200,
+                    json!([{
+                        "time": t_fund_e1,
+                        "hash": "0xdca1",
+                        "delta": {
+                            "type": "funding",
+                            "coin": "ETH",
+                            "usdc": "100.0",
+                            "szi": "100.0",
+                            "fundingRate": "0.01"
+                        }
+                    }]),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+
+    // Lot 1 (100) accrued E1 = +100.0, Lot 2 (300) accrued 0.0.
+    // Partial close 100 closes all of Lot 1 -> closed books +100.0, open has 0.0, E1 remaining_usdc == 0.0.
+    let closed = db.list_closed_positions(10).unwrap();
+    let eth_c = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-eth-6003")
+        .expect("DCA Lot 1 close trade");
+    assert!((eth_c.funding_accrued_usdc - 100.0).abs() < 1e-4);
+
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!((held[0].funding_accrued_usdc - 0.0).abs() < 1e-4);
+
+    let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
+    let evs = db.list_funding_events_for_asset(eth_id).unwrap();
+    assert_eq!(evs.len(), 1);
+    assert!((evs[0].remaining_usdc - 0.0).abs() < 1e-6);
+
+    // Weekly (7D) must report exactly +100.00 (no +75.00 double-count from uniform keep_ratio).
+    let pnl = db.compute_pnl_summary(0.0, 0.0, 5000.0).unwrap();
+    assert!(
+        (pnl.weekly.fees_funding_usdc - 100.0).abs() < 1e-2,
+        "weekly.fees_funding_usdc={} expected=100.0",
+        pnl.weekly.fees_funding_usdc
+    );
+    assert!((pnl.daily.fees_funding_usdc - 100.0).abs() < 1e-2);
 
     let _ = stop_tx.send(());
 }

@@ -711,6 +711,7 @@ struct OpenLot {
     orig_sz: f64,
     fee: f64,
     funding_accrued: f64,
+    funding_by_ev: Vec<(usize, f64)>,
     time_ms: i64,
 }
 
@@ -747,7 +748,9 @@ impl CoinReplayState {
         let total_open: f64 = self.open_lots.iter().map(|l| l.rem_sz).sum();
         if total_open > 1e-9 {
             for lot in self.open_lots.iter_mut() {
-                lot.funding_accrued += ev.usdc * (lot.rem_sz / total_open);
+                let share = ev.usdc * (lot.rem_sz / total_open);
+                lot.funding_accrued += share;
+                lot.funding_by_ev.push((ev_idx, share));
             }
             self.rem_usdc[ev_idx] = ev.usdc;
             self.active_epoch_ev_indices.push(ev_idx);
@@ -773,6 +776,7 @@ impl CoinReplayState {
                 orig_sz: fill.sz,
                 fee: fill.fee,
                 funding_accrued: 0.0,
+                funding_by_ev: Vec::new(),
                 time_ms: fill.time_ms,
             });
             self.prev_szi += signed_sz;
@@ -809,7 +813,6 @@ impl CoinReplayState {
         };
         let open_fee = (fill.fee - close_fee).max(0.0);
 
-        let open_sz_before: f64 = self.open_lots.iter().map(|l| l.rem_sz).sum();
         let mut matched_open_fee = 0.0_f64;
         let mut matched_funding = 0.0_f64;
         let mut earliest_open_time_ms: Option<i64> = None;
@@ -827,6 +830,14 @@ impl CoinReplayState {
             let matched_funding_part = front.funding_accrued * frac;
             front.funding_accrued -= matched_funding_part;
             matched_funding += matched_funding_part;
+            for (ev_i, lot_share) in &mut front.funding_by_ev {
+                let ev_part = *lot_share * frac;
+                *lot_share -= ev_part;
+                self.rem_usdc[*ev_i] -= ev_part;
+                if self.rem_usdc[*ev_i].abs() <= 1e-12 {
+                    self.rem_usdc[*ev_i] = 0.0;
+                }
+            }
             if front.orig_sz > 0.0 {
                 matched_open_fee += front.fee * (take / front.orig_sz);
             }
@@ -871,14 +882,6 @@ impl CoinReplayState {
             self.open_epoch_booked_funding = 0.0;
         } else {
             self.open_epoch_booked_funding += matched_funding;
-            let keep_ratio = if open_sz_before > 1e-9 {
-                (open_sz_after / open_sz_before).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            for &ev_i in &self.active_epoch_ev_indices {
-                self.rem_usdc[ev_i] *= keep_ratio;
-            }
         }
 
         if flipped_open_sz > 1e-9 {
@@ -887,6 +890,7 @@ impl CoinReplayState {
                 orig_sz: flipped_open_sz,
                 fee: open_fee,
                 funding_accrued: 0.0,
+                funding_by_ev: Vec::new(),
                 time_ms: fill.time_ms,
             });
         }
@@ -946,6 +950,7 @@ fn compute_fifo_closed_orders_and_funding(
                         orig_sz: sp.abs(),
                         fee: 0.0,
                         funding_accrued: 0.0,
+                        funding_by_ev: Vec::new(),
                         time_ms: earliest_ts.saturating_sub(1),
                     });
                     state.prev_szi = sp;
@@ -960,6 +965,7 @@ fn compute_fifo_closed_orders_and_funding(
                         orig_sz: szi.abs(),
                         fee: 0.0,
                         funding_accrued: 0.0,
+                        funding_by_ev: Vec::new(),
                         time_ms: earliest_ts.saturating_sub(1),
                     });
                     state.prev_szi = szi;
@@ -1547,13 +1553,13 @@ impl CutoverReconciler {
             (None, None) => None,
         };
         let has_untracked_prehistory = parsed_fills_by_coin.iter().any(|(coin_upper, fills)| {
-            fills
-                .first()
-                .and_then(|f| f.start_position)
-                .is_some_and(|sp| sp.abs() > 1e-9)
-                && !existing_open_by_coin
-                    .get(coin_upper)
-                    .is_some_and(|h| h.opened_at_ms.is_some_and(|t| t > 0))
+            fills.first().is_some_and(|first_fill| {
+                first_fill.start_position.is_some_and(|sp| sp.abs() > 1e-9)
+                    && !existing_open_by_coin.get(coin_upper).is_some_and(|h| {
+                        h.opened_at_ms
+                            .is_some_and(|t| t > 0 && t < first_fill.time_ms)
+                    })
+            })
         }) || open_szi_by_coin.keys().any(|coin_upper| {
             !parsed_fills_by_coin.contains_key(coin_upper)
                 && !existing_open_by_coin
@@ -3254,5 +3260,83 @@ mod tests {
         assert_eq!(out_same_ms.closed_orders.len(), 1);
         assert!((out_same_ms.closed_orders[0].1.funding_accrued_usdc - 4.5).abs() < 1e-9);
         assert!((out_same_ms.funding_events_with_remaining[0].1 - 0.0).abs() < 1e-9);
+
+        // Multi-lot DCA + partial close attributes per-lot event shares without double counting:
+        // Open 60 -> E0 (+60) -> Add 40 -> E1 (+100) -> Close 30 -> 70 remaining
+        // Lot 1 (60) loses 30/60 = 50% (30 of E0, 30 of E1 -> closed=60); remaining: E0=30, E1=70
+        let mut dca_fills = BTreeMap::new();
+        dca_fills.insert(
+            "SOL".to_string(),
+            vec![
+                make_fill(
+                    "SOL",
+                    "B",
+                    100.0,
+                    60.0,
+                    0.0,
+                    0.0,
+                    "Open Long",
+                    1_000,
+                    1,
+                    1,
+                    Some(0.0),
+                ),
+                make_fill(
+                    "SOL",
+                    "B",
+                    100.0,
+                    40.0,
+                    0.0,
+                    0.0,
+                    "Open Long",
+                    3_000,
+                    2,
+                    2,
+                    Some(60.0),
+                ),
+                make_fill(
+                    "SOL",
+                    "A",
+                    100.0,
+                    30.0,
+                    0.0,
+                    0.0,
+                    "Close Long",
+                    5_000,
+                    3,
+                    3,
+                    Some(100.0),
+                ),
+            ],
+        );
+        let mut dca_funding = HashMap::new();
+        dca_funding.insert(
+            "SOL".to_string(),
+            vec![
+                ParsedHlFunding {
+                    coin: "SOL".to_string(),
+                    time_ms: 2_000,
+                    usdc: 60.0,
+                    szi: 60.0,
+                    funding_rate: 0.01,
+                    dedup_key: "2000:SOL:0xe0".to_string(),
+                },
+                ParsedHlFunding {
+                    coin: "SOL".to_string(),
+                    time_ms: 4_000,
+                    usdc: 100.0,
+                    szi: 100.0,
+                    funding_rate: 0.01,
+                    dedup_key: "4000:SOL:0xe1".to_string(),
+                },
+            ],
+        );
+        let out_dca =
+            compute_fifo_closed_orders_and_funding(&dca_fills, &dca_funding, &HashMap::new());
+        assert_eq!(out_dca.closed_orders.len(), 1);
+        assert!((out_dca.closed_orders[0].1.funding_accrued_usdc - 60.0).abs() < 1e-9);
+        assert!((out_dca.open_epoch_booked_funding_by_coin["SOL"] - 60.0).abs() < 1e-9);
+        assert!((out_dca.funding_events_with_remaining[0].1 - 30.0).abs() < 1e-9);
+        assert!((out_dca.funding_events_with_remaining[1].1 - 70.0).abs() < 1e-9);
     }
 }
