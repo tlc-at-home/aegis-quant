@@ -16,6 +16,7 @@ const state = {
   sse: null,
   authRequired: false,
   equityChartPoints: [],
+  equityHoverIdx: null,
 };
 
 const IMMUTABLE_SECURITY_KEYS = new Set([
@@ -39,6 +40,12 @@ const IMMUTABLE_SECURITY_KEYS = new Set([
   'hyperliquid_testnet',
   'risk_capital_cap_updated_at_ms',
   'live_vault_info_json',
+  'live_exchange_equity_synced_at_ms',
+  'live_exchange_margin_used_usdc',
+  'live_exchange_withdrawable_usdc',
+  'live_exchange_open_orders_count',
+  'live_exchange_spot_usdc',
+  'live_exchange_spot_synced_at_ms',
 ]);
 
 const SORT_COLLATOR = new Intl.Collator(undefined, {
@@ -492,6 +499,29 @@ function fmtLocalShortTime(tsMs) {
   const mi = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   return `${hh}:${mi}:${ss}`;
+}
+
+function fmtLocalMonthDayTime(tsMs) {
+  const n = toFiniteNumber(tsMs);
+  if (n === null || n <= 0) return '';
+  const d = new Date(n);
+  if (Number.isNaN(d.getTime())) return '';
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${mm}/${dd} ${hh}:${mi}`;
+}
+
+function fmtCompactDuration(ms) {
+  const safeMs = Math.max(0, Number(ms || 0));
+  if (safeMs >= 86_400_000) {
+    return `${Math.max(1, Math.round(safeMs / 86_400_000))}d`;
+  }
+  if (safeMs >= 3_600_000) {
+    return `${Math.max(1, Math.round(safeMs / 3_600_000))}h`;
+  }
+  return `${Math.max(1, Math.round(safeMs / 60_000))}m`;
 }
 
 const fmtUtcTime = fmtLocalTime;
@@ -979,8 +1009,20 @@ function renderHealthAndTopBar(health, dash) {
   }
 
   const prioWatch = (dash && dash.v_priority_watchlist) || [];
+  const heldAssets = (dash && dash.v_assets_held) || [];
+  const heldIds = new Set(heldAssets.map((h) => Number(h.asset_id)));
+  const heldInWatch = prioWatch.filter((p) => {
+    const aid = Number(p.asset_id);
+    const st = String(p.position_status || '').toUpperCase();
+    return heldIds.has(aid) || st === 'OPEN';
+  }).length;
   const prioEl = document.getElementById('prio-watch-count');
-  if (prioEl) prioEl.textContent = String(prioWatch.length);
+  if (prioEl) {
+    prioEl.textContent =
+      heldInWatch > 0
+        ? `${prioWatch.length} (${heldInWatch} Held)`
+        : String(prioWatch.length);
+  }
 
   const exAssets = (dash && dash.exchange_assets) || [];
   const scanEl = document.getElementById('scanner-asset-count');
@@ -1012,7 +1054,11 @@ function renderPnlHorizonRibbon(dash) {
     (acc, h) => acc + Number(h.unrealized_pnl_usdc ?? 0),
     0
   );
-  const totalEq = Number(dash?.snapshot?.total_equity_usdc ?? 0);
+  const totalEq =
+    toFiniteNumber(dash?.equity_basis?.effective_equity_usdc) ??
+    toFiniteNumber(dash?.snapshot?.total_equity_usdc) ??
+    0;
+  const capEpochMs = Number(dash?.risk_capital_cap_updated_at_ms ?? 0);
 
   const paintHorizon = (key, defaultObj) => {
     const h = summary[key] || defaultObj;
@@ -1024,6 +1070,11 @@ function renderPnlHorizonRibbon(dash) {
     const upnl = Number(h.unrealized_pnl_usdc ?? fallbackUpnl);
     const trades = Number(h.trade_count ?? 0);
     const wins = Number(h.win_count ?? 0);
+    const winStartMs = Number(h.window_start_ms ?? 0);
+    const isClamped =
+      Boolean(h.is_cap_clamped) ||
+      (capEpochMs > 0 && winStartMs > 0 && capEpochMs > winStartMs);
+    const clampTs = capEpochMs > 0 ? capEpochMs : winStartMs;
 
     const tone = netPnl > 0.005 ? 'pos' : netPnl < -0.005 ? 'neg' : 'flat';
 
@@ -1031,10 +1082,21 @@ function renderPnlHorizonRibbon(dash) {
     const pctEl = document.getElementById(`pnl-${key}-pct`);
     const usdcEl = document.getElementById(`pnl-${key}-usdc`);
     const subEl = document.getElementById(`pnl-${key}-sub`);
+    const clampEl = document.getElementById(`pnl-${key}-clamp`);
 
     if (cardEl) {
       cardEl.classList.remove('pos', 'neg', 'flat');
       cardEl.classList.add(tone);
+    }
+    if (clampEl) {
+      if (isClamped && clampTs > 0) {
+        const dtLabel = fmtLocalMonthDayTime(clampTs);
+        clampEl.textContent = dtLabel ? `Since Cap · ${dtLabel}` : 'Since Cap';
+        clampEl.hidden = false;
+      } else {
+        clampEl.textContent = '';
+        clampEl.hidden = true;
+      }
     }
     if (pctEl) {
       pctEl.classList.remove('pos', 'neg', 'flat');
@@ -1049,10 +1111,11 @@ function renderPnlHorizonRibbon(dash) {
     if (subEl) {
       const tradeStr =
         trades > 0 ? `${trades} Trades (${wins}W)` : '0 Closed · Live Mark';
-      subEl.innerHTML = `
-        <span>Realized: ${fmtSignedUsd(rpnl)} · Unrealized: ${fmtSignedUsd(upnl)}</span>
-        <span>${escapeHtml(tradeStr)}</span>
-      `;
+      const leftSpan = document.createElement('span');
+      leftSpan.textContent = `Realized: ${fmtSignedUsd(rpnl)} · Unrealized: ${fmtSignedUsd(upnl)}`;
+      const rightSpan = document.createElement('span');
+      rightSpan.textContent = tradeStr;
+      subEl.replaceChildren(leftSpan, rightSpan);
     }
   };
 
@@ -1076,9 +1139,30 @@ function getConfigFloatFromDash(dash, key, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function createWalletStripItem(label, valText) {
+  const item = document.createElement('span');
+  item.className = 'kpi-wallet-item';
+  const lbl = document.createElement('span');
+  lbl.className = 'kpi-wallet-label';
+  lbl.textContent = label;
+  const val = document.createElement('span');
+  val.className = 'kpi-wallet-val';
+  val.textContent = valText;
+  item.append(lbl, val);
+  return item;
+}
+
 function renderKpiCards(dash) {
   const snap = (dash && dash.snapshot) || {};
-  const totalEq = Number(snap.total_equity_usdc ?? 0);
+  const eb = (dash && dash.equity_basis) || {};
+  const dd = (dash && dash.drawdown_breaker) || {};
+  const execMode = String(dash?.execution_mode || '').toUpperCase();
+  const isLiveOrTestnet = execMode === 'LIVE' || execMode === 'TESTNET';
+
+  const totalEq =
+    toFiniteNumber(eb.effective_equity_usdc) ??
+    toFiniteNumber(snap.total_equity_usdc) ??
+    0;
   const availCash = Number(snap.available_cash_usdc ?? totalEq);
   const reservedMargin = Number(snap.reserved_order_cash_usdc ?? 0.0);
   const committedNotional = Number(snap.committed_notional_usdc ?? 0.0);
@@ -1103,7 +1187,73 @@ function renderKpiCards(dash) {
     if (el) el.style.width = `${Math.max(0, Math.min(100, pct)).toFixed(1)}%`;
   };
 
+  // Equity KPI card title, Option B effective figure, wallet strip & sync status
+  const isCapBinding = Boolean(eb.is_cap_binding);
+  setTxt(
+    'kpi-equity-title',
+    isCapBinding
+      ? 'Trading Equity (Cap Active)'
+      : isLiveOrTestnet
+      ? 'Trading Equity (Perp)'
+      : 'Total Portfolio Equity'
+  );
   setTxt('kpi-total-equity', fmtUsd(totalEq));
+
+  const walletEl = document.getElementById('kpi-wallet-summary');
+  const syncEl = document.getElementById('kpi-equity-sync-sub');
+  const perpWalletEq = toFiniteNumber(eb.perp_wallet_equity_usdc) ?? totalEq;
+  const spotUsdc = toFiniteNumber(eb.spot_usdc) ?? 0;
+  const vaultEq = toFiniteNumber(dash?.vault_info?.total_vault_equity_usdc) ?? 0;
+  const totalWalletEq =
+    toFiniteNumber(eb.total_wallet_equity_usdc) ??
+    perpWalletEq + spotUsdc + vaultEq;
+  const capUsdc = toFiniteNumber(eb.risk_capital_cap_usdc) ?? 0;
+  const syncedAtMs = toFiniteNumber(eb.synced_at_ms) ?? 0;
+  const isStale = Boolean(eb.is_stale);
+
+  if (walletEl) {
+    if (isLiveOrTestnet) {
+      const items = [createWalletStripItem('Perp Wallet:', fmtUsd(perpWalletEq))];
+      if (spotUsdc > 0.005) {
+        items.push(createWalletStripItem('Spot:', fmtUsd(spotUsdc)));
+      }
+      if (spotUsdc > 0.005 || vaultEq > 0.005) {
+        items.push(createWalletStripItem('Total Wallet:', fmtUsd(totalWalletEq)));
+      }
+      walletEl.replaceChildren(...items);
+      walletEl.hidden = false;
+    } else {
+      walletEl.replaceChildren();
+      walletEl.hidden = true;
+    }
+  }
+
+  if (syncEl) {
+    if (isLiveOrTestnet) {
+      const capSpan = document.createElement('span');
+      capSpan.textContent =
+        capUsdc >= 10 ? `Cap: ${fmtUsd(capUsdc)}` : 'Uncapped Perp';
+
+      const syncSpan = document.createElement('span');
+      syncSpan.className = 'kpi-sync-status';
+      const syncTimeStr =
+        syncedAtMs > 0 ? `Synced ${fmtLocalShortTime(syncedAtMs)}` : 'Awaiting Sync';
+      syncSpan.append(document.createTextNode(syncTimeStr));
+      if (isStale) {
+        const stalePill = document.createElement('span');
+        stalePill.className = 'sync-stale-pill';
+        stalePill.textContent = 'STALE';
+        syncSpan.append(stalePill);
+      }
+
+      syncEl.replaceChildren(capSpan, syncSpan);
+      syncEl.hidden = false;
+    } else {
+      syncEl.replaceChildren();
+      syncEl.hidden = true;
+    }
+  }
+
   const tierIcon =
     tier === 'EXTREME'
       ? '🔥'
@@ -1123,13 +1273,21 @@ function renderKpiCards(dash) {
   setTxt('kpi-cash-pct', `${cashPct.toFixed(1)}% of Equity`);
   setWidth('kpi-cash-meter', cashPct);
 
+  const workingCnt = Number(
+    snap.working_order_count ?? (dash.v_assets_ordered || []).length
+  );
+  const attachedTpSl = Number(dash.attached_tpsl_order_count ?? 0);
+  const exOpenOrders = Number(
+    dash.exchange_open_orders_count ?? workingCnt + attachedTpSl
+  );
   const resPct = totalEq > 0 ? (reservedMargin / totalEq) * 100.0 : 0.0;
   setTxt('kpi-reserved-margin', fmtUsd(reservedMargin));
+  setTxt('kpi-working-count', `${workingCnt} Working Entry ALO`);
   setTxt(
-    'kpi-working-count',
-    `${Number(
-      snap.working_order_count ?? (dash.v_assets_ordered || []).length
-    )} Working ALO Orders`
+    'kpi-exchange-orders-sub',
+    isLiveOrTestnet || attachedTpSl > 0
+      ? `${attachedTpSl} Attached SL/TP · ${exOpenOrders} HL Open`
+      : '1s Maker Chaser'
   );
   setWidth('kpi-reserved-meter', Math.min(100, resPct * 2));
 
@@ -1150,15 +1308,42 @@ function renderKpiCards(dash) {
   setTxt('kpi-leverage-cap', `Cap: ${maxGrossCap.toFixed(2)}x`);
   setWidth('kpi-leverage-meter', (grossLev / Math.max(0.2, maxGrossCap)) * 100.0);
 
+  const ddPill = document.getElementById('kpi-drawdown-pill');
+  if (ddPill) {
+    if (dd.tripped) {
+      const ddPctVal = Math.abs(Number(dd.drawdown_pct ?? 0)).toFixed(1);
+      const ddCapVal = Number(dd.max_daily_drawdown_pct ?? 15.0).toFixed(1);
+      ddPill.textContent = `DD HALT -${ddPctVal}% / ${ddCapVal}%`;
+      ddPill.hidden = false;
+    } else {
+      ddPill.textContent = '';
+      ddPill.hidden = true;
+    }
+  }
+
   setTxt('kpi-regime-label', regime);
   setTxt('kpi-breadth-pct', `Bull Breadth: ${(breadth * 100.0).toFixed(1)}%`);
   setTxt('kpi-beta-exp', `Beta: ${beta >= 0 ? '+' : ''}${beta.toFixed(2)}`);
   setWidth('kpi-breadth-meter', breadth * 100.0);
 
-  // Sleeve attribution stat boxes
-  setTxt('sleeve-s1-weight', fmtPct(snap.s1_gross_weight ?? 0, true, 1));
-  setTxt('sleeve-s2-weight', fmtPct(snap.s2_gross_weight ?? 0, true, 1));
-  setTxt('sleeve-s3-weight', fmtPct(snap.s3_gross_weight ?? 0, true, 1));
+  // Sleeve attribution stat boxes (gross % of equity + relative share)
+  const s1Gross = Math.abs(toFiniteNumber(snap.s1_gross_weight) ?? 0);
+  const s2Gross = Math.abs(toFiniteNumber(snap.s2_gross_weight) ?? 0);
+  const s3Gross = Math.abs(toFiniteNumber(snap.s3_gross_weight) ?? 0);
+  const sleeveTotal = s1Gross + s2Gross + s3Gross;
+  setTxt('sleeve-total-gross', `Total Gross: ${(sleeveTotal * 100.0).toFixed(1)}%`);
+
+  const fmtSleeveBox = (w) => {
+    const grossPct = (w * 100.0).toFixed(1);
+    if (sleeveTotal > 1e-6) {
+      const sharePct = ((w / sleeveTotal) * 100.0).toFixed(1);
+      return `${grossPct}% · ${sharePct}% share`;
+    }
+    return `${grossPct}%`;
+  };
+  setTxt('sleeve-s1-weight', fmtSleeveBox(s1Gross));
+  setTxt('sleeve-s2-weight', fmtSleeveBox(s2Gross));
+  setTxt('sleeve-s3-weight', fmtSleeveBox(s3Gross));
 }
 
 /* ============================================================================
@@ -1347,10 +1532,16 @@ function renderVaultPanel(dash) {
   if (!tbody) return;
 
   const vi = (dash && dash.vault_info) || {};
-  const perpEq = toFiniteNumber(dash?.snapshot?.total_equity_usdc) ?? 0;
+  const eb = (dash && dash.equity_basis) || {};
+  const perpEq =
+    toFiniteNumber(eb.perp_wallet_equity_usdc) ??
+    toFiniteNumber(dash?.snapshot?.total_equity_usdc) ??
+    0;
+  const spotEq = toFiniteNumber(eb.spot_usdc) ?? 0;
   const totalVaultEq = toFiniteNumber(vi.total_vault_equity_usdc) ?? 0;
   const combinedEq =
-    toFiniteNumber(vi.combined_portfolio_equity_usdc) ?? perpEq + totalVaultEq;
+    toFiniteNumber(vi.combined_portfolio_equity_usdc) ??
+    perpEq + spotEq + totalVaultEq;
   const rawVaults = Array.isArray(vi.vaults) ? vi.vaults : [];
   const vaultCount = toFiniteNumber(vi.vault_count) ?? rawVaults.length;
   const configuredAddr = String(vi.configured_vault_address || '').trim();
@@ -1404,7 +1595,9 @@ function renderVaultPanel(dash) {
   setTxt('vault-combined-equity', fmtUsd(combinedEq, 2));
   setTxt(
     'vault-combined-breakdown',
-    `Perp ${fmtUsd(perpEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
+    spotEq > 0.005
+      ? `Perp ${fmtUsd(perpEq, 2)} + Spot ${fmtUsd(spotEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
+      : `Perp ${fmtUsd(perpEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
   );
 
   // Aggregate vault PnL & weighted APR
@@ -1620,6 +1813,22 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
       !state.closingSymbols.has(String(p.symbol))
     );
   });
+  const heldInWatch = prio.filter((p) => {
+    const aid = Number(p.asset_id);
+    const st = String(p.position_status || '').toUpperCase();
+    return heldAssetIds.has(aid) || st === 'OPEN';
+  }).length;
+  const splitNoteEl = document.getElementById('watch-split-note');
+  if (splitNoteEl) {
+    if (heldInWatch > 0) {
+      splitNoteEl.textContent = `${passiveWatched.length} Watching · ${heldInWatch} Held`;
+      splitNoteEl.hidden = false;
+    } else {
+      splitNoteEl.textContent = '';
+      splitNoteEl.hidden = true;
+    }
+  }
+
   const maxPassiveDefault = 6;
 
   if (toggleBtn) {
@@ -1627,7 +1836,7 @@ function renderPriorityAndWorkingTable(dash, forceRender = false) {
       toggleBtn.style.display = 'inline-flex';
       toggleBtn.textContent = state.showAllPriorityWatch
         ? `Show Top ${maxPassiveDefault}`
-        : `Show All (${ordered.length + passiveWatched.length})`;
+        : `Show All Watchlist (${ordered.length + passiveWatched.length})`;
     } else {
       toggleBtn.style.display = 'none';
     }
@@ -1832,16 +2041,31 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     const isPreCap = isPreCapHolding(h, capEpochMs);
     const sideStr = String(h.side ?? '');
     const sideCls = sideStr.toUpperCase() === 'SHORT' ? 'short' : 'long';
+    const isShort = sideCls === 'short';
     const upnl = toFiniteNumber(h.unrealized_pnl_usdc) ?? 0;
     const upnlPct = computeOpenPnlPct(h);
-    const stopDist =
-      h.stop_distance_pct !== null && h.stop_distance_pct !== undefined
-        ? `${Number(h.stop_distance_pct).toFixed(2)}%`
-        : '—';
+    const stopPx = toFiniteNumber(h.protective_stop_px);
+    const markPx = toFiniteNumber(h.mark_price);
+    let stopDistDisplay = '—';
+    let isStopBreached = false;
+    if (stopPx !== null && stopPx > 0 && markPx !== null && markPx > 0) {
+      const signedDist = isShort
+        ? ((stopPx - markPx) / markPx) * 100.0
+        : ((markPx - stopPx) / markPx) * 100.0;
+      if (signedDist < -0.005) {
+        isStopBreached = true;
+        stopDistDisplay = `BREACHED (${signedDist.toFixed(2)}%)`;
+      } else {
+        stopDistDisplay = `(-${Math.abs(signedDist).toFixed(2)}%)`;
+      }
+    } else if (h.stop_distance_pct !== null && h.stop_distance_pct !== undefined) {
+      stopDistDisplay = `(${Number(h.stop_distance_pct).toFixed(2)}%)`;
+    }
+    const tpNum = toFiniteNumber(h.tp_distance_pct);
     const tpDist =
-      h.tp_distance_pct !== null && h.tp_distance_pct !== undefined
-        ? `${Number(h.tp_distance_pct).toFixed(2)}%`
-        : '—';
+      tpNum !== null
+        ? `(${tpNum >= 0 ? '+' : ''}${tpNum.toFixed(2)}%)`
+        : '(—)';
     const slOid = h.protective_stop_oid ? String(h.protective_stop_oid).trim() : '';
     const tpOid = h.take_profit_oid ? String(h.take_profit_oid).trim() : '';
 
@@ -1894,7 +2118,10 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     );
     tdSl.append(
       document.createTextNode(`${fmtPrice(h.protective_stop_px)} `),
-      createTableSmall('cell-sl-dist', `(${stopDist})`),
+      createTableSmall(
+        isStopBreached ? 'cell-sl-breached' : 'cell-sl-dist',
+        stopDistDisplay
+      ),
       document.createTextNode(' '),
       slBadge
     );
@@ -1909,7 +2136,7 @@ function renderOpenHoldingsTable(dash, forceRender = false) {
     );
     tdTp.append(
       document.createTextNode(`${tpPxText} `),
-      createTableSmall('cell-tp-dist', `(${tpDist})`),
+      createTableSmall('cell-tp-dist', tpDist),
       document.createTextNode(' '),
       tpBadge
     );
@@ -2642,16 +2869,48 @@ function drawEquityCurveCanvas(dash) {
   const { ctx, w, h } = prep;
   ctx.clearRect(0, 0, w, h);
 
-  let history = (dash && dash.snapshots_history) || [];
-  if (history.length === 0 && dash && dash.snapshot) {
-    history = [dash.snapshot];
-  }
-  if (history.length === 1) {
-    history = [
-      { ...history[0], created_at_ms: Number(history[0].created_at_ms ?? Date.now()) - 60000 },
-      history[0],
+  const rawHistory = (dash && dash.snapshots_history) || [];
+  let history = rawHistory.length > 0 ? rawHistory : dash && dash.snapshot ? [dash.snapshot] : [];
+  const fallbackNow = toFiniteNumber(dash?.timestamp_ms) ?? Date.now();
+
+  let points = history
+    .map((pt, idx) => {
+      const tsRaw = toFiniteNumber(pt?.created_at_ms ?? pt?.updated_at_ms);
+      const ts = tsRaw !== null && tsRaw > 0 ? tsRaw : fallbackNow + idx * 1000;
+      return { pt, ts, origIdx: idx };
+    })
+    .toSorted((a, b) => a.ts - b.ts || a.origIdx - b.origIdx);
+
+  if (points.length === 1) {
+    points = [
+      { pt: { ...points[0].pt, created_at_ms: points[0].ts - 60_000 }, ts: points[0].ts - 60_000, origIdx: 0 },
+      points[0],
     ];
   }
+
+  // Update inline live values in Equity Curve legend
+  const latestSrc =
+    points.length > 0 ? points[points.length - 1].pt : dash?.snapshot || {};
+  const liveEqVal =
+    toFiniteNumber(dash?.equity_basis?.effective_equity_usdc) ??
+    toFiniteNumber(dash?.snapshot?.total_equity_usdc) ??
+    toFiniteNumber(latestSrc?.total_equity_usdc) ??
+    0;
+  const liveCommVal =
+    toFiniteNumber(dash?.snapshot?.committed_notional_usdc) ??
+    toFiniteNumber(latestSrc?.committed_notional_usdc) ??
+    0;
+  const liveResVal =
+    toFiniteNumber(dash?.snapshot?.reserved_order_cash_usdc) ??
+    toFiniteNumber(latestSrc?.reserved_order_cash_usdc) ??
+    0;
+  const setLegend = (id, v) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = fmtUsd(v);
+  };
+  setLegend('legend-eq-val', liveEqVal);
+  setLegend('legend-comm-val', liveCommVal);
+  setLegend('legend-res-val', liveResVal);
 
   const padL = 64;
   const padR = 18;
@@ -2661,7 +2920,7 @@ function drawEquityCurveCanvas(dash) {
   const plotH = Math.max(10, h - padT - padB);
 
   const vals = [];
-  history.forEach((pt) => {
+  points.forEach(({ pt }) => {
     vals.push(Number(pt.total_equity_usdc ?? 0));
     vals.push(Number(pt.committed_notional_usdc ?? 0));
     vals.push(Number(pt.reserved_order_cash_usdc ?? 0));
@@ -2674,7 +2933,7 @@ function drawEquityCurveCanvas(dash) {
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.12)';
   ctx.lineWidth = 1;
   ctx.font = '10px "JetBrains Mono", monospace';
-  ctx.fillStyle = '#64748b';
+  ctx.fillStyle = '#94a3b8';
   for (let i = 0; i <= 4; i++) {
     const frac = i / 4;
     const y = padT + plotH - frac * plotH;
@@ -2690,84 +2949,250 @@ function drawEquityCurveCanvas(dash) {
     ctx.fillText(labelStr, 6, y + 3);
   }
 
-  const xFor = (idx) =>
-    padL + (history.length <= 1 ? 0 : (idx / (history.length - 1)) * plotW);
+  const tMin = points.length > 0 ? points[0].ts : fallbackNow;
+  const tMax = points.length > 0 ? points[points.length - 1].ts : fallbackNow;
+  const spanMs = tMax - tMin;
+
+  const xForTime = (tsMs, idx) => {
+    if (spanMs > 0) {
+      return padL + ((tsMs - tMin) / spanMs) * plotW;
+    }
+    return padL + (points.length <= 1 ? 0 : (idx / (points.length - 1)) * plotW);
+  };
   const yFor = (v) =>
     padT + plotH - ((v - minVal) / Math.max(1e-6, maxVal - minVal)) * plotH;
 
-  // Store point coordinates for local-time hover tooltip
-  state.equityChartPoints = history.map((pt, idx) => ({
-    x: xFor(idx),
-    y: yFor(Number(pt.total_equity_usdc ?? 0)),
-    pt,
-  }));
+  const coords = points.map((item, idx) => {
+    const pt = item.pt;
+    const eq = Number(pt.total_equity_usdc ?? 0);
+    const comm = Number(pt.committed_notional_usdc ?? 0);
+    const res = Number(pt.reserved_order_cash_usdc ?? 0);
+    return {
+      x: xForTime(item.ts, idx),
+      y: yFor(eq),
+      yComm: yFor(comm),
+      yRes: yFor(res),
+      ts: item.ts,
+      pt,
+    };
+  });
 
-  // Local-timezone X-axis timestamps (start, mid, end)
-  if (history.length > 0) {
-    const indices =
-      history.length >= 3
-        ? [0, Math.floor((history.length - 1) / 2), history.length - 1]
-        : [0, history.length - 1];
-    indices.forEach((idx, posIdx) => {
-      const pt = history[idx];
-      if (!pt || !pt.created_at_ms) return;
-      const baseTime = fmtLocalShortTime(pt.created_at_ms);
+  // Store point coordinates for local-time hover tooltip & crosshair
+  state.equityChartPoints = coords;
+
+  // Detect snapshot gaps (dt > 15m && dt > 10 * medianDt) and split into contiguous segments
+  const posDts = [];
+  for (let i = 1; i < coords.length; i++) {
+    const dt = coords[i].ts - coords[i - 1].ts;
+    if (dt > 0) posDts.push(dt);
+  }
+  const sortedDts = posDts.toSorted((a, b) => a - b);
+  const medianDt =
+    sortedDts.length > 0
+      ? sortedDts[Math.floor((sortedDts.length - 1) / 2)]
+      : 0;
+  const gapThresholdMs = Math.max(15 * 60 * 1000, 10 * medianDt);
+
+  const segments = [];
+  const gaps = [];
+  if (coords.length > 0) {
+    let curSeg = [coords[0]];
+    for (let i = 1; i < coords.length; i++) {
+      const prev = coords[i - 1];
+      const next = coords[i];
+      const dt = next.ts - prev.ts;
+      if (dt > gapThresholdMs) {
+        segments.push(curSeg);
+        gaps.push({ prev, next, dtMs: dt });
+        curSeg = [next];
+      } else {
+        curSeg.push(next);
+      }
+    }
+    segments.push(curSeg);
+  }
+
+  // Local-timezone X-axis timestamps (time-proportional across [tMin, tMax])
+  if (coords.length > 0) {
+    const dMin = new Date(tMin);
+    const dMax = new Date(tMax);
+    const crossesMidnight =
+      dMin.getFullYear() !== dMax.getFullYear() ||
+      dMin.getMonth() !== dMax.getMonth() ||
+      dMin.getDate() !== dMax.getDate();
+    const useLongFmt = spanMs >= 18 * 3600 * 1000 || crossesMidnight;
+    const formatAxisTs = (tsMs) =>
+      useLongFmt ? fmtLocalMonthDayTime(tsMs) : fmtLocalShortTime(tsMs);
+
+    const tickPositions =
+      spanMs > 0
+        ? [
+            { ts: tMin, x: padL, align: 'left', isEnd: false },
+            { ts: tMin + spanMs * 0.5, x: padL + plotW * 0.5, align: 'center', isEnd: false },
+            { ts: tMax, x: padL + plotW, align: 'right', isEnd: true },
+          ]
+        : [
+            { ts: tMin, x: padL, align: 'left', isEnd: false },
+            { ts: tMax, x: padL + plotW, align: 'right', isEnd: true },
+          ];
+
+    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.fillStyle = '#94a3b8';
+    tickPositions.forEach((tk) => {
+      const baseTime = formatAxisTs(tk.ts);
       if (!baseTime) return;
-      const tzSuffix =
-        posIdx === indices.length - 1
-          ? ` ${getLocalTzAbbrev(new Date(Number(pt.created_at_ms)))}`
-          : '';
-      const txt = baseTime + tzSuffix;
-      const x = xFor(idx);
-      ctx.textAlign =
-        posIdx === 0 ? 'left' : posIdx === indices.length - 1 ? 'right' : 'center';
-      ctx.fillText(txt, x, padT + plotH + 17);
+      const tzSuffix = tk.isEnd ? ` ${getLocalTzAbbrev(new Date(tk.ts))}` : '';
+      ctx.textAlign = tk.align;
+      ctx.fillText(baseTime + tzSuffix, tk.x, padT + plotH + 17);
     });
     ctx.textAlign = 'left';
   }
 
-  const drawSeries = (getter, strokeColor, fillTop) => {
-    ctx.beginPath();
-    history.forEach((pt, idx) => {
-      const x = xFor(idx);
-      const y = yFor(getter(pt));
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = 2.2;
-    ctx.stroke();
+  // Layer 1: Gap bands & badges
+  gaps.forEach((g) => {
+    const bandW = Math.max(2, g.next.x - g.prev.x);
+    ctx.fillStyle = 'rgba(148, 163, 184, 0.07)';
+    ctx.fillRect(g.prev.x, padT, bandW, plotH);
 
-    if (fillTop) {
-      const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
-      grad.addColorStop(0, fillTop);
-      grad.addColorStop(1, 'rgba(6, 9, 17, 0.0)');
-      ctx.lineTo(xFor(history.length - 1), padT + plotH);
-      ctx.lineTo(xFor(0), padT + plotH);
-      ctx.closePath();
-      ctx.fillStyle = grad;
-      ctx.fill();
+    ctx.save();
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(g.prev.x, padT);
+    ctx.lineTo(g.prev.x, padT + plotH);
+    ctx.moveTo(g.next.x, padT);
+    ctx.lineTo(g.next.x, padT + plotH);
+    ctx.stroke();
+    ctx.restore();
+
+    if (bandW >= 46) {
+      const label = `gap ${fmtCompactDuration(g.dtMs)}`;
+      ctx.save();
+      ctx.font = '700 9.5px "JetBrains Mono", monospace';
+      const tw = ctx.measureText(label).width;
+      const pillW = tw + 12;
+      const pillH = 16;
+      const pillX = g.prev.x + bandW / 2 - pillW / 2;
+      const pillY = padT + 6;
+      ctx.fillStyle = 'rgba(10, 15, 29, 0.9)';
+      ctx.fillRect(pillX, pillY, pillW, pillH);
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(pillX, pillY, pillW, pillH);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.textAlign = 'center';
+      ctx.fillText(label, g.prev.x + bandW / 2, pillY + 11.5);
+      ctx.restore();
     }
+  });
+
+  // Layer 2: Translucent gradient area fills FIRST across all contiguous segments
+  const drawSegmentFill = (seg, yKey, fillTop) => {
+    if (seg.length < 2) return;
+    const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+    grad.addColorStop(0, fillTop);
+    grad.addColorStop(1, 'rgba(6, 9, 17, 0.0)');
+    ctx.beginPath();
+    seg.forEach((pt, idx) => {
+      if (idx === 0) ctx.moveTo(pt.x, pt[yKey]);
+      else ctx.lineTo(pt.x, pt[yKey]);
+    });
+    ctx.lineTo(seg[seg.length - 1].x, padT + plotH);
+    ctx.lineTo(seg[0].x, padT + plotH);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
   };
 
-  // 1. Total Equity Curve (Neon Cyan)
-  drawSeries(
-    (p) => Number(p.total_equity_usdc ?? 0),
-    '#00f2fe',
-    'rgba(0, 242, 254, 0.22)'
-  );
-  // 2. Committed Notional Curve (Neon Emerald)
-  drawSeries(
-    (p) => Number(p.committed_notional_usdc ?? 0),
-    '#10b981',
-    'rgba(16, 185, 129, 0.16)'
-  );
-  // 3. Reserved Working Order Margin (Neon Amber)
-  drawSeries(
-    (p) => Number(p.reserved_order_cash_usdc ?? 0),
-    '#f59e0b',
-    null
-  );
+  segments.forEach((seg) => {
+    drawSegmentFill(seg, 'y', 'rgba(0, 242, 254, 0.18)');
+    drawSegmentFill(seg, 'yComm', 'rgba(16, 185, 129, 0.14)');
+  });
+
+  // Layer 3: Dashed gap bridges across gaps
+  const drawGapBridge = (yKey, color) => {
+    if (gaps.length === 0) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
+    gaps.forEach((g) => {
+      ctx.beginPath();
+      ctx.moveTo(g.prev.x, g.prev[yKey]);
+      ctx.lineTo(g.next.x, g.next[yKey]);
+      ctx.stroke();
+    });
+    ctx.restore();
+  };
+  drawGapBridge('yComm', 'rgba(16, 185, 129, 0.45)');
+  drawGapBridge('yRes', 'rgba(245, 158, 11, 0.45)');
+  drawGapBridge('y', 'rgba(0, 242, 254, 0.6)');
+
+  // Layer 4: Crisp opaque strokes ON TOP (Committed, Reserved, and Total Equity LAST!)
+  const drawSeriesStroke = (yKey, strokeColor, lineWidth) => {
+    ctx.strokeStyle = strokeColor;
+    ctx.fillStyle = strokeColor;
+    ctx.lineWidth = lineWidth;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    segments.forEach((seg) => {
+      if (seg.length === 1) {
+        ctx.beginPath();
+        ctx.arc(seg[0].x, seg[0][yKey], 2.8, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+      ctx.beginPath();
+      seg.forEach((pt, idx) => {
+        if (idx === 0) ctx.moveTo(pt.x, pt[yKey]);
+        else ctx.lineTo(pt.x, pt[yKey]);
+      });
+      ctx.stroke();
+    });
+  };
+
+  drawSeriesStroke('yComm', '#10b981', 2.0);
+  drawSeriesStroke('yRes', '#f59e0b', 2.0);
+  drawSeriesStroke('y', '#00f2fe', 2.4);
+
+  // Layer 5: Hover crosshair & highlighted point markers
+  if (
+    state.equityHoverIdx !== null &&
+    state.equityHoverIdx >= 0 &&
+    state.equityHoverIdx < coords.length
+  ) {
+    const hp = coords[state.equityHoverIdx];
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 242, 254, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(hp.x, padT);
+    ctx.lineTo(hp.x, padT + plotH);
+    ctx.stroke();
+    ctx.restore();
+
+    const drawHoverDot = (cx, cy, color, r = 4) => {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#060911';
+      ctx.stroke();
+    };
+    drawHoverDot(hp.x, hp.yComm, '#10b981', 3.5);
+    drawHoverDot(hp.x, hp.yRes, '#f59e0b', 3.5);
+    drawHoverDot(hp.x, hp.y, '#00f2fe', 4.5);
+  }
+
+  // Accessible chart summary for screen readers
+  const eqCanvasEl = document.getElementById('equity-curve-canvas');
+  const eqCaptionEl = document.getElementById('equity-curve-caption');
+  const ariaSummary = `Portfolio equity curve from ${fmtLocalTime(tMin)} to ${fmtLocalTime(tMax)}: current equity ${fmtUsd(liveEqVal)}, committed notional ${fmtUsd(liveCommVal)}, reserved margin ${fmtUsd(liveResVal)}${gaps.length > 0 ? `, with ${gaps.length} snapshot gap(s)` : ''}.`;
+  if (eqCanvasEl) eqCanvasEl.setAttribute('aria-label', ariaSummary);
+  if (eqCaptionEl) eqCaptionEl.textContent = ariaSummary;
 }
 
 function drawSleeveAttributionCanvas(dash) {
@@ -2791,7 +3216,7 @@ function drawSleeveAttributionCanvas(dash) {
   ];
 
   const padL = 108;
-  const padR = 54;
+  const padR = 56;
   const rowH = Math.floor((h - 20) / 3);
   const maxW = Math.max(1.0, s1 + s2 + s3, 0.85);
 
@@ -2820,6 +3245,13 @@ function drawSleeveAttributionCanvas(dash) {
     ctx.fillStyle = '#ffffff';
     ctx.fillText(`${(b.val * 100).toFixed(1)}%`, padL + trackW + 8, yCenter + 4);
   });
+
+  const slCanvasEl = document.getElementById('sleeve-attr-canvas');
+  const slCaptionEl = document.getElementById('sleeve-attr-caption');
+  const totalPct = ((s1 + s2 + s3) * 100).toFixed(1);
+  const slSummary = `Gross target sleeve exposure total ${totalPct}% of equity: S1 Carry-Momentum ${(s1 * 100).toFixed(1)}%, S2 Trend-Breakout ${(s2 * 100).toFixed(1)}%, S3 Event-Reversion ${(s3 * 100).toFixed(1)}%.`;
+  if (slCanvasEl) slCanvasEl.setAttribute('aria-label', slSummary);
+  if (slCaptionEl) slCaptionEl.textContent = slSummary;
 }
 
 /* ============================================================================
@@ -3018,7 +3450,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     authForm.addEventListener('submit', submitAuthLogin);
   }
 
-  // Interactive local-timezone hover tooltip on Equity Curve canvas
+  // Interactive local-timezone hover tooltip & crosshair on Equity Curve canvas
   const eqCanvas = document.getElementById('equity-curve-canvas');
   const eqTooltip = document.getElementById('equity-chart-tooltip');
   if (eqCanvas && eqTooltip) {
@@ -3027,30 +3459,55 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (pts.length === 0) return;
       const rect = eqCanvas.getBoundingClientRect();
       const mouseX = evt.clientX - rect.left;
-      let nearest = pts[0];
-      let bestDist = Math.abs(mouseX - nearest.x);
+      let nearestIdx = 0;
+      let bestDist = Math.abs(mouseX - pts[0].x);
       for (let i = 1; i < pts.length; i++) {
         const d = Math.abs(mouseX - pts[i].x);
         if (d < bestDist) {
           bestDist = d;
-          nearest = pts[i];
+          nearestIdx = i;
         }
       }
+      const nearest = pts[nearestIdx];
+      if (state.equityHoverIdx !== nearestIdx) {
+        state.equityHoverIdx = nearestIdx;
+        if (state.dashboard) drawEquityCurveCanvas(state.dashboard);
+      }
+
       const pt = nearest.pt;
-      eqTooltip.innerHTML = `
-        <div style="color: var(--neon-cyan); font-weight: 700; margin-bottom: 3px;">${escapeHtml(fmtLocalTime(pt.created_at_ms))}</div>
-        <div>Equity: <strong>${escapeHtml(fmtUsd(pt.total_equity_usdc ?? 0))}</strong></div>
-        <div style="color: #34d399;">Committed: ${escapeHtml(fmtUsd(pt.committed_notional_usdc ?? 0))}</div>
-        <div style="color: #fbbf24;">Reserved: ${escapeHtml(fmtUsd(pt.reserved_order_cash_usdc ?? 0))}</div>
-      `;
-      eqTooltip.style.display = 'block';
-      const tipX = Math.min(rect.width - 170, Math.max(8, nearest.x + 12));
-      const tipY = Math.max(8, Math.min(rect.height - 80, nearest.y - 24));
+      const timeDiv = document.createElement('div');
+      timeDiv.style.color = 'var(--neon-cyan)';
+      timeDiv.style.fontWeight = '700';
+      timeDiv.style.marginBottom = '3px';
+      timeDiv.textContent = fmtLocalTime(pt.created_at_ms);
+
+      const eqDiv = document.createElement('div');
+      const eqStrong = document.createElement('strong');
+      eqStrong.textContent = fmtUsd(pt.total_equity_usdc ?? 0);
+      eqDiv.append(document.createTextNode('Equity: '), eqStrong);
+
+      const commDiv = document.createElement('div');
+      commDiv.style.color = '#34d399';
+      commDiv.textContent = `Committed: ${fmtUsd(pt.committed_notional_usdc ?? 0)}`;
+
+      const resDiv = document.createElement('div');
+      resDiv.style.color = '#fbbf24';
+      resDiv.textContent = `Reserved: ${fmtUsd(pt.reserved_order_cash_usdc ?? 0)}`;
+
+      eqTooltip.replaceChildren(timeDiv, eqDiv, commDiv, resDiv);
+      eqTooltip.hidden = false;
+      const tipX = Math.min(rect.width - 175, Math.max(8, nearest.x + 12));
+      const tipY = Math.max(8, Math.min(rect.height - 84, nearest.y - 24));
       eqTooltip.style.left = `${tipX}px`;
       eqTooltip.style.top = `${tipY}px`;
     });
     eqCanvas.addEventListener('mouseleave', () => {
-      eqTooltip.style.display = 'none';
+      eqTooltip.hidden = true;
+      eqTooltip.replaceChildren();
+      if (state.equityHoverIdx !== null) {
+        state.equityHoverIdx = null;
+        if (state.dashboard) drawEquityCurveCanvas(state.dashboard);
+      }
     });
   }
 

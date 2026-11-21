@@ -2,10 +2,11 @@
 
 use aegis_core::{
     is_immutable_security_config_key, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
-    now_ms, round_dp, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView, ExchangeAsset,
-    HeldAssetView, OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot,
-    PriorityWatchView, Result, RiskTier, SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView,
-    SystemConfigRow, TelemetryLogRecord, VaultInfoPayload, PLATFORM_VERSION,
+    now_ms, round_dp, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView,
+    DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset, HeldAssetView, OrderAuditRecord,
+    OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result, RiskTier,
+    SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord,
+    VaultInfoPayload, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -89,6 +90,14 @@ pub struct DashboardPayload {
     pub pre_cap_open_count: usize,
     pub pnl_summary: PnlSummary,
     pub vault_info: VaultInfoPayload,
+    #[serde(default)]
+    pub equity_basis: EquityBasisSummary,
+    #[serde(default)]
+    pub drawdown_breaker: DrawdownBreakerStatus,
+    #[serde(default)]
+    pub attached_tpsl_order_count: usize,
+    #[serde(default)]
+    pub exchange_open_orders_count: usize,
     pub snapshot: PortfolioSnapshot,
     pub snapshots_history: Vec<PortfolioSnapshot>,
     pub v_assets_held: Vec<HeldAssetView>,
@@ -262,6 +271,12 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
                 | "last_db_backup_ms"
                 | "last_entry_order_ms"
                 | "live_vault_info_json"
+                | "live_exchange_equity_synced_at_ms"
+                | "live_exchange_margin_used_usdc"
+                | "live_exchange_withdrawable_usdc"
+                | "live_exchange_open_orders_count"
+                | "live_exchange_spot_usdc"
+                | "live_exchange_spot_synced_at_ms"
         )
     {
         return Err(AegisError::SecurityViolation(format!(
@@ -513,6 +528,13 @@ pub fn build_vault_info_payload(
         };
     }
 
+    let raw_spot = cfg.get_f64("live_exchange_spot_usdc", 0.0);
+    let spot_usdc = if raw_spot.is_finite() {
+        raw_spot.max(0.0)
+    } else {
+        0.0
+    };
+
     let raw_json = cfg.get_str("live_vault_info_json", "");
     let parsed = (!raw_json.is_empty())
         .then(|| serde_json::from_str::<VaultInfoPayload>(&raw_json).ok())
@@ -522,7 +544,7 @@ pub fn build_vault_info_payload(
         return VaultInfoPayload {
             configured_vault_address,
             total_vault_equity_usdc: 0.0,
-            combined_portfolio_equity_usdc: round_dp(safe_perp_eq, 2),
+            combined_portfolio_equity_usdc: round_dp(safe_perp_eq + spot_usdc, 2),
             vault_count: 0,
             synced_at_ms: 0,
             vaults: Vec::new(),
@@ -563,7 +585,8 @@ pub fn build_vault_info_payload(
 
     info.configured_vault_address = configured_vault_address;
     info.total_vault_equity_usdc = total_vault_equity_usdc;
-    info.combined_portfolio_equity_usdc = round_dp(safe_perp_eq + total_vault_equity_usdc, 2);
+    info.combined_portfolio_equity_usdc =
+        round_dp(safe_perp_eq + spot_usdc + total_vault_equity_usdc, 2);
     info.vault_count = info.vaults.len();
     info
 }
@@ -592,6 +615,9 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     let order_audit = db.list_recent_order_audits(50).unwrap_or_default();
     let telemetry_logs = db.list_recent_telemetry(50).unwrap_or_default();
 
+    let is_live_or_testnet = cfg.execution_mode().is_live_or_testnet();
+    let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+
     let mut snapshot = db.get_latest_portfolio_snapshot()?;
     // Ensure snapshot reflects live risk tier & live working/open counts if synthesized or updated
     snapshot.risk_tier = tier.as_str().to_string();
@@ -606,13 +632,26 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
             .map(|h| h.committed_notional_usdc)
             .sum();
         let upnl: f64 = v_assets_held.iter().map(|h| h.unrealized_pnl_usdc).sum();
-        let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
-        let base_eq = if live_eq > 10.0 {
-            live_eq
+        let total_eq = if is_live_or_testnet {
+            let cap_eq = cfg.get_f64("risk_capital_cap_usdc", 0.0);
+            let eff_live = if live_eq > 0.0 && cap_eq >= 10.0 {
+                live_eq.min(cap_eq)
+            } else if live_eq > 0.0 {
+                live_eq
+            } else if cap_eq >= 10.0 {
+                cap_eq
+            } else {
+                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+            };
+            round_dp(eff_live, 2)
         } else {
-            cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+            let base_eq = if live_eq > 10.0 {
+                live_eq
+            } else {
+                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
+            };
+            round_dp(base_eq + upnl, 2)
         };
-        let total_eq = round_dp(base_eq + upnl, 2);
         let avail_cash = round_dp((total_eq - committed - reserved).max(0.0), 2);
         snapshot.total_equity_usdc = total_eq;
         snapshot.available_cash_usdc = avail_cash;
@@ -674,7 +713,7 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         })
         .collect();
 
-    let cap_epoch_ms = if cfg.execution_mode().is_live_or_testnet() {
+    let cap_epoch_ms = if is_live_or_testnet {
         cfg.get_i64("risk_capital_cap_updated_at_ms", 0)
     } else {
         0
@@ -685,7 +724,129 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .filter(|h| cap_epoch_ms <= 0 || h.opened_at_ms.unwrap_or(h.updated_at_ms) >= cap_epoch_ms)
         .count();
     let pre_cap_open_count = v_assets_held.len().saturating_sub(active_cap_open_count);
-    let vault_info = build_vault_info_payload(&cfg, snapshot.total_equity_usdc, ts);
+
+    let perp_wallet_equity_usdc = if is_live_or_testnet && live_eq > 0.0 {
+        round_dp(live_eq, 2)
+    } else {
+        round_dp(snapshot.total_equity_usdc, 2)
+    };
+    let vault_info = build_vault_info_payload(&cfg, perp_wallet_equity_usdc, ts);
+
+    let spot_usdc = if is_live_or_testnet {
+        round_dp(cfg.get_f64("live_exchange_spot_usdc", 0.0).max(0.0), 2)
+    } else {
+        0.0
+    };
+    let effective_equity_usdc = round_dp(snapshot.total_equity_usdc, 2);
+    let risk_capital_cap_usdc = if is_live_or_testnet {
+        round_dp(cfg.get_f64("risk_capital_cap_usdc", 0.0).max(0.0), 2)
+    } else {
+        0.0
+    };
+    let is_cap_binding = is_live_or_testnet
+        && risk_capital_cap_usdc >= 10.0
+        && perp_wallet_equity_usdc > risk_capital_cap_usdc + 1e-6;
+    let basis_label = if !is_live_or_testnet {
+        "PAPER_EQUITY"
+    } else if is_cap_binding {
+        "CAPPED_RISK_CAPITAL"
+    } else {
+        "PERP_ACCOUNT_VALUE"
+    }
+    .to_string();
+    let total_wallet_equity_usdc = round_dp(
+        perp_wallet_equity_usdc + spot_usdc + vault_info.total_vault_equity_usdc,
+        2,
+    );
+    let margin_used_usdc = if is_live_or_testnet {
+        round_dp(
+            cfg.get_f64("live_exchange_margin_used_usdc", 0.0).max(0.0),
+            2,
+        )
+    } else {
+        0.0
+    };
+    let withdrawable_usdc = if is_live_or_testnet {
+        round_dp(
+            cfg.get_f64("live_exchange_withdrawable_usdc", 0.0).max(0.0),
+            2,
+        )
+    } else {
+        round_dp(snapshot.available_cash_usdc.max(0.0), 2)
+    };
+    let synced_at_ms = cfg.get_i64("live_exchange_equity_synced_at_ms", 0).max(0);
+    let is_stale =
+        is_live_or_testnet && (synced_at_ms <= 0 || ts.saturating_sub(synced_at_ms) > 90_000);
+    let equity_basis = EquityBasisSummary {
+        basis_label,
+        effective_equity_usdc,
+        perp_wallet_equity_usdc,
+        risk_capital_cap_usdc,
+        is_cap_binding,
+        spot_usdc,
+        total_wallet_equity_usdc,
+        margin_used_usdc,
+        withdrawable_usdc,
+        synced_at_ms,
+        is_stale,
+    };
+
+    let dd_window_start = if cap_epoch_ms > 0 {
+        (ts - 86_400_000).max(cap_epoch_ms)
+    } else {
+        ts - 86_400_000
+    };
+    let max_dd_frac = cfg
+        .get_f64("max_daily_drawdown_pct", 0.15)
+        .clamp(0.01, 0.90);
+    let drawdown_breaker = match db
+        .get_peak_and_latest_equity_since(dd_window_start)
+        .ok()
+        .flatten()
+    {
+        Some((peak, latest))
+            if peak.is_finite() && latest.is_finite() && peak > 0.0 && latest > 0.0 =>
+        {
+            let dd_frac = ((peak - latest) / peak).max(0.0);
+            DrawdownBreakerStatus {
+                tripped: dd_frac >= max_dd_frac,
+                drawdown_pct: round_dp(dd_frac * 100.0, 2),
+                max_daily_drawdown_pct: round_dp(max_dd_frac * 100.0, 2),
+                peak_24h_equity_usdc: round_dp(peak, 2),
+                latest_equity_usdc: round_dp(latest, 2),
+                window_start_ms: dd_window_start,
+            }
+        }
+        _ => DrawdownBreakerStatus {
+            tripped: false,
+            drawdown_pct: 0.0,
+            max_daily_drawdown_pct: round_dp(max_dd_frac * 100.0, 2),
+            peak_24h_equity_usdc: 0.0,
+            latest_equity_usdc: 0.0,
+            window_start_ms: dd_window_start,
+        },
+    };
+
+    let attached_tpsl_order_count: usize = v_assets_held
+        .iter()
+        .map(|h| {
+            let has_sl = h
+                .protective_stop_oid
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            let has_tp = h
+                .take_profit_oid
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            usize::from(has_sl) + usize::from(has_tp)
+        })
+        .sum();
+    let fallback_open_orders = v_assets_ordered.len() + attached_tpsl_order_count;
+    let exchange_open_orders_count = if is_live_or_testnet && synced_at_ms > 0 {
+        cfg.get_usize("live_exchange_open_orders_count", fallback_open_orders)
+    } else {
+        fallback_open_orders
+    };
 
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
@@ -702,6 +863,10 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         pre_cap_open_count,
         pnl_summary,
         vault_info,
+        equity_basis,
+        drawdown_breaker,
+        attached_tpsl_order_count,
+        exchange_open_orders_count,
         snapshot,
         snapshots_history,
         v_assets_held,

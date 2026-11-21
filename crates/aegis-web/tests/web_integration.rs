@@ -2057,3 +2057,540 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
             < 1e-6
     );
 }
+
+#[tokio::test]
+async fn test_web_readonly_telemetry_keys_rejected_403() {
+    let readonly_keys = [
+        "live_exchange_equity_synced_at_ms",
+        "live_exchange_margin_used_usdc",
+        "live_exchange_withdrawable_usdc",
+        "live_exchange_open_orders_count",
+        "live_exchange_spot_usdc",
+        "live_exchange_spot_synced_at_ms",
+    ];
+
+    for key in readonly_keys {
+        assert!(
+            matches!(
+                validate_config_key_value(key, "123"),
+                Err(AegisError::SecurityViolation(_))
+            ),
+            "Expected SecurityViolation for {key}"
+        );
+        let upper = key.to_ascii_uppercase();
+        assert!(
+            matches!(
+                validate_config_key_value(&upper, "123"),
+                Err(AegisError::SecurityViolation(_))
+            ),
+            "Expected SecurityViolation for {upper}"
+        );
+    }
+
+    let db = tokio::task::spawn_blocking(|| {
+        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
+    })
+    .await
+    .unwrap();
+    let app = create_web_router(db, None);
+
+    for key in readonly_keys {
+        let single_body = serde_json::json!({
+            "config_key": key,
+            "config_value": "999",
+        });
+        let res_single = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&single_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_single.status(),
+            StatusCode::FORBIDDEN,
+            "Expected 403 for single POST {key}"
+        );
+
+        let batch_body = serde_json::json!({
+            "updates": {
+                key: "999"
+            }
+        });
+        let res_batch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&batch_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_batch.status(),
+            StatusCode::FORBIDDEN,
+            "Expected 403 for batch POST {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_web_option_b_equity_basis_spot_vault_and_stale_flag() {
+    use aegis_core::{VaultInfoPayload, VaultPositionInfo};
+
+    let now = now_ms();
+    let synced_recent = now - 5_000;
+    let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_usdc", "10944.72", None)
+            .unwrap();
+        mgr.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_spot_usdc", "5000.0", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_margin_used_usdc", "350.25", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_withdrawable_usdc", "8200.50", None)
+            .unwrap();
+        mgr.set_config_value(
+            "live_exchange_equity_synced_at_ms",
+            &synced_recent.to_string(),
+            None,
+        )
+        .unwrap();
+
+        let vault_payload = VaultInfoPayload {
+            configured_vault_address: hlp_addr.to_string(),
+            total_vault_equity_usdc: 202.40,
+            combined_portfolio_equity_usdc: 16147.12,
+            vault_count: 1,
+            synced_at_ms: now,
+            vaults: vec![VaultPositionInfo {
+                vault_address: hlp_addr.to_string(),
+                name: "HLP".to_string(),
+                leader: "0x677d831aef5328190852e24f13c46cac05f984e7".to_string(),
+                equity_usdc: 202.40,
+                pnl_usdc: 0.92,
+                all_time_pnl_usdc: 1.34,
+                pnl_pct: 0.46,
+                all_time_pnl_pct: 0.67,
+                apr_pct: 8.14,
+                days_following: 25,
+                locked_until_ms: 0,
+                is_locked: false,
+                is_closed: false,
+            }],
+        };
+        mgr.set_config_value(
+            "live_vault_info_json",
+            &serde_json::to_string(&vault_payload).unwrap(),
+            None,
+        )
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. When snapshot.id == 0 (synthesized), Option B caps snapshot.total_equity_usdc at 1000.0
+    // while perp_wallet, spot, and vault combine cleanly to 16147.12.
+    let res_synth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_synth.status(), StatusCode::OK);
+    let synth_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_synth.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        (synth_json["snapshot"]["total_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 1000.0)
+            .abs()
+            < 1e-6
+    );
+    let eb = &synth_json["equity_basis"];
+    assert_eq!(eb["basis_label"], "CAPPED_RISK_CAPITAL");
+    assert!((eb["effective_equity_usdc"].as_f64().unwrap() - 1000.0).abs() < 1e-6);
+    assert!((eb["perp_wallet_equity_usdc"].as_f64().unwrap() - 10944.72).abs() < 1e-6);
+    assert!((eb["risk_capital_cap_usdc"].as_f64().unwrap() - 1000.0).abs() < 1e-6);
+    assert_eq!(eb["is_cap_binding"], true);
+    assert!((eb["spot_usdc"].as_f64().unwrap() - 5000.0).abs() < 1e-6);
+    assert!((eb["total_wallet_equity_usdc"].as_f64().unwrap() - 16147.12).abs() < 1e-6);
+    assert!((eb["margin_used_usdc"].as_f64().unwrap() - 350.25).abs() < 1e-6);
+    assert!((eb["withdrawable_usdc"].as_f64().unwrap() - 8200.50).abs() < 1e-6);
+    assert_eq!(eb["is_stale"], false);
+    assert!(
+        (synth_json["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 16147.12)
+            .abs()
+            < 1e-6
+    );
+
+    // 2. With a persisted Option B snapshot (snapshot.id > 0) and stale sync timestamp (>90s)
+    let db_persisted = db.clone();
+    let stale_ts = now - 120_000;
+    tokio::task::spawn_blocking(move || {
+        db_persisted
+            .set_config_value(
+                "live_exchange_equity_synced_at_ms",
+                &stale_ts.to_string(),
+                None,
+            )
+            .unwrap();
+        db_persisted
+            .insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+                total_equity_usdc: 1000.0,
+                available_cash_usdc: 750.0,
+                reserved_order_cash_usdc: 0.0,
+                committed_notional_usdc: 250.0,
+                net_notional_usdc: 250.0,
+                gross_leverage_x: 0.25,
+                net_leverage_x: 0.25,
+                market_beta_exposure: 0.2,
+                market_breadth_bull: 0.55,
+                market_regime_label: "NEUTRAL".to_string(),
+                risk_tier: "extreme".to_string(),
+                leverage_multiplier: 1.85,
+                s1_gross_weight: 0.25,
+                s2_gross_weight: 0.0,
+                s3_gross_weight: 0.0,
+                working_order_count: 0,
+                open_long_count: 1,
+                open_short_count: 0,
+                eligible_coin_count: 10,
+            })
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_persisted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_persisted.status(), StatusCode::OK);
+    let persisted_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_persisted.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        (persisted_json["snapshot"]["total_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 1000.0)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(persisted_json["equity_basis"]["is_stale"], true);
+    assert_eq!(persisted_json["equity_basis"]["is_cap_binding"], true);
+    assert!(
+        (persisted_json["equity_basis"]["total_wallet_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 16147.12)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (persisted_json["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 16147.12)
+            .abs()
+            < 1e-6
+    );
+
+    // 3. PAPER mode disables cap binding, spot, and stale alerts
+    let db_paper = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_paper
+            .set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_paper = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paper.status(), StatusCode::OK);
+    let paper_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_paper.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(paper_json["equity_basis"]["basis_label"], "PAPER_EQUITY");
+    assert_eq!(paper_json["equity_basis"]["is_cap_binding"], false);
+    assert_eq!(paper_json["equity_basis"]["spot_usdc"], 0.0);
+    assert_eq!(paper_json["equity_basis"]["is_stale"], false);
+}
+
+#[tokio::test]
+async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl() {
+    let now = now_ms();
+    let cap_two_days_ago = now - 2 * 86_400_000;
+
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("max_daily_drawdown_pct", "0.15", None)
+            .unwrap();
+        mgr.set_config_value(
+            "risk_capital_cap_updated_at_ms",
+            &cap_two_days_ago.to_string(),
+            None,
+        )
+        .unwrap();
+        mgr.set_config_value("live_exchange_equity_synced_at_ms", &now.to_string(), None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_open_orders_count", "5", None)
+            .unwrap();
+
+        let sol_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "SOL".to_string(),
+                asset_index: 2,
+                sz_decimals: 2,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: 100.0,
+                mid_price: 100.0,
+                oracle_price: 100.0,
+                funding_rate_hourly: 0.00001,
+                day_volume_usdc: 50_000_000.0,
+                open_interest_usdc: 20_000_000.0,
+                prev_day_price: 98.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+        let btc_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "BTC".to_string(),
+                asset_index: 0,
+                sz_decimals: 4,
+                tick_size: 0.1,
+                lot_step_size: 0.001,
+                max_leverage: 40.0,
+                mark_price: 94000.0,
+                mid_price: 94000.0,
+                oracle_price: 94000.0,
+                funding_rate_hourly: 0.00001,
+                day_volume_usdc: 85_000_000.0,
+                open_interest_usdc: 25_000_000.0,
+                prev_day_price: 93000.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+
+        // Open SOL position with both protective SL & TP OIDs attached
+        let (open_pos_id, _) = mgr
+            .sync_open_position_from_exchange_v2(
+                sol_id,
+                "SOL",
+                OrderSide::Long,
+                100.0,
+                100.0,
+                2.0,
+                200.0,
+                0.0,
+                0.20,
+                92.0,
+                112.0,
+                0.0,
+                Some(now - 3_600_000),
+            )
+            .unwrap();
+        mgr.update_position_tpsl_orders(
+            open_pos_id,
+            92.0,
+            Some("hl-sl-oid-1"),
+            112.0,
+            Some("hl-tp-oid-2"),
+        )
+        .unwrap();
+
+        // Working BTC entry ALO order
+        mgr.create_working_order(&WorkingOrderInput {
+            asset_id: btc_id,
+            client_order_id: "dd-test-btc-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 93900.0,
+            requested_quantity: 0.01,
+            reserved_margin_usdc: 939.0,
+            portfolio_weight: 0.50,
+            s1_weight_contrib: 0.50,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 90000.0,
+            exchange_order_id: Some("hl-entry-oid-3".to_string()),
+            reason: "TEST_WORKING".to_string(),
+        })
+        .unwrap();
+
+        // Insert 24h peak snapshot (1000.0) followed by trough snapshot (676.0 -> 32.4% drawdown >= 15.0%)
+        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+            total_equity_usdc: 1000.0,
+            available_cash_usdc: 1000.0,
+            reserved_order_cash_usdc: 0.0,
+            committed_notional_usdc: 0.0,
+            net_notional_usdc: 0.0,
+            gross_leverage_x: 0.0,
+            net_leverage_x: 0.0,
+            market_beta_exposure: 0.0,
+            market_breadth_bull: 0.5,
+            market_regime_label: "NEUTRAL".to_string(),
+            risk_tier: "extreme".to_string(),
+            leverage_multiplier: 1.85,
+            s1_gross_weight: 0.0,
+            s2_gross_weight: 0.0,
+            s3_gross_weight: 0.0,
+            working_order_count: 0,
+            open_long_count: 0,
+            open_short_count: 0,
+            eligible_coin_count: 2,
+        })
+        .unwrap();
+        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+            total_equity_usdc: 676.0,
+            available_cash_usdc: 400.0,
+            reserved_order_cash_usdc: 939.0,
+            committed_notional_usdc: 200.0,
+            net_notional_usdc: 200.0,
+            gross_leverage_x: 0.296,
+            net_leverage_x: 0.296,
+            market_beta_exposure: 0.2,
+            market_breadth_bull: 0.4,
+            market_regime_label: "RISK_OFF".to_string(),
+            risk_tier: "extreme".to_string(),
+            leverage_multiplier: 1.85,
+            s1_gross_weight: 0.296,
+            s2_gross_weight: 0.0,
+            s3_gross_weight: 0.0,
+            working_order_count: 1,
+            open_long_count: 1,
+            open_short_count: 0,
+            eligible_coin_count: 2,
+        })
+        .unwrap();
+
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Drawdown breaker tripped (1000 -> 676 = 32.4% >= 15.0%)
+    let dd = &body["drawdown_breaker"];
+    assert_eq!(dd["tripped"], true);
+    assert!((dd["drawdown_pct"].as_f64().unwrap() - 32.4).abs() < 1e-6);
+    assert!((dd["max_daily_drawdown_pct"].as_f64().unwrap() - 15.0).abs() < 1e-6);
+    assert!((dd["peak_24h_equity_usdc"].as_f64().unwrap() - 1000.0).abs() < 1e-6);
+    assert!((dd["latest_equity_usdc"].as_f64().unwrap() - 676.0).abs() < 1e-6);
+
+    // Attached SL/TP orders + synced HL open orders count
+    assert_eq!(body["attached_tpsl_order_count"], 2);
+    assert_eq!(body["exchange_open_orders_count"], 5);
+
+    // Cap epoch 2 days ago: daily is not clamped, weekly/monthly/ytd are clamped
+    assert_eq!(body["pnl_summary"]["daily"]["is_cap_clamped"], false);
+    assert_eq!(body["pnl_summary"]["weekly"]["is_cap_clamped"], true);
+    assert_eq!(body["pnl_summary"]["monthly"]["is_cap_clamped"], true);
+    assert_eq!(body["pnl_summary"]["ytd"]["is_cap_clamped"], true);
+
+    // When unsynced (live_exchange_equity_synced_at_ms == 0), exchange_open_orders_count falls back to ordered + attached SL/TP
+    let db_unsynced = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_unsynced
+            .set_config_value("live_exchange_equity_synced_at_ms", "0", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_unsynced = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unsynced.status(), StatusCode::OK);
+    let unsynced_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_unsynced.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unsynced_json["attached_tpsl_order_count"], 2);
+    assert_eq!(unsynced_json["exchange_open_orders_count"], 3);
+}
