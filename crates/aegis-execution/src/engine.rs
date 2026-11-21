@@ -1189,7 +1189,7 @@ impl ExecutionEngine {
     }
 
     /// Computes and persists a unified [`PortfolioSnapshot`] reflecting the strict Order-to-Open Capital Lifecycle:
-    /// - In `LIVE`/`TESTNET`, uses `live_exchange_equity_usdc` directly as `total_equity_usdc`.
+    /// - In `LIVE`/`TESTNET`, uses Option B effective equity (`live_exchange_equity_usdc.min(risk_capital_cap_usdc)` when capped).
     /// - In `PAPER`, computes `initial_paper_equity_usdc + closed_realized_pnl + unrealized_pnl`.
     pub fn record_portfolio_snapshot(
         &self,
@@ -1202,24 +1202,28 @@ impl ExecutionEngine {
         let ordered = self.db.get_assets_ordered()?;
         let assets = self.db.list_exchange_assets()?;
 
-        let live_eq_cfg = cfg.get_f64("live_exchange_equity_usdc", 0.0);
         let ledger = if cfg.execution_mode().is_live_or_testnet() {
-            let actual_live_eq = if live_eq_cfg > 0.0 {
-                live_eq_cfg
-            } else if let Some(explicit_eq) = base_equity_override.filter(|&v| v > 0.0) {
-                explicit_eq
-            } else {
-                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
-            };
-            let mut l = risk.evaluate_ledger_from_views(actual_live_eq, &held, &ordered);
-            let tot_eq = round_dp(actual_live_eq.max(1.0), 4);
+            let eff_live_eq =
+                Self::resolve_live_base_equity_usdc(&cfg, self.db.is_ephemeral_test_db())
+                    .or_else(|| base_equity_override.filter(|&v| v > 0.0))
+                    .unwrap_or_else(|| cfg.get_f64("initial_paper_equity_usdc", 10_000.0));
+            let mut l = risk.evaluate_ledger_from_views(eff_live_eq, &held, &ordered);
+            let tot_eq = round_dp(eff_live_eq.max(1.0), 4);
             let eff_lev = cfg.target_leverage_multiplier().clamp(1.0, 20.0);
             let committed_margin_used = l.committed_notional_usdc / eff_lev;
+            let budget_idle =
+                (tot_eq - committed_margin_used - l.reserved_order_cash_usdc).max(0.0);
+            let synced_at = cfg.get_i64("live_exchange_equity_synced_at_ms", 0);
+            let avail_cash = if synced_at > 0 {
+                let withdrawable = cfg
+                    .get_f64("live_exchange_withdrawable_usdc", budget_idle)
+                    .max(0.0);
+                budget_idle.min(withdrawable)
+            } else {
+                budget_idle
+            };
             l.total_equity_usdc = tot_eq;
-            l.available_cash_usdc = round_dp(
-                (tot_eq - committed_margin_used - l.reserved_order_cash_usdc).max(0.0),
-                4,
-            );
+            l.available_cash_usdc = round_dp(avail_cash, 4);
             l.gross_leverage_x = round_dp(l.committed_notional_usdc / tot_eq, 4);
             l.net_leverage_x = round_dp(l.net_notional_usdc / tot_eq, 4);
             l
@@ -1253,28 +1257,31 @@ impl ExecutionEngine {
             ),
             None => {
                 let prev = self.db.get_latest_portfolio_snapshot()?;
-                let s1_sum: f64 = held.iter().map(|h| h.s1_weight_contrib.abs()).sum();
-                let s2_sum: f64 = held.iter().map(|h| h.s2_weight_contrib.abs()).sum();
-                let s3_sum: f64 = held.iter().map(|h| h.s3_weight_contrib.abs()).sum();
+                let has_prev_sleeves =
+                    (prev.s1_gross_weight + prev.s2_gross_weight + prev.s3_gross_weight) > 0.0;
+                let (s1_prev_or_held, s2_prev_or_held, s3_prev_or_held) = if has_prev_sleeves {
+                    (
+                        prev.s1_gross_weight,
+                        prev.s2_gross_weight,
+                        prev.s3_gross_weight,
+                    )
+                } else {
+                    let s1_sum: f64 = held.iter().map(|h| h.s1_weight_contrib.abs()).sum();
+                    let s2_sum: f64 = held.iter().map(|h| h.s2_weight_contrib.abs()).sum();
+                    let s3_sum: f64 = held.iter().map(|h| h.s3_weight_contrib.abs()).sum();
+                    (
+                        round_dp(s1_sum, 4),
+                        round_dp(s2_sum, 4),
+                        round_dp(s3_sum, 4),
+                    )
+                };
                 (
                     prev.market_beta_exposure,
                     prev.market_breadth_bull,
                     prev.market_regime_label,
-                    if s1_sum > 0.0 {
-                        round_dp(s1_sum, 4)
-                    } else {
-                        prev.s1_gross_weight
-                    },
-                    if s2_sum > 0.0 {
-                        round_dp(s2_sum, 4)
-                    } else {
-                        prev.s2_gross_weight
-                    },
-                    if s3_sum > 0.0 {
-                        round_dp(s3_sum, 4)
-                    } else {
-                        prev.s3_gross_weight
-                    },
+                    s1_prev_or_held,
+                    s2_prev_or_held,
+                    s3_prev_or_held,
                 )
             }
         };

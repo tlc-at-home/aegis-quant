@@ -3644,3 +3644,693 @@ fn test_reconcile_vault_info_sync_segregation_throttling_and_429_resilience() {
 
     let _ = stop_tx.send(());
 }
+
+fn configure_testnet_mock_db(db: &DatabaseManager, port: u16) {
+    let base_url = format!("http://127.0.0.1:{port}");
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_testnet_url", &base_url, None)
+        .unwrap();
+    db.set_config_value(
+        "hyperliquid_allowed_hosts",
+        "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+        None,
+    )
+    .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_reconcile_met_partial_close_pro_rata_funding_and_daily_pnl_window() {
+    let now = now_ms();
+    let open_ts = now - 36 * 3_600_000;
+    let pre_24h_fund_ts = now - 30 * 3_600_000;
+    let in_24h_fund_ts = now - 4 * 3_600_000;
+    let partial_close_ts = now - 3_600_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": {
+                            "accountValue": "5000.00",
+                            "totalMarginUsed": "1200.00"
+                        },
+                        "withdrawable": "3800.00",
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "MET",
+                                "szi": "9634.0",
+                                "entryPx": "1.00",
+                                "positionValue": "9634.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "-665.57" }
+                            }
+                        }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "MET",
+                            "side": "B",
+                            "px": "1.00",
+                            "sz": "9654.0",
+                            "fee": "0.0",
+                            "closedPnl": "0.0",
+                            "dir": "Open Long",
+                            "time": open_ts,
+                            "oid": 9001u64,
+                            "tid": 1u64,
+                            "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "MET",
+                            "side": "A",
+                            "px": "0.9575",
+                            "sz": "20.0",
+                            "fee": "0.02",
+                            "closedPnl": "-0.85",
+                            "dir": "Close Long",
+                            "time": partial_close_ts,
+                            "oid": 9002u64,
+                            "tid": 2u64,
+                            "startPosition": "9654.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => (
+                    200,
+                    json!([
+                        {
+                            "time": pre_24h_fund_ts,
+                            "hash": "0x0000",
+                            "delta": {
+                                "type": "funding",
+                                "coin": "MET",
+                                "usdc": "500.00",
+                                "szi": "9654.0",
+                                "fundingRate": "0.0005"
+                            }
+                        },
+                        {
+                            "time": in_24h_fund_ts,
+                            "hash": "0x0000",
+                            "delta": {
+                                "type": "funding",
+                                "coin": "MET",
+                                "usdc": "165.57",
+                                "szi": "9654.0",
+                                "fundingRate": "0.00017"
+                            }
+                        }
+                    ]),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    let met_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "MET".to_string(),
+            asset_index: 50,
+            sz_decimals: 0,
+            tick_size: 0.0001,
+            lot_step_size: 1.0,
+            max_leverage: 10.0,
+            mark_price: 1.0,
+            mid_price: 1.0,
+            oracle_price: 1.0,
+            funding_rate_hourly: 0.0001,
+            day_volume_usdc: 10_000_000.0,
+            open_interest_usdc: 5_000_000.0,
+            prev_day_price: 1.0,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: false,
+        })
+        .unwrap();
+    configure_testnet_mock_db(&db, port);
+
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    let met_open = &held[0];
+    assert_eq!(met_open.symbol, "MET-USDC");
+    assert_eq!(met_open.opened_at_ms, Some(open_ts));
+    assert!((met_open.funding_accrued_usdc - 664.19).abs() < 1e-2);
+
+    let closed = db.list_closed_positions(10).unwrap();
+    let met_closed = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-met-9002")
+        .expect("MET partial close trade");
+    assert!((met_closed.funding_accrued_usdc - 1.38).abs() < 1e-2);
+    assert!(
+        ((met_closed.funding_accrued_usdc + met_open.funding_accrued_usdc) - 665.57).abs() < 1e-2
+    );
+
+    let evs = db.list_funding_events_for_asset(met_id).unwrap();
+    assert_eq!(evs.len(), 2);
+    let rem_sum: f64 = evs.iter().map(|e| e.remaining_usdc).sum();
+    assert!((rem_sum - met_open.funding_accrued_usdc).abs() < 1e-2);
+
+    // Daily (24H) reflects ONLY the in-window open funding (165.57 * 9634/9654 ≈ 165.23) + closed (1.38 - 0.02) ≈ 166.59,
+    // NEVER leaking the pre-24h 500.00 tick and NEVER double-counting closed 1.38.
+    let pnl = db.compute_pnl_summary(0.0, 0.0, 5000.0).unwrap();
+    let expected_daily_open_rem = 165.57 * (9634.0 / 9654.0);
+    let expected_daily_fees_funding =
+        expected_daily_open_rem + met_closed.funding_accrued_usdc - 0.02;
+    assert!(
+        (pnl.daily.fees_funding_usdc - expected_daily_fees_funding).abs() < 0.05,
+        "daily.fees_funding_usdc={} expected={}",
+        pnl.daily.fees_funding_usdc,
+        expected_daily_fees_funding
+    );
+    assert!((pnl.weekly.fees_funding_usdc - 665.55).abs() < 0.05);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_reconcile_multi_partial_close_funding_conservation() {
+    let now = now_ms();
+    let t_open = now - 10_000_000;
+    let t_f1 = now - 8_000_000;
+    let t_c1 = now - 6_000_000;
+    let t_f2 = now - 4_000_000;
+    let t_c2 = now - 2_000_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "2000.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ETH",
+                                "szi": "50.0",
+                                "entryPx": "100.0",
+                                "positionValue": "5000.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "-140.0" }
+                            }
+                        }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH", "side": "B", "px": "100.0", "sz": "100.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Open Long",
+                            "time": t_open, "oid": 100u64, "tid": 1u64, "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "ETH", "side": "A", "px": "100.0", "sz": "20.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Close Long",
+                            "time": t_c1, "oid": 101u64, "tid": 2u64, "startPosition": "100.0"
+                        },
+                        {
+                            "coin": "ETH", "side": "A", "px": "100.0", "sz": "30.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Close Long",
+                            "time": t_c2, "oid": 102u64, "tid": 3u64, "startPosition": "80.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => (
+                    200,
+                    json!([
+                        {
+                            "time": t_f1, "hash": "0xf1",
+                            "delta": { "type": "funding", "coin": "ETH", "usdc": "100.0", "szi": "100.0", "fundingRate": "0.01" }
+                        },
+                        {
+                            "time": t_f2, "hash": "0xf2",
+                            "delta": { "type": "funding", "coin": "ETH", "usdc": "40.0", "szi": "80.0", "fundingRate": "0.005" }
+                        }
+                    ]),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+
+    let closed = db.list_closed_positions(10).unwrap();
+    let c1 = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-eth-101")
+        .unwrap();
+    let c2 = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-eth-102")
+        .unwrap();
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    let open = &held[0];
+
+    assert!((c1.funding_accrued_usdc - 20.0).abs() < 1e-4);
+    assert!((c2.funding_accrued_usdc - 45.0).abs() < 1e-4);
+    assert!((open.funding_accrued_usdc - 75.0).abs() < 1e-4);
+    assert!(
+        ((c1.funding_accrued_usdc + c2.funding_accrued_usdc + open.funding_accrued_usdc) - 140.0)
+            .abs()
+            < 1e-4
+    );
+
+    let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
+    let evs = db.list_funding_events_for_asset(eth_id).unwrap();
+    assert_eq!(evs.len(), 2);
+    assert!((evs[0].remaining_usdc - 50.0).abs() < 1e-6);
+    assert!((evs[1].remaining_usdc - 25.0).abs() < 1e-6);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_reconcile_prehistory_start_position_partial_close() {
+    let now = now_ms();
+    let fund_ts = now - 7_200_000;
+    let close_ts = now - 1_800_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "2000.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "SOL",
+                                "szi": "9634.0",
+                                "entryPx": "1.0",
+                                "positionValue": "9634.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "-96.54" }
+                            }
+                        }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "SOL",
+                            "side": "A",
+                            "px": "1.0",
+                            "sz": "20.0",
+                            "fee": "0.02",
+                            "closedPnl": "0.0",
+                            "dir": "Close Long",
+                            "time": close_ts,
+                            "oid": 3001u64,
+                            "tid": 1u64,
+                            "startPosition": "9654.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => {
+                    let start_time = body.get("startTime").and_then(Value::as_i64).unwrap_or(0);
+                    let list = if fund_ts >= start_time {
+                        json!([{
+                            "time": fund_ts,
+                            "hash": "0xpre1",
+                            "delta": {
+                                "type": "funding",
+                                "coin": "SOL",
+                                "usdc": "96.54",
+                                "szi": "9654.0",
+                                "fundingRate": "0.01"
+                            }
+                        }])
+                    } else {
+                        json!([])
+                    };
+                    (200, list)
+                }
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+
+    let closed = db.list_closed_positions(10).unwrap();
+    let sol_closed = closed
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-sol-3001")
+        .expect("SOL pre-history partial close");
+    assert!((sol_closed.funding_accrued_usdc - 0.20).abs() < 1e-4);
+
+    let held = db.get_assets_held().unwrap();
+    assert_eq!(held.len(), 1);
+    assert!((held[0].funding_accrued_usdc - 96.34).abs() < 1e-4);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_reconcile_user_funding_429_does_not_clobber_reconciled_funding() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fail_funding = Arc::new(AtomicBool::new(false));
+    let fail_srv = fail_funding.clone();
+    let now = now_ms();
+    let open_ts = now - 7_200_000;
+    let fund_ts = now - 3_600_000;
+    let close_ts = now - 1_800_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "2000.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ETH",
+                                "szi": "80.0",
+                                "entryPx": "100.0",
+                                "positionValue": "8000.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "-100.0" }
+                            }
+                        }]
+                    }),
+                ),
+                "userFills" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH", "side": "B", "px": "100.0", "sz": "100.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Open Long",
+                            "time": open_ts, "oid": 5001u64, "tid": 1u64, "startPosition": "0.0"
+                        },
+                        {
+                            "coin": "ETH", "side": "A", "px": "100.0", "sz": "20.0",
+                            "fee": "0.0", "closedPnl": "0.0", "dir": "Close Long",
+                            "time": close_ts, "oid": 5002u64, "tid": 2u64, "startPosition": "100.0"
+                        }
+                    ]),
+                ),
+                "userFunding" => {
+                    if fail_srv.load(Ordering::SeqCst) {
+                        return (429, json!({ "error": "rate_limited" }));
+                    }
+                    (
+                        200,
+                        json!([{
+                            "time": fund_ts, "hash": "0x429ok",
+                            "delta": { "type": "funding", "coin": "ETH", "usdc": "100.0", "szi": "100.0", "fundingRate": "0.01" }
+                        }]),
+                    )
+                }
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+
+    // 1. Initial reconcile succeeds and books +20.0 closed + +80.0 open
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    let closed1 = db.list_closed_positions(10).unwrap();
+    let eth_c1 = closed1
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-eth-5002")
+        .unwrap();
+    assert!((eth_c1.funding_accrued_usdc - 20.0).abs() < 1e-4);
+    assert!((db.get_assets_held().unwrap()[0].funding_accrued_usdc - 80.0).abs() < 1e-4);
+    let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
+    assert_eq!(db.list_funding_events_for_asset(eth_id).unwrap().len(), 1);
+
+    // 2. Subsequent reconcile hits HTTP 429 on userFunding -> must NOT zero closed trade or double-count open position
+    fail_funding.store(true, Ordering::SeqCst);
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+
+    let closed2 = db.list_closed_positions(10).unwrap();
+    let eth_c2 = closed2
+        .iter()
+        .find(|p| p.client_order_id == "hl-closed-eth-5002")
+        .unwrap();
+    assert!(
+        (eth_c2.funding_accrued_usdc - 20.0).abs() < 1e-4,
+        "429 must not clobber closed trade funding to 0.0"
+    );
+    assert!(
+        (db.get_assets_held().unwrap()[0].funding_accrued_usdc - 80.0).abs() < 1e-4,
+        "429 must not overwrite open position funding to 100.0"
+    );
+    let evs_after = db.list_funding_events_for_asset(eth_id).unwrap();
+    assert_eq!(evs_after.len(), 1);
+    assert!((evs_after[0].remaining_usdc - 80.0).abs() < 1e-6);
+
+    let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_option_b_snapshot_capping_spot_60s_sync_and_15s_sleeve_preservation() {
+    use aegis_core::VaultInfoPayload;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let spot_calls = Arc::new(AtomicUsize::new(0));
+    let fail_spot = Arc::new(AtomicBool::new(false));
+    let spot_srv = spot_calls.clone();
+    let fail_spot_srv = fail_spot.clone();
+    let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": {
+                            "accountValue": "10944.72",
+                            "totalMarginUsed": "1250.50"
+                        },
+                        "withdrawable": "8200.0",
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "ETH",
+                                "szi": "0.1",
+                                "entryPx": "3400.0",
+                                "positionValue": "340.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "0.0" }
+                            }
+                        }]
+                    }),
+                ),
+                "frontendOpenOrders" => (
+                    200,
+                    json!([
+                        {
+                            "coin": "ETH",
+                            "oid": 70001u64,
+                            "isTrigger": true,
+                            "orderType": "Stop Market",
+                            "reduceOnly": true,
+                            "triggerPx": "3200.0",
+                            "timestamp": 1_795_000_000_000u64
+                        }
+                    ]),
+                ),
+                "spotClearinghouseState" => {
+                    spot_srv.fetch_add(1, Ordering::SeqCst);
+                    if fail_spot_srv.load(Ordering::SeqCst) {
+                        return (429, json!({ "error": "rate_limited" }));
+                    }
+                    (
+                        200,
+                        json!({
+                            "balances": [
+                                { "coin": "USDC", "total": "5000.0", "hold": "0.0" }
+                            ]
+                        }),
+                    )
+                }
+                "userVaultEquities" => (
+                    200,
+                    json!([{
+                        "vaultAddress": hlp_addr,
+                        "equity": "202.40",
+                        "lockedUntilTimestamp": 0
+                    }]),
+                ),
+                "vaultDetails" => (
+                    200,
+                    json!({
+                        "name": "HLP",
+                        "vaultAddress": hlp_addr,
+                        "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                        "isClosed": false,
+                        "apr": 0.08,
+                        "followerState": {
+                            "vaultEquity": "202.40",
+                            "pnl": "1.0",
+                            "allTimePnl": "2.0",
+                            "daysFollowing": 10,
+                            "lockupUntil": 0
+                        }
+                    }),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+    db.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+        .unwrap();
+
+    // Seed ETH SL OID and sleeve weights so reconcile protects resting trigger order and counts it in live_exchange_open_orders_count
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let eth_pid = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: eth.id,
+            client_order_id: "test-eth-optb-open".to_string(),
+            side: OrderSide::Long,
+            limit_price: 3400.0,
+            requested_quantity: 0.1,
+            reserved_margin_usdc: 170.0,
+            portfolio_weight: 0.34,
+            s1_weight_contrib: 0.34,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 3200.0,
+            exchange_order_id: Some("70000".to_string()),
+            reason: "OPTION_B_SEED".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        eth_pid,
+        3400.0,
+        0.1,
+        0.0,
+        3200.0,
+        Some("70000"),
+        "TEST_OPEN",
+    )
+    .unwrap();
+    db.update_position_tpsl_orders(eth_pid, 3200.0, Some("70001"), 3800.0, None)
+        .unwrap();
+
+    let rep = engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert!((rep.exchange_equity_usdc - 10944.72).abs() < 1e-6);
+
+    let cfg = db.load_config_or_default();
+    assert!((cfg.get_f64("live_exchange_equity_usdc", 0.0) - 10944.72).abs() < 1e-6);
+    assert!((cfg.get_f64("live_exchange_spot_usdc", 0.0) - 5000.0).abs() < 1e-6);
+    assert!((cfg.get_f64("live_exchange_margin_used_usdc", 0.0) - 1250.50).abs() < 1e-6);
+    assert!((cfg.get_f64("live_exchange_withdrawable_usdc", 0.0) - 8200.0).abs() < 1e-6);
+    assert!(cfg.get_i64("live_exchange_equity_synced_at_ms", 0) > 0);
+    let spot_sync_ts = cfg.get_i64("live_exchange_spot_synced_at_ms", 0);
+    assert!(spot_sync_ts > 0);
+    assert_eq!(cfg.get_i64("live_exchange_open_orders_count", 0), 1);
+
+    // Reconcile weight used Option B cap ($1000 -> 340/1000 = 0.34)
+    let held_after = db.get_assets_held().unwrap();
+    assert!((held_after[0].portfolio_weight - 0.34).abs() < 1e-4);
+
+    // Combined portfolio equity = perp (10944.72) + spot (5000.0) + vault (202.40) == 16147.12
+    let vault_info: VaultInfoPayload =
+        serde_json::from_str(&cfg.get_str("live_vault_info_json", "")).unwrap();
+    assert!((vault_info.combined_portfolio_equity_usdc - 16147.12).abs() < 1e-6);
+
+    // Immediate second reconcile is throttled on spot (still 1 HTTP call)
+    assert_eq!(spot_calls.load(Ordering::SeqCst), 1);
+    engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert_eq!(spot_calls.load(Ordering::SeqCst), 1);
+
+    // After >= 60s, a 429 on spotClearinghouseState preserves cached 5000.0
+    fail_spot.store(true, Ordering::SeqCst);
+    let future_ts = spot_sync_ts + aegis_execution::VAULT_SYNC_MIN_INTERVAL_MS + 1_000;
+    assert!(engine
+        .reconciler
+        .sync_spot_usdc_if_due(&cfg, future_ts)
+        .is_none());
+    assert!(spot_calls.load(Ordering::SeqCst) >= 2);
+    let cfg_after_spot_429 = db.load_config_or_default();
+    assert!((cfg_after_spot_429.get_f64("live_exchange_spot_usdc", 0.0) - 5000.0).abs() < 1e-6);
+
+    // When previous snapshot has all-zero sleeve weights, signal_out == None falls back to held sleeve sums
+    let snap_zero_prev = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!((snap_zero_prev.s1_gross_weight - 0.34).abs() < 1e-6);
+    assert!((snap_zero_prev.s2_gross_weight - 0.0).abs() < 1e-6);
+    assert!((snap_zero_prev.s3_gross_weight - 0.0).abs() < 1e-6);
+
+    // Option B snapshot capping: snapshot.total_equity_usdc == 1000.0 (cap), NOT 10944.72
+    let mut sig_out = make_signal_output(vec![]);
+    sig_out.s1_gross_weight = 0.50;
+    sig_out.s2_gross_weight = 0.30;
+    sig_out.s3_gross_weight = 0.20;
+    let snap1 = engine
+        .record_portfolio_snapshot(None, Some(&sig_out))
+        .unwrap();
+    assert!((snap1.total_equity_usdc - 1000.0).abs() < 1e-6);
+    assert!((snap1.s1_gross_weight - 0.50).abs() < 1e-6);
+    assert!((snap1.s2_gross_weight - 0.30).abs() < 1e-6);
+    assert!((snap1.s3_gross_weight - 0.20).abs() < 1e-6);
+
+    // 15s snapshot with signal_out == None preserves ALL 3 previous signal sleeve weights
+    // instead of mixing held S1 (0.34) with target S2 (0.30) and S3 (0.20)
+    let snap_15s = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!((snap_15s.total_equity_usdc - 1000.0).abs() < 1e-6);
+    assert!((snap_15s.s1_gross_weight - 0.50).abs() < 1e-6);
+    assert!((snap_15s.s2_gross_weight - 0.30).abs() < 1e-6);
+    assert!((snap_15s.s3_gross_weight - 0.20).abs() < 1e-6);
+
+    // Also verify withdrawable constraint caps available_cash_usdc when exchange withdrawable < budget_idle
+    db.set_config_value("live_exchange_withdrawable_usdc", "150.0", None)
+        .unwrap();
+    let snap_capped_cash = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!((snap_capped_cash.available_cash_usdc - 150.0).abs() < 1e-6);
+
+    let _ = stop_tx.send(());
+}

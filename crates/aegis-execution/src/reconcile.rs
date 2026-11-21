@@ -15,10 +15,12 @@ use crate::signing::{
 use aegis_alerts::AlertEngine;
 use aegis_core::{
     compute_vault_pnl_pct, mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp,
-    ConfigMap, ExchangeAsset, ExecutionMode, OrderSide, OrderedAssetView, Result, VaultInfoPayload,
-    VaultPositionInfo,
+    ConfigMap, ExchangeAsset, ExecutionMode, HeldAssetView, OrderSide, OrderedAssetView, Result,
+    VaultInfoPayload, VaultPositionInfo,
 };
-use aegis_db::{AssetUpsertInput, DatabaseManager, ReconciledClosedTradeInput};
+use aegis_db::{
+    AssetUpsertInput, DatabaseManager, FundingEventUpsertInput, ReconciledClosedTradeInput,
+};
 use aegis_risk::{
     compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
     RiskLimitsConfig,
@@ -27,7 +29,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 const WORKING_ENTRY_GRACE_MS: i64 = 45_000;
@@ -38,6 +40,9 @@ const MAX_VAULTS_TO_FETCH: usize = 20;
 
 type VaultSyncThrottleKey = (String, String, String);
 static LAST_VAULT_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<VaultSyncThrottleKey, i64>>> =
+    OnceLock::new();
+type SpotSyncThrottleKey = (String, String);
+static LAST_SPOT_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<SpotSyncThrottleKey, i64>>> =
     OnceLock::new();
 
 fn parse_hl_f64_opt(val: Option<&Value>) -> Option<f64> {
@@ -176,6 +181,29 @@ pub fn parse_vault_position_info(
     now_ms_val: i64,
 ) -> VaultPositionInfo {
     parse_vault_position_info_with_raw_equity(vault_address, details, equity_fallback, now_ms_val).0
+}
+
+/// Parses a Hyperliquid `spotClearinghouseState` JSON payload and sums `"USDC"` `total` balances.
+/// Returns `None` if `"balances"` is missing or not a JSON array (so mock `[]` responses never
+/// clobber cached spot USDC).
+pub fn parse_spot_usdc_balance(spot_state: &Value) -> Option<f64> {
+    let balances = spot_state.get("balances")?.as_array()?;
+    let mut total_usdc = 0.0_f64;
+    for entry in balances {
+        let coin = entry
+            .get("coin")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if coin.eq_ignore_ascii_case("USDC") {
+            if let Some(amt) = parse_hl_f64_opt(entry.get("total")) {
+                if amt >= 0.0 {
+                    total_usdc += amt;
+                }
+            }
+        }
+    }
+    Some(total_usdc.max(0.0))
 }
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
@@ -661,150 +689,332 @@ struct AggClosingOrder {
     funding_accrued_usdc: f64,
 }
 
-fn compute_fifo_closed_orders(
-    parsed_fills_by_coin: &BTreeMap<String, Vec<ParsedHlFill>>,
-) -> Vec<(u64, AggClosingOrder)> {
-    struct OpenLot {
-        rem_sz: f64,
-        orig_sz: f64,
-        fee: f64,
-        time_ms: i64,
-    }
+#[derive(Clone, Debug)]
+struct ParsedHlFunding {
+    coin: String,
+    time_ms: i64,
+    usdc: f64,
+    szi: f64,
+    funding_rate: f64,
+    dedup_key: String,
+}
 
-    let mut agg_by_key: BTreeMap<(String, u64), AggClosingOrder> = BTreeMap::new();
+#[derive(Default)]
+struct FifoFundingReplayOutput {
+    closed_orders: Vec<(u64, AggClosingOrder)>,
+    open_epoch_booked_funding_by_coin: HashMap<String, f64>,
+    funding_events_with_remaining: Vec<(ParsedHlFunding, f64)>,
+}
 
-    for fills in parsed_fills_by_coin.values() {
-        let mut open_lots: VecDeque<OpenLot> = VecDeque::new();
-        let mut prev_szi = 0.0_f64;
-        let mut initialized_start_pos = false;
+struct OpenLot {
+    rem_sz: f64,
+    orig_sz: f64,
+    fee: f64,
+    funding_accrued: f64,
+    time_ms: i64,
+}
 
-        for fill in fills {
-            if !initialized_start_pos {
-                if let Some(sp) = fill.start_position {
-                    prev_szi = sp;
-                }
-                initialized_start_pos = true;
-            }
-            let fill_signed_sz = fill_signed_sz(fill);
-            let is_closing_dir = fill_is_closing_dir(fill);
+fn is_open_or_add_fill(fill: &ParsedHlFill, prev_szi: f64) -> bool {
+    let eff_prev = if prev_szi.abs() <= 1e-9 {
+        0.0
+    } else {
+        prev_szi
+    };
+    (eff_prev == 0.0 && !fill_is_closing_dir(fill))
+        || (eff_prev != 0.0 && eff_prev.signum() == fill_signed_sz(fill).signum())
+}
 
-            if prev_szi.abs() <= 1e-9 {
-                prev_szi = 0.0;
-            }
-            if (prev_szi == 0.0 && !is_closing_dir)
-                || (prev_szi != 0.0 && prev_szi.signum() == fill_signed_sz.signum())
-            {
-                open_lots.push_back(OpenLot {
-                    rem_sz: fill.sz,
-                    orig_sz: fill.sz,
-                    fee: fill.fee,
-                    time_ms: fill.time_ms,
-                });
-                prev_szi += fill_signed_sz;
-                continue;
-            }
+struct CoinReplayState {
+    open_lots: VecDeque<OpenLot>,
+    prev_szi: f64,
+    rem_usdc: Vec<f64>,
+    active_epoch_ev_indices: Vec<usize>,
+    open_epoch_booked_funding: f64,
+}
 
-            // Closing or flip fill (`dir.contains('>')`): attribute only closed_sz to the closed side
-            let (closed_sz, closed_pos_side) = if prev_szi.abs() > 1e-9 {
-                (
-                    prev_szi.abs().min(fill.sz),
-                    if prev_szi > 0.0 {
-                        OrderSide::Long
-                    } else {
-                        OrderSide::Short
-                    },
-                )
-            } else {
-                let fallback_side = if fill.dir.starts_with("Close Long")
-                    || fill.dir.starts_with("Long >")
-                    || (!fill.dir.contains("Short") && fill.side_str == "A")
-                {
-                    OrderSide::Long
-                } else {
-                    OrderSide::Short
-                };
-                (fill.sz, fallback_side)
-            };
-            let flipped_open_sz = (fill.sz - closed_sz).max(0.0);
-            let close_fee = if fill.sz > 0.0 {
-                fill.fee * (closed_sz / fill.sz)
-            } else {
-                0.0
-            };
-            let open_fee = (fill.fee - close_fee).max(0.0);
-
-            let mut matched_open_fee = 0.0_f64;
-            let mut earliest_open_time_ms: Option<i64> = None;
-            let mut rem_to_close = closed_sz;
-            while rem_to_close > 1e-9 {
-                let Some(front) = open_lots.front_mut() else {
-                    break;
-                };
-                let take = rem_to_close.min(front.rem_sz);
-                if front.orig_sz > 0.0 {
-                    matched_open_fee += front.fee * (take / front.orig_sz);
-                }
-                earliest_open_time_ms =
-                    Some(earliest_open_time_ms.map_or(front.time_ms, |t| t.min(front.time_ms)));
-                front.rem_sz -= take;
-                rem_to_close -= take;
-                if front.rem_sz <= 1e-9 {
-                    open_lots.pop_front();
-                }
-            }
-
-            if closed_sz > 1e-9 && is_closing_dir {
-                let entry = agg_by_key
-                    .entry((fill.coin.clone(), fill.oid))
-                    .or_insert_with(|| AggClosingOrder {
-                        coin: fill.coin.clone(),
-                        side: Some(closed_pos_side),
-                        min_time_ms: fill.time_ms,
-                        max_time_ms: fill.time_ms,
-                        ..Default::default()
-                    });
-                entry.total_sz += closed_sz;
-                entry.notional_sum += fill.px * closed_sz;
-                entry.gross_closed_pnl += fill.closed_pnl;
-                entry.close_fees_usdc += close_fee;
-                entry.open_fees_usdc += matched_open_fee;
-                if let Some(ot) = earliest_open_time_ms {
-                    entry.open_time_ms = Some(entry.open_time_ms.map_or(ot, |cur| cur.min(ot)));
-                }
-                entry.min_time_ms = entry.min_time_ms.min(fill.time_ms);
-                entry.max_time_ms = entry.max_time_ms.max(fill.time_ms);
-            }
-
-            if flipped_open_sz > 1e-9 {
-                open_lots.push_back(OpenLot {
-                    rem_sz: flipped_open_sz,
-                    orig_sz: flipped_open_sz,
-                    fee: open_fee,
-                    time_ms: fill.time_ms,
-                });
-            }
-
-            if prev_szi.abs() > 1e-9 || fill.start_position.is_some() {
-                prev_szi += fill_signed_sz;
-            } else if flipped_open_sz > 1e-9 {
-                prev_szi = if fill_signed_sz > 0.0 {
-                    flipped_open_sz
-                } else {
-                    -flipped_open_sz
-                };
-            } else {
-                prev_szi = 0.0;
-            }
+impl CoinReplayState {
+    fn new(funding_len: usize) -> Self {
+        Self {
+            open_lots: VecDeque::new(),
+            prev_szi: 0.0,
+            rem_usdc: vec![0.0; funding_len],
+            active_epoch_ev_indices: Vec::new(),
+            open_epoch_booked_funding: 0.0,
         }
     }
 
-    // Order closed trades chronologically so funding events match cleanly once per trade window
-    let mut closed_list: Vec<(u64, AggClosingOrder)> = agg_by_key
+    fn apply_funding(&mut self, ev_idx: usize, ev: &ParsedHlFunding) {
+        let total_open: f64 = self.open_lots.iter().map(|l| l.rem_sz).sum();
+        if total_open > 1e-9 {
+            for lot in self.open_lots.iter_mut() {
+                lot.funding_accrued += ev.usdc * (lot.rem_sz / total_open);
+            }
+            self.rem_usdc[ev_idx] = ev.usdc;
+            self.active_epoch_ev_indices.push(ev_idx);
+        } else {
+            self.rem_usdc[ev_idx] = 0.0;
+        }
+    }
+
+    fn apply_fill(
+        &mut self,
+        fill: &ParsedHlFill,
+        agg_by_key: &mut BTreeMap<(String, u64), AggClosingOrder>,
+    ) {
+        if self.prev_szi.abs() <= 1e-9 {
+            self.prev_szi = 0.0;
+        }
+        let signed_sz = fill_signed_sz(fill);
+        let is_closing_dir = fill_is_closing_dir(fill);
+
+        if is_open_or_add_fill(fill, self.prev_szi) {
+            self.open_lots.push_back(OpenLot {
+                rem_sz: fill.sz,
+                orig_sz: fill.sz,
+                fee: fill.fee,
+                funding_accrued: 0.0,
+                time_ms: fill.time_ms,
+            });
+            self.prev_szi += signed_sz;
+            return;
+        }
+
+        // Closing or flip fill (`dir.contains('>')`): attribute only closed_sz to the closed side
+        let had_open_pos = self.prev_szi.abs() > 1e-9;
+        let (closed_sz, closed_pos_side) = if had_open_pos {
+            (
+                self.prev_szi.abs().min(fill.sz),
+                if self.prev_szi > 0.0 {
+                    OrderSide::Long
+                } else {
+                    OrderSide::Short
+                },
+            )
+        } else {
+            let fallback_side = if fill.dir.starts_with("Close Long")
+                || fill.dir.starts_with("Long >")
+                || (!fill.dir.contains("Short") && fill.side_str == "A")
+            {
+                OrderSide::Long
+            } else {
+                OrderSide::Short
+            };
+            (fill.sz, fallback_side)
+        };
+        let flipped_open_sz = (fill.sz - closed_sz).max(0.0);
+        let close_fee = if fill.sz > 0.0 {
+            fill.fee * (closed_sz / fill.sz)
+        } else {
+            0.0
+        };
+        let open_fee = (fill.fee - close_fee).max(0.0);
+
+        let open_sz_before: f64 = self.open_lots.iter().map(|l| l.rem_sz).sum();
+        let mut matched_open_fee = 0.0_f64;
+        let mut matched_funding = 0.0_f64;
+        let mut earliest_open_time_ms: Option<i64> = None;
+        let mut rem_to_close = closed_sz;
+        while rem_to_close > 1e-9 {
+            let Some(front) = self.open_lots.front_mut() else {
+                break;
+            };
+            let take = rem_to_close.min(front.rem_sz);
+            let frac = if front.rem_sz > 0.0 {
+                (take / front.rem_sz).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let matched_funding_part = front.funding_accrued * frac;
+            front.funding_accrued -= matched_funding_part;
+            matched_funding += matched_funding_part;
+            if front.orig_sz > 0.0 {
+                matched_open_fee += front.fee * (take / front.orig_sz);
+            }
+            earliest_open_time_ms =
+                Some(earliest_open_time_ms.map_or(front.time_ms, |t| t.min(front.time_ms)));
+            front.rem_sz -= take;
+            rem_to_close -= take;
+            if front.rem_sz <= 1e-9 {
+                self.open_lots.pop_front();
+            }
+        }
+
+        if closed_sz > 1e-9 && (is_closing_dir || had_open_pos) {
+            let entry = agg_by_key
+                .entry((fill.coin.clone(), fill.oid))
+                .or_insert_with(|| AggClosingOrder {
+                    coin: fill.coin.clone(),
+                    side: Some(closed_pos_side),
+                    min_time_ms: fill.time_ms,
+                    max_time_ms: fill.time_ms,
+                    ..Default::default()
+                });
+            entry.total_sz += closed_sz;
+            entry.notional_sum += fill.px * closed_sz;
+            entry.gross_closed_pnl += fill.closed_pnl;
+            entry.close_fees_usdc += close_fee;
+            entry.open_fees_usdc += matched_open_fee;
+            entry.funding_accrued_usdc += matched_funding;
+            if let Some(ot) = earliest_open_time_ms {
+                entry.open_time_ms = Some(entry.open_time_ms.map_or(ot, |cur| cur.min(ot)));
+            }
+            entry.min_time_ms = entry.min_time_ms.min(fill.time_ms);
+            entry.max_time_ms = entry.max_time_ms.max(fill.time_ms);
+        }
+
+        let open_sz_after: f64 = self.open_lots.iter().map(|l| l.rem_sz).sum();
+        if open_sz_after <= 1e-9 || flipped_open_sz > 1e-9 {
+            for &ev_i in &self.active_epoch_ev_indices {
+                self.rem_usdc[ev_i] = 0.0;
+            }
+            self.active_epoch_ev_indices.clear();
+            self.open_epoch_booked_funding = 0.0;
+        } else {
+            self.open_epoch_booked_funding += matched_funding;
+            let keep_ratio = if open_sz_before > 1e-9 {
+                (open_sz_after / open_sz_before).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            for &ev_i in &self.active_epoch_ev_indices {
+                self.rem_usdc[ev_i] *= keep_ratio;
+            }
+        }
+
+        if flipped_open_sz > 1e-9 {
+            self.open_lots.push_back(OpenLot {
+                rem_sz: flipped_open_sz,
+                orig_sz: flipped_open_sz,
+                fee: open_fee,
+                funding_accrued: 0.0,
+                time_ms: fill.time_ms,
+            });
+        }
+
+        if had_open_pos || fill.start_position.is_some() {
+            self.prev_szi += signed_sz;
+            if self.prev_szi.abs() <= 1e-9 {
+                self.prev_szi = 0.0;
+            }
+        } else if flipped_open_sz > 1e-9 {
+            self.prev_szi = if signed_sz > 0.0 {
+                flipped_open_sz
+            } else {
+                -flipped_open_sz
+            };
+        } else {
+            self.prev_szi = 0.0;
+        }
+    }
+}
+
+fn compute_fifo_closed_orders_and_funding(
+    parsed_fills_by_coin: &BTreeMap<String, Vec<ParsedHlFill>>,
+    funding_by_coin: &HashMap<String, Vec<ParsedHlFunding>>,
+    open_szi_by_coin: &HashMap<String, f64>,
+) -> FifoFundingReplayOutput {
+    let mut all_coins: BTreeSet<String> = parsed_fills_by_coin.keys().cloned().collect();
+    all_coins.extend(funding_by_coin.keys().cloned());
+
+    let mut agg_by_key: BTreeMap<(String, u64), AggClosingOrder> = BTreeMap::new();
+    let mut open_epoch_booked_funding_by_coin: HashMap<String, f64> = HashMap::new();
+    let mut funding_events_with_remaining: Vec<(ParsedHlFunding, f64)> = Vec::new();
+
+    for coin_upper in all_coins {
+        let fills: &[ParsedHlFill] = parsed_fills_by_coin
+            .get(&coin_upper)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let funding_raw: &[ParsedHlFunding] = funding_by_coin
+            .get(&coin_upper)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let mut fund_indices: Vec<usize> = (0..funding_raw.len()).collect();
+        fund_indices.sort_by_key(|&idx| (funding_raw[idx].time_ms, idx));
+
+        let mut state = CoinReplayState::new(funding_raw.len());
+        let earliest_funding_ts = fund_indices.first().map(|&idx| funding_raw[idx].time_ms);
+
+        if let Some(first_fill) = fills.first() {
+            if let Some(sp) = first_fill.start_position {
+                if sp.abs() > 1e-9 {
+                    let earliest_ts = earliest_funding_ts
+                        .map_or(first_fill.time_ms, |ft| first_fill.time_ms.min(ft));
+                    state.open_lots.push_back(OpenLot {
+                        rem_sz: sp.abs(),
+                        orig_sz: sp.abs(),
+                        fee: 0.0,
+                        funding_accrued: 0.0,
+                        time_ms: earliest_ts.saturating_sub(1),
+                    });
+                    state.prev_szi = sp;
+                }
+            }
+        } else if !fund_indices.is_empty() {
+            if let Some(&szi) = open_szi_by_coin.get(&coin_upper) {
+                if szi.abs() > 1e-9 {
+                    let earliest_ts = earliest_funding_ts.unwrap_or(0);
+                    state.open_lots.push_back(OpenLot {
+                        rem_sz: szi.abs(),
+                        orig_sz: szi.abs(),
+                        fee: 0.0,
+                        funding_accrued: 0.0,
+                        time_ms: earliest_ts.saturating_sub(1),
+                    });
+                    state.prev_szi = szi;
+                }
+            }
+        }
+
+        let mut f_idx = 0usize;
+        let mut e_idx = 0usize;
+        while f_idx < fills.len() || e_idx < fund_indices.len() {
+            let cur_ms = match (fills.get(f_idx), fund_indices.get(e_idx)) {
+                (Some(f), Some(&ev_i)) => f.time_ms.min(funding_raw[ev_i].time_ms),
+                (Some(f), None) => f.time_ms,
+                (None, Some(&ev_i)) => funding_raw[ev_i].time_ms,
+                (None, None) => break,
+            };
+            while f_idx < fills.len()
+                && fills[f_idx].time_ms == cur_ms
+                && is_open_or_add_fill(&fills[f_idx], state.prev_szi)
+            {
+                state.apply_fill(&fills[f_idx], &mut agg_by_key);
+                f_idx += 1;
+            }
+            while e_idx < fund_indices.len() && funding_raw[fund_indices[e_idx]].time_ms == cur_ms {
+                let ev_i = fund_indices[e_idx];
+                state.apply_funding(ev_i, &funding_raw[ev_i]);
+                e_idx += 1;
+            }
+            while f_idx < fills.len() && fills[f_idx].time_ms == cur_ms {
+                state.apply_fill(&fills[f_idx], &mut agg_by_key);
+                f_idx += 1;
+            }
+        }
+
+        let remaining_open_sz: f64 = state.open_lots.iter().map(|l| l.rem_sz).sum();
+        if remaining_open_sz > 1e-9 && state.open_epoch_booked_funding.abs() > 1e-12 {
+            open_epoch_booked_funding_by_coin
+                .insert(coin_upper.clone(), state.open_epoch_booked_funding);
+        }
+        for &ev_i in &fund_indices {
+            funding_events_with_remaining.push((funding_raw[ev_i].clone(), state.rem_usdc[ev_i]));
+        }
+    }
+
+    let mut closed_orders: Vec<(u64, AggClosingOrder)> = agg_by_key
         .into_iter()
         .map(|((_, oid), agg)| (oid, agg))
         .collect();
-    closed_list.sort_by_key(|(_, agg)| agg.max_time_ms);
-    closed_list
+    closed_orders.sort_by_key(|(_, agg)| agg.max_time_ms);
+
+    FifoFundingReplayOutput {
+        closed_orders,
+        open_epoch_booked_funding_by_coin,
+        funding_events_with_remaining,
+    }
 }
 
 fn derive_open_position_opened_at_ms(fills: &[ParsedHlFill], current_szi: f64) -> Option<i64> {
@@ -1010,18 +1220,23 @@ impl CutoverReconciler {
                 w_eq
             }
         };
+        let margin_used = parse_f(ch_state.pointer("/marginSummary/totalMarginUsed"));
+        let withdrawable = parse_f(ch_state.get("withdrawable"));
         let configured_live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
         let cap_unset = cfg
             .get("risk_capital_cap_usdc")
             .map(|s| s.trim().is_empty())
             .unwrap_or(true);
-        if cap_unset && configured_live_eq > 10.0 {
+        let eff_cap_eq = if cap_unset && configured_live_eq > 10.0 {
             let _ = self.db.set_config_value(
                 "risk_capital_cap_usdc",
                 &format!("{configured_live_eq:.2}"),
                 Some("Preserved initial capital sizing cap from legacy live_exchange_equity_usdc"),
             );
-        }
+            configured_live_eq
+        } else {
+            cfg.get_f64("risk_capital_cap_usdc", 0.0)
+        };
 
         report.exchange_equity_usdc = if perp_eq >= 1.0 {
             round_dp(perp_eq, 2)
@@ -1035,6 +1250,21 @@ impl CutoverReconciler {
                 Some("Latest reconciled Hyperliquid perp marginSummary.accountValue in USDC"),
             );
         }
+        let _ = self.db.set_config_value(
+            "live_exchange_equity_synced_at_ms",
+            &ts.to_string(),
+            Some("Timestamp (ms) of latest successful Hyperliquid clearinghouseState equity sync"),
+        );
+        let _ = self.db.set_config_value(
+            "live_exchange_margin_used_usdc",
+            &format!("{:.2}", round_dp(margin_used.max(0.0), 2)),
+            Some("Latest synced Hyperliquid perp marginSummary.totalMarginUsed in USDC"),
+        );
+        let _ = self.db.set_config_value(
+            "live_exchange_withdrawable_usdc",
+            &format!("{:.2}", round_dp(withdrawable.max(0.0), 2)),
+            Some("Latest synced Hyperliquid perp withdrawable USDC balance"),
+        );
 
         // Identify currently open coins & signed szi on Hyperliquid before clearing orphan openOrders
         let mut open_coins: HashSet<String> = HashSet::new();
@@ -1190,6 +1420,13 @@ impl CutoverReconciler {
                     .unwrap_or(true)
             })
             .collect();
+        if open_orders_fetch_ok {
+            let _ = self.db.set_config_value(
+                "live_exchange_open_orders_count",
+                &remaining_open_orders.len().to_string(),
+                Some("Total resting Hyperliquid open orders from last reconcile (entry ALO + SL/TP triggers + passive closes)"),
+            );
+        }
 
         // Cancel local WORKING rows only if close_legacy_positions, or (not yet open on exchange AND (expired or no longer resting))
         // When `is_open_on_exch` is true, either keep chasing (when in `active_chasing_partial_coins`) or let
@@ -1211,7 +1448,17 @@ impl CutoverReconciler {
         }
 
         // Fetch userFills and userFunding once so both open position timestamps and closed trade FIFO/funding match accurately
-        let user_fills_opt = self.http.fetch_user_fills(&wallet, &cfg).ok();
+        let user_fills_opt = match self.http.fetch_user_fills(&wallet, &cfg) {
+            Ok(fills) => Some(fills),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid userFills fetch failed; skipping closed-trade/funding overwrite"
+                );
+                None
+            }
+        };
+        let user_fills_fetch_ok = user_fills_opt.is_some();
         let mut parsed_fills_by_coin: BTreeMap<String, Vec<ParsedHlFill>> = BTreeMap::new();
         if let Some(ref raw_fills) = user_fills_opt {
             for fill in raw_fills {
@@ -1280,17 +1527,62 @@ impl CutoverReconciler {
             }
         }
 
+        let local_held_before = self.db.get_assets_held().unwrap_or_default();
+        let existing_open_by_coin: HashMap<String, HeldAssetView> = local_held_before
+            .iter()
+            .map(|h| (h.coin.to_ascii_uppercase(), h.clone()))
+            .collect();
         let earliest_fill_ms = parsed_fills_by_coin
             .values()
             .filter_map(|v| v.first().map(|f| f.time_ms))
             .min();
-        let user_funding_raw = self
-            .http
-            .fetch_user_funding(&wallet, earliest_fill_ms, &cfg)
-            .unwrap_or_default();
-        let mut funding_by_coin: HashMap<String, Vec<(i64, f64, bool)>> = HashMap::new();
+        let earliest_local_open_ms = local_held_before
+            .iter()
+            .filter_map(|h| h.opened_at_ms.filter(|&t| t > 0))
+            .min();
+        let base_earliest_ms = match (earliest_fill_ms, earliest_local_open_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let has_untracked_prehistory = parsed_fills_by_coin.iter().any(|(coin_upper, fills)| {
+            fills
+                .first()
+                .and_then(|f| f.start_position)
+                .is_some_and(|sp| sp.abs() > 1e-9)
+                && !existing_open_by_coin
+                    .get(coin_upper)
+                    .is_some_and(|h| h.opened_at_ms.is_some_and(|t| t > 0))
+        }) || open_szi_by_coin.keys().any(|coin_upper| {
+            !parsed_fills_by_coin.contains_key(coin_upper)
+                && !existing_open_by_coin
+                    .get(coin_upper)
+                    .is_some_and(|h| h.opened_at_ms.is_some_and(|t| t > 0))
+        });
+        let earliest_funding_start_ms = if has_untracked_prehistory {
+            base_earliest_ms.map(|t| t.saturating_sub(90 * 86_400_000))
+        } else {
+            base_earliest_ms
+        };
+
+        let (user_funding_raw, funding_fetch_ok) = match self.http.fetch_user_funding(
+            &wallet,
+            earliest_funding_start_ms,
+            &cfg,
+        ) {
+            Ok(raw) => (raw, true),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid userFunding fetch failed; preserving existing reconciled funding without clobbering"
+                );
+                (Vec::new(), false)
+            }
+        };
+        let mut funding_by_coin: HashMap<String, Vec<ParsedHlFunding>> = HashMap::new();
         for ev in &user_funding_raw {
-            let f_time = ev.get("time").and_then(Value::as_i64).unwrap_or(0);
+            let f_time = parse_hl_i64_opt(ev.get("time")).unwrap_or(0);
             let Some(delta) = ev.get("delta") else {
                 continue;
             };
@@ -1309,19 +1601,69 @@ impl CutoverReconciler {
             let Ok((_, norm_coin)) = normalize_hyperliquid_symbol(raw_coin) else {
                 continue;
             };
+            let coin_upper = norm_coin.to_ascii_uppercase();
             let usdc = parse_f(delta.get("usdc"));
-            if f_time > 0 && usdc.abs() > 1e-12 {
-                funding_by_coin
-                    .entry(norm_coin.to_ascii_uppercase())
-                    .or_default()
-                    .push((f_time, usdc, false));
+            if f_time <= 0 || usdc.abs() <= 1e-12 {
+                continue;
             }
+            let szi = parse_f(delta.get("szi"));
+            let funding_rate = parse_f(delta.get("fundingRate"));
+            let raw_hash = ev
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.trim_start_matches("0x").chars().any(|c| c != '0'));
+            let n_suffix = ev
+                .get("n")
+                .or_else(|| delta.get("nSamples"))
+                .and_then(|v| {
+                    v.as_i64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(|s| s.trim().to_string()))
+                })
+                .filter(|s| !s.is_empty());
+            let mut dedup_key = match raw_hash {
+                Some(h) => match n_suffix {
+                    Some(n) => format!("{f_time}:{coin_upper}:{h}:{n}"),
+                    None => format!("{f_time}:{coin_upper}:{h}"),
+                },
+                None => match n_suffix {
+                    Some(n) => format!("{f_time}:{coin_upper}:{usdc:.6}:{szi:.6}:{n}"),
+                    None => format!("{f_time}:{coin_upper}:{usdc:.6}:{szi:.6}"),
+                },
+            };
+            if dedup_key.chars().count() > 128 {
+                dedup_key = dedup_key.chars().take(128).collect();
+            }
+            funding_by_coin
+                .entry(coin_upper)
+                .or_default()
+                .push(ParsedHlFunding {
+                    coin: norm_coin,
+                    time_ms: f_time,
+                    usdc,
+                    szi,
+                    funding_rate,
+                    dedup_key,
+                });
         }
         for list in funding_by_coin.values_mut() {
-            list.sort_by_key(|(t, _, _)| *t);
+            list.sort_by_key(|ev| ev.time_ms);
         }
 
+        let ledger_sync_ok = user_fills_fetch_ok && funding_fetch_ok;
+        let replay_out = if ledger_sync_ok {
+            compute_fifo_closed_orders_and_funding(
+                &parsed_fills_by_coin,
+                &funding_by_coin,
+                &open_szi_by_coin,
+            )
+        } else {
+            FifoFundingReplayOutput::default()
+        };
+
         let mut meta_cache: Option<HashMap<String, (u32, u32, f64)>> = None;
+        let mut coin_asset_id_cache: HashMap<String, i64> = HashMap::new();
 
         // 3. Inspect live Hyperliquid `assetPositions` and synchronize 1:1 with MariaDB `positions` + SL/TP orders
         let mut exchange_open_asset_ids: HashSet<i64> = HashSet::new();
@@ -1345,11 +1687,11 @@ impl CutoverReconciler {
                 let pos_val = parse_f(pos.get("positionValue"));
                 let upnl = parse_f(pos.get("unrealizedPnl"));
                 let since_open = parse_f(pos.pointer("/cumFunding/sinceOpen"));
-                let funding_accrued_usdc = round_dp(-since_open, 4);
 
                 let Ok((symbol, coin)) = normalize_hyperliquid_symbol(raw_coin) else {
                     continue;
                 };
+                let coin_upper = coin.to_ascii_uppercase();
 
                 let Some(asset) = self.resolve_or_upsert_asset(
                     &coin,
@@ -1364,12 +1706,34 @@ impl CutoverReconciler {
                 else {
                     continue;
                 };
+                coin_asset_id_cache.insert(coin_upper.clone(), asset.id);
 
                 report.legacy_positions_found += 1;
                 let side = if szi > 0.0 {
                     OrderSide::Long
                 } else {
                     OrderSide::Short
+                };
+                let funding_accrued_usdc = if ledger_sync_ok {
+                    let partial_booked = replay_out
+                        .open_epoch_booked_funding_by_coin
+                        .get(&coin_upper)
+                        .copied()
+                        .unwrap_or(0.0);
+                    round_dp((-since_open) - partial_booked, 4)
+                } else if let Some(existing) = existing_open_by_coin.get(&coin_upper) {
+                    if existing.side.eq_ignore_ascii_case(side.as_str())
+                        && (existing.funding_accrued_usdc.abs() > 1e-9
+                            || parsed_fills_by_coin
+                                .get(&coin_upper)
+                                .is_some_and(|fs| fs.iter().any(fill_is_closing_dir)))
+                    {
+                        existing.funding_accrued_usdc
+                    } else {
+                        round_dp(-since_open, 4)
+                    }
+                } else {
+                    round_dp(-since_open, 4)
                 };
                 let qty = szi.abs();
                 let mark_px = if pos_val > 0.0 && qty > 1e-9 {
@@ -1532,10 +1896,13 @@ impl CutoverReconciler {
                     } else {
                         round_dp(mark_px * qty, 4)
                     };
-                    let weight = round_dp(
-                        (committed_usdc / report.exchange_equity_usdc.max(1.0)) * side.sign(),
-                        4,
-                    );
+                    let eff_basis_eq = if eff_cap_eq >= 10.0 {
+                        report.exchange_equity_usdc.min(eff_cap_eq)
+                    } else {
+                        report.exchange_equity_usdc
+                    };
+                    let weight =
+                        round_dp((committed_usdc / eff_basis_eq.max(1.0)) * side.sign(), 4);
                     let opened_at_ms_opt = parsed_fills_by_coin
                         .get(&coin.to_ascii_uppercase())
                         .and_then(|fills| derive_open_position_opened_at_ms(fills, szi));
@@ -1608,82 +1975,141 @@ impl CutoverReconciler {
             }
         }
 
-        // 5. Reconcile historical `CLOSED` trades 1:1 from Hyperliquid `userFills` + `userFunding` (FIFO open fees + flip tracking)
-        if !parsed_fills_by_coin.is_empty() {
-            let closed_list = compute_fifo_closed_orders(&parsed_fills_by_coin);
-
-            let mut closed_inputs = Vec::with_capacity(closed_list.len());
-            for (oid, mut agg) in closed_list {
-                if agg.total_sz <= 1e-9 {
-                    continue;
-                }
-                let window_start = agg.open_time_ms.unwrap_or(agg.min_time_ms);
-                if let Some(f_list) = funding_by_coin.get_mut(&agg.coin.to_ascii_uppercase()) {
-                    for (f_time, usdc, used) in f_list.iter_mut() {
-                        if !*used && *f_time >= window_start && *f_time <= agg.max_time_ms {
-                            agg.funding_accrued_usdc += *usdc;
-                            *used = true;
+        // 5. Reconcile historical `CLOSED` trades 1:1 & persist `funding_events` when both userFills + userFunding succeeded
+        if ledger_sync_ok {
+            if !replay_out.closed_orders.is_empty() {
+                let mut closed_inputs = Vec::with_capacity(replay_out.closed_orders.len());
+                for (oid, agg) in replay_out.closed_orders {
+                    if agg.total_sz <= 1e-9 {
+                        continue;
+                    }
+                    let window_start = agg.open_time_ms.unwrap_or(agg.min_time_ms);
+                    let exit_px = agg.notional_sum / agg.total_sz;
+                    let side = agg.side.unwrap_or(OrderSide::Long);
+                    let entry_px = match side {
+                        OrderSide::Long => {
+                            (exit_px - (agg.gross_closed_pnl / agg.total_sz)).max(1e-8)
                         }
+                        OrderSide::Short => {
+                            (exit_px + (agg.gross_closed_pnl / agg.total_sz)).max(1e-8)
+                        }
+                    };
+                    let total_fees = agg.close_fees_usdc + agg.open_fees_usdc;
+                    let net_rpnl = round_dp(
+                        agg.gross_closed_pnl - total_fees + agg.funding_accrued_usdc,
+                        4,
+                    );
+
+                    let symbol = format!("{}-USDC", agg.coin);
+                    let Some(asset) = self.resolve_or_upsert_asset(
+                        &agg.coin,
+                        &symbol,
+                        exit_px,
+                        false,
+                        true,
+                        false,
+                        &mut meta_cache,
+                        &cfg,
+                    )?
+                    else {
+                        continue;
+                    };
+                    coin_asset_id_cache.insert(agg.coin.to_ascii_uppercase(), asset.id);
+
+                    closed_inputs.push(ReconciledClosedTradeInput {
+                        asset_id: asset.id,
+                        client_order_id: format!(
+                            "hl-closed-{}-{oid}",
+                            agg.coin.to_ascii_lowercase()
+                        ),
+                        exchange_order_id: format!("hl-{oid}"),
+                        side,
+                        entry_price: entry_px,
+                        exit_price: exit_px,
+                        filled_quantity: agg.total_sz,
+                        realized_pnl_usdc: net_rpnl,
+                        fees_paid_usdc: round_dp(total_fees, 4),
+                        funding_accrued_usdc: round_dp(agg.funding_accrued_usdc, 4),
+                        created_at_ms: window_start,
+                        closed_at_ms: agg.max_time_ms,
+                        exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+                    });
+                }
+
+                if !closed_inputs.is_empty() {
+                    if let Ok(reconciled_closed_count) = self
+                        .db
+                        .reconcile_closed_positions_from_exchange_fills(&closed_inputs)
+                    {
+                        report.details.push(format!(
+                            "Reconciled {reconciled_closed_count} historical closed trades from Hyperliquid userFills"
+                        ));
                     }
                 }
-
-                let exit_px = agg.notional_sum / agg.total_sz;
-                let side = agg.side.unwrap_or(OrderSide::Long);
-                let entry_px = match side {
-                    OrderSide::Long => (exit_px - (agg.gross_closed_pnl / agg.total_sz)).max(1e-8),
-                    OrderSide::Short => (exit_px + (agg.gross_closed_pnl / agg.total_sz)).max(1e-8),
-                };
-                let total_fees = agg.close_fees_usdc + agg.open_fees_usdc;
-                let net_rpnl = round_dp(
-                    agg.gross_closed_pnl - total_fees + agg.funding_accrued_usdc,
-                    4,
-                );
-
-                let symbol = format!("{}-USDC", agg.coin);
-                let Some(asset) = self.resolve_or_upsert_asset(
-                    &agg.coin,
-                    &symbol,
-                    exit_px,
-                    false,
-                    true,
-                    false,
-                    &mut meta_cache,
-                    &cfg,
-                )?
-                else {
-                    continue;
-                };
-
-                closed_inputs.push(ReconciledClosedTradeInput {
-                    asset_id: asset.id,
-                    client_order_id: format!("hl-closed-{}-{oid}", agg.coin.to_ascii_lowercase()),
-                    exchange_order_id: format!("hl-{oid}"),
-                    side,
-                    entry_price: entry_px,
-                    exit_price: exit_px,
-                    filled_quantity: agg.total_sz,
-                    realized_pnl_usdc: net_rpnl,
-                    fees_paid_usdc: round_dp(total_fees, 4),
-                    funding_accrued_usdc: round_dp(agg.funding_accrued_usdc, 4),
-                    created_at_ms: window_start,
-                    closed_at_ms: agg.max_time_ms,
-                    exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
-                });
             }
 
-            if let Ok(reconciled_closed_count) = self
-                .db
-                .reconcile_closed_positions_from_exchange_fills(&closed_inputs)
-            {
-                report.details.push(format!(
-                    "Reconciled {reconciled_closed_count} historical closed trades from Hyperliquid userFills"
-                ));
+            if !replay_out.funding_events_with_remaining.is_empty() {
+                let mut funding_inputs =
+                    Vec::with_capacity(replay_out.funding_events_with_remaining.len());
+                for (ev, remaining_usdc) in replay_out.funding_events_with_remaining {
+                    let coin_upper = ev.coin.to_ascii_uppercase();
+                    let asset_id = if let Some(&aid) = coin_asset_id_cache.get(&coin_upper) {
+                        aid
+                    } else {
+                        let symbol = format!("{}-USDC", ev.coin);
+                        let Some(asset) = self.resolve_or_upsert_asset(
+                            &ev.coin,
+                            &symbol,
+                            1.0,
+                            false,
+                            true,
+                            false,
+                            &mut meta_cache,
+                            &cfg,
+                        )?
+                        else {
+                            continue;
+                        };
+                        coin_asset_id_cache.insert(coin_upper, asset.id);
+                        asset.id
+                    };
+                    funding_inputs.push(FundingEventUpsertInput {
+                        asset_id,
+                        coin: ev.coin,
+                        event_time_ms: ev.time_ms,
+                        usdc: ev.usdc,
+                        remaining_usdc,
+                        position_szi: ev.szi,
+                        funding_rate: ev.funding_rate,
+                        dedup_key: ev.dedup_key,
+                    });
+                }
+                if !funding_inputs.is_empty() {
+                    if let Err(e) = self.db.upsert_funding_events_batch(&funding_inputs) {
+                        tracing::warn!(
+                            error = %e,
+                            count = funding_inputs.len(),
+                            "Failed persisting reconciled funding_events batch"
+                        );
+                    }
+                }
             }
+        } else {
+            report.details.push(
+                "Skipped closed-trade and funding_events overwrite because userFills/userFunding fetch failed (preserving cached funding)"
+                    .to_string(),
+            );
         }
 
-        // 6. Throttled Hyperliquid vault info sync (at most once per 60s; strictly segregated from perp equity/margin)
+        // 6. Throttled Hyperliquid spot USDC sync + vault info sync (at most once per 60s; strictly segregated from perp equity/margin)
+        if let Some(spot_usdc) = self.sync_spot_usdc_if_due(&cfg, ts) {
+            report.details.push(format!(
+                "Synced Hyperliquid spot USDC balance (${spot_usdc:.2}, segregated from perp margin)"
+            ));
+        }
+        let cfg_for_vault = self.db.load_config_or_default();
         if let Some(vault_snap) =
-            self.sync_vault_info_if_due(&cfg, ts, Some(report.exchange_equity_usdc))
+            self.sync_vault_info_if_due(&cfg_for_vault, ts, Some(report.exchange_equity_usdc))
         {
             report.details.push(format!(
                 "Synced {} Hyperliquid vault(s) (vault_equity=${:.2}, segregated from perp margin)",
@@ -1707,6 +2133,106 @@ impl CutoverReconciler {
         );
 
         Ok(report)
+    }
+
+    /// Syncs Hyperliquid spot USDC balance at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s).
+    /// Persists `live_exchange_spot_usdc` and `live_exchange_spot_synced_at_ms` without modifying `live_exchange_equity_usdc`.
+    /// On fetch errors/timeouts/429s or payloads lacking `"balances"`, logs WARN/DEBUG and keeps the cached value.
+    pub fn sync_spot_usdc_if_due(&self, cfg: &ConfigMap, now_ms_val: i64) -> Option<f64> {
+        self.sync_spot_usdc_with_interval(cfg, now_ms_val, VAULT_SYNC_MIN_INTERVAL_MS)
+    }
+
+    /// Interval-parameterized spot USDC sync helper used by [`Self::sync_spot_usdc_if_due`] and tests.
+    pub fn sync_spot_usdc_with_interval(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        min_interval_ms: i64,
+    ) -> Option<f64> {
+        if !cfg.execution_mode().is_live_or_testnet() {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "");
+        let wallet_trimmed = wallet.trim();
+        if wallet_trimmed.is_empty() {
+            return None;
+        }
+        let key: SpotSyncThrottleKey = (
+            self.db.db_name().to_string(),
+            wallet_trimmed.to_ascii_lowercase(),
+        );
+        let eff_min_interval = min_interval_ms.max(0);
+        if eff_min_interval > 0 {
+            let map = LAST_SPOT_SYNC_ATTEMPT_MS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = map.lock();
+            if let Some(&last_attempt) = guard.get(&key) {
+                if now_ms_val >= last_attempt
+                    && now_ms_val.saturating_sub(last_attempt) < eff_min_interval
+                {
+                    tracing::debug!(
+                        elapsed_ms = now_ms_val.saturating_sub(last_attempt),
+                        min_interval_ms = eff_min_interval,
+                        "Skipping Hyperliquid spot USDC sync (in-memory 60s throttle active)"
+                    );
+                    return None;
+                }
+            }
+            let prev_sync_ms = cfg.get_i64("live_exchange_spot_synced_at_ms", 0);
+            if prev_sync_ms > 0
+                && now_ms_val >= prev_sync_ms
+                && now_ms_val.saturating_sub(prev_sync_ms) < eff_min_interval
+            {
+                guard.insert(key, prev_sync_ms);
+                tracing::debug!(
+                    elapsed_ms = now_ms_val.saturating_sub(prev_sync_ms),
+                    min_interval_ms = eff_min_interval,
+                    "Skipping Hyperliquid spot USDC sync (persisted 60s throttle active)"
+                );
+                return None;
+            }
+            if guard.len() > 256 {
+                guard.clear();
+            }
+            guard.insert(key, now_ms_val);
+        }
+
+        let spot_state = match self
+            .http
+            .fetch_spot_clearinghouse_state(wallet_trimmed, cfg)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid spotClearinghouseState fetch failed; keeping last known cached spot USDC"
+                );
+                return None;
+            }
+        };
+
+        let Some(raw_usdc) = parse_spot_usdc_balance(&spot_state) else {
+            tracing::debug!(
+                "Hyperliquid spotClearinghouseState payload missing 'balances' array; keeping cached spot USDC"
+            );
+            return None;
+        };
+
+        let spot_usdc = round_dp(raw_usdc.max(0.0), 2);
+        if let Err(e) = self.db.set_config_value(
+            "live_exchange_spot_usdc",
+            &format!("{spot_usdc:.2}"),
+            Some("Latest synced Hyperliquid spot USDC balance (informational; segregated from perp margin)"),
+        ) {
+            tracing::warn!(error = %e, "Failed persisting live_exchange_spot_usdc");
+            return None;
+        }
+        let _ = self.db.set_config_value(
+            "live_exchange_spot_synced_at_ms",
+            &now_ms_val.to_string(),
+            Some("Timestamp (ms) of latest Hyperliquid spotClearinghouseState sync"),
+        );
+
+        Some(spot_usdc)
     }
 
     /// Syncs Hyperliquid vault equities and vault details at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s).
@@ -1907,7 +2433,19 @@ impl CutoverReconciler {
         let perp_eq = perp_equity_override
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or_else(|| cfg.get_f64("live_exchange_equity_usdc", 0.0).max(0.0));
-        let combined_portfolio_equity_usdc = round_dp(perp_eq + total_vault_equity_usdc, 2);
+        let spot_eq = {
+            let from_cfg = cfg.get_f64("live_exchange_spot_usdc", 0.0).max(0.0);
+            if from_cfg > 0.0 || cfg.get_i64("live_exchange_spot_synced_at_ms", 0) > 0 {
+                from_cfg
+            } else {
+                self.db
+                    .load_config_or_default()
+                    .get_f64("live_exchange_spot_usdc", 0.0)
+                    .max(0.0)
+            }
+        };
+        let combined_portfolio_equity_usdc =
+            round_dp(perp_eq + spot_eq + total_vault_equity_usdc, 2);
 
         let snapshot = VaultInfoPayload {
             configured_vault_address: configured_vault_trimmed.to_string(),
@@ -2027,7 +2565,9 @@ mod tests {
 
         let mut map_a = BTreeMap::new();
         map_a.insert("CHIP".to_string(), fills_a);
-        let closed_a = compute_fifo_closed_orders(&map_a);
+        let closed_a =
+            compute_fifo_closed_orders_and_funding(&map_a, &HashMap::new(), &HashMap::new())
+                .closed_orders;
         assert_eq!(closed_a.len(), 1);
         assert!((closed_a[0].1.total_sz - 3585.0).abs() < 1e-9);
         assert!((closed_a[0].1.open_fees_usdc - 0.04).abs() < 1e-9);
@@ -2095,7 +2635,9 @@ mod tests {
 
         let mut map_b = BTreeMap::new();
         map_b.insert("CHIP".to_string(), fills_b);
-        let closed_b = compute_fifo_closed_orders(&map_b);
+        let closed_b =
+            compute_fifo_closed_orders_and_funding(&map_b, &HashMap::new(), &HashMap::new())
+                .closed_orders;
         let chip_174331 = closed_b
             .iter()
             .find(|(oid, _)| *oid == 8003)
@@ -2615,5 +3157,102 @@ mod tests {
         assert_eq!(info_fb.locked_until_ms, future_lock);
         assert!(info_fb.is_locked);
         assert!(info_fb.is_closed);
+    }
+
+    #[test]
+    fn test_parse_spot_usdc_balance_variants() {
+        assert_eq!(parse_spot_usdc_balance(&json!([])), None);
+        assert_eq!(parse_spot_usdc_balance(&json!({})), None);
+        assert_eq!(parse_spot_usdc_balance(&json!({ "balances": "bad" })), None);
+        assert_eq!(
+            parse_spot_usdc_balance(&json!({ "balances": [] })),
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_spot_usdc_balance(&json!({
+                "balances": [
+                    { "coin": "USDC", "total": "5000.25", "hold": "0.0" },
+                    { "coin": "PURR", "total": "100.0", "hold": "0.0" },
+                    { "coin": "usdc", "total": "25.50", "hold": "1.0" },
+                    { "coin": "USDC", "total": "-5.0" }
+                ]
+            })),
+            Some(5025.75)
+        );
+    }
+
+    #[test]
+    fn test_fifo_funding_replay_open_only_and_same_ms_ordering() {
+        // Open-only coin (no userFills) uses open_szi_by_coin
+        let mut funding_by_coin = HashMap::new();
+        funding_by_coin.insert(
+            "ETH".to_string(),
+            vec![ParsedHlFunding {
+                coin: "ETH".to_string(),
+                time_ms: 1_000_000,
+                usdc: 3.25,
+                szi: 2.0,
+                funding_rate: 0.0001,
+                dedup_key: "1000000:ETH:0x1".to_string(),
+            }],
+        );
+        let mut open_szi = HashMap::new();
+        open_szi.insert("ETH".to_string(), 2.0);
+        let out_open =
+            compute_fifo_closed_orders_and_funding(&BTreeMap::new(), &funding_by_coin, &open_szi);
+        assert!(out_open.closed_orders.is_empty());
+        assert_eq!(out_open.funding_events_with_remaining.len(), 1);
+        assert!((out_open.funding_events_with_remaining[0].1 - 3.25).abs() < 1e-9);
+
+        // Same-ms Open + Funding + Close places Funding after Open and before Close
+        let mut fills_by_coin = BTreeMap::new();
+        fills_by_coin.insert(
+            "BTC".to_string(),
+            vec![
+                make_fill(
+                    "BTC",
+                    "B",
+                    90_000.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    "Open Long",
+                    2_000_000,
+                    1,
+                    1,
+                    Some(0.0),
+                ),
+                make_fill(
+                    "BTC",
+                    "A",
+                    90_100.0,
+                    1.0,
+                    0.0,
+                    100.0,
+                    "Close Long",
+                    2_000_000,
+                    2,
+                    2,
+                    Some(1.0),
+                ),
+            ],
+        );
+        let mut btc_funding = HashMap::new();
+        btc_funding.insert(
+            "BTC".to_string(),
+            vec![ParsedHlFunding {
+                coin: "BTC".to_string(),
+                time_ms: 2_000_000,
+                usdc: 4.5,
+                szi: 1.0,
+                funding_rate: 0.00005,
+                dedup_key: "2000000:BTC:0x2".to_string(),
+            }],
+        );
+        let out_same_ms =
+            compute_fifo_closed_orders_and_funding(&fills_by_coin, &btc_funding, &HashMap::new());
+        assert_eq!(out_same_ms.closed_orders.len(), 1);
+        assert!((out_same_ms.closed_orders[0].1.funding_accrued_usdc - 4.5).abs() < 1e-9);
+        assert!((out_same_ms.funding_events_with_remaining[0].1 - 0.0).abs() < 1e-9);
     }
 }
