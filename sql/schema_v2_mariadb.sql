@@ -1,6 +1,6 @@
 -- =============================================================================
 -- Aegis Quant v2.0 — Canonical MariaDB 13.0 Rolling / 12.3 LTS Relational Schema
--- 10 Normalized InnoDB Tables (id PK, Foreign Keys, Composite Covering Indexes)
+-- 11 Normalized InnoDB Tables (id PK, Foreign Keys, Composite Covering Indexes)
 -- + 7 First-Class SQL Views (v_assets_held, v_assets_ordered, v_assets_in_cooldown,
 --   v_assets_sleeve_s1, v_assets_sleeve_s2, v_assets_sleeve_s3, v_priority_watchlist)
 -- =============================================================================
@@ -246,6 +246,25 @@ CREATE TABLE IF NOT EXISTS alert_queue (
     updated_at_ms BIGINT NOT NULL,
     KEY idx_alerts_status_retry (status, next_retry_ms),
     KEY idx_alerts_event_created (event_type, created_at_ms DESC)
+) ENGINE=InnoDB;
+
+-- 11. Reconciled Hyperliquid Per-Event Funding Ledger (windowed open-position PnL attribution)
+CREATE TABLE IF NOT EXISTS funding_events (
+    id             BIGINT PRIMARY KEY AUTO_INCREMENT,
+    asset_id       BIGINT NOT NULL,
+    coin           VARCHAR(24) NOT NULL,
+    event_time_ms  BIGINT NOT NULL,
+    usdc           DOUBLE NOT NULL,
+    remaining_usdc DOUBLE NOT NULL,
+    position_szi   DOUBLE NOT NULL DEFAULT 0.0,
+    funding_rate   DOUBLE NOT NULL DEFAULT 0.0,
+    dedup_key      VARCHAR(128) NOT NULL,
+    created_at_ms  BIGINT NOT NULL,
+    updated_at_ms  BIGINT NOT NULL,
+    CONSTRAINT fk_funding_asset FOREIGN KEY (asset_id) REFERENCES exchange_assets(id) ON DELETE CASCADE,
+    UNIQUE KEY uq_funding_dedup (dedup_key),
+    KEY idx_funding_asset_time (asset_id, event_time_ms DESC),
+    KEY idx_funding_time (event_time_ms DESC)
 ) ENGINE=InnoDB;
 
 -- ============================================================================

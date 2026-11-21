@@ -245,7 +245,7 @@ impl DatabaseManager {
         Ok(ver.unwrap_or_else(|| "unknown".to_string()))
     }
 
-    /// Initializes all 10 InnoDB tables, Foreign Keys, Composite Indexes, and 7 SQL Views,
+    /// Initializes all 11 InnoDB tables, Foreign Keys, Composite Indexes, and 7 SQL Views,
     /// seeds default v2.0 `system_config` rows (with `risk_tier = "extreme"`), and migrates
     /// any preserved encrypted credentials from `data/aegis_quant.db` if present.
     pub fn init_schema(&self, force_recreate: bool) -> Result<()> {
@@ -265,6 +265,7 @@ impl DatabaseManager {
                 let _ = conn.query_drop(format!("DROP VIEW IF EXISTS `{v}`"));
             }
             let tables = [
+                "funding_events",
                 "alert_queue",
                 "telemetry_logs",
                 "portfolio_snapshots",

@@ -1,4 +1,4 @@
-//! Domain models matching the 10 MariaDB tables and 7 first-class SQL Views (`aegis-core::models`).
+//! Domain models matching the 11 MariaDB tables and 7 first-class SQL Views (`aegis-core::models`).
 
 use crate::time::round_dp;
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,7 @@ impl OrderFsmState {
 }
 
 // ============================================================================
-// 10 MARIADB TABLE DOMAIN MODELS
+// 11 MARIADB TABLE DOMAIN MODELS
 // ============================================================================
 
 /// Table 1: `system_config`
@@ -547,6 +547,8 @@ pub struct PnlHorizonMetrics {
     pub fees_funding_usdc: f64,
     pub trade_count: usize,
     pub win_count: usize,
+    #[serde(default)]
+    pub is_cap_clamped: bool,
 }
 
 /// Multi-horizon PnL breakdown (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`) for the operator dashboard.
@@ -556,6 +558,50 @@ pub struct PnlSummary {
     pub weekly: PnlHorizonMetrics,
     pub monthly: PnlHorizonMetrics,
     pub ytd: PnlHorizonMetrics,
+}
+
+/// Explicit equity & capital-sizing basis summary for UI transparency and reconciler sync status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EquityBasisSummary {
+    #[serde(default)]
+    pub basis_label: String,
+    #[serde(default)]
+    pub effective_equity_usdc: f64,
+    #[serde(default)]
+    pub perp_wallet_equity_usdc: f64,
+    #[serde(default)]
+    pub risk_capital_cap_usdc: f64,
+    #[serde(default)]
+    pub is_cap_binding: bool,
+    #[serde(default)]
+    pub spot_usdc: f64,
+    #[serde(default)]
+    pub total_wallet_equity_usdc: f64,
+    #[serde(default)]
+    pub margin_used_usdc: f64,
+    #[serde(default)]
+    pub withdrawable_usdc: f64,
+    #[serde(default)]
+    pub synced_at_ms: i64,
+    #[serde(default)]
+    pub is_stale: bool,
+}
+
+/// 24-hour peak-to-trough portfolio drawdown circuit-breaker status.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DrawdownBreakerStatus {
+    #[serde(default)]
+    pub tripped: bool,
+    #[serde(default)]
+    pub drawdown_pct: f64,
+    #[serde(default)]
+    pub max_daily_drawdown_pct: f64,
+    #[serde(default)]
+    pub peak_24h_equity_usdc: f64,
+    #[serde(default)]
+    pub latest_equity_usdc: f64,
+    #[serde(default)]
+    pub window_start_ms: i64,
 }
 
 /// Closed trade summary enriched with canonical symbol/coin and computed `realized_pnl_pct`.

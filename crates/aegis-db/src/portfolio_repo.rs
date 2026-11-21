@@ -8,6 +8,7 @@ use aegis_core::{
 };
 use mysql::params;
 use mysql::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 fn sanitize_telemetry_string(raw: &str) -> String {
@@ -64,6 +65,28 @@ fn sanitize_json_value(val: Value) -> Value {
     }
 }
 
+struct SanitizedFundingEvent {
+    asset_id: i64,
+    coin: String,
+    event_time_ms: i64,
+    usdc: f64,
+    remaining_usdc: f64,
+    position_szi: f64,
+    funding_rate: f64,
+    dedup_key: String,
+}
+
+type OpenPnlPositionRow = (i64, String, f64, f64, f64, i64, f64, f64);
+
+#[inline]
+fn finite_or_zero(val: f64) -> f64 {
+    if val.is_finite() {
+        val
+    } else {
+        0.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotInsertInput {
     pub total_equity_usdc: f64,
@@ -85,6 +108,35 @@ pub struct SnapshotInsertInput {
     pub open_long_count: i32,
     pub open_short_count: i32,
     pub eligible_coin_count: i32,
+}
+
+/// Input record for batch upserting Hyperliquid funding ledger events into `funding_events`.
+#[derive(Debug, Clone)]
+pub struct FundingEventUpsertInput {
+    pub asset_id: i64,
+    pub coin: String,
+    pub event_time_ms: i64,
+    pub usdc: f64,
+    pub remaining_usdc: f64,
+    pub position_szi: f64,
+    pub funding_rate: f64,
+    pub dedup_key: String,
+}
+
+/// Persisted Hyperliquid funding ledger row from `funding_events`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingEventRecord {
+    pub id: i64,
+    pub asset_id: i64,
+    pub coin: String,
+    pub event_time_ms: i64,
+    pub usdc: f64,
+    pub remaining_usdc: f64,
+    pub position_szi: f64,
+    pub funding_rate: f64,
+    pub dedup_key: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 impl DatabaseManager {
@@ -425,10 +477,110 @@ impl DatabaseManager {
         Ok((snaps_deleted, logs_deleted))
     }
 
+    /// Batch upserts reconciled Hyperliquid funding events into `funding_events` in a single transaction.
+    pub fn upsert_funding_events_batch(&self, events: &[FundingEventUpsertInput]) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| AegisError::Database(format!("Failed to start funding_events tx: {e}")))?;
+
+        let stmt = tx
+            .prep(
+                r#"INSERT INTO funding_events
+                   (asset_id, coin, event_time_ms, usdc, remaining_usdc, position_szi, funding_rate, dedup_key, created_at_ms, updated_at_ms)
+                   VALUES (:aid, :coin, :ev_ts, :usdc, :rem_usdc, :szi, :fr, :dkey, :ts, :ts)
+                   ON DUPLICATE KEY UPDATE
+                   coin = VALUES(coin),
+                   usdc = VALUES(usdc),
+                   remaining_usdc = VALUES(remaining_usdc),
+                   position_szi = VALUES(position_szi),
+                   funding_rate = VALUES(funding_rate),
+                   updated_at_ms = VALUES(updated_at_ms)"#,
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("Failed to prepare funding_events upsert: {e}"))
+            })?;
+
+        let sanitized: Vec<SanitizedFundingEvent> = events
+            .iter()
+            .map(|ev| SanitizedFundingEvent {
+                asset_id: ev.asset_id,
+                coin: ev.coin.trim().chars().take(24).collect(),
+                event_time_ms: ev.event_time_ms,
+                usdc: finite_or_zero(ev.usdc),
+                remaining_usdc: finite_or_zero(ev.remaining_usdc),
+                position_szi: finite_or_zero(ev.position_szi),
+                funding_rate: finite_or_zero(ev.funding_rate),
+                dedup_key: ev.dedup_key.chars().take(128).collect(),
+            })
+            .collect();
+
+        tx.exec_batch(
+            &stmt,
+            sanitized.iter().map(|ev| {
+                params! {
+                    "aid" => ev.asset_id,
+                    "coin" => &ev.coin,
+                    "ev_ts" => ev.event_time_ms,
+                    "usdc" => ev.usdc,
+                    "rem_usdc" => ev.remaining_usdc,
+                    "szi" => ev.position_szi,
+                    "fr" => ev.funding_rate,
+                    "dkey" => &ev.dedup_key,
+                    "ts" => ts,
+                }
+            }),
+        )
+        .map_err(|e| AegisError::Database(format!("Failed to upsert funding_events batch: {e}")))?;
+        drop(stmt);
+
+        tx.commit()
+            .map_err(|e| AegisError::Database(format!("Failed to commit funding_events: {e}")))?;
+        Ok(events.len())
+    }
+
+    /// Lists reconciled `funding_events` records for a specific `asset_id` ordered chronologically.
+    pub fn list_funding_events_for_asset(&self, asset_id: i64) -> Result<Vec<FundingEventRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                r#"SELECT id, asset_id, coin, event_time_ms, usdc, remaining_usdc,
+                          position_szi, funding_rate, dedup_key, created_at_ms, updated_at_ms
+                   FROM funding_events
+                   WHERE asset_id = :aid
+                   ORDER BY event_time_ms ASC, id ASC"#,
+                params! { "aid" => asset_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("list_funding_events_for_asset failed: {e}"))
+            })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| FundingEventRecord {
+                id: r.get(0).unwrap_or_default(),
+                asset_id: r.get(1).unwrap_or_default(),
+                coin: r.get(2).unwrap_or_default(),
+                event_time_ms: r.get(3).unwrap_or_default(),
+                usdc: r.get(4).unwrap_or_default(),
+                remaining_usdc: r.get(5).unwrap_or_default(),
+                position_szi: r.get(6).unwrap_or_default(),
+                funding_rate: r.get(7).unwrap_or_default(),
+                dedup_key: r.get(8).unwrap_or_default(),
+                created_at_ms: r.get(9).unwrap_or_default(),
+                updated_at_ms: r.get(10).unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// Computes multi-horizon PnL metrics (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`)
     /// respecting `risk_capital_cap_updated_at_ms`, anchoring baseline equity to `portfolio_snapshots`
     /// around each horizon start, attributing only the horizon uPnL delta (`current_upnl - start_upnl`),
-    /// and including funding accrued + open fees without fabricated `anchor - net_pnl` baselines.
+    /// and windowing open-position funding/fees via `funding_events` (with time-proration fallback).
     pub fn compute_pnl_summary(
         &self,
         current_unrealized_pnl: f64,
@@ -460,10 +612,11 @@ impl DatabaseManager {
         .max(1.0);
 
         let mut conn = self.get_conn()?;
-        let open_positions: Vec<(i64, String, f64, f64, f64, i64)> = conn
+        let open_positions: Vec<OpenPnlPositionRow> = conn
             .query(
                 r#"SELECT asset_id, side, entry_price, filled_quantity, unrealized_pnl_usdc,
-                          COALESCE(opened_at_ms, created_at_ms)
+                          COALESCE(opened_at_ms, created_at_ms),
+                          funding_accrued_usdc, fees_paid_usdc
                    FROM positions
                    WHERE status = 'OPEN'"#,
             )
@@ -477,6 +630,7 @@ impl DatabaseManager {
                              label: &str,
                              raw_start_ms: i64|
          -> Result<PnlHorizonMetrics> {
+            let is_cap_clamped = cap_updated_at_ms > 0 && cap_updated_at_ms > raw_start_ms;
             let eff_start_ms = if cap_updated_at_ms > 0 {
                 raw_start_ms.max(cap_updated_at_ms)
             } else {
@@ -547,7 +701,9 @@ impl DatabaseManager {
 
             // Compute unrealized PnL already present at eff_start_ms (`start_upnl`)
             let mut start_upnl = 0.0;
-            for (asset_id, side_str, entry_price, qty, cur_pos_upnl, open_ts) in &open_positions {
+            for (asset_id, side_str, entry_price, qty, cur_pos_upnl, open_ts, _, _) in
+                &open_positions
+            {
                 if *open_ts >= eff_start_ms {
                     // Position opened inside this horizon: start unrealized PnL was 0
                     continue;
@@ -580,11 +736,58 @@ impl DatabaseManager {
                 }
             }
 
+            // Compute horizon-windowed open funding & fees
+            let mut horizon_open_fees_funding = 0.0_f64;
+            if open_positions.is_empty() {
+                horizon_open_fees_funding = if open_fees_funding.is_finite() {
+                    open_fees_funding
+                } else {
+                    0.0
+                };
+            } else {
+                for (asset_id, _, _, _, _, open_ts, pos_funding, pos_fees) in &open_positions {
+                    if *open_ts >= eff_start_ms {
+                        horizon_open_fees_funding += *pos_funding - *pos_fees;
+                    } else {
+                        // Entry fees occurred prior to horizon start -> 0.0 entry fee in this window.
+                        let funding_row: Option<(i64, f64)> = conn
+                            .exec_first(
+                                r#"SELECT COUNT(*),
+                                          COALESCE(SUM(CASE WHEN event_time_ms >= :start_ms THEN remaining_usdc ELSE 0.0 END), 0.0)
+                                   FROM funding_events
+                                   WHERE asset_id = :aid AND event_time_ms >= :open_ts"#,
+                                params! {
+                                    "start_ms" => eff_start_ms,
+                                    "aid" => *asset_id,
+                                    "open_ts" => *open_ts,
+                                },
+                            )
+                            .map_err(|e| {
+                                AegisError::Database(format!(
+                                    "compute_pnl_summary funding_events query failed: {e}"
+                                ))
+                            })?;
+                        let (ev_count, window_remaining_usdc) = funding_row.unwrap_or((0, 0.0));
+                        if ev_count > 0 {
+                            horizon_open_fees_funding += window_remaining_usdc;
+                        } else {
+                            let total_span = (now - *open_ts).max(1) as f64;
+                            let win_span = (now - eff_start_ms).max(0) as f64;
+                            horizon_open_fees_funding +=
+                                *pos_funding * (win_span / total_span).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+            }
+
             let horizon_upnl_delta = current_unrealized_pnl - start_upnl;
             let realized_pnl_usdc = round_dp(closed_rpnl, 2);
-            let unrealized_pnl_usdc = round_dp(horizon_upnl_delta + open_fees_funding, 2);
-            let net_pnl_usdc = round_dp(closed_rpnl + horizon_upnl_delta + open_fees_funding, 2);
-            let fees_funding_usdc = round_dp(closed_fees_funding + open_fees_funding, 2);
+            let unrealized_pnl_usdc = round_dp(horizon_upnl_delta + horizon_open_fees_funding, 2);
+            let net_pnl_usdc = round_dp(
+                closed_rpnl + horizon_upnl_delta + horizon_open_fees_funding,
+                2,
+            );
+            let fees_funding_usdc = round_dp(closed_fees_funding + horizon_open_fees_funding, 2);
 
             let return_pct = if baseline_equity_usdc > 0.0 {
                 round_dp((net_pnl_usdc / baseline_equity_usdc) * 100.0, 2)
@@ -603,6 +806,7 @@ impl DatabaseManager {
                 fees_funding_usdc,
                 trade_count: trade_cnt.max(0) as usize,
                 win_count: win_cnt.max(0) as usize,
+                is_cap_clamped,
             })
         };
 

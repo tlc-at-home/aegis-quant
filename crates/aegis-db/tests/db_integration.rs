@@ -1,11 +1,11 @@
 //! Comprehensive MariaDB 13.0 Rolling integration tests for `aegis-db` (`tests/db_integration.rs`).
 
-use aegis_core::{now_ms, OrderSide, RiskTier};
+use aegis_core::{now_ms, ytd_start_ms, OrderSide, RiskTier};
 use aegis_db::{
     canonicalize_asset_updates, canonicalize_asset_upserts, create_mariadb_backup,
     order_asset_upserts_by_lock_key, verify_latest_backup, AssetUpsertInput, BarUpsertInput,
-    DatabaseManager, ReconciledClosedTradeInput, SignalUpsertInput, SnapshotInsertInput,
-    WorkingOrderInput,
+    DatabaseManager, FundingEventUpsertInput, ReconciledClosedTradeInput, SignalUpsertInput,
+    SnapshotInsertInput, WorkingOrderInput,
 };
 use mysql::params;
 use mysql::prelude::*;
@@ -30,6 +30,7 @@ fn test_mariadb_13_schema_views_and_default_extreme_config() {
             "alert_queue",
             "asset_cooldowns",
             "exchange_assets",
+            "funding_events",
             "ohlcv_bars",
             "order_audit",
             "portfolio_snapshots",
@@ -56,6 +57,25 @@ fn test_mariadb_13_schema_views_and_default_extreme_config() {
     assert_eq!(cfg.risk_tier(), RiskTier::Extreme);
     assert!((cfg.target_leverage_multiplier() - 1.85).abs() < 1e-9);
     assert_eq!(cfg.get_str("alert_provider", ""), "telegram");
+
+    // Verify init_schema(false) creates funding_events cleanly on existing DBs,
+    // and init_schema(true) drops/recreates all 11 tables cleanly (FK order).
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.query_drop("DROP TABLE IF EXISTS funding_events")
+            .unwrap();
+    }
+    db.init_schema(false)
+        .expect("init_schema(false) should recreate missing funding_events");
+    let (tables_after_migrate, _) = db.list_tables_and_views().unwrap();
+    assert_eq!(tables_after_migrate.len(), 11);
+    assert!(tables_after_migrate.contains(&"funding_events".to_string()));
+
+    db.init_schema(true)
+        .expect("init_schema(true) should drop and recreate all 11 tables cleanly");
+    let (tables_after_recreate, views_after_recreate) = db.list_tables_and_views().unwrap();
+    assert_eq!(tables_after_recreate.len(), 11);
+    assert_eq!(views_after_recreate.len(), 7);
 }
 
 #[test]
@@ -743,7 +763,8 @@ fn test_pnl_summary_horizon_baseline_funding_and_cap_cutoff() {
     }])
     .unwrap();
 
-    // Open position opened 2d ago with current mark $115 -> total uPnL = +$30.0 (24h delta = +$10.0)
+    // Open position opened 2d ago with current mark $115 -> total uPnL = +$30.0 (24h delta = +$10.0),
+    // funding_accrued_usdc = $3.0, fees_paid_usdc = $1.0
     let (open_id, _) = db
         .sync_open_position_from_exchange_v2(
             eth_id,
@@ -762,6 +783,14 @@ fn test_pnl_summary_horizon_baseline_funding_and_cap_cutoff() {
         )
         .unwrap();
     assert!(open_id > 0);
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            "UPDATE positions SET fees_paid_usdc = 1.0 WHERE id = :pid",
+            params! { "pid" => open_id },
+        )
+        .unwrap();
+    }
 
     // Closed trades: 1 trade 2d ago (+$500 realized, +$10 funding, -$2 fee) and 1 trade 2h ago (+$50 realized, +$5 funding, -$1 fee)
     db.reconcile_closed_positions_from_exchange_fills(&[
@@ -798,22 +827,97 @@ fn test_pnl_summary_horizon_baseline_funding_and_cap_cutoff() {
     ])
     .unwrap();
 
-    // open_fees_funding = +2.0 (3.0 funding - 1.0 open fee)
+    // Before funding_events exist, time-proration fallback prorates open funding (3.0 * ~1d/2d = ~1.50) for Daily
+    let fallback_summary = db.compute_pnl_summary(30.0, 2.0, 2562.0).unwrap();
+    assert!((fallback_summary.daily.unrealized_pnl_usdc - 11.5).abs() < 0.05);
+    assert!((fallback_summary.daily.fees_funding_usdc - 5.5).abs() < 0.05);
+    assert!((fallback_summary.weekly.unrealized_pnl_usdc - 32.0).abs() < 1e-6);
+
+    // Upsert per-event funding ledger: +2.00 at 36h ago (outside 24h) and +1.00 at 2h ago (inside 24h)
+    let thirty_six_h_ago = now - (36 * 3_600_000);
+    let upserted = db
+        .upsert_funding_events_batch(&[
+            FundingEventUpsertInput {
+                asset_id: eth_id,
+                coin: "ETH".to_string(),
+                event_time_ms: thirty_six_h_ago,
+                usdc: 2.0,
+                remaining_usdc: 2.0,
+                position_szi: 2.0,
+                funding_rate: 0.0001,
+                dedup_key: "eth-funding-36h".to_string(),
+            },
+            FundingEventUpsertInput {
+                asset_id: eth_id,
+                coin: "ETH".to_string(),
+                event_time_ms: two_hours_ago,
+                usdc: 1.0,
+                remaining_usdc: 1.0,
+                position_szi: 2.0,
+                funding_rate: 0.00005,
+                dedup_key: "eth-funding-2h".to_string(),
+            },
+        ])
+        .unwrap();
+    assert_eq!(upserted, 2);
+    // Re-upserting with identical dedup_key updates in place without duplicating rows
+    db.upsert_funding_events_batch(&[FundingEventUpsertInput {
+        asset_id: eth_id,
+        coin: "ETH".to_string(),
+        event_time_ms: two_hours_ago,
+        usdc: 1.0,
+        remaining_usdc: 1.0,
+        position_szi: 2.0,
+        funding_rate: 0.00005,
+        dedup_key: "eth-funding-2h".to_string(),
+    }])
+    .unwrap();
+    let evs = db.list_funding_events_for_asset(eth_id).unwrap();
+    assert_eq!(evs.len(), 2);
+    assert_eq!(evs[0].dedup_key, "eth-funding-36h");
+    assert_eq!(evs[1].dedup_key, "eth-funding-2h");
+
+    // Windowed funding_events attribution:
+    // - Daily (24h): gets only +1.0 open funding and 0 open entry fee (not +2.0 unwindowed!)
+    //   closed_rpnl=50.0, horizon_upnl_delta=10.0, open_funding=1.0 -> uPnL=11.0, net=61.0, fees_funding=4.0+1.0=5.0
+    // - Weekly (7d): open position opened inside 7d -> full +3.0 funding - 1.0 fee = +2.0
+    //   closed_rpnl=550.0, horizon_upnl_delta=30.0, open_fees_funding=2.0 -> uPnL=32.0, net=582.0, fees_funding=12.0+2.0=14.0
     let summary = db.compute_pnl_summary(30.0, 2.0, 2562.0).unwrap();
     assert!((summary.daily.baseline_equity_usdc - 2500.0).abs() < 1e-6);
     assert!((summary.daily.realized_pnl_usdc - 50.0).abs() < 1e-6);
-    assert!((summary.daily.unrealized_pnl_usdc - 12.0).abs() < 1e-6);
-    assert!((summary.daily.net_pnl_usdc - 62.0).abs() < 1e-6);
-    assert!((summary.daily.fees_funding_usdc - 6.0).abs() < 1e-6);
+    assert!((summary.daily.unrealized_pnl_usdc - 11.0).abs() < 1e-6);
+    assert!((summary.daily.net_pnl_usdc - 61.0).abs() < 1e-6);
+    assert!((summary.daily.fees_funding_usdc - 5.0).abs() < 1e-6);
     assert_eq!(summary.daily.trade_count, 1);
+    assert!(!summary.daily.is_cap_clamped);
 
     assert!((summary.weekly.baseline_equity_usdc - 2000.0).abs() < 1e-6);
     assert!((summary.weekly.realized_pnl_usdc - 550.0).abs() < 1e-6);
     assert!((summary.weekly.unrealized_pnl_usdc - 32.0).abs() < 1e-6);
     assert!((summary.weekly.net_pnl_usdc - 582.0).abs() < 1e-6);
+    assert!((summary.weekly.fees_funding_usdc - 14.0).abs() < 1e-6);
     assert_eq!(summary.weekly.trade_count, 2);
+    assert!(!summary.weekly.is_cap_clamped);
+    assert!(!summary.monthly.is_cap_clamped);
+    assert!(!summary.ytd.is_cap_clamped);
 
-    // Updating risk_capital_cap_usdc automatically advances risk_capital_cap_updated_at_ms
+    // Setting cap_updated_at_ms to 2 days ago clamps weekly/monthly/ytd (when > Jan 1) but NOT daily
+    db.set_config_value(
+        "risk_capital_cap_updated_at_ms",
+        &two_days_ago.to_string(),
+        None,
+    )
+    .unwrap();
+    let cap_2d_summary = db.compute_pnl_summary(30.0, 2.0, 2562.0).unwrap();
+    assert!(!cap_2d_summary.daily.is_cap_clamped);
+    assert!(cap_2d_summary.weekly.is_cap_clamped);
+    assert!(cap_2d_summary.monthly.is_cap_clamped);
+    assert_eq!(
+        cap_2d_summary.ytd.is_cap_clamped,
+        two_days_ago > ytd_start_ms()
+    );
+
+    // Updating risk_capital_cap_usdc automatically advances risk_capital_cap_updated_at_ms to now
     db.set_config_value("risk_capital_cap_usdc", "1500.0", None)
         .unwrap();
     let cfg_cap = db.load_config().unwrap();
@@ -821,6 +925,40 @@ fn test_pnl_summary_horizon_baseline_funding_and_cap_cutoff() {
     let post_cap_summary = db.compute_pnl_summary(30.0, 2.0, 2562.0).unwrap();
     assert_eq!(post_cap_summary.daily.trade_count, 0);
     assert_eq!(post_cap_summary.weekly.trade_count, 0);
+    assert!(post_cap_summary.daily.is_cap_clamped);
+    assert!(post_cap_summary.weekly.is_cap_clamped);
+    assert!(post_cap_summary.monthly.is_cap_clamped);
+    assert!(post_cap_summary.ytd.is_cap_clamped);
+    assert!((post_cap_summary.daily.fees_funding_usdc - 0.0).abs() < 1e-6);
+
+    // Time-proration fallback when funding_events has 0 rows: post-cap window attributes ~0.0 (not +2.0)
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.query_drop("DELETE FROM funding_events").unwrap();
+    }
+    let post_cap_fallback = db.compute_pnl_summary(30.0, 2.0, 2562.0).unwrap();
+    assert_eq!(post_cap_fallback.daily.trade_count, 0);
+    assert_eq!(post_cap_fallback.weekly.trade_count, 0);
+    assert!(post_cap_fallback.daily.fees_funding_usdc.abs() < 0.05);
+    assert!(post_cap_fallback.weekly.fees_funding_usdc.abs() < 0.05);
+    assert!((post_cap_fallback.daily.unrealized_pnl_usdc - 10.0).abs() < 0.05);
+
+    // Verify dedup_key clamping <= 128 chars in upsert_funding_events_batch
+    let long_key = "k".repeat(200);
+    db.upsert_funding_events_batch(&[FundingEventUpsertInput {
+        asset_id: eth_id,
+        coin: "ETH".to_string(),
+        event_time_ms: two_hours_ago,
+        usdc: 0.25,
+        remaining_usdc: 0.25,
+        position_szi: 2.0,
+        funding_rate: 0.00001,
+        dedup_key: long_key,
+    }])
+    .expect("overlong dedup_key must be clamped safely to <= 128 chars");
+    let clamped_evs = db.list_funding_events_for_asset(eth_id).unwrap();
+    assert_eq!(clamped_evs.len(), 1);
+    assert_eq!(clamped_evs[0].dedup_key.chars().count(), 128);
 
     // Retention pruning deletes >9d snapshots & logs while keeping recent rows
     let (pruned_snaps, pruned_logs) = db.prune_old_snapshots_and_logs(9).unwrap();

@@ -298,6 +298,12 @@ pub fn default_v2_system_config_seeds(
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),
         ("initial_paper_equity_usdc", "10000.0", "float", "Default starting equity in USDC for PAPER mode or empty account fallback"),
         ("live_exchange_equity_usdc", "0.0", "float", "Live Hyperliquid perp accountValue in USDC continuously synced by reconciler"),
+        ("live_exchange_equity_synced_at_ms", "0", "int", "Timestamp (ms) of latest successful Hyperliquid clearinghouseState equity sync"),
+        ("live_exchange_margin_used_usdc", "0.0", "float", "Latest synced Hyperliquid perp marginSummary.totalMarginUsed in USDC"),
+        ("live_exchange_withdrawable_usdc", "0.0", "float", "Latest synced Hyperliquid perp withdrawable USDC balance"),
+        ("live_exchange_open_orders_count", "0", "int", "Total resting Hyperliquid open orders from last reconcile (entry ALO + SL/TP triggers + passive closes)"),
+        ("live_exchange_spot_usdc", "0.0", "float", "Latest synced Hyperliquid spot USDC balance (informational; segregated from perp margin)"),
+        ("live_exchange_spot_synced_at_ms", "0", "int", "Timestamp (ms) of latest Hyperliquid spotClearinghouseState sync"),
         ("live_vault_info_json", "", "json", "Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
@@ -429,6 +435,12 @@ mod tests {
         assert_eq!(find("take_profit_atr_mult"), Some("2.8"));
         assert_eq!(find("take_profit_default_pct"), Some("0.055"));
         assert_eq!(find("live_vault_info_json"), Some(""));
+        assert_eq!(find("live_exchange_equity_synced_at_ms"), Some("0"));
+        assert_eq!(find("live_exchange_margin_used_usdc"), Some("0.0"));
+        assert_eq!(find("live_exchange_withdrawable_usdc"), Some("0.0"));
+        assert_eq!(find("live_exchange_open_orders_count"), Some("0"));
+        assert_eq!(find("live_exchange_spot_usdc"), Some("0.0"));
+        assert_eq!(find("live_exchange_spot_synced_at_ms"), Some("0"));
     }
 
     #[test]
