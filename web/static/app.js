@@ -46,6 +46,9 @@ const IMMUTABLE_SECURITY_KEYS = new Set([
   'live_exchange_open_orders_count',
   'live_exchange_spot_usdc',
   'live_exchange_spot_synced_at_ms',
+  'live_exchange_account_mode',
+  'live_exchange_perp_margin_equity_usdc',
+  'live_exchange_portfolio_pnl_json',
 ]);
 
 const SORT_COLLATOR = new Intl.Collator(undefined, {
@@ -1083,10 +1086,25 @@ function renderPnlHorizonRibbon(dash) {
     const usdcEl = document.getElementById(`pnl-${key}-usdc`);
     const subEl = document.getElementById(`pnl-${key}-sub`);
     const clampEl = document.getElementById(`pnl-${key}-clamp`);
+    const sourceEl = document.getElementById(`pnl-${key}-source`);
 
     if (cardEl) {
       cardEl.classList.remove('pos', 'neg', 'flat');
       cardEl.classList.add(tone);
+    }
+    if (sourceEl) {
+      if (String(h.pnl_source || '').toUpperCase() === 'HL_PORTFOLIO') {
+        sourceEl.textContent = 'HL Perps';
+        sourceEl.setAttribute(
+          'aria-label',
+          'Hyperliquid Perps exchange-reconciled PnL'
+        );
+        sourceEl.hidden = false;
+      } else {
+        sourceEl.textContent = '';
+        sourceEl.removeAttribute('aria-label');
+        sourceEl.hidden = true;
+      }
     }
     if (clampEl) {
       if (isClamped && clampTs > 0) {
@@ -1189,10 +1207,14 @@ function renderKpiCards(dash) {
 
   // Equity KPI card title, Option B effective figure, wallet strip & sync status
   const isCapBinding = Boolean(eb.is_cap_binding);
+  const isUnified = Boolean(eb.is_unified_account);
+  const perpMarginEq = toFiniteNumber(eb.perp_margin_equity_usdc) ?? 0;
   setTxt(
     'kpi-equity-title',
     isCapBinding
       ? 'Trading Equity (Cap Active)'
+      : isUnified
+      ? 'Trading Equity (Unified)'
       : isLiveOrTestnet
       ? 'Trading Equity (Perp)'
       : 'Total Portfolio Equity'
@@ -1206,19 +1228,30 @@ function renderKpiCards(dash) {
   const vaultEq = toFiniteNumber(dash?.vault_info?.total_vault_equity_usdc) ?? 0;
   const totalWalletEq =
     toFiniteNumber(eb.total_wallet_equity_usdc) ??
-    perpWalletEq + spotUsdc + vaultEq;
+    (isUnified ? perpWalletEq + vaultEq : perpWalletEq + spotUsdc + vaultEq);
   const capUsdc = toFiniteNumber(eb.risk_capital_cap_usdc) ?? 0;
   const syncedAtMs = toFiniteNumber(eb.synced_at_ms) ?? 0;
   const isStale = Boolean(eb.is_stale);
 
   if (walletEl) {
     if (isLiveOrTestnet) {
-      const items = [createWalletStripItem('Perp Wallet:', fmtUsd(perpWalletEq))];
-      if (spotUsdc > 0.005) {
-        items.push(createWalletStripItem('Spot:', fmtUsd(spotUsdc)));
-      }
-      if (spotUsdc > 0.005 || vaultEq > 0.005) {
-        items.push(createWalletStripItem('Total Wallet:', fmtUsd(totalWalletEq)));
+      const items = isUnified
+        ? [createWalletStripItem('Unified Wallet:', fmtUsd(perpWalletEq))]
+        : [createWalletStripItem('Perp Wallet:', fmtUsd(perpWalletEq))];
+      if (isUnified) {
+        if (perpMarginEq > 0.005) {
+          items.push(createWalletStripItem('Perp Margin:', fmtUsd(perpMarginEq)));
+        }
+        if (vaultEq > 0.005) {
+          items.push(createWalletStripItem('Total Wallet:', fmtUsd(totalWalletEq)));
+        }
+      } else {
+        if (spotUsdc > 0.005) {
+          items.push(createWalletStripItem('Spot:', fmtUsd(spotUsdc)));
+        }
+        if (spotUsdc > 0.005 || vaultEq > 0.005) {
+          items.push(createWalletStripItem('Total Wallet:', fmtUsd(totalWalletEq)));
+        }
       }
       walletEl.replaceChildren(...items);
       walletEl.hidden = false;
@@ -1537,11 +1570,13 @@ function renderVaultPanel(dash) {
     toFiniteNumber(eb.perp_wallet_equity_usdc) ??
     toFiniteNumber(dash?.snapshot?.total_equity_usdc) ??
     0;
+  const perpMarginEq = toFiniteNumber(eb.perp_margin_equity_usdc) ?? 0;
+  const isUnified = Boolean(eb.is_unified_account);
   const spotEq = toFiniteNumber(eb.spot_usdc) ?? 0;
   const totalVaultEq = toFiniteNumber(vi.total_vault_equity_usdc) ?? 0;
   const combinedEq =
     toFiniteNumber(vi.combined_portfolio_equity_usdc) ??
-    perpEq + spotEq + totalVaultEq;
+    (isUnified ? perpEq + totalVaultEq : perpEq + spotEq + totalVaultEq);
   const rawVaults = Array.isArray(vi.vaults) ? vi.vaults : [];
   const vaultCount = toFiniteNumber(vi.vault_count) ?? rawVaults.length;
   const configuredAddr = String(vi.configured_vault_address || '').trim();
@@ -1592,10 +1627,20 @@ function renderVaultPanel(dash) {
     syncedAtMs > 0 ? `Synced ${fmtLocalTime(syncedAtMs)}` : 'Awaiting vault sync'
   );
 
+  setTxt(
+    'vault-combined-title',
+    isUnified
+      ? 'Combined Wallet Equity (Unified + Vault)'
+      : 'Combined Wallet Equity (Perp + Spot + Vault)'
+  );
   setTxt('vault-combined-equity', fmtUsd(combinedEq, 2));
   setTxt(
     'vault-combined-breakdown',
-    spotEq > 0.005
+    isUnified
+      ? perpMarginEq > 0.005
+        ? `Unified ${fmtUsd(perpEq, 2)} (Perp Margin ${fmtUsd(perpMarginEq, 2)}) + Vault ${fmtUsd(totalVaultEq, 2)}`
+        : `Unified ${fmtUsd(perpEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
+      : spotEq > 0.005
       ? `Perp ${fmtUsd(perpEq, 2)} + Spot ${fmtUsd(spotEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
       : `Perp ${fmtUsd(perpEq, 2)} + Vault ${fmtUsd(totalVaultEq, 2)}`
   );

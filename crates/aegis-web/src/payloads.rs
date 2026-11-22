@@ -277,6 +277,9 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
                 | "live_exchange_open_orders_count"
                 | "live_exchange_spot_usdc"
                 | "live_exchange_spot_synced_at_ms"
+                | "live_exchange_account_mode"
+                | "live_exchange_perp_margin_equity_usdc"
+                | "live_exchange_portfolio_pnl_json"
         )
     {
         return Err(AegisError::SecurityViolation(format!(
@@ -528,6 +531,8 @@ pub fn build_vault_info_payload(
         };
     }
 
+    let is_unified =
+        aegis_core::is_unified_account_mode(&cfg.get_str("live_exchange_account_mode", "default"));
     let raw_spot = cfg.get_f64("live_exchange_spot_usdc", 0.0);
     let spot_usdc = if raw_spot.is_finite() {
         raw_spot.max(0.0)
@@ -544,7 +549,11 @@ pub fn build_vault_info_payload(
         return VaultInfoPayload {
             configured_vault_address,
             total_vault_equity_usdc: 0.0,
-            combined_portfolio_equity_usdc: round_dp(safe_perp_eq + spot_usdc, 2),
+            combined_portfolio_equity_usdc: if is_unified {
+                round_dp(safe_perp_eq, 2)
+            } else {
+                round_dp(safe_perp_eq + spot_usdc, 2)
+            },
             vault_count: 0,
             synced_at_ms: 0,
             vaults: Vec::new(),
@@ -585,8 +594,11 @@ pub fn build_vault_info_payload(
 
     info.configured_vault_address = configured_vault_address;
     info.total_vault_equity_usdc = total_vault_equity_usdc;
-    info.combined_portfolio_equity_usdc =
-        round_dp(safe_perp_eq + spot_usdc + total_vault_equity_usdc, 2);
+    info.combined_portfolio_equity_usdc = if is_unified {
+        round_dp(safe_perp_eq + total_vault_equity_usdc, 2)
+    } else {
+        round_dp(safe_perp_eq + spot_usdc + total_vault_equity_usdc, 2)
+    };
     info.vault_count = info.vaults.len();
     info
 }
@@ -737,6 +749,27 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     } else {
         0.0
     };
+    let account_mode = if is_live_or_testnet {
+        let m = cfg.get_str("live_exchange_account_mode", "default");
+        if m.trim().is_empty() {
+            "default".to_string()
+        } else {
+            m
+        }
+    } else {
+        "paper".to_string()
+    };
+    let is_unified_account =
+        is_live_or_testnet && aegis_core::is_unified_account_mode(&account_mode);
+    let perp_margin_equity_usdc = if is_unified_account {
+        round_dp(
+            cfg.get_f64("live_exchange_perp_margin_equity_usdc", 0.0)
+                .max(0.0),
+            2,
+        )
+    } else {
+        perp_wallet_equity_usdc
+    };
     let effective_equity_usdc = round_dp(snapshot.total_equity_usdc, 2);
     let risk_capital_cap_usdc = if is_live_or_testnet {
         round_dp(cfg.get_f64("risk_capital_cap_usdc", 0.0).max(0.0), 2)
@@ -750,14 +783,23 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         "PAPER_EQUITY"
     } else if is_cap_binding {
         "CAPPED_RISK_CAPITAL"
+    } else if is_unified_account {
+        "UNIFIED_ACCOUNT_VALUE"
     } else {
         "PERP_ACCOUNT_VALUE"
     }
     .to_string();
-    let total_wallet_equity_usdc = round_dp(
-        perp_wallet_equity_usdc + spot_usdc + vault_info.total_vault_equity_usdc,
-        2,
-    );
+    let total_wallet_equity_usdc = if is_unified_account {
+        round_dp(
+            perp_wallet_equity_usdc + vault_info.total_vault_equity_usdc,
+            2,
+        )
+    } else {
+        round_dp(
+            perp_wallet_equity_usdc + spot_usdc + vault_info.total_vault_equity_usdc,
+            2,
+        )
+    };
     let margin_used_usdc = if is_live_or_testnet {
         round_dp(
             cfg.get_f64("live_exchange_margin_used_usdc", 0.0).max(0.0),
@@ -789,6 +831,9 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         withdrawable_usdc,
         synced_at_ms,
         is_stale,
+        account_mode,
+        is_unified_account,
+        perp_margin_equity_usdc,
     };
 
     let dd_window_start = if cap_epoch_ms > 0 {

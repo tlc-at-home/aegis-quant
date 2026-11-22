@@ -2067,6 +2067,9 @@ async fn test_web_readonly_telemetry_keys_rejected_403() {
         "live_exchange_open_orders_count",
         "live_exchange_spot_usdc",
         "live_exchange_spot_synced_at_ms",
+        "live_exchange_account_mode",
+        "live_exchange_perp_margin_equity_usdc",
+        "live_exchange_portfolio_pnl_json",
     ];
 
     for key in readonly_keys {
@@ -2593,4 +2596,173 @@ async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl
     .unwrap();
     assert_eq!(unsynced_json["attached_tpsl_order_count"], 2);
     assert_eq!(unsynced_json["exchange_open_orders_count"], 3);
+}
+
+#[tokio::test]
+async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
+    use aegis_core::{
+        CachedHlPortfolioPnl, HlPortfolioWindowCache, VaultInfoPayload, VaultPositionInfo,
+    };
+
+    let now = now_ms();
+    let cap_ms = now - 3 * 86_400_000;
+    let d1_start = now - 86_400_000 - 3_600_000;
+    let w1_start = now - 7 * 86_400_000;
+    let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_account_mode", "unifiedAccount", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_perp_margin_equity_usdc", "679.15", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_usdc", "10978.37", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_spot_usdc", "10978.37", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_margin_used_usdc", "675.77", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_withdrawable_usdc", "10298.32", None)
+            .unwrap();
+        mgr.set_config_value(
+            "live_exchange_equity_synced_at_ms",
+            &(now - 2_000).to_string(),
+            None,
+        )
+        .unwrap();
+        mgr.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+            .unwrap();
+        mgr.set_config_value("risk_capital_cap_updated_at_ms", &cap_ms.to_string(), None)
+            .unwrap();
+
+        let vault_payload = VaultInfoPayload {
+            configured_vault_address: hlp_addr.to_string(),
+            total_vault_equity_usdc: 202.47,
+            combined_portfolio_equity_usdc: 11180.84,
+            vault_count: 1,
+            synced_at_ms: now - 2_000,
+            vaults: vec![VaultPositionInfo {
+                vault_address: hlp_addr.to_string(),
+                name: "HLP".to_string(),
+                leader: "0x677d831aef5328190852e24f13c46cac05f984e7".to_string(),
+                equity_usdc: 202.47,
+                pnl_usdc: 0.99,
+                all_time_pnl_usdc: 1.41,
+                pnl_pct: 0.49,
+                all_time_pnl_pct: 0.70,
+                apr_pct: 8.45,
+                days_following: 26,
+                locked_until_ms: 0,
+                is_locked: false,
+                is_closed: false,
+            }],
+        };
+        mgr.set_config_value(
+            "live_vault_info_json",
+            &serde_json::to_string(&vault_payload).unwrap(),
+            None,
+        )
+        .unwrap();
+
+        let hl_cache = CachedHlPortfolioPnl {
+            synced_at_ms: now - 2_000,
+            perp_day: HlPortfolioWindowCache {
+                pnl_history: vec![(d1_start, 0.0), (now - 1_000, 242.70)],
+                vlm: 1412.91,
+            },
+            perp_week: HlPortfolioWindowCache {
+                pnl_history: vec![
+                    (w1_start, 0.0),
+                    (cap_ms - 3_600_000, -100.0),
+                    (cap_ms + 3_600_000, -300.0),
+                    (now - 1_000, 362.52),
+                ],
+                vlm: 64604.1,
+            },
+            perp_month: HlPortfolioWindowCache {
+                pnl_history: vec![
+                    (w1_start, 0.0),
+                    (cap_ms - 3_600_000, -100.0),
+                    (cap_ms + 3_600_000, -300.0),
+                    (now - 1_000, 362.52),
+                ],
+                vlm: 83291.08,
+            },
+            perp_all_time: HlPortfolioWindowCache {
+                pnl_history: vec![
+                    (w1_start, 0.0),
+                    (cap_ms - 3_600_000, -100.0),
+                    (cap_ms + 3_600_000, -300.0),
+                    (now - 1_000, 362.52),
+                ],
+                vlm: 83291.08,
+            },
+        };
+        mgr.set_config_value(
+            "live_exchange_portfolio_pnl_json",
+            &serde_json::to_string(&hl_cache).unwrap(),
+            None,
+        )
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db, None);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let eb = &body["equity_basis"];
+    assert_eq!(eb["account_mode"], "unifiedAccount");
+    assert_eq!(eb["is_unified_account"], true);
+    assert!((eb["perp_margin_equity_usdc"].as_f64().unwrap() - 679.15).abs() < 1e-6);
+    assert!((eb["effective_equity_usdc"].as_f64().unwrap() - 1000.0).abs() < 1e-6);
+    assert_eq!(eb["is_cap_binding"], true);
+    assert!((eb["total_wallet_equity_usdc"].as_f64().unwrap() - 11180.84).abs() < 1e-6);
+    assert!(
+        (body["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 11180.84)
+            .abs()
+            < 1e-6
+    );
+
+    assert_eq!(body["pnl_summary"]["daily"]["pnl_source"], "HL_PORTFOLIO");
+    assert!(
+        (body["pnl_summary"]["daily"]["net_pnl_usdc"]
+            .as_f64()
+            .unwrap()
+            - 242.70)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(body["pnl_summary"]["daily"]["is_cap_clamped"], false);
+    assert_eq!(body["pnl_summary"]["weekly"]["pnl_source"], "HL_PORTFOLIO");
+    assert_eq!(body["pnl_summary"]["weekly"]["is_cap_clamped"], true);
+    assert!(
+        (body["pnl_summary"]["weekly"]["net_pnl_usdc"]
+            .as_f64()
+            .unwrap()
+            - 562.52)
+            .abs()
+            < 1e-4
+    );
 }

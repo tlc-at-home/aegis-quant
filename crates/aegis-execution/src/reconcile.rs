@@ -14,9 +14,10 @@ use crate::signing::{
 };
 use aegis_alerts::AlertEngine;
 use aegis_core::{
-    compute_vault_pnl_pct, mask_identifier, normalize_hyperliquid_symbol, now_ms, round_dp,
-    ConfigMap, ExchangeAsset, ExecutionMode, HeldAssetView, OrderSide, OrderedAssetView, Result,
-    VaultInfoPayload, VaultPositionInfo,
+    compute_vault_pnl_pct, is_unified_account_mode, mask_identifier, normalize_hyperliquid_symbol,
+    now_ms, round_dp, CachedHlPortfolioPnl, ConfigMap, ExchangeAsset, ExecutionMode, HeldAssetView,
+    HlPortfolioWindowCache, OrderSide, OrderedAssetView, Result, VaultInfoPayload,
+    VaultPositionInfo,
 };
 use aegis_db::{
     AssetUpsertInput, DatabaseManager, FundingEventUpsertInput, ReconciledClosedTradeInput,
@@ -36,6 +37,8 @@ const WORKING_ENTRY_GRACE_MS: i64 = 45_000;
 const WORKING_FILL_COMPLETE_RATIO: f64 = 0.85;
 const CAUSAL_CHAIN_MAX_DFS_STEPS: usize = 4096;
 pub const VAULT_SYNC_MIN_INTERVAL_MS: i64 = 60_000;
+pub const ABSTRACTION_SYNC_MIN_INTERVAL_MS: i64 = 300_000;
+pub const UNIFIED_SPOT_SYNC_MIN_INTERVAL_MS: i64 = 15_000;
 const MAX_VAULTS_TO_FETCH: usize = 20;
 
 type VaultSyncThrottleKey = (String, String, String);
@@ -43,6 +46,10 @@ static LAST_VAULT_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<VaultSyncThrottleKey, 
     OnceLock::new();
 type SpotSyncThrottleKey = (String, String);
 static LAST_SPOT_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<SpotSyncThrottleKey, i64>>> =
+    OnceLock::new();
+static LAST_ABSTRACTION_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<SpotSyncThrottleKey, i64>>> =
+    OnceLock::new();
+static LAST_PORTFOLIO_SYNC_ATTEMPT_MS: OnceLock<Mutex<HashMap<SpotSyncThrottleKey, i64>>> =
     OnceLock::new();
 
 fn parse_hl_f64_opt(val: Option<&Value>) -> Option<f64> {
@@ -183,12 +190,15 @@ pub fn parse_vault_position_info(
     parse_vault_position_info_with_raw_equity(vault_address, details, equity_fallback, now_ms_val).0
 }
 
-/// Parses a Hyperliquid `spotClearinghouseState` JSON payload and sums `"USDC"` `total` balances.
+/// Parses a Hyperliquid `spotClearinghouseState` JSON payload returning
+/// `(total_usdc, hold_usdc, available_after_maintenance_opt)`.
 /// Returns `None` if `"balances"` is missing or not a JSON array (so mock `[]` responses never
 /// clobber cached spot USDC).
-pub fn parse_spot_usdc_balance(spot_state: &Value) -> Option<f64> {
+pub fn parse_spot_usdc_details(spot_state: &Value) -> Option<(f64, f64, Option<f64>)> {
     let balances = spot_state.get("balances")?.as_array()?;
     let mut total_usdc = 0.0_f64;
+    let mut hold_usdc = 0.0_f64;
+    let mut usdc_token_id: Option<i64> = None;
     for entry in balances {
         let coin = entry
             .get("coin")
@@ -196,14 +206,111 @@ pub fn parse_spot_usdc_balance(spot_state: &Value) -> Option<f64> {
             .unwrap_or("")
             .trim();
         if coin.eq_ignore_ascii_case("USDC") {
+            if usdc_token_id.is_none() {
+                usdc_token_id = parse_hl_i64_opt(entry.get("token"));
+            }
             if let Some(amt) = parse_hl_f64_opt(entry.get("total")) {
                 if amt >= 0.0 {
                     total_usdc += amt;
                 }
             }
+            if let Some(hold) = parse_hl_f64_opt(entry.get("hold")) {
+                if hold >= 0.0 {
+                    hold_usdc += hold;
+                }
+            }
         }
     }
-    Some(total_usdc.max(0.0))
+    let target_token = usdc_token_id.unwrap_or(0);
+    let avail_after_maint = spot_state
+        .get("tokenToAvailableAfterMaintenance")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter().find_map(|pair| {
+                let items = pair.as_array()?;
+                let tid = parse_hl_i64_opt(items.first())?;
+                if tid == target_token {
+                    parse_hl_f64_opt(items.get(1)).filter(|v| *v >= 0.0)
+                } else {
+                    None
+                }
+            })
+        });
+    Some((total_usdc.max(0.0), hold_usdc.max(0.0), avail_after_maint))
+}
+
+/// Parses a Hyperliquid `spotClearinghouseState` JSON payload and sums `"USDC"` `total` balances.
+/// Returns `None` if `"balances"` is missing or not a JSON array (so mock `[]` responses never
+/// clobber cached spot USDC).
+pub fn parse_spot_usdc_balance(spot_state: &Value) -> Option<f64> {
+    parse_spot_usdc_details(spot_state).map(|(total, _, _)| total)
+}
+
+/// Parses a Hyperliquid `/info {"type":"portfolio"}` response into [`CachedHlPortfolioPnl`].
+/// Extracts `perpDay`, `perpWeek`, `perpMonth`, and `perpAllTime` `pnlHistory` series sorted
+/// ascending and deduplicated by timestamp. Returns `None` when all windows are empty.
+pub fn parse_hl_portfolio_pnl(raw: &Value, synced_at_ms: i64) -> Option<CachedHlPortfolioPnl> {
+    let entries = raw.as_array()?;
+    let parse_window = |obj: &Value| -> HlPortfolioWindowCache {
+        let mut raw_pts: Vec<(i64, f64)> = obj
+            .get("pnlHistory")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|pair| {
+                        let items = pair.as_array()?;
+                        let t = parse_hl_i64_opt(items.first())?;
+                        let v = parse_hl_f64_opt(items.get(1))?;
+                        Some((t, v))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        raw_pts.sort_by_key(|(t, _)| *t);
+        let mut deduped: Vec<(i64, f64)> = Vec::with_capacity(raw_pts.len());
+        for (t, v) in raw_pts {
+            if let Some(last) = deduped.last_mut() {
+                if last.0 == t {
+                    last.1 = v;
+                    continue;
+                }
+            }
+            deduped.push((t, v));
+        }
+        let vlm = parse_hl_f64_opt(obj.get("vlm")).unwrap_or(0.0).max(0.0);
+        HlPortfolioWindowCache {
+            pnl_history: deduped,
+            vlm,
+        }
+    };
+
+    let mut out = CachedHlPortfolioPnl {
+        synced_at_ms,
+        ..Default::default()
+    };
+    for item in entries {
+        let Some(pair) = item.as_array() else {
+            continue;
+        };
+        let Some(name) = pair.first().and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        let Some(obj) = pair.get(1) else {
+            continue;
+        };
+        match name {
+            "perpDay" => out.perp_day = parse_window(obj),
+            "perpWeek" => out.perp_week = parse_window(obj),
+            "perpMonth" => out.perp_month = parse_window(obj),
+            "perpAllTime" => out.perp_all_time = parse_window(obj),
+            _ => {}
+        }
+    }
+    let any_non_empty = !out.perp_day.pnl_history.is_empty()
+        || !out.perp_week.pnl_history.is_empty()
+        || !out.perp_month.pnl_history.is_empty()
+        || !out.perp_all_time.pnl_history.is_empty();
+    any_non_empty.then_some(out)
 }
 
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
@@ -1213,7 +1320,7 @@ impl CutoverReconciler {
         };
         let parse_f = |v: Option<&Value>| -> f64 { parse_f_opt(v).unwrap_or(0.0) };
 
-        // 1. Resolve live on-chain account equity strictly from Perp `marginSummary.accountValue`
+        // 1. Resolve perp margin accountValue plus Hyperliquid userAbstraction & spot collateral
         let perp_eq = {
             let m_eq = parse_f(ch_state.pointer("/marginSummary/accountValue"));
             let cm_eq = parse_f(ch_state.pointer("/crossMarginSummary/accountValue"));
@@ -1228,6 +1335,47 @@ impl CutoverReconciler {
         };
         let margin_used = parse_f(ch_state.pointer("/marginSummary/totalMarginUsed"));
         let withdrawable = parse_f(ch_state.get("withdrawable"));
+        let _ = self.db.set_config_value(
+            "live_exchange_perp_margin_equity_usdc",
+            &format!("{:.2}", round_dp(perp_eq.max(0.0), 2)),
+            Some("Latest synced Hyperliquid perp clearinghouseState marginSummary.accountValue in USDC"),
+        );
+
+        let account_mode = self
+            .sync_account_mode_if_due(&cfg, ts)
+            .unwrap_or_else(|| cfg.get_str("live_exchange_account_mode", "default"));
+        let is_unified = is_unified_account_mode(&account_mode);
+        let spot_interval = if is_unified {
+            UNIFIED_SPOT_SYNC_MIN_INTERVAL_MS
+        } else {
+            VAULT_SYNC_MIN_INTERVAL_MS
+        };
+        let fresh_spot = self.sync_spot_usdc_details_with_interval(&cfg, ts, spot_interval);
+        if let Some((spot_total, _, _)) = fresh_spot {
+            report.details.push(format!(
+                "Synced Hyperliquid spot USDC balance (${spot_total:.2}, account_mode={account_mode})"
+            ));
+        }
+
+        let (effective_wallet_eq, effective_withdrawable) = if is_unified {
+            let cached_spot = cfg.get_f64("live_exchange_spot_usdc", 0.0).max(0.0);
+            if let Some((st, sh, avail_opt)) = fresh_spot.filter(|(st, _, _)| *st >= 1.0) {
+                let free_spot = if sh > 0.0 {
+                    (st - sh).max(0.0)
+                } else {
+                    avail_opt.unwrap_or(st).max(0.0)
+                };
+                (st, free_spot.max(withdrawable))
+            } else if cached_spot >= 1.0 {
+                let free_spot = (cached_spot - margin_used).max(withdrawable).max(0.0);
+                (cached_spot, free_spot)
+            } else {
+                (perp_eq, withdrawable)
+            }
+        } else {
+            (perp_eq, withdrawable)
+        };
+
         let configured_live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
         let cap_unset = cfg
             .get("risk_capital_cap_usdc")
@@ -1244,16 +1392,16 @@ impl CutoverReconciler {
             cfg.get_f64("risk_capital_cap_usdc", 0.0)
         };
 
-        report.exchange_equity_usdc = if perp_eq >= 1.0 {
-            round_dp(perp_eq, 2)
+        report.exchange_equity_usdc = if effective_wallet_eq >= 1.0 {
+            round_dp(effective_wallet_eq, 2)
         } else {
             fallback_eq
         };
-        if perp_eq >= 1.0 {
+        if effective_wallet_eq >= 1.0 {
             let _ = self.db.set_config_value(
                 "live_exchange_equity_usdc",
                 &format!("{:.2}", report.exchange_equity_usdc),
-                Some("Latest reconciled Hyperliquid perp marginSummary.accountValue in USDC"),
+                Some("Latest reconciled Hyperliquid trading equity in USDC (unified spot+perp total on unified accounts, else perp marginSummary.accountValue)"),
             );
         }
         let _ = self.db.set_config_value(
@@ -1268,8 +1416,8 @@ impl CutoverReconciler {
         );
         let _ = self.db.set_config_value(
             "live_exchange_withdrawable_usdc",
-            &format!("{:.2}", round_dp(withdrawable.max(0.0), 2)),
-            Some("Latest synced Hyperliquid perp withdrawable USDC balance"),
+            &format!("{:.2}", round_dp(effective_withdrawable.max(0.0), 2)),
+            Some("Latest synced Hyperliquid withdrawable / free margin USDC balance"),
         );
 
         // Identify currently open coins & signed szi on Hyperliquid before clearing orphan openOrders
@@ -2107,15 +2255,17 @@ impl CutoverReconciler {
             );
         }
 
-        // 6. Throttled Hyperliquid spot USDC sync + vault info sync (at most once per 60s; strictly segregated from perp equity/margin)
-        if let Some(spot_usdc) = self.sync_spot_usdc_if_due(&cfg, ts) {
-            report.details.push(format!(
-                "Synced Hyperliquid spot USDC balance (${spot_usdc:.2}, segregated from perp margin)"
-            ));
+        // 6. Throttled Hyperliquid portfolio PnL sync + vault info sync (at most once per 60s)
+        let cfg_post_reconcile = self.db.load_config_or_default();
+        if let Some(port_cache) = self.sync_portfolio_pnl_if_due(&cfg_post_reconcile, ts) {
+            if let Some((_, day_last)) = port_cache.perp_day.pnl_history.last() {
+                report.details.push(format!(
+                    "Synced Hyperliquid portfolio PnL histories (perpDay={day_last:.2})"
+                ));
+            }
         }
-        let cfg_for_vault = self.db.load_config_or_default();
         if let Some(vault_snap) =
-            self.sync_vault_info_if_due(&cfg_for_vault, ts, Some(report.exchange_equity_usdc))
+            self.sync_vault_info_if_due(&cfg_post_reconcile, ts, Some(report.exchange_equity_usdc))
         {
             report.details.push(format!(
                 "Synced {} Hyperliquid vault(s) (vault_equity=${:.2}, segregated from perp margin)",
@@ -2141,6 +2291,70 @@ impl CutoverReconciler {
         Ok(report)
     }
 
+    /// Syncs Hyperliquid `userAbstraction` account mode at most once per [`ABSTRACTION_SYNC_MIN_INTERVAL_MS`] (5 min).
+    /// Persists `live_exchange_account_mode` only when a non-empty string mode is returned.
+    pub fn sync_account_mode_if_due(&self, cfg: &ConfigMap, now_ms_val: i64) -> Option<String> {
+        self.sync_account_mode_with_interval(cfg, now_ms_val, ABSTRACTION_SYNC_MIN_INTERVAL_MS)
+    }
+
+    /// Interval-parameterized `userAbstraction` sync helper used by [`Self::sync_account_mode_if_due`] and tests.
+    pub fn sync_account_mode_with_interval(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        min_interval_ms: i64,
+    ) -> Option<String> {
+        if !cfg.execution_mode().is_live_or_testnet() {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "");
+        let wallet_trimmed = wallet.trim();
+        if wallet_trimmed.is_empty() {
+            return None;
+        }
+        let key: SpotSyncThrottleKey = (
+            self.db.db_name().to_string(),
+            wallet_trimmed.to_ascii_lowercase(),
+        );
+        let eff_min_interval = min_interval_ms.max(0);
+        if eff_min_interval > 0 {
+            let map = LAST_ABSTRACTION_SYNC_ATTEMPT_MS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = map.lock();
+            if let Some(&last_attempt) = guard.get(&key) {
+                if now_ms_val >= last_attempt
+                    && now_ms_val.saturating_sub(last_attempt) < eff_min_interval
+                {
+                    return None;
+                }
+            }
+            if guard.len() > 256 {
+                guard.clear();
+            }
+            guard.insert(key, now_ms_val);
+        }
+
+        let mode_opt = match self.http.fetch_user_abstraction(wallet_trimmed, cfg) {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid userAbstraction fetch failed; keeping cached account mode"
+                );
+                return None;
+            }
+        };
+        let mode = mode_opt?;
+        if let Err(e) = self.db.set_config_value(
+            "live_exchange_account_mode",
+            &mode,
+            Some("Latest synced Hyperliquid userAbstraction mode (default, unifiedAccount, portfolioMargin)"),
+        ) {
+            tracing::warn!(error = %e, "Failed persisting live_exchange_account_mode");
+            return None;
+        }
+        Some(mode)
+    }
+
     /// Syncs Hyperliquid spot USDC balance at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s).
     /// Persists `live_exchange_spot_usdc` and `live_exchange_spot_synced_at_ms` without modifying `live_exchange_equity_usdc`.
     /// On fetch errors/timeouts/429s or payloads lacking `"balances"`, logs WARN/DEBUG and keeps the cached value.
@@ -2155,6 +2369,16 @@ impl CutoverReconciler {
         now_ms_val: i64,
         min_interval_ms: i64,
     ) -> Option<f64> {
+        self.sync_spot_usdc_details_with_interval(cfg, now_ms_val, min_interval_ms)
+            .map(|(total, _, _)| total)
+    }
+
+    fn sync_spot_usdc_details_with_interval(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        min_interval_ms: i64,
+    ) -> Option<(f64, f64, Option<f64>)> {
         if !cfg.execution_mode().is_live_or_testnet() {
             return None;
         }
@@ -2178,7 +2402,7 @@ impl CutoverReconciler {
                     tracing::debug!(
                         elapsed_ms = now_ms_val.saturating_sub(last_attempt),
                         min_interval_ms = eff_min_interval,
-                        "Skipping Hyperliquid spot USDC sync (in-memory 60s throttle active)"
+                        "Skipping Hyperliquid spot USDC sync (in-memory throttle active)"
                     );
                     return None;
                 }
@@ -2192,7 +2416,7 @@ impl CutoverReconciler {
                 tracing::debug!(
                     elapsed_ms = now_ms_val.saturating_sub(prev_sync_ms),
                     min_interval_ms = eff_min_interval,
-                    "Skipping Hyperliquid spot USDC sync (persisted 60s throttle active)"
+                    "Skipping Hyperliquid spot USDC sync (persisted throttle active)"
                 );
                 return None;
             }
@@ -2216,7 +2440,8 @@ impl CutoverReconciler {
             }
         };
 
-        let Some(raw_usdc) = parse_spot_usdc_balance(&spot_state) else {
+        let Some((raw_usdc, hold_usdc, avail_after_maint)) = parse_spot_usdc_details(&spot_state)
+        else {
             tracing::debug!(
                 "Hyperliquid spotClearinghouseState payload missing 'balances' array; keeping cached spot USDC"
             );
@@ -2238,7 +2463,120 @@ impl CutoverReconciler {
             Some("Timestamp (ms) of latest Hyperliquid spotClearinghouseState sync"),
         );
 
-        Some(spot_usdc)
+        Some((
+            spot_usdc,
+            round_dp(hold_usdc.max(0.0), 2),
+            avail_after_maint,
+        ))
+    }
+
+    /// Syncs Hyperliquid `portfolio` PnL histories (`perpDay`, `perpWeek`, `perpMonth`, `perpAllTime`)
+    /// at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s), bypassing throttle once when
+    /// `risk_capital_cap_updated_at_ms` advances past the cached snapshot timestamp.
+    pub fn sync_portfolio_pnl_if_due(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+    ) -> Option<CachedHlPortfolioPnl> {
+        self.sync_portfolio_pnl_with_interval(cfg, now_ms_val, VAULT_SYNC_MIN_INTERVAL_MS)
+    }
+
+    /// Interval-parameterized `portfolio` PnL sync helper used by [`Self::sync_portfolio_pnl_if_due`] and tests.
+    pub fn sync_portfolio_pnl_with_interval(
+        &self,
+        cfg: &ConfigMap,
+        now_ms_val: i64,
+        min_interval_ms: i64,
+    ) -> Option<CachedHlPortfolioPnl> {
+        if !cfg.execution_mode().is_live_or_testnet() {
+            return None;
+        }
+        let wallet = cfg.get_str("wallet_address", "");
+        let wallet_trimmed = wallet.trim();
+        if wallet_trimmed.is_empty() {
+            return None;
+        }
+        let key: SpotSyncThrottleKey = (
+            self.db.db_name().to_string(),
+            wallet_trimmed.to_ascii_lowercase(),
+        );
+        let eff_min_interval = min_interval_ms.max(0);
+        let cached_snapshot: Option<CachedHlPortfolioPnl> = {
+            let raw = cfg.get_str("live_exchange_portfolio_pnl_json", "");
+            (!raw.is_empty())
+                .then(|| serde_json::from_str::<CachedHlPortfolioPnl>(&raw).ok())
+                .flatten()
+        };
+        let cap_updated_at_ms = cfg.get_i64("risk_capital_cap_updated_at_ms", 0).max(0);
+
+        if eff_min_interval > 0 {
+            let map = LAST_PORTFOLIO_SYNC_ATTEMPT_MS.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = map.lock();
+            if let Some(&last_attempt) = guard.get(&key) {
+                let cap_advanced = cap_updated_at_ms > 0 && last_attempt < cap_updated_at_ms;
+                if !cap_advanced
+                    && now_ms_val >= last_attempt
+                    && now_ms_val.saturating_sub(last_attempt) < eff_min_interval
+                {
+                    return None;
+                }
+            }
+            if let Some(ref prev) = cached_snapshot {
+                let cap_advanced = cap_updated_at_ms > 0 && prev.synced_at_ms < cap_updated_at_ms;
+                if !cap_advanced
+                    && prev.synced_at_ms > 0
+                    && now_ms_val >= prev.synced_at_ms
+                    && now_ms_val.saturating_sub(prev.synced_at_ms) < eff_min_interval
+                {
+                    guard.insert(key, prev.synced_at_ms);
+                    return None;
+                }
+            }
+            if guard.len() > 256 {
+                guard.clear();
+            }
+            guard.insert(key, now_ms_val);
+        }
+
+        let raw_portfolio = match self.http.fetch_user_portfolio(wallet_trimmed, cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Hyperliquid portfolio PnL fetch failed; keeping cached portfolio snapshot"
+                );
+                return None;
+            }
+        };
+
+        let Some(parsed) = parse_hl_portfolio_pnl(&raw_portfolio, now_ms_val) else {
+            tracing::debug!(
+                "Hyperliquid portfolio response missing non-empty perp PnL histories; keeping cache"
+            );
+            return None;
+        };
+
+        match serde_json::to_string(&parsed) {
+            Ok(json_str) => {
+                if let Err(e) = self.db.set_config_value(
+                    "live_exchange_portfolio_pnl_json",
+                    &json_str,
+                    Some("Cached Hyperliquid portfolio perpDay/perpWeek/perpMonth/perpAllTime PnL snapshot JSON synced by reconciler (read-only)"),
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed persisting live_exchange_portfolio_pnl_json; keeping prior cache"
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed serializing CachedHlPortfolioPnl");
+                return None;
+            }
+        }
+
+        Some(parsed)
     }
 
     /// Syncs Hyperliquid vault equities and vault details at most once per [`VAULT_SYNC_MIN_INTERVAL_MS`] (60s).
@@ -2439,6 +2777,8 @@ impl CutoverReconciler {
         let perp_eq = perp_equity_override
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or_else(|| cfg.get_f64("live_exchange_equity_usdc", 0.0).max(0.0));
+        let is_unified =
+            is_unified_account_mode(&cfg.get_str("live_exchange_account_mode", "default"));
         let spot_eq = {
             let from_cfg = cfg.get_f64("live_exchange_spot_usdc", 0.0).max(0.0);
             if from_cfg > 0.0 || cfg.get_i64("live_exchange_spot_synced_at_ms", 0) > 0 {
@@ -2450,8 +2790,11 @@ impl CutoverReconciler {
                     .max(0.0)
             }
         };
-        let combined_portfolio_equity_usdc =
-            round_dp(perp_eq + spot_eq + total_vault_equity_usdc, 2);
+        let combined_portfolio_equity_usdc = if is_unified {
+            round_dp(perp_eq + total_vault_equity_usdc, 2)
+        } else {
+            round_dp(perp_eq + spot_eq + total_vault_equity_usdc, 2)
+        };
 
         let snapshot = VaultInfoPayload {
             configured_vault_address: configured_vault_trimmed.to_string(),
@@ -3184,6 +3527,44 @@ mod tests {
                 ]
             })),
             Some(5025.75)
+        );
+        assert_eq!(
+            parse_spot_usdc_details(&json!({
+                "balances": [
+                    { "coin": "USDC", "token": 0, "total": "10978.37", "hold": "680.05" }
+                ],
+                "tokenToAvailableAfterMaintenance": [[0, "10641.56"]]
+            })),
+            Some((10978.37, 680.05, Some(10641.56)))
+        );
+    }
+
+    #[test]
+    fn test_parse_hl_portfolio_pnl_variants() {
+        assert!(parse_hl_portfolio_pnl(&json!([]), 1000).is_none());
+        assert!(parse_hl_portfolio_pnl(&json!({}), 1000).is_none());
+        assert!(
+            parse_hl_portfolio_pnl(&json!([["perpDay", { "pnlHistory": [] }]]), 1000).is_none()
+        );
+
+        let parsed = parse_hl_portfolio_pnl(
+            &json!([
+                ["day", { "pnlHistory": [[100, "0.0"], [200, "250.0"]], "vlm": "1412.91" }],
+                ["perpDay", { "pnlHistory": [[200, "242.70"], [100, "0.0"], [200, "243.10"]], "vlm": "1412.91" }],
+                ["perpWeek", { "pnlHistory": [[50, "0.0"], [200, "362.52"]], "vlm": "64604.1" }],
+                ["perpAllTime", { "pnlHistory": [[10, "0.0"], [200, "362.52"]], "vlm": "83291.08" }]
+            ]),
+            999_999,
+        )
+        .unwrap();
+        assert_eq!(parsed.synced_at_ms, 999_999);
+        assert_eq!(parsed.perp_day.pnl_history, vec![(100, 0.0), (200, 243.10)]);
+        assert!((parsed.perp_day.vlm - 1412.91).abs() < 1e-6);
+        assert_eq!(parsed.perp_week.pnl_history, vec![(50, 0.0), (200, 362.52)]);
+        assert!(parsed.perp_month.pnl_history.is_empty());
+        assert_eq!(
+            parsed.perp_all_time.pnl_history,
+            vec![(10, 0.0), (200, 362.52)]
         );
     }
 

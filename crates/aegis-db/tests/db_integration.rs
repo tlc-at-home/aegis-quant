@@ -1876,3 +1876,205 @@ fn test_vault_config_seed_and_position_pnl_percentages() {
     assert!((closed_views[0].realized_pnl_usdc - 49.5).abs() < 1e-4);
     assert!((closed_views[0].realized_pnl_pct - 5.21).abs() < 1e-6);
 }
+
+#[test]
+fn test_pnl_summary_ignores_zero_volume_stale_candles_and_applies_hl_portfolio_cache() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let now = now_ms();
+    let day_ms = 86_400_000i64;
+    let two_days_ago = now - 2 * day_ms;
+    let three_days_ago = now - 3 * day_ms;
+    let twenty_five_h_ago = now - 25 * 3_600_000;
+
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+        .unwrap();
+    // Place cap update 3 days ago so Daily (24h) is unclamped while Weekly/Monthly/YTD are clamped.
+    db.set_config_value(
+        "risk_capital_cap_updated_at_ms",
+        &three_days_ago.to_string(),
+        None,
+    )
+    .unwrap();
+
+    let met_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "MET".to_string(),
+            asset_index: 5,
+            sz_decimals: 1,
+            tick_size: 0.00001,
+            lot_step_size: 1.0,
+            max_leverage: 3.0,
+            mark_price: 0.18872,
+            mid_price: 0.18872,
+            oracle_price: 0.18872,
+            funding_rate_hourly: 0.0005,
+            day_volume_usdc: 25_000.0,
+            open_interest_usdc: 100_000.0,
+            prev_day_price: 0.23652,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: true,
+        })
+        .unwrap();
+
+    // Open LONG 9614 @ 0.23227, current mark 0.18872 -> current_upnl = -418.6897, cumulative funding = +698.08
+    let _ = db
+        .sync_open_position_from_exchange_v2(
+            met_id,
+            "MET",
+            OrderSide::Long,
+            0.23227,
+            0.18872,
+            9614.0,
+            1814.35,
+            -418.69,
+            0.18,
+            0.18165,
+            0.25086,
+            698.08,
+            Some(two_days_ago - day_ms),
+        )
+        .unwrap();
+
+    // Carry-forward illiquid 1h bar at 25h ago with volume = 0.0 and stale close = 0.23652
+    db.upsert_ohlcv_bars(&[BarUpsertInput {
+        asset_id: met_id,
+        timeframe: "1h".to_string(),
+        timestamp_ms: twenty_five_h_ago,
+        open: 0.23652,
+        high: 0.23652,
+        low: 0.23652,
+        close: 0.23652,
+        volume: 0.0,
+        funding_rate: 0.0,
+    }])
+    .unwrap();
+
+    // Record 24h funding event +268.53 inside last 24h
+    db.upsert_funding_events_batch(&[FundingEventUpsertInput {
+        asset_id: met_id,
+        coin: "MET".to_string(),
+        event_time_ms: now - 3_600_000,
+        usdc: 268.53,
+        remaining_usdc: 268.53,
+        position_szi: 9614.0,
+        funding_rate: 0.0005,
+        dedup_key: "met-24h-funding".to_string(),
+    }])
+    .unwrap();
+
+    // 1. Local ledger must ignore the volume=0 stale candle (no phantom -$459.55 drop)
+    let local_summary = db.compute_pnl_summary(-418.69, 698.08, 679.15).unwrap();
+    assert_eq!(local_summary.daily.pnl_source, "LOCAL_LEDGER");
+    assert!((local_summary.daily.unrealized_pnl_usdc - 268.53).abs() < 0.05);
+    assert!((local_summary.daily.net_pnl_usdc - 268.53).abs() < 0.05);
+    assert!(!local_summary.daily.is_cap_clamped);
+    assert!(local_summary.weekly.is_cap_clamped);
+
+    // 2. Populate fresh CachedHlPortfolioPnl JSON
+    let hl_cache = aegis_core::CachedHlPortfolioPnl {
+        synced_at_ms: now - 5_000,
+        perp_day: aegis_core::HlPortfolioWindowCache {
+            pnl_history: vec![(now - day_ms - 1_800_000, 0.0), (now, 242.70)],
+            vlm: 1412.91,
+        },
+        perp_week: aegis_core::HlPortfolioWindowCache {
+            pnl_history: vec![
+                (three_days_ago - 3_600_000, -100.0),
+                (three_days_ago + 3_600_000, -300.0),
+                (now, 362.52),
+            ],
+            vlm: 64604.1,
+        },
+        perp_month: aegis_core::HlPortfolioWindowCache {
+            pnl_history: vec![
+                (three_days_ago - 3_600_000, -100.0),
+                (three_days_ago + 3_600_000, -300.0),
+                (now, 362.52),
+            ],
+            vlm: 83291.0,
+        },
+        perp_all_time: aegis_core::HlPortfolioWindowCache {
+            pnl_history: vec![
+                (three_days_ago - 3_600_000, -100.0),
+                (three_days_ago + 3_600_000, -300.0),
+                (now, 362.52),
+            ],
+            vlm: 83291.0,
+        },
+    };
+    db.set_config_value(
+        "live_exchange_portfolio_pnl_json",
+        &serde_json::to_string(&hl_cache).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    // Closed trade 2h ago (+12.00 realized) verifies unrealized = net - realized identity
+    db.reconcile_closed_positions_from_exchange_fills(&[ReconciledClosedTradeInput {
+        asset_id: met_id,
+        client_order_id: "hl-closed-met-2h".to_string(),
+        exchange_order_id: "hl-met-2h".to_string(),
+        side: OrderSide::Long,
+        entry_price: 0.20,
+        exit_price: 0.21,
+        filled_quantity: 120.0,
+        realized_pnl_usdc: 12.0,
+        fees_paid_usdc: 0.5,
+        funding_accrued_usdc: 0.5,
+        created_at_ms: now - 7_200_000,
+        closed_at_ms: now - 7_200_000,
+        exit_reason: "EXCHANGE_CLOSED".to_string(),
+    }])
+    .unwrap();
+
+    let hl_summary = db.compute_pnl_summary(-418.69, 698.08, 679.15).unwrap();
+    assert_eq!(hl_summary.daily.pnl_source, "HL_PORTFOLIO");
+    assert!(!hl_summary.daily.is_cap_clamped);
+    assert!((hl_summary.daily.net_pnl_usdc - 242.70).abs() < 1e-6);
+    assert!((hl_summary.daily.realized_pnl_usdc - 12.0).abs() < 1e-6);
+    assert!((hl_summary.daily.unrealized_pnl_usdc - 230.70).abs() < 1e-6);
+
+    // Weekly clamped at three_days_ago sits halfway between (-100) and (-300) => -200 => delta = 362.52 - (-200) = 562.52
+    assert_eq!(hl_summary.weekly.pnl_source, "HL_PORTFOLIO");
+    assert!(hl_summary.weekly.is_cap_clamped);
+    assert!((hl_summary.weekly.net_pnl_usdc - 562.52).abs() < 1e-4);
+
+    // 3. Stale cache (>10 min old) falls back to LOCAL_LEDGER
+    let stale_cache = aegis_core::CachedHlPortfolioPnl {
+        synced_at_ms: now - 700_000,
+        ..hl_cache.clone()
+    };
+    db.set_config_value(
+        "live_exchange_portfolio_pnl_json",
+        &serde_json::to_string(&stale_cache).unwrap(),
+        None,
+    )
+    .unwrap();
+    let stale_summary = db.compute_pnl_summary(-418.69, 698.08, 679.15).unwrap();
+    assert_eq!(stale_summary.daily.pnl_source, "LOCAL_LEDGER");
+    assert!((stale_summary.daily.net_pnl_usdc - 280.53).abs() < 0.05);
+
+    // 4. Cap updated AFTER synced_at_ms must also fall back to LOCAL_LEDGER for all horizons clamped by it
+    db.set_config_value(
+        "risk_capital_cap_updated_at_ms",
+        &(now - 1_000).to_string(),
+        None,
+    )
+    .unwrap();
+    let mid_cache = aegis_core::CachedHlPortfolioPnl {
+        synced_at_ms: now - 5_000,
+        ..hl_cache
+    };
+    db.set_config_value(
+        "live_exchange_portfolio_pnl_json",
+        &serde_json::to_string(&mid_cache).unwrap(),
+        None,
+    )
+    .unwrap();
+    let post_cap_fallback = db.compute_pnl_summary(-418.69, 698.08, 679.15).unwrap();
+    assert_eq!(post_cap_fallback.daily.pnl_source, "LOCAL_LEDGER");
+    assert_eq!(post_cap_fallback.weekly.pnl_source, "LOCAL_LEDGER");
+}

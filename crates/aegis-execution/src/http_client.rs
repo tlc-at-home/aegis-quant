@@ -769,6 +769,38 @@ impl HyperliquidHttpClient {
         )
     }
 
+    /// Polls `userAbstraction` for `user_wallet` (e.g. `"default"`, `"unifiedAccount"`, `"portfolioMargin"`).
+    /// Returns `Ok(None)` when the exchange payload is not a non-empty JSON string.
+    pub fn fetch_user_abstraction(
+        &self,
+        user_wallet: &str,
+        cfg: &ConfigMap,
+    ) -> Result<Option<String>> {
+        let raw = self.post_info(
+            &json!({
+                "type": "userAbstraction",
+                "user": user_wallet.trim(),
+            }),
+            cfg,
+        )?;
+        Ok(raw
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    }
+
+    /// Polls `portfolio` for `user_wallet` returning Hyperliquid cumulative PnL windows
+    /// (`day`/`week`/`month`/`allTime` and `perpDay`/`perpWeek`/`perpMonth`/`perpAllTime`).
+    pub fn fetch_user_portfolio(&self, user_wallet: &str, cfg: &ConfigMap) -> Result<Value> {
+        self.post_info(
+            &json!({
+                "type": "portfolio",
+                "user": user_wallet.trim(),
+            }),
+            cfg,
+        )
+    }
+
     /// Polls `userVaultEquities` for `user_wallet` returning Hyperliquid vault equity records.
     pub fn fetch_user_vault_equities(
         &self,

@@ -278,6 +278,15 @@ pub fn resolve_project_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Returns `true` when Hyperliquid `userAbstraction` indicates unified/portfolio collateral
+/// where `spotClearinghouseState` USDC `total` already encompasses perp margin allocation.
+pub fn is_unified_account_mode(mode: &str) -> bool {
+    matches!(
+        mode.trim().to_ascii_lowercase().as_str(),
+        "unifiedaccount" | "portfoliomargin"
+    )
+}
+
 /// Canonical default v2.0 `system_config` seed entries (`(key, value, value_type, description)`).
 pub fn default_v2_system_config_seeds(
 ) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
@@ -304,6 +313,9 @@ pub fn default_v2_system_config_seeds(
         ("live_exchange_open_orders_count", "0", "int", "Total resting Hyperliquid open orders from last reconcile (entry ALO + SL/TP triggers + passive closes)"),
         ("live_exchange_spot_usdc", "0.0", "float", "Latest synced Hyperliquid spot USDC balance (informational; segregated from perp margin)"),
         ("live_exchange_spot_synced_at_ms", "0", "int", "Timestamp (ms) of latest Hyperliquid spotClearinghouseState sync"),
+        ("live_exchange_account_mode", "default", "string", "Latest synced Hyperliquid userAbstraction mode (default, unifiedAccount, portfolioMargin)"),
+        ("live_exchange_perp_margin_equity_usdc", "0.0", "float", "Latest synced Hyperliquid perp clearinghouseState marginSummary.accountValue in USDC"),
+        ("live_exchange_portfolio_pnl_json", "", "json", "Cached Hyperliquid portfolio perpDay/perpWeek/perpMonth/perpAllTime PnL snapshot JSON synced by reconciler (read-only)"),
         ("live_vault_info_json", "", "json", "Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
@@ -441,6 +453,20 @@ mod tests {
         assert_eq!(find("live_exchange_open_orders_count"), Some("0"));
         assert_eq!(find("live_exchange_spot_usdc"), Some("0.0"));
         assert_eq!(find("live_exchange_spot_synced_at_ms"), Some("0"));
+        assert_eq!(find("live_exchange_account_mode"), Some("default"));
+        assert_eq!(find("live_exchange_perp_margin_equity_usdc"), Some("0.0"));
+        assert_eq!(find("live_exchange_portfolio_pnl_json"), Some(""));
+    }
+
+    #[test]
+    fn test_is_unified_account_mode() {
+        assert!(is_unified_account_mode("unifiedAccount"));
+        assert!(is_unified_account_mode(" unifiedaccount "));
+        assert!(is_unified_account_mode("portfolioMargin"));
+        assert!(is_unified_account_mode("PORTFOLIOMARGIN"));
+        assert!(!is_unified_account_mode("default"));
+        assert!(!is_unified_account_mode("standard"));
+        assert!(!is_unified_account_mode(""));
     }
 
     #[test]

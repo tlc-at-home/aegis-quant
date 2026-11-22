@@ -549,6 +549,8 @@ pub struct PnlHorizonMetrics {
     pub win_count: usize,
     #[serde(default)]
     pub is_cap_clamped: bool,
+    #[serde(default)]
+    pub pnl_source: String,
 }
 
 /// Multi-horizon PnL breakdown (`Daily 24h`, `Weekly 7d`, `Monthly 30d`, `YTD`) for the operator dashboard.
@@ -558,6 +560,122 @@ pub struct PnlSummary {
     pub weekly: PnlHorizonMetrics,
     pub monthly: PnlHorizonMetrics,
     pub ytd: PnlHorizonMetrics,
+}
+
+/// Compact time-series window parsed from Hyperliquid `/info {"type":"portfolio"}` (`perpDay`, `perpWeek`, `perpMonth`, `perpAllTime`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HlPortfolioWindowCache {
+    #[serde(default)]
+    pub pnl_history: Vec<(i64, f64)>,
+    #[serde(default)]
+    pub vlm: f64,
+}
+
+/// Cached Hyperliquid `portfolio` perp PnL histories persisted by reconciler (`live_exchange_portfolio_pnl_json`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CachedHlPortfolioPnl {
+    #[serde(default)]
+    pub synced_at_ms: i64,
+    #[serde(default)]
+    pub perp_day: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub perp_week: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub perp_month: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub perp_all_time: HlPortfolioWindowCache,
+}
+
+impl CachedHlPortfolioPnl {
+    /// Returns `true` when `synced_at_ms` is valid and no older than `max_age_ms` at `now_ms_val`.
+    pub fn is_fresh(&self, now_ms_val: i64, max_age_ms: i64) -> bool {
+        self.synced_at_ms > 0
+            && now_ms_val >= self.synced_at_ms
+            && now_ms_val.saturating_sub(self.synced_at_ms) <= max_age_ms
+    }
+
+    /// Linearly interpolates a cumulative PnL series sorted ascending by timestamp `(ts_ms, pnl)`.
+    pub fn interpolate_series_pnl(pts: &[(i64, f64)], target_ms: i64) -> Option<f64> {
+        let first = *pts.first()?;
+        let last = *pts.last()?;
+        if target_ms <= first.0 {
+            return first.1.is_finite().then_some(first.1);
+        }
+        if target_ms >= last.0 {
+            return last.1.is_finite().then_some(last.1);
+        }
+        for pair in pts.windows(2) {
+            let (t0, p0) = pair[0];
+            let (t1, p1) = pair[1];
+            if t0 <= target_ms && target_ms <= t1 {
+                if !p0.is_finite() || !p1.is_finite() {
+                    return None;
+                }
+                if t1 <= t0 {
+                    return Some(p1);
+                }
+                let frac = (target_ms - t0) as f64 / (t1 - t0) as f64;
+                return Some(p0 + (p1 - p0) * frac);
+            }
+        }
+        None
+    }
+
+    /// Resolves `(net_pnl_usdc, window_start_ms, is_cap_clamped)` for `"daily"`, `"weekly"`, `"monthly"`, or `"ytd"`.
+    pub fn horizon_net_pnl(
+        &self,
+        horizon: &str,
+        raw_start_ms: i64,
+        cap_updated_at_ms: i64,
+    ) -> Option<(f64, i64, bool)> {
+        let is_cap_clamped = cap_updated_at_ms > 0 && cap_updated_at_ms > raw_start_ms;
+        if is_cap_clamped {
+            if self.synced_at_ms < cap_updated_at_ms {
+                return None;
+            }
+            let candidates = [
+                &self.perp_day,
+                &self.perp_week,
+                &self.perp_month,
+                &self.perp_all_time,
+            ];
+            let series = candidates
+                .iter()
+                .copied()
+                .find(|w| {
+                    w.pnl_history
+                        .first()
+                        .is_some_and(|&(first_ts, _)| first_ts <= cap_updated_at_ms)
+                })
+                .or_else(|| {
+                    (!self.perp_all_time.pnl_history.is_empty()).then_some(&self.perp_all_time)
+                })?;
+            let (_, last_pnl) = *series.pnl_history.last()?;
+            let cap_pnl = Self::interpolate_series_pnl(&series.pnl_history, cap_updated_at_ms)?;
+            let net = last_pnl - cap_pnl;
+            return net.is_finite().then_some((net, cap_updated_at_ms, true));
+        }
+
+        let series = match horizon {
+            "daily" => &self.perp_day,
+            "weekly" => &self.perp_week,
+            "monthly" => &self.perp_month,
+            "ytd" => &self.perp_all_time,
+            _ => return None,
+        };
+        let &(first_ts, first_pnl) = series.pnl_history.first()?;
+        let &(_, last_pnl) = series.pnl_history.last()?;
+        if !first_pnl.is_finite() || !last_pnl.is_finite() {
+            return None;
+        }
+        if horizon == "ytd" && first_ts < raw_start_ms {
+            let start_pnl = Self::interpolate_series_pnl(&series.pnl_history, raw_start_ms)?;
+            let net = last_pnl - start_pnl;
+            return net.is_finite().then_some((net, raw_start_ms, false));
+        }
+        let net = last_pnl - first_pnl;
+        net.is_finite().then_some((net, first_ts, false))
+    }
 }
 
 /// Explicit equity & capital-sizing basis summary for UI transparency and reconciler sync status.
@@ -585,6 +703,12 @@ pub struct EquityBasisSummary {
     pub synced_at_ms: i64,
     #[serde(default)]
     pub is_stale: bool,
+    #[serde(default)]
+    pub account_mode: String,
+    #[serde(default)]
+    pub is_unified_account: bool,
+    #[serde(default)]
+    pub perp_margin_equity_usdc: f64,
 }
 
 /// 24-hour peak-to-trough portfolio drawdown circuit-breaker status.
@@ -781,5 +905,70 @@ mod tests {
         assert_eq!(compute_vault_pnl_pct(0.0, 0.0), 0.0);
         assert_eq!(compute_vault_pnl_pct(0.0, 5.0), 0.0);
         assert_eq!(compute_vault_pnl_pct(f64::NAN, 1.0), 0.0);
+    }
+
+    #[test]
+    fn test_cached_hl_portfolio_pnl_interpolation_and_horizons() {
+        let day_pts = vec![(1_000_000, 0.0), (1_086_400, 242.70)];
+        let week_pts = vec![
+            (500_000, 0.0),
+            (700_000, -100.0),
+            (800_000, -200.0),
+            (1_086_400, 362.50),
+        ];
+        let all_pts = vec![
+            (100_000, 0.0),
+            (400_000, 50.0),
+            (500_000, 100.0),
+            (1_086_400, 462.50),
+        ];
+        let cache = CachedHlPortfolioPnl {
+            synced_at_ms: 1_086_500,
+            perp_day: HlPortfolioWindowCache {
+                pnl_history: day_pts,
+                vlm: 1412.91,
+            },
+            perp_week: HlPortfolioWindowCache {
+                pnl_history: week_pts,
+                vlm: 64604.1,
+            },
+            perp_month: HlPortfolioWindowCache::default(),
+            perp_all_time: HlPortfolioWindowCache {
+                pnl_history: all_pts,
+                vlm: 83291.0,
+            },
+        };
+
+        assert!(cache.is_fresh(1_100_000, 600_000));
+        assert!(!cache.is_fresh(1_700_000, 600_000));
+
+        // Exact daily (cap = 750_000 < raw_start 1_000_000 -> not clamped)
+        let (daily_net, daily_ts, daily_clamped) =
+            cache.horizon_net_pnl("daily", 1_000_000, 750_000).unwrap();
+        assert!(!daily_clamped);
+        assert_eq!(daily_ts, 1_000_000);
+        assert!((daily_net - 242.70).abs() < 1e-6);
+
+        // Clamped weekly: cap = 750_000 sits halfway between (700_000, -100.0) and (800_000, -200.0) => -150.0
+        // Delta = 362.50 - (-150.0) = 512.50
+        let (wk_net, wk_ts, wk_clamped) =
+            cache.horizon_net_pnl("weekly", 400_000, 750_000).unwrap();
+        assert!(wk_clamped);
+        assert_eq!(wk_ts, 750_000);
+        assert!((wk_net - 512.50).abs() < 1e-6);
+
+        // Stale cap check: synced_at_ms < cap_updated_at_ms -> None (forces LOCAL_LEDGER fallback)
+        assert!(cache
+            .horizon_net_pnl("weekly", 400_000, 1_090_000)
+            .is_none());
+
+        // YTD with cap = 0 and first_ts < raw_start (450_000 sits halfway between 50 and 100 => 75; 462.50 - 75 = 387.50)
+        let (ytd_net, ytd_ts, ytd_clamped) = cache.horizon_net_pnl("ytd", 450_000, 0).unwrap();
+        assert!(!ytd_clamped);
+        assert_eq!(ytd_ts, 450_000);
+        assert!((ytd_net - 387.50).abs() < 1e-6);
+
+        // Empty monthly window returns None
+        assert!(cache.horizon_net_pnl("monthly", 400_000, 0).is_none());
     }
 }

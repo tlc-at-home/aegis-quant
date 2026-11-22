@@ -3,8 +3,8 @@
 use crate::engine::DatabaseManager;
 use aegis_core::{
     is_sensitive_config_key, mask_identifier, now_ms, round_dp, sanitize_telemetry_message,
-    ytd_start_ms, AegisError, AlertQueueRecord, OrderSide, PnlHorizonMetrics, PnlSummary,
-    PortfolioSnapshot, Result, TelemetryLogRecord,
+    ytd_start_ms, AegisError, AlertQueueRecord, CachedHlPortfolioPnl, OrderSide, PnlHorizonMetrics,
+    PnlSummary, PortfolioSnapshot, Result, TelemetryLogRecord,
 };
 use mysql::params;
 use mysql::prelude::*;
@@ -611,6 +611,16 @@ impl DatabaseManager {
         }
         .max(1.0);
 
+        let hl_portfolio_opt: Option<CachedHlPortfolioPnl> = if is_live_or_testnet {
+            let raw_json = cfg.get_str("live_exchange_portfolio_pnl_json", "");
+            (!raw_json.is_empty())
+                .then(|| serde_json::from_str::<CachedHlPortfolioPnl>(&raw_json).ok())
+                .flatten()
+                .filter(|c| c.is_fresh(now, 600_000))
+        } else {
+            None
+        };
+
         let mut conn = self.get_conn()?;
         let open_positions: Vec<OpenPnlPositionRow> = conn
             .query(
@@ -627,6 +637,7 @@ impl DatabaseManager {
             })?;
 
         let build_horizon = |conn: &mut mysql::PooledConn,
+                             horizon_key: &str,
                              label: &str,
                              raw_start_ms: i64|
          -> Result<PnlHorizonMetrics> {
@@ -708,9 +719,11 @@ impl DatabaseManager {
                     // Position opened inside this horizon: start unrealized PnL was 0
                     continue;
                 }
-                let bar_close_opt: Option<f64> = conn
+                // Fetch the latest candle at or before horizon start (1h preferred over 4h) and ignore
+                // zero-volume carry-forward bars, which freeze stale last-trade prices on illiquid books.
+                let bar_row_opt: Option<(f64, f64)> = conn
                     .exec_first(
-                        r#"SELECT close
+                        r#"SELECT close, volume
                            FROM ohlcv_bars
                            WHERE asset_id = :aid
                              AND timeframe IN ('1h', '4h')
@@ -718,13 +731,18 @@ impl DatabaseManager {
                            ORDER BY CASE WHEN timeframe = '1h' THEN 0 ELSE 1 END,
                                     timestamp_ms DESC
                            LIMIT 1"#,
-                        params! { "aid" => *asset_id, "start_ms" => eff_start_ms },
+                        params! {
+                            "aid" => *asset_id,
+                            "start_ms" => eff_start_ms,
+                        },
                     )
                     .map_err(|e| {
                         AegisError::Database(format!("compute_pnl_summary bar lookup failed: {e}"))
                     })?;
 
-                if let Some(bar_close) = bar_close_opt.filter(|&px| px.is_finite() && px > 0.0) {
+                if let Some((bar_close, _)) = bar_row_opt
+                    .filter(|&(px, vol)| px.is_finite() && px > 0.0 && vol.is_finite() && vol > 0.0)
+                {
                     let side = OrderSide::parse(side_str);
                     start_upnl += (bar_close - *entry_price) * *qty * side.sign();
                 } else if snap_ts_opt.is_some_and(|st| st <= eff_start_ms)
@@ -782,12 +800,44 @@ impl DatabaseManager {
 
             let horizon_upnl_delta = current_unrealized_pnl - start_upnl;
             let realized_pnl_usdc = round_dp(closed_rpnl, 2);
-            let unrealized_pnl_usdc = round_dp(horizon_upnl_delta + horizon_open_fees_funding, 2);
-            let net_pnl_usdc = round_dp(
-                closed_rpnl + horizon_upnl_delta + horizon_open_fees_funding,
-                2,
-            );
             let fees_funding_usdc = round_dp(closed_fees_funding + horizon_open_fees_funding, 2);
+
+            let hl_match = hl_portfolio_opt
+                .as_ref()
+                .and_then(|hl| hl.horizon_net_pnl(horizon_key, raw_start_ms, cap_updated_at_ms))
+                .filter(|(net, _, _)| net.is_finite());
+
+            let (
+                net_pnl_usdc,
+                unrealized_pnl_usdc,
+                final_window_start_ms,
+                final_is_cap_clamped,
+                pnl_source,
+            ) = if let Some((hl_net_pnl, hl_win_start, hl_clamped)) = hl_match {
+                let net = round_dp(hl_net_pnl, 2);
+                let unrl = round_dp(net - realized_pnl_usdc, 2);
+                let win_ms = if hl_clamped {
+                    eff_start_ms
+                } else if hl_win_start > 0 {
+                    hl_win_start
+                } else {
+                    eff_start_ms
+                };
+                (net, unrl, win_ms, hl_clamped, "HL_PORTFOLIO".to_string())
+            } else {
+                let unrl = round_dp(horizon_upnl_delta + horizon_open_fees_funding, 2);
+                let net = round_dp(
+                    closed_rpnl + horizon_upnl_delta + horizon_open_fees_funding,
+                    2,
+                );
+                (
+                    net,
+                    unrl,
+                    eff_start_ms,
+                    is_cap_clamped,
+                    "LOCAL_LEDGER".to_string(),
+                )
+            };
 
             let return_pct = if baseline_equity_usdc > 0.0 {
                 round_dp((net_pnl_usdc / baseline_equity_usdc) * 100.0, 2)
@@ -797,7 +847,7 @@ impl DatabaseManager {
 
             Ok(PnlHorizonMetrics {
                 horizon_label: label.to_string(),
-                window_start_ms: eff_start_ms,
+                window_start_ms: final_window_start_ms,
                 baseline_equity_usdc,
                 net_pnl_usdc,
                 return_pct,
@@ -806,15 +856,16 @@ impl DatabaseManager {
                 fees_funding_usdc,
                 trade_count: trade_cnt.max(0) as usize,
                 win_count: win_cnt.max(0) as usize,
-                is_cap_clamped,
+                is_cap_clamped: final_is_cap_clamped,
+                pnl_source,
             })
         };
 
         let day_ms = 86_400_000i64;
-        let daily = build_horizon(&mut conn, "DAILY (24H)", now - day_ms)?;
-        let weekly = build_horizon(&mut conn, "WEEKLY (7D)", now - 7 * day_ms)?;
-        let monthly = build_horizon(&mut conn, "MONTHLY (30D)", now - 30 * day_ms)?;
-        let ytd = build_horizon(&mut conn, "YTD", ytd_start_ms())?;
+        let daily = build_horizon(&mut conn, "daily", "DAILY (24H)", now - day_ms)?;
+        let weekly = build_horizon(&mut conn, "weekly", "WEEKLY (7D)", now - 7 * day_ms)?;
+        let monthly = build_horizon(&mut conn, "monthly", "MONTHLY (30D)", now - 30 * day_ms)?;
+        let ytd = build_horizon(&mut conn, "ytd", "YTD", ytd_start_ms())?;
 
         Ok(PnlSummary {
             daily,

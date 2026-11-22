@@ -4455,3 +4455,147 @@ fn test_reconcile_multi_lot_dca_partial_close_funding_conservation_and_pnl() {
 
     let _ = stop_tx.send(());
 }
+
+#[test]
+fn test_unified_account_equity_no_double_count_and_hl_portfolio_pnl_sync() {
+    let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+    let now = now_ms();
+    let cap_ms = now - 3 * 86_400_000;
+    let d1_start = now - 86_400_000 - 3_600_000;
+    let w1_start = now - 7 * 86_400_000;
+
+    let (port, stop_tx) = spawn_mock_hl_server(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "userAbstraction" => (200, json!("unifiedAccount")),
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": {
+                            "accountValue": "679.151704",
+                            "totalNtlPos": "2267.552108",
+                            "totalMarginUsed": "675.765769"
+                        },
+                        "withdrawable": "0.0",
+                        "assetPositions": []
+                    }),
+                ),
+                "spotClearinghouseState" => (
+                    200,
+                    json!({
+                        "balances": [
+                            { "coin": "USDC", "token": 0, "total": "10978.372686", "hold": "680.047375", "entryNtl": "0.0" }
+                        ],
+                        "tokenToAvailableAfterMaintenance": [[0, "10641.560205"]]
+                    }),
+                ),
+                "userVaultEquities" => (
+                    200,
+                    json!([{ "vaultAddress": hlp_addr, "equity": "202.47", "lockedUntilTimestamp": 0 }]),
+                ),
+                "vaultDetails" => (
+                    200,
+                    json!({
+                        "name": "HLP",
+                        "vaultAddress": hlp_addr,
+                        "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                        "isClosed": false,
+                        "apr": 0.0845,
+                        "followerState": {
+                            "vaultEquity": "202.47",
+                            "pnl": "0.99",
+                            "allTimePnl": "1.41",
+                            "daysFollowing": 26,
+                            "lockupUntil": 0
+                        }
+                    }),
+                ),
+                "portfolio" => (
+                    200,
+                    json!([
+                        ["perpDay", {
+                            "pnlHistory": [[d1_start, "0.0"], [now - 60_000, "242.70"]],
+                            "vlm": "1412.91"
+                        }],
+                        ["perpWeek", {
+                            "pnlHistory": [
+                                [w1_start, "0.0"],
+                                [cap_ms - 3_600_000, "-100.0"],
+                                [cap_ms + 3_600_000, "-300.0"],
+                                [now - 60_000, "362.52"]
+                            ],
+                            "vlm": "64604.1"
+                        }],
+                        ["perpMonth", {
+                            "pnlHistory": [
+                                [w1_start, "0.0"],
+                                [cap_ms - 3_600_000, "-100.0"],
+                                [cap_ms + 3_600_000, "-300.0"],
+                                [now - 60_000, "362.52"]
+                            ],
+                            "vlm": "83291.08"
+                        }],
+                        ["perpAllTime", {
+                            "pnlHistory": [
+                                [w1_start, "0.0"],
+                                [cap_ms - 3_600_000, "-100.0"],
+                                [cap_ms + 3_600_000, "-300.0"],
+                                [now - 60_000, "362.52"]
+                            ],
+                            "vlm": "83291.08"
+                        }]
+                    ]),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, port);
+    db.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", &cap_ms.to_string(), None)
+        .unwrap();
+
+    let rep = engine.reconciler.run_cutover_reconciliation(false).unwrap();
+    assert!((rep.exchange_equity_usdc - 10978.37).abs() < 1e-6);
+
+    let cfg = db.load_config_or_default();
+    assert_eq!(
+        cfg.get_str("live_exchange_account_mode", ""),
+        "unifiedAccount"
+    );
+    assert!((cfg.get_f64("live_exchange_perp_margin_equity_usdc", 0.0) - 679.15).abs() < 1e-6);
+    assert!((cfg.get_f64("live_exchange_equity_usdc", 0.0) - 10978.37).abs() < 1e-6);
+    assert!((cfg.get_f64("live_exchange_spot_usdc", 0.0) - 10978.37).abs() < 1e-6);
+    // Free spot collateral = total (10978.37) - hold (680.05) = 10298.32
+    assert!((cfg.get_f64("live_exchange_withdrawable_usdc", 0.0) - 10298.32).abs() < 0.02);
+
+    // Vault combined equity must NOT double-count $679.15 perp margin on unified accounts: 10978.37 + 202.47 = 11180.84
+    let vault_info: aegis_core::VaultInfoPayload =
+        serde_json::from_str(&cfg.get_str("live_vault_info_json", "")).unwrap();
+    assert!((vault_info.combined_portfolio_equity_usdc - 11180.84).abs() < 1e-6);
+
+    // Option B snapshot uses capped $1,000.00 equity with available_cash == $1,000.00 (no positions)
+    let snap = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!((snap.total_equity_usdc - 1000.0).abs() < 1e-6);
+    assert!((snap.available_cash_usdc - 1000.0).abs() < 1e-6);
+
+    // Hybrid HL portfolio PnL: daily = 242.70 (HL_PORTFOLIO), weekly clamped = 562.52
+    let pnl = db
+        .compute_pnl_summary(0.0, 0.0, snap.total_equity_usdc)
+        .unwrap();
+    assert_eq!(pnl.daily.pnl_source, "HL_PORTFOLIO");
+    assert!((pnl.daily.net_pnl_usdc - 242.70).abs() < 1e-6);
+    assert!(!pnl.daily.is_cap_clamped);
+    assert_eq!(pnl.weekly.pnl_source, "HL_PORTFOLIO");
+    assert!(pnl.weekly.is_cap_clamped);
+    assert!((pnl.weekly.net_pnl_usdc - 562.52).abs() < 1e-4);
+
+    let _ = stop_tx.send(());
+}
