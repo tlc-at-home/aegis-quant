@@ -317,6 +317,11 @@ pub fn default_v2_system_config_seeds(
         ("live_exchange_perp_margin_equity_usdc", "0.0", "float", "Latest synced Hyperliquid perp clearinghouseState marginSummary.accountValue in USDC"),
         ("live_exchange_portfolio_pnl_json", "", "json", "Cached Hyperliquid portfolio perpDay/perpWeek/perpMonth/perpAllTime PnL snapshot JSON synced by reconciler (read-only)"),
         ("live_vault_info_json", "", "json", "Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
+        ("hyperliquid_vault_address", "", "string", "Configured Hyperliquid Vault EVM address (0x...) tracked alongside active wallet vault deposits"),
+        ("vault_role", "follower", "string", "Vault operating role: follower (Barbell/HLP), operator (Aegis-led User Vault), or none"),
+        ("vault_target_allocation_pct", "0.0", "float", "Target percentage of combined wallet equity allocated to Hyperliquid vaults (0-100%, informational barbell benchmark)"),
+        ("vault_profit_sweep_threshold_usdc", "0.0", "float", "Realized perp profit threshold in USDC (0 disables) for operator vault profit-sweep reminders"),
+        ("vault_notes", "", "string", "Operator vault thesis, mandate, and maintenance notes (plain text, max 500 chars)"),
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
         ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
@@ -451,6 +456,11 @@ mod tests {
         assert_eq!(find("take_profit_atr_mult"), Some("2.8"));
         assert_eq!(find("take_profit_default_pct"), Some("0.055"));
         assert_eq!(find("live_vault_info_json"), Some(""));
+        assert_eq!(find("hyperliquid_vault_address"), Some(""));
+        assert_eq!(find("vault_role"), Some("follower"));
+        assert_eq!(find("vault_target_allocation_pct"), Some("0.0"));
+        assert_eq!(find("vault_profit_sweep_threshold_usdc"), Some("0.0"));
+        assert_eq!(find("vault_notes"), Some(""));
         assert_eq!(find("live_exchange_equity_synced_at_ms"), Some("0"));
         assert_eq!(find("live_exchange_margin_used_usdc"), Some("0.0"));
         assert_eq!(find("live_exchange_withdrawable_usdc"), Some("0.0"));

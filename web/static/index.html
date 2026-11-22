@@ -337,6 +337,22 @@
         <div class="panel-actions">
           <span class="vault-config-badge" id="vault-configured-badge" hidden></span>
           <span class="status-pill watch" id="vault-sync-pill">0 VAULTS</span>
+          <button
+            type="button"
+            class="action-btn vault-manage-btn"
+            id="btn-open-vault-modal"
+            command="show-modal"
+            commandfor="vault-manager-modal"
+            title="Configure Hyperliquid Vault tracking, barbell allocation targets, and inspect live vault facts"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+              <circle cx="12" cy="12" r="3"></circle>
+              <line x1="12" y1="9" x2="12" y2="7"></line>
+              <line x1="12" y1="17" x2="12" y2="15"></line>
+            </svg>
+            <span>⚙ Manage Vault</span>
+          </button>
         </div>
       </div>
 
@@ -1722,6 +1738,252 @@
       </form>
     </div>
   </div>
+
+  <!-- ========================================================================
+       NATIVE HYPERLIQUID VAULT MAINTENANCE & LIVE FACTS MODAL (<dialog>)
+       ======================================================================== -->
+  <dialog id="vault-manager-modal" class="aegis-native-dialog vault-modal" closedby="any" aria-labelledby="vault-modal-title">
+    <div id="vault-form-announcer" aria-live="polite" class="visually-hidden"></div>
+    <div class="vault-modal-header">
+      <div class="panel-title-cluster">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+          <circle cx="12" cy="12" r="3"></circle>
+          <line x1="12" y1="9" x2="12" y2="7"></line>
+          <line x1="12" y1="17" x2="12" y2="15"></line>
+          <line x1="9" y1="12" x2="7" y2="12"></line>
+          <line x1="17" y1="12" x2="15" y2="12"></line>
+        </svg>
+        <div>
+          <h2 class="panel-title" id="vault-modal-title">Hyperliquid Vault Maintenance &amp; Live Facts</h2>
+          <div class="panel-subtitle">Segregated vault tracking · Live Hyperliquid L1 metadata · Barbell targets &amp; operator readiness</div>
+        </div>
+      </div>
+      <div class="vault-modal-header-actions">
+        <span class="status-pill watch" id="vault-modal-network-pill">TESTNET</span>
+        <button
+          type="button"
+          class="close-btn"
+          id="btn-close-vault-modal"
+          command="close"
+          commandfor="vault-manager-modal"
+        >✕ Close</button>
+      </div>
+    </div>
+
+    <div class="vault-modal-body">
+      <div class="vault-modal-grid">
+        <!-- LEFT PANE: VAULT MAINTENANCE FORM -->
+        <section class="vault-modal-pane vault-modal-left" aria-labelledby="vault-form-heading">
+          <div class="vault-pane-header">
+            <h3 class="vault-section-heading" id="vault-form-heading">Vault Configuration &amp; Maintenance</h3>
+            <span class="vault-segregated-tag">Non-Custodial</span>
+          </div>
+
+          <form id="vault-manager-form" action="/api/v1/config" method="POST" aria-labelledby="vault-form-heading">
+            <fieldset class="vault-fieldset">
+              <legend>Tracked Hyperliquid Vault</legend>
+              <div class="vault-field">
+                <label for="vault-address-input">Hyperliquid Vault EVM Address</label>
+                <span id="vault-address-hint" class="vault-field-hint">Optional 42-char EVM address (0x + 40 hex chars). Leave blank to track wallet deposits only.</span>
+                <input
+                  type="text"
+                  id="vault-address-input"
+                  name="hyperliquid_vault_address"
+                  class="vault-input vault-mono-input"
+                  autofocus
+                  placeholder="0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+                  pattern="^$|^0[xX][0-9a-fA-F]{40}$"
+                  maxlength="64"
+                  autocorrect="off"
+                  autocapitalize="none"
+                  spellcheck="false"
+                  autocomplete="off"
+                  enterkeyhint="next"
+                  aria-describedby="vault-address-hint"
+                  data-error="vault-address-error"
+                />
+                <div id="vault-address-error" class="vault-error-msg">
+                  <span role="img" aria-label="Error">❌</span>
+                  <span>Enter a valid 42-character EVM address starting with 0x (40 hex digits), or leave blank.</span>
+                </div>
+              </div>
+
+              <div class="vault-helper-actions">
+                <button type="button" class="vault-helper-btn inspect" id="btn-vault-inspect">Inspect Live Facts</button>
+                <button type="button" class="vault-helper-btn preset" id="btn-vault-use-hlp">Use Official HLP</button>
+                <button type="button" class="vault-helper-btn clear" id="btn-vault-clear-addr">Clear</button>
+              </div>
+            </fieldset>
+
+            <fieldset class="vault-fieldset vault-role-fieldset">
+              <legend>Vault Operating Role</legend>
+              <div class="vault-radio-group">
+                <div class="vault-radio-item">
+                  <input type="radio" id="vault-role-follower" name="vault_role" value="follower" checked />
+                  <label for="vault-role-follower">
+                    <span class="vault-radio-title">Follower (Barbell / HLP)</span>
+                    <span class="vault-radio-desc">Track idle capital &amp; swept perp profits parked in HLP or third-party vaults.</span>
+                  </label>
+                </div>
+                <div class="vault-radio-item">
+                  <input type="radio" id="vault-role-operator" name="vault_role" value="operator" />
+                  <label for="vault-role-operator">
+                    <span class="vault-radio-title">Operator (Aegis-Led User Vault)</span>
+                    <span class="vault-radio-desc">Monitor readiness for operating a Hyperliquid User Vault (master wallet signs vault lifecycle).</span>
+                  </label>
+                </div>
+                <div class="vault-radio-item">
+                  <input type="radio" id="vault-role-none" name="vault_role" value="none" />
+                  <label for="vault-role-none">
+                    <span class="vault-radio-title">None (Passive Monitoring)</span>
+                    <span class="vault-radio-desc">Display synced wallet vault balances passively without barbell targets.</span>
+                  </label>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="vault-fieldset">
+              <legend>Barbell Allocation &amp; Profit-Sweep Benchmarks</legend>
+              <div class="vault-field">
+                <label for="vault-target-alloc-input">Target Vault Allocation (% of Combined Equity)</label>
+                <span id="vault-target-alloc-hint" class="vault-field-hint">Informational barbell target from 0% to 100% (up to 2 decimal places). Does not alter perp margin.</span>
+                <input
+                  type="number"
+                  id="vault-target-alloc-input"
+                  name="vault_target_allocation_pct"
+                  class="vault-input vault-mono-input"
+                  min="0"
+                  max="100"
+                  step="0.01"
+                  inputmode="decimal"
+                  enterkeyhint="next"
+                  aria-describedby="vault-target-alloc-hint"
+                  data-error="vault-target-alloc-error"
+                  value="0"
+                />
+                <div id="vault-target-alloc-error" class="vault-error-msg">
+                  <span role="img" aria-label="Error">❌</span>
+                  <span>Enter a target allocation percentage between 0 and 100.</span>
+                </div>
+              </div>
+
+              <div class="vault-field">
+                <label for="vault-sweep-threshold-input">Profit-Sweep Reminder Threshold (USDC)</label>
+                <span id="vault-sweep-threshold-hint" class="vault-field-hint">Realized perp profit in USDC triggering a manual vault sweep reminder (0 disables).</span>
+                <input
+                  type="number"
+                  id="vault-sweep-threshold-input"
+                  name="vault_profit_sweep_threshold_usdc"
+                  class="vault-input vault-mono-input"
+                  min="0"
+                  max="10000000"
+                  step="0.01"
+                  inputmode="decimal"
+                  enterkeyhint="next"
+                  aria-describedby="vault-sweep-threshold-hint"
+                  data-error="vault-sweep-threshold-error"
+                  value="0"
+                />
+                <div id="vault-sweep-threshold-error" class="vault-error-msg">
+                  <span role="img" aria-label="Error">❌</span>
+                  <span>Enter a USDC amount between 0 and 10,000,000 (0 disables reminders).</span>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="vault-fieldset">
+              <legend>Operator Mandate &amp; Maintenance Notes</legend>
+              <div class="vault-field">
+                <label for="vault-notes-input">Vault Thesis &amp; Maintenance Notes</label>
+                <span id="vault-notes-hint" class="vault-field-hint">Plain text up to 500 characters (<span id="vault-notes-char-count">0</span>/500).</span>
+                <textarea
+                  id="vault-notes-input"
+                  name="vault_notes"
+                  class="vault-textarea"
+                  maxlength="500"
+                  rows="3"
+                  placeholder="Document barbell thesis, profit-sweep cadence, lockup schedule, or operator runbook..."
+                  aria-describedby="vault-notes-hint"
+                  data-error="vault-notes-error"
+                ></textarea>
+                <div id="vault-notes-error" class="vault-error-msg">
+                  <span role="img" aria-label="Error">❌</span>
+                  <span>Notes must be 500 characters or fewer.</span>
+                </div>
+              </div>
+            </fieldset>
+
+            <div id="vault-form-status" class="vault-form-status" role="status" aria-live="polite" hidden></div>
+
+            <div class="vault-form-actions">
+              <button type="submit" class="action-btn cycle-btn vault-submit-btn" id="btn-vault-save-sync">Save &amp; Sync Vault</button>
+              <button type="button" class="action-btn telegram-btn" id="btn-vault-refresh-sync">⟳ Refresh Live Sync</button>
+            </div>
+          </form>
+        </section>
+
+        <!-- RIGHT PANE: LIVE VAULT FACTS, BARBELL ALLOCATION & OPERATOR READINESS -->
+        <section class="vault-modal-pane vault-modal-right" aria-labelledby="vault-facts-heading">
+          <div class="vault-pane-header">
+            <h3 class="vault-section-heading" id="vault-facts-heading">Live Hyperliquid Vault Facts</h3>
+            <span class="status-pill watch" id="vault-fact-source-pill">AWAITING SELECTION</span>
+          </div>
+
+          <!-- Synced Vaults Quick-Selector Chips -->
+          <div class="vault-synced-tabs" id="vault-modal-synced-tabs" aria-label="Synced Hyperliquid vaults"></div>
+
+          <!-- Live Vault Summary Card -->
+          <article class="vault-summary-card" id="vault-facts-summary-card">
+            <div class="vault-summary-top">
+              <div class="vault-summary-title-row">
+                <h4 class="vault-summary-name" id="vault-fact-name">No Vault Selected</h4>
+                <div class="vault-summary-pills" id="vault-fact-status-pills"></div>
+              </div>
+              <div class="vault-summary-addrs" id="vault-fact-addresses"></div>
+            </div>
+            <p class="vault-summary-desc" id="vault-fact-description">
+              Select a synced vault above, click "Use Official HLP", or enter a 0x vault address and click "Inspect Live Facts".
+            </p>
+          </article>
+
+          <!-- 12-Tile Live Vault Facts Grid -->
+          <div class="vault-facts-grid" id="vault-facts-grid"></div>
+
+          <!-- Barbell Portfolio Allocation Card -->
+          <article class="vault-insight-card" id="vault-barbell-card">
+            <div class="vault-insight-header">
+              <h4 class="vault-insight-title">Barbell Portfolio Allocation</h4>
+              <span class="status-pill watch" id="vault-barbell-role-pill">FOLLOWER</span>
+            </div>
+            <div class="vault-barbell-bar-wrap">
+              <div class="vault-barbell-bar" id="vault-barbell-bar" role="img" aria-label="Portfolio allocation bar across Perps, Spot, and Vaults">
+                <div class="vault-bar-seg seg-perp" id="vault-bar-seg-perp"></div>
+                <div class="vault-bar-seg seg-spot" id="vault-bar-seg-spot"></div>
+                <div class="vault-bar-seg seg-vault" id="vault-bar-seg-vault"></div>
+              </div>
+              <div class="vault-barbell-legend" id="vault-barbell-legend"></div>
+            </div>
+            <div class="vault-barbell-metrics" id="vault-barbell-metrics"></div>
+          </article>
+
+          <!-- Vault Operator Readiness & Protocol Facts Card -->
+          <article class="vault-insight-card" id="vault-readiness-card">
+            <div class="vault-insight-header">
+              <h4 class="vault-insight-title">Vault Operator Readiness &amp; Protocol Facts</h4>
+              <span class="vault-segregated-tag">Hyperliquid L1 Rules</span>
+            </div>
+            <div class="vault-readiness-badges" id="vault-readiness-badges"></div>
+            <ul class="vault-protocol-notes">
+              <li><strong>≥5% Leader Stake:</strong> Hyperliquid User Vaults require the leader to maintain at least 5% of total vault TVL (HLP is a protocol vault exempt from User Vault leader rules).</li>
+              <li><strong>100 USDC Creation Fee:</strong> Deploying a new Hyperliquid User Vault requires a 100 USDC protocol fee plus initial leader deposit on Hyperliquid L1.</li>
+              <li><strong>Master Wallet Signatures:</strong> Vault creation, deposits, and withdrawals require a Master Wallet signature — Trade-Only API Agent keys cannot move vault funds, keeping Aegis perp execution strictly isolated on the main account.</li>
+            </ul>
+          </article>
+        </section>
+      </div>
+    </div>
+  </dialog>
 
   <!-- Toast Banner -->
   <div class="toast-banner" id="toast-banner"></div>

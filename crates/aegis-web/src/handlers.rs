@@ -6,9 +6,10 @@ use crate::auth::{
 };
 use crate::payloads::{
     build_dashboard_payload, build_health_payload, execute_close_position_or_order,
-    execute_risk_tier_switch, json_value_to_config_string, map_aegis_error_response,
-    validate_config_key_value, ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse,
-    ReconcileRequest, RiskTierUpdateRequest,
+    execute_risk_tier_switch, execute_vault_inspect, execute_vault_sync,
+    json_value_to_config_string, map_aegis_error_response, validate_config_key_value,
+    ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse, ReconcileRequest,
+    RiskTierUpdateRequest, VaultInspectRequest,
 };
 use crate::server::{AppState, ClientIpKey, SESSION_TTL_SECS};
 use aegis_alerts::send_test_alert_async;
@@ -151,6 +152,8 @@ fn normalize_pending_config_write(
     let clean_k = key.trim().to_ascii_lowercase();
     let norm_val = if clean_k == "execution_mode" {
         raw_val.trim().to_ascii_uppercase()
+    } else if clean_k == "vault_role" {
+        raw_val.trim().to_ascii_lowercase()
     } else {
         raw_val
     };
@@ -383,6 +386,40 @@ pub async fn post_reconcile_handler(
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => {
             map_aegis_error_response(AegisError::Database(format!("Reconcile task error: {e}")))
+        }
+    }
+}
+
+/// `POST /api/v1/vault/inspect` — Queries live Hyperliquid `vaultDetails` for a validated EVM vault
+/// address without modifying `system_config` or cached `live_vault_info_json`.
+pub async fn post_vault_inspect_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VaultInspectRequest>,
+) -> Response {
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || execute_vault_inspect(&db, &req)).await;
+    match res {
+        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
+        Ok(Err(e)) => map_aegis_error_response(e),
+        Err(e) => map_aegis_error_response(AegisError::Database(format!(
+            "Vault inspect task error: {e}"
+        ))),
+    }
+}
+
+/// `POST /api/v1/vault/sync` — Forces an immediate Hyperliquid vault sync (`min_interval_ms = 0`)
+/// and broadcasts a dashboard SSE refresh.
+pub async fn post_vault_sync_handler(State(state): State<AppState>) -> Response {
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || execute_vault_sync(&db)).await;
+    match res {
+        Ok(Ok(payload)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Ok(Err(e)) => map_aegis_error_response(e),
+        Err(e) => {
+            map_aegis_error_response(AegisError::Database(format!("Vault sync task error: {e}")))
         }
     }
 }

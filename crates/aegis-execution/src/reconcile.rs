@@ -91,6 +91,87 @@ fn parse_hl_u64_opt(val: Option<&Value>) -> Option<u64> {
     })
 }
 
+fn truncate_utf8_chars(raw: &str, max_chars: usize) -> String {
+    match raw.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => raw[..byte_idx].to_string(),
+        None => raw.to_string(),
+    }
+}
+
+fn extract_vault_portfolio_tvl_and_vlm(details: &Value) -> (Option<f64>, f64) {
+    let Some(entries) = details.get("portfolio").and_then(Value::as_array) else {
+        return (None, 0.0);
+    };
+
+    let latest_account_value = |obj: &Value| -> Option<f64> {
+        let arr = obj.get("accountValueHistory")?.as_array()?;
+        let mut best: Option<(i64, f64)> = None;
+        for pt in arr {
+            let Some(items) = pt.as_array() else {
+                continue;
+            };
+            let Some(ts) = parse_hl_i64_opt(items.first()) else {
+                continue;
+            };
+            let Some(val) = parse_hl_f64_opt(items.get(1)).filter(|v| *v >= 0.0) else {
+                continue;
+            };
+            if best.is_none_or(|(best_ts, _)| ts >= best_ts) {
+                best = Some((ts, val));
+            }
+        }
+        best.map(|(_, v)| v)
+    };
+
+    // Priority order for TVL: "day", "allTime", "week", "month".
+    let mut tvl_by_window: [Option<f64>; 4] = [None; 4];
+    let mut all_time_vlm = 0.0_f64;
+
+    for item in entries {
+        let Some(pair) = item.as_array() else {
+            continue;
+        };
+        let Some(window_name) = pair.first().and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        let Some(obj) = pair.get(1).filter(|v| v.is_object()) else {
+            continue;
+        };
+        match window_name {
+            "day" => {
+                if let Some(v) = latest_account_value(obj) {
+                    tvl_by_window[0] = Some(v);
+                }
+            }
+            "allTime" => {
+                if let Some(v) = latest_account_value(obj) {
+                    tvl_by_window[1] = Some(v);
+                }
+                if let Some(vlm) = parse_hl_f64_opt(obj.get("vlm")) {
+                    all_time_vlm = vlm.max(0.0);
+                }
+            }
+            "week" => {
+                if let Some(v) = latest_account_value(obj) {
+                    tvl_by_window[2] = Some(v);
+                }
+            }
+            "month" => {
+                if let Some(v) = latest_account_value(obj) {
+                    tvl_by_window[3] = Some(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let tvl = tvl_by_window[0]
+        .or(tvl_by_window[1])
+        .or(tvl_by_window[2])
+        .or(tvl_by_window[3]);
+    (tvl, all_time_vlm)
+}
+
 /// Parses a Hyperliquid `vaultDetails` JSON object (plus optional `userVaultEquities` fallback)
 /// into a [`VaultPositionInfo`] and the raw unrounded vault equity in USDC.
 pub fn parse_vault_position_info_with_raw_equity(
@@ -122,6 +203,13 @@ pub fn parse_vault_position_info_with_raw_equity(
         .unwrap_or("")
         .to_string();
 
+    let description = details
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|s| truncate_utf8_chars(s, 500))
+        .unwrap_or_default();
+
     let is_closed = details
         .get("isClosed")
         .and_then(Value::as_bool)
@@ -136,6 +224,70 @@ pub fn parse_vault_position_info_with_raw_equity(
             0.0
         }
     };
+
+    let leader_fraction_pct = parse_hl_f64_opt(details.get("leaderFraction"))
+        .map(|f| round_dp((f * 100.0).clamp(0.0, 100.0), 2))
+        .unwrap_or(0.0);
+
+    let leader_commission_pct = parse_hl_f64_opt(details.get("leaderCommission"))
+        .map(|f| round_dp((f * 100.0).clamp(0.0, 100.0), 2))
+        .unwrap_or(0.0);
+
+    let allow_deposits = details
+        .get("allowDeposits")
+        .and_then(Value::as_bool)
+        .unwrap_or(!is_closed);
+
+    let always_close_on_withdraw = details
+        .get("alwaysCloseOnWithdraw")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let max_distributable_usdc = round_dp(
+        parse_hl_f64_opt(details.get("maxDistributable"))
+            .unwrap_or(0.0)
+            .max(0.0),
+        2,
+    );
+
+    let max_withdrawable_usdc = round_dp(
+        parse_hl_f64_opt(details.get("maxWithdrawable"))
+            .unwrap_or(0.0)
+            .max(0.0),
+        2,
+    );
+
+    let (follower_count, followers_capped, followers_tvl_sum) = details
+        .get("followers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            let sum: f64 = arr
+                .iter()
+                .filter_map(|f| parse_hl_f64_opt(f.get("vaultEquity")))
+                .filter(|v| *v >= 0.0)
+                .sum();
+            (arr.len(), arr.len() >= 100, sum)
+        })
+        .unwrap_or((0, false, 0.0));
+
+    let (portfolio_tvl, portfolio_all_time_vlm) = extract_vault_portfolio_tvl_and_vlm(details);
+    let tvl_usdc = round_dp(portfolio_tvl.unwrap_or(followers_tvl_sum).max(0.0), 2);
+    let all_time_volume_usdc = round_dp(portfolio_all_time_vlm.max(0.0), 2);
+
+    let relationship_obj = details.get("relationship").filter(|v| v.is_object());
+    let relationship_type = relationship_obj
+        .and_then(|r| r.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("normal")
+        .to_string();
+    let child_vault_count = relationship_obj
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("childAddresses"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
 
     let follower = details.get("followerState").filter(|v| v.is_object());
     let raw_equity = follower
@@ -166,6 +318,7 @@ pub fn parse_vault_position_info_with_raw_equity(
         vault_address: resolved_addr,
         name,
         leader,
+        description,
         equity_usdc: round_dp(raw_equity, 2),
         pnl_usdc: round_dp(raw_pnl, 2),
         all_time_pnl_usdc: round_dp(raw_all_time_pnl, 2),
@@ -176,6 +329,18 @@ pub fn parse_vault_position_info_with_raw_equity(
         locked_until_ms,
         is_locked: locked_until_ms > now_ms_val,
         is_closed,
+        tvl_usdc,
+        follower_count,
+        followers_capped,
+        leader_fraction_pct,
+        leader_commission_pct,
+        allow_deposits,
+        always_close_on_withdraw,
+        max_distributable_usdc,
+        max_withdrawable_usdc,
+        relationship_type,
+        child_vault_count,
+        all_time_volume_usdc,
     };
     (info, raw_equity)
 }
@@ -2610,11 +2775,11 @@ impl CutoverReconciler {
         }
         let wallet = cfg.get_str("wallet_address", "");
         let wallet_trimmed = wallet.trim();
-        if wallet_trimmed.is_empty() {
-            return None;
-        }
         let configured_vault = cfg.get_str("hyperliquid_vault_address", "");
         let configured_vault_trimmed = configured_vault.trim();
+        if wallet_trimmed.is_empty() && configured_vault_trimmed.is_empty() {
+            return None;
+        }
         let key: VaultSyncThrottleKey = (
             self.db.db_name().to_string(),
             wallet_trimmed.to_ascii_lowercase(),
@@ -2670,14 +2835,18 @@ impl CutoverReconciler {
             guard.insert(key, now_ms_val);
         }
 
-        let raw_equities = match self.http.fetch_user_vault_equities(wallet_trimmed, cfg) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Hyperliquid userVaultEquities fetch failed; keeping last known cached vault info"
-                );
-                return None;
+        let raw_equities = if wallet_trimmed.is_empty() {
+            Vec::new()
+        } else {
+            match self.http.fetch_user_vault_equities(wallet_trimmed, cfg) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Hyperliquid userVaultEquities fetch failed; keeping last known cached vault info"
+                    );
+                    return None;
+                }
             }
         };
 
@@ -2750,6 +2919,7 @@ impl CutoverReconciler {
                             locked_until_ms: *locked_until,
                             is_locked: *locked_until > now_ms_val,
                             is_closed: false,
+                            ..Default::default()
                         });
                     }
                 }
@@ -3719,5 +3889,136 @@ mod tests {
         assert!((out_dca.open_epoch_booked_funding_by_coin["SOL"] - 60.0).abs() < 1e-9);
         assert!((out_dca.funding_events_with_remaining[0].1 - 30.0).abs() < 1e-9);
         assert!((out_dca.funding_events_with_remaining[1].1 - 70.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_vault_position_info_enriched_facts_fallback_and_truncation() {
+        let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
+        let now = 1_795_000_000_000_i64;
+
+        // 1. Live-shaped HLP vaultDetails with 100 followers (API cap), portfolio TVL + allTime vlm,
+        // parent relationship with 7 child sub-vaults, and rich protocol fields.
+        let followers_100: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({
+                    "user": format!("0x{:040x}", i + 1),
+                    "vaultEquity": "1000.0"
+                })
+            })
+            .collect();
+        let hlp_details = json!({
+            "name": "Hyperliquidity Provider (HLP)",
+            "vaultAddress": hlp_addr,
+            "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+            "description": "  Protocol market-making and liquidation vault on Hyperliquid L1.  ",
+            "apr": 0.14256,
+            "leaderFraction": 0.01493,
+            "leaderCommission": 0.0,
+            "allowDeposits": true,
+            "alwaysCloseOnWithdraw": false,
+            "maxDistributable": "312450123.456",
+            "maxWithdrawable": "305000000.123",
+            "isClosed": false,
+            "followers": followers_100,
+            "portfolio": [
+                ["week", {
+                    "accountValueHistory": [[1000, "290000000.0"], [2000, "310000000.55"]],
+                    "vlm": "9999999.0"
+                }],
+                ["allTime", {
+                    "accountValueHistory": [[500, "1000000.0"], [1500, "311111111.11"]],
+                    "vlm": "512345678901.239"
+                }],
+                ["day", {
+                    "accountValueHistory": [[1900, "312000000.0"], [2100, "315432109.876"]],
+                    "vlm": "123456789.0"
+                }]
+            ],
+            "relationship": {
+                "type": "parent",
+                "data": {
+                    "childAddresses": [
+                        "0x0000000000000000000000000000000000000001",
+                        "0x0000000000000000000000000000000000000002",
+                        "0x0000000000000000000000000000000000000003",
+                        "0x0000000000000000000000000000000000000004",
+                        "0x0000000000000000000000000000000000000005",
+                        "0x0000000000000000000000000000000000000006",
+                        "0x0000000000000000000000000000000000000007"
+                    ]
+                }
+            },
+            "followerState": {
+                "vaultEquity": "202.400584",
+                "pnl": "1.25",
+                "allTimePnl": "4.50",
+                "daysFollowing": 30,
+                "lockupUntil": now + 60_000
+            }
+        });
+
+        let (info, raw_eq) =
+            parse_vault_position_info_with_raw_equity(hlp_addr, &hlp_details, None, now);
+        assert!((raw_eq - 202.400584).abs() < 1e-6);
+        assert_eq!(info.name, "Hyperliquidity Provider (HLP)");
+        assert_eq!(
+            info.description,
+            "Protocol market-making and liquidation vault on Hyperliquid L1."
+        );
+        assert!((info.apr_pct - 14.26).abs() < 1e-6);
+        assert!((info.leader_fraction_pct - 1.49).abs() < 1e-6);
+        assert!((info.leader_commission_pct - 0.0).abs() < 1e-6);
+        assert!(info.allow_deposits);
+        assert!(!info.always_close_on_withdraw);
+        assert!((info.max_distributable_usdc - 312_450_123.46).abs() < 1e-2);
+        assert!((info.max_withdrawable_usdc - 305_000_000.12).abs() < 1e-2);
+        assert_eq!(info.follower_count, 100);
+        assert!(info.followers_capped);
+        // Prefer "day" latest accountValueHistory over followers sum or week/allTime
+        assert!((info.tvl_usdc - 315_432_109.88).abs() < 1e-2);
+        assert!((info.all_time_volume_usdc - 512_345_678_901.24).abs() < 1e-1);
+        assert_eq!(info.relationship_type, "parent");
+        assert_eq!(info.child_vault_count, 7);
+        assert!(info.is_locked);
+
+        // 2. Fallback TVL when `portfolio` is missing, plus >500-char UTF-8 description truncation,
+        // leader commission clamping, and default allow_deposits/relationship fields.
+        let long_utf8_desc = format!("  {}  ", "é".repeat(540));
+        let user_vault_details = json!({
+            "name": "Aegis Alpha User Vault",
+            "vaultAddress": "0x2222222222222222222222222222222222222222",
+            "leader": "0x3333333333333333333333333333333333333333",
+            "description": long_utf8_desc,
+            "isClosed": true,
+            "leaderFraction": 0.125,
+            "leaderCommission": 0.10,
+            "alwaysCloseOnWithdraw": true,
+            "maxDistributable": "-5.0",
+            "followers": [
+                { "user": "0x1", "vaultEquity": "1500.25" },
+                { "user": "0x2", "vaultEquity": "2499.75" },
+                { "user": "0x3", "vaultEquity": "-50.0" }
+            ]
+        });
+
+        let fallback_info = parse_vault_position_info(
+            "0x2222222222222222222222222222222222222222",
+            &user_vault_details,
+            None,
+            now,
+        );
+        assert_eq!(fallback_info.description.chars().count(), 500);
+        assert!(fallback_info.description.chars().all(|c| c == 'é'));
+        assert_eq!(fallback_info.follower_count, 3);
+        assert!(!fallback_info.followers_capped);
+        assert!((fallback_info.tvl_usdc - 4000.0).abs() < 1e-6);
+        assert!((fallback_info.all_time_volume_usdc - 0.0).abs() < 1e-6);
+        assert!((fallback_info.leader_fraction_pct - 12.5).abs() < 1e-6);
+        assert!((fallback_info.leader_commission_pct - 10.0).abs() < 1e-6);
+        assert!(!fallback_info.allow_deposits); // defaults to !is_closed
+        assert!(fallback_info.always_close_on_withdraw);
+        assert!((fallback_info.max_distributable_usdc - 0.0).abs() < 1e-6);
+        assert_eq!(fallback_info.relationship_type, "normal");
+        assert_eq!(fallback_info.child_vault_count, 0);
     }
 }

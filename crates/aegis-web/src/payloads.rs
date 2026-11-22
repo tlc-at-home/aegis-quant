@@ -6,7 +6,7 @@ use aegis_core::{
     DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset, HeldAssetView, OrderAuditRecord,
     OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result, RiskTier,
     SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord,
-    VaultInfoPayload, PLATFORM_VERSION,
+    VaultInfoPayload, VaultPositionInfo, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -191,6 +191,33 @@ pub struct ReconcileRequest {
     pub close_legacy_positions: bool,
 }
 
+/// Request payload for `POST /api/v1/vault/inspect`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaultInspectRequest {
+    pub vault_address: String,
+}
+
+/// Response payload for `POST /api/v1/vault/inspect`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultInspectResponse {
+    pub status: String,
+    pub execution_mode: String,
+    pub is_testnet: bool,
+    pub found: bool,
+    pub vault: Option<VaultPositionInfo>,
+    pub inspected_at_ms: i64,
+}
+
+/// Response payload for `POST /api/v1/vault/sync`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSyncResponse {
+    pub status: String,
+    pub execution_mode: String,
+    pub synced: bool,
+    pub vault_info: VaultInfoPayload,
+    pub synced_at_ms: i64,
+}
+
 /// Converts a JSON `Value` into a clean configuration string.
 pub fn json_value_to_config_string(val: &Value) -> String {
     match val {
@@ -333,6 +360,37 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
         "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
             if !clean_val.is_empty() {
                 let _ = aegis_core::validate_evm_address(clean_val)?;
+            }
+        }
+        "vault_role" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "follower" | "operator" | "none"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid vault_role '{clean_val}': expected follower, operator, or none"
+                )));
+            }
+        }
+        "vault_target_allocation_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
+        }
+        "vault_profit_sweep_threshold_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000.0)?;
+        }
+        "vault_notes" => {
+            if clean_val.chars().count() > 500 {
+                return Err(AegisError::Validation(
+                    "vault_notes must be at most 500 characters".to_string(),
+                ));
+            }
+            if value_str
+                .chars()
+                .any(|c| c.is_ascii_control() && !matches!(c, '\n' | '\r' | '\t'))
+            {
+                return Err(AegisError::Validation(
+                    "vault_notes must not contain ASCII control characters".to_string(),
+                ));
             }
         }
         "private_key" => {
@@ -582,6 +640,24 @@ pub fn build_vault_info_payload(
         }
         if !v.apr_pct.is_finite() {
             v.apr_pct = 0.0;
+        }
+        if !v.tvl_usdc.is_finite() {
+            v.tvl_usdc = 0.0;
+        }
+        if !v.leader_fraction_pct.is_finite() {
+            v.leader_fraction_pct = 0.0;
+        }
+        if !v.leader_commission_pct.is_finite() {
+            v.leader_commission_pct = 0.0;
+        }
+        if !v.max_distributable_usdc.is_finite() {
+            v.max_distributable_usdc = 0.0;
+        }
+        if !v.max_withdrawable_usdc.is_finite() {
+            v.max_withdrawable_usdc = 0.0;
+        }
+        if !v.all_time_volume_usdc.is_finite() {
+            v.all_time_volume_usdc = 0.0;
         }
         v.is_locked = v.locked_until_ms > now_ms_val;
         sum_vault_eq += v.equity_usdc;
@@ -1110,6 +1186,130 @@ pub fn execute_risk_tier_switch(
         display_badge: badge,
         updated_at_ms: now_ms(),
     })
+}
+
+/// Queries live Hyperliquid `/info {"type":"vaultDetails"}` for an arbitrary validated EVM vault
+/// address without mutating `system_config` or cached `live_vault_info_json`.
+pub fn execute_vault_inspect(
+    db: &DatabaseManager,
+    req: &VaultInspectRequest,
+) -> Result<VaultInspectResponse> {
+    let valid_addr = aegis_core::validate_evm_address(&req.vault_address)?;
+    let cfg = db.load_config_or_default();
+    let mode = cfg.execution_mode();
+    if !mode.is_live_or_testnet() {
+        return Err(AegisError::Validation(
+            "Live vault inspection is unavailable in PAPER mode; switch execution_mode to TESTNET or LIVE"
+                .to_string(),
+        ));
+    }
+
+    let is_testnet = aegis_execution::is_testnet_configured(&cfg);
+    let wallet = cfg.get_str("wallet_address", "");
+    let http = aegis_execution::HyperliquidHttpClient::new(8);
+    let details_opt = http.fetch_vault_details(&valid_addr, wallet.trim(), &cfg)?;
+    let ts = now_ms();
+    let (found, vault) = match details_opt {
+        Some(details) => {
+            let parsed =
+                aegis_execution::parse_vault_position_info(&valid_addr, &details, None, ts);
+            (true, Some(parsed))
+        }
+        None => (false, None),
+    };
+
+    Ok(VaultInspectResponse {
+        status: "ok".to_string(),
+        execution_mode: mode.as_str().to_string(),
+        is_testnet,
+        found,
+        vault,
+        inspected_at_ms: ts,
+    })
+}
+
+/// Forces an immediate Hyperliquid vault sync (`min_interval_ms = 0`) in TESTNET/LIVE mode
+/// and returns the refreshed [`VaultSyncResponse`]. In PAPER mode, returns `synced: false` with
+/// the cached payload without issuing network calls.
+pub fn execute_vault_sync(db: &DatabaseManager) -> Result<VaultSyncResponse> {
+    let cfg = db.load_config_or_default();
+    let mode = cfg.execution_mode();
+    let ts = now_ms();
+    if !mode.is_live_or_testnet() {
+        let snap_eq = db
+            .get_latest_portfolio_snapshot()
+            .map(|s| s.total_equity_usdc)
+            .unwrap_or(0.0);
+        let vault_info = build_vault_info_payload(&cfg, snap_eq, ts);
+        let synced_at_ms = vault_info.synced_at_ms;
+        return Ok(VaultSyncResponse {
+            status: "ok".to_string(),
+            execution_mode: mode.as_str().to_string(),
+            synced: false,
+            vault_info,
+            synced_at_ms,
+        });
+    }
+
+    let synced_opt = {
+        let _exec_guard = aegis_execution::execution_lock().lock();
+        let fresh_cfg = db.load_config_or_default();
+        if !fresh_cfg.execution_mode().is_live_or_testnet() {
+            None
+        } else {
+            let reconciler = aegis_execution::CutoverReconciler::new(
+                db.clone(),
+                aegis_execution::HyperliquidHttpClient::new(8),
+            );
+            reconciler.sync_vault_info_with_interval(&fresh_cfg, ts, 0, None)
+        }
+    };
+
+    let post_cfg = db.load_config_or_default();
+    let post_mode = post_cfg.execution_mode();
+    let live_eq = post_cfg.get_f64("live_exchange_equity_usdc", 0.0);
+    let perp_wallet_eq = if post_mode.is_live_or_testnet() && live_eq > 0.0 {
+        round_dp(live_eq, 2)
+    } else {
+        round_dp(
+            db.get_latest_portfolio_snapshot()
+                .map(|s| s.total_equity_usdc)
+                .unwrap_or(0.0),
+            2,
+        )
+    };
+    let vault_info = build_vault_info_payload(&post_cfg, perp_wallet_eq, ts);
+
+    match synced_opt {
+        Some(snapshot) => {
+            let _ = db.log_telemetry(
+                "INFO",
+                "aegis-web.vault_sync",
+                &format!(
+                    "Manual vault sync completed: {} vault(s), total_vault_equity=${:.2}",
+                    snapshot.vault_count, snapshot.total_vault_equity_usdc
+                ),
+                None,
+            );
+            Ok(VaultSyncResponse {
+                status: "ok".to_string(),
+                execution_mode: post_mode.as_str().to_string(),
+                synced: true,
+                vault_info,
+                synced_at_ms: snapshot.synced_at_ms,
+            })
+        }
+        None => {
+            let synced_at_ms = vault_info.synced_at_ms;
+            Ok(VaultSyncResponse {
+                status: "ok".to_string(),
+                execution_mode: post_mode.as_str().to_string(),
+                synced: false,
+                vault_info,
+                synced_at_ms,
+            })
+        }
+    }
 }
 
 /// Converts an `AegisError` into an HTTP JSON response with appropriate status code.

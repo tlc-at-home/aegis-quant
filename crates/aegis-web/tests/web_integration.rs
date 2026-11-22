@@ -1903,6 +1903,7 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
                 locked_until_ms: locked_past,
                 is_locked: true, // stale flag should be recomputed dynamically to false!
                 is_closed: false,
+                ..Default::default()
             },
             VaultPositionInfo {
                 vault_address: "0x3333333333333333333333333333333333333333".to_string(),
@@ -1918,6 +1919,7 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
                 locked_until_ms: locked_future,
                 is_locked: false, // stale flag should be recomputed dynamically to true!
                 is_closed: false,
+                ..Default::default()
             },
         ],
     };
@@ -2200,6 +2202,7 @@ async fn test_web_option_b_equity_basis_spot_vault_and_stale_flag() {
                 locked_until_ms: 0,
                 is_locked: false,
                 is_closed: false,
+                ..Default::default()
             }],
         };
         mgr.set_config_value(
@@ -2663,6 +2666,7 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
                 locked_until_ms: 0,
                 is_locked: false,
                 is_closed: false,
+                ..Default::default()
             }],
         };
         mgr.set_config_value(
@@ -2771,4 +2775,658 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
             .abs()
             < 1e-4
     );
+}
+
+async fn spawn_mock_hl_info_server<F>(handler: F) -> (u16, tokio::sync::oneshot::Sender<()>)
+where
+    F: Fn(&Value) -> (StatusCode, Value) + Send + Sync + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback mock Hyperliquid server");
+    let port = listener.local_addr().unwrap().port();
+    let handler = std::sync::Arc::new(handler);
+    let router = axum::Router::new().route(
+        "/info",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let h = handler.clone();
+            async move {
+                let (status, resp) = h(&body);
+                (status, axum::Json(resp))
+            }
+        }),
+    );
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+            })
+            .await;
+    });
+    (port, stop_tx)
+}
+
+#[tokio::test]
+async fn test_web_vault_config_keys_validation_and_role_normalization() {
+    // 1. Direct validator unit checks
+    assert!(validate_config_key_value("vault_role", "follower").is_ok());
+    assert!(validate_config_key_value("vault_role", "OPERATOR").is_ok());
+    assert!(validate_config_key_value("vault_role", "None").is_ok());
+    assert!(matches!(
+        validate_config_key_value("vault_role", "manager"),
+        Err(AegisError::Validation(_))
+    ));
+
+    assert!(validate_config_key_value("vault_target_allocation_pct", "0.0").is_ok());
+    assert!(validate_config_key_value("vault_target_allocation_pct", "100.0").is_ok());
+    assert!(matches!(
+        validate_config_key_value("vault_target_allocation_pct", "-0.1"),
+        Err(AegisError::Validation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("vault_target_allocation_pct", "100.1"),
+        Err(AegisError::Validation(_))
+    ));
+
+    assert!(validate_config_key_value("vault_profit_sweep_threshold_usdc", "0").is_ok());
+    assert!(validate_config_key_value("vault_profit_sweep_threshold_usdc", "10000000").is_ok());
+    assert!(matches!(
+        validate_config_key_value("vault_profit_sweep_threshold_usdc", "-1.0"),
+        Err(AegisError::Validation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("vault_profit_sweep_threshold_usdc", "10000000.5"),
+        Err(AegisError::Validation(_))
+    ));
+
+    assert!(validate_config_key_value("vault_notes", "").is_ok());
+    assert!(validate_config_key_value("vault_notes", "Line 1\nLine 2\tOK\r\n").is_ok());
+    assert!(validate_config_key_value("vault_notes", &"x".repeat(500)).is_ok());
+    assert!(matches!(
+        validate_config_key_value("vault_notes", &"x".repeat(501)),
+        Err(AegisError::Validation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("vault_notes", "bad\x07bell"),
+        Err(AegisError::Validation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("vault_notes", "bad\x00nul"),
+        Err(AegisError::Validation(_))
+    ));
+    assert!(matches!(
+        validate_config_key_value("vault_notes", "bad\x1besc"),
+        Err(AegisError::Validation(_))
+    ));
+
+    // 2. End-to-end POST /api/v1/config with uppercase VAULT_ROLE normalization
+    let db = tokio::task::spawn_blocking(|| {
+        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
+    })
+    .await
+    .unwrap();
+    let app = create_web_router(db.clone(), None);
+
+    let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+    let res_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "updates": {
+                            "hyperliquid_vault_address": hlp_addr,
+                            "VAULT_ROLE": "  OPERATOR  ",
+                            "vault_target_allocation_pct": 25.5,
+                            "vault_profit_sweep_threshold_usdc": 250.0,
+                            "vault_notes": "Barbell HLP sleeve\nMonthly profit sweep"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_ok.status(), StatusCode::OK);
+
+    let db_check = db.clone();
+    let cfg = tokio::task::spawn_blocking(move || db_check.load_config_or_default())
+        .await
+        .unwrap();
+    assert_eq!(cfg.get_str("hyperliquid_vault_address", ""), hlp_addr);
+    assert_eq!(cfg.get_str("vault_role", ""), "operator");
+    assert!((cfg.get_f64("vault_target_allocation_pct", 0.0) - 25.5).abs() < 1e-6);
+    assert!((cfg.get_f64("vault_profit_sweep_threshold_usdc", 0.0) - 250.0).abs() < 1e-6);
+    assert_eq!(
+        cfg.get_str("vault_notes", ""),
+        "Barbell HLP sleeve\nMonthly profit sweep"
+    );
+
+    // Invalid batch config payloads return 400 Bad Request
+    for bad_body in [
+        serde_json::json!({ "config_key": "vault_role", "config_value": "leader" }).to_string(),
+        serde_json::json!({ "config_key": "vault_target_allocation_pct", "config_value": 150.0 })
+            .to_string(),
+        serde_json::json!({ "config_key": "vault_notes", "config_value": "a".repeat(501) })
+            .to_string(),
+        serde_json::json!({ "config_key": "vault_notes", "config_value": "ctrl\x07char" })
+            .to_string(),
+    ] {
+        let res_bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_web_vault_inspect_endpoint_validation_paper_found_and_not_found() {
+    let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+    let unknown_addr = "0x9999999999999999999999999999999999999999";
+
+    let (port, stop_tx) = spawn_mock_hl_info_server(move |body| {
+        let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+        if typ == "vaultDetails" {
+            let addr = body
+                .get("vaultAddress")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if addr.eq_ignore_ascii_case(hlp_addr) {
+                let followers: Vec<Value> = (0..100)
+                    .map(|i| serde_json::json!({ "user": format!("0x{:040x}", i + 1), "vaultEquity": "50.0" }))
+                    .collect();
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "name": "Hyperliquidity Provider (HLP)",
+                        "vaultAddress": hlp_addr,
+                        "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                        "description": "Protocol market-making vault",
+                        "apr": 0.1125,
+                        "leaderFraction": 0.025,
+                        "leaderCommission": 0.0,
+                        "allowDeposits": true,
+                        "alwaysCloseOnWithdraw": false,
+                        "maxDistributable": "25000000.55",
+                        "maxWithdrawable": "24000000.25",
+                        "isClosed": false,
+                        "followers": followers,
+                        "portfolio": [
+                            ["day", { "accountValueHistory": [[100, "26000000.0"], [200, "26543210.75"]], "vlm": "1000000.0" }],
+                            ["allTime", { "accountValueHistory": [[50, "1000000.0"]], "vlm": "987654321.50" }]
+                        ],
+                        "relationship": {
+                            "type": "parent",
+                            "data": {
+                                "childAddresses": [
+                                    "0x0000000000000000000000000000000000000001",
+                                    "0x0000000000000000000000000000000000000002"
+                                ]
+                            }
+                        },
+                        "followerState": {
+                            "vaultEquity": "500.0",
+                            "pnl": "12.5",
+                            "allTimePnl": "25.0",
+                            "daysFollowing": 14,
+                            "lockupUntil": 0
+                        }
+                    }),
+                );
+            }
+            return (StatusCode::OK, Value::Null);
+        }
+        (StatusCode::OK, serde_json::json!([]))
+    })
+    .await;
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        mgr.set_config_value("hyperliquid_testnet_url", &base_url, None)
+            .unwrap();
+        mgr.set_config_value(
+            "hyperliquid_allowed_hosts",
+            "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+            None,
+        )
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. 400 Bad Request on malformed vault address
+    let res_bad_addr = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/inspect")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"vault_address":"not-an-evm-address"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_addr.status(), StatusCode::BAD_REQUEST);
+
+    // 2. 400 Bad Request in PAPER mode even with valid EVM address
+    let res_paper = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/inspect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "vault_address": hlp_addr }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paper.status(), StatusCode::BAD_REQUEST);
+
+    // Switch to TESTNET
+    let db_sw = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_sw
+            .set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    // 3. 200 OK found == true with enriched VaultPositionInfo
+    let res_found = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/inspect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "vault_address": hlp_addr.to_ascii_uppercase().replacen("0X", "0x", 1) }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_found.status(), StatusCode::OK);
+    let body_found: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_found.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_found["status"], "ok");
+    assert_eq!(body_found["execution_mode"], "TESTNET");
+    assert_eq!(body_found["is_testnet"], true);
+    assert_eq!(body_found["found"], true);
+    assert!(body_found["inspected_at_ms"].as_i64().unwrap() > 0);
+    let v = &body_found["vault"];
+    assert_eq!(v["name"], "Hyperliquidity Provider (HLP)");
+    assert_eq!(v["description"], "Protocol market-making vault");
+    assert!((v["tvl_usdc"].as_f64().unwrap() - 26_543_210.75).abs() < 1e-2);
+    assert_eq!(v["follower_count"], 100);
+    assert_eq!(v["followers_capped"], true);
+    assert!((v["leader_fraction_pct"].as_f64().unwrap() - 2.5).abs() < 1e-6);
+    assert!((v["leader_commission_pct"].as_f64().unwrap() - 0.0).abs() < 1e-6);
+    assert_eq!(v["allow_deposits"], true);
+    assert_eq!(v["always_close_on_withdraw"], false);
+    assert!((v["max_distributable_usdc"].as_f64().unwrap() - 25_000_000.55).abs() < 1e-2);
+    assert!((v["max_withdrawable_usdc"].as_f64().unwrap() - 24_000_000.25).abs() < 1e-2);
+    assert_eq!(v["relationship_type"], "parent");
+    assert_eq!(v["child_vault_count"], 2);
+    assert!((v["all_time_volume_usdc"].as_f64().unwrap() - 987_654_321.50).abs() < 1e-2);
+
+    // Inspect must NOT mutate live_vault_info_json
+    let db_chk = db.clone();
+    let cached_raw = tokio::task::spawn_blocking(move || {
+        db_chk
+            .load_config_or_default()
+            .get_str("live_vault_info_json", "")
+    })
+    .await
+    .unwrap();
+    assert!(cached_raw.is_empty());
+
+    // 4. 200 OK found == false, vault == null when Hyperliquid returns null
+    let res_missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/inspect")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "vault_address": unknown_addr }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_missing.status(), StatusCode::OK);
+    let body_missing: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_missing.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_missing["status"], "ok");
+    assert_eq!(body_missing["found"], false);
+    assert!(body_missing["vault"].is_null());
+
+    let _ = stop_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_web_vault_sync_endpoint_immediate_sync_and_dashboard_enriched_fields() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
+    let user_wallet = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23";
+    let user_eq_calls = Arc::new(AtomicUsize::new(0));
+    let details_calls = Arc::new(AtomicUsize::new(0));
+    let ueq_srv = user_eq_calls.clone();
+    let det_srv = details_calls.clone();
+
+    let (port, stop_tx) = spawn_mock_hl_info_server(move |body| {
+        let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+        match typ {
+            "userVaultEquities" => {
+                ueq_srv.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    serde_json::json!([{
+                        "vaultAddress": hlp_addr,
+                        "equity": "205.50",
+                        "lockedUntilTimestamp": 0
+                    }]),
+                )
+            }
+            "vaultDetails" => {
+                let call_no = det_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                let has_user = body
+                    .get("user")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+                let tvl_str = if call_no >= 2 {
+                    "42000100.25"
+                } else {
+                    "42000000.00"
+                };
+                let follower_state = if has_user {
+                    serde_json::json!({
+                        "vaultEquity": "205.50",
+                        "pnl": "3.10",
+                        "allTimePnl": "5.50",
+                        "daysFollowing": 31,
+                        "lockupUntil": 0
+                    })
+                } else {
+                    Value::Null
+                };
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "name": "Hyperliquidity Provider (HLP)",
+                        "vaultAddress": hlp_addr,
+                        "leader": "0x677d831aef5328190852e24f13c46cac05f984e7",
+                        "description": "Testnet HLP protocol vault",
+                        "apr": 0.095,
+                        "leaderFraction": 0.015,
+                        "leaderCommission": 0.0,
+                        "allowDeposits": true,
+                        "alwaysCloseOnWithdraw": false,
+                        "maxDistributable": "40000000.00",
+                        "maxWithdrawable": "39500000.00",
+                        "isClosed": false,
+                        "followers": [
+                            { "user": "0x1", "vaultEquity": "100.0" },
+                            { "user": "0x2", "vaultEquity": "205.5" }
+                        ],
+                        "portfolio": [
+                            ["day", { "accountValueHistory": [[1000, tvl_str]], "vlm": "50000.0" }],
+                            ["allTime", { "accountValueHistory": [[500, "1000000.0"]], "vlm": "750000000.88" }]
+                        ],
+                        "relationship": {
+                            "type": "parent",
+                            "data": {
+                                "childAddresses": [
+                                    "0x0000000000000000000000000000000000000011",
+                                    "0x0000000000000000000000000000000000000022",
+                                    "0x0000000000000000000000000000000000000033"
+                                ]
+                            }
+                        },
+                        "followerState": follower_state
+                    }),
+                )
+            }
+            _ => (StatusCode::OK, serde_json::json!([])),
+        }
+    })
+    .await;
+
+    let base_url = format!("http://127.0.0.1:{port}");
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_usdc", "1000.0", None)
+            .unwrap();
+        mgr.set_config_value("hyperliquid_testnet_url", &base_url, None)
+            .unwrap();
+        mgr.set_config_value(
+            "hyperliquid_allowed_hosts",
+            "127.0.0.1,api.hyperliquid.xyz,api.hyperliquid-testnet.xyz",
+            None,
+        )
+        .unwrap();
+        mgr.set_config_value("hyperliquid_vault_address", hlp_addr, None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. PAPER mode returns synced=false without hitting Hyperliquid
+    let res_paper = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/sync")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paper.status(), StatusCode::OK);
+    let body_paper: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_paper.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_paper["status"], "ok");
+    assert_eq!(body_paper["execution_mode"], "PAPER");
+    assert_eq!(body_paper["synced"], false);
+    assert_eq!(user_eq_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(details_calls.load(Ordering::SeqCst), 0);
+
+    // 2. TESTNET with configured vault ONLY (empty wallet_address): skips userVaultEquities, fetches vaultDetails
+    let db_t1 = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_t1
+            .set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_sync1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/sync")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_sync1.status(), StatusCode::OK);
+    let body_sync1: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_sync1.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_sync1["status"], "ok");
+    assert_eq!(body_sync1["execution_mode"], "TESTNET");
+    assert_eq!(body_sync1["synced"], true);
+    assert!(body_sync1["synced_at_ms"].as_i64().unwrap() > 0);
+    assert_eq!(user_eq_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(details_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(body_sync1["vault_info"]["vault_count"], 1);
+    assert!(
+        (body_sync1["vault_info"]["vaults"][0]["tvl_usdc"]
+            .as_f64()
+            .unwrap()
+            - 42_000_000.0)
+            .abs()
+            < 1e-2
+    );
+
+    // 3. Configure wallet_address and immediately invoke POST /api/v1/vault/sync again (min_interval_ms = 0 bypasses 60s throttle)
+    let db_t2 = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db_t2
+            .set_config_value("wallet_address", user_wallet, None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let res_sync2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/sync")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_sync2.status(), StatusCode::OK);
+    let body_sync2: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_sync2.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body_sync2["synced"], true);
+    assert_eq!(user_eq_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(details_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        (body_sync2["vault_info"]["total_vault_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 205.50)
+            .abs()
+            < 1e-6
+    );
+    assert!(
+        (body_sync2["vault_info"]["combined_portfolio_equity_usdc"]
+            .as_f64()
+            .unwrap()
+            - 1205.50)
+            .abs()
+            < 1e-6
+    );
+
+    // 4. Verify immediate third sync with identical wallet+vault STILL executes (min_interval_ms = 0)
+    let res_sync3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/vault/sync")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_sync3.status(), StatusCode::OK);
+    assert_eq!(user_eq_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(details_calls.load(Ordering::SeqCst), 3);
+
+    // 5. Verify GET /api/v1/dashboard returns enriched vault_info.vaults[0] fields
+    let res_dash = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_dash.status(), StatusCode::OK);
+    let dash: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_dash.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Perp equity strictly segregated from vault equity
+    assert!((dash["snapshot"]["total_equity_usdc"].as_f64().unwrap() - 1000.0).abs() < 1e-6);
+    let v0 = &dash["vault_info"]["vaults"][0];
+    assert_eq!(v0["vault_address"], hlp_addr);
+    assert_eq!(v0["name"], "Hyperliquidity Provider (HLP)");
+    assert_eq!(v0["description"], "Testnet HLP protocol vault");
+    assert!((v0["equity_usdc"].as_f64().unwrap() - 205.50).abs() < 1e-6);
+    assert!((v0["tvl_usdc"].as_f64().unwrap() - 42_000_100.25).abs() < 1e-2);
+    assert_eq!(v0["follower_count"], 2);
+    assert_eq!(v0["followers_capped"], false);
+    assert!((v0["leader_fraction_pct"].as_f64().unwrap() - 1.5).abs() < 1e-6);
+    assert!((v0["leader_commission_pct"].as_f64().unwrap() - 0.0).abs() < 1e-6);
+    assert_eq!(v0["allow_deposits"], true);
+    assert_eq!(v0["always_close_on_withdraw"], false);
+    assert!((v0["max_distributable_usdc"].as_f64().unwrap() - 40_000_000.0).abs() < 1e-2);
+    assert!((v0["max_withdrawable_usdc"].as_f64().unwrap() - 39_500_000.0).abs() < 1e-2);
+    assert_eq!(v0["relationship_type"], "parent");
+    assert_eq!(v0["child_vault_count"], 3);
+    assert!((v0["all_time_volume_usdc"].as_f64().unwrap() - 750_000_000.88).abs() < 1e-2);
+
+    let _ = stop_tx.send(());
 }

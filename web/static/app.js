@@ -17,7 +17,19 @@ const state = {
   authRequired: false,
   equityChartPoints: [],
   equityHoverIdx: null,
+  vaultModal: {
+    selectedAddress: '',
+    isPreviewMode: false,
+    previewVault: null,
+    previewMeta: null,
+    inFlightSave: false,
+    inFlightInspect: false,
+    inFlightSync: false,
+  },
 };
+
+const OFFICIAL_HLP_TESTNET = '0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0';
+const OFFICIAL_HLP_MAINNET = '0xdfc24b077bc1425ad1dea75bcb6f8158e10df303';
 
 const IMMUTABLE_SECURITY_KEYS = new Set([
   'enforce_master_key',
@@ -80,6 +92,21 @@ function fmtUsd(val, decimals = 2) {
       maximumFractionDigits: decimals,
     })
   );
+}
+
+function fmtCompactUsd(val) {
+  const n = toFiniteNumber(val);
+  if (n === null) return '—';
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(2)}M`;
+  return fmtUsd(n, 2);
+}
+
+function isOfficialHlpAddress(rawAddr) {
+  const norm = String(rawAddr || '').trim().toLowerCase();
+  return norm === OFFICIAL_HLP_TESTNET || norm === OFFICIAL_HLP_MAINNET;
 }
 
 function fmtSignedUsd(val, decimals = 2) {
@@ -924,6 +951,14 @@ function setConfigCategory(cat) {
 function classifyConfigKeyCategory(key) {
   const k = String(key || '').toLowerCase();
   if (
+    k === 'hyperliquid_vault_address' ||
+    k === 'hyperliquid_agent_address' ||
+    k.startsWith('vault_') ||
+    k === 'live_vault_info_json'
+  ) {
+    return 'wallet';
+  }
+  if (
     k === 'max_open_positions' ||
     k === 'min_entry_interval_sec' ||
     k === 'min_position_hold_sec' ||
@@ -1155,6 +1190,21 @@ function getConfigFloatFromDash(dash, key, fallback) {
   if (!row) return fallback;
   const n = Number(row.config_value);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function getConfigNonNegFloatFromDash(dash, key, fallback = 0) {
+  const row = (dash?.system_config || []).find((r) => r.config_key === key);
+  if (!row) return fallback;
+  const n = toFiniteNumber(row.config_value);
+  return n !== null && n >= 0 ? n : fallback;
+}
+
+function getConfigValueFromDash(dash, key, fallback = '') {
+  const row = (dash?.system_config || []).find((r) => r.config_key === key);
+  if (!row || row.config_value === null || row.config_value === undefined) {
+    return fallback;
+  }
+  return String(row.config_value);
 }
 
 function createWalletStripItem(label, valText) {
@@ -1761,6 +1811,17 @@ function renderVaultPanel(dash) {
     if (v?.vault_address) {
       nameWrap.appendChild(createAddressChip(v.vault_address));
     }
+    const inspectBtn = document.createElement('button');
+    inspectBtn.type = 'button';
+    inspectBtn.className = 'vault-row-inspect-btn';
+    inspectBtn.dataset.action = 'inspect-vault';
+    inspectBtn.dataset.vaultAddress = String(v?.vault_address || '');
+    inspectBtn.setAttribute(
+      'aria-label',
+      `Inspect live facts for ${String(v?.name || v?.vault_address || 'Hyperliquid Vault')}`
+    );
+    inspectBtn.textContent = 'Facts';
+    nameWrap.appendChild(inspectBtn);
     tdName.appendChild(nameWrap);
 
     // 2. Equity USDC
@@ -2450,6 +2511,8 @@ function buildInlineConfigControlHtml(row, idPrefix, rowIdx = 0) {
     enumOptions = ['extreme', 'aggressive', 'standard', 'conservative', 'custom'];
   } else if (key === 'alert_provider') {
     enumOptions = ['telegram', 'discord', 'both'];
+  } else if (key === 'vault_role') {
+    enumOptions = ['follower', 'operator', 'none'];
   } else if (vtype === 'bool' || val === 'true' || val === 'false') {
     enumOptions = ['true', 'false'];
   }
@@ -3300,6 +3363,1435 @@ function drawSleeveAttributionCanvas(dash) {
 }
 
 /* ============================================================================
+   NATIVE <dialog> HYPERLIQUID VAULT MAINTENANCE & LIVE FACTS MODAL
+   ============================================================================ */
+
+const VaultFormValidation = (() => {
+  let announceTimer = null;
+  let announcedField = null;
+  const flagged = new WeakSet();
+  const announced = new WeakSet();
+  const fallbackDirtyState = new WeakMap();
+
+  const getAnnouncer = () => document.getElementById('vault-form-announcer');
+
+  // List the error message (from data-error) in aria-describedby ONLY while invalid
+  const linkError = (el, shown) => {
+    const errorId = el?.dataset?.error;
+    if (!errorId) return;
+    const ids = (el.getAttribute('aria-describedby') || '')
+      .split(/\s+/)
+      .filter((id) => id && id !== errorId);
+    if (shown) ids.push(errorId);
+    if (ids.length) el.setAttribute('aria-describedby', ids.join(' '));
+    else el.removeAttribute('aria-describedby');
+  };
+
+  // Text as a screen reader reads it: icons' text alternatives in, aria-hidden text out
+  const spokenText = (node) => {
+    const copy = node.cloneNode(true);
+    copy.querySelectorAll('[aria-hidden="true"]').forEach((n) => n.remove());
+    copy.querySelectorAll('[role="img"][aria-label]').forEach((n) => {
+      n.replaceWith(`${n.getAttribute('aria-label')}: `);
+    });
+    return copy.textContent.replace(/\s+/g, ' ').trim();
+  };
+
+  const clearAnnouncer = (el = null) => {
+    if (el !== null && announcedField !== el) return;
+    clearTimeout(announceTimer);
+    const announcer = getAnnouncer();
+    if (announcer) announcer.textContent = '';
+    if (el === null || announcedField === el) {
+      announcedField = null;
+    }
+  };
+
+  const announceError = (el) => {
+    const announcer = getAnnouncer();
+    const errorId = el?.dataset?.error;
+    if (!announcer || !errorId) return;
+    const errorEl = document.getElementById(errorId);
+    if (!errorEl) return;
+    const label = el.labels?.[0] ? `${spokenText(el.labels[0])}: ` : '';
+    clearTimeout(announceTimer);
+    announcer.textContent = '';
+    announcedField = el;
+    // Wait 500ms until the screen reader has announced the next focused field
+    announceTimer = setTimeout(() => {
+      announcer.textContent = label + spokenText(errorEl);
+    }, 500);
+  };
+
+  const trimAddressIfNeeded = (el) => {
+    if (el && el.id === 'vault-address-input' && typeof el.value === 'string') {
+      const trimmed = el.value.trim();
+      if (trimmed !== el.value) {
+        el.value = trimmed;
+      }
+    }
+  };
+
+  // Fallback for browsers without :user-invalid support (WeakMap dirty tracking)
+  const UserInvalidFallback = (() => {
+    const updateState = (input, shouldAnnounce = false) => {
+      const isValid = input.validity.valid;
+      input.classList.toggle('user-invalid-fallback', !isValid);
+      input.classList.toggle('user-valid-fallback', isValid);
+      input.setAttribute('aria-invalid', isValid ? 'false' : 'true');
+      linkError(input, !isValid);
+      if (!isValid) {
+        if (shouldAnnounce && !announced.has(input)) {
+          announceError(input);
+          announced.add(input);
+        }
+      } else {
+        announced.delete(input);
+        clearAnnouncer(input);
+      }
+    };
+
+    const handleEvent = (event) => {
+      const input = event.target;
+      if (event.type === 'reset') {
+        const controls = input.elements || [];
+        for (const control of controls) {
+          fallbackDirtyState.delete(control);
+          announced.delete(control);
+          control.classList.remove('user-invalid-fallback', 'user-valid-fallback');
+          if (control.matches?.('input, select, textarea')) {
+            control.setAttribute('aria-invalid', 'false');
+          }
+          if (control.dataset?.error) linkError(control, false);
+        }
+        clearAnnouncer(null);
+        return;
+      }
+
+      if (!input || !input.checkValidity) return;
+
+      if (event.type === 'invalid') {
+        fallbackDirtyState.set(input, { hasInteracted: true, hasBlurred: true });
+        announced.add(input);
+        updateState(input, false);
+        return;
+      }
+
+      if (event.type === 'input' || event.type === 'change') {
+        const st = fallbackDirtyState.get(input) || {
+          hasInteracted: false,
+          hasBlurred: false,
+        };
+        st.hasInteracted = true;
+        fallbackDirtyState.set(input, st);
+        if (st.hasBlurred || event.type === 'change') {
+          updateState(input, event.type === 'change');
+        }
+      } else if (event.type === 'blur') {
+        trimAddressIfNeeded(input);
+        const st = fallbackDirtyState.get(input) || {
+          hasInteracted: false,
+          hasBlurred: false,
+        };
+        st.hasBlurred = true;
+        fallbackDirtyState.set(input, st);
+        if (st.hasInteracted) {
+          updateState(input, true);
+        }
+      }
+    };
+
+    const init = (root) => {
+      if (CSS.supports('selector(:user-invalid)')) return false;
+      root.querySelectorAll('input, select, textarea').forEach((el) => {
+        if (!el.hasAttribute('aria-invalid')) {
+          el.setAttribute('aria-invalid', 'false');
+        }
+      });
+      root.addEventListener('blur', handleEvent, true);
+      root.addEventListener('input', handleEvent);
+      root.addEventListener('change', handleEvent, true);
+      root.addEventListener('invalid', handleEvent, true);
+      root.addEventListener('reset', handleEvent, true);
+      return true;
+    };
+
+    return { init, updateState };
+  })();
+
+  const syncAria = (el, announce = false) => {
+    if (!el || !el.matches?.('input, select, textarea')) return;
+    if (!CSS.supports('selector(:user-invalid)')) {
+      if (el.validity?.valid) {
+        el.classList.remove('user-invalid-fallback');
+        if (!String(el.value || '').trim()) {
+          el.classList.remove('user-valid-fallback');
+        }
+        fallbackDirtyState.delete(el);
+      }
+      const invalid =
+        Boolean(el.validity ? !el.validity.valid : true) &&
+        el.classList.contains('user-invalid-fallback');
+      el.setAttribute('aria-invalid', invalid ? 'true' : 'false');
+      linkError(el, invalid);
+      if (!invalid) {
+        announced.delete(el);
+        clearAnnouncer(el);
+      }
+      return;
+    }
+    const invalid = el.matches(':user-invalid');
+    if (invalid) {
+      if (announce && !announced.has(el)) {
+        announceError(el);
+        announced.add(el);
+      }
+      el.setAttribute('aria-invalid', 'true');
+      linkError(el, true);
+      flagged.add(el);
+    } else if (flagged.has(el) || el.getAttribute('aria-invalid') !== 'true') {
+      el.setAttribute('aria-invalid', 'false');
+      linkError(el, false);
+      flagged.delete(el);
+      announced.delete(el);
+      clearAnnouncer(el);
+    }
+  };
+
+  const resetFormState = (form) => {
+    if (!form) return;
+    for (const el of form.elements || []) {
+      if (typeof el.setCustomValidity === 'function') {
+        el.setCustomValidity('');
+      }
+      fallbackDirtyState.delete(el);
+      flagged.delete(el);
+      announced.delete(el);
+      el.classList?.remove('user-invalid-fallback', 'user-valid-fallback');
+      if (el.matches?.('input, select, textarea')) {
+        el.setAttribute('aria-invalid', 'false');
+        linkError(el, false);
+      }
+    }
+    clearAnnouncer(null);
+  };
+
+  const init = (form) => {
+    if (!form || form.dataset.validationWired === 'true') return;
+    form.dataset.validationWired = 'true';
+
+    // Helpful native constraint message for EVM address pattern mismatch
+    const addrInput = document.getElementById('vault-address-input');
+    if (addrInput) {
+      addrInput.addEventListener('invalid', () => {
+        if (addrInput.validity.patternMismatch) {
+          addrInput.setCustomValidity(
+            'Enter a valid 42-character EVM address starting with 0x (40 hex digits), or leave blank.'
+          );
+        }
+      });
+      addrInput.addEventListener('input', () => {
+        addrInput.setCustomValidity('');
+      });
+    }
+
+    const usedFallback = UserInvalidFallback.init(form);
+    if (!usedFallback) {
+      form.querySelectorAll('input, select, textarea').forEach((el) => syncAria(el));
+
+      form.addEventListener(
+        'blur',
+        (e) => {
+          trimAddressIfNeeded(e.target);
+          syncAria(e.target, true);
+        },
+        true
+      );
+      form.addEventListener('input', (e) => {
+        if (e.target?.hasAttribute?.('aria-invalid')) syncAria(e.target, false);
+      });
+      form.addEventListener('change', (e) => syncAria(e.target, true), true);
+      form.addEventListener(
+        'invalid',
+        (e) => {
+          announced.add(e.target);
+          syncAria(e.target, false);
+        },
+        true
+      );
+      form.addEventListener(
+        'reset',
+        (e) => {
+          setTimeout(() => {
+            [...(e.target.elements || [])].forEach((el) => syncAria(el, false));
+          });
+        },
+        true
+      );
+    }
+  };
+
+  return { init, syncAria, resetFormState };
+})();
+
+function initVaultModalDialogAndForm() {
+  const dialog = document.getElementById('vault-manager-modal');
+  const form = document.getElementById('vault-manager-form');
+  if (!dialog) return;
+
+  if (dialog.dataset.dialogWired !== 'true') {
+    dialog.dataset.dialogWired = 'true';
+
+    // Read and reset dialog.returnValue on every close so stale values never leak
+    dialog.addEventListener('close', () => {
+      const closedWith = dialog.returnValue;
+      dialog.returnValue = '';
+      state.vaultModal.isPreviewMode = false;
+      state.vaultModal.previewVault = null;
+      state.vaultModal.previewMeta = null;
+      if (closedWith) {
+        // Explicit close value consumed and cleared
+      }
+    });
+
+    // Progressive light-dismiss fallback when <dialog closedby="any"> is unsupported
+    if (!('closedBy' in HTMLDialogElement.prototype)) {
+      const isOutsideDialog = (e, dlg) => {
+        const r = dlg.getBoundingClientRect();
+        return (
+          e.clientX < r.left ||
+          e.clientX > r.right ||
+          e.clientY < r.top ||
+          e.clientY > r.bottom
+        );
+      };
+      let pressedOutside = false;
+      dialog.addEventListener('pointerdown', (e) => {
+        pressedOutside = dialog.open && isOutsideDialog(e, dialog);
+      });
+      dialog.addEventListener('pointerup', (e) => {
+        if (pressedOutside && dialog.open && isOutsideDialog(e, dialog)) {
+          dialog.close();
+        }
+        pressedOutside = false;
+      });
+      dialog.addEventListener('pointercancel', () => {
+        pressedOutside = false;
+      });
+    }
+  }
+
+  if (form) {
+    VaultFormValidation.init(form);
+    if (form.dataset.submitWired !== 'true') {
+      form.dataset.submitWired = 'true';
+      form.addEventListener('submit', submitVaultManagerForm);
+    }
+  }
+
+  const notesInput = document.getElementById('vault-notes-input');
+  if (notesInput && notesInput.dataset.countWired !== 'true') {
+    notesInput.dataset.countWired = 'true';
+    notesInput.addEventListener('input', updateVaultNotesCharCount);
+  }
+
+  const allocInput = document.getElementById('vault-target-alloc-input');
+  const sweepInput = document.getElementById('vault-sweep-threshold-input');
+  const previewBarbell = () => {
+    if (state.dashboard && dialog.open) {
+      renderVaultBarbellCard(state.dashboard);
+    }
+  };
+  if (allocInput && allocInput.dataset.previewWired !== 'true') {
+    allocInput.dataset.previewWired = 'true';
+    allocInput.addEventListener('input', previewBarbell);
+  }
+  if (sweepInput && sweepInput.dataset.previewWired !== 'true') {
+    sweepInput.dataset.previewWired = 'true';
+    sweepInput.addEventListener('input', previewBarbell);
+  }
+  if (form && form.dataset.rolePreviewWired !== 'true') {
+    form.dataset.rolePreviewWired = 'true';
+    form.addEventListener('change', (evt) => {
+      if (evt.target?.name === 'vault_role') {
+        previewBarbell();
+      }
+    });
+  }
+}
+
+function updateVaultNotesCharCount() {
+  const notesInput = document.getElementById('vault-notes-input');
+  const countEl = document.getElementById('vault-notes-char-count');
+  if (notesInput && countEl) {
+    countEl.textContent = String((notesInput.value || '').length);
+  }
+}
+
+function setVaultFormStatus(message, tone = 'info') {
+  const el = document.getElementById('vault-form-status');
+  if (!el) return;
+  if (!message) {
+    el.textContent = '';
+    el.className = 'vault-form-status';
+    el.hidden = true;
+    return;
+  }
+  el.className = `vault-form-status status-${tone}`;
+  el.textContent = message;
+  el.hidden = false;
+}
+
+function getOfficialHlpForCurrentMode(dash = state.dashboard) {
+  const mode = String(
+    dash?.execution_mode || state.health?.execution_mode || 'TESTNET'
+  ).toUpperCase();
+  const isLive = mode === 'LIVE';
+  return {
+    isLive,
+    mode,
+    address: isLive ? OFFICIAL_HLP_MAINNET : OFFICIAL_HLP_TESTNET,
+    networkLabel: isLive ? 'Mainnet (LIVE)' : 'Testnet',
+  };
+}
+
+function renderVaultModalHeaderMeta(dash) {
+  const pill = document.getElementById('vault-modal-network-pill');
+  const hlpBtn = document.getElementById('btn-vault-use-hlp');
+  const info = getOfficialHlpForCurrentMode(dash);
+  if (pill) {
+    pill.textContent = info.mode;
+    pill.className = info.isLive ? 'status-pill open' : 'status-pill working';
+  }
+  if (hlpBtn) {
+    hlpBtn.title = `Fill Official Hyperliquid HLP address for ${info.networkLabel}: ${info.address}`;
+  }
+}
+
+function hydrateVaultModalFormFromDashboard(dash) {
+  const form = document.getElementById('vault-manager-form');
+  if (!form) return;
+  form.reset();
+  VaultFormValidation.resetFormState(form);
+
+  const cfgAddr = getConfigValueFromDash(
+    dash,
+    'hyperliquid_vault_address',
+    dash?.vault_info?.configured_vault_address || ''
+  ).trim();
+  const cfgRoleRaw = getConfigValueFromDash(dash, 'vault_role', 'follower')
+    .trim()
+    .toLowerCase();
+  const cfgRole = ['follower', 'operator', 'none'].includes(cfgRoleRaw)
+    ? cfgRoleRaw
+    : 'follower';
+  const cfgTargetAlloc = getConfigNonNegFloatFromDash(
+    dash,
+    'vault_target_allocation_pct',
+    0
+  );
+  const cfgSweepThresh = getConfigNonNegFloatFromDash(
+    dash,
+    'vault_profit_sweep_threshold_usdc',
+    0
+  );
+  const cfgNotes = getConfigValueFromDash(dash, 'vault_notes', '');
+
+  const addrInput = document.getElementById('vault-address-input');
+  if (addrInput) addrInput.value = cfgAddr;
+
+  const roleRadio = form.querySelector(
+    `input[name="vault_role"][value="${cfgRole}"]`
+  );
+  if (roleRadio) roleRadio.checked = true;
+
+  const allocInput = document.getElementById('vault-target-alloc-input');
+  if (allocInput) allocInput.value = String(cfgTargetAlloc);
+
+  const sweepInput = document.getElementById('vault-sweep-threshold-input');
+  if (sweepInput) sweepInput.value = String(cfgSweepThresh);
+
+  const notesInput = document.getElementById('vault-notes-input');
+  if (notesInput) notesInput.value = cfgNotes;
+  updateVaultNotesCharCount();
+}
+
+function openVaultModal(focusVaultAddress = null) {
+  const dialog = document.getElementById('vault-manager-modal');
+  if (!dialog) return;
+  initVaultModalDialogAndForm();
+
+  const dash = state.dashboard || {};
+  hydrateVaultModalFormFromDashboard(dash);
+  setVaultFormStatus('');
+
+  state.vaultModal.isPreviewMode = false;
+  state.vaultModal.previewVault = null;
+  state.vaultModal.previewMeta = null;
+
+  const vaults = Array.isArray(dash?.vault_info?.vaults) ? dash.vault_info.vaults : [];
+  const focusNorm = String(focusVaultAddress || '').trim().toLowerCase();
+  const cfgAddrNorm = String(
+    getConfigValueFromDash(
+      dash,
+      'hyperliquid_vault_address',
+      dash?.vault_info?.configured_vault_address || ''
+    )
+  )
+    .trim()
+    .toLowerCase();
+
+  if (focusNorm) {
+    state.vaultModal.selectedAddress = focusNorm;
+  } else if (
+    cfgAddrNorm &&
+    vaults.some((v) => String(v?.vault_address || '').trim().toLowerCase() === cfgAddrNorm)
+  ) {
+    state.vaultModal.selectedAddress = cfgAddrNorm;
+  } else if (vaults.length > 0) {
+    state.vaultModal.selectedAddress = String(vaults[0]?.vault_address || '')
+      .trim()
+      .toLowerCase();
+  } else {
+    state.vaultModal.selectedAddress = '';
+  }
+
+  renderVaultModalHeaderMeta(dash);
+  renderVaultModalSyncedTabs(dash);
+  renderVaultFactsDisplay(dash);
+  renderVaultBarbellCard(dash);
+  renderVaultReadinessCard(dash);
+
+  // Guard against double-open when browser natively invokes command="show-modal"
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+
+  if (
+    focusNorm &&
+    !vaults.some((v) => String(v?.vault_address || '').trim().toLowerCase() === focusNorm) &&
+    /^0[xX][0-9a-fA-F]{40}$/.test(focusNorm)
+  ) {
+    inspectVaultAddress(focusNorm);
+  }
+}
+
+function refreshOpenVaultModalFromDashboard(dash) {
+  const dialog = document.getElementById('vault-manager-modal');
+  if (!dialog || !dialog.open || !dash) return;
+  renderVaultModalHeaderMeta(dash);
+  renderVaultModalSyncedTabs(dash);
+  renderVaultBarbellCard(dash);
+  renderVaultReadinessCard(dash);
+  if (!state.vaultModal.isPreviewMode) {
+    renderVaultFactsDisplay(dash);
+  }
+}
+
+function renderVaultModalSyncedTabs(dash) {
+  const container = document.getElementById('vault-modal-synced-tabs');
+  if (!container) return;
+
+  const vaults = Array.isArray(dash?.vault_info?.vaults) ? dash.vault_info.vaults : [];
+  const selectedNorm = String(state.vaultModal.selectedAddress || '').toLowerCase();
+  const nodes = [];
+
+  if (state.vaultModal.previewVault) {
+    const pv = state.vaultModal.previewVault;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `vault-chip-btn preview${state.vaultModal.isPreviewMode ? ' active' : ''}`;
+    btn.dataset.action = 'select-preview-vault';
+    btn.setAttribute('aria-pressed', state.vaultModal.isPreviewMode ? 'true' : 'false');
+    const previewName = String(pv.name || pv.vault_address || 'Inspected Vault');
+    btn.textContent = `LIVE PREVIEW · ${previewName}`;
+    nodes.push(btn);
+  }
+
+  for (const v of vaults) {
+    const addr = String(v?.vault_address || '').trim();
+    const addrNorm = addr.toLowerCase();
+    const isActive = !state.vaultModal.isPreviewMode && addrNorm && addrNorm === selectedNorm;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `vault-chip-btn${isActive ? ' active' : ''}`;
+    btn.dataset.action = 'select-synced-vault';
+    btn.dataset.vaultAddress = addr;
+    btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+
+    const label = document.createElement('span');
+    label.textContent = String(v?.name || 'Hyperliquid Vault');
+    btn.appendChild(label);
+
+    const eq = toFiniteNumber(v?.equity_usdc);
+    if (eq !== null && eq > 0.005) {
+      const eqSpan = document.createElement('span');
+      eqSpan.className = 'tab-count';
+      eqSpan.textContent = fmtUsd(eq, 0);
+      btn.appendChild(eqSpan);
+    }
+    nodes.push(btn);
+  }
+
+  if (nodes.length === 0) {
+    const emptyNote = document.createElement('span');
+    emptyNote.className = 'vault-empty-tabs-note';
+    emptyNote.textContent =
+      'No synced wallet vaults yet — click "Use Official HLP" or inspect a 0x vault address.';
+    container.replaceChildren(emptyNote);
+    return;
+  }
+
+  container.replaceChildren(...nodes);
+}
+
+function createVaultFactTile(labelText, valueText, subText = '', extraValueClass = '', valueTitle = '') {
+  const tile = document.createElement('div');
+  tile.className = 'vault-fact-tile';
+
+  const lbl = document.createElement('span');
+  lbl.className = 'vault-fact-label';
+  lbl.textContent = labelText;
+
+  const val = document.createElement('div');
+  val.className = extraValueClass ? `vault-fact-value ${extraValueClass}` : 'vault-fact-value';
+  val.textContent = valueText;
+  if (valueTitle) val.title = valueTitle;
+
+  tile.append(lbl, val);
+
+  if (subText) {
+    const sub = document.createElement('span');
+    sub.className = 'vault-fact-sub';
+    sub.textContent = subText;
+    tile.appendChild(sub);
+  }
+
+  return { tile, val };
+}
+
+function createStatusPillEl(cls, text) {
+  const span = document.createElement('span');
+  span.className = `status-pill ${cls}`;
+  span.textContent = text;
+  return span;
+}
+
+function renderVaultFactsDisplay(dash) {
+  const sourcePill = document.getElementById('vault-fact-source-pill');
+  const nameEl = document.getElementById('vault-fact-name');
+  const pillsEl = document.getElementById('vault-fact-status-pills');
+  const addrsEl = document.getElementById('vault-fact-addresses');
+  const descEl = document.getElementById('vault-fact-description');
+  const gridEl = document.getElementById('vault-facts-grid');
+  if (!gridEl) return;
+
+  const vaults = Array.isArray(dash?.vault_info?.vaults) ? dash.vault_info.vaults : [];
+  let activeVault = null;
+  let sourceText = 'AWAITING SELECTION';
+  let sourceCls = 'status-pill watch';
+
+  if (state.vaultModal.isPreviewMode && state.vaultModal.previewVault) {
+    activeVault = state.vaultModal.previewVault;
+    const isTestnet = Boolean(state.vaultModal.previewMeta?.is_testnet);
+    const inspectedAt = toFiniteNumber(state.vaultModal.previewMeta?.inspected_at_ms);
+    const tsStr = inspectedAt ? ` · ${fmtLocalShortTime(inspectedAt)}` : '';
+    sourceText = `LIVE PREVIEW · ${isTestnet ? 'TESTNET' : 'MAINNET'}${tsStr}`;
+    sourceCls = 'status-pill relationship';
+  } else if (vaults.length > 0) {
+    const selNorm = String(state.vaultModal.selectedAddress || '').toLowerCase();
+    activeVault =
+      vaults.find(
+        (v) => String(v?.vault_address || '').trim().toLowerCase() === selNorm
+      ) || vaults[0];
+    if (activeVault?.vault_address) {
+      state.vaultModal.selectedAddress = String(activeVault.vault_address)
+        .trim()
+        .toLowerCase();
+    }
+    const mode = String(dash?.execution_mode || 'TESTNET').toUpperCase();
+    const syncedAt = toFiniteNumber(dash?.vault_info?.synced_at_ms);
+    const tsStr = syncedAt ? ` · ${fmtLocalShortTime(syncedAt)}` : '';
+    sourceText = `LIVE SYNCED · ${mode === 'LIVE' ? 'MAINNET' : mode}${tsStr}`;
+    sourceCls = 'status-pill open';
+  }
+
+  if (sourcePill) {
+    sourcePill.className = sourceCls;
+    sourcePill.textContent = sourceText;
+  }
+
+  if (!activeVault) {
+    if (nameEl) nameEl.textContent = 'No Vault Selected';
+    if (pillsEl) pillsEl.replaceChildren();
+    if (addrsEl) addrsEl.replaceChildren();
+    if (descEl) {
+      descEl.textContent =
+        'Select a synced vault above, click "Use Official HLP", or enter a 0x vault address and click "Inspect Live Facts".';
+      descEl.classList.add('is-empty');
+    }
+    const placeholderTiles = [
+      createVaultFactTile('Vault TVL', '—', 'Total Value Locked').tile,
+      createVaultFactTile('Vault APR', '—', 'Annualized return').tile,
+      createVaultFactTile('Followers', '—', 'Active depositors').tile,
+      createVaultFactTile('Leader Stake %', '—', 'HL User Vault rule: ≥5%').tile,
+      createVaultFactTile('Leader Profit Share', '—', 'Commission on profits').tile,
+      createVaultFactTile('Your Equity', '—', 'Segregated from perp margin').tile,
+      createVaultFactTile('Your PnL ($ / %)', '—', 'Current vault position').tile,
+      createVaultFactTile('All-Time PnL ($ / %)', '—', 'Cumulative wallet PnL').tile,
+      createVaultFactTile('Days Following', '—', 'Deposit tenure').tile,
+      createVaultFactTile('Lockup Status', '—', '4-day deposit lock rule').tile,
+      createVaultFactTile('Close-on-Withdraw', '—', 'Withdrawal policy').tile,
+      createVaultFactTile('Max Withdrawable / Vol', '—', 'All-Time Vol: —').tile,
+    ];
+    gridEl.replaceChildren(...placeholderTiles);
+    return;
+  }
+
+  const v = activeVault;
+  const isHlp = isOfficialHlpAddress(v.vault_address);
+
+  if (nameEl) {
+    nameEl.textContent = String(v.name || 'Hyperliquid Vault');
+  }
+
+  if (pillsEl) {
+    const pills = [];
+    pills.push(
+      v.is_closed
+        ? createStatusPillEl('closed', 'CLOSED')
+        : createStatusPillEl('open', 'OPEN')
+    );
+    const allowDeposits = v.allow_deposits !== undefined ? Boolean(v.allow_deposits) : !v.is_closed;
+    pills.push(
+      allowDeposits
+        ? createStatusPillEl('open', 'DEPOSITS OPEN')
+        : createStatusPillEl('working', 'DEPOSITS PAUSED')
+    );
+
+    const relRaw = String(v.relationship_type || 'normal').trim().toLowerCase();
+    const childCount = Math.max(0, Math.floor(Number(v.child_vault_count || 0)));
+    let relLabel = 'STANDARD VAULT';
+    if (relRaw === 'parent') {
+      relLabel =
+        childCount > 0
+          ? `PARENT (${childCount} ${childCount === 1 ? 'SUB-VAULT' : 'SUB-VAULTS'})`
+          : 'PARENT VAULT';
+    } else if (relRaw === 'child') {
+      relLabel = 'CHILD VAULT';
+    } else if (relRaw && relRaw !== 'normal') {
+      relLabel = relRaw.toUpperCase();
+    }
+    pills.push(createStatusPillEl('relationship', relLabel));
+
+    if (isHlp) {
+      pills.push(createStatusPillEl('watch', 'OFFICIAL HLP'));
+    }
+    pillsEl.replaceChildren(...pills);
+  }
+
+  if (addrsEl) {
+    const pairVault = document.createElement('span');
+    pairVault.className = 'vault-addr-pair';
+    const lblVault = document.createElement('span');
+    lblVault.className = 'vault-addr-label';
+    lblVault.textContent = 'Vault:';
+    pairVault.append(lblVault, createAddressChip(v.vault_address));
+
+    const pairLeader = document.createElement('span');
+    pairLeader.className = 'vault-addr-pair';
+    const lblLeader = document.createElement('span');
+    lblLeader.className = 'vault-addr-label';
+    lblLeader.textContent = 'Leader:';
+    pairLeader.append(lblLeader, createAddressChip(v.leader));
+
+    addrsEl.replaceChildren(pairVault, pairLeader);
+  }
+
+  if (descEl) {
+    const desc = String(v.description || '').trim();
+    if (desc) {
+      descEl.textContent = desc;
+      descEl.classList.remove('is-empty');
+    } else {
+      descEl.textContent = 'No description published for this vault on Hyperliquid L1.';
+      descEl.classList.add('is-empty');
+    }
+  }
+
+  // Build 12-tile Live Vault Facts Grid (strictly DOM API, zero innerHTML)
+  const tvlVal = toFiniteNumber(v.tvl_usdc);
+  const tileTvl = createVaultFactTile(
+    'Vault TVL',
+    tvlVal !== null ? fmtCompactUsd(tvlVal) : '—',
+    'Total Value Locked',
+    '',
+    tvlVal !== null ? `Exact TVL: ${fmtUsd(tvlVal, 2)}` : ''
+  );
+
+  const aprVal = toFiniteNumber(v.apr_pct);
+  const tileApr = createVaultFactTile(
+    'Vault APR',
+    fmtSignedPct(aprVal, 2) ?? '—',
+    'Annualized vault return',
+    pnlToneClass(aprVal, 0.005)
+  );
+
+  const followerCount = Math.max(0, Math.floor(Number(v.follower_count ?? 0)));
+  const followersCapped = Boolean(v.followers_capped);
+  const tileFollowers = createVaultFactTile(
+    'Followers',
+    followersCapped ? `${Math.max(100, followerCount)}+` : followerCount.toLocaleString('en-US'),
+    followersCapped ? 'HL API follower list capped at 100+' : 'Active vault depositors'
+  );
+
+  const leaderStakePct = toFiniteNumber(v.leader_fraction_pct) ?? 0;
+  let leaderStakeSub = 'Meets ≥5% HL User Vault rule';
+  let leaderStakeTone = 'pnl-pos';
+  if (isHlp) {
+    leaderStakeSub = 'Protocol vault (HLP exempt from ≥5% rule)';
+    leaderStakeTone = '';
+  } else if (leaderStakePct < 5.0) {
+    leaderStakeSub = 'Below ≥5% HL User Vault leader floor';
+    leaderStakeTone = 'cell-sl-dist';
+  }
+  const tileLeaderStake = createVaultFactTile(
+    'Leader Stake %',
+    `${leaderStakePct.toFixed(2)}%`,
+    leaderStakeSub,
+    leaderStakeTone
+  );
+
+  const leaderCommPct = toFiniteNumber(v.leader_commission_pct) ?? 0;
+  const tileLeaderComm = createVaultFactTile(
+    'Leader Profit Share',
+    `${leaderCommPct.toFixed(2)}%`,
+    isHlp ? '0% protocol vault fee' : 'Leader commission on profits'
+  );
+
+  const yourEq = toFiniteNumber(v.equity_usdc) ?? 0;
+  const tileEquity = createVaultFactTile(
+    'Your Equity',
+    fmtUsd(yourEq, 2),
+    'Segregated from perp margin'
+  );
+
+  const tilePnl = createVaultFactTile('Your PnL ($ / %)', '—', 'Current vault position');
+  populatePnlElement(
+    tilePnl.val,
+    v.pnl_usdc,
+    computeVaultPnlPct(v, 'pnl_pct', 'pnl_usdc'),
+    'vault-fact-value'
+  );
+
+  const tileAtPnl = createVaultFactTile(
+    'All-Time PnL ($ / %)',
+    '—',
+    'Cumulative wallet vault PnL'
+  );
+  populatePnlElement(
+    tileAtPnl.val,
+    v.all_time_pnl_usdc,
+    computeVaultPnlPct(v, 'all_time_pnl_pct', 'all_time_pnl_usdc'),
+    'vault-fact-value'
+  );
+
+  const daysVal = toFiniteNumber(v.days_following);
+  const tileDays = createVaultFactTile(
+    'Days Following',
+    daysVal !== null ? `${Math.max(0, Math.floor(daysVal))}d` : '—',
+    'Active deposit tenure'
+  );
+
+  const isLocked = Boolean(v.is_locked);
+  const lockedUntilMs = toFiniteNumber(v.locked_until_ms) ?? 0;
+  const tileLockup = createVaultFactTile(
+    'Lockup Status',
+    isLocked ? 'LOCKED' : 'UNLOCKED',
+    isLocked
+      ? lockedUntilMs > 0
+        ? `Until ${fmtLocalTime(lockedUntilMs)}`
+        : 'Deposit lock active'
+      : lockedUntilMs > 0
+      ? `Unlocked since ${fmtLocalMonthDayTime(lockedUntilMs)}`
+      : 'No active deposit lock',
+    isLocked ? 'cell-sl-dist' : 'pnl-pos'
+  );
+
+  const alwaysClose = Boolean(v.always_close_on_withdraw);
+  const tileClosePolicy = createVaultFactTile(
+    'Close-on-Withdraw',
+    alwaysClose ? 'ALWAYS CLOSE' : 'PROPORTIONAL',
+    alwaysClose
+      ? 'Closes vault positions upon withdrawal'
+      : 'Proportional share withdrawal policy'
+  );
+
+  const maxWithdrawable = toFiniteNumber(v.max_withdrawable_usdc) ?? 0;
+  const maxDistributable = toFiniteNumber(v.max_distributable_usdc) ?? 0;
+  const allTimeVol = toFiniteNumber(v.all_time_volume_usdc) ?? 0;
+  const tileWithdrawable = createVaultFactTile(
+    'Max Withdrawable / Vol',
+    fmtCompactUsd(maxWithdrawable),
+    `All-Time Vol: ${fmtCompactUsd(allTimeVol)}`,
+    '',
+    `Max Withdrawable: ${fmtUsd(maxWithdrawable, 2)} · Max Distributable: ${fmtUsd(
+      maxDistributable,
+      2
+    )} · All-Time Volume: ${fmtUsd(allTimeVol, 2)}`
+  );
+
+  gridEl.replaceChildren(
+    tileTvl.tile,
+    tileApr.tile,
+    tileFollowers.tile,
+    tileLeaderStake.tile,
+    tileLeaderComm.tile,
+    tileEquity.tile,
+    tilePnl.tile,
+    tileAtPnl.tile,
+    tileDays.tile,
+    tileLockup.tile,
+    tileClosePolicy.tile,
+    tileWithdrawable.tile
+  );
+}
+
+function readCurrentVaultModalDraftTargets(dash) {
+  const form = document.getElementById('vault-manager-form');
+  const allocInput = document.getElementById('vault-target-alloc-input');
+  const sweepInput = document.getElementById('vault-sweep-threshold-input');
+
+  const checkedRole = form?.querySelector('input[name="vault_role"]:checked')?.value;
+  const role =
+    checkedRole ||
+    getConfigValueFromDash(dash, 'vault_role', 'follower').trim().toLowerCase() ||
+    'follower';
+
+  const allocDraft = toFiniteNumber(allocInput?.value);
+  const targetPctRaw =
+    allocDraft !== null
+      ? allocDraft
+      : getConfigNonNegFloatFromDash(dash, 'vault_target_allocation_pct', 0);
+  const targetPct = Math.max(0, Math.min(100, targetPctRaw));
+
+  const sweepDraft = toFiniteNumber(sweepInput?.value);
+  const sweepThreshold = Math.max(
+    0,
+    sweepDraft !== null
+      ? sweepDraft
+      : getConfigNonNegFloatFromDash(dash, 'vault_profit_sweep_threshold_usdc', 0)
+  );
+
+  return { role, targetPct, sweepThreshold };
+}
+
+function createLegendSwatchItem(colorHex, labelText, valText) {
+  const item = document.createElement('span');
+  item.className = 'legend-item';
+  const swatch = document.createElement('span');
+  swatch.className = 'legend-swatch';
+  swatch.style.background = colorHex;
+  const lbl = document.createElement('span');
+  lbl.textContent = labelText;
+  const strong = document.createElement('strong');
+  strong.className = 'legend-val';
+  strong.textContent = valText;
+  item.append(swatch, lbl, strong);
+  return item;
+}
+
+function renderVaultBarbellCard(dash) {
+  const rolePill = document.getElementById('vault-barbell-role-pill');
+  const barEl = document.getElementById('vault-barbell-bar');
+  const segPerp = document.getElementById('vault-bar-seg-perp');
+  const segSpot = document.getElementById('vault-bar-seg-spot');
+  const segVault = document.getElementById('vault-bar-seg-vault');
+  const legendEl = document.getElementById('vault-barbell-legend');
+  const metricsEl = document.getElementById('vault-barbell-metrics');
+  if (!barEl || !legendEl || !metricsEl) return;
+
+  const eb = dash?.equity_basis || {};
+  const vi = dash?.vault_info || {};
+  const isUnified = Boolean(eb.is_unified_account);
+  const perpEq = Math.max(
+    0,
+    toFiniteNumber(eb.perp_wallet_equity_usdc) ??
+      toFiniteNumber(dash?.snapshot?.total_equity_usdc) ??
+      0
+  );
+  const spotEq = isUnified ? 0 : Math.max(0, toFiniteNumber(eb.spot_usdc) ?? 0);
+  const vaultEq = Math.max(0, toFiniteNumber(vi.total_vault_equity_usdc) ?? 0);
+  const combined = perpEq + spotEq + vaultEq;
+
+  const perpPct = combined > 0 ? (perpEq / combined) * 100 : 0;
+  const spotPct = combined > 0 ? (spotEq / combined) * 100 : 0;
+  const vaultPct = combined > 0 ? (vaultEq / combined) * 100 : 0;
+
+  const { role, targetPct, sweepThreshold } = readCurrentVaultModalDraftTargets(dash);
+
+  if (rolePill) {
+    rolePill.textContent = role.toUpperCase();
+    rolePill.className =
+      role === 'operator'
+        ? 'status-pill relationship'
+        : role === 'follower'
+        ? 'status-pill open'
+        : 'status-pill watch';
+  }
+
+  if (segPerp) segPerp.style.width = `${perpPct.toFixed(2)}%`;
+  if (segSpot) segSpot.style.width = `${spotPct.toFixed(2)}%`;
+  if (segVault) segVault.style.width = `${vaultPct.toFixed(2)}%`;
+
+  const perpLabel = isUnified ? 'Unified' : 'Perps';
+  barEl.setAttribute(
+    'aria-label',
+    `Portfolio allocation: ${perpLabel} ${perpPct.toFixed(1)}%${
+      !isUnified ? `, Spot ${spotPct.toFixed(1)}%` : ''
+    }, Vault ${vaultPct.toFixed(1)}%`
+  );
+
+  const legendItems = [
+    createLegendSwatchItem('#00f2fe', `${perpLabel}:`, `${fmtUsd(perpEq, 2)} (${perpPct.toFixed(1)}%)`),
+  ];
+  if (!isUnified) {
+    legendItems.push(
+      createLegendSwatchItem('#8b5cf6', 'Spot:', `${fmtUsd(spotEq, 2)} (${spotPct.toFixed(1)}%)`)
+    );
+  }
+  legendItems.push(
+    createLegendSwatchItem('#10b981', 'Vault:', `${fmtUsd(vaultEq, 2)} (${vaultPct.toFixed(1)}%)`)
+  );
+  legendEl.replaceChildren(...legendItems);
+
+  // Metric 1: Actual % vs Target % + USDC Delta
+  const targetBox = document.createElement('div');
+  targetBox.className = 'vault-metric-box';
+  const targetLbl = document.createElement('span');
+  targetLbl.className = 'vault-metric-label';
+  targetLbl.textContent = 'Actual vs Target Vault Share';
+
+  const targetVal = document.createElement('div');
+  targetVal.className = 'vault-metric-val';
+  targetVal.textContent = `${vaultPct.toFixed(1)}% actual · ${targetPct.toFixed(1)}% target`;
+
+  const targetSub = document.createElement('span');
+  targetSub.className = 'vault-metric-sub';
+  if (targetPct <= 0.001) {
+    targetSub.textContent = 'Target allocation disabled (0%) · Informational barbell benchmark';
+  } else {
+    const targetUsdc = combined * (targetPct / 100.0);
+    const deltaUsdc = targetUsdc - vaultEq;
+    if (Math.abs(deltaUsdc) < 1.0) {
+      targetSub.classList.add('pnl-pos');
+      targetSub.textContent = `On target (${fmtUsd(targetUsdc, 2)} benchmark)`;
+    } else if (deltaUsdc > 0) {
+      targetSub.classList.add('cell-sl-dist');
+      targetSub.textContent = `Delta: +${fmtUsd(deltaUsdc, 2)} under target (${fmtUsd(targetUsdc, 2)})`;
+    } else {
+      targetSub.classList.add('pnl-pos');
+      targetSub.textContent = `Delta: -${fmtUsd(Math.abs(deltaUsdc), 2)} above target (${fmtUsd(targetUsdc, 2)})`;
+    }
+  }
+  targetBox.append(targetLbl, targetVal, targetSub);
+
+  // Metric 2: Realized PnL vs Profit-Sweep Threshold
+  const sweepBox = document.createElement('div');
+  sweepBox.className = 'vault-metric-box';
+  const sweepLbl = document.createElement('span');
+  sweepLbl.className = 'vault-metric-label';
+  sweepLbl.textContent = 'Realized PnL vs Sweep Threshold';
+
+  const realizedYtd = toFiniteNumber(dash?.pnl_summary?.ytd?.realized_pnl_usdc) ?? 0;
+  const realizedMonthly = toFiniteNumber(dash?.pnl_summary?.monthly?.realized_pnl_usdc) ?? 0;
+
+  const sweepVal = document.createElement('div');
+  sweepVal.className = `vault-metric-val ${pnlToneClass(realizedYtd, 0.005)}`;
+  sweepVal.textContent = `YTD ${fmtSignedUsd(realizedYtd, 2)} (30D ${fmtSignedUsd(realizedMonthly, 2)})`;
+
+  const sweepSub = document.createElement('span');
+  sweepSub.className = 'vault-metric-sub';
+  if (sweepThreshold <= 0.001) {
+    sweepSub.textContent = 'Profit-sweep reminder disabled ($0 threshold)';
+  } else if (realizedYtd >= sweepThreshold) {
+    sweepSub.classList.add('pnl-pos');
+    sweepSub.textContent = `SWEEP READY · Exceeds ${fmtUsd(sweepThreshold, 2)} threshold`;
+  } else {
+    const remaining = Math.max(0, sweepThreshold - realizedYtd);
+    sweepSub.textContent = `${fmtUsd(remaining, 2)} to reach ${fmtUsd(sweepThreshold, 2)} sweep trigger`;
+  }
+  sweepBox.append(sweepLbl, sweepVal, sweepSub);
+
+  metricsEl.replaceChildren(targetBox, sweepBox);
+}
+
+function createReadinessItem(nameText, badgeCls, badgeText, titleText = '') {
+  const row = document.createElement('div');
+  row.className = 'vault-readiness-item';
+  if (titleText) row.title = titleText;
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'vault-readiness-name';
+  nameSpan.textContent = nameText;
+
+  const pill = createStatusPillEl(badgeCls, badgeText);
+  row.append(nameSpan, pill);
+  return row;
+}
+
+function renderVaultReadinessCard(dash) {
+  const container = document.getElementById('vault-readiness-badges');
+  if (!container) return;
+
+  const pkVal = getConfigValueFromDash(dash, 'private_key', '').trim();
+  const hasAgentKey = Boolean(pkVal) && pkVal !== '[UNSET]';
+  const agentAddr = getConfigValueFromDash(dash, 'hyperliquid_agent_address', '').trim();
+  const keyItem = createReadinessItem(
+    'Trade-Only API Agent Key',
+    hasAgentKey ? 'open' : 'working',
+    hasAgentKey ? (agentAddr ? 'AGENT BOUND' : 'ENCRYPTED') : 'UNSET',
+    'Aegis signs perp orders with a Trade-Only API Agent key (vaultAddress: null); master wallet keys are never required for automated trading.'
+  );
+
+  const stopAtr = getConfigFloatFromDash(dash, 'protective_stop_atr_mult', 2.2);
+  const tpAtr = getConfigFloatFromDash(dash, 'take_profit_atr_mult', 2.8);
+  const attachedTpsl = Number(dash?.attached_tpsl_order_count ?? 0);
+  const tpslItem = createReadinessItem(
+    'Hard SL/TP Orders',
+    'open',
+    attachedTpsl > 0
+      ? `${attachedTpsl} LIVE · ${stopAtr.toFixed(1)}x/${tpAtr.toFixed(1)}x`
+      : `ARMED ${stopAtr.toFixed(1)}x/${tpAtr.toFixed(1)}x ATR`,
+    'Protective stop-loss and take-profit trigger orders are enforced on Hyperliquid.'
+  );
+
+  const pgEnabled =
+    getConfigValueFromDash(dash, 'profit_gate_signal_exits', 'true')
+      .trim()
+      .toLowerCase() === 'true';
+  const pgMinPct =
+    getConfigNonNegFloatFromDash(dash, 'signal_exit_min_net_profit_pct', 0.0025) * 100.0;
+  const pgItem = createReadinessItem(
+    'Profit-Gated Exits',
+    pgEnabled ? 'open' : 'working',
+    pgEnabled ? `ON (≥${pgMinPct.toFixed(2)}%)` : 'OFF',
+    'Blocks low-conviction signal CLOSE/FLIP exits below minimum net profit while keeping hard SL/TP unrestricted.'
+  );
+
+  const dd = dash?.drawdown_breaker || {};
+  const maxDdPct =
+    toFiniteNumber(dd.max_daily_drawdown_pct) ??
+    getConfigFloatFromDash(dash, 'max_daily_drawdown_pct', 0.15) * 100.0;
+  const ddTripped = Boolean(dd.tripped);
+  const ddItem = createReadinessItem(
+    'Daily Drawdown Breaker',
+    ddTripped ? 'closed' : 'open',
+    ddTripped
+      ? `HALTED (-${Math.abs(Number(dd.drawdown_pct ?? 0)).toFixed(1)}%)`
+      : `ARMED (${maxDdPct.toFixed(1)}% CAP)`,
+    '24-hour peak-to-trough perp equity drawdown circuit breaker (vault deposits excluded from drawdown calculation).'
+  );
+
+  container.replaceChildren(keyItem, tpslItem, pgItem, ddItem);
+}
+
+async function inspectVaultAddress(rawAddress) {
+  if (state.vaultModal.inFlightInspect) return;
+  const addr = String(rawAddress || '').trim();
+  const addrInput = document.getElementById('vault-address-input');
+
+  if (!addr) {
+    setVaultFormStatus(
+      'Enter a 42-character 0x Hyperliquid vault address first, or click "Use Official HLP".',
+      'warn'
+    );
+    addrInput?.focus();
+    return;
+  }
+
+  if (!/^0[xX][0-9a-fA-F]{40}$/.test(addr)) {
+    if (addrInput) {
+      addrInput.value = addr;
+      addrInput.reportValidity();
+      VaultFormValidation.syncAria(addrInput, true);
+    }
+    setVaultFormStatus(
+      'Invalid vault address format — expected 0x followed by 40 hexadecimal characters.',
+      'error'
+    );
+    return;
+  }
+
+  const inspectBtn = document.getElementById('btn-vault-inspect');
+  state.vaultModal.inFlightInspect = true;
+  if (inspectBtn) {
+    inspectBtn.disabled = true;
+    inspectBtn.textContent = 'Inspecting...';
+  }
+  setVaultFormStatus(`Querying live Hyperliquid vaultDetails for ${addr}...`, 'info');
+
+  try {
+    const res = await apiFetch('/api/v1/vault/inspect', {
+      method: 'POST',
+      body: JSON.stringify({ vault_address: addr }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setVaultFormStatus(
+        `Vault inspection failed: ${data.detail || data.error || `HTTP ${res.status}`}`,
+        'error'
+      );
+      return;
+    }
+
+    const netLabel = data.is_testnet ? 'Testnet' : 'Mainnet';
+    if (!data.found || !data.vault) {
+      setVaultFormStatus(
+        `No vault found at ${addr} on Hyperliquid ${netLabel}. Confirm the address and active execution mode.`,
+        'warn'
+      );
+      return;
+    }
+
+    state.vaultModal.isPreviewMode = true;
+    state.vaultModal.previewVault = data.vault;
+    state.vaultModal.previewMeta = {
+      execution_mode: data.execution_mode,
+      is_testnet: Boolean(data.is_testnet),
+      inspected_at_ms: data.inspected_at_ms || Date.now(),
+    };
+
+    const dash = state.dashboard || {};
+    renderVaultModalSyncedTabs(dash);
+    renderVaultFactsDisplay(dash);
+
+    const vName = String(data.vault.name || addr);
+    setVaultFormStatus(
+      `Loaded live ${netLabel} facts for "${vName}". Click "Save & Sync Vault" to persist this configuration.`,
+      'success'
+    );
+  } catch (err) {
+    setVaultFormStatus(`Vault inspection error: ${err.message}`, 'error');
+  } finally {
+    state.vaultModal.inFlightInspect = false;
+    if (inspectBtn) {
+      inspectBtn.disabled = false;
+      inspectBtn.textContent = 'Inspect Live Facts';
+    }
+  }
+}
+
+function triggerVaultInspectFromInput() {
+  const addrInput = document.getElementById('vault-address-input');
+  if (!addrInput) return;
+  addrInput.value = addrInput.value.trim();
+  inspectVaultAddress(addrInput.value);
+}
+
+function applyOfficialHlpPreset() {
+  const addrInput = document.getElementById('vault-address-input');
+  if (!addrInput) return;
+  const info = getOfficialHlpForCurrentMode(state.dashboard);
+  addrInput.value = info.address;
+  addrInput.setCustomValidity('');
+  VaultFormValidation.syncAria(addrInput, false);
+  inspectVaultAddress(info.address);
+}
+
+function clearVaultAddressInput() {
+  const addrInput = document.getElementById('vault-address-input');
+  if (!addrInput) return;
+  addrInput.value = '';
+  addrInput.setCustomValidity('');
+  VaultFormValidation.syncAria(addrInput, false);
+  state.vaultModal.isPreviewMode = false;
+  state.vaultModal.previewVault = null;
+  state.vaultModal.previewMeta = null;
+  if (state.dashboard) {
+    renderVaultModalSyncedTabs(state.dashboard);
+    renderVaultFactsDisplay(state.dashboard);
+  }
+  setVaultFormStatus(
+    'Cleared tracked vault address. Click "Save & Sync Vault" to remove the configured vault.',
+    'info'
+  );
+  addrInput.focus();
+}
+
+async function triggerVaultLiveSync() {
+  if (state.vaultModal.inFlightSync) return;
+  const btn = document.getElementById('btn-vault-refresh-sync');
+  state.vaultModal.inFlightSync = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+  }
+  setVaultFormStatus('Syncing live Hyperliquid vault equities & L1 metadata...', 'info');
+
+  try {
+    const res = await apiFetch('/api/v1/vault/sync', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setVaultFormStatus(
+        `Live vault sync failed: ${data.detail || data.error || `HTTP ${res.status}`}`,
+        'error'
+      );
+      showToast(`Vault sync failed: ${data.detail || data.error || res.status}`, true);
+      return;
+    }
+
+    state.vaultModal.isPreviewMode = false;
+    state.vaultModal.previewVault = null;
+    state.vaultModal.previewMeta = null;
+
+    await refreshAll(true);
+    if (state.dashboard) {
+      refreshOpenVaultModalFromDashboard(state.dashboard);
+    }
+
+    const syncedVaultCount = Number(
+      data?.vault_info?.vault_count ??
+        (Array.isArray(data?.vault_info?.vaults) ? data.vault_info.vaults.length : 0)
+    );
+    const tsLabel = fmtLocalShortTime(data?.synced_at_ms || Date.now());
+    const msg =
+      data.synced === false
+        ? `Vault sync skipped in ${data.execution_mode || 'PAPER'} mode (no live wallet or configured vault).`
+        : `Live Hyperliquid vault sync completed (${syncedVaultCount} ${
+            syncedVaultCount === 1 ? 'vault' : 'vaults'
+          } · ${tsLabel}).`;
+    setVaultFormStatus(msg, data.synced === false ? 'warn' : 'success');
+    showToast(msg);
+  } catch (err) {
+    setVaultFormStatus(`Live vault sync error: ${err.message}`, 'error');
+    showToast(`Vault sync error: ${err.message}`, true);
+  } finally {
+    state.vaultModal.inFlightSync = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '⟳ Refresh Live Sync';
+    }
+  }
+}
+
+async function submitVaultManagerForm(evt) {
+  evt.preventDefault();
+  const form = evt.currentTarget;
+  if (!form || state.vaultModal.inFlightSave) return;
+
+  const addrInput = document.getElementById('vault-address-input');
+  if (addrInput) {
+    addrInput.value = addrInput.value.trim();
+    addrInput.setCustomValidity('');
+  }
+
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    return;
+  }
+
+  const vaultAddr = addrInput ? addrInput.value.trim() : '';
+  const roleVal =
+    form.querySelector('input[name="vault_role"]:checked')?.value || 'follower';
+  const allocInput = document.getElementById('vault-target-alloc-input');
+  const sweepInput = document.getElementById('vault-sweep-threshold-input');
+  const notesInput = document.getElementById('vault-notes-input');
+
+  const allocNum = toFiniteNumber(allocInput?.value);
+  const sweepNum = toFiniteNumber(sweepInput?.value);
+  const notesVal = String(notesInput?.value || '').trim().slice(0, 500);
+
+  const submitBtn = document.getElementById('btn-vault-save-sync');
+  state.vaultModal.inFlightSave = true;
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Saving & Syncing...';
+  }
+  setVaultFormStatus('Saving vault maintenance settings to MariaDB...', 'info');
+
+  try {
+    const cfgRes = await apiFetch('/api/v1/config', {
+      method: 'POST',
+      body: JSON.stringify({
+        updates: {
+          hyperliquid_vault_address: vaultAddr,
+          vault_role: roleVal,
+          vault_target_allocation_pct: String(allocNum !== null ? allocNum : 0),
+          vault_profit_sweep_threshold_usdc: String(sweepNum !== null ? sweepNum : 0),
+          vault_notes: notesVal,
+        },
+      }),
+    });
+    const cfgData = await cfgRes.json().catch(() => ({}));
+    if (!cfgRes.ok) {
+      const errMsg = `Save failed: ${cfgData.detail || cfgData.error || `HTTP ${cfgRes.status}`}`;
+      setVaultFormStatus(errMsg, 'error');
+      showToast(errMsg, true);
+      return;
+    }
+
+    setVaultFormStatus(
+      'Configuration saved. Syncing live Hyperliquid vault telemetry...',
+      'info'
+    );
+
+    const syncRes = await apiFetch('/api/v1/vault/sync', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const syncData = await syncRes.json().catch(() => ({}));
+
+    state.vaultModal.isPreviewMode = false;
+    state.vaultModal.previewVault = null;
+    state.vaultModal.previewMeta = null;
+    if (vaultAddr) {
+      state.vaultModal.selectedAddress = vaultAddr.toLowerCase();
+    }
+
+    await refreshAll(true);
+    if (state.dashboard) {
+      refreshOpenVaultModalFromDashboard(state.dashboard);
+    }
+
+    if (!syncRes.ok) {
+      const warnMsg = `Saved vault settings, but live sync returned: ${
+        syncData.detail || syncData.error || `HTTP ${syncRes.status}`
+      }`;
+      setVaultFormStatus(warnMsg, 'warn');
+      showToast(warnMsg, true);
+      return;
+    }
+
+    const vCount = Number(
+      syncData?.vault_info?.vault_count ??
+        (Array.isArray(syncData?.vault_info?.vaults) ? syncData.vault_info.vaults.length : 0)
+    );
+    const doneMsg =
+      syncData.synced === false
+        ? `Vault configuration saved (${syncData.execution_mode || 'PAPER'} mode — live sync inactive).`
+        : `Saved & synced vault configuration (${vCount} ${
+            vCount === 1 ? 'vault' : 'vaults'
+          } live).`;
+    setVaultFormStatus(doneMsg, 'success');
+    showToast(doneMsg);
+  } catch (err) {
+    const errMsg = `Vault save/sync error: ${err.message}`;
+    setVaultFormStatus(errMsg, 'error');
+    showToast(errMsg, true);
+  } finally {
+    state.vaultModal.inFlightSave = false;
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Save & Sync Vault';
+    }
+  }
+}
+
+/* ============================================================================
    DATA FETCHING & 1.5s SSE STREAM WIRING
    ============================================================================ */
 
@@ -3317,6 +4809,10 @@ function applyDashboardPayload(dash, forceConfig = false) {
   renderActiveExplorerTab(forceConfig);
   drawEquityCurveCanvas(dash);
   drawSleeveAttributionCanvas(dash);
+  const vaultDialog = document.getElementById('vault-manager-modal');
+  if (vaultDialog && vaultDialog.open) {
+    refreshOpenVaultModalFromDashboard(dash);
+  }
 }
 
 async function refreshAll(forceConfig = false) {
@@ -3429,6 +4925,65 @@ document.addEventListener('click', (evt) => {
     closeConfigModal();
     return;
   }
+  if (target.closest('#btn-open-vault-modal')) {
+    openVaultModal(null);
+    return;
+  }
+  if (target.closest('#btn-close-vault-modal')) {
+    if (!SUPPORTS_INVOKER_COMMANDS) {
+      const dlg = document.getElementById('vault-manager-modal');
+      if (dlg && dlg.open) dlg.close('close-button');
+    }
+    return;
+  }
+  const inspectVaultRowBtn = target.closest(
+    '.vault-row-inspect-btn[data-action="inspect-vault"]'
+  );
+  if (inspectVaultRowBtn) {
+    openVaultModal(inspectVaultRowBtn.getAttribute('data-vault-address') || '');
+    return;
+  }
+  if (target.closest('#btn-vault-inspect')) {
+    triggerVaultInspectFromInput();
+    return;
+  }
+  if (target.closest('#btn-vault-use-hlp')) {
+    applyOfficialHlpPreset();
+    return;
+  }
+  if (target.closest('#btn-vault-clear-addr')) {
+    clearVaultAddressInput();
+    return;
+  }
+  if (target.closest('#btn-vault-refresh-sync')) {
+    triggerVaultLiveSync();
+    return;
+  }
+  const syncedVaultChip = target.closest(
+    '.vault-chip-btn[data-action="select-synced-vault"]'
+  );
+  if (syncedVaultChip) {
+    state.vaultModal.isPreviewMode = false;
+    state.vaultModal.selectedAddress = String(
+      syncedVaultChip.getAttribute('data-vault-address') || ''
+    )
+      .trim()
+      .toLowerCase();
+    if (state.dashboard) {
+      renderVaultModalSyncedTabs(state.dashboard);
+      renderVaultFactsDisplay(state.dashboard);
+    }
+    return;
+  }
+  if (target.closest('.vault-chip-btn[data-action="select-preview-vault"]')) {
+    if (state.vaultModal.previewVault) {
+      state.vaultModal.isPreviewMode = true;
+      const dash = state.dashboard || {};
+      renderVaultModalSyncedTabs(dash);
+      renderVaultFactsDisplay(dash);
+    }
+    return;
+  }
   if (target.closest('#btn-toggle-watch-all')) {
     toggleShowAllPriorityWatch();
     return;
@@ -3475,6 +5030,7 @@ document.addEventListener('click', (evt) => {
 
 document.addEventListener('DOMContentLoaded', async () => {
   initSortableTables();
+  initVaultModalDialogAndForm();
 
   const scannerSearch = document.getElementById('scanner-search-input');
   if (scannerSearch) {

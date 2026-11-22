@@ -761,6 +761,8 @@ pub struct VaultPositionInfo {
     #[serde(default)]
     pub leader: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub equity_usdc: f64,
     #[serde(default)]
     pub pnl_usdc: f64,
@@ -780,6 +782,30 @@ pub struct VaultPositionInfo {
     pub is_locked: bool,
     #[serde(default)]
     pub is_closed: bool,
+    #[serde(default)]
+    pub tvl_usdc: f64,
+    #[serde(default)]
+    pub follower_count: usize,
+    #[serde(default)]
+    pub followers_capped: bool,
+    #[serde(default)]
+    pub leader_fraction_pct: f64,
+    #[serde(default)]
+    pub leader_commission_pct: f64,
+    #[serde(default)]
+    pub allow_deposits: bool,
+    #[serde(default)]
+    pub always_close_on_withdraw: bool,
+    #[serde(default)]
+    pub max_distributable_usdc: f64,
+    #[serde(default)]
+    pub max_withdrawable_usdc: f64,
+    #[serde(default)]
+    pub relationship_type: String,
+    #[serde(default)]
+    pub child_vault_count: usize,
+    #[serde(default)]
+    pub all_time_volume_usdc: f64,
 }
 
 /// Aggregated Hyperliquid vault portfolio summary (segregated from perp margin).
