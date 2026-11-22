@@ -485,6 +485,12 @@ async fn test_web_health_503_and_config_validation() {
     assert!(validate_config_key_value("execution_mode", "INVALID").is_err());
     assert!(validate_config_key_value("private_key", "gAAAAABrawinvalid").is_err());
     assert!(validate_config_key_value("risk_capital_cap_usdc", "1000.0").is_ok());
+    assert!(validate_config_key_value("profit_gate_signal_exits", "true").is_ok());
+    assert!(validate_config_key_value("profit_gate_signal_exits", "false").is_ok());
+    assert!(validate_config_key_value("profit_gate_signal_exits", "invalid").is_err());
+    assert!(validate_config_key_value("signal_exit_min_net_profit_pct", "0.0025").is_ok());
+    assert!(validate_config_key_value("signal_exit_min_net_profit_pct", "-0.01").is_err());
+    assert!(validate_config_key_value("signal_exit_min_net_profit_pct", "0.60").is_err());
 }
 
 #[tokio::test]

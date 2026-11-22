@@ -324,8 +324,11 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
                 )));
             }
         }
-        "auto_rebalance_enabled" => {
+        "auto_rebalance_enabled" | "profit_gate_signal_exits" => {
             parse_bool_strict(clean_key, clean_val)?;
+        }
+        "signal_exit_min_net_profit_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
         }
         "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
             if !clean_val.is_empty() {

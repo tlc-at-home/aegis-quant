@@ -320,6 +320,8 @@ pub fn default_v2_system_config_seeds(
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
         ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
         ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
+        ("profit_gate_signal_exits", "true", "bool", "Block signal-driven CLOSE/FLIP exits while estimated net PnL (after fees/funding) is below signal_exit_min_net_profit_pct; hard SL/TP/trailing stops remain unrestricted"),
+        ("signal_exit_min_net_profit_pct", "0.0025", "float", "Minimum estimated net profit fraction of entry notional (0.25% default) required before signal CLOSE/FLIP may exit an open position when profit_gate_signal_exits=true"),
         ("max_entry_spread_bps", "20.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders (20.0 bps default)"),
         ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough equity drawdown fraction before halting new entries"),
         ("scanner_interval_ms", "3000", "int", "Full-exchange 150+ perp scanner cadence in milliseconds (3s)"),
@@ -438,6 +440,8 @@ mod tests {
             Some("1795035600000")
         );
         assert_eq!(find("min_position_hold_sec"), Some("300"));
+        assert_eq!(find("profit_gate_signal_exits"), Some("true"));
+        assert_eq!(find("signal_exit_min_net_profit_pct"), Some("0.0025"));
         assert_eq!(find("max_entry_spread_bps"), Some("20.0"));
         assert_eq!(find("core_min_day_volume_usdc"), Some("2000000.0"));
         assert_eq!(find("event_min_day_volume_usdc"), Some("500000.0"));

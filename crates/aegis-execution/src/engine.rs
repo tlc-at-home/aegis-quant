@@ -102,6 +102,81 @@ pub(crate) fn is_active_cap_order(o: &OrderedAssetView, cap_epoch_ms: i64) -> bo
     cap_epoch_ms <= 0 || o.created_at_ms >= cap_epoch_ms
 }
 
+/// Evaluates whether a held position's estimated net exit PnL (mark-to-market unrealized PnL
+/// plus accrued funding minus paid fees and estimated taker exit fee) clears the profit threshold
+/// `entry_notional * min_net_profit_pct` (and is strictly positive).
+pub fn signal_exit_passes_profit_gate(
+    h: &HeldAssetView,
+    min_net_profit_pct: f64,
+    taker_fee_bps: f64,
+) -> (bool, f64, f64) {
+    let live_upnl = if h.entry_price.is_finite()
+        && h.entry_price > 0.0
+        && h.mark_price.is_finite()
+        && h.mark_price > 0.0
+        && h.quantity.is_finite()
+        && h.quantity > 0.0
+    {
+        match OrderSide::parse(&h.side) {
+            OrderSide::Long => (h.mark_price - h.entry_price) * h.quantity,
+            OrderSide::Short => (h.entry_price - h.mark_price) * h.quantity,
+        }
+    } else if h.unrealized_pnl_usdc.is_finite() {
+        h.unrealized_pnl_usdc
+    } else {
+        0.0
+    };
+
+    let entry_notional = if h.entry_price.is_finite()
+        && h.entry_price > 0.0
+        && h.quantity.is_finite()
+        && h.quantity > 0.0
+    {
+        (h.entry_price * h.quantity)
+            .abs()
+            .max(h.committed_notional_usdc.abs())
+    } else {
+        h.committed_notional_usdc.abs()
+    };
+    let exit_notional = if h.mark_price.is_finite()
+        && h.mark_price > 0.0
+        && h.quantity.is_finite()
+        && h.quantity > 0.0
+    {
+        (h.mark_price * h.quantity).abs().max(entry_notional)
+    } else {
+        entry_notional
+    };
+
+    let fee_rate = if taker_fee_bps.is_finite() {
+        taker_fee_bps.clamp(0.0, 100.0) / 10_000.0
+    } else {
+        0.00045
+    };
+    let est_exit_fee = exit_notional * fee_rate;
+    let funding = if h.funding_accrued_usdc.is_finite() {
+        h.funding_accrued_usdc
+    } else {
+        0.0
+    };
+    let fees_paid = if h.fees_paid_usdc.is_finite() {
+        h.fees_paid_usdc.max(0.0)
+    } else {
+        0.0
+    };
+    let net_exit_pnl_usdc = live_upnl + funding - fees_paid - est_exit_fee;
+    let min_pct = if min_net_profit_pct.is_finite() {
+        min_net_profit_pct.clamp(0.0, 0.50)
+    } else {
+        0.0025
+    };
+    let min_required_profit_usdc = entry_notional * min_pct;
+    let allowed = net_exit_pnl_usdc.is_finite()
+        && net_exit_pnl_usdc > 0.0
+        && net_exit_pnl_usdc >= min_required_profit_usdc;
+    (allowed, net_exit_pnl_usdc, min_required_profit_usdc)
+}
+
 fn parse_hl_f64(val: Option<&Value>) -> f64 {
     val.and_then(|x| {
         x.as_f64()
@@ -878,9 +953,14 @@ impl ExecutionEngine {
         let held = self.db.get_assets_held()?;
         let rebalance_now = now_ms();
         let min_hold_ms = cfg.get_i64("min_position_hold_sec", 300).max(0) * 1000;
+        let profit_gate_signal_exits = cfg.get_bool("profit_gate_signal_exits", true);
+        let signal_exit_min_net_profit_pct = cfg
+            .get_f64("signal_exit_min_net_profit_pct", 0.0025)
+            .clamp(0.0, 0.50);
+        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
         let mut flipped_symbols: HashSet<i64> = HashSet::new();
 
-        // 1. Handle CLOSE or FLIP on currently OPEN holdings (respecting min_position_hold_sec)
+        // 1. Handle CLOSE or FLIP on currently OPEN holdings (respecting min_position_hold_sec and profit gate)
         for sig in &signal_out.signals {
             if sig.rebalance_action == ACTION_CLOSE || sig.rebalance_action == ACTION_FLIP {
                 if let Some(h) = held.iter().find(|x| x.asset_id == sig.asset_id) {
@@ -893,6 +973,25 @@ impl ExecutionEngine {
                         || self.is_illiquid_close_backed_off(h.position_id, rebalance_now)
                     {
                         continue;
+                    }
+                    if profit_gate_signal_exits {
+                        let (passes_profit_gate, net_exit_pnl_usdc, min_required_profit_usdc) =
+                            signal_exit_passes_profit_gate(
+                                h,
+                                signal_exit_min_net_profit_pct,
+                                taker_fee_bps,
+                            );
+                        if !passes_profit_gate {
+                            tracing::debug!(
+                                position_id = h.position_id,
+                                symbol = %h.symbol,
+                                action = %sig.rebalance_action,
+                                net_exit_pnl_usdc = net_exit_pnl_usdc,
+                                min_required_profit_usdc = min_required_profit_usdc,
+                                "Holding open position: signal exit blocked by profit gate"
+                            );
+                            continue;
+                        }
                     }
                     let close_cd = if sig.rebalance_action == ACTION_FLIP {
                         Some(0)

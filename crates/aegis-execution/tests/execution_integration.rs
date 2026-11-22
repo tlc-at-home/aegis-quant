@@ -576,6 +576,8 @@ fn test_symbol_scoped_action_flip_cooldown_bypass() {
 
     db.set_config_value("min_entry_interval_sec", "150", None)
         .unwrap();
+    db.set_config_value("profit_gate_signal_exits", "false", None)
+        .unwrap();
     db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
         .unwrap();
     db.record_position_entry_timestamp_ms(now_ms() - 10_000)
@@ -1172,6 +1174,8 @@ fn test_execute_signal_rebalance_enforces_min_position_hold_sec() {
     seed_test_assets(&db);
 
     db.set_config_value("min_position_hold_sec", "300", None)
+        .unwrap();
+    db.set_config_value("profit_gate_signal_exits", "false", None)
         .unwrap();
     db.set_config_value("min_entry_interval_sec", "0", None)
         .unwrap();
@@ -4598,4 +4602,187 @@ fn test_unified_account_equity_no_double_count_and_hl_portfolio_pnl_sync() {
     assert!((pnl.weekly.net_pnl_usdc - 562.52).abs() < 1e-4);
 
     let _ = stop_tx.send(());
+}
+
+#[test]
+fn test_execute_signal_rebalance_profit_gates_signal_close_and_flip() {
+    let db = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+
+    // Explicitly rely on default profit_gate_signal_exits=true, signal_exit_min_net_profit_pct=0.0025
+    db.set_config_value("min_position_hold_sec", "300", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let arb = db.get_asset_by_symbol("ARB-USDC").unwrap().unwrap();
+    let avax = db.get_asset_by_symbol("AVAX-USDC").unwrap().unwrap();
+    let link = db.get_asset_by_symbol("LINK-USDC").unwrap().unwrap();
+
+    let mature_opened_ms = now_ms() - 600_000; // 10 min > 300s hold floor
+
+    // 1. SOL LONG underwater (entry 186.0 > mark 184.0) -> blocked from ACTION_CLOSE
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            sol.id,
+            &sol.coin,
+            OrderSide::Long,
+            sol.mark_price + 2.0,
+            sol.mark_price,
+            5.0,
+            5.0 * sol.mark_price,
+            0.0,
+            0.10,
+            sol.mark_price * 0.90,
+            sol.mark_price * 1.15,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    // 2. ETH LONG flat (entry == mark) -> blocked from ACTION_FLIP
+    let (eth_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            eth.id,
+            &eth.coin,
+            OrderSide::Long,
+            eth.mark_price,
+            eth.mark_price,
+            0.5,
+            0.5 * eth.mark_price,
+            0.0,
+            0.15,
+            eth.mark_price * 0.90,
+            eth.mark_price * 1.15,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    // 3. ARB LONG marginally positive (~0.10% < 0.25% + exit fee) -> blocked from ACTION_CLOSE
+    let (arb_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            arb.id,
+            &arb.coin,
+            OrderSide::Long,
+            arb.mark_price * 0.999,
+            arb.mark_price,
+            100.0,
+            100.0 * arb.mark_price,
+            0.0,
+            0.05,
+            arb.mark_price * 0.90,
+            arb.mark_price * 1.15,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    // 4. AVAX LONG clearly profitable (+2.5% >> 0.25% + fees) -> ALLOWED to ACTION_CLOSE
+    let (avax_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            avax.id,
+            &avax.coin,
+            OrderSide::Long,
+            avax.mark_price * 0.975,
+            avax.mark_price,
+            20.0,
+            20.0 * avax.mark_price,
+            0.0,
+            0.10,
+            avax.mark_price * 0.90,
+            avax.mark_price * 1.15,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    // 5. LINK SHORT clearly profitable (+3.0% >> 0.25% + fees) -> ALLOWED to ACTION_FLIP
+    let (link_pid, _) = db
+        .sync_open_position_from_exchange_v2(
+            link.id,
+            &link.coin,
+            OrderSide::Short,
+            link.mark_price * 1.03,
+            link.mark_price,
+            40.0,
+            40.0 * link.mark_price,
+            0.0,
+            0.10,
+            link.mark_price * 1.15,
+            link.mark_price * 0.85,
+            0.0,
+            Some(mature_opened_ms),
+        )
+        .unwrap();
+
+    let sigs = make_signal_output(vec![
+        make_signal_input(&sol, 0.0, 0.10, ACTION_CLOSE),
+        make_signal_input(&eth, -0.20, 0.15, ACTION_FLIP),
+        make_signal_input(&arb, 0.0, 0.05, ACTION_CLOSE),
+        make_signal_input(&avax, 0.0, 0.10, ACTION_CLOSE),
+        make_signal_input(&link, 0.20, -0.10, ACTION_FLIP),
+    ]);
+    let reb = engine.execute_signal_rebalance(&sigs, 10_000.0).unwrap();
+    assert_eq!(reb.positions_closed, 2);
+    assert_eq!(reb.working_orders_placed, 1);
+
+    assert_eq!(
+        db.get_position_by_id(avax_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert_eq!(
+        db.get_position_by_id(link_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert_eq!(
+        db.get_position_by_id(arb_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+
+    let ordered = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].symbol, "LINK-USDC");
+    assert_eq!(ordered[0].side, "LONG");
+
+    // Manual close_or_cancel_position remains unrestricted on underwater holdings
+    let manual_rep = engine
+        .close_or_cancel_position(arb_pid, "MANUAL_OVERRIDE_TEST", Some(0))
+        .unwrap();
+    assert_eq!(manual_rep.final_status, "CLOSED");
+
+    // Setting profit_gate_signal_exits=false restores unrestricted mature signal exits
+    db.set_config_value("profit_gate_signal_exits", "false", None)
+        .unwrap();
+    let sigs_unrestricted = make_signal_output(vec![
+        make_signal_input(&sol, 0.0, 0.10, ACTION_CLOSE),
+        make_signal_input(&eth, -0.20, 0.15, ACTION_FLIP),
+    ]);
+    let reb_off = engine
+        .execute_signal_rebalance(&sigs_unrestricted, 10_000.0)
+        .unwrap();
+    assert_eq!(reb_off.positions_closed, 2);
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
 }
