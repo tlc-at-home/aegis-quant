@@ -8,6 +8,7 @@ version = "2.0.0"
 dependencies = [
  "aegis-core",
  "aegis-db",
+ "aegis-test-support",
  "chrono",
  "mysql",
  "parking_lot",
@@ -140,7 +141,6 @@ dependencies = [
 name = "aegis-telemetry"
 version = "2.0.0"
 dependencies = [
- "aegis-alerts",
  "aegis-core",
  "aegis-db",
  "serde",

@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Tracing subscriber, Tokio inter-task telemetry channels, and Telegram/Discord AlertEngine re-export"
+description = "Tracing subscriber and non-blocking Tokio inter-task telemetry engine"
 
 [dependencies]
 aegis-core.workspace = true
 aegis-db.workspace = true
-aegis-alerts.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

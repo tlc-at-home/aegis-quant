@@ -645,7 +645,9 @@ pub fn truncate_telegram_html(html: &str, max_chars: usize) -> String {
             }
         }
 
-        let ch = rest.chars().next().unwrap();
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         if ch == '&' {
             in_entity = true;
         } else if in_entity && (ch == ';' || ch.is_whitespace()) {

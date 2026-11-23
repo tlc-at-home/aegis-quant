@@ -1,4 +1,4 @@
-//! MariaDB `alert_queue` poller, persistent retry state machine, and in-memory retry queue (`aegis-alerts::queue`).
+//! MariaDB `alert_queue` poller, persistent retry state machine, and delivery receipt tracking (`aegis-alerts::queue`).
 
 use crate::engine::{
     is_duplicate_alert_within_window, record_alert_dedup_timestamp_with_ts, AlertEngine,
@@ -9,13 +9,102 @@ use aegis_db::DatabaseManager;
 use mysql::params;
 use mysql::prelude::*;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
+use std::thread;
+use std::time::Duration;
+
+const MAX_ALERT_RETRY_ATTEMPTS: i32 = 5;
+const STALE_DISPATCH_TIMEOUT_MS: i64 = 60_000;
+const STATE_UPDATE_RETRY_DELAYS_MS: [u64; 3] = [50, 150, 300];
+const MAX_DELIVERY_RECEIPTS: usize = 2048;
+
+#[derive(Debug, Clone, Copy)]
+struct DeliveryReceipt {
+    telegram_sent: bool,
+    discord_sent: bool,
+    all_delivered: bool,
+}
+
+#[derive(Default)]
+struct DeliveryReceiptCache {
+    order: VecDeque<(String, i64)>,
+    entries: HashMap<(String, i64), DeliveryReceipt>,
+}
+
+impl DeliveryReceiptCache {
+    fn get(&self, db_name: &str, alert_id: i64) -> Option<DeliveryReceipt> {
+        self.entries.get(&(db_name.to_string(), alert_id)).copied()
+    }
+
+    fn insert(&mut self, db_name: &str, alert_id: i64, receipt: DeliveryReceipt) {
+        let key = (db_name.to_string(), alert_id);
+        if let Some(existing) = self.entries.get_mut(&key) {
+            existing.telegram_sent |= receipt.telegram_sent;
+            existing.discord_sent |= receipt.discord_sent;
+            existing.all_delivered |= receipt.all_delivered;
+            return;
+        }
+        while self.entries.len() >= MAX_DELIVERY_RECEIPTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, receipt);
+    }
+
+    #[cfg(test)]
+    fn clear_db(&mut self, db_name: &str) {
+        self.entries.retain(|(db, _), _| db != db_name);
+        self.order.retain(|(db, _)| db != db_name);
+    }
+}
+
+static DELIVERY_RECEIPTS: OnceLock<Mutex<DeliveryReceiptCache>> = OnceLock::new();
+
+fn delivery_receipts() -> &'static Mutex<DeliveryReceiptCache> {
+    DELIVERY_RECEIPTS.get_or_init(|| Mutex::new(DeliveryReceiptCache::default()))
+}
+
+pub(crate) fn record_delivery_receipt(
+    db_name: &str,
+    alert_id: i64,
+    telegram_sent: bool,
+    discord_sent: bool,
+    all_delivered: bool,
+) {
+    if alert_id <= 0 {
+        return;
+    }
+    delivery_receipts().lock().insert(
+        db_name,
+        alert_id,
+        DeliveryReceipt {
+            telegram_sent,
+            discord_sent,
+            all_delivered,
+        },
+    );
+}
+
+fn get_delivery_receipt(db_name: &str, alert_id: i64) -> Option<DeliveryReceipt> {
+    if alert_id <= 0 {
+        return None;
+    }
+    delivery_receipts().lock().get(db_name, alert_id)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_delivery_receipts_for_db(db_name: &str) {
+    delivery_receipts().lock().clear_db(db_name);
+}
 
 fn row_to_alert_queue_record(r: mysql::Row) -> AlertQueueRecord {
     let raw_json: Option<String> = r.get::<Option<String>, _>(5).unwrap_or(None);
@@ -100,6 +189,75 @@ pub fn fetch_due_pending_alerts(
     Ok(rows.into_iter().map(row_to_alert_queue_record).collect())
 }
 
+fn recover_stale_dispatching_rows(tx: &mut mysql::Transaction<'_>, ts: i64) -> Result<()> {
+    let stale_dispatch_cutoff = ts.saturating_sub(STALE_DISPATCH_TIMEOUT_MS);
+    type StaleDispatchRow = (i64, String, Option<String>, i32, Option<i64>);
+    let stale_rows: Vec<StaleDispatchRow> = tx
+        .exec(
+            r#"SELECT id, provider, CAST(payload_json AS CHAR), attempts, dispatched_at_ms
+               FROM alert_queue
+               WHERE status = 'DISPATCHING' AND updated_at_ms <= :stale
+               ORDER BY id ASC
+               FOR UPDATE"#,
+            params! {
+                "stale" => stale_dispatch_cutoff,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("claim_due_pending_alerts stale scan failed: {e}"))
+        })?;
+
+    for (alert_id, provider, raw_payload, attempts, dispatched_at_ms) in stale_rows {
+        let next_attempts = attempts.saturating_add(1);
+        let parsed_payload = raw_payload.and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let (tg_sent, dc_sent, has_delivery_obj) =
+            extract_delivery_state_with_presence(parsed_payload.as_ref());
+
+        let provider_complete = match provider.as_str() {
+            "telegram" => tg_sent,
+            "discord" => dc_sent,
+            _ => tg_sent && dc_sent,
+        };
+
+        let recovered_status = if next_attempts >= MAX_ALERT_RETRY_ATTEMPTS {
+            "FAILED"
+        } else if provider_complete {
+            "DELIVERED"
+        } else if dispatched_at_ms.is_some() && !has_delivery_obj {
+            // Prior worker already persisted a dispatch timestamp with no partial breakdown;
+            // finalize to DELIVERED rather than risking duplicate external notifications.
+            "DELIVERED"
+        } else if tg_sent || dc_sent {
+            "PARTIAL"
+        } else if dispatched_at_ms.is_some() {
+            "DELIVERED"
+        } else {
+            "PENDING"
+        };
+
+        tx.exec_drop(
+            r#"UPDATE alert_queue
+               SET status = :st,
+                   attempts = :att,
+                   next_retry_ms = CASE WHEN :st IN ('PENDING', 'PARTIAL') THEN :now ELSE next_retry_ms END,
+                   updated_at_ms = :now
+               WHERE id = :id AND status = 'DISPATCHING'"#,
+            params! {
+                "st" => recovered_status,
+                "att" => next_attempts,
+                "now" => ts,
+                "id" => alert_id,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "claim_due_pending_alerts stale recovery update failed for id={alert_id}: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Atomically claims up to `limit` due `PENDING` / `PARTIAL` alerts using `FOR UPDATE SKIP LOCKED`
 /// and transitions them to `DISPATCHING` inside a transaction before any network dispatch.
 pub fn claim_due_pending_alerts(
@@ -107,22 +265,13 @@ pub fn claim_due_pending_alerts(
     limit: usize,
 ) -> Result<Vec<AlertQueueRecord>> {
     let ts = now_ms();
-    let stale_dispatch_cutoff = ts.saturating_sub(60_000);
     let mut conn = db.get_conn()?;
     let mut tx = conn
         .start_transaction(mysql::TxOpts::default())
         .map_err(|e| AegisError::Database(format!("claim_due_pending_alerts tx failed: {e}")))?;
 
-    // Recover any orphaned DISPATCHING rows left behind by a crashed worker >60s ago
-    let _ = tx.exec_drop(
-        r#"UPDATE alert_queue
-           SET status = 'PENDING', updated_at_ms = :now
-           WHERE status = 'DISPATCHING' AND updated_at_ms <= :stale"#,
-        params! {
-            "now" => ts,
-            "stale" => stale_dispatch_cutoff,
-        },
-    );
+    // Recover orphaned DISPATCHING rows left behind by a crashed worker >60s ago
+    recover_stale_dispatching_rows(&mut tx, ts)?;
 
     let rows: Vec<mysql::Row> = tx
         .exec(
@@ -200,7 +349,7 @@ pub fn update_alert_queue_status(
     Ok(())
 }
 
-/// Updates an `alert_queue` row's status, attempts, `next_retry_ms`, and `payload_json`.
+/// Updates a claimed (`status = 'DISPATCHING'`) `alert_queue` row's status, attempts, `next_retry_ms`, and `payload_json`.
 pub fn update_alert_queue_state_and_payload(
     db: &DatabaseManager,
     alert_id: i64,
@@ -219,7 +368,7 @@ pub fn update_alert_queue_state_and_payload(
                next_retry_ms = :next,
                payload_json = COALESCE(:pay, payload_json),
                updated_at_ms = :ts
-           WHERE id = :id"#,
+           WHERE id = :id AND status = 'DISPATCHING'"#,
         params! {
             "st" => status,
             "att" => attempts,
@@ -232,21 +381,56 @@ pub fn update_alert_queue_state_and_payload(
     .map_err(|e| {
         AegisError::Database(format!("update_alert_queue_state_and_payload failed: {e}"))
     })?;
+    if conn.affected_rows() == 0 {
+        tracing::warn!(
+            alert_id = alert_id,
+            target_status = status,
+            "update_alert_queue_state_and_payload matched 0 DISPATCHING rows"
+        );
+    }
     Ok(())
 }
 
-fn extract_delivery_state(payload: Option<&Value>) -> (bool, bool) {
-    let tg = payload
-        .and_then(|v| v.get("_delivery"))
+fn update_alert_queue_state_with_retry<F>(
+    db: &DatabaseManager,
+    alert_id: i64,
+    status: &str,
+    attempts: i32,
+    next_retry_ms: i64,
+    payload_json: Option<&Value>,
+    updater: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&DatabaseManager, i64, &str, i32, i64, Option<&Value>) -> Result<()>,
+{
+    let mut last_err = match updater(db, alert_id, status, attempts, next_retry_ms, payload_json) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    for delay_ms in STATE_UPDATE_RETRY_DELAYS_MS {
+        thread::sleep(Duration::from_millis(delay_ms));
+        match updater(db, alert_id, status, attempts, next_retry_ms, payload_json) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = e,
+        }
+    }
+
+    Err(last_err)
+}
+
+fn extract_delivery_state_with_presence(payload: Option<&Value>) -> (bool, bool, bool) {
+    let delivery_obj = payload.and_then(|v| v.get("_delivery"));
+    let has_delivery_obj = delivery_obj.is_some_and(Value::is_object);
+    let tg = delivery_obj
         .and_then(|d| d.get("telegram_sent"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let dc = payload
-        .and_then(|v| v.get("_delivery"))
+    let dc = delivery_obj
         .and_then(|d| d.get("discord_sent"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    (tg, dc)
+    (tg, dc, has_delivery_obj)
 }
 
 fn with_delivery_state(payload: Option<&Value>, tg_sent: bool, dc_sent: bool) -> Value {
@@ -273,17 +457,99 @@ fn with_delivery_state(payload: Option<&Value>, tg_sent: bool, dc_sent: bool) ->
 /// unsent provider channels via `AlertEngine`, respects `retriable`, and transitions rows to
 /// `DELIVERED`, `SKIPPED`, exponential-backoff `PENDING`/`PARTIAL`, or `FAILED`.
 pub fn poll_and_dispatch_pending_alerts(engine: &AlertEngine, batch_limit: usize) -> Result<usize> {
+    poll_and_dispatch_pending_alerts_with_updater(
+        engine,
+        batch_limit,
+        update_alert_queue_state_and_payload,
+    )
+}
+
+fn poll_and_dispatch_pending_alerts_with_updater<F>(
+    engine: &AlertEngine,
+    batch_limit: usize,
+    mut updater: F,
+) -> Result<usize>
+where
+    F: FnMut(&DatabaseManager, i64, &str, i32, i64, Option<&Value>) -> Result<()>,
+{
     let claimed = claim_due_pending_alerts(&engine.db, batch_limit)?;
     if claimed.is_empty() {
         return Ok(0);
     }
 
-    let max_attempts = 5i32;
+    let db_name = engine.db.db_name();
     let mut delivered_count = 0usize;
 
     for record in claimed {
         let next_attempt_num = record.attempts.saturating_add(1);
-        let (prior_tg, prior_dc) = extract_delivery_state(record.payload_json.as_ref());
+        let (payload_tg, payload_dc, has_delivery_obj) =
+            extract_delivery_state_with_presence(record.payload_json.as_ref());
+        let receipt_opt = get_delivery_receipt(db_name, record.id);
+        let prior_tg = payload_tg || receipt_opt.is_some_and(|r| r.telegram_sent);
+        let prior_dc = payload_dc || receipt_opt.is_some_and(|r| r.discord_sent);
+        let already_all_delivered = receipt_opt.is_some_and(|r| r.all_delivered);
+
+        if already_all_delivered {
+            let updated_payload =
+                with_delivery_state(record.payload_json.as_ref(), prior_tg, prior_dc);
+            if let Err(err) = engine.db.mark_alert_queue_dispatched(record.id, now_ms()) {
+                tracing::warn!(
+                    alert_id = record.id,
+                    error = %err,
+                    "Failed to mark alert_queue dispatched_at_ms from in-memory receipt"
+                );
+            }
+            match update_alert_queue_state_with_retry(
+                &engine.db,
+                record.id,
+                "DELIVERED",
+                next_attempt_num,
+                now_ms(),
+                Some(&updated_payload),
+                &mut updater,
+            ) {
+                Ok(()) => delivered_count += 1,
+                Err(err) => {
+                    tracing::error!(
+                        alert_id = record.id,
+                        error = %err,
+                        "Failed to finalize DELIVERED state from in-memory receipt; continuing batch"
+                    );
+                }
+            }
+            continue;
+        }
+
+        if !has_delivery_obj
+            && !prior_tg
+            && !prior_dc
+            && engine
+                .db
+                .get_alert_queue_dispatched_at_ms(record.id)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            match update_alert_queue_state_with_retry(
+                &engine.db,
+                record.id,
+                "DELIVERED",
+                next_attempt_num,
+                now_ms(),
+                record.payload_json.as_ref(),
+                &mut updater,
+            ) {
+                Ok(()) => delivered_count += 1,
+                Err(err) => {
+                    tracing::error!(
+                        alert_id = record.id,
+                        error = %err,
+                        "Failed to finalize DELIVERED state from DB dispatch receipt; continuing batch"
+                    );
+                }
+            }
+            continue;
+        }
 
         let outcome = engine.dispatch_raw_html_for_channels(
             &record.event_type,
@@ -298,91 +564,90 @@ pub fn poll_and_dispatch_pending_alerts(engine: &AlertEngine, batch_limit: usize
         let updated_payload =
             with_delivery_state(record.payload_json.as_ref(), combined_tg, combined_dc);
 
-        if outcome.status == "DELIVERED" {
-            update_alert_queue_state_and_payload(
-                &engine.db,
-                record.id,
-                "DELIVERED",
-                next_attempt_num,
-                now_ms(),
-                Some(&updated_payload),
-            )?;
-            delivered_count += 1;
-        } else if outcome.status == "SKIPPED" {
-            let final_st = if prior_tg || prior_dc {
-                delivered_count += 1;
-                "DELIVERED"
+        let (target_status, target_next_retry, counts_as_delivered) =
+            if outcome.status == "DELIVERED" {
+                ("DELIVERED", now_ms(), true)
+            } else if outcome.status == "SKIPPED" {
+                if prior_tg || prior_dc {
+                    ("DELIVERED", now_ms(), true)
+                } else {
+                    ("SKIPPED", now_ms(), false)
+                }
+            } else if outcome.queued_for_retry && next_attempt_num < MAX_ALERT_RETRY_ATTEMPTS {
+                let backoff_ms = 500_i64 * (1_i64 << (next_attempt_num.saturating_sub(1).min(6)));
+                let retry_status = if combined_tg || combined_dc {
+                    "PARTIAL"
+                } else {
+                    "PENDING"
+                };
+                (retry_status, now_ms() + backoff_ms, false)
             } else {
-                "SKIPPED"
+                ("FAILED", now_ms(), false)
             };
-            update_alert_queue_state_and_payload(
-                &engine.db,
+
+        if combined_tg || combined_dc || target_status == "DELIVERED" {
+            record_delivery_receipt(
+                db_name,
                 record.id,
-                final_st,
-                next_attempt_num,
-                now_ms(),
-                Some(&updated_payload),
-            )?;
-        } else if outcome.queued_for_retry && next_attempt_num < max_attempts {
-            let backoff_ms = 500_i64 * (1_i64 << (next_attempt_num.saturating_sub(1).min(6)));
-            let next_retry = now_ms() + backoff_ms;
-            let retry_status = if combined_tg || combined_dc {
-                "PARTIAL"
-            } else {
-                "PENDING"
-            };
-            update_alert_queue_state_and_payload(
-                &engine.db,
-                record.id,
-                retry_status,
-                next_attempt_num,
-                next_retry,
-                Some(&updated_payload),
-            )?;
-        } else {
-            update_alert_queue_state_and_payload(
-                &engine.db,
-                record.id,
-                "FAILED",
-                next_attempt_num,
-                now_ms(),
-                Some(&updated_payload),
-            )?;
+                combined_tg,
+                combined_dc,
+                target_status == "DELIVERED",
+            );
+            if let Err(err) = engine.db.mark_alert_queue_dispatched(record.id, now_ms()) {
+                tracing::warn!(
+                    alert_id = record.id,
+                    error = %err,
+                    "Failed to record alert_queue dispatched_at_ms; retaining in-memory receipt"
+                );
+            }
+        }
+
+        match update_alert_queue_state_with_retry(
+            &engine.db,
+            record.id,
+            target_status,
+            next_attempt_num,
+            target_next_retry,
+            Some(&updated_payload),
+            &mut updater,
+        ) {
+            Ok(()) => {
+                if counts_as_delivered {
+                    delivered_count += 1;
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    alert_id = record.id,
+                    target_status = target_status,
+                    error = %err,
+                    "Failed to update alert_queue state after retries; preserving receipt and continuing batch"
+                );
+            }
         }
     }
 
     Ok(delivered_count)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueuedAlertTask {
-    pub event_type: String,
-    pub message: String,
-    pub severity: String,
-    pub details: Option<Value>,
-    pub attempt: usize,
-    pub next_attempt_ms: i64,
-}
-
-/// Lightweight thread-safe retry queue wrapper backed by MariaDB `alert_queue`.
-#[derive(Clone, Default)]
-pub struct AlertRetryQueue {
-    in_memory: Arc<Mutex<VecDeque<QueuedAlertTask>>>,
+/// Thread-safe atomic counters tracking alert delivery outcomes for an [`AlertEngine`] instance.
+#[derive(Clone, Default, Debug)]
+pub struct AlertDeliveryCounters {
     delivered_count: Arc<AtomicUsize>,
     failed_count: Arc<AtomicUsize>,
 }
 
-impl AlertRetryQueue {
+impl AlertDeliveryCounters {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn pending_count(&self) -> usize {
-        self.in_memory.lock().len()
-    }
-
     pub fn delivered_count(&self) -> usize {
         self.delivered_count.load(Ordering::SeqCst)
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed_count.load(Ordering::SeqCst)
     }
 
     pub fn failed_permanently_count(&self) -> usize {
@@ -401,10 +666,12 @@ impl AlertRetryQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_db::AlertQueueInsertInput;
+    use aegis_test_support::mock_http::{MockHttpResponse, MockHttpServer};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Barrier;
-    use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn test_atomic_claim_due_pending_alerts_single_winner() {
@@ -588,5 +855,269 @@ mod tests {
         let row2 = rows2.into_iter().find(|r| r.id == qid).unwrap();
         assert_eq!(row2.status, "DELIVERED");
         assert_eq!(row2.attempts, 2);
+    }
+
+    #[test]
+    fn test_r14_l14_stale_dispatching_recovery_respects_dispatch_receipt_and_fails_exhausted() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let tg_srv = MockHttpServer::start_static(200, &json!({ "ok": true, "result": {} }));
+        let dc_srv = MockHttpServer::start(|_| MockHttpResponse::text(204, "text/plain", ""));
+
+        db.set_config_value("alert_provider", "telegram", None)
+            .unwrap();
+        db.set_config_value("telegram_api_base_url", &tg_srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("telegram_bot_token", "123456:TOKEN", None)
+            .unwrap();
+        db.set_config_value("telegram_chat_id", "999888777", None)
+            .unwrap();
+        db.set_config_value(
+            "discord_webhook_url",
+            &dc_srv.url("/api/webhooks/1/abc"),
+            None,
+        )
+        .unwrap();
+
+        let stale_ts = now_ms() - 120_000;
+
+        // 1. Stale DISPATCHING row with dispatched_at_ms set (simulating crash after HTTP send,
+        //    followed by process restart where in-memory receipts are empty).
+        let q_dispatched = db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: "telegram",
+                event_type: "ORDER_FILLED_OPEN",
+                severity: "INFO",
+                message: "<b>Asset:</b> <code>R14L14A-USDC</code>",
+                payload_json: Some(&json!({ "symbol": "R14L14A-USDC" })),
+                status: "DISPATCHING",
+                attempts: 1,
+                next_retry_ms: stale_ts,
+                dispatched_at_ms: Some(stale_ts),
+            })
+            .unwrap();
+
+        // 2. Stale DISPATCHING row already at attempts=4 with NO dispatched_at_ms -> must transition
+        //    directly to FAILED (attempts=5 >= max_attempts) without sending HTTP.
+        let q_exhausted = db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: "telegram",
+                event_type: "ORDER_FILLED_OPEN",
+                severity: "INFO",
+                message: "<b>Asset:</b> <code>R14L14B-USDC</code>",
+                payload_json: Some(&json!({ "symbol": "R14L14B-USDC" })),
+                status: "DISPATCHING",
+                attempts: 4,
+                next_retry_ms: stale_ts,
+                dispatched_at_ms: None,
+            })
+            .unwrap();
+
+        // 3. Stale DISPATCHING row from a PARTIAL retry (Telegram already sent, Discord pending).
+        db.set_config_value("alert_provider", "both", None).unwrap();
+        let q_partial_stale = db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: "both",
+                event_type: "ORDER_FILLED_OPEN",
+                severity: "INFO",
+                message: "<b>Asset:</b> <code>R14L14C-USDC</code>",
+                payload_json: Some(&json!({
+                    "symbol": "R14L14C-USDC",
+                    "_delivery": { "telegram_sent": true, "discord_sent": false }
+                })),
+                status: "DISPATCHING",
+                attempts: 1,
+                next_retry_ms: stale_ts,
+                dispatched_at_ms: Some(stale_ts),
+            })
+            .unwrap();
+
+        {
+            let mut conn = db.get_conn().unwrap();
+            conn.exec_drop(
+                "UPDATE alert_queue SET updated_at_ms = :stale WHERE id IN (:a, :b, :c)",
+                params! {
+                    "stale" => stale_ts,
+                    "a" => q_dispatched,
+                    "b" => q_exhausted,
+                    "c" => q_partial_stale,
+                },
+            )
+            .unwrap();
+        }
+        clear_delivery_receipts_for_db(db.db_name());
+
+        let engine = AlertEngine::new(db.clone());
+        let delivered = poll_and_dispatch_pending_alerts(&engine, 10).unwrap();
+        assert_eq!(delivered, 1);
+
+        // Zero duplicate Telegram requests (q_dispatched had DB receipt, q_exhausted failed,
+        // q_partial_stale skipped Telegram via _delivery).
+        assert_eq!(tg_srv.request_count(), 0);
+        // Only Discord leg of q_partial_stale was dispatched.
+        assert_eq!(dc_srv.request_count(), 1);
+
+        let rows = db.list_recent_alerts(10).unwrap();
+        let row_dispatched = rows.iter().find(|r| r.id == q_dispatched).unwrap();
+        assert_eq!(row_dispatched.status, "DELIVERED");
+        assert_eq!(row_dispatched.attempts, 2);
+
+        let row_exhausted = rows.iter().find(|r| r.id == q_exhausted).unwrap();
+        assert_eq!(row_exhausted.status, "FAILED");
+        assert_eq!(row_exhausted.attempts, 5);
+
+        let row_partial = rows.iter().find(|r| r.id == q_partial_stale).unwrap();
+        assert_eq!(row_partial.status, "DELIVERED");
+        assert_eq!(row_partial.attempts, 3);
+    }
+
+    #[test]
+    fn test_r14_l14_batch_continues_after_db_update_failure_and_memory_receipt_prevents_dup() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let tg_srv = MockHttpServer::start_static(200, &json!({ "ok": true, "result": {} }));
+
+        db.set_config_value("alert_provider", "telegram", None)
+            .unwrap();
+        db.set_config_value("telegram_api_base_url", &tg_srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("telegram_bot_token", "123456:TOKEN", None)
+            .unwrap();
+        db.set_config_value("telegram_chat_id", "999888777", None)
+            .unwrap();
+
+        let q1 = db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: "telegram",
+                event_type: "ORDER_FILLED_OPEN",
+                severity: "INFO",
+                message: "<b>Asset:</b> <code>BATCH1-USDC</code>",
+                payload_json: Some(&json!({ "symbol": "BATCH1-USDC" })),
+                status: "PENDING",
+                attempts: 0,
+                next_retry_ms: 0,
+                dispatched_at_ms: None,
+            })
+            .unwrap();
+        let q2 = db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: "telegram",
+                event_type: "ORDER_FILLED_OPEN",
+                severity: "INFO",
+                message: "<b>Asset:</b> <code>BATCH2-USDC</code>",
+                payload_json: Some(&json!({ "symbol": "BATCH2-USDC" })),
+                status: "PENDING",
+                attempts: 0,
+                next_retry_ms: 0,
+                dispatched_at_ms: None,
+            })
+            .unwrap();
+
+        let engine = AlertEngine::new(db.clone());
+        let mut q1_update_attempts = 0usize;
+        let started = Instant::now();
+        let delivered = poll_and_dispatch_pending_alerts_with_updater(
+            &engine,
+            10,
+            |d, id, st, att, next, pay| {
+                if id == q1 {
+                    q1_update_attempts += 1;
+                    Err(AegisError::Database(
+                        "simulated transient MariaDB lock timeout".to_string(),
+                    ))
+                } else {
+                    update_alert_queue_state_and_payload(d, id, st, att, next, pay)
+                }
+            },
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        // q1 tried initial + 3 retries (50+150+300ms = 500ms) and failed, while q2 STILL completed.
+        assert_eq!(q1_update_attempts, 4);
+        assert!(elapsed >= Duration::from_millis(450));
+        assert_eq!(delivered, 1);
+        assert_eq!(tg_srv.request_count(), 2);
+
+        let rows1 = db.list_recent_alerts(10).unwrap();
+        assert_eq!(
+            rows1.iter().find(|r| r.id == q1).unwrap().status,
+            "DISPATCHING"
+        );
+        assert_eq!(
+            rows1.iter().find(|r| r.id == q2).unwrap().status,
+            "DELIVERED"
+        );
+
+        // Simulate stale recovery where even dispatched_at_ms is NULL in DB, relying solely on the
+        // bounded in-memory delivery receipt set to prevent duplicate HTTP send of q1.
+        {
+            let stale_ts = now_ms() - 120_000;
+            let mut conn = db.get_conn().unwrap();
+            conn.exec_drop(
+                "UPDATE alert_queue SET dispatched_at_ms = NULL, updated_at_ms = :stale WHERE id = :id",
+                params! { "stale" => stale_ts, "id" => q1 },
+            )
+            .unwrap();
+        }
+
+        let recovered_delivered = poll_and_dispatch_pending_alerts(&engine, 10).unwrap();
+        assert_eq!(recovered_delivered, 1);
+        assert_eq!(
+            tg_srv.request_count(),
+            2,
+            "in-memory receipt must prevent duplicate Telegram send on recovery"
+        );
+        let rows2 = db.list_recent_alerts(10).unwrap();
+        assert_eq!(
+            rows2.iter().find(|r| r.id == q1).unwrap().status,
+            "DELIVERED"
+        );
+    }
+
+    #[test]
+    fn test_r14_l14_update_state_requires_dispatching_status() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let qid = enqueue_pending_alert(
+            &db,
+            "ORDER_FILLED_OPEN",
+            "INFO",
+            "<b>Asset:</b> <code>GUARD-USDC</code>",
+            Some(&json!({ "symbol": "GUARD-USDC" })),
+        )
+        .unwrap();
+
+        // Row is PENDING, not DISPATCHING -> guarded UPDATE must leave status untouched.
+        update_alert_queue_state_and_payload(&db, qid, "FAILED", 1, 0, None).unwrap();
+        let row_pending = db
+            .list_recent_alerts(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == qid)
+            .unwrap();
+        assert_eq!(row_pending.status, "PENDING");
+
+        let claimed = claim_due_pending_alerts(&db, 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        update_alert_queue_state_and_payload(&db, qid, "DELIVERED", 1, 0, None).unwrap();
+        let row_delivered = db
+            .list_recent_alerts(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == qid)
+            .unwrap();
+        assert_eq!(row_delivered.status, "DELIVERED");
+    }
+
+    #[test]
+    fn test_r14_l1_alert_delivery_counters() {
+        let counters = AlertDeliveryCounters::new();
+        assert_eq!(counters.delivered_count(), 0);
+        assert_eq!(counters.failed_count(), 0);
+        assert_eq!(counters.failed_permanently_count(), 0);
+        counters.record_delivered();
+        counters.record_delivered();
+        counters.record_failed();
+        assert_eq!(counters.delivered_count(), 2);
+        assert_eq!(counters.failed_count(), 1);
+        assert_eq!(counters.failed_permanently_count(), 1);
     }
 }

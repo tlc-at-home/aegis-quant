@@ -9,15 +9,15 @@ use crate::formatter::{
     WorkingOrderPlacedAlert,
 };
 use crate::queue::{
-    enqueue_pending_alert, poll_and_dispatch_pending_alerts, update_alert_queue_status,
-    AlertRetryQueue,
+    enqueue_pending_alert, poll_and_dispatch_pending_alerts, record_delivery_receipt,
+    AlertDeliveryCounters,
 };
 use crate::telegram::send_telegram_html;
 use aegis_core::{
     format_ms_human_utc, mask_identifier, now_iso8601_utc, now_ms, AegisError, AlertProvider,
     ConfigMap, Result,
 };
-use aegis_db::DatabaseManager;
+use aegis_db::{AlertQueueInsertInput, DatabaseManager};
 use mysql::params;
 use mysql::prelude::*;
 use parking_lot::Mutex;
@@ -301,7 +301,7 @@ pub struct AlertEngine {
     pub db: DatabaseManager,
     pub timeout_sec: u64,
     pub dedup_window_ms: i64,
-    pub retry_queue: AlertRetryQueue,
+    pub delivery_counters: AlertDeliveryCounters,
 }
 
 impl AlertEngine {
@@ -315,7 +315,7 @@ impl AlertEngine {
             db,
             timeout_sec,
             dedup_window_ms,
-            retry_queue: AlertRetryQueue::new(),
+            delivery_counters: AlertDeliveryCounters::new(),
         }
     }
 
@@ -441,13 +441,13 @@ impl AlertEngine {
         }
 
         let status = if (tg_sent || discord_sent) && !any_error {
-            self.retry_queue.record_delivered();
+            self.delivery_counters.record_delivered();
             "DELIVERED".to_string()
         } else if tg_sent || discord_sent {
             "PARTIAL".to_string()
         } else {
             if !retriable {
-                self.retry_queue.record_failed();
+                self.delivery_counters.record_failed();
             }
             "ERROR".to_string()
         };
@@ -537,7 +537,7 @@ impl AlertEngine {
         };
 
         let mut stored_payload = payload_json.clone();
-        if db_status == "PARTIAL" {
+        if db_status == "PARTIAL" || res.telegram_sent || res.discord_sent {
             let mut obj = match stored_payload.take() {
                 Some(Value::Object(map)) => map,
                 Some(other) => {
@@ -557,20 +557,43 @@ impl AlertEngine {
             stored_payload = Some(Value::Object(obj));
         }
 
+        let insert_ts = now_ms();
+        let next_retry_ms = if matches!(db_status, "PENDING" | "PARTIAL") {
+            insert_ts + 1000
+        } else {
+            insert_ts
+        };
+        let dispatched_at_ms = if res.telegram_sent || res.discord_sent {
+            Some(insert_ts)
+        } else {
+            None
+        };
+
         let mut db_inserted = false;
-        if let Ok(qid) = self.db.insert_alert_queue_record(
-            &res.provider,
-            event_type,
-            severity,
-            html_message,
-            stored_payload.as_ref(),
-            db_status,
-        ) {
+        if let Ok(qid) = self
+            .db
+            .insert_alert_queue_record_full(&AlertQueueInsertInput {
+                provider: &res.provider,
+                event_type,
+                severity,
+                message: html_message,
+                payload_json: stored_payload.as_ref(),
+                status: db_status,
+                attempts: 1,
+                next_retry_ms,
+                dispatched_at_ms,
+            })
+        {
             db_inserted = true;
             res.alert_queue_id = Some(qid);
-            if matches!(db_status, "PENDING" | "PARTIAL") {
-                let next_retry = now_ms() + 1000;
-                let _ = update_alert_queue_status(&self.db, qid, db_status, 1, next_retry);
+            if res.telegram_sent || res.discord_sent {
+                record_delivery_receipt(
+                    self.db.db_name(),
+                    qid,
+                    res.telegram_sent,
+                    res.discord_sent,
+                    db_status == "DELIVERED",
+                );
             }
         }
 
@@ -687,8 +710,6 @@ impl AlertEngine {
         message: &str,
         severity: &str,
         details: Option<Value>,
-        _throw_on_error: bool,
-        _allow_retry_queue: bool,
     ) -> AlertDispatchResult {
         let icon = match severity.to_ascii_uppercase().as_str() {
             "CRITICAL" | "ERROR" => "🔴",
@@ -1000,8 +1021,6 @@ mod tests {
             "<b>AEGIS v2.0</b> <script>alert('xss')</script>",
             "WARNING",
             None,
-            false,
-            false,
         );
         assert_eq!(res.status, "DELIVERED");
         assert!(!res.html_message.contains("<script>"));
@@ -1042,5 +1061,72 @@ mod tests {
             listener.accept().is_err(),
             "AlertEngine must not issue /getUpdates or any outbound request when telegram_chat_id is empty"
         );
+    }
+
+    #[test]
+    fn test_r14_l14_dispatch_html_alert_atomic_insert_sets_retry_and_dispatched_at_ms() {
+        use aegis_test_support::mock_http::{MockHttpResponse, MockHttpServer};
+
+        let _guard = DEDUP_TEST_LOCK.lock();
+        clear_alert_dedup_cache_for_tests();
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let tg_srv = MockHttpServer::start_scripted([
+            MockHttpResponse::ok_json(&json!({ "ok": true, "result": {} })),
+            MockHttpResponse::json(503, &json!({ "ok": false, "description": "unavailable" })),
+        ]);
+
+        db.set_config_value("alert_provider", "telegram", None)
+            .unwrap();
+        db.set_config_value("telegram_api_base_url", &tg_srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("telegram_bot_token", "123456:TOKEN", None)
+            .unwrap();
+        db.set_config_value("telegram_chat_id", "999888777", None)
+            .unwrap();
+
+        let engine = AlertEngine::new(db.clone());
+        let res_ok = engine.dispatch_html_alert(
+            "ORDER_FILLED_OPEN",
+            "INFO",
+            "<b>Asset:</b> <code>SOL-USDC</code>",
+            Some(json!({ "symbol": "SOL-USDC" })),
+        );
+        assert_eq!(res_ok.status, "DELIVERED");
+        let qid_ok = res_ok.alert_queue_id.expect("alert_queue_id must be set");
+        assert!(db
+            .get_alert_queue_dispatched_at_ms(qid_ok)
+            .unwrap()
+            .is_some());
+        assert_eq!(engine.delivery_counters.delivered_count(), 1);
+
+        let res_err = engine.dispatch_html_alert(
+            "ORDER_FILLED_OPEN",
+            "INFO",
+            "<b>Asset:</b> <code>ETH-USDC</code>",
+            Some(json!({ "symbol": "ETH-USDC" })),
+        );
+        assert_eq!(res_err.status, "ERROR");
+        assert!(res_err.queued_for_retry);
+        let qid_err = res_err.alert_queue_id.expect("alert_queue_id must be set");
+        assert_eq!(db.get_alert_queue_dispatched_at_ms(qid_err).unwrap(), None);
+
+        let rows = db.list_recent_alerts(10).unwrap();
+        let row_ok = rows.iter().find(|r| r.id == qid_ok).unwrap();
+        assert_eq!(row_ok.status, "DELIVERED");
+        assert_eq!(row_ok.attempts, 1);
+        assert_eq!(
+            row_ok
+                .payload_json
+                .as_ref()
+                .and_then(|v| v.get("_delivery"))
+                .and_then(|d| d.get("telegram_sent"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let row_err = rows.iter().find(|r| r.id == qid_err).unwrap();
+        assert_eq!(row_err.status, "PENDING");
+        assert_eq!(row_err.attempts, 1);
+        assert!(row_err.next_retry_ms >= row_err.created_at_ms + 900);
     }
 }

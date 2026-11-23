@@ -219,6 +219,9 @@ fn dispatch_discord_post(client: &BlockingClient, url: &str, markdown: &str) -> 
     let payload = json!({
         "username": "Aegis Quant v2.0",
         "content": markdown,
+        "allowed_mentions": {
+            "parse": []
+        },
     });
 
     match client.post(url).json(&payload).send() {
@@ -520,5 +523,30 @@ mod tests {
         assert!(!outcome.delivered);
         assert!(!outcome.retriable);
         assert_eq!(outcome.http_status, 0);
+    }
+
+    #[test]
+    fn test_discord_webhook_payload_disables_mentions_r14_l18() {
+        use aegis_test_support::mock_http::{MockHttpResponse, MockHttpServer};
+
+        let srv = MockHttpServer::start(|_| MockHttpResponse::text(204, "text/plain", ""));
+        let webhook_url = srv.url("/api/webhooks/123456789/test_token");
+        let outcome = send_discord_webhook(
+            &webhook_url,
+            "<b>AEGIS Alert</b> @everyone @here <@12345>",
+            5,
+        );
+        assert!(outcome.delivered);
+        assert_eq!(outcome.http_status, 204);
+
+        let requests = srv.requests();
+        assert_eq!(requests.len(), 1);
+        let body = &requests[0].json_body;
+        assert_eq!(body["username"], "Aegis Quant v2.0");
+        assert_eq!(body["allowed_mentions"], json!({ "parse": [] }));
+        assert!(body["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("**AEGIS Alert** @everyone @here"));
     }
 }
