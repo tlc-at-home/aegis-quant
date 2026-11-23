@@ -26,6 +26,42 @@ pub struct RiskLimitsConfig {
     pub stop_out_cooldown_sec: i64,
     pub maker_fee_bps: f64,
     pub taker_fee_bps: f64,
+    #[serde(default = "default_breakeven_trigger_r")]
+    pub breakeven_trigger_r: f64,
+    #[serde(default = "default_breakeven_lock_r")]
+    pub breakeven_lock_r: f64,
+    #[serde(default = "default_stagnation_time_stop_hours")]
+    pub stagnation_time_stop_hours: f64,
+    #[serde(default = "default_stagnation_min_mfe_r")]
+    pub stagnation_min_mfe_r: f64,
+    #[serde(default = "default_risk_per_trade_equity_pct")]
+    pub risk_per_trade_equity_pct: f64,
+    #[serde(default = "default_min_equity_halt_usdc")]
+    pub min_equity_halt_usdc: f64,
+}
+
+fn default_breakeven_trigger_r() -> f64 {
+    0.40
+}
+
+fn default_breakeven_lock_r() -> f64 {
+    0.05
+}
+
+fn default_stagnation_time_stop_hours() -> f64 {
+    5.0
+}
+
+fn default_stagnation_min_mfe_r() -> f64 {
+    0.35
+}
+
+fn default_risk_per_trade_equity_pct() -> f64 {
+    0.005
+}
+
+fn default_min_equity_halt_usdc() -> f64 {
+    50.0
 }
 
 impl Default for RiskLimitsConfig {
@@ -34,7 +70,7 @@ impl Default for RiskLimitsConfig {
             risk_tier: RiskTier::Extreme,
             target_leverage_multiplier: 1.85,
             max_gross_leverage_x: 2.50,
-            max_single_asset_weight: 0.30,
+            max_single_asset_weight: 0.15,
             min_rebalance_delta_weight: 0.025,
             min_order_notional_usdc: 12.0,
             protective_stop_atr_mult: 2.2,
@@ -44,6 +80,12 @@ impl Default for RiskLimitsConfig {
             stop_out_cooldown_sec: 1800,
             maker_fee_bps: 1.5,
             taker_fee_bps: 4.5,
+            breakeven_trigger_r: 0.40,
+            breakeven_lock_r: 0.05,
+            stagnation_time_stop_hours: 5.0,
+            stagnation_min_mfe_r: 0.35,
+            risk_per_trade_equity_pct: 0.005,
+            min_equity_halt_usdc: 50.0,
         }
     }
 }
@@ -57,7 +99,7 @@ impl RiskLimitsConfig {
             target_leverage_multiplier,
             max_gross_leverage_x: cfg.get_f64("max_gross_leverage_x", 2.50).clamp(0.20, 5.00),
             max_single_asset_weight: cfg
-                .get_f64("max_single_asset_weight", 0.30)
+                .get_f64("max_single_asset_weight", 0.15)
                 .clamp(0.01, 1.00),
             min_rebalance_delta_weight: cfg
                 .get_f64("min_rebalance_delta_weight", 0.025)
@@ -76,6 +118,18 @@ impl RiskLimitsConfig {
             stop_out_cooldown_sec: cfg.get_i64("stop_out_cooldown_sec", 1800).max(60),
             maker_fee_bps: cfg.get_f64("maker_fee_bps", 1.5).max(0.0),
             taker_fee_bps: cfg.get_f64("taker_fee_bps", 4.5).max(0.0),
+            breakeven_trigger_r: cfg.get_f64("breakeven_trigger_r", 0.40).clamp(0.15, 1.50),
+            breakeven_lock_r: cfg.get_f64("breakeven_lock_r", 0.05).clamp(0.0, 0.50),
+            stagnation_time_stop_hours: cfg
+                .get_f64("stagnation_time_stop_hours", 5.0)
+                .clamp(0.0, 72.0),
+            stagnation_min_mfe_r: cfg.get_f64("stagnation_min_mfe_r", 0.35).clamp(0.05, 2.0),
+            risk_per_trade_equity_pct: cfg
+                .get_f64("risk_per_trade_equity_pct", 0.005)
+                .clamp(0.0, 0.05),
+            min_equity_halt_usdc: cfg
+                .get_f64("min_equity_halt_usdc", 50.0)
+                .clamp(1.0, 100_000.0),
         }
     }
 }
@@ -94,6 +148,23 @@ pub struct CapitalLedgerState {
     pub working_order_count: i32,
     pub open_long_count: i32,
     pub open_short_count: i32,
+    #[serde(default)]
+    pub is_insolvent: bool,
+}
+
+impl CapitalLedgerState {
+    /// Returns `true` when equity is non-finite, insolvent (`<= 0`), or strictly below `min_equity_halt_usdc` (`R14-M12`).
+    pub fn is_ruin_halted(&self, min_equity_halt_usdc: f64) -> bool {
+        let floor = if min_equity_halt_usdc.is_finite() && min_equity_halt_usdc > 0.0 {
+            min_equity_halt_usdc
+        } else {
+            50.0
+        };
+        !self.total_equity_usdc.is_finite()
+            || self.is_insolvent
+            || self.total_equity_usdc <= 0.0
+            || self.total_equity_usdc < floor
+    }
 }
 
 impl Default for CapitalLedgerState {
@@ -110,6 +181,7 @@ impl Default for CapitalLedgerState {
             working_order_count: 0,
             open_long_count: 0,
             open_short_count: 0,
+            is_insolvent: false,
         }
     }
 }
@@ -176,6 +248,75 @@ pub fn compute_committed_notional_usdc(fill_price: f64, filled_quantity: f64) ->
     round_dp(fill_price * filled_quantity.abs(), 4)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn finalize_capital_ledger(
+    base_cash_equity_usdc: f64,
+    eff_lev: f64,
+    reserved_order_cash_usdc: f64,
+    committed_notional_usdc: f64,
+    net_notional_usdc: f64,
+    unrealized_pnl_usdc: f64,
+    working_order_count: i32,
+    open_long_count: i32,
+    open_short_count: i32,
+) -> CapitalLedgerState {
+    let base_finite = base_cash_equity_usdc.is_finite();
+    let base_eq = if base_finite {
+        base_cash_equity_usdc
+    } else {
+        0.0
+    };
+    let safe_upnl = if unrealized_pnl_usdc.is_finite() {
+        unrealized_pnl_usdc
+    } else {
+        0.0
+    };
+    let raw_total_eq = base_eq + safe_upnl;
+    let is_insolvent = !base_finite || !raw_total_eq.is_finite() || raw_total_eq <= 0.0;
+    let total_equity_usdc = if raw_total_eq.is_finite() {
+        round_dp(raw_total_eq, 4)
+    } else {
+        0.0
+    };
+    let committed_margin_used = committed_notional_usdc / eff_lev;
+    let available_cash_usdc = round_dp(
+        (total_equity_usdc - committed_margin_used - reserved_order_cash_usdc).max(0.0),
+        4,
+    );
+    let (gross_leverage_x, net_leverage_x) = if total_equity_usdc > 1e-6 {
+        (
+            round_dp(committed_notional_usdc / total_equity_usdc, 4),
+            round_dp(net_notional_usdc / total_equity_usdc, 4),
+        )
+    } else if committed_notional_usdc > 0.0 {
+        let net_sign = if net_notional_usdc > 0.0 {
+            1.0
+        } else if net_notional_usdc < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+        (999.99, net_sign * 999.99)
+    } else {
+        (0.0, 0.0)
+    };
+
+    CapitalLedgerState {
+        total_equity_usdc,
+        available_cash_usdc,
+        reserved_order_cash_usdc: round_dp(reserved_order_cash_usdc, 4),
+        committed_notional_usdc: round_dp(committed_notional_usdc, 4),
+        net_notional_usdc: round_dp(net_notional_usdc, 4),
+        unrealized_pnl_usdc: round_dp(safe_upnl, 4),
+        gross_leverage_x,
+        net_leverage_x,
+        working_order_count,
+        open_long_count,
+        open_short_count,
+        is_insolvent,
+    }
+}
+
 /// Computes the unified `CapitalLedgerState` from a base cash/realized equity floor and active `PositionRecord` rows.
 /// - `WORKING` orders add to `reserved_order_cash_usdc` without adding to `committed_notional_usdc`.
 /// - `OPEN` positions add to `committed_notional_usdc` and `unrealized_pnl_usdc`.
@@ -184,11 +325,6 @@ pub fn compute_capital_ledger(
     positions: &[PositionRecord],
     leverage_multiplier: f64,
 ) -> CapitalLedgerState {
-    let base_eq = if base_cash_equity_usdc.is_finite() {
-        base_cash_equity_usdc.max(1.0)
-    } else {
-        1.0
-    };
     let eff_lev = if leverage_multiplier.is_finite() {
         leverage_multiplier.clamp(0.1, 20.0)
     } else {
@@ -240,28 +376,17 @@ pub fn compute_capital_ledger(
         }
     }
 
-    let total_equity_usdc = round_dp((base_eq + unrealized_pnl_usdc).max(1.0), 4);
-    let committed_margin_used = committed_notional_usdc / eff_lev;
-    let available_cash_usdc = round_dp(
-        (total_equity_usdc - committed_margin_used - reserved_order_cash_usdc).max(0.0),
-        4,
-    );
-    let gross_leverage_x = round_dp(committed_notional_usdc / total_equity_usdc, 4);
-    let net_leverage_x = round_dp(net_notional_usdc / total_equity_usdc, 4);
-
-    CapitalLedgerState {
-        total_equity_usdc,
-        available_cash_usdc,
-        reserved_order_cash_usdc: round_dp(reserved_order_cash_usdc, 4),
-        committed_notional_usdc: round_dp(committed_notional_usdc, 4),
-        net_notional_usdc: round_dp(net_notional_usdc, 4),
-        unrealized_pnl_usdc: round_dp(unrealized_pnl_usdc, 4),
-        gross_leverage_x,
-        net_leverage_x,
+    finalize_capital_ledger(
+        base_cash_equity_usdc,
+        eff_lev,
+        reserved_order_cash_usdc,
+        committed_notional_usdc,
+        net_notional_usdc,
+        unrealized_pnl_usdc,
         working_order_count,
         open_long_count,
         open_short_count,
-    }
+    )
 }
 
 /// Computes `CapitalLedgerState` directly from the MariaDB `v_assets_held` and `v_assets_ordered` view structs.
@@ -271,11 +396,6 @@ pub fn compute_capital_ledger_from_views(
     ordered_assets: &[OrderedAssetView],
     leverage_multiplier: f64,
 ) -> CapitalLedgerState {
-    let base_eq = if base_cash_equity_usdc.is_finite() {
-        base_cash_equity_usdc.max(1.0)
-    } else {
-        1.0
-    };
     let eff_lev = if leverage_multiplier.is_finite() {
         leverage_multiplier.clamp(0.1, 20.0)
     } else {
@@ -322,28 +442,17 @@ pub fn compute_capital_ledger_from_views(
         unrealized_pnl_usdc += h.unrealized_pnl_usdc;
     }
 
-    let total_equity_usdc = round_dp((base_eq + unrealized_pnl_usdc).max(1.0), 4);
-    let committed_margin_used = committed_notional_usdc / eff_lev;
-    let available_cash_usdc = round_dp(
-        (total_equity_usdc - committed_margin_used - reserved_order_cash_usdc).max(0.0),
-        4,
-    );
-    let gross_leverage_x = round_dp(committed_notional_usdc / total_equity_usdc, 4);
-    let net_leverage_x = round_dp(net_notional_usdc / total_equity_usdc, 4);
-
-    CapitalLedgerState {
-        total_equity_usdc,
-        available_cash_usdc,
-        reserved_order_cash_usdc: round_dp(reserved_order_cash_usdc, 4),
-        committed_notional_usdc: round_dp(committed_notional_usdc, 4),
-        net_notional_usdc: round_dp(net_notional_usdc, 4),
-        unrealized_pnl_usdc: round_dp(unrealized_pnl_usdc, 4),
-        gross_leverage_x,
-        net_leverage_x,
-        working_order_count: ordered_assets.len() as i32,
+    finalize_capital_ledger(
+        base_cash_equity_usdc,
+        eff_lev,
+        reserved_order_cash_usdc,
+        committed_notional_usdc,
+        net_notional_usdc,
+        unrealized_pnl_usdc,
+        ordered_assets.len() as i32,
         open_long_count,
         open_short_count,
-    }
+    )
 }
 
 #[cfg(test)]
@@ -353,13 +462,21 @@ mod tests {
     #[test]
     fn test_risk_limits_defaults_and_config_map_clamping() {
         let defaults = RiskLimitsConfig::default();
+        assert!((defaults.max_single_asset_weight - 0.15).abs() < 1e-9);
         assert!((defaults.protective_stop_atr_mult - 2.2).abs() < 1e-9);
         assert!((defaults.protective_stop_default_pct - 0.04).abs() < 1e-9);
         assert!((defaults.take_profit_atr_mult - 2.8).abs() < 1e-9);
         assert!((defaults.take_profit_default_pct - 0.055).abs() < 1e-9);
+        assert!((defaults.breakeven_trigger_r - 0.40).abs() < 1e-9);
+        assert!((defaults.breakeven_lock_r - 0.05).abs() < 1e-9);
+        assert!((defaults.stagnation_time_stop_hours - 5.0).abs() < 1e-9);
+        assert!((defaults.stagnation_min_mfe_r - 0.35).abs() < 1e-9);
+        assert!((defaults.risk_per_trade_equity_pct - 0.005).abs() < 1e-9);
+        assert!((defaults.min_equity_halt_usdc - 50.0).abs() < 1e-9);
 
         let empty_cfg = ConfigMap::new();
         let from_empty = RiskLimitsConfig::from_config_map(&empty_cfg);
+        assert!((from_empty.max_single_asset_weight - 0.15).abs() < 1e-9);
         assert!((from_empty.take_profit_atr_mult - 2.8).abs() < 1e-9);
         assert!((from_empty.take_profit_default_pct - 0.055).abs() < 1e-9);
 
@@ -380,5 +497,59 @@ mod tests {
         assert_eq!(round_to_tick(f64::NAN, 0.01, true), 0.0);
         assert_eq!(round_to_lot(1.299, 0.1), 1.2);
         assert_eq!(round_to_lot(-5.0, 0.1), 0.0);
+    }
+
+    #[test]
+    fn test_r14_m12_ledger_tracks_negative_equity_and_ruin_halt() {
+        let neg_flat = compute_capital_ledger(-125.0, &[], 1.85);
+        assert_eq!(neg_flat.total_equity_usdc, -125.0);
+        assert!(neg_flat.is_insolvent);
+        assert!(neg_flat.is_ruin_halted(50.0));
+        assert_eq!(neg_flat.gross_leverage_x, 0.0);
+
+        let pos_below_floor = compute_capital_ledger(40.0, &[], 1.85);
+        assert_eq!(pos_below_floor.total_equity_usdc, 40.0);
+        assert!(!pos_below_floor.is_insolvent);
+        assert!(pos_below_floor.is_ruin_halted(50.0));
+
+        let view_held = HeldAssetView {
+            position_id: 1,
+            asset_id: 1,
+            symbol: "BTC-USDC".to_string(),
+            coin: "BTC".to_string(),
+            client_order_id: "c1".to_string(),
+            side: "LONG".to_string(),
+            quantity: 0.01,
+            committed_notional_usdc: 1000.0,
+            portfolio_weight: 0.5,
+            entry_price: 100_000.0,
+            mark_price: 50_000.0,
+            protective_stop_px: 95_000.0,
+            protective_stop_oid: None,
+            stop_distance_pct: None,
+            take_profit_px: 110_000.0,
+            take_profit_oid: None,
+            tp_distance_pct: None,
+            highest_price_seen: 100_000.0,
+            lowest_price_seen: 50_000.0,
+            unrealized_pnl_usdc: -500.0,
+            unrealized_pnl_pct: -50.0,
+            realized_pnl_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            s1_weight_contrib: 0.5,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            latest_target_weight: 0.5,
+            latest_delta_weight: 0.0,
+            created_at_ms: 0,
+            opened_at_ms: Some(1000),
+            updated_at_ms: 1000,
+        };
+        let view_insolvent = compute_capital_ledger_from_views(200.0, &[view_held], &[], 1.85);
+        assert_eq!(view_insolvent.total_equity_usdc, -300.0);
+        assert!(view_insolvent.is_insolvent);
+        assert!(view_insolvent.is_ruin_halted(50.0));
+        assert_eq!(view_insolvent.gross_leverage_x, 999.99);
     }
 }

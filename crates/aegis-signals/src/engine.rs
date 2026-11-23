@@ -4,20 +4,21 @@
 //! Cross-Sectional Market Breadth (`breadth`), and Risk-Tier Portfolio Allocation (`allocator`).
 
 use crate::allocator::{
-    allocate_multi_sleeve_weights, AllocatorConfig, RiskTierLeverageExt, SleeveSignalInput,
+    allocate_multi_sleeve_weights_with_context, AllocatorConfig, HeldPositionContext,
+    RiskTierLeverageExt, SleeveSignalInput,
 };
-use crate::breadth::{
-    compute_market_breadth_snapshot, compute_preliminary_bull_breadth, MarketBreadthSnapshot,
-};
-use crate::carry_momentum::evaluate_sleeve_s1;
-use crate::event_reversion::{evaluate_sleeve_s3, TRIGGER_CAPITULATION_FLUSH};
-use crate::trend_breakout::evaluate_sleeve_s2;
+use crate::breadth::{compute_regime_gate_state, MarketBreadthSnapshot};
+use crate::carry_momentum::evaluate_sleeve_s1_with_features;
+use crate::event_reversion::{evaluate_sleeve_s3_with_features, TRIGGER_CAPITULATION_FLUSH};
+use crate::features::{BarCloseCache, CycleFeatureCache};
+use crate::trend_breakout::evaluate_sleeve_s2_with_features;
 use aegis_core::{
     round_dp, ConfigMap, CooldownAssetView, ExchangeAsset, OhlcvBar, OrderSide, PositionRecord,
     PositionStatus, RiskTier,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Full evaluation output of a single 3s/1s multi-sleeve signal cycle across the universe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,64 +35,135 @@ pub struct SignalCycleOutput {
 }
 
 /// Primary Aegis Quant v2.0 Multi-Sleeve Signal Engine.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SignalEngine {
     pub config: AllocatorConfig,
+    bar_cache: Mutex<BarCloseCache>,
+}
+
+impl Clone for SignalEngine {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            bar_cache: Mutex::new(BarCloseCache::default()),
+        }
+    }
 }
 
 impl SignalEngine {
     pub fn new(config: AllocatorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            bar_cache: Mutex::new(BarCloseCache::default()),
+        }
     }
 
     pub fn from_config_map(cfg: &ConfigMap) -> Self {
-        Self {
-            config: AllocatorConfig::from_config_map(cfg),
-        }
+        Self::new(AllocatorConfig::from_config_map(cfg))
     }
 
     /// Evaluates all three sleeves (S1 Carry-Momentum, S2 Trend-Breakout, S3 Event-Reversion),
     /// cross-sectional breadth, cooldown blocking, and risk-tier allocation across `assets`.
-    pub fn evaluate_universe(
+    pub fn evaluate_universe<B: AsRef<[OhlcvBar]>>(
         &self,
         assets: &[ExchangeAsset],
-        bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+        bars_by_asset: &HashMap<i64, B>,
         current_weights: &HashMap<i64, f64>,
         active_cooldowns: &[CooldownAssetView],
     ) -> SignalCycleOutput {
-        let btc_bars: &[OhlcvBar] = assets
+        let held_contexts: HashMap<i64, HeldPositionContext> = current_weights
             .iter()
-            .find(|a| {
-                a.coin.eq_ignore_ascii_case("BTC") || a.symbol.eq_ignore_ascii_case("BTC-USDC")
+            .map(|(&id, &w)| {
+                (
+                    id,
+                    HeldPositionContext {
+                        current_weight: w,
+                        unrealized_pnl_pct: 0.0,
+                    },
+                )
             })
-            .and_then(|btc| bars_by_asset.get(&btc.id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .collect();
+        self.evaluate_universe_with_context(assets, bars_by_asset, &held_contexts, active_cooldowns)
+    }
 
-        let (prelim_breadth_bull, _) = compute_preliminary_bull_breadth(assets, bars_by_asset);
-
-        let s1_map = evaluate_sleeve_s1(
+    /// Evaluates the universe using explicit per-asset [`HeldPositionContext`] (supporting
+    /// asymmetric loser invalidation / winner protection hysteresis).
+    pub fn evaluate_universe_with_context<B: AsRef<[OhlcvBar]>>(
+        &self,
+        assets: &[ExchangeAsset],
+        bars_by_asset: &HashMap<i64, B>,
+        held_contexts: &HashMap<i64, HeldPositionContext>,
+        active_cooldowns: &[CooldownAssetView],
+    ) -> SignalCycleOutput {
+        let mut guard = self
+            .bar_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.evaluate_universe_with_cache(
             assets,
             bars_by_asset,
-            btc_bars,
+            held_contexts,
+            active_cooldowns,
+            &mut guard,
+        )
+    }
+
+    /// Evaluates the universe using an externally owned [`BarCloseCache`] (lock-free path for backtests).
+    pub fn evaluate_universe_with_cache<B: AsRef<[OhlcvBar]>>(
+        &self,
+        assets: &[ExchangeAsset],
+        bars_by_asset: &HashMap<i64, B>,
+        held_contexts: &HashMap<i64, HeldPositionContext>,
+        active_cooldowns: &[CooldownAssetView],
+        bar_cache: &mut BarCloseCache,
+    ) -> SignalCycleOutput {
+        let features = CycleFeatureCache::build(assets, bars_by_asset, bar_cache);
+        let gate_cfg = self.config.regime_gate_config();
+        let mut regime_gate = features.initial_regime_gate(&gate_cfg);
+
+        let s1_map = evaluate_sleeve_s1_with_features(
+            assets,
+            bars_by_asset,
+            &features,
+            &regime_gate,
             self.config.s1_carry_mom_budget,
         );
-        let s2_map = evaluate_sleeve_s2(
+        let s2_map = evaluate_sleeve_s2_with_features(
             assets,
             bars_by_asset,
-            prelim_breadth_bull,
+            &features,
+            &regime_gate,
+            features.prelim_breadth_bull,
             self.config.s2_trend_breakout_budget,
         );
-        let s3_map =
-            evaluate_sleeve_s3(assets, bars_by_asset, self.config.s3_event_reversion_budget);
+        let s3_map = evaluate_sleeve_s3_with_features(
+            assets,
+            bars_by_asset,
+            &features,
+            &regime_gate,
+            self.config.s3_event_reversion_budget,
+        );
 
-        let signals = allocate_multi_sleeve_weights(
+        let capitulation_count = s3_map
+            .values()
+            .filter(|m| m.event_trigger.as_deref() == Some(TRIGGER_CAPITULATION_FLUSH))
+            .count();
+        regime_gate = compute_regime_gate_state(
+            features.prelim_breadth_bull,
+            features.eligible_coin_count,
+            features.avg_eligible_funding,
+            capitulation_count,
+            &gate_cfg,
+        );
+
+        let signals = allocate_multi_sleeve_weights_with_context(
             assets,
             &s1_map,
             &s2_map,
             &s3_map,
-            current_weights,
+            held_contexts,
             active_cooldowns,
+            &regime_gate,
             &self.config,
         );
 
@@ -99,16 +171,14 @@ impl SignalEngine {
             .iter()
             .map(|(&aid, m)| (aid, m.market_beta))
             .collect();
-        let capitulation_count = s3_map
-            .values()
-            .filter(|m| m.event_trigger.as_deref() == Some(TRIGGER_CAPITULATION_FLUSH))
-            .count();
+        let current_weights: HashMap<i64, f64> = held_contexts
+            .iter()
+            .map(|(&aid, ctx)| (aid, ctx.current_weight))
+            .collect();
 
-        let breadth = compute_market_breadth_snapshot(
-            assets,
-            bars_by_asset,
+        let breadth = features.finalize_breadth_snapshot(
             &beta_by_asset,
-            current_weights,
+            &current_weights,
             capitulation_count,
         );
 
@@ -140,18 +210,20 @@ impl SignalEngine {
         }
     }
 
-    /// Convenience entrypoint that derives `current_weights` from active (`WORKING` and `OPEN`) positions
-    /// and total portfolio equity before running `evaluate_universe`.
-    pub fn evaluate_universe_with_positions(
+    /// Convenience entrypoint that derives `current_weights` and `unrealized_pnl_pct` from active
+    /// (`WORKING` and `OPEN`) positions and true portfolio equity before running `evaluate_universe_with_context`.
+    pub fn evaluate_universe_with_positions<B: AsRef<[OhlcvBar]>>(
         &self,
         assets: &[ExchangeAsset],
-        bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+        bars_by_asset: &HashMap<i64, B>,
         active_positions: &[PositionRecord],
         active_cooldowns: &[CooldownAssetView],
         total_equity_usdc: f64,
     ) -> SignalCycleOutput {
-        let eq = total_equity_usdc.max(1.0);
-        let mut current_weights = HashMap::new();
+        let eq_valid = total_equity_usdc.is_finite() && total_equity_usdc > 1e-6;
+        let mut weight_by_asset: HashMap<i64, f64> = HashMap::new();
+        let mut open_pnl_acc: HashMap<i64, (f64, f64)> = HashMap::new();
+
         for pos in active_positions {
             let status = PositionStatus::parse(&pos.status);
             if !matches!(status, PositionStatus::Working | PositionStatus::Open) {
@@ -178,14 +250,66 @@ impl SignalEngine {
             } else {
                 pos.entry_price * pos.requested_quantity
             };
-            let signed_w = if notional.is_finite() && notional > 0.0 {
-                (notional / eq) * side.sign()
+            let signed_w = if eq_valid && notional.is_finite() && notional > 0.0 {
+                (notional / total_equity_usdc) * side.sign()
             } else {
                 pos.portfolio_weight.abs() * side.sign()
             };
-            *current_weights.entry(pos.asset_id).or_insert(0.0) += signed_w;
+            *weight_by_asset.entry(pos.asset_id).or_insert(0.0) += signed_w;
+
+            if status == PositionStatus::Open {
+                let entry_notional = if pos.entry_price.is_finite()
+                    && pos.entry_price > 0.0
+                    && pos.filled_quantity.is_finite()
+                    && pos.filled_quantity > 0.0
+                {
+                    pos.entry_price * pos.filled_quantity
+                } else if pos.committed_notional_usdc.is_finite()
+                    && pos.committed_notional_usdc > 0.0
+                {
+                    pos.committed_notional_usdc
+                } else {
+                    0.0
+                };
+                if entry_notional > 1e-6 {
+                    let upnl = if pos.current_price.is_finite()
+                        && pos.current_price > 0.0
+                        && pos.entry_price.is_finite()
+                        && pos.entry_price > 0.0
+                        && pos.filled_quantity.is_finite()
+                        && pos.filled_quantity > 0.0
+                        && (pos.current_price - pos.entry_price).abs() > 1e-12
+                    {
+                        (pos.current_price - pos.entry_price) * pos.filled_quantity * side.sign()
+                    } else if pos.unrealized_pnl_usdc.is_finite() {
+                        pos.unrealized_pnl_usdc
+                    } else {
+                        0.0
+                    };
+                    let entry = open_pnl_acc.entry(pos.asset_id).or_insert((0.0, 0.0));
+                    entry.0 += upnl;
+                    entry.1 += entry_notional;
+                }
+            }
         }
-        self.evaluate_universe(assets, bars_by_asset, &current_weights, active_cooldowns)
+
+        let mut held_contexts = HashMap::with_capacity(weight_by_asset.len());
+        for (asset_id, current_weight) in weight_by_asset {
+            let unrealized_pnl_pct = open_pnl_acc
+                .get(&asset_id)
+                .filter(|(_, denom)| *denom > 1e-6)
+                .map(|(upnl, denom)| upnl / denom)
+                .unwrap_or(0.0);
+            held_contexts.insert(
+                asset_id,
+                HeldPositionContext {
+                    current_weight,
+                    unrealized_pnl_pct,
+                },
+            );
+        }
+
+        self.evaluate_universe_with_context(assets, bars_by_asset, &held_contexts, active_cooldowns)
     }
 }
 
@@ -579,6 +703,381 @@ mod tests {
         assert_eq!(
             eigen_sig.rebalance_action, ACTION_CLOSE,
             "Held dead coin failing bar-liveness must emit ACTION_CLOSE, never trapped in HOLD"
+        );
+    }
+
+    #[test]
+    fn test_r14_h7_40_equal_score_assets_respect_budget_and_preserve_s3() {
+        use crate::allocator::ACTION_REGIME_BLOCKED;
+        use crate::carry_momentum::evaluate_sleeve_s1;
+        use crate::event_reversion::evaluate_sleeve_s3;
+        use crate::trend_breakout::evaluate_sleeve_s2;
+        let _ = ACTION_REGIME_BLOCKED;
+
+        // 40 equal-score assets with distinct day_volume_usdc: 1..=40
+        let mut assets = Vec::with_capacity(41);
+        let mut bars_by_asset = HashMap::new();
+        for id in 1..=40i64 {
+            let mut bars = build_trend_bars(id, 100.0, 0.012, 26, 2.0);
+            let close = bars.last().unwrap().close;
+            let mut a = sample_asset(
+                id,
+                &format!("C{id}"),
+                close * 1.01,
+                100.0,
+                -0.00015,
+                (id as f64) * 1_000_000.0,
+            );
+            a.tick_size = 0.01;
+            bars.last_mut().unwrap().volume *= 2.0;
+            bars_by_asset.insert(id, bars);
+            assets.push(a);
+        }
+
+        // Per-sleeve budget invariance: S1 (0.45), S2 (0.40) -> strictly 8 non-zero top-volume IDs (33..=40)
+        let s1 = evaluate_sleeve_s1(&assets, &bars_by_asset, &[], 0.45);
+        let s1_nz: Vec<i64> = s1
+            .values()
+            .filter(|m| m.w_s1_carry_mom.abs() > 1e-6)
+            .map(|m| m.asset_id)
+            .collect();
+        let s1_sum: f64 = s1.values().map(|m| m.w_s1_carry_mom.abs()).sum();
+        assert_eq!(s1_nz.len(), 8);
+        assert!((0.45 - 0.001..=0.45 + 1e-6).contains(&s1_sum));
+        for id in 33..=40 {
+            assert!(s1_nz.contains(&id), "S1 must pick top-8 volume ID {id}");
+        }
+
+        let s2 = evaluate_sleeve_s2(&assets, &bars_by_asset, 0.55, 0.40);
+        let s2_nz: Vec<i64> = s2
+            .values()
+            .filter(|m| m.w_s2_trend_breakout.abs() > 1e-6)
+            .map(|m| m.asset_id)
+            .collect();
+        let s2_sum: f64 = s2.values().map(|m| m.w_s2_trend_breakout.abs()).sum();
+        assert_eq!(s2_nz.len(), 8);
+        assert!((0.40 - 0.001..=0.40 + 1e-6).contains(&s2_sum));
+        for id in 33..=40 {
+            assert!(s2_nz.contains(&id), "S2 must pick top-8 volume ID {id}");
+        }
+
+        // S3 with 40 identical capitulation assets (budget 0.10) -> strictly 8 non-zero IDs (33..=40)
+        let mut s3_assets = Vec::with_capacity(40);
+        let mut s3_bars_map = HashMap::new();
+        for id in 1..=40i64 {
+            let mut bars = build_trend_bars(id, 100.0, -0.015, 26, 1.0);
+            let prev = bars.last().unwrap().close;
+            let flush_px = prev * 0.88;
+            let mut b = bars.last().unwrap().clone();
+            b.id = 27;
+            b.timestamp_ms += 14_400_000;
+            b.open = prev;
+            b.low = flush_px;
+            b.close = flush_px;
+            b.high = prev;
+            bars.push(b);
+            let mut a = sample_asset(
+                id,
+                &format!("F{id}"),
+                flush_px,
+                100.0,
+                -0.0002,
+                (id as f64) * 1_000_000.0,
+            );
+            a.tick_size = 0.01;
+            s3_bars_map.insert(id, bars);
+            s3_assets.push(a);
+        }
+        let s3 = evaluate_sleeve_s3(&s3_assets, &s3_bars_map, 0.10);
+        let s3_nz: Vec<i64> = s3
+            .values()
+            .filter(|m| m.w_s3_event_reversion.abs() > 1e-6)
+            .map(|m| m.asset_id)
+            .collect();
+        let s3_sum: f64 = s3.values().map(|m| m.w_s3_event_reversion.abs()).sum();
+        assert_eq!(s3_nz.len(), 8);
+        assert!((0.10 - 0.001..=0.10 + 1e-6).contains(&s3_sum));
+
+        // End-to-end SignalEngine with 40 equal S1/S2 assets + 1 S3 capitulation asset:
+        // S3 asset MUST retain positive w_s3_event_reversion and NOT be crowded out!
+        let mut cap_bars = build_trend_bars(99, 100.0, -0.015, 26, 1.0);
+        let c_prev = cap_bars.last().unwrap().close;
+        let c_flush = c_prev * 0.88;
+        let mut c_last = cap_bars.last().unwrap().clone();
+        c_last.id = 27;
+        c_last.timestamp_ms += 14_400_000;
+        c_last.open = c_prev;
+        c_last.low = c_flush;
+        c_last.close = c_flush;
+        c_last.high = c_prev;
+        cap_bars.push(c_last);
+        let cap_asset = sample_asset(99, "CAP", c_flush, 100.0, -0.0003, 500_000.0);
+        bars_by_asset.insert(99, cap_bars);
+        assets.push(cap_asset);
+
+        let engine = SignalEngine::default();
+        let out = engine.evaluate_universe(&assets, &bars_by_asset, &HashMap::new(), &[]);
+        let cap_sig = out.signals.iter().find(|s| s.asset_id == 99).unwrap();
+        assert!(
+            cap_sig.w_s3_event_reversion > 0.0,
+            "S3 capitulation asset must not be crowded out by 40 S1/S2 assets, got w_s3={}",
+            cap_sig.w_s3_event_reversion
+        );
+        assert!(out.s1_gross_weight <= 0.45 * 1.85 + 1e-3);
+        assert!(out.s2_gross_weight <= 0.40 * 1.85 + 1e-3);
+    }
+
+    #[test]
+    fn test_breadth_regime_gates_shorts_in_bull_and_longs_in_bear_and_fixes_s1_demeaning() {
+        // 1. BULL_EXPANSION (4 strong leaders + 1 mild positive laggard + 1 bearish coin -> breadth >= 0.68):
+        //    - Lagging positive coin MUST NOT invert sign via S1 cross-sectional demeaning!
+        //    - Bearish coin MUST be gated to 0.0 (no counter-regime SHORT in BULL_EXPANSION).
+        //    - Held SHORT on bearish coin MUST still emit ACTION_CLOSE when signal exits (never blocked).
+        let mut bull_assets = Vec::new();
+        let mut bull_bars = HashMap::new();
+        for id in 1..=4i64 {
+            let b = build_trend_bars(id, 100.0, 0.015, 26, 2.0);
+            let close = b.last().unwrap().close;
+            bull_assets.push(sample_asset(
+                id,
+                &format!("L{id}"),
+                close * 1.01,
+                100.0,
+                -0.00025,
+                20_000_000.0,
+            ));
+            bull_bars.insert(id, b);
+        }
+        // Mildly positive laggard (id=5) with small positive drift + baseline carry
+        let lag_bars = build_trend_bars(5, 100.0, 0.001, 26, 1.0);
+        let lag_close = lag_bars.last().unwrap().close;
+        bull_assets.push(sample_asset(
+            5,
+            "LAG",
+            lag_close * 1.003,
+            100.0,
+            -0.00001,
+            10_000_000.0,
+        ));
+        bull_bars.insert(5, lag_bars);
+
+        // Bearish coin (id=6): breadth = 5 / 6 = 0.8333 >= 0.68 -> BULL_EXPANSION, block_new_shorts = true
+        // First 12 bars up, then 14 bars down so EMA8 < EMA21 < EMA55 while sitting mid-range (range_pos ~ 0.4)
+        // without triggering contrarian downward-flush LONG.
+        let mut bear_bars = build_trend_bars(6, 100.0, 0.004, 10, 1.0);
+        let mut b_px = bear_bars.last().unwrap().close;
+        let mut b_ts = bear_bars.last().unwrap().timestamp_ms;
+        for i in 10..26 {
+            b_ts += 14_400_000;
+            let open = b_px;
+            b_px *= 0.985;
+            bear_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 6,
+                timeframe: "4h".to_string(),
+                timestamp_ms: b_ts,
+                open,
+                high: open * 1.02,
+                low: b_px * 0.98,
+                close: b_px,
+                volume: if i == 25 { 20_000.0 } else { 10_000.0 },
+                funding_rate: 0.00025,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        // Keep a prior swing low far below so range_pos stays above 0.25
+        bear_bars[0].low = 60.0;
+        let bear_close = bear_bars.last().unwrap().close;
+        bull_assets.push(sample_asset(
+            6,
+            "BEAR",
+            bear_close,
+            100.0,
+            0.00025,
+            15_000_000.0,
+        ));
+        bull_bars.insert(6, bear_bars);
+
+        // Overextended blow-off coin (id=8) with crowded positive funding -> S3 would emit contrarian SHORT,
+        // which BULL_EXPANSION must suppress to 0.0 (breadth = 6/7 >= 0.68)
+        let mut blow_bars = build_trend_bars(8, 100.0, 0.005, 25, 1.0);
+        let bl_prev = blow_bars.last().unwrap().close;
+        let bl_spike = bl_prev * 1.12;
+        let mut bl_last = blow_bars.last().unwrap().clone();
+        bl_last.id = 26;
+        bl_last.timestamp_ms += 14_400_000;
+        bl_last.open = bl_prev;
+        bl_last.high = bl_spike;
+        bl_last.close = bl_spike;
+        bl_last.low = bl_prev;
+        blow_bars.push(bl_last);
+        bull_assets.push(sample_asset(
+            8,
+            "BLOW",
+            bl_spike,
+            100.0,
+            0.0020,
+            15_000_000.0,
+        ));
+        bull_bars.insert(8, blow_bars);
+
+        let engine = SignalEngine::default();
+        let bull_out = engine.evaluate_universe(&bull_assets, &bull_bars, &HashMap::new(), &[]);
+        assert_eq!(bull_out.breadth.market_regime_label, "BULL_EXPANSION");
+
+        let lag_sig = bull_out.signals.iter().find(|s| s.asset_id == 5).unwrap();
+        assert!(
+            lag_sig.w_s1_carry_mom >= 0.0 && lag_sig.target_weight >= 0.0,
+            "S1 demeaning must preserve positive sign on lagging bull coin, got w_s1={}",
+            lag_sig.w_s1_carry_mom
+        );
+
+        let bear_sig = bull_out.signals.iter().find(|s| s.asset_id == 6).unwrap();
+        assert_eq!(bear_sig.w_s1_carry_mom, 0.0);
+        assert_eq!(bear_sig.w_s2_trend_breakout, 0.0);
+        assert_eq!(bear_sig.w_s3_event_reversion, 0.0);
+        assert_eq!(bear_sig.target_weight, 0.0);
+
+        let blow_sig = bull_out.signals.iter().find(|s| s.asset_id == 8).unwrap();
+        assert!(blow_sig.w_s3_event_reversion >= 0.0);
+        assert!(blow_sig.target_weight >= 0.0);
+
+        // Held SHORT on neutral/exiting coin in BULL_EXPANSION MUST still emit ACTION_CLOSE
+        let mut flat_coin = sample_asset(7, "EXITSHORT", 100.0, 100.0, 0.0, 15_000_000.0);
+        flat_coin.is_event_eligible = false;
+        let flat_bars = build_trend_bars(7, 100.0, 0.0, 26, 1.0);
+        bull_assets.push(flat_coin);
+        bull_bars.insert(7, flat_bars);
+        let mut held = HashMap::new();
+        held.insert(7, -0.10);
+        let close_out = engine.evaluate_universe(&bull_assets, &bull_bars, &held, &[]);
+        let close_sig = close_out.signals.iter().find(|s| s.asset_id == 7).unwrap();
+        assert_eq!(close_sig.rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_sig.target_weight, 0.0);
+
+        // 2. BEAR_CONTRACTION (4 bearish coins + 1 bullish coin -> breadth = 1/5 = 0.20 <= 0.32):
+        //    - Bullish coin MUST be gated to 0.0 (no counter-regime LONG).
+        let mut bear_assets = Vec::new();
+        let mut bear_bars_map = HashMap::new();
+        for id in 10..=13i64 {
+            let b = build_trend_bars(id, 100.0, -0.012, 26, 2.0);
+            let close = b.last().unwrap().close;
+            bear_assets.push(sample_asset(
+                id,
+                &format!("B{id}"),
+                close * 0.99,
+                100.0,
+                0.0002,
+                20_000_000.0,
+            ));
+            bear_bars_map.insert(id, b);
+        }
+        let loner_bars = build_trend_bars(14, 100.0, 0.008, 26, 2.0);
+        let loner_close = loner_bars.last().unwrap().close;
+        bear_assets.push(sample_asset(
+            14,
+            "LONER",
+            loner_close * 1.01,
+            100.0,
+            -0.0003,
+            15_000_000.0,
+        ));
+        bear_bars_map.insert(14, loner_bars);
+
+        // Downward flush dip-buy coin (id=15) in BEAR_CONTRACTION (breadth = 1/6 = 0.1667 <= 0.32):
+        // S3 would emit a contrarian LONG, which BEAR_CONTRACTION must block to 0.0!
+        let mut knife_bars = build_trend_bars(15, 100.0, -0.015, 25, 1.0);
+        let k_prev = knife_bars.last().unwrap().close;
+        let k_flush = k_prev * 0.88;
+        let mut k_last = knife_bars.last().unwrap().clone();
+        k_last.id = 26;
+        k_last.timestamp_ms += 14_400_000;
+        k_last.open = k_prev;
+        k_last.low = k_flush;
+        k_last.close = k_flush;
+        k_last.high = k_prev;
+        knife_bars.push(k_last);
+        bear_assets.push(sample_asset(
+            15,
+            "KNIFE",
+            k_flush,
+            100.0,
+            -0.0004,
+            15_000_000.0,
+        ));
+        bear_bars_map.insert(15, knife_bars);
+
+        let bear_out = engine.evaluate_universe(&bear_assets, &bear_bars_map, &HashMap::new(), &[]);
+        assert_eq!(bear_out.breadth.market_regime_label, "BEAR_CONTRACTION");
+        let loner_sig = bear_out.signals.iter().find(|s| s.asset_id == 14).unwrap();
+        assert_eq!(loner_sig.w_s1_carry_mom, 0.0);
+        assert_eq!(loner_sig.w_s2_trend_breakout, 0.0);
+        assert!(loner_sig.target_weight <= 0.0);
+        let knife_sig = bear_out.signals.iter().find(|s| s.asset_id == 15).unwrap();
+        assert_eq!(knife_sig.w_s1_carry_mom, 0.0);
+        assert_eq!(knife_sig.w_s2_trend_breakout, 0.0);
+        assert_eq!(knife_sig.w_s3_event_reversion, 0.0);
+        assert_eq!(knife_sig.target_weight, 0.0);
+    }
+
+    #[test]
+    fn test_cycle_feature_cache_and_bar_close_cache_bit_exact_and_slice_parity() {
+        let btc_bars = build_trend_bars(1, 90_000.0, 0.006, 25, 1.2);
+        let sol_bars = build_trend_bars(2, 160.0, 0.015, 25, 2.4);
+        let eth_bars = build_trend_bars(3, 3_200.0, -0.012, 25, 2.1);
+
+        let btc = sample_asset(
+            1,
+            "BTC",
+            btc_bars.last().unwrap().close,
+            90_000.0,
+            0.00001,
+            50_000_000.0,
+        );
+        let sol = sample_asset(
+            2,
+            "SOL",
+            sol_bars.last().unwrap().close * 1.02,
+            160.0,
+            -0.00015,
+            25_000_000.0,
+        );
+        let eth = sample_asset(
+            3,
+            "ETH",
+            eth_bars.last().unwrap().close * 0.98,
+            3_200.0,
+            0.00035,
+            30_000_000.0,
+        );
+        let assets = vec![btc, sol, eth];
+
+        let mut vec_map: HashMap<i64, Vec<OhlcvBar>> = HashMap::new();
+        vec_map.insert(1, btc_bars);
+        vec_map.insert(2, sol_bars);
+        vec_map.insert(3, eth_bars);
+
+        let slice_map: HashMap<i64, &[OhlcvBar]> =
+            vec_map.iter().map(|(&id, v)| (id, v.as_slice())).collect();
+
+        let engine = SignalEngine::default();
+        let first = engine.evaluate_universe(&assets, &vec_map, &HashMap::new(), &[]);
+        // Second call hits BarCloseCache on unchanged bars -> bit-exact parity
+        let second = engine.evaluate_universe(&assets, &slice_map, &HashMap::new(), &[]);
+
+        assert_eq!(first.signals.len(), second.signals.len());
+        for (a, b) in first.signals.iter().zip(second.signals.iter()) {
+            assert_eq!(a.asset_id, b.asset_id);
+            assert_eq!(a.w_s1_carry_mom, b.w_s1_carry_mom);
+            assert_eq!(a.w_s2_trend_breakout, b.w_s2_trend_breakout);
+            assert_eq!(a.w_s3_event_reversion, b.w_s3_event_reversion);
+            assert_eq!(a.target_weight, b.target_weight);
+            assert_eq!(a.rebalance_action, b.rebalance_action);
+        }
+        assert_eq!(
+            first.breadth.market_regime_label,
+            second.breadth.market_regime_label
         );
     }
 }

@@ -1,8 +1,26 @@
 //! Initial Protective Stop & 1-Second High-Water Chandelier/ATR Trailing Stop Ratchet (`aegis-risk::stops`).
 
 use crate::limits::{round_to_tick, RiskLimitsConfig};
+use aegis_core::indicators::compute_atr as core_compute_atr;
 use aegis_core::{round_dp, OhlcvBar, OrderSide};
 use serde::{Deserialize, Serialize};
+
+/// Input bundle for single-source 1-second position lifecycle evaluation (`evaluate_1s_position_lifecycle`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StopEvaluationInput {
+    pub side: OrderSide,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub quantity: f64,
+    pub current_stop_px: f64,
+    pub current_tp_px: f64,
+    pub highest_price_seen: f64,
+    pub lowest_price_seen: f64,
+    pub atr_opt: Option<f64>,
+    pub tick_size: f64,
+    pub check_tp: bool,
+    pub held_duration_ms: Option<i64>,
+}
 
 /// Result of a 1-second protective stop ratchet & take-profit evaluation on an `OPEN` position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,37 +48,21 @@ fn tick_step(tick_size: f64) -> f64 {
 }
 
 /// Computes Average True Range (ATR) over `period` OHLCV bars with a safe price-fraction floor.
+/// Delegates to `aegis_core::indicators::compute_atr` (`R14-M28`).
 pub fn compute_atr_from_bars(
     bars: &[OhlcvBar],
     period: usize,
     reference_price: f64,
     default_pct: f64,
 ) -> f64 {
-    let ref_px = if reference_price.is_finite() {
-        reference_price.max(1e-8)
-    } else {
-        1.0
-    };
-    let fallback = (ref_px * (default_pct.max(0.005) / 2.2)).max(1e-8);
-    if bars.len() < 2 {
-        return fallback;
-    }
-    let lookback = period.max(2).min(bars.len() - 1);
-    let start = bars.len() - lookback;
-    let mut sum_tr = 0.0;
-    for i in start..bars.len() {
-        let cur = &bars[i];
-        let prev_close = bars[i - 1].close;
-        if !cur.high.is_finite() || !cur.low.is_finite() || !prev_close.is_finite() {
-            return fallback;
-        }
-        let hl = (cur.high - cur.low).abs();
-        let hc = (cur.high - prev_close).abs();
-        let lc = (cur.low - prev_close).abs();
-        sum_tr += hl.max(hc).max(lc);
-    }
-    let min_floor = (ref_px * 0.004).max(1e-8);
-    (sum_tr / (lookback as f64)).max(min_floor)
+    let fallback_pct = default_pct.max(0.005) / 2.2;
+    core_compute_atr(
+        bars,
+        period,
+        reference_price,
+        Some(0.004),
+        Some(fallback_pct),
+    )
 }
 
 /// Computes the effective stop distance in price units given `entry_price`, optional `atr_value`, and `RiskLimitsConfig`.
@@ -144,15 +146,41 @@ pub fn compute_initial_take_profit(
     }
 }
 
-/// Returns `(trail_mult, lock_mult)` in multiples of `stop_dist` for stepped Chandelier profit-locking,
-/// or `None` while favorable excursion is below `0.6 * stop_dist` (leaving the initial stop untouched).
+/// Returns `(trail_mult, lock_mult)` in multiples of `stop_dist` for stepped Chandelier profit-locking:
+/// - `< breakeven_trigger_r * stop_dist` (`0.40R` default): `None` (initial stop untouched)
+/// - `[breakeven_trigger_r, 0.60R)`: `Some((0.85, breakeven_lock_r))` (`+0.05R` lock)
+/// - `[0.60R, 1.00R)`: `Some((0.75, 0.10))`
+/// - `[1.00R, 1.60R)`: `Some((0.55, 0.45))`
+/// - `>= 1.60R`: `Some((0.40, 1.00))`
 #[inline]
-fn stepped_chandelier_params(excursion: f64, stop_dist: f64) -> Option<(f64, f64)> {
+fn stepped_chandelier_params(
+    excursion: f64,
+    stop_dist: f64,
+    limits: &RiskLimitsConfig,
+) -> Option<(f64, f64)> {
     let tol = stop_dist * 1e-9;
+    let be_trigger = if limits.breakeven_trigger_r.is_finite() {
+        limits.breakeven_trigger_r.clamp(0.15, 1.50)
+    } else {
+        0.40
+    };
+    let be_lock = if limits.breakeven_lock_r.is_finite() {
+        limits.breakeven_lock_r.clamp(0.0, 0.50)
+    } else {
+        0.05
+    };
     if excursion + tol < 0.6 * stop_dist {
-        None
+        if excursion + tol >= be_trigger * stop_dist {
+            Some((0.85, be_lock))
+        } else {
+            None
+        }
     } else if excursion + tol < 1.0 * stop_dist {
-        Some((0.75, 0.10))
+        if excursion + tol >= be_trigger * stop_dist {
+            Some((0.75, 0.10_f64.max(be_lock)))
+        } else {
+            None
+        }
     } else if excursion + tol < 1.6 * stop_dist {
         Some((0.55, 0.45))
     } else {
@@ -163,7 +191,7 @@ fn stepped_chandelier_params(excursion: f64, stop_dist: f64) -> Option<(f64, f64
 /// Evaluates the 1-second High-Water Chandelier/ATR trailing stop ratchet on an `OPEN` holding.
 /// - Ratchets the stop monotonically in the direction of profit (`new_stop >= current_stop` for `LONG`,
 ///   `new_stop <= current_stop` for `SHORT`).
-/// - Applies stepped profit locks and progressively tighter trailing stops at `0.6x`, `1.0x`, and `1.6x` stop distance.
+/// - Applies stepped profit locks and progressively tighter trailing stops at `0.4x`, `0.6x`, `1.0x`, and `1.6x` stop distance.
 /// - Detects immediate stop breach when `mark_price <= active_stop` (`LONG`) or `mark_price >= active_stop` (`SHORT`).
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_1s_protective_stop(
@@ -178,20 +206,21 @@ pub fn evaluate_1s_protective_stop(
     tick_size: f64,
     limits: &RiskLimitsConfig,
 ) -> StopRatchetEvaluation {
-    evaluate_1s_position_tpsl_inner(
+    let input = StopEvaluationInput {
         side,
         entry_price,
         mark_price,
         quantity,
         current_stop_px,
-        0.0,
+        current_tp_px: 0.0,
         highest_price_seen,
         lowest_price_seen,
         atr_opt,
         tick_size,
-        limits,
-        false,
-    )
+        check_tp: false,
+        held_duration_ms: None,
+    };
+    evaluate_1s_position_lifecycle(&input, limits)
 }
 
 /// Evaluates both the 1-second High-Water Chandelier/ATR trailing stop ratchet AND the take-profit target on an `OPEN` holding.
@@ -209,7 +238,7 @@ pub fn evaluate_1s_position_tpsl(
     tick_size: f64,
     limits: &RiskLimitsConfig,
 ) -> StopRatchetEvaluation {
-    evaluate_1s_position_tpsl_inner(
+    let input = StopEvaluationInput {
         side,
         entry_price,
         mark_price,
@@ -220,26 +249,34 @@ pub fn evaluate_1s_position_tpsl(
         lowest_price_seen,
         atr_opt,
         tick_size,
-        limits,
-        true,
-    )
+        check_tp: true,
+        held_duration_ms: None,
+    };
+    evaluate_1s_position_lifecycle(&input, limits)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn evaluate_1s_position_tpsl_inner(
-    side: OrderSide,
-    entry_price: f64,
-    mark_price: f64,
-    quantity: f64,
-    current_stop_px: f64,
-    current_tp_px: f64,
-    highest_price_seen: f64,
-    lowest_price_seen: f64,
-    atr_opt: Option<f64>,
-    tick_size: f64,
+/// Single-source 1-second position lifecycle evaluation (`P1-Strat`):
+/// Precedence:
+/// 1. Protective stop breach (`PROTECTIVE_STOP_LONG` | `PROTECTIVE_STOP_SHORT`)
+/// 2. Take-profit hit (`TAKE_PROFIT_LONG` | `TAKE_PROFIT_SHORT`)
+/// 3. Stagnation time-stop (`STAGNATION_TIME_STOP_LONG` | `STAGNATION_TIME_STOP_SHORT`, 600s cooldown)
+/// 4. Monotonic Chandelier / breakeven stop ratchet
+pub fn evaluate_1s_position_lifecycle(
+    input: &StopEvaluationInput,
     limits: &RiskLimitsConfig,
-    check_tp: bool,
 ) -> StopRatchetEvaluation {
+    let side = input.side;
+    let entry_price = input.entry_price;
+    let mark_price = input.mark_price;
+    let quantity = input.quantity;
+    let current_stop_px = input.current_stop_px;
+    let current_tp_px = input.current_tp_px;
+    let highest_price_seen = input.highest_price_seen;
+    let lowest_price_seen = input.lowest_price_seen;
+    let atr_opt = input.atr_opt;
+    let tick_size = input.tick_size;
+    let check_tp = input.check_tp;
+
     if !mark_price.is_finite()
         || mark_price <= 0.0
         || !entry_price.is_finite()
@@ -289,51 +326,108 @@ fn evaluate_1s_position_tpsl_inner(
     let step = tick_step(tick_size);
     let min_buf = (stop_dist * 0.25).max(step * 4.0);
 
-    match side {
-        OrderSide::Long => {
-            let active_stop = if current_stop_px.is_finite() && current_stop_px > 0.0 {
-                current_stop_px
-            } else {
-                init_stop
-            };
-            let active_tp = if current_tp_px.is_finite() && current_tp_px > 0.0 {
-                current_tp_px
-            } else {
-                init_tp
-            };
-            let new_highest = (if highest_price_seen.is_finite() {
-                highest_price_seen
-            } else {
-                entry_price
-            })
-            .max(entry_price)
-            .max(ref_mark);
-            let new_lowest = if lowest_price_seen.is_finite() && lowest_price_seen > 0.0 {
-                lowest_price_seen.min(ref_mark)
-            } else {
-                entry_price.min(ref_mark)
-            };
+    let active_stop = if current_stop_px.is_finite() && current_stop_px > 0.0 {
+        current_stop_px
+    } else {
+        init_stop
+    };
+    let active_tp = if current_tp_px.is_finite() && current_tp_px > 0.0 {
+        current_tp_px
+    } else {
+        init_tp
+    };
+    let new_highest = (if highest_price_seen.is_finite() {
+        highest_price_seen
+    } else {
+        entry_price
+    })
+    .max(entry_price)
+    .max(ref_mark);
+    let new_lowest = if lowest_price_seen.is_finite() && lowest_price_seen > 0.0 {
+        lowest_price_seen.min(entry_price).min(ref_mark)
+    } else {
+        entry_price.min(ref_mark)
+    };
 
-            if active_stop > 0.0 && ref_mark <= active_stop {
-                let tp_dist_pct = round_dp(((active_tp - ref_mark).max(0.0) / ref_mark) * 100.0, 2);
-                return StopRatchetEvaluation {
-                    triggered: true,
-                    new_protective_stop_px: active_stop,
-                    stop_ratcheted: false,
-                    take_profit_px: active_tp,
-                    highest_price_seen: new_highest,
-                    lowest_price_seen: new_lowest,
-                    stop_distance_pct: 0.0,
-                    tp_distance_pct: tp_dist_pct,
-                    unrealized_pnl_usdc,
-                    exit_reason: Some("PROTECTIVE_STOP_LONG".to_string()),
-                    cooldown_duration_ms: limits.stop_out_cooldown_sec * 1000,
+    let sl_hit = match side {
+        OrderSide::Long => active_stop > 0.0 && ref_mark <= active_stop,
+        OrderSide::Short => active_stop > 0.0 && ref_mark >= active_stop,
+    };
+    if sl_hit {
+        let tp_dist_pct = round_dp(((active_tp - ref_mark).abs() / ref_mark) * 100.0, 2);
+        let reason = match side {
+            OrderSide::Long => "PROTECTIVE_STOP_LONG",
+            OrderSide::Short => "PROTECTIVE_STOP_SHORT",
+        };
+        return StopRatchetEvaluation {
+            triggered: true,
+            new_protective_stop_px: active_stop,
+            stop_ratcheted: false,
+            take_profit_px: active_tp,
+            highest_price_seen: new_highest,
+            lowest_price_seen: new_lowest,
+            stop_distance_pct: 0.0,
+            tp_distance_pct: tp_dist_pct,
+            unrealized_pnl_usdc,
+            exit_reason: Some(reason.to_string()),
+            cooldown_duration_ms: limits.stop_out_cooldown_sec * 1000,
+        };
+    }
+
+    let tp_hit = check_tp
+        && active_tp > 0.0
+        && match side {
+            OrderSide::Long => ref_mark >= active_tp,
+            OrderSide::Short => ref_mark <= active_tp,
+        };
+    if tp_hit {
+        let stop_dist_pct = round_dp(((ref_mark - active_stop).abs() / ref_mark) * 100.0, 2);
+        let reason = match side {
+            OrderSide::Long => "TAKE_PROFIT_LONG",
+            OrderSide::Short => "TAKE_PROFIT_SHORT",
+        };
+        return StopRatchetEvaluation {
+            triggered: true,
+            new_protective_stop_px: active_stop,
+            stop_ratcheted: false,
+            take_profit_px: active_tp,
+            highest_price_seen: new_highest,
+            lowest_price_seen: new_lowest,
+            stop_distance_pct: stop_dist_pct,
+            tp_distance_pct: 0.0,
+            unrealized_pnl_usdc,
+            exit_reason: Some(reason.to_string()),
+            cooldown_duration_ms: 0,
+        };
+    }
+
+    let excursion = match side {
+        OrderSide::Long => (new_highest - entry_price).max(0.0),
+        OrderSide::Short => (entry_price - new_lowest).max(0.0),
+    };
+
+    // 3. Stagnation Time-Stop (`P1-Strat`): exit low-MFE drifting positions after `stagnation_time_stop_hours`
+    if limits.stagnation_time_stop_hours.is_finite() && limits.stagnation_time_stop_hours > 0.0 {
+        let min_held_ms = (limits.stagnation_time_stop_hours * 3_600_000.0).round() as i64;
+        if input
+            .held_duration_ms
+            .is_some_and(|held_ms| held_ms >= min_held_ms)
+        {
+            let mfe_r = excursion / stop_dist.max(1e-8);
+            let cur_r = ((ref_mark - entry_price) * side.sign()) / stop_dist.max(1e-8);
+            if mfe_r < limits.stagnation_min_mfe_r && cur_r <= 0.15 {
+                let stop_dist_pct = round_dp(
+                    (((ref_mark - active_stop) * side.sign()).max(0.0) / ref_mark) * 100.0,
+                    2,
+                );
+                let tp_dist_pct = round_dp(
+                    (((active_tp - ref_mark) * side.sign()).max(0.0) / ref_mark) * 100.0,
+                    2,
+                );
+                let reason = match side {
+                    OrderSide::Long => "STAGNATION_TIME_STOP_LONG",
+                    OrderSide::Short => "STAGNATION_TIME_STOP_SHORT",
                 };
-            }
-
-            if check_tp && active_tp > 0.0 && ref_mark >= active_tp {
-                let stop_dist_pct =
-                    round_dp(((ref_mark - active_stop).max(0.0) / ref_mark) * 100.0, 2);
                 return StopRatchetEvaluation {
                     triggered: true,
                     new_protective_stop_px: active_stop,
@@ -342,17 +436,23 @@ fn evaluate_1s_position_tpsl_inner(
                     highest_price_seen: new_highest,
                     lowest_price_seen: new_lowest,
                     stop_distance_pct: stop_dist_pct,
-                    tp_distance_pct: 0.0,
+                    tp_distance_pct: tp_dist_pct,
                     unrealized_pnl_usdc,
-                    exit_reason: Some("TAKE_PROFIT_LONG".to_string()),
-                    cooldown_duration_ms: 0,
+                    exit_reason: Some(reason.to_string()),
+                    cooldown_duration_ms: 600_000,
                 };
             }
+        }
+    }
 
+    // 4. Monotonic Chandelier / Breakeven Ratchet
+    let (ratcheted_stop, stop_ratcheted) = match side {
+        OrderSide::Long => {
             let max_safe_stop = (ref_mark - min_buf).max(step);
-            let mut ratcheted_stop = active_stop;
-            let excursion = (new_highest - entry_price).max(0.0);
-            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, stop_dist) {
+            let mut ratcheted = active_stop;
+            if let Some((trail_mult, lock_mult)) =
+                stepped_chandelier_params(excursion, stop_dist, limits)
+            {
                 if new_highest > entry_price + step && active_stop < max_safe_stop {
                     let profit_lock = entry_price + lock_mult * stop_dist;
                     let candidate = (new_highest - trail_mult * stop_dist).max(profit_lock);
@@ -361,91 +461,18 @@ fn evaluate_1s_position_tpsl_inner(
                     if rounded_candidate > active_stop + step * 0.5
                         && rounded_candidate <= max_safe_stop + 1e-12
                     {
-                        ratcheted_stop = rounded_candidate;
+                        ratcheted = rounded_candidate;
                     }
                 }
             }
-            let stop_ratcheted = ratcheted_stop > active_stop + step * 0.5;
-            let dist_pct = round_dp(((ref_mark - ratcheted_stop).max(0.0) / ref_mark) * 100.0, 2);
-            let tp_dist_pct = round_dp(((active_tp - ref_mark).max(0.0) / ref_mark) * 100.0, 2);
-
-            StopRatchetEvaluation {
-                triggered: false,
-                new_protective_stop_px: ratcheted_stop,
-                stop_ratcheted,
-                take_profit_px: active_tp,
-                highest_price_seen: new_highest,
-                lowest_price_seen: new_lowest,
-                stop_distance_pct: dist_pct,
-                tp_distance_pct: tp_dist_pct,
-                unrealized_pnl_usdc,
-                exit_reason: None,
-                cooldown_duration_ms: 0,
-            }
+            (ratcheted, ratcheted > active_stop + step * 0.5)
         }
         OrderSide::Short => {
-            let active_stop = if current_stop_px.is_finite() && current_stop_px > 0.0 {
-                current_stop_px
-            } else {
-                init_stop
-            };
-            let active_tp = if current_tp_px.is_finite() && current_tp_px > 0.0 {
-                current_tp_px
-            } else {
-                init_tp
-            };
-            let new_highest = (if highest_price_seen.is_finite() {
-                highest_price_seen
-            } else {
-                entry_price
-            })
-            .max(entry_price)
-            .max(ref_mark);
-            let new_lowest = if lowest_price_seen.is_finite() && lowest_price_seen > 0.0 {
-                lowest_price_seen.min(entry_price).min(ref_mark)
-            } else {
-                entry_price.min(ref_mark)
-            };
-
-            if active_stop > 0.0 && ref_mark >= active_stop {
-                let tp_dist_pct = round_dp(((ref_mark - active_tp).max(0.0) / ref_mark) * 100.0, 2);
-                return StopRatchetEvaluation {
-                    triggered: true,
-                    new_protective_stop_px: active_stop,
-                    stop_ratcheted: false,
-                    take_profit_px: active_tp,
-                    highest_price_seen: new_highest,
-                    lowest_price_seen: new_lowest,
-                    stop_distance_pct: 0.0,
-                    tp_distance_pct: tp_dist_pct,
-                    unrealized_pnl_usdc,
-                    exit_reason: Some("PROTECTIVE_STOP_SHORT".to_string()),
-                    cooldown_duration_ms: limits.stop_out_cooldown_sec * 1000,
-                };
-            }
-
-            if check_tp && active_tp > 0.0 && ref_mark <= active_tp {
-                let stop_dist_pct =
-                    round_dp(((active_stop - ref_mark).max(0.0) / ref_mark) * 100.0, 2);
-                return StopRatchetEvaluation {
-                    triggered: true,
-                    new_protective_stop_px: active_stop,
-                    stop_ratcheted: false,
-                    take_profit_px: active_tp,
-                    highest_price_seen: new_highest,
-                    lowest_price_seen: new_lowest,
-                    stop_distance_pct: stop_dist_pct,
-                    tp_distance_pct: 0.0,
-                    unrealized_pnl_usdc,
-                    exit_reason: Some("TAKE_PROFIT_SHORT".to_string()),
-                    cooldown_duration_ms: 0,
-                };
-            }
-
             let min_safe_stop = ref_mark + min_buf;
-            let mut ratcheted_stop = active_stop;
-            let excursion = (entry_price - new_lowest).max(0.0);
-            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, stop_dist) {
+            let mut ratcheted = active_stop;
+            if let Some((trail_mult, lock_mult)) =
+                stepped_chandelier_params(excursion, stop_dist, limits)
+            {
                 if new_lowest > 0.0
                     && new_lowest < entry_price - step
                     && active_stop > min_safe_stop
@@ -457,28 +484,35 @@ fn evaluate_1s_position_tpsl_inner(
                     if rounded_candidate + step * 0.5 < active_stop
                         && rounded_candidate >= min_safe_stop - 1e-12
                     {
-                        ratcheted_stop = rounded_candidate;
+                        ratcheted = rounded_candidate;
                     }
                 }
             }
-            let stop_ratcheted = ratcheted_stop + step * 0.5 < active_stop;
-            let dist_pct = round_dp(((ratcheted_stop - ref_mark).max(0.0) / ref_mark) * 100.0, 2);
-            let tp_dist_pct = round_dp(((ref_mark - active_tp).max(0.0) / ref_mark) * 100.0, 2);
-
-            StopRatchetEvaluation {
-                triggered: false,
-                new_protective_stop_px: ratcheted_stop,
-                stop_ratcheted,
-                take_profit_px: active_tp,
-                highest_price_seen: new_highest,
-                lowest_price_seen: new_lowest,
-                stop_distance_pct: dist_pct,
-                tp_distance_pct: tp_dist_pct,
-                unrealized_pnl_usdc,
-                exit_reason: None,
-                cooldown_duration_ms: 0,
-            }
+            (ratcheted, ratcheted + step * 0.5 < active_stop)
         }
+    };
+
+    let dist_pct = round_dp(
+        (((ref_mark - ratcheted_stop) * side.sign()).max(0.0) / ref_mark) * 100.0,
+        2,
+    );
+    let tp_dist_pct = round_dp(
+        (((active_tp - ref_mark) * side.sign()).max(0.0) / ref_mark) * 100.0,
+        2,
+    );
+
+    StopRatchetEvaluation {
+        triggered: false,
+        new_protective_stop_px: ratcheted_stop,
+        stop_ratcheted,
+        take_profit_px: active_tp,
+        highest_price_seen: new_highest,
+        lowest_price_seen: new_lowest,
+        stop_distance_pct: dist_pct,
+        tp_distance_pct: tp_dist_pct,
+        unrealized_pnl_usdc,
+        exit_reason: None,
+        cooldown_duration_ms: 0,
     }
 }
 
@@ -716,15 +750,15 @@ mod tests {
     fn test_stepped_chandelier_all_tiers_and_tick_rounding_long_and_short() {
         let limits = RiskLimitsConfig::default();
         // entry=100, atr=2.0 -> stop_dist=4.4, min_buf=1.1
-        // Tier 0 (< 0.6R = 2.64): initial stop untouched
+        // Tier 0 (< 0.40R = 1.76): excursion = 0.30R (1.32) -> initial stop untouched
         let l0 = evaluate_1s_position_tpsl(
             OrderSide::Long,
             100.0,
-            102.20,
+            101.32,
             5.0,
             95.60,
             120.0,
-            102.20,
+            101.32,
             99.5,
             Some(2.0),
             0.01,
@@ -736,18 +770,51 @@ mod tests {
         let s0 = evaluate_1s_position_tpsl(
             OrderSide::Short,
             100.0,
-            97.80,
+            98.68,
             5.0,
             104.40,
             80.0,
             100.5,
-            97.80,
+            98.68,
             Some(2.0),
             0.01,
             &limits,
         );
         assert!(!s0.stop_ratcheted);
         assert_eq!(s0.new_protective_stop_px, 104.40);
+
+        // Breakeven Tier ([0.40R, 0.60R)): excursion=0.45R (1.98) -> lock entry +- 0.05R = +-0.22 (100.22 / 99.78)
+        let l_be = evaluate_1s_position_tpsl(
+            OrderSide::Long,
+            100.0,
+            101.98,
+            5.0,
+            95.60,
+            120.0,
+            101.98,
+            99.5,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(l_be.stop_ratcheted);
+        assert!((l_be.new_protective_stop_px - 100.22).abs() < 1e-9);
+
+        let s_be = evaluate_1s_position_tpsl(
+            OrderSide::Short,
+            100.0,
+            98.02,
+            5.0,
+            104.40,
+            80.0,
+            100.5,
+            98.02,
+            Some(2.0),
+            0.01,
+            &limits,
+        );
+        assert!(s_be.stop_ratcheted);
+        assert!((s_be.new_protective_stop_px - 99.78).abs() < 1e-9);
 
         // Tier 1 ([0.6R, 1.0R)): excursion=0.70R (3.08) -> lock entry +- 0.10R = +-0.44 (100.44 / 99.56)
         let l1 = evaluate_1s_position_tpsl(
@@ -941,5 +1008,165 @@ mod tests {
             low_s = ev.lowest_price_seen;
         }
         assert!(stop_s <= 95.60);
+    }
+
+    #[test]
+    fn test_breakeven_04r_lock_and_stagnation_time_stop_long_short() {
+        let limits = RiskLimitsConfig::default();
+        // entry=100, atr=2.0 -> stop_dist=4.4, 0.40R=1.76, +0.05R lock = +0.22 -> 100.22 / 99.78
+        // 1. Exact 0.40R breakeven lock for LONG and SHORT
+        let long_be = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 101.76,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 101.76,
+                lowest_price_seen: 99.80,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(1_000_000),
+            },
+            &limits,
+        );
+        assert!(!long_be.triggered);
+        assert!(long_be.stop_ratcheted);
+        assert!((long_be.new_protective_stop_px - 100.22).abs() < 1e-9);
+
+        let short_be = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Short,
+                entry_price: 100.0,
+                mark_price: 98.24,
+                quantity: 5.0,
+                current_stop_px: 104.40,
+                current_tp_px: 94.40,
+                highest_price_seen: 100.20,
+                lowest_price_seen: 98.24,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(1_000_000),
+            },
+            &limits,
+        );
+        assert!(!short_be.triggered);
+        assert!(short_be.stop_ratcheted);
+        assert!((short_be.new_protective_stop_px - 99.78).abs() < 1e-9);
+
+        // 2. Stagnation time-stop LONG: held 5h (18_000_000 ms), mfe_r < 0.35 (highest=101.0 -> 0.227R), cur_r <= 0.15
+        let long_stag = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.20,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 101.00,
+                lowest_price_seen: 99.20,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(18_000_000),
+            },
+            &limits,
+        );
+        assert!(long_stag.triggered);
+        assert_eq!(
+            long_stag.exit_reason.as_deref(),
+            Some("STAGNATION_TIME_STOP_LONG")
+        );
+        assert_eq!(long_stag.cooldown_duration_ms, 600_000);
+
+        // 3. Stagnation time-stop SHORT: held 5h, mfe_r < 0.35 (lowest=99.0 -> 0.227R), cur_r <= 0.15
+        let short_stag = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Short,
+                entry_price: 100.0,
+                mark_price: 99.80,
+                quantity: 5.0,
+                current_stop_px: 104.40,
+                current_tp_px: 94.40,
+                highest_price_seen: 100.80,
+                lowest_price_seen: 99.00,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(18_000_000),
+            },
+            &limits,
+        );
+        assert!(short_stag.triggered);
+        assert_eq!(
+            short_stag.exit_reason.as_deref(),
+            Some("STAGNATION_TIME_STOP_SHORT")
+        );
+        assert_eq!(short_stag.cooldown_duration_ms, 600_000);
+
+        // 4. Exempt if actively breaking out (cur_r > 0.15) OR held < 5h OR MFE >= 0.35R OR disabled (hours=0.0)
+        let exempt_breakout = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.90, // cur_r = 0.204 > 0.15
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 100.90,
+                lowest_price_seen: 99.20,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(18_000_000),
+            },
+            &limits,
+        );
+        assert!(!exempt_breakout.triggered);
+
+        let exempt_mfe = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.10,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 101.60, // mfe_r = 0.363 >= 0.35
+                lowest_price_seen: 99.20,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(18_000_000),
+            },
+            &limits,
+        );
+        assert!(!exempt_mfe.triggered);
+
+        let disabled_limits = RiskLimitsConfig {
+            stagnation_time_stop_hours: 0.0,
+            ..limits
+        };
+        let disabled_stag = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.20,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 101.00,
+                lowest_price_seen: 99.20,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(36_000_000),
+            },
+            &disabled_limits,
+        );
+        assert!(!disabled_stag.triggered);
     }
 }

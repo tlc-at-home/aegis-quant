@@ -3,8 +3,13 @@
 //! Computes per-asset `s1_mom_score`, `s1_carry_score`, `market_beta`, `annualized_vol`,
 //! and risk-adjusted inverse-volatility weight `w_s1_carry_mom` across core-eligible Hyperliquid perps.
 
+use crate::breadth::RegimeGateState;
+use crate::features::{
+    compute_market_beta_from_map, fallback_annualized_vol, fallback_beta, CycleFeatureCache,
+};
 use crate::liquidity::{default_passes_quality, evaluate_asset_liquidity_quality};
 use crate::trend_breakout::compute_rsi_and_range_position;
+use aegis_core::indicators::{compute_annualized_vol_from_bars, top_k_normalized};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,45 +29,12 @@ pub struct CarryMomentumMetrics {
 }
 
 /// Estimates annualized realized volatility from historical OHLCV bars (or 24h price change fallback).
+/// Delegates to `aegis_core::indicators::compute_annualized_vol_from_bars` (`R14-M9`).
 pub fn compute_annualized_vol(bars: &[OhlcvBar], asset: &ExchangeAsset) -> f64 {
-    if bars.len() >= 6 {
-        let mut log_rets = Vec::with_capacity(bars.len() - 1);
-        for pair in bars.windows(2) {
-            let p0 = pair[0].close.max(1e-12);
-            let p1 = pair[1].close.max(1e-12);
-            log_rets.push((p1 / p0).ln());
-        }
-        let n = log_rets.len() as f64;
-        let mean = log_rets.iter().sum::<f64>() / n;
-        let var = log_rets
-            .iter()
-            .map(|r| {
-                let d = *r - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / (n - 1.0).max(1.0);
-        let std_per_bar = var.sqrt();
-        let periods_per_year: f64 = match bars.last().map(|b| b.timeframe.as_str()).unwrap_or("4h")
-        {
-            "1m" => 365.0 * 24.0 * 60.0,
-            "5m" => 365.0 * 24.0 * 12.0,
-            "15m" => 365.0 * 24.0 * 4.0,
-            "1h" => 365.0 * 24.0,
-            "1d" => 365.0,
-            _ => 365.0 * 6.0, // 4h default
-        };
-        let ann = (std_per_bar * periods_per_year.sqrt()).clamp(0.18, 3.20);
-        return round_dp(ann, 4);
+    if let Some(ann) = compute_annualized_vol_from_bars(bars) {
+        return ann;
     }
-
-    if asset.prev_day_price > 0.0 && asset.mark_price > 0.0 {
-        let day_ret = ((asset.mark_price / asset.prev_day_price).ln()).abs();
-        let est = (day_ret * (365.0_f64).sqrt()).clamp(0.25, 2.80);
-        return round_dp(est, 4);
-    }
-
-    0.65
+    fallback_annualized_vol(asset)
 }
 
 /// Estimates rolling market beta relative to `BTC-USDC` benchmark returns.
@@ -81,56 +53,8 @@ pub fn compute_market_beta(
         .map(|b| (b.timestamp_ms, b.close))
         .collect();
 
-    let mut aligned: Vec<(i64, f64, f64)> = asset_bars
-        .iter()
-        .filter(|a| a.close.is_finite() && a.close > 0.0)
-        .filter_map(|a| {
-            btc_by_ts
-                .get(&a.timestamp_ms)
-                .map(|&bc| (a.timestamp_ms, a.close, bc))
-        })
-        .collect();
-    aligned.sort_by_key(|x| x.0);
-    aligned.dedup_by_key(|x| x.0);
-
-    if aligned.len() >= 8 {
-        let mut a_rets = Vec::with_capacity(aligned.len() - 1);
-        let mut b_rets = Vec::with_capacity(aligned.len() - 1);
-        for pair in aligned.windows(2) {
-            let ar = (pair[1].1 / pair[0].1).ln();
-            let br = (pair[1].2 / pair[0].2).ln();
-            if ar.is_finite() && br.is_finite() {
-                a_rets.push(ar);
-                b_rets.push(br);
-            }
-        }
-
-        if a_rets.len() >= 7 {
-            let m = a_rets.len() as f64;
-            let mean_a = a_rets.iter().sum::<f64>() / m;
-            let mean_b = b_rets.iter().sum::<f64>() / m;
-
-            let mut cov = 0.0;
-            let mut var_b = 0.0;
-            for i in 0..a_rets.len() {
-                let da = a_rets[i] - mean_a;
-                let db = b_rets[i] - mean_b;
-                cov += da * db;
-                var_b += db * db;
-            }
-            if var_b > 1e-10 {
-                let beta = (cov / var_b).clamp(0.15, 2.80);
-                return round_dp(beta, 4);
-            }
-        }
-    }
-
-    let default_beta = match asset.coin.as_str() {
-        "ETH" => 1.12,
-        "SOL" | "HYPE" | "SUI" | "AVAX" | "INJ" | "TAO" => 1.35,
-        _ => 1.25,
-    };
-    round_dp(default_beta, 4)
+    compute_market_beta_from_map(asset_bars, &btc_by_ts, asset)
+        .unwrap_or_else(|| fallback_beta(asset))
 }
 
 /// Computes multi-horizon risk-adjusted momentum score in `[-1.0, +1.0]`.
@@ -138,6 +62,16 @@ pub fn compute_s1_momentum_score(
     bars: &[OhlcvBar],
     asset: &ExchangeAsset,
     annualized_vol: f64,
+) -> f64 {
+    compute_s1_momentum_score_with_rsi(bars, asset, annualized_vol, None)
+}
+
+#[inline]
+fn compute_s1_momentum_score_with_rsi(
+    bars: &[OhlcvBar],
+    asset: &ExchangeAsset,
+    annualized_vol: f64,
+    precomputed_rsi_range: Option<(f64, f64, bool)>,
 ) -> f64 {
     let vol_norm = annualized_vol.max(0.20);
     if bars.len() >= 8 {
@@ -157,7 +91,8 @@ pub fn compute_s1_momentum_score(
 
         let composite_ret = 0.45 * r_fast + 0.35 * r_mid + 0.20 * r_slow;
         let score = (composite_ret / (vol_norm * 0.18)).tanh().clamp(-1.0, 1.0);
-        let (rsi_14, range_pos, bouncing_from_low) = compute_rsi_and_range_position(bars, last_px);
+        let (rsi_14, range_pos, bouncing_from_low) =
+            precomputed_rsi_range.unwrap_or_else(|| compute_rsi_and_range_position(bars, last_px));
         if score < 0.0 && (rsi_14 < 36.0 || range_pos < 0.22 || bouncing_from_low) {
             return 0.0;
         }
@@ -190,16 +125,53 @@ pub fn compute_s1_carry_score(funding_rate_hourly: f64, mom_score: f64) -> f64 {
     round_dp(blended, 4)
 }
 
-/// Evaluates Sleeve 1 (Cross-Sectional Carry-Momentum & Market-Beta Hedge) across the universe.
-pub fn evaluate_sleeve_s1(
+/// Evaluates Sleeve 1 using precomputed [`CycleFeatureCache`] and macro [`RegimeGateState`].
+pub(crate) fn evaluate_sleeve_s1_with_features<B: AsRef<[OhlcvBar]>>(
     assets: &[ExchangeAsset],
-    bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+    bars_by_asset: &HashMap<i64, B>,
+    features: &CycleFeatureCache,
+    regime_gate: &RegimeGateState,
+    s1_budget: f64,
+) -> HashMap<i64, CarryMomentumMetrics> {
+    evaluate_sleeve_s1_inner(
+        assets,
+        bars_by_asset,
+        None,
+        Some(features),
+        regime_gate,
+        s1_budget,
+    )
+}
+
+/// Evaluates Sleeve 1 (Cross-Sectional Carry-Momentum & Market-Beta Hedge) across the universe.
+pub fn evaluate_sleeve_s1<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
     btc_bars: &[OhlcvBar],
+    s1_budget: f64,
+) -> HashMap<i64, CarryMomentumMetrics> {
+    evaluate_sleeve_s1_inner(
+        assets,
+        bars_by_asset,
+        Some(btc_bars),
+        None,
+        &RegimeGateState::default(),
+        s1_budget,
+    )
+}
+
+fn evaluate_sleeve_s1_inner<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    btc_bars_opt: Option<&[OhlcvBar]>,
+    features_opt: Option<&CycleFeatureCache>,
+    regime_gate: &RegimeGateState,
     s1_budget: f64,
 ) -> HashMap<i64, CarryMomentumMetrics> {
     struct RawS1Metric {
         asset_id: i64,
         symbol: String,
+        day_volume_usdc: f64,
         annualized_vol: f64,
         market_beta: f64,
         s1_mom_score: f64,
@@ -212,25 +184,57 @@ pub fn evaluate_sleeve_s1(
     let budget = s1_budget.clamp(0.0, 1.50);
     let mut raw_metrics = Vec::with_capacity(assets.len());
 
+    // Only build fallback btc_by_ts once when called standalone without CycleFeatureCache
+    let fallback_btc_map: Option<HashMap<i64, f64>> = if features_opt.is_none() {
+        Some(
+            btc_bars_opt
+                .unwrap_or(&[])
+                .iter()
+                .filter(|b| b.close.is_finite() && b.close > 0.0)
+                .map(|b| (b.timestamp_ms, b.close))
+                .collect(),
+        )
+    } else {
+        None
+    };
+
     for asset in assets {
         let bars = bars_by_asset
             .get(&asset.id)
-            .map(Vec::as_slice)
+            .map(AsRef::as_ref)
             .unwrap_or(&[]);
-        let quality = evaluate_asset_liquidity_quality(asset, bars);
-        let annualized_vol = compute_annualized_vol(bars, asset);
-        let market_beta = compute_market_beta(bars, btc_bars, asset);
-        let s1_mom_score = compute_s1_momentum_score(bars, asset, annualized_vol);
+
+        let feat_opt = features_opt.and_then(|f| f.per_asset.get(&asset.id));
+        let quality = feat_opt
+            .map(|f| f.quality)
+            .unwrap_or_else(|| evaluate_asset_liquidity_quality(asset, bars));
+        let annualized_vol = feat_opt
+            .map(|f| f.annualized_vol)
+            .unwrap_or_else(|| compute_annualized_vol(bars, asset));
+        let market_beta = if let Some(f) = feat_opt {
+            f.market_beta
+        } else if let Some(ref map_ref) = fallback_btc_map {
+            compute_market_beta_from_map(bars, map_ref, asset)
+                .unwrap_or_else(|| fallback_beta(asset))
+        } else {
+            fallback_beta(asset)
+        };
+
+        let rsi_range_opt = feat_opt.map(|f| (f.rsi_14, f.range_pos, f.bouncing_from_low));
+        let s1_mom_score =
+            compute_s1_momentum_score_with_rsi(bars, asset, annualized_vol, rsi_range_opt);
         let s1_carry_score = compute_s1_carry_score(asset.funding_rate_hourly, s1_mom_score);
 
-        let last_px = if asset.mark_price > 0.0 {
-            asset.mark_price
-        } else {
-            bars.last().map(|b| b.close).unwrap_or(0.0)
-        };
+        let last_px = feat_opt.map(|f| f.live_px).unwrap_or_else(|| {
+            if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
+                asset.mark_price
+            } else {
+                bars.last().map(|b| b.close).unwrap_or(0.0)
+            }
+        });
         let at_range_bottom = if bars.len() >= 8 && last_px > 0.0 {
             let (rsi_14, range_pos, bouncing_from_low) =
-                compute_rsi_and_range_position(bars, last_px);
+                rsi_range_opt.unwrap_or_else(|| compute_rsi_and_range_position(bars, last_px));
             rsi_14 < 36.0 || range_pos < 0.22 || bouncing_from_low
         } else {
             false
@@ -259,6 +263,7 @@ pub fn evaluate_sleeve_s1(
         raw_metrics.push(RawS1Metric {
             asset_id: asset.id,
             symbol: asset.symbol.clone(),
+            day_volume_usdc: asset.day_volume_usdc,
             annualized_vol,
             market_beta,
             s1_mom_score,
@@ -280,38 +285,36 @@ pub fn evaluate_sleeve_s1(
         0.0
     };
 
-    let mut adjusted_scores: Vec<(i64, f64)> = Vec::with_capacity(raw_metrics.len());
+    let mut adjusted_scores: Vec<(i64, f64, f64)> = Vec::with_capacity(raw_metrics.len());
     for m in &raw_metrics {
         let mut adj = if m.inv_vol_score.is_finite() && m.inv_vol_score.abs() > 1e-6 {
-            0.65 * m.inv_vol_score + 0.35 * (m.inv_vol_score - mean_score)
+            let raw_adj = 0.65 * m.inv_vol_score + 0.35 * (m.inv_vol_score - mean_score);
+            // Sign-preservation guard (P1-Strat): cross-sectional demeaning can modulate conviction rank
+            // but NEVER invert a positive momentum/carry coin into a SHORT (or negative into a LONG).
+            if m.inv_vol_score > 0.0 {
+                raw_adj.max(0.0)
+            } else {
+                raw_adj.min(0.0)
+            }
         } else {
             0.0
         };
         if m.at_range_bottom && adj < 0.0 {
             adj = 0.0;
         }
-        adjusted_scores.push((m.asset_id, adj));
+        // Zero counter-regime scores BEFORE top_k_normalized so 100% of budget concentrates on aligned leaders
+        if (regime_gate.block_new_shorts && adj < 0.0) || (regime_gate.block_new_longs && adj > 0.0)
+        {
+            adj = 0.0;
+        }
+        adjusted_scores.push((m.asset_id, adj, m.day_volume_usdc));
     }
 
-    let mut abs_scores: Vec<f64> = adjusted_scores
-        .iter()
-        .map(|(_, adj)| adj.abs())
-        .filter(|v| v.is_finite() && *v > 1e-6)
-        .collect();
-    abs_scores.sort_by(|a, b| b.total_cmp(a));
-    let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
-    let norm_denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
-    let score_lookup: HashMap<i64, f64> = adjusted_scores.into_iter().collect();
+    let weights = top_k_normalized(&adjusted_scores, 8, budget);
 
     let mut out = HashMap::with_capacity(raw_metrics.len());
     for m in raw_metrics {
-        let adj = score_lookup.get(&m.asset_id).copied().unwrap_or(0.0);
-        let w_s1 = if top_abs_sum > 1e-8 {
-            round_dp((adj / norm_denom) * budget, 4)
-        } else {
-            0.0
-        };
-
+        let w_s1 = weights.get(&m.asset_id).copied().unwrap_or(0.0);
         out.insert(
             m.asset_id,
             CarryMomentumMetrics {
@@ -762,5 +765,78 @@ mod tests {
             floor_res[&201].w_s1_carry_mom,
             floor_res[&202].w_s1_carry_mom
         );
+    }
+
+    #[test]
+    fn test_r14_m9_mixed_timeframe_and_mislabeled_bars_annualized_vol() {
+        let step_4h = 14_400_000i64;
+        let step_1h = 3_600_000i64;
+        let asset = test_asset(301, "SOL", 104.0, 0.0);
+        let closes = [100.0, 101.0, 99.5, 102.0, 100.5, 103.0, 101.5, 104.0];
+
+        let mk = |ts_ms: i64, tf: &str, c: f64| OhlcvBar {
+            id: ts_ms,
+            asset_id: 301,
+            timeframe: tf.to_string(),
+            timestamp_ms: ts_ms,
+            open: c,
+            high: c * 1.002,
+            low: c * 0.998,
+            close: c,
+            volume: 10_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let bars_4h: Vec<OhlcvBar> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| mk((i as i64 + 1) * step_4h, "4h", c))
+            .collect();
+        let vol_4h = compute_annualized_vol(&bars_4h, &asset);
+
+        // Mislabeled "1m" on true 4h timestamps uses timestamp deltas instead of 15.5x blow-up
+        let bars_mislabeled: Vec<OhlcvBar> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| mk((i as i64 + 1) * step_4h, "1m", c))
+            .collect();
+        let vol_mislabeled = compute_annualized_vol(&bars_mislabeled, &asset);
+        assert!(
+            (vol_4h - vol_mislabeled).abs() < 1e-9,
+            "Mislabeled 1m bars on 4h timestamps must recover exact 4h vol ({vol_4h} vs {vol_mislabeled})"
+        );
+
+        // Mixed 4h + 1h bars recover true time-normalized sigma rather than assuming last bar's 1h
+        let mut mixed = Vec::new();
+        let mut ts = 1_700_000_000_000i64;
+        let mut px = 100.0;
+        for i in 0..8 {
+            ts += step_4h;
+            px *= if i % 2 == 0 { 1.015 } else { 0.985 };
+            mixed.push(mk(ts, "4h", px));
+        }
+        for i in 0..8 {
+            ts += step_1h;
+            px *= if i % 2 == 0 { 1.0075 } else { 0.9925 };
+            mixed.push(mk(ts, "1h", px));
+        }
+        let vol_mixed = compute_annualized_vol(&mixed, &asset);
+        assert!(
+            vol_mixed > 0.35 && vol_mixed < 1.30,
+            "Mixed 4h+1h annualized vol must reflect time-normalized sigma, got {vol_mixed}"
+        );
+
+        // Inconsistent unknown labels with zero timestamps fall back safely to 24h prev_day_price / 0.65
+        let bad_ts_bars: Vec<OhlcvBar> = closes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| mk(0, if i % 2 == 0 { "4h" } else { "weird" }, c))
+            .collect();
+        let mut fallback_asset = asset;
+        fallback_asset.prev_day_price = 104.0;
+        let vol_fb = compute_annualized_vol(&bad_ts_bars, &fallback_asset);
+        assert!((vol_fb - 0.25).abs() < 1e-6);
     }
 }

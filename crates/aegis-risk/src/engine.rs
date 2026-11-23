@@ -11,8 +11,9 @@ use crate::limits::{
     RiskLimitsConfig,
 };
 use crate::stops::{
-    compute_initial_protective_stop, compute_initial_take_profit, evaluate_1s_position_tpsl,
-    evaluate_1s_protective_stop, StopRatchetEvaluation,
+    compute_initial_protective_stop, compute_initial_take_profit, evaluate_1s_position_lifecycle,
+    evaluate_1s_position_tpsl, evaluate_1s_protective_stop, StopEvaluationInput,
+    StopRatchetEvaluation,
 };
 use aegis_core::{
     round_dp, ConfigMap, ExchangeAsset, HeldAssetView, OrderSide, OrderedAssetView, PositionRecord,
@@ -41,6 +42,9 @@ pub struct WorkingOrderSizingPlan {
     pub stop_distance_pct: f64,
     pub take_profit_px: f64,
     pub tp_distance_pct: f64,
+    /// Per-trade equity risk budget in USDC (`equity * risk_per_trade_equity_pct`), `0.0` when disabled.
+    #[serde(default)]
+    pub risk_budget_usdc: f64,
 }
 
 /// Summary of the `WORKING -> OPEN` capital commitment transition when an exchange fill is confirmed.
@@ -162,6 +166,7 @@ impl RiskEngine {
                 stop_distance_pct: 0.0,
                 take_profit_px: 0.0,
                 tp_distance_pct: 0.0,
+                risk_budget_usdc: 0.0,
             };
         }
 
@@ -181,7 +186,15 @@ impl RiskEngine {
         } else {
             asset.mark_price
         };
-        let limit_price = round_to_tick(raw_px, asset.tick_size, side.is_buy());
+        let tick_lot_ok = asset.tick_size.is_finite()
+            && asset.tick_size > 0.0
+            && asset.lot_step_size.is_finite()
+            && asset.lot_step_size > 0.0;
+        let limit_price = if tick_lot_ok {
+            round_to_tick(raw_px, asset.tick_size, side.is_buy())
+        } else {
+            0.0
+        };
 
         let reject = |reason: String| WorkingOrderSizingPlan {
             approved: false,
@@ -202,10 +215,28 @@ impl RiskEngine {
             stop_distance_pct: 0.0,
             take_profit_px: 0.0,
             tp_distance_pct: 0.0,
+            risk_budget_usdc: 0.0,
         };
+
+        if !tick_lot_ok {
+            return reject("INVALID_TICK_OR_LOT_SIZE".to_string());
+        }
 
         if limit_price <= 0.0 {
             return reject("INVALID_MARK_OR_MID_PRICE".to_string());
+        }
+
+        if ledger.is_ruin_halted(self.limits.min_equity_halt_usdc)
+            || ledger.total_equity_usdc <= 0.0
+        {
+            tracing::error!(
+                asset_id = asset.id,
+                symbol = %asset.symbol,
+                total_equity_usdc = ledger.total_equity_usdc,
+                min_equity_halt_usdc = self.limits.min_equity_halt_usdc,
+                "Rejecting working order: RUIN_HALT_EQUITY_BELOW_FLOOR"
+            );
+            return reject("RUIN_HALT_EQUITY_BELOW_FLOOR".to_string());
         }
 
         if delta_w.abs() < self.limits.min_rebalance_delta_weight {
@@ -216,7 +247,7 @@ impl RiskEngine {
             ));
         }
 
-        let equity = ledger.total_equity_usdc.max(1.0);
+        let equity = ledger.total_equity_usdc;
         let eff_lev = if self.limits.target_leverage_multiplier.is_finite() {
             self.limits.target_leverage_multiplier.max(0.1)
         } else {
@@ -235,6 +266,39 @@ impl RiskEngine {
             ));
         }
 
+        // Compute protective stop BEFORE notional sizing for risk-parity sizing (`P1-Strat`).
+        let protective_stop_px = compute_initial_protective_stop(
+            side,
+            limit_price,
+            atr_opt,
+            asset.tick_size,
+            &self.limits,
+        );
+        let stop_distance_frac = if protective_stop_px.is_finite() && protective_stop_px > 0.0 {
+            (limit_price - protective_stop_px).abs() / limit_price
+        } else {
+            0.0
+        };
+        if !stop_distance_frac.is_finite() || stop_distance_frac <= 1e-6 {
+            return reject("INVALID_STOP_DISTANCE".to_string());
+        }
+
+        let weight_cap_notional = equity * self.limits.max_single_asset_weight;
+        let risk_parity_notional = if self.limits.risk_per_trade_equity_pct.is_finite()
+            && self.limits.risk_per_trade_equity_pct > 0.0
+        {
+            (equity * self.limits.risk_per_trade_equity_pct) / stop_distance_frac
+        } else {
+            f64::INFINITY
+        };
+        let existing_notional = if current_weight * side.sign() > 0.0 {
+            equity * current_weight.abs()
+        } else {
+            0.0
+        };
+        let max_add_cap =
+            (weight_cap_notional.min(risk_parity_notional) - existing_notional).max(0.0);
+
         let avail_cash = ledger.available_cash_usdc.max(0.0);
         let max_notional_from_cash = avail_cash * eff_lev;
         let asset_max_lev = if asset.max_leverage.is_finite() {
@@ -248,7 +312,7 @@ impl RiskEngine {
             .min(remaining_gross_notional)
             .min(max_notional_from_cash)
             .min(max_asset_lev_notional)
-            .min(equity * self.limits.max_single_asset_weight);
+            .min(max_add_cap);
 
         let raw_qty = capped_notional / limit_price;
         let requested_quantity = round_to_lot(raw_qty, asset.lot_step_size);
@@ -272,21 +336,7 @@ impl RiskEngine {
             ));
         }
 
-        let protective_stop_px = compute_initial_protective_stop(
-            side,
-            limit_price,
-            atr_opt,
-            asset.tick_size,
-            &self.limits,
-        );
-        let stop_distance_pct = if protective_stop_px > 0.0 {
-            round_dp(
-                ((limit_price - protective_stop_px).abs() / limit_price) * 100.0,
-                2,
-            )
-        } else {
-            0.0
-        };
+        let stop_distance_pct = round_dp(stop_distance_frac * 100.0, 2);
         let take_profit_px =
             compute_initial_take_profit(side, limit_price, atr_opt, asset.tick_size, &self.limits);
         let tp_distance_pct = if take_profit_px > 0.0 {
@@ -294,6 +344,13 @@ impl RiskEngine {
                 ((take_profit_px - limit_price).abs() / limit_price) * 100.0,
                 2,
             )
+        } else {
+            0.0
+        };
+        let risk_budget_usdc = if self.limits.risk_per_trade_equity_pct.is_finite()
+            && self.limits.risk_per_trade_equity_pct > 0.0
+        {
+            round_dp(equity * self.limits.risk_per_trade_equity_pct, 4)
         } else {
             0.0
         };
@@ -339,6 +396,7 @@ impl RiskEngine {
             stop_distance_pct,
             take_profit_px,
             tp_distance_pct,
+            risk_budget_usdc,
         }
     }
 
@@ -449,6 +507,14 @@ impl RiskEngine {
             tick_size,
             &self.limits,
         )
+    }
+
+    /// Evaluates full 1-second position lifecycle (`SL -> TP -> Stagnation Time-Stop -> Chandelier/BE Ratchet`).
+    pub fn evaluate_1s_position_lifecycle(
+        &self,
+        input: &StopEvaluationInput,
+    ) -> StopRatchetEvaluation {
+        evaluate_1s_position_lifecycle(input, &self.limits)
     }
 }
 
@@ -728,6 +794,7 @@ mod tests {
             target_leverage_multiplier: 0.65,
             max_single_asset_weight: 1.0,
             max_gross_leverage_x: 2.50,
+            risk_per_trade_equity_pct: 0.0,
             ..RiskLimitsConfig::default()
         };
         let risk = RiskEngine::new(limits.clone());
@@ -815,6 +882,162 @@ mod tests {
             plan_asset_cap.target_notional_usdc <= 2_000.0 + 1e-2,
             "Asset max_leverage=2.0 should cap $1k cash order at $2,000, got {}",
             plan_asset_cap.target_notional_usdc
+        );
+    }
+
+    #[test]
+    fn test_risk_parity_sizing_interacts_with_weight_and_gross_caps() {
+        let risk = RiskEngine::default();
+        assert!((risk.limits.max_single_asset_weight - 0.15).abs() < 1e-9);
+        assert!((risk.limits.risk_per_trade_equity_pct - 0.005).abs() < 1e-9);
+
+        let mut asset = sample_sol_asset();
+        asset.mark_price = 100.0;
+        asset.mid_price = 100.0;
+        asset.oracle_price = 100.0;
+        asset.tick_size = 0.01;
+        asset.lot_step_size = 0.01;
+        let ledger = risk.evaluate_ledger(1_000.0, &[]);
+
+        // 1. Tight 2% stop (stop_dist = 2.0 -> atr = 2.0 / 2.2 = 0.9091):
+        //    Risk-parity = $5 / 0.02 = $250, capped by max_single_asset_weight (0.15) to $150!
+        let tight = risk.size_working_order_from_weights(
+            &asset,
+            0.15,
+            0.0,
+            0.15,
+            0.0,
+            0.0,
+            &ledger,
+            Some(2.0 / 2.2),
+        );
+        assert!(tight.approved);
+        assert!((tight.risk_budget_usdc - 5.0).abs() < 1e-6);
+        assert!((tight.target_notional_usdc - 150.0).abs() < 1.5);
+
+        // 2. Medium 4% stop (atr = None -> default 4%):
+        //    Risk-parity = $5 / 0.04 = $125 (< $150 weight cap), exact 0.50% equity risk!
+        let med =
+            risk.size_working_order_from_weights(&asset, 0.15, 0.0, 0.15, 0.0, 0.0, &ledger, None);
+        assert!(med.approved);
+        assert!((med.target_notional_usdc - 125.0).abs() < 1.5);
+
+        // 3. Wide 8% stop (atr = 8.0 / 2.2):
+        //    Risk-parity = $5 / 0.08 = $62.50 (< $150 weight cap), exact 0.50% equity risk!
+        let wide = risk.size_working_order_from_weights(
+            &asset,
+            0.15,
+            0.0,
+            0.15,
+            0.0,
+            0.0,
+            &ledger,
+            Some(8.0 / 2.2),
+        );
+        assert!(wide.approved);
+        assert!((wide.target_notional_usdc - 62.5).abs() < 1.5);
+
+        // 4. ACTION_INCREASE with existing same-side weight 0.08 ($80) on 4% stop ($125 cap):
+        //    Remaining add cap = $125 - $80 = $45!
+        let inc =
+            risk.size_working_order_from_weights(&asset, 0.15, 0.08, 0.15, 0.0, 0.0, &ledger, None);
+        assert!(inc.approved);
+        assert!(
+            inc.target_notional_usdc <= 45.5 && inc.target_notional_usdc >= 43.0,
+            "ACTION_INCREASE must account for existing $80 notional against $125 risk-parity cap, got {}",
+            inc.target_notional_usdc
+        );
+    }
+
+    #[test]
+    fn test_r14_m8_zero_nan_tick_and_lot_size_fails_closed() {
+        let risk = RiskEngine::default();
+        let ledger = risk.evaluate_ledger(10_000.0, &[]);
+
+        for bad_tick in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+            let mut asset = sample_sol_asset();
+            asset.tick_size = bad_tick;
+            let plan = risk.size_working_order_from_weights(
+                &asset,
+                0.10,
+                0.0,
+                0.10,
+                0.0,
+                0.0,
+                &ledger,
+                Some(3.0),
+            );
+            assert!(!plan.approved);
+            assert_eq!(
+                plan.rejection_reason.as_deref(),
+                Some("INVALID_TICK_OR_LOT_SIZE")
+            );
+        }
+
+        for bad_lot in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+            let mut asset = sample_sol_asset();
+            asset.lot_step_size = bad_lot;
+            let plan = risk.size_working_order_from_weights(
+                &asset,
+                0.10,
+                0.0,
+                0.10,
+                0.0,
+                0.0,
+                &ledger,
+                Some(3.0),
+            );
+            assert!(!plan.approved);
+            assert_eq!(
+                plan.rejection_reason.as_deref(),
+                Some("INVALID_TICK_OR_LOT_SIZE")
+            );
+        }
+    }
+
+    #[test]
+    fn test_r14_m12_true_negative_equity_and_ruin_halt_gate() {
+        let risk = RiskEngine::default();
+        let sol = sample_sol_asset();
+
+        // Below $50 ruin halt floor -> rejected with RUIN_HALT_EQUITY_BELOW_FLOOR
+        let low_ledger = risk.evaluate_ledger(40.0, &[]);
+        assert_eq!(low_ledger.total_equity_usdc, 40.0);
+        assert!(low_ledger.is_ruin_halted(risk.limits.min_equity_halt_usdc));
+        let low_plan = risk.size_working_order_from_weights(
+            &sol,
+            0.10,
+            0.0,
+            0.10,
+            0.0,
+            0.0,
+            &low_ledger,
+            Some(3.0),
+        );
+        assert!(!low_plan.approved);
+        assert_eq!(
+            low_plan.rejection_reason.as_deref(),
+            Some("RUIN_HALT_EQUITY_BELOW_FLOOR")
+        );
+
+        // Negative equity -> tracked truthfully without $1.0 floor and rejected
+        let neg_ledger = risk.evaluate_ledger(-250.0, &[]);
+        assert_eq!(neg_ledger.total_equity_usdc, -250.0);
+        assert!(neg_ledger.is_insolvent);
+        let neg_plan = risk.size_working_order_from_weights(
+            &sol,
+            0.10,
+            0.0,
+            0.10,
+            0.0,
+            0.0,
+            &neg_ledger,
+            Some(3.0),
+        );
+        assert!(!neg_plan.approved);
+        assert_eq!(
+            neg_plan.rejection_reason.as_deref(),
+            Some("RUIN_HALT_EQUITY_BELOW_FLOOR")
         );
     }
 }

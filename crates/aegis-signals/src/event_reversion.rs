@@ -3,10 +3,15 @@
 //! Computes `s3_funding_zscore`, `s3_flush_atr_mult`, `w_s3_event_reversion`,
 //! and detects `"CAPITULATION_FLUSH"` and `"FUNDING_SQUEEZE"` triggers.
 
+use crate::breadth::RegimeGateState;
+use crate::features::{ema_step, CycleFeatureCache, PrecomputedAssetFeatures};
 use crate::liquidity::{
     default_passes_quality, evaluate_asset_liquidity_quality, AssetLiquidityQuality,
 };
-use crate::trend_breakout::{causal_ema, compute_rsi_and_range_position};
+use crate::trend_breakout::compute_rsi_and_range_position;
+use aegis_core::indicators::{
+    compute_atr as core_compute_atr, cross_sectional_zscore, top_k_normalized,
+};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -28,48 +33,52 @@ pub struct EventReversionMetrics {
 }
 
 /// Computes Average True Range (ATR) over `period` bars with a safe price-percentage floor.
+/// Delegates to `aegis_core::indicators::compute_atr` (`R14-M28`).
 pub fn compute_atr(bars: &[OhlcvBar], period: usize, fallback_price: f64) -> f64 {
-    let min_floor = (fallback_price.max(1e-8) * 0.012).max(1e-8);
-    if bars.len() < 2 {
-        return min_floor;
-    }
-    let lookback = period.max(2).min(bars.len() - 1);
-    let start = bars.len() - lookback;
-    let mut tr_sum = 0.0;
-    for i in start..bars.len() {
-        let cur = &bars[i];
-        let prev_close = bars[i - 1].close;
-        let hl = (cur.high - cur.low).abs();
-        let hc = (cur.high - prev_close).abs();
-        let lc = (cur.low - prev_close).abs();
-        tr_sum += hl.max(hc).max(lc);
-    }
-    (tr_sum / (lookback as f64)).max(min_floor)
+    core_compute_atr(bars, period, fallback_price, Some(0.012), Some(0.012))
 }
 
 /// Computes signed excursion from short-term equilibrium in ATR units (`(mark_price - ema_anchor) / atr`).
 /// Negative values (`<= -2.0`) indicate an acute downward capitulation flush;
 /// positive values (`>= +2.0`) indicate an acute upward blow-off extension.
 pub fn compute_flush_atr_multiple(asset: &ExchangeAsset, bars: &[OhlcvBar]) -> f64 {
-    let live_px = if asset.mark_price > 0.0 {
-        asset.mark_price
-    } else {
-        bars.last().map(|b| b.close).unwrap_or(0.0)
-    };
-    if live_px <= 0.0 {
+    compute_flush_atr_multiple_with_features(asset, bars, None)
+}
+
+#[inline]
+fn compute_flush_atr_multiple_with_features(
+    asset: &ExchangeAsset,
+    bars: &[OhlcvBar],
+    feat_opt: Option<&PrecomputedAssetFeatures>,
+) -> f64 {
+    let live_px = feat_opt.map(|f| f.live_px).unwrap_or_else(|| {
+        if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
+            asset.mark_price
+        } else {
+            bars.last().map(|b| b.close).unwrap_or(0.0)
+        }
+    });
+    if !live_px.is_finite() || live_px <= 0.0 {
         return 0.0;
     }
 
-    if bars.len() >= 6 {
-        let closes: Vec<f64> = bars.iter().map(|b| b.close.max(1e-12)).collect();
-        let ema12 = causal_ema(&closes, 12.0);
-        let anchor = *ema12.last().unwrap_or(&live_px);
-        let atr = compute_atr(bars, 14, live_px);
+    let bars_len = feat_opt.map(|f| f.bars_len).unwrap_or(bars.len());
+    if bars_len >= 6 {
+        let (anchor, atr) = if let Some(feat) = feat_opt {
+            (feat.ema12_bars, feat.floored_atr)
+        } else {
+            let init = bars[0].close.max(1e-12);
+            let mut e12 = if init.is_finite() { init } else { 0.0 };
+            for b in &bars[1..] {
+                e12 = ema_step(e12, b.close.max(1e-12), 12.0);
+            }
+            (e12, compute_atr(bars, 14, live_px))
+        };
         let mult = ((live_px - anchor) / atr.max(1e-8)).clamp(-8.0, 8.0);
         return round_dp(mult, 4);
     }
 
-    if asset.prev_day_price > 0.0 {
+    if asset.prev_day_price.is_finite() && asset.prev_day_price > 0.0 {
         let est_atr = (asset.prev_day_price * 0.025).max(1e-8);
         let mult = ((live_px - asset.prev_day_price) / est_atr).clamp(-8.0, 8.0);
         return round_dp(mult, 4);
@@ -78,15 +87,49 @@ pub fn compute_flush_atr_multiple(asset: &ExchangeAsset, bars: &[OhlcvBar]) -> f
     0.0
 }
 
-/// Evaluates Sleeve 3 (Live Capitulation Flush & Funding Dislocation Harvester) across the universe.
-pub fn evaluate_sleeve_s3(
+/// Evaluates Sleeve 3 using precomputed [`CycleFeatureCache`] and macro [`RegimeGateState`].
+pub(crate) fn evaluate_sleeve_s3_with_features<B: AsRef<[OhlcvBar]>>(
     assets: &[ExchangeAsset],
-    bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+    bars_by_asset: &HashMap<i64, B>,
+    features: &CycleFeatureCache,
+    regime_gate: &RegimeGateState,
+    s3_budget: f64,
+) -> HashMap<i64, EventReversionMetrics> {
+    evaluate_sleeve_s3_inner(
+        assets,
+        bars_by_asset,
+        Some(features),
+        regime_gate,
+        s3_budget,
+    )
+}
+
+/// Evaluates Sleeve 3 (Live Capitulation Flush & Funding Dislocation Harvester) across the universe.
+pub fn evaluate_sleeve_s3<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    s3_budget: f64,
+) -> HashMap<i64, EventReversionMetrics> {
+    evaluate_sleeve_s3_inner(
+        assets,
+        bars_by_asset,
+        None,
+        &RegimeGateState::default(),
+        s3_budget,
+    )
+}
+
+fn evaluate_sleeve_s3_inner<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    features_opt: Option<&CycleFeatureCache>,
+    regime_gate: &RegimeGateState,
     s3_budget: f64,
 ) -> HashMap<i64, EventReversionMetrics> {
     struct RawS3Item {
         asset_id: i64,
         symbol: String,
+        day_volume_usdc: f64,
         s3_funding_zscore: f64,
         s3_flush_atr_mult: f64,
         raw_score: f64,
@@ -102,62 +145,55 @@ pub fn evaluate_sleeve_s3(
     let qualities: HashMap<i64, AssetLiquidityQuality> = assets
         .iter()
         .map(|a| {
-            let bars = bars_by_asset.get(&a.id).map(Vec::as_slice).unwrap_or(&[]);
-            (a.id, evaluate_asset_liquidity_quality(a, bars))
+            let q = features_opt
+                .and_then(|f| f.per_asset.get(&a.id))
+                .map(|f| f.quality)
+                .unwrap_or_else(|| {
+                    let bars = bars_by_asset.get(&a.id).map(AsRef::as_ref).unwrap_or(&[]);
+                    evaluate_asset_liquidity_quality(a, bars)
+                });
+            (a.id, q)
         })
         .collect();
 
-    // Cross-sectional funding rate distribution over quality-passing eligible assets only
-    let eligible_fundings: Vec<f64> = assets
+    // Cross-sectional funding rate distribution over quality-passing eligible assets (`R14-M28`)
+    let eligible_funding_pairs: Vec<(i64, f64)> = assets
         .iter()
         .filter(|a| {
             (a.is_core_eligible || a.is_event_eligible)
                 && qualities.get(&a.id).is_some_and(|q| q.passes_quality)
                 && a.funding_rate_hourly.is_finite()
         })
-        .map(|a| a.funding_rate_hourly)
+        .map(|a| (a.id, a.funding_rate_hourly))
         .collect();
-    let (mean_funding, std_funding) = if eligible_fundings.is_empty() {
-        (0.0, 0.00004)
-    } else {
-        let n = eligible_fundings.len() as f64;
-        let mean = eligible_fundings.iter().sum::<f64>() / n;
-        let var = eligible_fundings
-            .iter()
-            .map(|&f| {
-                let d = f - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / (n - 1.0).max(1.0);
-        (mean, var.sqrt().max(0.00004))
-    };
+    let funding_zscores = cross_sectional_zscore(&eligible_funding_pairs, 0.00004, 6.0);
 
     let mut raw_items = Vec::with_capacity(assets.len());
 
     for asset in assets {
         let bars = bars_by_asset
             .get(&asset.id)
-            .map(Vec::as_slice)
+            .map(AsRef::as_ref)
             .unwrap_or(&[]);
+        let feat_opt = features_opt.and_then(|f| f.per_asset.get(&asset.id));
         let quality = qualities
             .get(&asset.id)
             .copied()
             .unwrap_or_else(|| evaluate_asset_liquidity_quality(asset, bars));
-        let funding = if asset.funding_rate_hourly.is_finite() {
-            asset.funding_rate_hourly
-        } else {
-            mean_funding
-        };
-        let f_zscore = round_dp(((funding - mean_funding) / std_funding).clamp(-6.0, 6.0), 4);
-        let flush_atr = compute_flush_atr_multiple(asset, bars);
-        let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
-            asset.mark_price
-        } else {
-            bars.last().map(|b| b.close).unwrap_or(0.0)
-        };
-        let (rsi_14, range_pos, bouncing_from_low) = if bars.len() >= 8 && live_px > 0.0 {
-            compute_rsi_and_range_position(bars, live_px)
+        let f_zscore = funding_zscores.get(&asset.id).copied().unwrap_or(0.0);
+        let flush_atr = compute_flush_atr_multiple_with_features(asset, bars, feat_opt);
+        let live_px = feat_opt.map(|f| f.live_px).unwrap_or_else(|| {
+            if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
+                asset.mark_price
+            } else {
+                bars.last().map(|b| b.close).unwrap_or(0.0)
+            }
+        });
+        let bars_len = feat_opt.map(|f| f.bars_len).unwrap_or(bars.len());
+        let (rsi_14, range_pos, bouncing_from_low) = if bars_len >= 8 && live_px > 0.0 {
+            feat_opt
+                .map(|f| (f.rsi_14, f.range_pos, f.bouncing_from_low))
+                .unwrap_or_else(|| compute_rsi_and_range_position(bars, live_px))
         } else {
             (50.0, 0.5, false)
         };
@@ -167,7 +203,7 @@ pub fn evaluate_sleeve_s3(
         let is_capitulation = flush_atr <= -2.0 || (flush_atr >= 2.0 && range_pos > 0.55);
         let is_funding_squeeze =
             f_zscore <= -1.8 || (f_zscore >= 1.8 && flush_atr > 0.25 && range_pos > 0.35);
-        let is_bottom_reversion = bars.len() >= 8
+        let is_bottom_reversion = bars_len >= 8
             && range_pos <= 0.20
             && rsi_14 < 54.0
             && flush_atr <= 0.25
@@ -210,33 +246,36 @@ pub fn evaluate_sleeve_s3(
             0.0
         };
 
+        // Zero counter-regime scores and suppress counter-regime triggers before top_k_normalized (`P1-Strat`)
+        let (raw_score, event_trigger) = if (regime_gate.block_new_shorts && raw_score < 0.0)
+            || (regime_gate.block_new_longs && raw_score > 0.0)
+        {
+            (0.0, None)
+        } else {
+            (raw_score, trigger)
+        };
+
         raw_items.push(RawS3Item {
             asset_id: asset.id,
             symbol: asset.symbol.clone(),
+            day_volume_usdc: asset.day_volume_usdc,
             s3_funding_zscore: f_zscore,
             s3_flush_atr_mult: flush_atr,
             raw_score,
-            event_trigger: trigger,
+            event_trigger,
             passes_quality: quality.passes_quality,
         });
     }
 
-    let mut abs_scores: Vec<f64> = raw_items
+    let scored: Vec<(i64, f64, f64)> = raw_items
         .iter()
-        .map(|x| x.raw_score.abs())
-        .filter(|v| v.is_finite() && *v > 1e-6)
+        .map(|item| (item.asset_id, item.raw_score, item.day_volume_usdc))
         .collect();
-    abs_scores.sort_by(|a, b| b.total_cmp(a));
-    let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
-    let denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
+    let weights = top_k_normalized(&scored, 8, budget);
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for item in raw_items {
-        let w_s3 = if top_abs_sum > 1e-8 && item.raw_score.abs() > 1e-6 {
-            round_dp((item.raw_score / denom) * budget, 4)
-        } else {
-            0.0
-        };
+        let w_s3 = weights.get(&item.asset_id).copied().unwrap_or(0.0);
         out.insert(
             item.asset_id,
             EventReversionMetrics {
@@ -320,7 +359,7 @@ mod tests {
         let a3 = test_asset(3, "SOL", -0.00020, 150.0, true);
         let dead = test_asset(4, "DEAD", 0.05000, 1.0, false);
 
-        let bars = HashMap::new();
+        let bars: HashMap<i64, Vec<OhlcvBar>> = HashMap::new();
         let with_dead =
             evaluate_sleeve_s3(&[a1.clone(), a2.clone(), a3.clone(), dead], &bars, 0.25);
         let without_dead = evaluate_sleeve_s3(&[a1, a2, a3], &bars, 0.25);

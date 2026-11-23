@@ -7,6 +7,9 @@
 //! - Measures trailing 12-bar activity (`volume > 0` and `high > low`) to reject ghost/sparse books
 //!   (`kSHIB` `3/12`, `EIGEN` `0/12`), and produces a smooth `[0.0, 1.0]` `activity_scale` attenuation.
 
+use aegis_core::indicators::{
+    compute_one_tick_bps_opt, compute_unfloored_atr as core_compute_unfloored_atr,
+};
 use aegis_core::{ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 
@@ -40,72 +43,22 @@ pub struct AssetLiquidityQuality {
 
 /// Computes unfloored Average True Range (ATR) over up to `period` trailing bars.
 ///
-/// Unlike `event_reversion::compute_atr`, this applies NO percentage floor so dead/flat books
-/// report their true near-zero range. Returns `0.0` when fewer than 2 bars exist.
-pub fn compute_unfloored_atr(bars: &[OhlcvBar], period: usize) -> f64 {
-    if bars.len() < 2 || period == 0 {
-        return 0.0;
-    }
-    let lookback = period.min(bars.len() - 1);
-    let start = bars.len() - lookback;
-    let mut tr_sum = 0.0;
-    let mut count = 0usize;
-    for i in start..bars.len() {
-        let cur = &bars[i];
-        let prev_close = bars[i - 1].close;
-        if !cur.high.is_finite() || !cur.low.is_finite() || !prev_close.is_finite() {
-            continue;
-        }
-        let hl = (cur.high - cur.low).abs();
-        let hc = (cur.high - prev_close).abs();
-        let lc = (cur.low - prev_close).abs();
-        let tr = hl.max(hc).max(lc);
-        if tr.is_finite() {
-            tr_sum += tr;
-            count += 1;
-        }
-    }
-    if count == 0 {
-        0.0
-    } else {
-        tr_sum / (count as f64)
-    }
-}
-
-/// Computes the single-tick price increment in basis points at `live_px`.
+/// Delegates to `aegis_core::indicators::compute_unfloored_atr` (`R14-M28`).
 #[inline]
-pub fn compute_one_tick_bps(asset: &ExchangeAsset, live_px: f64) -> f64 {
-    if live_px.is_finite() && live_px > 0.0 && asset.tick_size.is_finite() && asset.tick_size > 0.0
-    {
-        (asset.tick_size / live_px) * 10_000.0
-    } else {
-        0.0
-    }
+pub fn compute_unfloored_atr(bars: &[OhlcvBar], period: usize) -> f64 {
+    core_compute_unfloored_atr(bars, period)
 }
 
-/// Evaluates bar-liveness, tick granularity, unfloored ATR vs friction, and smooth activity scaling
-/// for a single `ExchangeAsset` and its historical OHLCV bars.
-pub fn evaluate_asset_liquidity_quality(
-    asset: &ExchangeAsset,
-    bars: &[OhlcvBar],
-) -> AssetLiquidityQuality {
-    let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
-        asset.mark_price
-    } else {
-        bars.last()
-            .map(|b| b.close)
-            .filter(|c| c.is_finite() && *c > 0.0)
-            .unwrap_or(0.0)
-    };
+/// Fail-closed single-tick price increment in basis points at `live_px` (`R14-M8`).
+/// Returns `None` when `tick_size` or `live_px` is non-finite or non-positive.
+#[inline]
+pub fn compute_one_tick_bps(asset: &ExchangeAsset, live_px: f64) -> Option<f64> {
+    compute_one_tick_bps_opt(asset.tick_size, live_px)
+}
 
-    let one_tick_bps = compute_one_tick_bps(asset, live_px);
-    let raw_atr = compute_unfloored_atr(bars, ATR_LOOKBACK_PERIOD);
-    let raw_atr_bps = if live_px > 0.0 && raw_atr.is_finite() {
-        (raw_atr / live_px) * 10_000.0
-    } else {
-        0.0
-    };
-
+/// Counts `(active_bars, window_bars)` over the trailing `LIVENESS_WINDOW_BARS` window.
+#[inline]
+pub(crate) fn count_trailing_active_bars(bars: &[OhlcvBar]) -> (usize, usize) {
     let window_bars = bars.len().min(LIVENESS_WINDOW_BARS);
     let trailing = &bars[bars.len() - window_bars..];
     let active_bars = trailing
@@ -118,17 +71,46 @@ pub fn evaluate_asset_liquidity_quality(
                 && b.high > b.low
         })
         .count();
+    (active_bars, window_bars)
+}
+
+/// Evaluates bar-liveness, tick granularity, unfloored ATR vs friction, and smooth activity scaling
+/// from precomputed bar indicators (`raw_atr`, `active_bars`, `window_bars`).
+pub(crate) fn evaluate_asset_liquidity_quality_with_bar_stats(
+    asset: &ExchangeAsset,
+    bars_len: usize,
+    last_bar_close: Option<f64>,
+    raw_atr: f64,
+    active_bars: usize,
+    window_bars: usize,
+) -> AssetLiquidityQuality {
+    let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
+        asset.mark_price
+    } else {
+        last_bar_close
+            .filter(|c| c.is_finite() && *c > 0.0)
+            .unwrap_or(0.0)
+    };
+
+    let one_tick_bps_opt = compute_one_tick_bps(asset, live_px);
+    let one_tick_bps = one_tick_bps_opt.unwrap_or(0.0);
+    let raw_atr_bps = if live_px > 0.0 && raw_atr.is_finite() {
+        (raw_atr / live_px) * 10_000.0
+    } else {
+        0.0
+    };
+
     let active_bar_ratio = if window_bars > 0 {
         (active_bars as f64) / (window_bars as f64)
     } else {
         0.0
     };
 
-    let tick_ok = one_tick_bps.is_finite() && one_tick_bps <= MAX_ONE_TICK_BPS;
+    let tick_ok = one_tick_bps_opt.is_some_and(|bps| bps <= MAX_ONE_TICK_BPS);
     let min_atr_bps = (one_tick_bps * MIN_RAW_ATR_TICK_MULT).max(MIN_RAW_ATR_BPS);
     let passes_quality = if live_px <= 0.0 || !tick_ok {
         false
-    } else if bars.len() >= MIN_BARS_FOR_LIVENESS_GATE {
+    } else if bars_len >= MIN_BARS_FOR_LIVENESS_GATE {
         active_bar_ratio >= MIN_ACTIVE_BAR_RATIO
             && raw_atr_bps.is_finite()
             && raw_atr_bps >= min_atr_bps
@@ -136,17 +118,21 @@ pub fn evaluate_asset_liquidity_quality(
         asset.day_volume_usdc.is_finite() && asset.day_volume_usdc >= MIN_FALLBACK_DAY_VOLUME_USDC
     };
 
-    let bar_factor = if bars.len() >= MIN_BARS_FOR_LIVENESS_GATE {
-        (active_bars as f64 / 10.0).clamp(0.0, 1.0)
+    let activity_scale = if live_px <= 0.0 || !tick_ok {
+        0.0
     } else {
-        0.75
+        let bar_factor = if bars_len >= MIN_BARS_FOR_LIVENESS_GATE {
+            (active_bars as f64 / 10.0).clamp(0.0, 1.0)
+        } else {
+            0.75
+        };
+        let vol_factor = if asset.day_volume_usdc.is_finite() && asset.day_volume_usdc > 0.0 {
+            (asset.day_volume_usdc / 25_000.0).clamp(0.45, 1.0)
+        } else {
+            0.45
+        };
+        (bar_factor * vol_factor).clamp(0.0, 1.0)
     };
-    let vol_factor = if asset.day_volume_usdc.is_finite() && asset.day_volume_usdc > 0.0 {
-        (asset.day_volume_usdc / 25_000.0).clamp(0.45, 1.0)
-    } else {
-        0.45
-    };
-    let activity_scale = (bar_factor * vol_factor).clamp(0.0, 1.0);
 
     AssetLiquidityQuality {
         active_bars,
@@ -158,6 +144,24 @@ pub fn evaluate_asset_liquidity_quality(
         activity_scale,
         passes_quality,
     }
+}
+
+/// Evaluates bar-liveness, tick granularity, unfloored ATR vs friction, and smooth activity scaling
+/// for a single `ExchangeAsset` and its historical OHLCV bars.
+pub fn evaluate_asset_liquidity_quality(
+    asset: &ExchangeAsset,
+    bars: &[OhlcvBar],
+) -> AssetLiquidityQuality {
+    let raw_atr = compute_unfloored_atr(bars, ATR_LOOKBACK_PERIOD);
+    let (active_bars, window_bars) = count_trailing_active_bars(bars);
+    evaluate_asset_liquidity_quality_with_bar_stats(
+        asset,
+        bars.len(),
+        bars.last().map(|b| b.close),
+        raw_atr,
+        active_bars,
+        window_bars,
+    )
 }
 
 #[cfg(test)]
@@ -341,5 +345,25 @@ mod tests {
         let q_thin = evaluate_asset_liquidity_quality(&thin, &thin_bars);
         assert!(q_thin.passes_quality);
         assert!((q_thin.activity_scale - 0.27).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_r14_m8_zero_nan_tick_size_fails_closed() {
+        let healthy_bars = mk_bars(20, 12, 100.0, 80.0, 50_000.0);
+        for bad_tick in [0.0, -0.01, f64::NAN, f64::INFINITY] {
+            let bad_asset = mk_asset("BADTICK", 100.0, bad_tick, 1_000_000.0);
+            assert_eq!(compute_one_tick_bps(&bad_asset, 100.0), None);
+            let q = evaluate_asset_liquidity_quality(&bad_asset, &healthy_bars);
+            assert!(!q.passes_quality, "tick={bad_tick} must fail quality");
+            assert_eq!(q.activity_scale, 0.0);
+            assert!(q.one_tick_bps.is_finite());
+        }
+        for bad_px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let asset = mk_asset("BADPX", bad_px, 0.01, 1_000_000.0);
+            assert_eq!(compute_one_tick_bps(&asset, bad_px), None);
+            let q = evaluate_asset_liquidity_quality(&asset, &[]);
+            assert!(!q.passes_quality, "mark={bad_px} must fail quality");
+            assert_eq!(q.activity_scale, 0.0);
+        }
     }
 }
