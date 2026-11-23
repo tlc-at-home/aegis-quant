@@ -3,9 +3,15 @@
 //! Computes `s2_trend_alignment` (`-1`, `0`, `+1`), `s2_vol_surge_ratio`, `w_s2_trend_breakout`,
 //! and detects `"LIVE_BREAKOUT_SURGE"` events.
 
+use crate::breadth::RegimeGateState;
+use crate::features::{
+    compute_range_bounds_and_rsi_tail, compute_rsi_and_range_from_parts, ema_step,
+    CycleFeatureCache, PrecomputedAssetFeatures,
+};
 use crate::liquidity::{
     compute_unfloored_atr, default_passes_quality, evaluate_asset_liquidity_quality,
 };
+use aegis_core::indicators::{causal_ema as core_causal_ema, top_k_normalized};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -26,18 +32,9 @@ pub struct TrendBreakoutMetrics {
 }
 
 /// Computes a strictly causal Exponential Moving Average (`alpha = 2 / (span + 1)`).
+/// Delegates to `aegis_core::indicators::causal_ema` (`R14-M28`).
 pub fn causal_ema(series: &[f64], span: f64) -> Vec<f64> {
-    if series.is_empty() {
-        return Vec::new();
-    }
-    let alpha = (2.0 / (span.max(1.0) + 1.0)).clamp(0.001, 1.0);
-    let mut out = Vec::with_capacity(series.len());
-    out.push(series[0]);
-    for &val in &series[1..] {
-        let prev = *out.last().unwrap_or(&val);
-        out.push(alpha * val + (1.0 - alpha) * prev);
-    }
-    out
+    core_causal_ema(series, span)
 }
 
 /// Computes causal 14-period RSI (`[0.0, 100.0]`), lookback range position (`[0.0, 1.0]`),
@@ -46,86 +43,16 @@ pub fn compute_rsi_and_range_position(bars: &[OhlcvBar], live_px: f64) -> (f64, 
     if bars.is_empty() || !live_px.is_finite() || live_px <= 0.0 {
         return (50.0, 0.5, false);
     }
-
-    let end = bars.len().saturating_sub(1).max(1);
-    let range_lookback = end.min(72);
-    let range_slice = &bars[end.saturating_sub(range_lookback)..end];
-    let min_low = range_slice
-        .iter()
-        .filter(|b| b.low.is_finite() && b.close.is_finite())
-        .map(|b| b.low.min(b.close))
-        .fold(f64::MAX, f64::min);
-    let max_high = range_slice
-        .iter()
-        .filter(|b| b.high.is_finite() && b.close.is_finite())
-        .map(|b| b.high.max(b.close))
-        .fold(f64::MIN, f64::max);
-    let span = max_high - min_low;
-    let range_pos = if min_low < f64::MAX && max_high > f64::MIN && span > 1e-12 {
-        ((live_px - min_low) / span).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-    if min_low < f64::MAX && live_px < min_low * 0.995 {
-        return (50.0, 0.30, false);
-    }
-
-    let rsi_14 = if bars.len() >= 4 {
-        let mut closes: Vec<f64> = bars
-            .iter()
-            .rev()
-            .take(15)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|b| b.close.max(1e-12))
-            .collect();
-        let dup_tol = (live_px * 1e-6).max(1e-12);
-        if bars
-            .last()
-            .is_none_or(|b| (live_px - b.close).abs() > dup_tol)
-        {
-            closes.push(live_px);
-        }
-        let mut gains = 0.0;
-        let mut losses = 0.0;
-        let diffs = closes.len().saturating_sub(1);
-        for pair in closes.windows(2) {
-            let diff = pair[1] - pair[0];
-            if diff > 0.0 {
-                gains += diff;
-            } else if diff < 0.0 {
-                losses += -diff;
-            }
-        }
-        if diffs == 0 {
-            50.0
-        } else {
-            let avg_gain = gains / (diffs as f64);
-            let avg_loss = losses / (diffs as f64);
-            if avg_loss <= 1e-12 && avg_gain <= 1e-12 {
-                50.0
-            } else if avg_loss <= 1e-12 {
-                100.0
-            } else {
-                let rs = avg_gain / avg_loss;
-                100.0 - (100.0 / (1.0 + rs))
-            }
-        }
-    } else {
-        50.0
-    };
-
-    let last_green = bars
-        .last()
-        .is_some_and(|b| b.open.is_finite() && b.open > 0.0 && live_px > b.open * 1.001);
-    let holding_above_swing_low = last_green
-        && min_low > 0.0
-        && min_low < f64::MAX
-        && live_px >= min_low * 1.003
-        && range_pos <= 0.20;
-    let bouncing_from_low = (last_green && range_pos <= 0.25) || holding_above_swing_low;
-    (rsi_14, range_pos, bouncing_from_low)
+    let (min_low, max_high, tail, tail_len) = compute_range_bounds_and_rsi_tail(bars);
+    compute_rsi_and_range_from_parts(
+        bars.len(),
+        bars.last().map(|b| b.open),
+        bars.last().map(|b| b.close),
+        min_low,
+        max_high,
+        &tail[..tail_len],
+        live_px,
+    )
 }
 
 /// Computes multi-speed trend alignment (`-1`, `0`, `+1`), volume surge ratio, and live breakout detection
@@ -134,29 +61,57 @@ pub fn compute_asset_trend_breakout(
     asset: &ExchangeAsset,
     bars: &[OhlcvBar],
 ) -> (i32, f64, f64, Option<String>) {
-    if bars.len() >= 10 {
-        let mut closes: Vec<f64> = bars.iter().map(|b| b.close.max(1e-12)).collect();
+    compute_asset_trend_breakout_with_features(asset, bars, None)
+}
+
+pub(crate) fn compute_asset_trend_breakout_with_features(
+    asset: &ExchangeAsset,
+    bars: &[OhlcvBar],
+    feat_opt: Option<&PrecomputedAssetFeatures>,
+) -> (i32, f64, f64, Option<String>) {
+    let bars_len = feat_opt.map(|f| f.bars_len).unwrap_or(bars.len());
+    if bars_len >= 10 {
+        let last_bar_close = feat_opt
+            .and_then(|f| f.last_bar_close)
+            .or_else(|| bars.last().map(|b| b.close));
+        let last_bar_open = feat_opt
+            .and_then(|f| f.last_bar_open)
+            .or_else(|| bars.last().map(|b| b.open));
+
         let tick_tol = if asset.tick_size.is_finite() && asset.tick_size > 0.0 {
             asset.tick_size * 0.5
         } else {
             1e-12
         };
-        if asset.mark_price.is_finite()
+        let append_mark = asset.mark_price.is_finite()
             && asset.mark_price > 0.0
-            && bars
-                .last()
-                .is_none_or(|b| (asset.mark_price - b.close).abs() > tick_tol)
-        {
-            closes.push(asset.mark_price);
-        }
-        let n = closes.len();
-        let ema_fast = causal_ema(&closes, 8.0);
-        let ema_mid = causal_ema(&closes, 21.0);
-        let ema_slow = causal_ema(&closes, 55.0);
+            && last_bar_close.is_none_or(|c| (asset.mark_price - c).abs() > tick_tol);
 
-        let f = ema_fast[n - 1];
-        let m = ema_mid[n - 1];
-        let s = ema_slow[n - 1].max(1e-12);
+        let (mut f, mut m, mut s) = if let Some(feat) = feat_opt {
+            (feat.ema8_bars, feat.ema21_bars, feat.ema55_bars)
+        } else {
+            let init = bars[0].close.max(1e-12);
+            let mut e8 = if init.is_finite() { init } else { 0.0 };
+            let mut e21 = e8;
+            let mut e55 = e8;
+            for b in &bars[1..] {
+                let c = b.close.max(1e-12);
+                e8 = ema_step(e8, c, 8.0);
+                e21 = ema_step(e21, c, 21.0);
+                e55 = ema_step(e55, c, 55.0);
+            }
+            (e8, e21, e55)
+        };
+
+        let live_px = if append_mark {
+            f = ema_step(f, asset.mark_price, 8.0);
+            m = ema_step(m, asset.mark_price, 21.0);
+            s = ema_step(s, asset.mark_price, 55.0);
+            asset.mark_price
+        } else {
+            last_bar_close.map(|c| c.max(1e-12)).unwrap_or(1e-12)
+        };
+        let s = s.max(1e-12);
 
         let alignment = if f > m && m > s {
             1
@@ -166,40 +121,55 @@ pub fn compute_asset_trend_breakout(
             0
         };
 
-        let live_px = closes[n - 1];
         let vol_floor = (100.0 / live_px.max(1e-8)).max(1.0);
-        let lookback = bars.len().min(20);
-        let recent_bars = &bars[bars.len() - lookback..];
-        let mut active_vol_sum = 0.0;
-        let mut active_vol_count = 0usize;
-        for b in recent_bars {
-            if b.volume.is_finite() && b.volume > 0.0 {
-                active_vol_sum += b.volume;
-                active_vol_count += 1;
+        let (active_vol_sum, active_vol_count, last_vol) = if let Some(feat) = feat_opt {
+            (
+                feat.avg_vol_20_sum,
+                feat.avg_vol_20_count,
+                feat.last_bar_vol,
+            )
+        } else {
+            let lookback = bars.len().min(20);
+            let recent_bars = &bars[bars.len() - lookback..];
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for b in recent_bars {
+                if b.volume.is_finite() && b.volume > 0.0 {
+                    sum += b.volume;
+                    count += 1;
+                }
             }
-        }
+            let lv = recent_bars
+                .last()
+                .map(|b| {
+                    if b.volume.is_finite() && b.volume > 0.0 {
+                        b.volume
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0);
+            (sum, count, lv)
+        };
         let avg_vol = if active_vol_count > 0 {
             (active_vol_sum / (active_vol_count as f64)).max(vol_floor)
         } else {
             vol_floor
         };
-        let last_vol = recent_bars
-            .last()
-            .map(|b| {
-                if b.volume.is_finite() && b.volume > 0.0 {
-                    b.volume
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
 
-        let chan_len = bars.len().saturating_sub(1).clamp(4, 18);
-        let prior_slice = &bars[bars.len() - 1 - chan_len..bars.len() - 1];
-        let channel_high = prior_slice.iter().map(|b| b.high).fold(f64::MIN, f64::max);
-        let channel_low = prior_slice.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+        let (channel_high, channel_low) = if let Some(feat) = feat_opt {
+            (feat.channel_high_18, feat.channel_low_18)
+        } else {
+            let chan_len = bars.len().saturating_sub(1).clamp(4, 18);
+            let prior_slice = &bars[bars.len() - 1 - chan_len..bars.len() - 1];
+            let ch = prior_slice.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+            let cl = prior_slice.iter().map(|b| b.low).fold(f64::MAX, f64::min);
+            (ch, cl)
+        };
 
-        let raw_atr = compute_unfloored_atr(bars, 14);
+        let raw_atr = feat_opt
+            .map(|feat| feat.quality.raw_atr)
+            .unwrap_or_else(|| compute_unfloored_atr(bars, 14));
         let high_margin = (0.20 * raw_atr).max(channel_high * 0.0015);
         let low_margin = (0.20 * raw_atr).max(channel_low * 0.0015);
         let broke_high = channel_high > 0.0 && live_px > channel_high + high_margin;
@@ -211,14 +181,31 @@ pub fn compute_asset_trend_breakout(
         }
         let surge_ratio = round_dp(surge_ratio, 4);
 
-        let (rsi_14, range_pos, bouncing_from_low) = compute_rsi_and_range_position(bars, live_px);
+        let (rsi_14, range_pos, bouncing_from_low) = if let Some(feat) = feat_opt {
+            if (live_px - feat.live_px).abs() <= 1e-12 {
+                (feat.rsi_14, feat.range_pos, feat.bouncing_from_low)
+            } else {
+                compute_rsi_and_range_from_parts(
+                    feat.bars_len,
+                    feat.last_bar_open,
+                    feat.last_bar_close,
+                    feat.min_low_72,
+                    feat.max_high_72,
+                    &feat.rsi_tail_closes[..feat.rsi_tail_len],
+                    live_px,
+                )
+            }
+        } else {
+            compute_rsi_and_range_position(bars, live_px)
+        };
+
         if alignment < 0 && (rsi_14 < 36.0 || range_pos < 0.22 || bouncing_from_low) {
             return (0, surge_ratio, 0.0, None);
         }
         if alignment > 0
             && rsi_14 > 76.0
             && range_pos > 0.90
-            && bars.last().is_some_and(|b| live_px < b.open)
+            && last_bar_open.is_some_and(|open| live_px < open)
         {
             return (0, surge_ratio, 0.0, None);
         }
@@ -227,12 +214,12 @@ pub fn compute_asset_trend_breakout(
             && (broke_high
                 || (surge_ratio >= 1.75
                     && range_pos >= 0.65
-                    && bars.last().is_some_and(|b| live_px >= b.open))))
+                    && last_bar_open.is_some_and(|open| live_px >= open))))
             || (alignment == -1
                 && (broke_low
                     || (surge_ratio >= 1.75
                         && (0.22..=0.35).contains(&range_pos)
-                        && bars.last().is_some_and(|b| live_px <= b.open))));
+                        && last_bar_open.is_some_and(|open| live_px <= open))));
         let trigger = is_breakout_surge.then(|| TRIGGER_LIVE_BREAKOUT_SURGE.to_string());
 
         let trend_strength = ((f - s) / s * 12.0).tanh();
@@ -264,16 +251,54 @@ pub fn compute_asset_trend_breakout(
     (0, 1.0, 0.0, None)
 }
 
-/// Evaluates Sleeve 2 (Breadth-Confirmed Multi-Speed Trend & Live 3s Breakout) across the universe.
-pub fn evaluate_sleeve_s2(
+/// Evaluates Sleeve 2 using precomputed [`CycleFeatureCache`] and macro [`RegimeGateState`].
+pub(crate) fn evaluate_sleeve_s2_with_features<B: AsRef<[OhlcvBar]>>(
     assets: &[ExchangeAsset],
-    bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+    bars_by_asset: &HashMap<i64, B>,
+    features: &CycleFeatureCache,
+    regime_gate: &RegimeGateState,
+    market_breadth_bull: f64,
+    s2_budget: f64,
+) -> HashMap<i64, TrendBreakoutMetrics> {
+    evaluate_sleeve_s2_inner(
+        assets,
+        bars_by_asset,
+        Some(features),
+        regime_gate,
+        market_breadth_bull,
+        s2_budget,
+    )
+}
+
+/// Evaluates Sleeve 2 (Breadth-Confirmed Multi-Speed Trend & Live 3s Breakout) across the universe.
+pub fn evaluate_sleeve_s2<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    market_breadth_bull: f64,
+    s2_budget: f64,
+) -> HashMap<i64, TrendBreakoutMetrics> {
+    evaluate_sleeve_s2_inner(
+        assets,
+        bars_by_asset,
+        None,
+        &RegimeGateState::default(),
+        market_breadth_bull,
+        s2_budget,
+    )
+}
+
+fn evaluate_sleeve_s2_inner<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    features_opt: Option<&CycleFeatureCache>,
+    regime_gate: &RegimeGateState,
     market_breadth_bull: f64,
     s2_budget: f64,
 ) -> HashMap<i64, TrendBreakoutMetrics> {
     struct RawS2Item {
         asset_id: i64,
         symbol: String,
+        day_volume_usdc: f64,
         s2_trend_alignment: i32,
         s2_vol_surge_ratio: f64,
         confirmed_score: f64,
@@ -284,22 +309,35 @@ pub fn evaluate_sleeve_s2(
     let budget = s2_budget.clamp(0.0, 1.50);
     let breadth = market_breadth_bull.clamp(0.0, 1.0);
 
-    let bull_breadth_mult = (0.65 + 0.70 * breadth).clamp(0.50, 1.35);
-    let bear_breadth_mult = (0.65 + 0.70 * (1.0 - breadth)).clamp(0.50, 1.35);
+    let bull_breadth_mult = if regime_gate.block_new_longs {
+        0.0
+    } else {
+        (0.65 + 0.70 * breadth).clamp(0.50, 1.35)
+    };
+    let bear_breadth_mult = if regime_gate.block_new_shorts {
+        0.0
+    } else {
+        (0.65 + 0.70 * (1.0 - breadth)).clamp(0.50, 1.35)
+    };
 
     let mut raw_items = Vec::with_capacity(assets.len());
 
     for asset in assets {
         let bars = bars_by_asset
             .get(&asset.id)
-            .map(Vec::as_slice)
+            .map(AsRef::as_ref)
             .unwrap_or(&[]);
-        let quality = evaluate_asset_liquidity_quality(asset, bars);
+        let feat_opt = features_opt.and_then(|f| f.per_asset.get(&asset.id));
+        let quality = feat_opt
+            .map(|f| f.quality)
+            .unwrap_or_else(|| evaluate_asset_liquidity_quality(asset, bars));
         let (alignment, surge_ratio, raw_score, trigger) =
-            compute_asset_trend_breakout(asset, bars);
+            compute_asset_trend_breakout_with_features(asset, bars, feat_opt);
 
         let eligible = quality.passes_quality
             && (asset.is_core_eligible || (asset.is_event_eligible && trigger.is_some()));
+        let blocked_dir = (alignment > 0 && regime_gate.block_new_longs)
+            || (alignment < 0 && regime_gate.block_new_shorts);
         let confirmed_score = if eligible && alignment != 0 {
             let b_mult = if alignment > 0 {
                 bull_breadth_mult
@@ -310,11 +348,16 @@ pub fn evaluate_sleeve_s2(
         } else {
             0.0
         };
-        let emitted_trigger = if eligible { trigger } else { None };
+        let emitted_trigger = if eligible && !blocked_dir {
+            trigger
+        } else {
+            None
+        };
 
         raw_items.push(RawS2Item {
             asset_id: asset.id,
             symbol: asset.symbol.clone(),
+            day_volume_usdc: asset.day_volume_usdc,
             s2_trend_alignment: alignment,
             s2_vol_surge_ratio: surge_ratio,
             confirmed_score,
@@ -323,22 +366,15 @@ pub fn evaluate_sleeve_s2(
         });
     }
 
-    let mut abs_scores: Vec<f64> = raw_items
+    let scored: Vec<(i64, f64, f64)> = raw_items
         .iter()
-        .map(|x| x.confirmed_score.abs())
-        .filter(|v| v.is_finite() && *v > 1e-6)
+        .map(|item| (item.asset_id, item.confirmed_score, item.day_volume_usdc))
         .collect();
-    abs_scores.sort_by(|a, b| b.total_cmp(a));
-    let top_abs_sum: f64 = abs_scores.iter().take(8).sum();
-    let denom = if top_abs_sum > 1e-8 { top_abs_sum } else { 1.0 };
+    let weights = top_k_normalized(&scored, 8, budget);
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for item in raw_items {
-        let w_s2 = if top_abs_sum > 1e-8 {
-            round_dp((item.confirmed_score / denom) * budget, 4)
-        } else {
-            0.0
-        };
+        let w_s2 = weights.get(&item.asset_id).copied().unwrap_or(0.0);
         out.insert(
             item.asset_id,
             TrendBreakoutMetrics {
