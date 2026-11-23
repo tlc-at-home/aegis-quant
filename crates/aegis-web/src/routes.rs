@@ -3,9 +3,9 @@
 use crate::auth::security_and_auth_middleware;
 use crate::handlers::{
     get_dashboard_handler, get_health_handler, post_alerts_test_handler, post_auth_login_handler,
-    post_config_handler, post_positions_close_handler, post_reconcile_handler,
-    post_risk_tier_handler, post_vault_inspect_handler, post_vault_sync_handler, serve_app_js,
-    serve_index, serve_styles_css,
+    post_auth_logout_handler, post_config_handler, post_positions_close_handler,
+    post_reconcile_handler, post_risk_tier_handler, post_vault_inspect_handler,
+    post_vault_sync_handler, serve_app_js, serve_index, serve_js_module, serve_styles_css,
 };
 use crate::server::AppState;
 use crate::stream::sse_stream_handler;
@@ -25,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/static/styles.css", get(serve_styles_css))
         .route("/app.js", get(serve_app_js))
         .route("/static/app.js", get(serve_app_js))
+        .route("/js/:filename", get(serve_js_module))
         // v2.0 REST API & Real-Time SSE Stream
         .route("/api/v1/health", get(get_health_handler))
         .route("/api/v1/dashboard", get(get_dashboard_handler))
@@ -41,6 +42,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/vault/inspect", post(post_vault_inspect_handler))
         .route("/api/v1/vault/sync", post(post_vault_sync_handler))
         .route("/api/v1/auth/login", post(post_auth_login_handler))
+        .route("/api/v1/auth/logout", post(post_auth_logout_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,

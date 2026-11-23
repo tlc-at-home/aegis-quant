@@ -1,101 +1,78 @@
 //! REST and static asset route handlers for Aegis Quant v2.0 (`aegis-web::handlers`).
 
+use crate::assets::{
+    resolve_js_module_asset, serve_static_asset, ASSET_APP_JS, ASSET_INDEX_HTML, ASSET_STYLES_CSS,
+};
 use crate::auth::{
     auth_error_response, constant_time_eq, extract_cookie_token, too_many_requests_response,
-    AuthLoginPayload, AuthLoginResponse,
+    AuthLoginPayload, AuthLoginResponse, PeerTrustedProxy,
 };
 use crate::payloads::{
-    build_dashboard_payload, build_health_payload, execute_close_position_or_order,
-    execute_risk_tier_switch, execute_vault_inspect, execute_vault_sync,
-    json_value_to_config_string, map_aegis_error_response, validate_config_key_value,
-    ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse, ReconcileRequest,
-    RiskTierUpdateRequest, VaultInspectRequest,
+    build_dashboard_payload, build_degraded_dashboard_body, build_health_payload,
+    execute_close_position_or_order, execute_risk_tier_switch, execute_vault_inspect,
+    execute_vault_sync, has_critical_degradation, json_value_to_config_string,
+    map_aegis_error_response, next_error_correlation_id, next_snapshot_seq, server_boot_id,
+    validate_config_key_value, ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse,
+    ReconcileRequest, RiskTierUpdateRequest, VaultInspectRequest,
 };
 use crate::server::{AppState, ClientIpKey, SESSION_TTL_SECS};
 use aegis_alerts::send_test_alert_async;
-use aegis_core::{now_ms, AegisError, ExecutionMode};
+use aegis_core::{now_ms, sanitize_telemetry_message, AegisError, ExecutionMode};
 use axum::{
-    extract::{Extension, State},
+    extract::{Extension, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
 
-pub const EMBEDDED_INDEX_HTML: &str = include_str!("../../../web/static/index.html");
-pub const EMBEDDED_STYLES_CSS: &str = include_str!("../../../web/static/styles.css");
-pub const EMBEDDED_APP_JS: &str = include_str!("../../../web/static/app.js");
-
-/// `GET /` and `GET /index.html` — Serves `web/static/index.html`.
-pub async fn serve_index(State(state): State<AppState>) -> Response {
-    let index_path = state.static_dir.join("index.html");
-    let html_content = match tokio::fs::read_to_string(&index_path).await {
-        Ok(content) => content,
-        Err(_) => EMBEDDED_INDEX_HTML.to_string(),
-    };
-    let mut resp = Html(html_content).into_response();
-    if let Ok(hv) = HeaderValue::from_str("no-store") {
-        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
-    }
-    resp
+/// `GET /` and `GET /index.html` — Serves `web/static/index.html` via ETag-cached `assets::serve_static_asset`.
+pub async fn serve_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    serve_static_asset(&state, &headers, &ASSET_INDEX_HTML).await
 }
 
-/// `GET /styles.css` and `GET /static/styles.css` — Serves `web/static/styles.css`.
-pub async fn serve_styles_css(State(state): State<AppState>) -> Response {
-    let css_path = state.static_dir.join("styles.css");
-    let css_content = match tokio::fs::read_to_string(&css_path).await {
-        Ok(content) => content,
-        Err(_) => EMBEDDED_STYLES_CSS.to_string(),
-    };
-    let mut resp = (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        css_content,
-    )
-        .into_response();
-    if let Ok(hv) = HeaderValue::from_str("no-store") {
-        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
-    }
-    resp
+/// `GET /styles.css` and `GET /static/styles.css` — Serves `web/static/styles.css` via `assets::serve_static_asset`.
+pub async fn serve_styles_css(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    serve_static_asset(&state, &headers, &ASSET_STYLES_CSS).await
 }
 
-/// `GET /app.js` and `GET /static/app.js` — Serves `web/static/app.js`.
-pub async fn serve_app_js(State(state): State<AppState>) -> Response {
-    let js_path = state.static_dir.join("app.js");
-    let js_content = match tokio::fs::read_to_string(&js_path).await {
-        Ok(content) => content,
-        Err(_) => EMBEDDED_APP_JS.to_string(),
-    };
-    let mut resp = (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        js_content,
-    )
-        .into_response();
-    if let Ok(hv) = HeaderValue::from_str("no-store") {
-        resp.headers_mut().insert(header::CACHE_CONTROL, hv);
-    }
-    resp
+/// `GET /app.js` and `GET /static/app.js` — Serves `web/static/app.js` ES compat shim via `assets::serve_static_asset`.
+pub async fn serve_app_js(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    serve_static_asset(&state, &headers, &ASSET_APP_JS).await
 }
 
-/// Converts a `build_health_payload` result into `200 OK` or `503 Service Unavailable`.
+/// `GET /js/:filename` — Serves one of the 8 allowlisted ES modules from `web/static/js/`.
+pub async fn serve_js_module(
+    State(state): State<AppState>,
+    Path(filename): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match resolve_js_module_asset(&filename) {
+        Some(asset) => serve_static_asset(&state, &headers, asset).await,
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
+    }
+}
+
+/// Converts a `build_health_payload` result into `200 OK` or sanitized `503 Service Unavailable` (`R14-L16`).
 pub fn health_result_to_response(
     res: aegis_core::Result<crate::payloads::HealthPayload>,
 ) -> Response {
     match res {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "status": "unavailable",
-                "error": "Service Unavailable",
-                "detail": e.to_string(),
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            let cid = next_error_correlation_id();
+            tracing::error!(correlation_id = %cid, error = %e, "Database health check failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "unavailable",
+                    "error": "Service Unavailable",
+                    "detail": "Database health check failed. Reference server logs with correlation_id.",
+                    "correlation_id": cid,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -112,15 +89,62 @@ pub async fn get_health_handler(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `GET /api/v1/dashboard` and `GET /api/v1/state` — Returns unified MariaDB 13.0 + 7 SQL Views dashboard payload.
+/// `GET /api/v1/dashboard` and `GET /api/v1/state` — Returns unified MariaDB 13.0 + 7 SQL Views dashboard payload,
+/// failing closed with sanitized HTTP `503` whenever MariaDB or critical sections are unavailable (`R14-M22`).
 pub async fn get_dashboard_handler(State(state): State<AppState>) -> Response {
     let db = state.db.clone();
     let res = tokio::task::spawn_blocking(move || build_dashboard_payload(&db)).await;
     match res {
-        Ok(Ok(payload)) => (StatusCode::OK, Json(payload)).into_response(),
+        Ok(Ok(payload)) => {
+            if has_critical_degradation(&payload) {
+                let cid = next_error_correlation_id();
+                tracing::error!(
+                    correlation_id = %cid,
+                    degraded_sections = ?payload.degraded_sections,
+                    "Returning 503 due to degraded critical dashboard sections"
+                );
+                let body = build_degraded_dashboard_body(
+                    payload.database_reachable,
+                    payload.degraded_sections,
+                    payload.degraded_errors,
+                    cid,
+                    payload.snapshot_seq,
+                    payload.generated_at_ms,
+                    payload.server_boot_id,
+                );
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+            } else {
+                (StatusCode::OK, Json(payload)).into_response()
+            }
+        }
+        Ok(Err(AegisError::Database(ref msg))) => {
+            let cid = next_error_correlation_id();
+            tracing::error!(correlation_id = %cid, error = %msg, "Dashboard database query failed");
+            let body = build_degraded_dashboard_body(
+                false,
+                vec!["database".to_string()],
+                vec![format!("Database unavailable (ref: {cid})")],
+                cid,
+                next_snapshot_seq(),
+                now_ms(),
+                server_boot_id(),
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+        }
         Ok(Err(e)) => map_aegis_error_response(e),
         Err(e) => {
-            map_aegis_error_response(AegisError::Database(format!("Dashboard task error: {e}")))
+            let cid = next_error_correlation_id();
+            tracing::error!(correlation_id = %cid, error = %e, "Dashboard blocking task failed");
+            let body = build_degraded_dashboard_body(
+                false,
+                vec!["database".to_string()],
+                vec![format!("Database task unavailable (ref: {cid})")],
+                cid,
+                next_snapshot_seq(),
+                now_ms(),
+                server_boot_id(),
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
         }
     }
 }
@@ -193,81 +217,86 @@ pub async fn post_config_handler(
             ));
         }
 
-        let _exec_guard = aegis_execution::execution_lock().lock();
-        let requested_modes: Vec<&str> = pending_writes
-            .iter()
-            .filter(|(k, _, _)| k == "execution_mode")
-            .map(|(_, v, _)| v.as_str())
-            .collect();
-        if requested_modes.windows(2).any(|w| w[0] != w[1]) {
-            return Err(AegisError::Validation(
-                "Conflicting execution_mode values in single config update".to_string(),
-            ));
-        }
-
-        let mut hyperliquid_testnet_sync: Option<&'static str> = None;
-        if let Some(&target_mode_str) = requested_modes.first() {
-            let current_cfg = db.load_config()?;
-            let current_mode = current_cfg.execution_mode();
-            let target_mode = ExecutionMode::parse(target_mode_str);
-            if target_mode != current_mode {
-                if !db.get_assets_held()?.is_empty() || !db.get_assets_ordered()?.is_empty() {
-                    return Err(AegisError::Validation(format!(
-                        "Cannot switch execution_mode from {} to {} while OPEN positions or WORKING orders exist",
-                        current_mode.as_str(),
-                        target_mode.as_str(),
-                    )));
-                }
-                if target_mode == ExecutionMode::Live
-                    && !current_cfg.get_bool("allow_web_live_mode", false)
-                {
-                    return Err(AegisError::SecurityViolation(
-                        "Switching execution_mode to LIVE via Web API requires DB-immutable allow_web_live_mode=true".to_string(),
-                    ));
-                }
-                hyperliquid_testnet_sync = Some(if target_mode == ExecutionMode::Live {
-                    "false"
-                } else {
-                    "true"
-                });
+        // R14-H2: Hold execution_lock() ONLY for atomic MariaDB config writes; release BEFORE unlocked cap enforcement!
+        let mut updated_keys = {
+            let _exec_guard = aegis_execution::execution_lock().lock();
+            let requested_modes: Vec<&str> = pending_writes
+                .iter()
+                .filter(|(k, _, _)| k == "execution_mode")
+                .map(|(_, v, _)| v.as_str())
+                .collect();
+            if requested_modes.windows(2).any(|w| w[0] != w[1]) {
+                return Err(AegisError::Validation(
+                    "Conflicting execution_mode values in single config update".to_string(),
+                ));
             }
-        }
 
-        let mut updated_keys = Vec::with_capacity(pending_writes.len());
-        let mut risk_tier_updated: Option<String> = None;
-        let mut explicit_mult_updated = false;
-        for (k, val_str, desc) in &pending_writes {
-            if k == "risk_tier" {
-                risk_tier_updated = Some(val_str.clone());
-            } else if k == "target_leverage_multiplier" {
-                explicit_mult_updated = true;
+            let mut hyperliquid_testnet_sync: Option<&'static str> = None;
+            if let Some(&target_mode_str) = requested_modes.first() {
+                let current_cfg = db.load_config()?;
+                let current_mode = current_cfg.execution_mode();
+                let target_mode = ExecutionMode::parse(target_mode_str);
+                if target_mode != current_mode {
+                    if !db.get_assets_held()?.is_empty() || !db.get_assets_ordered()?.is_empty() {
+                        return Err(AegisError::Validation(format!(
+                            "Cannot switch execution_mode from {} to {} while OPEN positions or WORKING orders exist",
+                            current_mode.as_str(),
+                            target_mode.as_str(),
+                        )));
+                    }
+                    if target_mode == ExecutionMode::Live
+                        && !current_cfg.get_bool("allow_web_live_mode", false)
+                    {
+                        return Err(AegisError::SecurityViolation(
+                            "Switching execution_mode to LIVE via Web API requires DB-immutable allow_web_live_mode=true".to_string(),
+                        ));
+                    }
+                    hyperliquid_testnet_sync = Some(if target_mode == ExecutionMode::Live {
+                        "false"
+                    } else {
+                        "true"
+                    });
+                }
             }
-            db.set_config_value(k, val_str, desc.as_deref())?;
-            updated_keys.push(k.clone());
-        }
 
-        if let Some(testnet_val) = hyperliquid_testnet_sync {
-            db.set_config_value(
-                "hyperliquid_testnet",
-                testnet_val,
-                Some("Synchronized with execution_mode transition"),
-            )?;
-            updated_keys.push("hyperliquid_testnet".to_string());
-        }
+            let mut keys = Vec::with_capacity(pending_writes.len());
+            let mut risk_tier_updated: Option<String> = None;
+            let mut explicit_mult_updated = false;
+            for (k, val_str, desc) in &pending_writes {
+                if k == "risk_tier" {
+                    risk_tier_updated = Some(val_str.clone());
+                } else if k == "target_leverage_multiplier" {
+                    explicit_mult_updated = true;
+                }
+                db.set_config_value(k, val_str, desc.as_deref())?;
+                keys.push(k.clone());
+            }
 
-        // Keep target_leverage_multiplier synchronized if risk_tier was changed directly
-        if let Some(raw_tier) = risk_tier_updated {
-            if !explicit_mult_updated && !raw_tier.eq_ignore_ascii_case("custom") {
-                let tier = aegis_core::RiskTier::parse(&raw_tier);
-                let mult = tier.leverage_multiplier(None);
+            if let Some(testnet_val) = hyperliquid_testnet_sync {
                 db.set_config_value(
-                    "target_leverage_multiplier",
-                    &format!("{mult:.2}"),
-                    Some("Synchronized with risk_tier update"),
+                    "hyperliquid_testnet",
+                    testnet_val,
+                    Some("Synchronized with execution_mode transition"),
                 )?;
-                updated_keys.push("target_leverage_multiplier".to_string());
+                keys.push("hyperliquid_testnet".to_string());
             }
-        }
+
+            // Keep target_leverage_multiplier synchronized if risk_tier was changed directly
+            if let Some(raw_tier) = risk_tier_updated {
+                if !explicit_mult_updated && !raw_tier.eq_ignore_ascii_case("custom") {
+                    let tier = aegis_core::RiskTier::parse(&raw_tier);
+                    let mult = tier.leverage_multiplier(None);
+                    db.set_config_value(
+                        "target_leverage_multiplier",
+                        &format!("{mult:.2}"),
+                        Some("Synchronized with risk_tier update"),
+                    )?;
+                    keys.push("target_leverage_multiplier".to_string());
+                }
+            }
+
+            keys
+        };
 
         updated_keys.sort();
         updated_keys.dedup();
@@ -325,6 +354,11 @@ pub async fn post_alerts_test_handler(State(state): State<AppState>) -> Response
                 .and_then(|c| c.get("http_status"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(200);
+            let raw_detail = outcome
+                .error_detail
+                .clone()
+                .or(outcome.reason.clone())
+                .unwrap_or_else(|| "HTML alert dispatched".to_string());
             let body = json!({
                 "status": outcome.status,
                 "delivered": outcome.is_delivered() || outcome.telegram_sent || outcome.discord_sent,
@@ -334,7 +368,7 @@ pub async fn post_alerts_test_handler(State(state): State<AppState>) -> Response
                 "http_status": http_status,
                 "chat_id": outcome.chat_id,
                 "alert_queue_id": outcome.alert_queue_id,
-                "detail": outcome.error_detail.clone().or(outcome.reason.clone()).unwrap_or_else(|| "HTML alert dispatched".to_string()),
+                "detail": sanitize_telemetry_message(&raw_detail),
                 "html_message": outcome.html_message,
                 "channels": outcome.channels,
             });
@@ -424,7 +458,12 @@ pub async fn post_vault_sync_handler(State(state): State<AppState>) -> Response 
     }
 }
 
-fn should_set_secure_cookie(state: &AppState, headers: &HeaderMap, uri: &Uri) -> bool {
+fn should_set_secure_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    peer_trusted_proxy: bool,
+) -> bool {
     if state.cookie_secure {
         return true;
     }
@@ -443,7 +482,7 @@ fn should_set_secure_cookie(state: &AppState, headers: &HeaderMap, uri: &Uri) ->
             return true;
         }
     }
-    if state.trust_proxy_headers {
+    if state.trust_proxy_headers && peer_trusted_proxy {
         if let Some(xfp) = headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
@@ -479,6 +518,7 @@ pub async fn post_auth_login_handler(
     headers: HeaderMap,
     uri: Uri,
     client_ip_ext: Option<Extension<ClientIpKey>>,
+    peer_proxy_ext: Option<Extension<PeerTrustedProxy>>,
     Json(req): Json<AuthLoginPayload>,
 ) -> Response {
     let Some(expected) = state
@@ -496,6 +536,7 @@ pub async fn post_auth_login_handler(
     let client_ip = client_ip_ext
         .map(|Extension(k)| k)
         .unwrap_or(ClientIpKey::Local);
+    let peer_trusted_proxy = peer_proxy_ext.is_some_and(|Extension(PeerTrustedProxy(b))| b);
     if state.require_bearer_auth {
         if let Err(retry_after) = state.auth_rate_limiter.check_allowed(client_ip) {
             return too_many_requests_response(retry_after);
@@ -515,7 +556,7 @@ pub async fn post_auth_login_handler(
 
     let prior_cookie = extract_cookie_token(&headers);
     let session_tok = state.mint_session(prior_cookie.as_deref());
-    let secure_attr = if should_set_secure_cookie(&state, &headers, &uri) {
+    let secure_attr = if should_set_secure_cookie(&state, &headers, &uri, peer_trusted_proxy) {
         "; Secure"
     } else {
         ""
@@ -532,6 +573,39 @@ pub async fn post_auth_login_handler(
     )
         .into_response();
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+/// `POST /api/v1/auth/logout` — Revokes the caller's active `aegis_session` cookie (closing any live SSE
+/// stream using that session) and clears the cookie (`R14-L15`).
+pub async fn post_auth_logout_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    peer_proxy_ext: Option<Extension<PeerTrustedProxy>>,
+) -> Response {
+    if let Some(cookie_tok) = extract_cookie_token(&headers) {
+        state.revoke_session(&cookie_tok);
+    }
+    let peer_trusted_proxy = peer_proxy_ext.is_some_and(|Extension(PeerTrustedProxy(b))| b);
+    let secure_attr = if should_set_secure_cookie(&state, &headers, &uri, peer_trusted_proxy) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cleared =
+        format!("aegis_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure_attr}");
+    let mut resp = (
+        StatusCode::OK,
+        Json(AuthLoginResponse {
+            status: "ok",
+            authenticated: false,
+        }),
+    )
+        .into_response();
+    if let Ok(hv) = HeaderValue::from_str(&cleared) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
     resp

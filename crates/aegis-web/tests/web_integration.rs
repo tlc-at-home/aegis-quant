@@ -1,7 +1,10 @@
 //! Integration tests for Aegis Quant v2.0 Web Dashboard & REST/SSE API (`aegis-web`).
 
 use aegis_core::{now_ms, AegisError, OrderSide};
-use aegis_db::{AssetUpsertInput, DatabaseManager, WorkingOrderInput};
+use aegis_db::{
+    AssetUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput, OidUpdate,
+    SnapshotInsertInput, WorkingOrderInput,
+};
 use aegis_web::{
     build_router, create_web_router, create_web_router_for_host, health_result_to_response,
     serve_web_with_shutdown, validate_config_key_value, AppState, AuthLoginPayload,
@@ -9,19 +12,33 @@ use aegis_web::{
 };
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{header, Request, StatusCode},
 };
 use mysql::params;
 use mysql::prelude::*;
 use serde_json::Value;
-use std::path::Path;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use tokio_stream::StreamExt;
 use tower::ServiceExt;
+
+fn new_test_db() -> DatabaseManager {
+    DatabaseManager::new_isolated_test(None).unwrap()
+}
+
+fn new_test_db_noauth() -> DatabaseManager {
+    let mgr = DatabaseManager::new_isolated_test(None).unwrap();
+    mgr.set_config_value("web_auth_enabled", "false", None)
+        .unwrap();
+    mgr
+}
 
 #[tokio::test]
 async fn test_web_health_dashboard_risk_tier_and_position_close() {
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "PAPER", None)
             .unwrap();
         let btc_id = mgr
@@ -58,6 +75,7 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
                 s2_weight_contrib: 0.271,
                 s3_weight_contrib: 0.0,
                 protective_stop_px: 90432.0,
+                take_profit_px: None,
                 exchange_order_id: Some("hl-oid-101".to_string()),
                 reason: "S1_S2_CONFLUENCE".to_string(),
             })
@@ -246,7 +264,7 @@ async fn test_web_health_dashboard_risk_tier_and_position_close() {
 #[tokio::test]
 async fn test_web_auth_enforced_on_get_and_mutating_routes_and_csp() {
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
@@ -404,11 +422,9 @@ async fn test_web_auth_enforced_on_get_and_mutating_routes_and_csp() {
 
 #[tokio::test]
 async fn test_web_csrf_origin_mismatch_rejected() {
-    let db = tokio::task::spawn_blocking(|| {
-        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
-    })
-    .await
-    .unwrap();
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
     let app = create_web_router(db, None);
 
     // Cross-origin Origin -> 403 Forbidden
@@ -497,7 +513,7 @@ async fn test_web_health_503_and_config_validation() {
 async fn test_web_auth_explicit_disable_on_non_loopback_respects_operator_opt_out() {
     // 1. When web_auth_enabled is unset and a token exists on non-loopback, fail closed (401).
     let db_default = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
             .unwrap();
         mgr
@@ -519,7 +535,7 @@ async fn test_web_auth_explicit_disable_on_non_loopback_respects_operator_opt_ou
 
     // 2. When web_auth_enabled is explicitly "false" in DB (immutable via HTTP), allow direct access.
     let db_disabled = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_api_token", "aegis-secret-token-123", None)
             .unwrap();
         mgr.set_config_value("web_auth_enabled", "false", None)
@@ -546,7 +562,7 @@ async fn test_web_auth_explicit_disable_on_non_loopback_respects_operator_opt_ou
 async fn test_web_dashboard_separates_pre_cap_and_active_cap_holdings() {
     let cap_epoch_ms = now_ms() - 600_000;
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "TESTNET", None)
             .unwrap();
         mgr.set_config_value("max_open_positions", "6", None)
@@ -591,21 +607,21 @@ async fn test_web_dashboard_separates_pre_cap_and_active_cap_holdings() {
                 })
                 .unwrap();
 
-            mgr.sync_open_position_from_exchange_v2(
+            mgr.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
                 asset_id,
                 coin,
-                OrderSide::Long,
-                px,
-                px,
-                150.0 / px,
-                150.0,
-                0.0,
-                0.15,
-                px * 0.95,
-                px * 1.10,
-                0.0,
-                opened_at,
-            )
+                side: OrderSide::Long,
+                entry_price: px,
+                mark_price: px,
+                quantity: 150.0 / px,
+                committed_notional_usdc: 150.0,
+                unrealized_pnl_usdc: 0.0,
+                portfolio_weight: 0.15,
+                protective_stop_px: px * 0.95,
+                take_profit_px: px * 1.10,
+                funding_accrued_usdc: 0.0,
+                opened_at_ms: opened_at,
+            })
             .unwrap();
         }
 
@@ -673,7 +689,7 @@ async fn test_web_dashboard_separates_pre_cap_and_active_cap_holdings() {
 async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
     // 1. Empty token with web_auth_enabled=true fails closed (401 on routes, 503 on login, startup Err)
     let db_empty = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "", None).unwrap();
@@ -714,7 +730,7 @@ async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
 
     // 2. Corrupt encrypted web_api_token with web_auth_enabled unset fails closed
     let db_corrupt = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         let mut conn = mgr.get_conn().unwrap();
         let ts = now_ms();
         conn.exec_drop(
@@ -761,11 +777,7 @@ async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
     assert!(matches!(err_corrupt, Err(AegisError::SecurityViolation(_))));
 
     // 3. Unset web_auth_enabled + unset token on non-loopback 0.0.0.0 fails closed
-    let db_unset_remote = tokio::task::spawn_blocking(|| {
-        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
-    })
-    .await
-    .unwrap();
+    let db_unset_remote = tokio::task::spawn_blocking(new_test_db).await.unwrap();
 
     let app_unset_remote =
         create_web_router_for_host(db_unset_remote.clone(), None, Some("0.0.0.0"));
@@ -786,7 +798,7 @@ async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
 
     // 4. Loopback bind with web_api_token configured enforces auth even when web_auth_enabled is unset
     let db_loopback_tok = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_api_token", "loopback-tok-99", None)
             .unwrap();
         mgr
@@ -821,7 +833,7 @@ async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
 
     // 5. KVM bridge: explicit DB-immutable web_auth_enabled=false on 0.0.0.0 + Host 192.168.122.254:8000 stays 200
     let db_kvm = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "false", None)
             .unwrap();
         mgr
@@ -862,7 +874,7 @@ async fn test_web_auth_fail_closed_and_kvm_bridge_opt_out() {
 #[tokio::test]
 async fn test_web_dns_rebinding_host_allowlist_and_ipv6() {
     let db_kvm = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "false", None)
             .unwrap();
         mgr
@@ -944,7 +956,7 @@ async fn test_web_dns_rebinding_host_allowlist_and_ipv6() {
 
     // Explicit CSV web_allowed_hosts disables wildcard IP literals
     let db_allow = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "false", None)
             .unwrap();
         mgr.set_config_value("web_allowed_hosts", "aegis.lan:8000", None)
@@ -984,7 +996,7 @@ async fn test_web_dns_rebinding_host_allowlist_and_ipv6() {
 #[tokio::test]
 async fn test_web_session_channel_separation_rotation_and_expiry() {
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "api-master-secret-20", None)
@@ -1166,7 +1178,7 @@ async fn test_web_cookie_secure_and_immutable_proxy_headers() {
     ));
 
     let db_plain = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "tok-cookie-30", None)
@@ -1243,14 +1255,16 @@ async fn test_web_cookie_secure_and_immutable_proxy_headers() {
         .unwrap();
     assert!(cookie_https.contains("; Secure"));
 
-    // Trusted proxy headers honor X-Forwarded-Proto: https
+    // Trusted proxy headers honor X-Forwarded-Proto: https ONLY when peer matches web_trusted_proxies
     let db_proxy = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "tok-cookie-30", None)
             .unwrap();
         mgr.set_config_value("web_trust_proxy_headers", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_trusted_proxies", "127.0.0.1/32", None)
             .unwrap();
         mgr
     })
@@ -1258,11 +1272,13 @@ async fn test_web_cookie_secure_and_immutable_proxy_headers() {
     .unwrap();
     let app_proxy = create_web_router(db_proxy, None);
 
+    let trusted_peer: SocketAddr = "127.0.0.1:43210".parse().unwrap();
     let login_xfp = app_proxy
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(trusted_peer))
                 .header("x-forwarded-proto", "https")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"token":"tok-cookie-30"}"#))
@@ -1283,7 +1299,7 @@ async fn test_web_cookie_secure_and_immutable_proxy_headers() {
 #[tokio::test]
 async fn test_web_auth_rate_limiting_429_and_reset() {
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db();
         mgr.set_config_value("web_auth_enabled", "true", None)
             .unwrap();
         mgr.set_config_value("web_api_token", "real-token-36", None)
@@ -1398,7 +1414,7 @@ async fn test_web_auth_rate_limiting_429_and_reset() {
 #[tokio::test]
 async fn test_web_execution_mode_transition_guards() {
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "PAPER", None)
             .unwrap();
         let btc_id = mgr
@@ -1433,6 +1449,7 @@ async fn test_web_execution_mode_transition_guards() {
             s2_weight_contrib: 0.0,
             s3_weight_contrib: 0.0,
             protective_stop_px: 90000.0,
+            take_profit_px: None,
             exchange_order_id: None,
             reason: "TEST_GUARD".to_string(),
         })
@@ -1592,7 +1609,7 @@ async fn test_web_discord_webhook_ssrf_rejected_and_uppercase_config_normalized(
     assert!(validate_config_key_value("discord_webhook_url", "").is_ok());
 
     let db = tokio::task::spawn_blocking(|| {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("risk_capital_cap_usdc", "1000.0", None)
             .unwrap();
         mgr.set_config_value("risk_capital_cap_updated_at_ms", "100", None)
@@ -1671,7 +1688,7 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
     let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
 
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "TESTNET", None)
             .unwrap();
         mgr.set_config_value("live_exchange_equity_usdc", "629.84", None)
@@ -1722,21 +1739,21 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
             .unwrap();
 
         // Open SOL position: entry=180.0, qty=2.0 (entry notional=360.0), uPnL=+12.34 -> +3.43%
-        mgr.sync_open_position_from_exchange_v2(
-            sol_id,
-            "SOL",
-            OrderSide::Long,
-            180.0,
-            186.17,
-            2.0,
-            372.34,
-            12.34,
-            0.59,
-            172.0,
-            195.0,
-            0.0,
-            Some(now - 600_000),
-        )
+        mgr.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol_id,
+            coin: "SOL",
+            side: OrderSide::Long,
+            entry_price: 180.0,
+            mark_price: 186.17,
+            quantity: 2.0,
+            committed_notional_usdc: 372.34,
+            unrealized_pnl_usdc: 12.34,
+            portfolio_weight: 0.59,
+            protective_stop_px: 172.0,
+            take_profit_px: 195.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 600_000),
+        })
         .unwrap();
 
         // Closed MET position in MariaDB with committed_notional_usdc == 0.0!
@@ -1755,6 +1772,7 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
             created_at_ms: now - 3_600_000,
             closed_at_ms: now - 60_000,
             exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+            close_epoch_id: None,
         }])
         .unwrap();
 
@@ -1772,6 +1790,7 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
                 s2_weight_contrib: 0.0,
                 s3_weight_contrib: -0.05,
                 protective_stop_px: 0.22,
+                take_profit_px: None,
                 exchange_order_id: None,
                 reason: "TEST_CANCEL".to_string(),
             })
@@ -1779,8 +1798,9 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
         mgr.cancel_working_order(cancelled_pid, "TEST_CANCELLED")
             .unwrap();
 
-        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+        mgr.insert_portfolio_snapshot(&SnapshotInsertInput {
             total_equity_usdc: 629.84,
+            uncapped_equity_usdc: 629.84,
             available_cash_usdc: 428.58,
             reserved_order_cash_usdc: 0.0,
             committed_notional_usdc: 372.34,
@@ -1971,12 +1991,15 @@ async fn test_web_vault_info_contract_readonly_config_and_pnl_percentages() {
     // 4b. Verify SSE broadcaster (/api/v1/stream) serializes the exact same vault_info & PnL % fields
     let sse_state = AppState::new(db.clone(), None);
     let mut sse_rx = sse_state.dashboard_rx.clone();
+    sse_state.ensure_broadcaster_running();
     sse_state.notify_dashboard_refresh();
     let sse_payload_str = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let cur = sse_rx.borrow_and_update().clone();
-            if !cur.is_empty() {
-                return cur;
+            if let Some(snap) = cur {
+                if !snap.json.is_empty() {
+                    return snap.json;
+                }
             }
             if sse_rx.changed().await.is_err() {
                 break;
@@ -2098,11 +2121,9 @@ async fn test_web_readonly_telemetry_keys_rejected_403() {
         );
     }
 
-    let db = tokio::task::spawn_blocking(|| {
-        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
-    })
-    .await
-    .unwrap();
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
     let app = create_web_router(db, None);
 
     for key in readonly_keys {
@@ -2162,7 +2183,7 @@ async fn test_web_option_b_equity_basis_spot_vault_and_stale_flag() {
     let hlp_addr = "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303";
 
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "TESTNET", None)
             .unwrap();
         mgr.set_config_value("live_exchange_equity_usdc", "10944.72", None)
@@ -2278,8 +2299,9 @@ async fn test_web_option_b_equity_basis_spot_vault_and_stale_flag() {
             )
             .unwrap();
         db_persisted
-            .insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+            .insert_portfolio_snapshot(&SnapshotInsertInput {
                 total_equity_usdc: 1000.0,
+                uncapped_equity_usdc: 10944.72,
                 available_cash_usdc: 750.0,
                 reserved_order_cash_usdc: 0.0,
                 committed_notional_usdc: 250.0,
@@ -2387,7 +2409,7 @@ async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl
     let cap_two_days_ago = now - 2 * 86_400_000;
 
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "TESTNET", None)
             .unwrap();
         mgr.set_config_value("max_daily_drawdown_pct", "0.15", None)
@@ -2446,28 +2468,28 @@ async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl
 
         // Open SOL position with both protective SL & TP OIDs attached
         let (open_pos_id, _) = mgr
-            .sync_open_position_from_exchange_v2(
-                sol_id,
-                "SOL",
-                OrderSide::Long,
-                100.0,
-                100.0,
-                2.0,
-                200.0,
-                0.0,
-                0.20,
-                92.0,
-                112.0,
-                0.0,
-                Some(now - 3_600_000),
-            )
+            .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+                asset_id: sol_id,
+                coin: "SOL",
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.0,
+                quantity: 2.0,
+                committed_notional_usdc: 200.0,
+                unrealized_pnl_usdc: 0.0,
+                portfolio_weight: 0.20,
+                protective_stop_px: 92.0,
+                take_profit_px: 112.0,
+                funding_accrued_usdc: 0.0,
+                opened_at_ms: Some(now - 3_600_000),
+            })
             .unwrap();
         mgr.update_position_tpsl_orders(
             open_pos_id,
             92.0,
-            Some("hl-sl-oid-1"),
+            OidUpdate::Set("hl-sl-oid-1"),
             112.0,
-            Some("hl-tp-oid-2"),
+            OidUpdate::Set("hl-tp-oid-2"),
         )
         .unwrap();
 
@@ -2484,14 +2506,16 @@ async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl
             s2_weight_contrib: 0.0,
             s3_weight_contrib: 0.0,
             protective_stop_px: 90000.0,
+            take_profit_px: None,
             exchange_order_id: Some("hl-entry-oid-3".to_string()),
             reason: "TEST_WORKING".to_string(),
         })
         .unwrap();
 
         // Insert 24h peak snapshot (1000.0) followed by trough snapshot (676.0 -> 32.4% drawdown >= 15.0%)
-        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+        mgr.insert_portfolio_snapshot(&SnapshotInsertInput {
             total_equity_usdc: 1000.0,
+            uncapped_equity_usdc: 1000.0,
             available_cash_usdc: 1000.0,
             reserved_order_cash_usdc: 0.0,
             committed_notional_usdc: 0.0,
@@ -2512,8 +2536,9 @@ async fn test_web_drawdown_breaker_attached_tpsl_open_orders_and_cap_clamped_pnl
             eligible_coin_count: 2,
         })
         .unwrap();
-        mgr.insert_portfolio_snapshot(&aegis_db::SnapshotInsertInput {
+        mgr.insert_portfolio_snapshot(&SnapshotInsertInput {
             total_equity_usdc: 676.0,
+            uncapped_equity_usdc: 676.0,
             available_cash_usdc: 400.0,
             reserved_order_cash_usdc: 939.0,
             committed_notional_usdc: 200.0,
@@ -2620,7 +2645,7 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
     let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
 
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "TESTNET", None)
             .unwrap();
         mgr.set_config_value("live_exchange_account_mode", "unifiedAccount", None)
@@ -2861,11 +2886,9 @@ async fn test_web_vault_config_keys_validation_and_role_normalization() {
     ));
 
     // 2. End-to-end POST /api/v1/config with uppercase VAULT_ROLE normalization
-    let db = tokio::task::spawn_blocking(|| {
-        DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap()
-    })
-    .await
-    .unwrap();
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
     let app = create_web_router(db.clone(), None);
 
     let hlp_addr = "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0";
@@ -2996,7 +3019,7 @@ async fn test_web_vault_inspect_endpoint_validation_paper_found_and_not_found() 
 
     let base_url = format!("http://127.0.0.1:{port}");
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "PAPER", None)
             .unwrap();
         mgr.set_config_value("hyperliquid_testnet_url", &base_url, None)
@@ -3231,7 +3254,7 @@ async fn test_web_vault_sync_endpoint_immediate_sync_and_dashboard_enriched_fiel
 
     let base_url = format!("http://127.0.0.1:{port}");
     let db = tokio::task::spawn_blocking(move || {
-        let mgr = DatabaseManager::new(Some(Path::new(":memory:")), None).unwrap();
+        let mgr = new_test_db_noauth();
         mgr.set_config_value("execution_mode", "PAPER", None)
             .unwrap();
         mgr.set_config_value("live_exchange_equity_usdc", "1000.0", None)
@@ -3429,4 +3452,993 @@ async fn test_web_vault_sync_endpoint_immediate_sync_and_dashboard_enriched_fiel
     assert!((v0["all_time_volume_usdc"].as_f64().unwrap() - 750_000_000.88).abs() < 1e-2);
 
     let _ = stop_tx.send(());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sse_stalled_client_drops_on_timeout_and_never_blocks_shutdown() {
+    use std::sync::atomic::Ordering;
+
+    // 1. Stalled / unpolled SSE client drops on send timeout instead of pinning MAX_SSE_CLIENTS slot
+    let db1 = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let mut state1 = AppState::new(db1, None);
+    state1.sse_client_send_timeout = Duration::from_millis(80);
+    let app1 = build_router(state1.clone());
+
+    let stalled_resp = app1
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stalled_resp.status(), StatusCode::OK);
+    // Intentionally hold `stalled_resp` without reading its body so `mpsc::channel(2)` stays unpolled.
+    // Push updates until the 2-slot buffer fills and `deliver_sse_event` hits the 80ms timeout.
+    for _ in 0..8 {
+        state1.notify_dashboard_refresh();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if state1.sse_client_count.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state1.sse_client_count.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        state1.notify_dashboard_refresh();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        state1.sse_client_count.load(Ordering::SeqCst),
+        0,
+        "Stalled SSE client slot must be released after send timeout"
+    );
+    drop(stalled_resp);
+    state1.shutdown();
+
+    // 2. Shutdown signal preempts even an active slow send immediately (< 200ms)
+    let db2 = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let mut state2 = AppState::new(db2, None);
+    state2.sse_client_send_timeout = Duration::from_secs(30);
+    let app2 = build_router(state2.clone());
+
+    let stalled_shutdown_resp = app2
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stalled_shutdown_resp.status(), StatusCode::OK);
+    assert_eq!(state2.sse_client_count.load(Ordering::SeqCst), 1);
+
+    // Fill 2-slot queue so deliver_sse_event parks inside `tokio::select!`
+    for _ in 0..4 {
+        state2.notify_dashboard_refresh();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    let t0 = Instant::now();
+    state2.shutdown();
+    while state2.sse_client_count.load(Ordering::SeqCst) > 0
+        && t0.elapsed() < Duration::from_millis(200)
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        state2.sse_client_count.load(Ordering::SeqCst),
+        0,
+        "SSE stalled stream must abort immediately (<200ms) on shutdown"
+    );
+    assert!(t0.elapsed() < Duration::from_millis(200));
+    drop(stalled_shutdown_resp);
+}
+
+#[tokio::test]
+async fn test_dashboard_db_failure_returns_503_and_sse_broadcasts_degraded_without_empty_holdings()
+{
+    // 1. Critical view failure (`v_assets_held` dropped) -> HTTP 503 with sanitized JSON, zero SQL/DSN leak,
+    //    and SSE broadcasts `DegradedDashboardEvent` omitting holdings arrays so clients retain stale rows.
+    let db_crit = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db_noauth();
+        let mut conn = mgr.get_conn().unwrap();
+        conn.query_drop("DROP VIEW IF EXISTS v_assets_held")
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_crit = create_web_router(db_crit.clone(), None);
+
+    for uri in ["/api/v1/dashboard", "/api/v1/state"] {
+        let res = app_crit
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "URI {uri}");
+        let body_bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        let json: Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["degraded"], true);
+        assert_eq!(json["database_reachable"], true);
+        assert!(json["correlation_id"].as_str().is_some());
+        let sections = json["degraded_sections"].as_array().unwrap();
+        assert!(sections.iter().any(|s| s == "v_assets_held"));
+        assert!(!body_str.contains("mysql://"));
+        assert!(!body_str.contains("aegis_v2_local"));
+        assert!(!body_str.contains("SELECT "));
+    }
+
+    let sse_state = AppState::new(db_crit, None);
+    let mut sse_rx = sse_state.dashboard_rx.clone();
+    sse_state.ensure_broadcaster_running();
+    sse_state.notify_dashboard_refresh();
+    let sse_snap = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cur = sse_rx.borrow_and_update().clone();
+            if let Some(snap) = cur {
+                if !snap.json.is_empty() {
+                    return snap;
+                }
+            }
+            if sse_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        panic!("Expected degraded SSE broadcast snapshot");
+    })
+    .await
+    .unwrap();
+    sse_state.shutdown();
+    assert!(sse_snap.degraded);
+    let sse_json: Value = serde_json::from_str(&sse_snap.json).unwrap();
+    assert_eq!(sse_json["degraded"], true);
+    assert!(sse_json["degraded_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "v_assets_held"));
+    assert!(sse_json.get("v_assets_held").is_none());
+    assert!(sse_json.get("v_assets_ordered").is_none());
+    assert!(sse_json.get("snapshot").is_none());
+
+    // 2. Non-critical secondary section failure (`v_assets_in_cooldown` dropped) -> HTTP 200 with `degraded: true`
+    let db_sec = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db_noauth();
+        let mut conn = mgr.get_conn().unwrap();
+        conn.query_drop("DROP VIEW IF EXISTS v_assets_in_cooldown")
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_sec = create_web_router(db_sec, None);
+    let res_sec = app_sec
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_sec.status(), StatusCode::OK);
+    let json_sec: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_sec.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json_sec["degraded"], true);
+    assert!(json_sec["degraded_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s == "v_assets_in_cooldown"));
+}
+
+#[tokio::test]
+async fn test_dashboard_snapshot_seq_monotonic_across_rest_and_sse() {
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let state = AppState::new(db, None);
+    let app = build_router(state.clone());
+
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+    let j1: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res1.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let seq1 = j1["snapshot_seq"].as_u64().unwrap();
+    let boot1 = j1["server_boot_id"].as_i64().unwrap();
+    assert!(seq1 > 0);
+    assert!(boot1 > 0);
+
+    let mut rx = state.dashboard_rx.clone();
+    state.ensure_broadcaster_running();
+    state.notify_dashboard_refresh();
+    let sse_json_str = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cur = rx.borrow_and_update().clone();
+            if let Some(snap) = cur {
+                if snap.seq > seq1 && !snap.json.is_empty() {
+                    return snap.json;
+                }
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+        panic!("Timed out waiting for monotonic SSE snapshot");
+    })
+    .await
+    .unwrap();
+    let j2: Value = serde_json::from_str(&sse_json_str).unwrap();
+    let seq2 = j2["snapshot_seq"].as_u64().unwrap();
+    let boot2 = j2["server_boot_id"].as_i64().unwrap();
+    assert!(seq2 > seq1);
+    assert_eq!(boot1, boot2);
+
+    let res3 = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let j3: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res3.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let seq3 = j3["snapshot_seq"].as_u64().unwrap();
+    assert!(seq3 > seq2);
+    assert_eq!(j3["server_boot_id"].as_i64().unwrap(), boot1);
+    state.shutdown();
+}
+
+#[tokio::test]
+async fn test_trusted_proxies_cidr_blocks_spoofed_xff_and_xfp_and_parses_rtl() {
+    // 1. web_trust_proxy_headers=true with EMPTY web_trusted_proxies MUST ignore XFP & XFF headers
+    let db_empty_cidr = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "cidr-tok-1", None)
+            .unwrap();
+        mgr.set_config_value("web_trust_proxy_headers", "true", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_empty_cidr = create_web_router(db_empty_cidr, None);
+    let attacker_peer: SocketAddr = "198.51.100.10:5555".parse().unwrap();
+
+    let res_no_cidr = app_empty_cidr
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(attacker_peer))
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-for", "203.0.113.1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"cidr-tok-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_no_cidr.status(), StatusCode::OK);
+    let cookie_no_cidr = res_no_cidr
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!cookie_no_cidr.contains("; Secure"));
+
+    // 2. With web_trusted_proxies="10.0.0.0/8", untrusted peer spoofing XFF cannot bypass rate-limit or forge XFP,
+    //    while trusted proxy peer `10.1.2.3` strips intermediate trusted hops `10.2.3.4` right-to-left.
+    let db_cidr = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "cidr-tok-2", None)
+            .unwrap();
+        mgr.set_config_value("web_trust_proxy_headers", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_trusted_proxies", "10.0.0.0/8", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let app_cidr = create_web_router(db_cidr, None);
+
+    // Untrusted peer attempting XFP=https + XFF=127.0.0.1 must NOT get `; Secure`
+    let spoof_login = app_cidr
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(attacker_peer))
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-for", "127.0.0.1, 10.0.0.2")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"cidr-tok-2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoof_login.status(), StatusCode::OK);
+    let spoof_cookie = spoof_login
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(!spoof_cookie.contains("; Secure"));
+
+    // Trusted proxy peer with XFF "spoofed-left, 198.51.100.77, 10.9.9.9" (rightmost non-trusted = 198.51.100.77)
+    let proxy_peer: SocketAddr = "10.1.2.3:8443".parse().unwrap();
+    let proxy_ok = app_cidr
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(proxy_peer))
+                .header("x-forwarded-proto", "https")
+                .header("x-forwarded-for", "203.0.113.99, 198.51.100.77, 10.9.9.9")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"cidr-tok-2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proxy_ok.status(), StatusCode::OK);
+    assert!(proxy_ok
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("; Secure"));
+
+    // Exhaust 5 bad login failures for client 198.51.100.77 through trusted proxy
+    for _ in 0..5 {
+        let bad = app_cidr
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .extension(ConnectInfo(proxy_peer))
+                    .header("x-forwarded-for", "203.0.113.99, 198.51.100.77, 10.9.9.9")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    }
+    // 6th attempt from 198.51.100.77 is rate-limited (429) even with different spoofed leftmost IP
+    let throttled = app_cidr
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(proxy_peer))
+                .header("x-forwarded-for", "1.2.3.4, 198.51.100.77, 10.9.9.9")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"cidr-tok-2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Another real client (198.51.100.88) behind the SAME trusted proxy peer is unaffected (200 OK)
+    let other_client = app_cidr
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .extension(ConnectInfo(proxy_peer))
+                .header("x-forwarded-for", "198.51.100.88, 10.9.9.9")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"cidr-tok-2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_client.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_loopback_bind_requires_auth_by_default_unless_explicitly_opted_out() {
+    // 1. Fresh DB with unset web_auth_enabled and unset token refuses loopback bind & enforces auth
+    let db_unset = tokio::task::spawn_blocking(new_test_db).await.unwrap();
+    let app_unset = create_web_router_for_host(db_unset.clone(), None, Some("127.0.0.1"));
+    let res_unset = app_unset
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unset.status(), StatusCode::UNAUTHORIZED);
+
+    let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    let startup_err = serve_web_with_shutdown(db_unset, "127.0.0.1", 0, sd_rx).await;
+    assert!(matches!(startup_err, Err(AegisError::SecurityViolation(_))));
+
+    // 2. Explicit DB-immutable `web_auth_enabled=false` opts out for loopback access
+    let db_optout = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let app_optout = create_web_router_for_host(db_optout, None, Some("127.0.0.1"));
+    let res_optout = app_optout
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_optout.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sse_idle_to_active_transition_rebuilds_fresh_snapshot_not_stale_cache() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db_noauth();
+        mgr.set_config_value("risk_tier", "aggressive", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let state = AppState::new(db, None);
+
+    // Inject a stale cached snapshot (> 2s old) while 0 SSE clients are connected
+    let stale_json = r#"{"risk_tier":"conservative","snapshot_seq":1,"stale":true}"#;
+    let _ = state.dashboard_tx.send(Some(aegis_web::BroadcastSnapshot {
+        seq: 1,
+        generated_at: Instant::now() - Duration::from_secs(10),
+        generated_at_ms: now_ms() - 10_000,
+        json: std::sync::Arc::new(stale_json.to_string()),
+        degraded: false,
+    }));
+
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut data_stream = resp.into_body().into_data_stream();
+    let first_chunk = tokio::time::timeout(Duration::from_secs(4), data_stream.next())
+        .await
+        .expect("SSE emitted initial snapshot within timeout")
+        .expect("Stream returned chunk")
+        .expect("Chunk succeeded");
+    let text = String::from_utf8_lossy(&first_chunk);
+    assert!(
+        text.contains(r#""risk_tier":"aggressive""#),
+        "Expected fresh DB snapshot on idle->active transition, got: {text}"
+    );
+    assert!(!text.contains(r#""stale":true"#));
+    drop(data_stream);
+    state.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sse_stream_terminates_immediately_on_session_revocation_and_expiry() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "sse-revoke-secret", None)
+            .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+    let mut state = AppState::new(db, None);
+    state.sse_auth_recheck_interval = Duration::from_millis(50);
+    let app = build_router(state.clone());
+
+    let login_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"sse-revoke-secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_res.status(), StatusCode::OK);
+    let set_cookie = login_res
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+    let sse_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+
+    let mut data_stream = sse_resp.into_body().into_data_stream();
+    let initial = tokio::time::timeout(Duration::from_secs(4), data_stream.next())
+        .await
+        .expect("Initial SSE frame")
+        .expect("Initial chunk exists")
+        .expect("Chunk ok");
+    assert!(!initial.is_empty());
+
+    // Revoke session via POST /api/v1/auth/logout -> stream emits `event: auth_expired` and closes immediately
+    let logout_res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_res.status(), StatusCode::OK);
+    let clear_cookie = logout_res
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(clear_cookie.contains("Max-Age=0"));
+
+    let mut seen_auth_expired = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), data_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                let s = String::from_utf8_lossy(&chunk);
+                if s.contains("event: auth_expired") || s.contains("auth_expired") {
+                    seen_auth_expired = true;
+                }
+            }
+            Ok(None) => break,
+            Ok(Some(Err(_))) | Err(_) => break,
+        }
+    }
+    assert!(
+        seen_auth_expired,
+        "Expected SSE stream to emit event: auth_expired upon session logout/revocation"
+    );
+    state.shutdown();
+}
+
+#[tokio::test]
+async fn test_health_503_and_internal_500_sanitize_mysql_errors_with_correlation_id() {
+    let secret_dsn_err =
+        "mysql://aegis:aegis_v2_local@10.0.0.5:3306/aegis_quant Access denied SELECT * FROM system_config";
+    let resp_503 = health_result_to_response(Err(AegisError::Database(secret_dsn_err.to_string())));
+    assert_eq!(resp_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes_503 = axum::body::to_bytes(resp_503.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let str_503 = String::from_utf8_lossy(&bytes_503);
+    let json_503: Value = serde_json::from_slice(&bytes_503).unwrap();
+    assert_eq!(json_503["status"], "unavailable");
+    assert!(json_503["correlation_id"]
+        .as_str()
+        .is_some_and(|c| c.starts_with("err-")));
+    for secret in ["aegis_v2_local", "mysql://", "10.0.0.5", "SELECT *"] {
+        assert!(!str_503.contains(secret), "503 leaked {secret}: {str_503}");
+    }
+
+    let resp_500 = aegis_web::map_aegis_error_response(AegisError::Crypto(
+        "Failed reading /var/lib/aegis/secret.key for user root@127.0.0.1".to_string(),
+    ));
+    assert_eq!(resp_500.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes_500 = axum::body::to_bytes(resp_500.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let str_500 = String::from_utf8_lossy(&bytes_500);
+    let json_500: Value = serde_json::from_slice(&bytes_500).unwrap();
+    assert!(json_500["correlation_id"]
+        .as_str()
+        .is_some_and(|c| c.starts_with("err-")));
+    assert!(!str_500.contains("secret.key"));
+    assert!(!str_500.contains("/var/lib"));
+}
+
+#[tokio::test]
+async fn test_csp_strict_no_unsafe_inline_and_no_external_fonts() {
+    assert!(!DEFAULT_CSP_POLICY.contains("'unsafe-inline'"));
+    assert!(!DEFAULT_CSP_POLICY.contains("'unsafe-eval'"));
+    assert!(!DEFAULT_CSP_POLICY.contains("fonts.googleapis.com"));
+    assert!(!DEFAULT_CSP_POLICY.contains("fonts.gstatic.com"));
+    assert!(DEFAULT_CSP_POLICY.contains("script-src 'self';"));
+    assert!(DEFAULT_CSP_POLICY.contains("style-src 'self';"));
+    assert!(DEFAULT_CSP_POLICY.contains("style-src-attr 'none';"));
+
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let app = create_web_router(db, None);
+
+    for path in ["/", "/styles.css", "/js/main.js", "/api/v1/dashboard"] {
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "path {path}");
+        let csp = res
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, DEFAULT_CSP_POLICY);
+    }
+}
+
+#[tokio::test]
+async fn test_static_html_and_js_audit_zero_inline_styles_and_innerhtml() {
+    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/static");
+    let index_html = std::fs::read_to_string(static_dir.join("index.html")).unwrap();
+    assert!(
+        !index_html.contains("style="),
+        "index.html contains inline style="
+    );
+    assert!(
+        !index_html.contains("fonts.googleapis.com") && !index_html.contains("fonts.gstatic.com"),
+        "index.html references external Google Fonts"
+    );
+    assert!(index_html.contains(r#"<script type="module" src="/js/main.js"></script>"#));
+
+    let app_js = std::fs::read_to_string(static_dir.join("app.js")).unwrap();
+    assert_eq!(app_js.trim(), "import '/js/main.js';");
+
+    for module in [
+        "state.js",
+        "format.js",
+        "api.js",
+        "tables.js",
+        "charts.js",
+        "config.js",
+        "modals.js",
+        "main.js",
+    ] {
+        let src = std::fs::read_to_string(static_dir.join("js").join(module)).unwrap();
+        assert!(
+            !src.contains("innerHTML"),
+            "web/static/js/{module} must not use innerHTML"
+        );
+        assert!(
+            !src.contains("style=") && !src.contains(".style."),
+            "web/static/js/{module} must not use inline style= or .style. DOM mutations"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_static_assets_etag_304_and_js_module_allowlist_blocks_traversal() {
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let app = create_web_router(db, None);
+
+    let paths = [
+        "/",
+        "/styles.css",
+        "/app.js",
+        "/js/state.js",
+        "/js/format.js",
+        "/js/api.js",
+        "/js/tables.js",
+        "/js/charts.js",
+        "/js/config.js",
+        "/js/modals.js",
+        "/js/main.js",
+    ];
+
+    for path in paths {
+        let res_200 = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res_200.status(), StatusCode::OK, "200 expected for {path}");
+        assert_eq!(
+            res_200
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "public, max-age=0, must-revalidate"
+        );
+        let etag = res_200
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+        // Exact strong match -> 304
+        let res_304 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::IF_NONE_MATCH, etag.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_304.status(), StatusCode::NOT_MODIFIED, "304 for {path}");
+
+        // RFC 9110 comma-separated list with W/ prefix -> 304
+        let multi_inm = format!(r#""stale", W/{etag}"#);
+        let res_304_multi = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::IF_NONE_MATCH, multi_inm)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_304_multi.status(),
+            StatusCode::NOT_MODIFIED,
+            "304 multi If-None-Match for {path}"
+        );
+    }
+
+    for bad_path in [
+        "/js/unknown.js",
+        "/js/..%2Findex.html",
+        "/js/../index.html",
+        "/js/sub/state.js",
+    ] {
+        let res_404 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(bad_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_404.status(),
+            StatusCode::NOT_FOUND,
+            "404 expected for traversal/unknown path {bad_path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_forensic_tier1_and_p0_p1_config_validation_uncapped_drawdown_and_priority_health() {
+    // 1. Validate Tier-1 & P0/P1 strategy/execution/retention bounds
+    for (k, v) in [
+        ("enable_breadth_regime_gate", "true"),
+        ("early_loser_invalidation_enabled", "false"),
+        ("breadth_bull_block_shorts_threshold", "0.75"),
+        ("breadth_bear_block_longs_threshold", "0.25"),
+        ("breakeven_trigger_r", "0.50"),
+        ("breakeven_lock_r", "0.10"),
+        ("stagnation_time_stop_hours", "12.0"),
+        ("stagnation_min_mfe_r", "0.25"),
+        ("risk_per_trade_equity_pct", "0.02"),
+        ("min_equity_halt_usdc", "50.0"),
+        ("retention_ohlcv_bars_days", "90"),
+        ("hl_rest_weight_limit_per_min", "900"),
+    ] {
+        assert!(
+            validate_config_key_value(k, v).is_ok(),
+            "Expected valid config {k}={v}"
+        );
+    }
+    for (k, bad_v) in [
+        ("breadth_bull_block_shorts_threshold", "0.10"),
+        ("breakeven_trigger_r", "5.0"),
+        ("retention_ohlcv_bars_days", "5"),
+        ("hl_rest_weight_limit_per_min", "2000"),
+    ] {
+        assert!(
+            validate_config_key_value(k, bad_v).is_err(),
+            "Expected invalid config {k}={bad_v}"
+        );
+    }
+    for immut in ["web_trusted_proxies", "priority_monitor_health_json"] {
+        assert!(matches!(
+            validate_config_key_value(immut, "bad"),
+            Err(AegisError::SecurityViolation(_))
+        ));
+    }
+
+    // 2. Uncapped drawdown detection in TESTNET even when capped equity barely moved + PriorityMonitorHealth
+    let now = now_ms();
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = new_test_db_noauth();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        mgr.set_config_value("risk_capital_cap_usdc", "1000.0", None)
+            .unwrap();
+        mgr.set_config_value("max_daily_drawdown_pct", "0.15", None)
+            .unwrap();
+        mgr.set_config_value("min_equity_halt_usdc", "50.0", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_usdc", "9000.0", None)
+            .unwrap();
+        mgr.set_config_value("live_exchange_equity_synced_at_ms", &now.to_string(), None)
+            .unwrap();
+        mgr.set_config_value(
+            "priority_monitor_health_json",
+            &serde_json::json!({
+                "last_tick_at_ms": now,
+                "consecutive_error_ticks": 3,
+                "last_tick_error_count": 1,
+                "failed_symbols": ["SOL"],
+                "unfilled_stop_breach_symbols": ["BTC"],
+                "unmonitored_alert_active": true,
+                "is_stale": false,
+                "status": "DEGRADED"
+            })
+            .to_string(),
+            None,
+        )
+        .unwrap();
+
+        mgr.insert_portfolio_snapshot(&SnapshotInsertInput {
+            total_equity_usdc: 1000.0,
+            uncapped_equity_usdc: 12000.0,
+            available_cash_usdc: 1000.0,
+            reserved_order_cash_usdc: 0.0,
+            committed_notional_usdc: 0.0,
+            net_notional_usdc: 0.0,
+            gross_leverage_x: 0.0,
+            net_leverage_x: 0.0,
+            market_beta_exposure: 0.0,
+            market_breadth_bull: 0.5,
+            market_regime_label: "NEUTRAL".to_string(),
+            risk_tier: "standard".to_string(),
+            leverage_multiplier: 1.0,
+            s1_gross_weight: 0.0,
+            s2_gross_weight: 0.0,
+            s3_gross_weight: 0.0,
+            working_order_count: 0,
+            open_long_count: 0,
+            open_short_count: 0,
+            eligible_coin_count: 2,
+        })
+        .unwrap();
+        mgr.insert_portfolio_snapshot(&SnapshotInsertInput {
+            total_equity_usdc: 990.0,
+            uncapped_equity_usdc: 9000.0,
+            available_cash_usdc: 990.0,
+            reserved_order_cash_usdc: 0.0,
+            committed_notional_usdc: 0.0,
+            net_notional_usdc: 0.0,
+            gross_leverage_x: 0.0,
+            net_leverage_x: 0.0,
+            market_beta_exposure: 0.0,
+            market_breadth_bull: 0.4,
+            market_regime_label: "NEUTRAL".to_string(),
+            risk_tier: "standard".to_string(),
+            leverage_multiplier: 1.0,
+            s1_gross_weight: 0.0,
+            s2_gross_weight: 0.0,
+            s3_gross_weight: 0.0,
+            working_order_count: 0,
+            open_long_count: 0,
+            open_short_count: 0,
+            eligible_coin_count: 2,
+        })
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db, None);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let dash: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(dash["drawdown_breaker"]["basis"], "UNCAPPED_WALLET_EQUITY");
+    assert_eq!(dash["drawdown_breaker"]["tripped"], true);
+    assert!((dash["drawdown_breaker"]["drawdown_pct"].as_f64().unwrap() - 25.0).abs() < 1e-4);
+    assert_eq!(dash["priority_monitor_health"]["status"], "DEGRADED");
+    assert_eq!(
+        dash["priority_monitor_health"]["unmonitored_alert_active"],
+        true
+    );
+    assert!(dash["immutable_config_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "web_trusted_proxies"));
 }

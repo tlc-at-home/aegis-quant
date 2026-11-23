@@ -10,7 +10,6 @@ aegis-alerts = { workspace = true }
 aegis-core = { workspace = true }
 aegis-db = { workspace = true }
 aegis-execution = { workspace = true }
-aegis-telemetry = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 parking_lot = { workspace = true }
@@ -23,5 +22,6 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+aegis-test-support = { workspace = true }
 mysql = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
