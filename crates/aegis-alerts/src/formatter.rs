@@ -164,9 +164,21 @@ impl OrderFilledOpenAlert {
         trigger: Option<&str>,
     ) -> Self {
         let tier = RiskTier::parse(&snap.risk_tier);
+        let side = match OrderSide::parse(&held.side) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(
+                    symbol = %held.symbol,
+                    side = %held.side,
+                    error = %err,
+                    "Invalid OrderSide in OrderFilledOpenAlert::from_held_view"
+                );
+                OrderSide::Long
+            }
+        };
         Self {
             symbol: held.symbol.clone(),
-            side: OrderSide::parse(&held.side),
+            side,
             risk_tier: tier,
             leverage_multiplier: Some(snap.leverage_multiplier),
             trigger: trigger.unwrap_or("MULTI_SLEEVE_ALLOCATION").to_string(),
@@ -297,9 +309,21 @@ impl WorkingOrderPlacedAlert {
     /// Builds a `WorkingOrderPlacedAlert` directly from an `OrderedAssetView` and `PortfolioSnapshot`.
     pub fn from_ordered_view(order: &OrderedAssetView, snap: &PortfolioSnapshot) -> Self {
         let tier = RiskTier::parse(&snap.risk_tier);
+        let side = match OrderSide::parse(&order.side) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::error!(
+                    symbol = %order.symbol,
+                    side = %order.side,
+                    error = %err,
+                    "Invalid OrderSide in WorkingOrderPlacedAlert::from_ordered_view"
+                );
+                OrderSide::Long
+            }
+        };
         Self {
             symbol: order.symbol.clone(),
-            side: OrderSide::parse(&order.side),
+            side,
             risk_tier: tier,
             leverage_multiplier: Some(snap.leverage_multiplier),
             fsm_state: order.fsm_state.clone(),

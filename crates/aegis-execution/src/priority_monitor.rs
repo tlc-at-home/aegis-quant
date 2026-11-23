@@ -173,7 +173,7 @@ impl PriorityMonitor {
                 )
             });
 
-            let side = OrderSide::parse(&h.side);
+            let side = OrderSide::parse(&h.side)?;
             let (eff_highest, eff_lowest) = {
                 let mut guard = self.widened_watermarks.lock();
                 if let Some((wh, wl)) = guard.get_mut(&h.position_id) {
@@ -293,7 +293,7 @@ impl PriorityMonitor {
         risk: &RiskEngine,
     ) -> Result<Option<f64>> {
         let cfg = self.db.load_config()?;
-        let side = OrderSide::parse(&held.side);
+        let side = OrderSide::parse(&held.side)?;
         let is_tp_exit = exit_reason.starts_with("TAKE_PROFIT");
         let taker_fee_bps = risk.limits.taker_fee_bps;
         let default_stop_pct = risk.limits.protective_stop_default_pct.clamp(0.01, 0.25);

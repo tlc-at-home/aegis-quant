@@ -157,7 +157,14 @@ impl SignalEngine {
             if !matches!(status, PositionStatus::Working | PositionStatus::Open) {
                 continue;
             }
-            let side = OrderSide::parse(&pos.side);
+            let Ok(side) = OrderSide::parse(&pos.side) else {
+                tracing::error!(
+                    position_id = pos.id,
+                    side = %pos.side,
+                    "Skipping active position with invalid OrderSide in evaluate_universe_with_positions"
+                );
+                continue;
+            };
             let notional = if status == PositionStatus::Open {
                 if pos.current_price.is_finite()
                     && pos.current_price > 0.0

@@ -218,6 +218,7 @@ impl DatabaseManager {
             Ok(PortfolioSnapshot {
                 id: 0,
                 total_equity_usdc: eq,
+                uncapped_equity_usdc: eq,
                 available_cash_usdc: eq,
                 reserved_order_cash_usdc: 0.0,
                 committed_notional_usdc: 0.0,
@@ -743,7 +744,7 @@ impl DatabaseManager {
                 if let Some((bar_close, _)) = bar_row_opt
                     .filter(|&(px, vol)| px.is_finite() && px > 0.0 && vol.is_finite() && vol > 0.0)
                 {
-                    let side = OrderSide::parse(side_str);
+                    let side = OrderSide::parse(side_str)?;
                     start_upnl += (bar_close - *entry_price) * *qty * side.sign();
                 } else if snap_ts_opt.is_some_and(|st| st <= eff_start_ms)
                     && snap_comm_opt.unwrap_or(0.0) <= 1e-6
@@ -877,9 +878,11 @@ impl DatabaseManager {
 }
 
 fn row_to_portfolio_snapshot(r: mysql::Row) -> PortfolioSnapshot {
+    let total_equity_usdc: f64 = r.get(1).unwrap_or_default();
     PortfolioSnapshot {
         id: r.get(0).unwrap_or_default(),
-        total_equity_usdc: r.get(1).unwrap_or_default(),
+        total_equity_usdc,
+        uncapped_equity_usdc: 0.0,
         available_cash_usdc: r.get(2).unwrap_or_default(),
         reserved_order_cash_usdc: r.get(3).unwrap_or_default(),
         committed_notional_usdc: r.get(4).unwrap_or_default(),

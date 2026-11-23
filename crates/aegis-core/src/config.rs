@@ -1,6 +1,9 @@
 //! Canonical v2.0 configuration domain types, risk tiers, symbol normalization, and seed defaults (`aegis-core::config`).
 
 use crate::errors::{AegisError, Result};
+use crate::security::{
+    is_immutable_security_config_key, validate_evm_address, validate_private_key,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -302,7 +305,7 @@ pub fn default_v2_system_config_seeds(
         ("max_gross_leverage_x", "2.50", "float", "Hard portfolio gross leverage ceiling (2.50x)"),
         ("max_open_positions", "6", "int", "Hard cap on total concurrent active positions (OPEN + WORKING combined)"),
         ("min_entry_interval_sec", "150", "int", "Minimum cooldown interval in seconds between opening new positions (150s default)"),
-        ("max_single_asset_weight", "0.30", "float", "Maximum single-asset portfolio weight cap (30% of equity)"),
+        ("max_single_asset_weight", "0.15", "float", "Maximum single-asset portfolio weight cap (15% of equity)"),
         ("min_rebalance_delta_weight", "0.025", "float", "Minimum weight delta (2.5% of equity) required to submit a rebalance order"),
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),
         ("initial_paper_equity_usdc", "10000.0", "float", "Default starting equity in USDC for PAPER mode or empty account fallback"),
@@ -316,33 +319,82 @@ pub fn default_v2_system_config_seeds(
         ("live_exchange_account_mode", "default", "string", "Latest synced Hyperliquid userAbstraction mode (default, unifiedAccount, portfolioMargin)"),
         ("live_exchange_perp_margin_equity_usdc", "0.0", "float", "Latest synced Hyperliquid perp clearinghouseState marginSummary.accountValue in USDC"),
         ("live_exchange_portfolio_pnl_json", "", "json", "Cached Hyperliquid portfolio perpDay/perpWeek/perpMonth/perpAllTime PnL snapshot JSON synced by reconciler (read-only)"),
+        ("live_exchange_maker_fee_bps", "0.0", "float", "Synced account Hyperliquid maker fee tier in bps (0 falls back to static maker_fee_bps; read-only)"),
+        ("live_exchange_taker_fee_bps", "0.0", "float", "Synced account Hyperliquid taker fee tier in bps (0 falls back to static taker_fee_bps; read-only)"),
         ("live_vault_info_json", "", "json", "Cached Hyperliquid vault portfolio snapshot JSON synced by reconciler (read-only; segregated from perp margin)"),
+        ("priority_monitor_health_json", "", "json", "Cached 1s PriorityMonitor surveillance health snapshot JSON (read-only)"),
+        ("ws_stream_status_json", "", "json", "Cached Hyperliquid WebSocket Market+User stream health snapshot JSON (read-only)"),
         ("hyperliquid_vault_address", "", "string", "Configured Hyperliquid Vault EVM address (0x...) tracked alongside active wallet vault deposits"),
         ("vault_role", "follower", "string", "Vault operating role: follower (Barbell/HLP), operator (Aegis-led User Vault), or none"),
         ("vault_target_allocation_pct", "0.0", "float", "Target percentage of combined wallet equity allocated to Hyperliquid vaults (0-100%, informational barbell benchmark)"),
         ("vault_profit_sweep_threshold_usdc", "0.0", "float", "Realized perp profit threshold in USDC (0 disables) for operator vault profit-sweep reminders"),
         ("vault_notes", "", "string", "Operator vault thesis, mandate, and maintenance notes (plain text, max 500 chars)"),
         ("risk_capital_cap_usdc", "1000.0", "float", "Optional user portfolio capital sizing cap in USDC (0 disables cap)"),
-        ("risk_capital_cap_updated_at_ms", "1795035600000", "int", "Cutoff timestamp (ms, 2026-11-18T21:00:00Z) below which pre-cap legacy positions/orders are ignored by active cap enforcement"),
-        ("min_position_hold_sec", "300", "int", "Minimum hold duration in seconds before auto-deleverage may target a newly filled position"),
-        ("profit_gate_signal_exits", "true", "bool", "Block signal-driven CLOSE/FLIP exits while estimated net PnL (after fees/funding) is below signal_exit_min_net_profit_pct; hard SL/TP/trailing stops remain unrestricted"),
-        ("signal_exit_min_net_profit_pct", "0.0025", "float", "Minimum estimated net profit fraction of entry notional (0.25% default) required before signal CLOSE/FLIP may exit an open position when profit_gate_signal_exits=true"),
-        ("max_entry_spread_bps", "20.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders (20.0 bps default)"),
-        ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough equity drawdown fraction before halting new entries"),
+        ("risk_capital_cap_updated_at_ms", "0", "int", "Cutoff timestamp (ms; 0 disables legacy isolation) below which pre-cap holdings are excluded from active cap deleverage"),
+        ("min_position_hold_sec", "900", "int", "Minimum hold duration in seconds before signal closes or auto-deleverage may target a newly filled position"),
+        ("profit_gate_signal_exits", "false", "bool", "Block signal-driven CLOSE exits while estimated net PnL (after fees/funding) is below signal_exit_min_net_profit_pct; hard SL/TP/trailing stops and FLIP remain unrestricted"),
+        ("signal_exit_min_net_profit_pct", "0.0025", "float", "Minimum estimated net profit fraction of entry notional (0.25% default) required before signal CLOSE may exit an open position when profit_gate_signal_exits=true"),
+        ("max_entry_spread_bps", "10.0", "float", "Maximum allowed L2 bid-ask spread in basis points for new WORKING orders (10.0 bps default)"),
+        ("max_entry_oracle_deviation_pct", "0.015", "float", "Maximum fractional divergence allowed between entry mid/mark price and oracle price (1.5% default)"),
+        ("min_entry_l2_depth_mult", "1.5", "float", "Minimum 15bps L2 book depth multiplier relative to target order notional on both sides"),
+        ("min_entry_l2_depth_usdc", "150.0", "float", "Minimum absolute 15bps L2 book depth floor in USDC on both bid and ask sides"),
+        ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough uncapped equity drawdown fraction before halting new entries"),
+        ("min_equity_halt_usdc", "50.0", "float", "Minimum live equity floor in USDC below which ruin-halt blocks all new entries (R14-M12)"),
+        ("risk_per_trade_equity_pct", "0.005", "float", "Risk-parity per-trade equity risk budget fraction (0.5% default; 0.0 disables risk-parity cap)"),
+        ("auto_deleverage_confirm_ticks", "2", "int", "Consecutive breach ticks required before AUTO_DELEVERAGE closes OPEN holdings (1-5)"),
         ("scanner_interval_ms", "3000", "int", "Full-exchange 150+ perp scanner cadence in milliseconds (3s)"),
         ("priority_monitor_interval_ms", "1000", "int", "High-frequency priority watchlist & active order monitor cadence in milliseconds (1s)"),
-        ("core_min_day_volume_usdc", "2000000.0", "float", "Minimum 24h USDC volume on Mainnet ($2M; $5k on Testnet) for Core S1/S2 eligibility"),
-        ("event_min_day_volume_usdc", "500000.0", "float", "Minimum 24h USDC volume on Mainnet ($500k; $2.5k on Testnet) for Event S3 eligibility"),
+        ("core_min_day_volume_usdc", "2000000.0", "float", "Minimum 24h USDC volume on Mainnet ($2M) for Core S1/S2 eligibility"),
+        ("event_min_day_volume_usdc", "500000.0", "float", "Minimum 24h USDC volume on Mainnet ($500k) for Event S3 eligibility"),
+        ("core_min_open_interest_usdc", "250000.0", "float", "Minimum open interest on Mainnet ($250k) for Core S1/S2 eligibility"),
+        ("event_min_open_interest_usdc", "100000.0", "float", "Minimum open interest on Mainnet ($100k) for Event S3 eligibility"),
+        ("testnet_core_min_day_volume_usdc", "50000.0", "float", "Minimum 24h USDC volume on Testnet ($50k) for Core S1/S2 eligibility"),
+        ("testnet_event_min_day_volume_usdc", "50000.0", "float", "Minimum 24h USDC volume on Testnet ($50k) for Event S3 eligibility"),
+        ("testnet_core_min_open_interest_usdc", "50000.0", "float", "Minimum open interest on Testnet ($50k) for Core S1/S2 eligibility"),
+        ("testnet_event_min_open_interest_usdc", "50000.0", "float", "Minimum open interest on Testnet ($50k) for Event S3 eligibility"),
         ("s1_carry_mom_budget", "0.45", "float", "Sleeve 1 (Cross-Sectional Carry-Momentum & Beta Hedge) base portfolio weight budget"),
         ("s2_trend_breakout_budget", "0.40", "float", "Sleeve 2 (Breadth-Confirmed Multi-Speed Trend & Live 3s Breakout) base portfolio weight budget"),
-        ("s3_event_reversion_budget", "0.25", "float", "Sleeve 3 (Live Capitulation Flush & Funding Dislocation) base portfolio weight budget"),
+        ("s3_event_reversion_budget", "0.10", "float", "Sleeve 3 (Live Capitulation Flush & Funding Dislocation) base portfolio weight budget"),
+        ("enable_breadth_regime_gate", "true", "bool", "Gate counter-regime short/long entries when market breadth signals strong expansion/contraction"),
+        ("breadth_bull_block_shorts_threshold", "0.68", "float", "Bullish breadth threshold above which counter-regime short entries are blocked"),
+        ("breadth_bear_block_longs_threshold", "0.32", "float", "Bearish breadth threshold below which counter-regime long entries are blocked"),
+        ("early_loser_invalidation_enabled", "true", "bool", "Allow immediate exit of underwater losers on trend/momentum invalidation without holding full 900s floor"),
+        ("hysteresis_s1_reversal_mom_threshold", "0.08", "float", "Held-position S1 momentum reversal magnitude threshold"),
+        ("hysteresis_s1_support_composite_threshold", "0.025", "float", "Held-position S1 composite support threshold"),
         ("protective_stop_atr_mult", "2.2", "float", "Protective trailing stop distance multiplier in ATR units"),
         ("protective_stop_default_pct", "0.04", "float", "Default protective stop distance fraction of entry price (4.0%)"),
+        ("breakeven_trigger_r", "0.40", "float", "MFE excursion multiple in R-units activating the breakeven stop lock"),
+        ("breakeven_lock_r", "0.05", "float", "Profit lock multiple in R-units applied when breakeven tier activates"),
+        ("stagnation_time_stop_hours", "5.0", "float", "Hours open below stagnation_min_mfe_r before closing stagnant position (0 disables)"),
+        ("stagnation_min_mfe_r", "0.35", "float", "Minimum MFE in R-units required to keep a trade exempt from stagnation time-stop"),
         ("take_profit_atr_mult", "2.8", "float", "Take-profit target distance multiplier in ATR units (~1.27x reward-to-risk vs 2.2x ATR stop)"),
         ("take_profit_default_pct", "0.055", "float", "Default take-profit target distance fraction of entry price (5.5%)"),
         ("stop_out_cooldown_sec", "1800", "int", "Post-stop-out asset cooldown duration in seconds (30 minutes)"),
-        ("max_alo_chase_ticks", "5", "int", "Maximum 1-second ALO maker limit chase attempts before IOC crossing or cancel"),
-        ("alo_chase_threshold_bps", "4.0", "float", "Mid-price drift threshold in basis points triggering a 1s ALO limit price chase"),
+        ("max_alo_chase_ticks", "3", "int", "Maximum 1-second ALO maker limit chase attempts before IOC crossing or cancel"),
+        ("alo_chase_threshold_bps", "8.0", "float", "Mid-price drift threshold in basis points triggering a 1s ALO limit price chase"),
+        ("max_alo_chase_drift_bps", "60.0", "float", "Maximum cumulative ALO chase drift in bps from initial working limit price before abort"),
+        ("max_alo_oracle_drift_bps", "150.0", "float", "Maximum ALO chase drift in bps from oracle price before abort"),
+        ("chase_reject_cooldown_sec", "300", "int", "CHURN_GUARD cooldown in seconds after chase abort, repeated rejects, or ALO expiries"),
+        ("entry_ioc_max_slippage_bps", "25.0", "float", "Maximum adverse slippage in bps allowed on entry chase-to-IOC escalation"),
+        ("sl_trigger_limit_band_bps", "100.0", "float", "Stop-Limit protective trigger limit slippage band in bps (1.0% default)"),
+        ("passive_close_rest_sec", "8", "int", "Seconds to rest maker-first reduce-only close order before IOC ladder escalation"),
+        ("priority_unmonitored_alert_ticks", "10", "int", "Consecutive degraded 1s priority monitor ticks before firing CRITICAL unmonitored alert"),
+        ("hl_reject_backoff_threshold", "3", "int", "Exchange rejects within 15m window triggering chase_reject_cooldown_sec"),
+        ("alo_expiry_backoff_threshold", "2", "int", "ALO expiries within 30m window triggering full chase_reject_cooldown_sec"),
+        ("trigger_oracle_fallback_basis_bps", "50.0", "float", "Mark-vs-oracle basis threshold in bps switching 1s surveillance to oracle price"),
+        ("emergency_ioc_breach_pct", "0.015", "float", "Stop-breach gap fraction bypassing passive close wait for immediate IOC exit"),
+        ("hl_rest_weight_limit_per_min", "900", "int", "Self-imposed Hyperliquid REST weight budget per minute (300-1150)"),
+        ("candle_refresh_max_assets", "30", "int", "Maximum non-active top-volume assets refreshed per candle cycle"),
+        ("hl_websocket_enabled", "true", "bool", "Enable 2-connection Hyperliquid WebSocket Market+User cache with REST fallback"),
+        ("retention_snapshots_days", "30", "int", "Days to retain intraday portfolio_snapshots (daily YTD anchors preserved 400d)"),
+        ("retention_telemetry_days", "14", "int", "Days to retain telemetry_logs rows"),
+        ("retention_order_audit_days", "30", "int", "Days to retain order_audit rows for closed/cancelled positions"),
+        ("retention_cooldowns_days", "14", "int", "Days to retain inactive asset_cooldowns rows"),
+        ("retention_alert_queue_days", "30", "int", "Days to retain terminal alert_queue rows"),
+        ("retention_ohlcv_bars_days", "180", "int", "Days to retain ohlcv_bars rows beyond active open positions"),
+        ("retention_funding_events_days", "365", "int", "Days to retain settled funding_events rows"),
+        ("retention_prune_interval_sec", "3600", "int", "Automated DB retention prune cadence in seconds"),
+        ("retention_prune_batch_size", "1000", "int", "Batch delete size per retention prune pass"),
         ("maker_fee_bps", "1.5", "float", "Hyperliquid perpetual maker fee in basis points (1.5 bps)"),
         ("taker_fee_bps", "4.5", "float", "Hyperliquid perpetual taker fee in basis points (4.5 bps)"),
         ("alert_provider", "telegram", "string", "Primary real-time alert provider: telegram (HTML cards), discord, or both"),
@@ -356,8 +408,410 @@ pub fn default_v2_system_config_seeds(
         ("web_bind_host", "127.0.0.1", "string", "WebUI listening interface"),
         ("web_server_port", "8000", "int", "WebUI REST + SSE server listening port"),
         ("web_allow_remote_bind", "false", "bool", "Allow WebUI binding to non-loopback address without --allow-remote-bind"),
+        ("web_trusted_proxies", "", "string", "Comma-separated CIDR/IP allowlist of trusted reverse proxies for X-Forwarded-* headers"),
         ("enforce_master_key", "true", "bool", "Require external or keyfile Fernet master key"),
     ]
+}
+
+fn parse_f64_bounded(key: &str, raw: &str, min: f64, max: f64) -> Result<f64> {
+    let val = raw.trim().parse::<f64>().map_err(|_| {
+        AegisError::Validation(format!("'{key}' must be a valid number, got '{raw}'"))
+    })?;
+    if !val.is_finite() || val < min || val > max {
+        return Err(AegisError::Validation(format!(
+            "'{key}' must be between {min} and {max}, got {val}"
+        )));
+    }
+    Ok(val)
+}
+
+fn parse_i64_bounded(key: &str, raw: &str, min: i64, max: i64) -> Result<i64> {
+    let val = raw.trim().parse::<i64>().map_err(|_| {
+        AegisError::Validation(format!("'{key}' must be a valid integer, got '{raw}'"))
+    })?;
+    if val < min || val > max {
+        return Err(AegisError::Validation(format!(
+            "'{key}' must be between {min} and {max}, got {val}"
+        )));
+    }
+    Ok(val)
+}
+
+fn parse_bool_strict(key: &str, raw: &str) -> Result<()> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "false" => Ok(()),
+        _ => Err(AegisError::Validation(format!(
+            "'{key}' must be 'true' or 'false', got '{raw}'"
+        ))),
+    }
+}
+
+/// Canonical single-source validator for `system_config` key/value updates (`#18` Sec B).
+///
+/// Enforces key syntax, immutable security/internal-state rejection (`SecurityViolation`),
+/// raw ciphertext envelope rejection, enum membership, and bounded numeric ranges.
+pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> {
+    let clean_key = key.trim();
+    let clean_val = value_str.trim();
+
+    if clean_key.is_empty() || clean_key.len() > 128 {
+        return Err(AegisError::Validation(
+            "config_key must be between 1 and 128 characters".to_string(),
+        ));
+    }
+    if !clean_key
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        || !clean_key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AegisError::Validation(format!(
+            "Invalid config_key '{clean_key}': must start with an ASCII letter and contain only [A-Za-z0-9_]"
+        )));
+    }
+
+    if is_immutable_security_config_key(clean_key) {
+        return Err(AegisError::SecurityViolation(format!(
+            "Configuration key '{clean_key}' is an immutable security or internal state key and cannot be modified via Web API"
+        )));
+    }
+
+    if clean_val.starts_with("gAAAAAB") || clean_val.starts_with("ENC:") {
+        return Err(AegisError::Validation(format!(
+            "Configuration value for '{clean_key}' cannot be a raw encrypted ciphertext envelope"
+        )));
+    }
+
+    let lower_key = clean_key.to_ascii_lowercase();
+    match lower_key.as_str() {
+        "execution_mode" => {
+            if !matches!(
+                clean_val.to_ascii_uppercase().as_str(),
+                "PAPER" | "TESTNET" | "LIVE"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid execution_mode '{clean_val}': expected PAPER, TESTNET, or LIVE"
+                )));
+            }
+        }
+        "risk_tier" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "conservative" | "standard" | "aggressive" | "extreme" | "custom"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid risk_tier '{clean_val}': expected conservative, standard, aggressive, extreme, or custom"
+                )));
+            }
+        }
+        "alert_provider" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "telegram" | "discord" | "both"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid alert_provider '{clean_val}': expected telegram, discord, or both"
+                )));
+            }
+        }
+        "auto_rebalance_enabled"
+        | "profit_gate_signal_exits"
+        | "hl_websocket_enabled"
+        | "enable_breadth_regime_gate"
+        | "early_loser_invalidation_enabled" => {
+            parse_bool_strict(clean_key, clean_val)?;
+        }
+        "signal_exit_min_net_profit_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
+        }
+        "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
+            if !clean_val.is_empty() {
+                let _ = validate_evm_address(clean_val)?;
+            }
+        }
+        "vault_role" => {
+            if !matches!(
+                clean_val.to_ascii_lowercase().as_str(),
+                "follower" | "operator" | "none"
+            ) {
+                return Err(AegisError::Validation(format!(
+                    "Invalid vault_role '{clean_val}': expected follower, operator, or none"
+                )));
+            }
+        }
+        "vault_target_allocation_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
+        }
+        "vault_profit_sweep_threshold_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000.0)?;
+        }
+        "vault_notes" => {
+            if clean_val.chars().count() > 500 {
+                return Err(AegisError::Validation(
+                    "vault_notes must be at most 500 characters".to_string(),
+                ));
+            }
+            if value_str
+                .chars()
+                .any(|c| c.is_ascii_control() && !matches!(c, '\n' | '\r' | '\t'))
+            {
+                return Err(AegisError::Validation(
+                    "vault_notes must not contain ASCII control characters".to_string(),
+                ));
+            }
+        }
+        "private_key" => {
+            if clean_val.is_empty() {
+                return Err(AegisError::Validation(
+                    "private_key cannot be cleared to empty via Web API".to_string(),
+                ));
+            }
+            let _ = validate_private_key(clean_val)?;
+        }
+        "telegram_bot_token" => {
+            if clean_val.is_empty()
+                || !clean_val.contains(':')
+                || clean_val.chars().any(char::is_whitespace)
+            {
+                return Err(AegisError::Validation(
+                    "telegram_bot_token must be a valid non-empty bot token containing ':'"
+                        .to_string(),
+                ));
+            }
+        }
+        "telegram_chat_id" => {
+            if !clean_val.is_empty()
+                && (clean_val.len() > 64
+                    || clean_val.chars().any(char::is_whitespace)
+                    || clean_val.contains('<')
+                    || clean_val.contains('>'))
+            {
+                return Err(AegisError::Validation(
+                    "Invalid telegram_chat_id format".to_string(),
+                ));
+            }
+        }
+        "discord_webhook_url" => {
+            if !clean_val.is_empty()
+                && (!clean_val.starts_with("https://")
+                    || clean_val.chars().any(char::is_whitespace))
+            {
+                return Err(AegisError::Validation(
+                    "discord_webhook_url must start with https:// and contain no whitespace"
+                        .to_string(),
+                ));
+            }
+        }
+        "gemini_api_key" => {
+            if clean_val.is_empty() || clean_val.chars().any(char::is_whitespace) {
+                return Err(AegisError::Validation(
+                    "gemini_api_key must be non-empty without whitespace".to_string(),
+                ));
+            }
+        }
+        "target_leverage_multiplier" => {
+            parse_f64_bounded(clean_key, clean_val, 0.10, 3.00)?;
+        }
+        "max_gross_leverage_x" => {
+            parse_f64_bounded(clean_key, clean_val, 0.20, 5.00)?;
+        }
+        "max_single_asset_weight" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 1.00)?;
+        }
+        "min_rebalance_delta_weight" => {
+            parse_f64_bounded(clean_key, clean_val, 0.001, 0.50)?;
+        }
+        "min_order_notional_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 10.0, 100_000.0)?;
+        }
+        "initial_paper_equity_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 100.0, 100_000_000.0)?;
+        }
+        "live_exchange_equity_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
+        }
+        "risk_capital_cap_usdc" => {
+            let v = parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
+            if v > 0.0 && v < 10.0 {
+                return Err(AegisError::Validation(
+                    "risk_capital_cap_usdc must be 0 (disabled) or at least $10.00".to_string(),
+                ));
+            }
+        }
+        "core_min_day_volume_usdc" | "event_min_day_volume_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000_000.0)?;
+        }
+        "testnet_core_min_day_volume_usdc"
+        | "testnet_event_min_day_volume_usdc"
+        | "testnet_core_min_open_interest_usdc"
+        | "testnet_event_min_open_interest_usdc"
+        | "core_min_open_interest_usdc"
+        | "event_min_open_interest_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 1_000.0, 100_000_000.0)?;
+        }
+        "s1_carry_mom_budget" | "s2_trend_breakout_budget" | "s3_event_reversion_budget" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 1.50)?;
+        }
+        "protective_stop_atr_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.5, 15.0)?;
+        }
+        "protective_stop_default_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.002, 0.50)?;
+        }
+        "take_profit_atr_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.5, 30.0)?;
+        }
+        "take_profit_default_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.002, 2.00)?;
+        }
+        "alo_chase_threshold_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 0.5, 500.0)?;
+        }
+        "max_alo_chase_drift_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 5.0, 300.0)?;
+        }
+        "max_alo_oracle_drift_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 20.0, 500.0)?;
+        }
+        "chase_reject_cooldown_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 30, 3_600)?;
+        }
+        "entry_ioc_max_slippage_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 5.0, 200.0)?;
+        }
+        "sl_trigger_limit_band_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 20.0, 350.0)?;
+        }
+        "passive_close_rest_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 60)?;
+        }
+        "priority_unmonitored_alert_ticks" => {
+            parse_i64_bounded(clean_key, clean_val, 3, 300)?;
+        }
+        "hl_reject_backoff_threshold" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 20)?;
+        }
+        "alo_expiry_backoff_threshold" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 10)?;
+        }
+        "trigger_oracle_fallback_basis_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 10.0, 500.0)?;
+        }
+        "emergency_ioc_breach_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.005, 0.05)?;
+        }
+        "max_entry_oracle_deviation_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.002, 0.05)?;
+        }
+        "min_entry_l2_depth_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.25, 10.0)?;
+        }
+        "min_entry_l2_depth_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 25.0, 50_000.0)?;
+        }
+        "auto_deleverage_confirm_ticks" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 5)?;
+        }
+        "hl_rest_weight_limit_per_min" => {
+            parse_i64_bounded(clean_key, clean_val, 300, 1_150)?;
+        }
+        "candle_refresh_max_assets" => {
+            parse_i64_bounded(clean_key, clean_val, 5, 150)?;
+        }
+        "breadth_bull_block_shorts_threshold" => {
+            parse_f64_bounded(clean_key, clean_val, 0.55, 0.95)?;
+        }
+        "breadth_bear_block_longs_threshold" => {
+            parse_f64_bounded(clean_key, clean_val, 0.05, 0.45)?;
+        }
+        "breakeven_trigger_r" => {
+            parse_f64_bounded(clean_key, clean_val, 0.15, 1.50)?;
+        }
+        "breakeven_lock_r" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
+        }
+        "stagnation_time_stop_hours" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 72.0)?;
+        }
+        "stagnation_min_mfe_r" => {
+            parse_f64_bounded(clean_key, clean_val, 0.05, 2.0)?;
+        }
+        "hysteresis_s1_reversal_mom_threshold" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 0.50)?;
+        }
+        "hysteresis_s1_support_composite_threshold" => {
+            parse_f64_bounded(clean_key, clean_val, 0.005, 0.25)?;
+        }
+        "risk_per_trade_equity_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 0.05)?;
+        }
+        "min_equity_halt_usdc" => {
+            parse_f64_bounded(clean_key, clean_val, 1.0, 100_000.0)?;
+        }
+        "retention_snapshots_days"
+        | "retention_telemetry_days"
+        | "retention_order_audit_days"
+        | "retention_cooldowns_days"
+        | "retention_alert_queue_days" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 365)?;
+        }
+        "retention_ohlcv_bars_days" | "retention_funding_events_days" => {
+            parse_i64_bounded(clean_key, clean_val, 30, 1_095)?;
+        }
+        "retention_prune_interval_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 300, 86_400)?;
+        }
+        "retention_prune_batch_size" => {
+            parse_i64_bounded(clean_key, clean_val, 100, 5_000)?;
+        }
+        "maker_fee_bps" | "taker_fee_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
+        }
+        "max_entry_spread_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 1.0, 500.0)?;
+        }
+        "max_daily_drawdown_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 0.95)?;
+        }
+        "max_open_positions" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
+        }
+        "min_entry_interval_sec" | "min_position_hold_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 86_400)?;
+        }
+        "scanner_interval_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 500, 60_000)?;
+        }
+        "priority_monitor_interval_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 250, 10_000)?;
+        }
+        "stop_out_cooldown_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 60, 604_800)?;
+        }
+        "max_alo_chase_ticks" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
+        }
+        "alert_dedup_window_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 86_400_000)?;
+        }
+        "alert_http_timeout_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 2, 60)?;
+        }
+        "telemetry_queue_capacity" => {
+            parse_i64_bounded(clean_key, clean_val, 64, 65_536)?;
+        }
+        "web_server_port" => {
+            parse_i64_bounded(clean_key, clean_val, 1024, 65535)?;
+        }
+        _ => {
+            return Err(AegisError::Validation(format!(
+                "Unknown or unsupported configuration key '{clean_key}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -439,15 +893,78 @@ mod tests {
     fn test_default_seeds_contain_cap_and_safe_bind() {
         let seeds = default_v2_system_config_seeds();
         let find = |k: &str| seeds.iter().find(|(key, ..)| *key == k).map(|s| s.1);
+
+        // Tier-1 & R14-H1 updated seed defaults
         assert_eq!(find("risk_capital_cap_usdc"), Some("1000.0"));
-        assert_eq!(
-            find("risk_capital_cap_updated_at_ms"),
-            Some("1795035600000")
-        );
-        assert_eq!(find("min_position_hold_sec"), Some("300"));
-        assert_eq!(find("profit_gate_signal_exits"), Some("true"));
+        assert_eq!(find("risk_capital_cap_updated_at_ms"), Some("0"));
+        assert_eq!(find("max_single_asset_weight"), Some("0.15"));
+        assert_eq!(find("min_position_hold_sec"), Some("900"));
+        assert_eq!(find("profit_gate_signal_exits"), Some("false"));
         assert_eq!(find("signal_exit_min_net_profit_pct"), Some("0.0025"));
-        assert_eq!(find("max_entry_spread_bps"), Some("20.0"));
+        assert_eq!(find("max_entry_spread_bps"), Some("10.0"));
+        assert_eq!(find("s3_event_reversion_budget"), Some("0.10"));
+        assert_eq!(find("max_alo_chase_ticks"), Some("3"));
+        assert_eq!(find("alo_chase_threshold_bps"), Some("8.0"));
+
+        // New P0/P1/R14 canonical seeds
+        assert_eq!(find("max_alo_chase_drift_bps"), Some("60.0"));
+        assert_eq!(find("max_alo_oracle_drift_bps"), Some("150.0"));
+        assert_eq!(find("chase_reject_cooldown_sec"), Some("300"));
+        assert_eq!(find("entry_ioc_max_slippage_bps"), Some("25.0"));
+        assert_eq!(find("sl_trigger_limit_band_bps"), Some("100.0"));
+        assert_eq!(find("passive_close_rest_sec"), Some("8"));
+        assert_eq!(find("priority_unmonitored_alert_ticks"), Some("10"));
+        assert_eq!(find("hl_reject_backoff_threshold"), Some("3"));
+        assert_eq!(find("alo_expiry_backoff_threshold"), Some("2"));
+        assert_eq!(find("trigger_oracle_fallback_basis_bps"), Some("50.0"));
+        assert_eq!(find("emergency_ioc_breach_pct"), Some("0.015"));
+        assert_eq!(find("max_entry_oracle_deviation_pct"), Some("0.015"));
+        assert_eq!(find("min_entry_l2_depth_mult"), Some("1.5"));
+        assert_eq!(find("min_entry_l2_depth_usdc"), Some("150.0"));
+        assert_eq!(find("testnet_core_min_day_volume_usdc"), Some("50000.0"));
+        assert_eq!(find("testnet_event_min_day_volume_usdc"), Some("50000.0"));
+        assert_eq!(find("testnet_core_min_open_interest_usdc"), Some("50000.0"));
+        assert_eq!(
+            find("testnet_event_min_open_interest_usdc"),
+            Some("50000.0")
+        );
+        assert_eq!(find("core_min_open_interest_usdc"), Some("250000.0"));
+        assert_eq!(find("event_min_open_interest_usdc"), Some("100000.0"));
+        assert_eq!(find("auto_deleverage_confirm_ticks"), Some("2"));
+        assert_eq!(find("hl_rest_weight_limit_per_min"), Some("900"));
+        assert_eq!(find("candle_refresh_max_assets"), Some("30"));
+        assert_eq!(find("hl_websocket_enabled"), Some("true"));
+        assert_eq!(find("enable_breadth_regime_gate"), Some("true"));
+        assert_eq!(find("breadth_bull_block_shorts_threshold"), Some("0.68"));
+        assert_eq!(find("breadth_bear_block_longs_threshold"), Some("0.32"));
+        assert_eq!(find("breakeven_trigger_r"), Some("0.40"));
+        assert_eq!(find("breakeven_lock_r"), Some("0.05"));
+        assert_eq!(find("stagnation_time_stop_hours"), Some("5.0"));
+        assert_eq!(find("stagnation_min_mfe_r"), Some("0.35"));
+        assert_eq!(find("early_loser_invalidation_enabled"), Some("true"));
+        assert_eq!(find("hysteresis_s1_reversal_mom_threshold"), Some("0.08"));
+        assert_eq!(
+            find("hysteresis_s1_support_composite_threshold"),
+            Some("0.025")
+        );
+        assert_eq!(find("risk_per_trade_equity_pct"), Some("0.005"));
+        assert_eq!(find("min_equity_halt_usdc"), Some("50.0"));
+        assert_eq!(find("retention_snapshots_days"), Some("30"));
+        assert_eq!(find("retention_telemetry_days"), Some("14"));
+        assert_eq!(find("retention_order_audit_days"), Some("30"));
+        assert_eq!(find("retention_cooldowns_days"), Some("14"));
+        assert_eq!(find("retention_alert_queue_days"), Some("30"));
+        assert_eq!(find("retention_ohlcv_bars_days"), Some("180"));
+        assert_eq!(find("retention_funding_events_days"), Some("365"));
+        assert_eq!(find("retention_prune_interval_sec"), Some("3600"));
+        assert_eq!(find("retention_prune_batch_size"), Some("1000"));
+        assert_eq!(find("web_trusted_proxies"), Some(""));
+        assert_eq!(find("priority_monitor_health_json"), Some(""));
+        assert_eq!(find("ws_stream_status_json"), Some(""));
+        assert_eq!(find("live_exchange_maker_fee_bps"), Some("0.0"));
+        assert_eq!(find("live_exchange_taker_fee_bps"), Some("0.0"));
+
+        // Preserved seeds
         assert_eq!(find("core_min_day_volume_usdc"), Some("2000000.0"));
         assert_eq!(find("event_min_day_volume_usdc"), Some("500000.0"));
         assert_eq!(find("max_daily_drawdown_pct"), Some("0.15"));
@@ -470,6 +987,38 @@ mod tests {
         assert_eq!(find("live_exchange_account_mode"), Some("default"));
         assert_eq!(find("live_exchange_perp_margin_equity_usdc"), Some("0.0"));
         assert_eq!(find("live_exchange_portfolio_pnl_json"), Some(""));
+
+        // Ensure zero duplicate keys and every non-immutable, non-empty-secret seed validates
+        let mut seen = std::collections::HashSet::new();
+        for (k, v, _, _) in &seeds {
+            assert!(seen.insert(*k), "duplicate seed key {k}");
+            if is_immutable_security_config_key(k) {
+                assert!(matches!(
+                    validate_core_config_key_value(k, v),
+                    Err(AegisError::SecurityViolation(_))
+                ));
+            } else if !matches!(*k, "private_key" | "telegram_bot_token") {
+                assert!(
+                    validate_core_config_key_value(k, v).is_ok(),
+                    "seed {k}={v} failed validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_core_config_key_value_bounds_and_security() {
+        assert!(validate_core_config_key_value("max_alo_chase_drift_bps", "60.0").is_ok());
+        assert!(validate_core_config_key_value("max_alo_chase_drift_bps", "301.0").is_err());
+        assert!(validate_core_config_key_value("risk_per_trade_equity_pct", "0.0").is_ok());
+        assert!(validate_core_config_key_value("risk_per_trade_equity_pct", "0.06").is_err());
+        assert!(validate_core_config_key_value("retention_ohlcv_bars_days", "29").is_err());
+        assert!(validate_core_config_key_value("retention_ohlcv_bars_days", "180").is_ok());
+        assert!(validate_core_config_key_value("hl_websocket_enabled", "maybe").is_err());
+        assert!(matches!(
+            validate_core_config_key_value("schema_migration_version", "2.1.0"),
+            Err(AegisError::SecurityViolation(_))
+        ));
     }
 
     #[test]

@@ -118,8 +118,18 @@ pub fn signal_exit_passes_profit_gate(
         && h.quantity > 0.0
     {
         match OrderSide::parse(&h.side) {
-            OrderSide::Long => (h.mark_price - h.entry_price) * h.quantity,
-            OrderSide::Short => (h.entry_price - h.mark_price) * h.quantity,
+            Ok(OrderSide::Long) => (h.mark_price - h.entry_price) * h.quantity,
+            Ok(OrderSide::Short) => (h.entry_price - h.mark_price) * h.quantity,
+            Err(err) => {
+                tracing::error!(
+                    position_id = h.position_id,
+                    symbol = %h.symbol,
+                    side = %h.side,
+                    error = %err,
+                    "Invalid OrderSide in signal_exit_passes_profit_gate; failing closed"
+                );
+                return (false, 0.0, 0.0);
+            }
         }
     } else if h.unrealized_pnl_usdc.is_finite() {
         h.unrealized_pnl_usdc
@@ -628,7 +638,7 @@ impl ExecutionEngine {
         let eq = base_equity_usdc.max(100.0);
         let mut current_weights: HashMap<i64, f64> = HashMap::new();
         for h in &held {
-            let side = OrderSide::parse(&h.side);
+            let side = OrderSide::parse(&h.side)?;
             let w = if h.portfolio_weight.abs() > 1e-6 {
                 h.portfolio_weight.abs() * side.sign()
             } else {
@@ -637,7 +647,7 @@ impl ExecutionEngine {
             *current_weights.entry(h.asset_id).or_insert(0.0) += w;
         }
         for o in &ordered {
-            let side = OrderSide::parse(&o.side);
+            let side = OrderSide::parse(&o.side)?;
             let notional = o.limit_price * o.requested_quantity;
             let w = (notional / eq) * side.sign();
             *current_weights.entry(o.asset_id).or_insert(0.0) += w;
@@ -870,8 +880,10 @@ impl ExecutionEngine {
                 let a_young = is_young(a);
                 let b_young = is_young(b);
                 a_young.cmp(&b_young).then_with(|| {
-                    let a_align = a.latest_target_weight * OrderSide::parse(&a.side).sign();
-                    let b_align = b.latest_target_weight * OrderSide::parse(&b.side).sign();
+                    let a_align = a.latest_target_weight
+                        * OrderSide::parse(&a.side).map(|s| s.sign()).unwrap_or(0.0);
+                    let b_align = b.latest_target_weight
+                        * OrderSide::parse(&b.side).map(|s| s.sign()).unwrap_or(0.0);
                     a_align.total_cmp(&b_align).then_with(|| {
                         b.committed_notional_usdc
                             .total_cmp(&a.committed_notional_usdc)
@@ -889,12 +901,14 @@ impl ExecutionEngine {
                 if self.is_illiquid_close_backed_off(h.position_id, check_ts) {
                     continue;
                 }
-                let deleverage_cd =
-                    if h.latest_target_weight * OrderSide::parse(&h.side).sign() < 0.0 {
-                        0
-                    } else {
-                        900
-                    };
+                let deleverage_cd = if h.latest_target_weight
+                    * OrderSide::parse(&h.side).map(|s| s.sign()).unwrap_or(0.0)
+                    < 0.0
+                {
+                    0
+                } else {
+                    900
+                };
                 if let Ok(rep) = self.close_or_cancel_position(
                     h.position_id,
                     "AUTO_DELEVERAGE_RISK_CAP",
@@ -1576,7 +1590,7 @@ impl ExecutionEngine {
                 }
             }
             PositionStatus::Open => {
-                let side = OrderSide::parse(&pos.side);
+                let side = OrderSide::parse(&pos.side)?;
                 let mut exit_px = if asset.mark_price > 0.0 {
                     asset.mark_price
                 } else {

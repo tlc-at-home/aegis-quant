@@ -29,7 +29,7 @@ pub fn is_sensitive_config_key(key: &str) -> bool {
         || k.contains("webhook")
 }
 
-/// Security-critical config keys that cannot be weakened or mutated via the Web API.
+/// Security-critical and read-only internal state config keys that cannot be weakened or mutated via the Web API.
 pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "enforce_master_key",
     "web_auth_enabled",
@@ -40,6 +40,7 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "web_cors_allowed_origins",
     "web_allowed_hosts",
     "web_trust_proxy_headers",
+    "web_trusted_proxies",
     "web_cookie_secure",
     "web_api_token",
     "allow_web_live_mode",
@@ -52,7 +53,26 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "hyperliquid_exchange_url",
     "hyperliquid_testnet_exchange_url",
     "hyperliquid_allowed_hosts",
+    "platform_version",
+    "schema_migration_version",
+    "risk_capital_cap_updated_at_ms",
+    "hyperliquid_last_nonce",
+    "last_db_backup_ms",
+    "last_entry_order_ms",
     "live_vault_info_json",
+    "live_exchange_equity_synced_at_ms",
+    "live_exchange_margin_used_usdc",
+    "live_exchange_withdrawable_usdc",
+    "live_exchange_open_orders_count",
+    "live_exchange_spot_usdc",
+    "live_exchange_spot_synced_at_ms",
+    "live_exchange_account_mode",
+    "live_exchange_perp_margin_equity_usdc",
+    "live_exchange_portfolio_pnl_json",
+    "live_exchange_maker_fee_bps",
+    "live_exchange_taker_fee_bps",
+    "priority_monitor_health_json",
+    "ws_stream_status_json",
 ];
 
 /// Returns true if `key` is an immutable security policy key that cannot be modified via the Web API.
@@ -221,6 +241,19 @@ mod tests {
         assert!(is_immutable_security_config_key("ALLOW_WEB_LIVE_MODE"));
         assert!(is_immutable_security_config_key("live_vault_info_json"));
         assert!(is_immutable_security_config_key(" LIVE_VAULT_INFO_JSON "));
+        for k in [
+            "web_trusted_proxies",
+            "priority_monitor_health_json",
+            "ws_stream_status_json",
+            "live_exchange_maker_fee_bps",
+            "live_exchange_taker_fee_bps",
+            "schema_migration_version",
+        ] {
+            assert!(
+                is_immutable_security_config_key(k),
+                "expected immutable: {k}"
+            );
+        }
         assert_eq!(mask_identifier(""), "");
         assert_eq!(mask_identifier("αβγδ"), "***");
         assert_eq!(mask_identifier("🔥🚀αβγδε"), "🔥🚀***δε");

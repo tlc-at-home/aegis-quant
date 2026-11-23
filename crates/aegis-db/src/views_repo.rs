@@ -77,6 +77,7 @@ impl DatabaseManager {
                     s3_weight_contrib: r.get(25).unwrap_or_default(),
                     latest_target_weight: r.get(26).unwrap_or_default(),
                     latest_delta_weight: r.get(27).unwrap_or_default(),
+                    created_at_ms: 0,
                     opened_at_ms: r.get::<Option<i64>, _>(28).unwrap_or(None),
                     updated_at_ms: r.get(29).unwrap_or_default(),
                 }

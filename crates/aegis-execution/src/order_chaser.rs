@@ -565,7 +565,7 @@ impl OrderChaser {
             });
         }
 
-        let side = OrderSide::parse(&ordered.side);
+        let side = OrderSide::parse(&ordered.side)?;
         let tick = asset.tick_size.max(1e-8);
         let live_mid = if asset.mid_price > 0.0 {
             asset.mid_price

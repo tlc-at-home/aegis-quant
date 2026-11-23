@@ -203,7 +203,7 @@ impl DatabaseManager {
             )));
         }
 
-        let side = OrderSide::parse(&side_str);
+        let side = OrderSide::parse(&side_str)?;
         let take_profit_px = derive_take_profit_px(side, fill_price, protective_stop_px);
 
         tx.exec_drop(
@@ -289,7 +289,7 @@ impl DatabaseManager {
         let pos = self
             .get_position_by_id(position_id)?
             .ok_or_else(|| AegisError::Database(format!("Position {position_id} not found")))?;
-        let side = OrderSide::parse(&pos.side);
+        let side = OrderSide::parse(&pos.side)?;
         let qty = pos.filled_quantity.max(0.0);
         let raw_upnl = (mark_price - pos.entry_price) * qty * side.sign();
         let upnl = round_dp(raw_upnl, 4);
@@ -388,7 +388,7 @@ impl DatabaseManager {
             else {
                 continue;
             };
-            let side = OrderSide::parse(side_str);
+            let side = OrderSide::parse(side_str)?;
             let eff_qty = qty.max(0.0);
             let upnl = round_dp((mark_price - *entry_px) * eff_qty * side.sign(), 4);
             let high = hi_seen.max(mark_price);
@@ -536,7 +536,7 @@ impl DatabaseManager {
             )));
         }
 
-        let side = OrderSide::parse(&side_str);
+        let side = OrderSide::parse(&side_str)?;
         let qty = filled_quantity.max(0.0);
         let gross_pnl = (exit_price - entry_price) * qty * side.sign();
         let total_fees = existing_fees_paid + fees_paid_usdc;

@@ -11,6 +11,7 @@ members = [
     "crates/aegis-telemetry",
     "crates/aegis-web",
     "crates/aegis-cli",
+    "crates/aegis-test-support",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ aegis-execution = { path = "crates/aegis-execution" }
 aegis-backtest = { path = "crates/aegis-backtest" }
 aegis-telemetry = { path = "crates/aegis-telemetry" }
 aegis-web = { path = "crates/aegis-web" }
+aegis-test-support = { path = "crates/aegis-test-support" }
 
 anyhow = "1.0"
 thiserror = "1.0"
@@ -37,6 +39,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 mysql = "28.0"
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }

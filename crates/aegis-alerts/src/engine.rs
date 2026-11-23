@@ -719,6 +719,7 @@ pub fn send_test_alert(db: &DatabaseManager) -> AlertDispatchResult {
             .unwrap_or_else(|_| aegis_core::PortfolioSnapshot {
                 id: 0,
                 total_equity_usdc: cfg.get_f64("initial_paper_equity_usdc", 10_000.0),
+                uncapped_equity_usdc: cfg.get_f64("initial_paper_equity_usdc", 10_000.0),
                 available_cash_usdc: cfg.get_f64("initial_paper_equity_usdc", 10_000.0),
                 reserved_order_cash_usdc: 0.0,
                 committed_notional_usdc: 0.0,

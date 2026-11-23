@@ -1,8 +1,10 @@
 //! Typed JSON DTOs and MariaDB 13.0 + 7 SQL Views dashboard payload builders (`aegis-web::payloads`).
 
 use aegis_core::{
-    is_immutable_security_config_key, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
-    now_ms, round_dp, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView,
+    build_vault_info_payload_from_config, compute_drawdown_breaker_status,
+    compute_equity_basis_summary, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
+    now_ms, partition_cap_epoch_holdings, round_dp, synthesize_fallback_snapshot,
+    validate_core_config_key_value, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView,
     DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset, HeldAssetView, OrderAuditRecord,
     OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result, RiskTier,
     SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord,
@@ -229,306 +231,14 @@ pub fn json_value_to_config_string(val: &Value) -> String {
     }
 }
 
-fn parse_f64_bounded(key: &str, raw: &str, min: f64, max: f64) -> Result<f64> {
-    let val = raw.trim().parse::<f64>().map_err(|_| {
-        AegisError::Validation(format!("'{key}' must be a valid number, got '{raw}'"))
-    })?;
-    if !val.is_finite() || val < min || val > max {
-        return Err(AegisError::Validation(format!(
-            "'{key}' must be between {min} and {max}, got {val}"
-        )));
-    }
-    Ok(val)
-}
-
-fn parse_i64_bounded(key: &str, raw: &str, min: i64, max: i64) -> Result<i64> {
-    let val = raw.trim().parse::<i64>().map_err(|_| {
-        AegisError::Validation(format!("'{key}' must be a valid integer, got '{raw}'"))
-    })?;
-    if val < min || val > max {
-        return Err(AegisError::Validation(format!(
-            "'{key}' must be between {min} and {max}, got {val}"
-        )));
-    }
-    Ok(val)
-}
-
-fn parse_bool_strict(key: &str, raw: &str) -> Result<()> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "true" | "false" => Ok(()),
-        _ => Err(AegisError::Validation(format!(
-            "'{key}' must be 'true' or 'false', got '{raw}'"
-        ))),
-    }
-}
-
 /// Validates a configuration update before persisting to MariaDB `system_config`.
-/// Enforces key syntax, immutable security blocks, numeric/enum bounds, and rejects raw `"gAAAAAB"` strings.
+/// Delegates canonical rules to [`aegis_core::validate_core_config_key_value`] and enforces SSRF checks on `discord_webhook_url`.
 pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
-    let clean_key = key.trim();
-    let clean_val = value_str.trim();
-
-    if clean_key.is_empty() || clean_key.len() > 128 {
-        return Err(AegisError::Validation(
-            "config_key must be between 1 and 128 characters".to_string(),
-        ));
-    }
-    if !clean_key
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic())
-        || !clean_key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AegisError::Validation(format!(
-            "Invalid config_key '{clean_key}': must start with an ASCII letter and contain only [A-Za-z0-9_]"
-        )));
-    }
-
-    let lower_key = clean_key.to_ascii_lowercase();
-    if is_immutable_security_config_key(clean_key)
-        || matches!(
-            lower_key.as_str(),
-            "web_require_auth"
-                | "hyperliquid_testnet"
-                | "platform_version"
-                | "risk_capital_cap_updated_at_ms"
-                | "hyperliquid_last_nonce"
-                | "last_db_backup_ms"
-                | "last_entry_order_ms"
-                | "live_vault_info_json"
-                | "live_exchange_equity_synced_at_ms"
-                | "live_exchange_margin_used_usdc"
-                | "live_exchange_withdrawable_usdc"
-                | "live_exchange_open_orders_count"
-                | "live_exchange_spot_usdc"
-                | "live_exchange_spot_synced_at_ms"
-                | "live_exchange_account_mode"
-                | "live_exchange_perp_margin_equity_usdc"
-                | "live_exchange_portfolio_pnl_json"
-        )
-    {
-        return Err(AegisError::SecurityViolation(format!(
-            "Configuration key '{clean_key}' is an immutable security or internal state key and cannot be modified via Web API"
-        )));
-    }
-
-    if clean_val.starts_with("gAAAAAB") || clean_val.starts_with("ENC:") {
-        return Err(AegisError::Validation(format!(
-            "Configuration value for '{clean_key}' cannot be a raw encrypted ciphertext envelope"
-        )));
-    }
-
-    match lower_key.as_str() {
-        "execution_mode" => {
-            if !matches!(
-                clean_val.to_ascii_uppercase().as_str(),
-                "PAPER" | "TESTNET" | "LIVE"
-            ) {
-                return Err(AegisError::Validation(format!(
-                    "Invalid execution_mode '{clean_val}': expected PAPER, TESTNET, or LIVE"
-                )));
-            }
-        }
-        "risk_tier" => {
-            if !matches!(
-                clean_val.to_ascii_lowercase().as_str(),
-                "conservative" | "standard" | "aggressive" | "extreme" | "custom"
-            ) {
-                return Err(AegisError::Validation(format!(
-                    "Invalid risk_tier '{clean_val}': expected conservative, standard, aggressive, extreme, or custom"
-                )));
-            }
-        }
-        "alert_provider" => {
-            if !matches!(
-                clean_val.to_ascii_lowercase().as_str(),
-                "telegram" | "discord" | "both"
-            ) {
-                return Err(AegisError::Validation(format!(
-                    "Invalid alert_provider '{clean_val}': expected telegram, discord, or both"
-                )));
-            }
-        }
-        "auto_rebalance_enabled" | "profit_gate_signal_exits" => {
-            parse_bool_strict(clean_key, clean_val)?;
-        }
-        "signal_exit_min_net_profit_pct" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
-        }
-        "wallet_address" | "hyperliquid_agent_address" | "hyperliquid_vault_address" => {
-            if !clean_val.is_empty() {
-                let _ = aegis_core::validate_evm_address(clean_val)?;
-            }
-        }
-        "vault_role" => {
-            if !matches!(
-                clean_val.to_ascii_lowercase().as_str(),
-                "follower" | "operator" | "none"
-            ) {
-                return Err(AegisError::Validation(format!(
-                    "Invalid vault_role '{clean_val}': expected follower, operator, or none"
-                )));
-            }
-        }
-        "vault_target_allocation_pct" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
-        }
-        "vault_profit_sweep_threshold_usdc" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000.0)?;
-        }
-        "vault_notes" => {
-            if clean_val.chars().count() > 500 {
-                return Err(AegisError::Validation(
-                    "vault_notes must be at most 500 characters".to_string(),
-                ));
-            }
-            if value_str
-                .chars()
-                .any(|c| c.is_ascii_control() && !matches!(c, '\n' | '\r' | '\t'))
-            {
-                return Err(AegisError::Validation(
-                    "vault_notes must not contain ASCII control characters".to_string(),
-                ));
-            }
-        }
-        "private_key" => {
-            if clean_val.is_empty() {
-                return Err(AegisError::Validation(
-                    "private_key cannot be cleared to empty via Web API".to_string(),
-                ));
-            }
-            let _ = aegis_core::validate_private_key(clean_val)?;
-        }
-        "telegram_bot_token" => {
-            if clean_val.is_empty()
-                || !clean_val.contains(':')
-                || clean_val.chars().any(char::is_whitespace)
-            {
-                return Err(AegisError::Validation(
-                    "telegram_bot_token must be a valid non-empty bot token containing ':'"
-                        .to_string(),
-                ));
-            }
-        }
-        "telegram_chat_id" => {
-            if !clean_val.is_empty()
-                && (clean_val.len() > 64
-                    || clean_val.chars().any(char::is_whitespace)
-                    || clean_val.contains('<')
-                    || clean_val.contains('>'))
-            {
-                return Err(AegisError::Validation(
-                    "Invalid telegram_chat_id format".to_string(),
-                ));
-            }
-        }
-        "discord_webhook_url" => {
-            if !clean_val.is_empty() {
-                let _ = aegis_alerts::validate_discord_webhook_url(clean_val)?;
-            }
-        }
-        "gemini_api_key" => {
-            if clean_val.is_empty() || clean_val.chars().any(char::is_whitespace) {
-                return Err(AegisError::Validation(
-                    "gemini_api_key must be non-empty without whitespace".to_string(),
-                ));
-            }
-        }
-        "target_leverage_multiplier" => {
-            parse_f64_bounded(clean_key, clean_val, 0.10, 3.00)?;
-        }
-        "max_gross_leverage_x" => {
-            parse_f64_bounded(clean_key, clean_val, 0.20, 5.00)?;
-        }
-        "max_single_asset_weight" => {
-            parse_f64_bounded(clean_key, clean_val, 0.01, 1.00)?;
-        }
-        "min_rebalance_delta_weight" => {
-            parse_f64_bounded(clean_key, clean_val, 0.001, 0.50)?;
-        }
-        "min_order_notional_usdc" => {
-            parse_f64_bounded(clean_key, clean_val, 10.0, 100_000.0)?;
-        }
-        "initial_paper_equity_usdc" => {
-            parse_f64_bounded(clean_key, clean_val, 100.0, 100_000_000.0)?;
-        }
-        "live_exchange_equity_usdc" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
-        }
-        "risk_capital_cap_usdc" => {
-            let v = parse_f64_bounded(clean_key, clean_val, 0.0, 100_000_000.0)?;
-            if v > 0.0 && v < 10.0 {
-                return Err(AegisError::Validation(
-                    "risk_capital_cap_usdc must be 0 (disabled) or at least $10.00".to_string(),
-                ));
-            }
-        }
-        "core_min_day_volume_usdc" | "event_min_day_volume_usdc" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 10_000_000_000.0)?;
-        }
-        "s1_carry_mom_budget" | "s2_trend_breakout_budget" | "s3_event_reversion_budget" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 1.50)?;
-        }
-        "protective_stop_atr_mult" => {
-            parse_f64_bounded(clean_key, clean_val, 0.5, 15.0)?;
-        }
-        "protective_stop_default_pct" => {
-            parse_f64_bounded(clean_key, clean_val, 0.002, 0.50)?;
-        }
-        "take_profit_atr_mult" => {
-            parse_f64_bounded(clean_key, clean_val, 0.5, 30.0)?;
-        }
-        "take_profit_default_pct" => {
-            parse_f64_bounded(clean_key, clean_val, 0.002, 2.00)?;
-        }
-        "alo_chase_threshold_bps" => {
-            parse_f64_bounded(clean_key, clean_val, 0.1, 500.0)?;
-        }
-        "maker_fee_bps" | "taker_fee_bps" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 100.0)?;
-        }
-        "max_entry_spread_bps" => {
-            parse_f64_bounded(clean_key, clean_val, 1.0, 1000.0)?;
-        }
-        "max_daily_drawdown_pct" => {
-            parse_f64_bounded(clean_key, clean_val, 0.01, 0.95)?;
-        }
-        "max_open_positions" => {
-            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
-        }
-        "min_entry_interval_sec" | "min_position_hold_sec" => {
-            parse_i64_bounded(clean_key, clean_val, 0, 86_400)?;
-        }
-        "scanner_interval_ms" => {
-            parse_i64_bounded(clean_key, clean_val, 500, 60_000)?;
-        }
-        "priority_monitor_interval_ms" => {
-            parse_i64_bounded(clean_key, clean_val, 250, 10_000)?;
-        }
-        "stop_out_cooldown_sec" => {
-            parse_i64_bounded(clean_key, clean_val, 60, 604_800)?;
-        }
-        "max_alo_chase_ticks" => {
-            parse_i64_bounded(clean_key, clean_val, 1, 50)?;
-        }
-        "alert_dedup_window_ms" => {
-            parse_i64_bounded(clean_key, clean_val, 0, 86_400_000)?;
-        }
-        "alert_http_timeout_sec" => {
-            parse_i64_bounded(clean_key, clean_val, 2, 60)?;
-        }
-        "telemetry_queue_capacity" => {
-            parse_i64_bounded(clean_key, clean_val, 64, 65_536)?;
-        }
-        "web_server_port" => {
-            parse_i64_bounded(clean_key, clean_val, 1024, 65535)?;
-        }
-        _ => {
-            return Err(AegisError::Validation(format!(
-                "Unknown or unsupported configuration key '{clean_key}'"
-            )));
+    validate_core_config_key_value(key, value_str)?;
+    if key.trim().eq_ignore_ascii_case("discord_webhook_url") {
+        let clean_val = value_str.trim();
+        if !clean_val.is_empty() {
+            let _ = aegis_alerts::validate_discord_webhook_url(clean_val)?;
         }
     }
     Ok(())
@@ -574,112 +284,7 @@ pub fn build_vault_info_payload(
     perp_equity_usdc: f64,
     now_ms_val: i64,
 ) -> VaultInfoPayload {
-    let configured_vault_address = cfg.get_str("hyperliquid_vault_address", "");
-    let safe_perp_eq = if perp_equity_usdc.is_finite() {
-        perp_equity_usdc
-    } else {
-        0.0
-    };
-
-    if !cfg.execution_mode().is_live_or_testnet() {
-        return VaultInfoPayload {
-            configured_vault_address,
-            total_vault_equity_usdc: 0.0,
-            combined_portfolio_equity_usdc: round_dp(safe_perp_eq, 2),
-            vault_count: 0,
-            synced_at_ms: 0,
-            vaults: Vec::new(),
-        };
-    }
-
-    let is_unified =
-        aegis_core::is_unified_account_mode(&cfg.get_str("live_exchange_account_mode", "default"));
-    let raw_spot = cfg.get_f64("live_exchange_spot_usdc", 0.0);
-    let spot_usdc = if raw_spot.is_finite() {
-        raw_spot.max(0.0)
-    } else {
-        0.0
-    };
-
-    let raw_json = cfg.get_str("live_vault_info_json", "");
-    let parsed = (!raw_json.is_empty())
-        .then(|| serde_json::from_str::<VaultInfoPayload>(&raw_json).ok())
-        .flatten();
-
-    let Some(mut info) = parsed else {
-        return VaultInfoPayload {
-            configured_vault_address,
-            total_vault_equity_usdc: 0.0,
-            combined_portfolio_equity_usdc: if is_unified {
-                round_dp(safe_perp_eq, 2)
-            } else {
-                round_dp(safe_perp_eq + spot_usdc, 2)
-            },
-            vault_count: 0,
-            synced_at_ms: 0,
-            vaults: Vec::new(),
-        };
-    };
-
-    let mut sum_vault_eq = 0.0_f64;
-    for v in &mut info.vaults {
-        if !v.equity_usdc.is_finite() {
-            v.equity_usdc = 0.0;
-        }
-        if !v.pnl_usdc.is_finite() {
-            v.pnl_usdc = 0.0;
-        }
-        if !v.all_time_pnl_usdc.is_finite() {
-            v.all_time_pnl_usdc = 0.0;
-        }
-        if !v.pnl_pct.is_finite() {
-            v.pnl_pct = 0.0;
-        }
-        if !v.all_time_pnl_pct.is_finite() {
-            v.all_time_pnl_pct = 0.0;
-        }
-        if !v.apr_pct.is_finite() {
-            v.apr_pct = 0.0;
-        }
-        if !v.tvl_usdc.is_finite() {
-            v.tvl_usdc = 0.0;
-        }
-        if !v.leader_fraction_pct.is_finite() {
-            v.leader_fraction_pct = 0.0;
-        }
-        if !v.leader_commission_pct.is_finite() {
-            v.leader_commission_pct = 0.0;
-        }
-        if !v.max_distributable_usdc.is_finite() {
-            v.max_distributable_usdc = 0.0;
-        }
-        if !v.max_withdrawable_usdc.is_finite() {
-            v.max_withdrawable_usdc = 0.0;
-        }
-        if !v.all_time_volume_usdc.is_finite() {
-            v.all_time_volume_usdc = 0.0;
-        }
-        v.is_locked = v.locked_until_ms > now_ms_val;
-        sum_vault_eq += v.equity_usdc;
-    }
-
-    let total_vault_equity_usdc = if info.vaults.is_empty() {
-        0.0
-    } else if info.total_vault_equity_usdc.is_finite() && info.total_vault_equity_usdc > 0.0 {
-        round_dp(info.total_vault_equity_usdc, 2)
-    } else {
-        round_dp(sum_vault_eq, 2)
-    };
-
-    info.configured_vault_address = configured_vault_address;
-    info.total_vault_equity_usdc = total_vault_equity_usdc;
-    info.combined_portfolio_equity_usdc = if is_unified {
-        round_dp(safe_perp_eq + total_vault_equity_usdc, 2)
-    } else {
-        round_dp(safe_perp_eq + spot_usdc + total_vault_equity_usdc, 2)
-    };
-    info.vault_count = info.vaults.len();
-    info
+    build_vault_info_payload_from_config(cfg, perp_equity_usdc, now_ms_val)
 }
 
 /// Builds the unified `DashboardPayload` querying MariaDB 13.0 tables and all 7 SQL Views.
@@ -714,58 +319,13 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     snapshot.risk_tier = tier.as_str().to_string();
     snapshot.leverage_multiplier = mult;
     if snapshot.id == 0 {
-        let reserved: f64 = v_assets_ordered
-            .iter()
-            .map(|o| o.reserved_margin_usdc)
-            .sum();
-        let committed: f64 = v_assets_held
-            .iter()
-            .map(|h| h.committed_notional_usdc)
-            .sum();
-        let upnl: f64 = v_assets_held.iter().map(|h| h.unrealized_pnl_usdc).sum();
-        let total_eq = if is_live_or_testnet {
-            let cap_eq = cfg.get_f64("risk_capital_cap_usdc", 0.0);
-            let eff_live = if live_eq > 0.0 && cap_eq >= 10.0 {
-                live_eq.min(cap_eq)
-            } else if live_eq > 0.0 {
-                live_eq
-            } else if cap_eq >= 10.0 {
-                cap_eq
-            } else {
-                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
-            };
-            round_dp(eff_live, 2)
-        } else {
-            let base_eq = if live_eq > 10.0 {
-                live_eq
-            } else {
-                cfg.get_f64("initial_paper_equity_usdc", 10_000.0)
-            };
-            round_dp(base_eq + upnl, 2)
-        };
-        let avail_cash = round_dp((total_eq - committed - reserved).max(0.0), 2);
-        snapshot.total_equity_usdc = total_eq;
-        snapshot.available_cash_usdc = avail_cash;
-        snapshot.reserved_order_cash_usdc = round_dp(reserved, 2);
-        snapshot.committed_notional_usdc = round_dp(committed, 2);
-        snapshot.gross_leverage_x = if total_eq > 0.0 {
-            round_dp(committed / total_eq, 3)
-        } else {
-            0.0
-        };
-        snapshot.working_order_count = v_assets_ordered.len() as i32;
-        snapshot.open_long_count = v_assets_held
-            .iter()
-            .filter(|h| h.side.eq_ignore_ascii_case("LONG"))
-            .count() as i32;
-        snapshot.open_short_count = v_assets_held
-            .iter()
-            .filter(|h| h.side.eq_ignore_ascii_case("SHORT"))
-            .count() as i32;
-        snapshot.eligible_coin_count = exchange_assets
-            .iter()
-            .filter(|a| a.is_core_eligible || a.is_event_eligible)
-            .count() as i32;
+        snapshot = synthesize_fallback_snapshot(
+            &cfg,
+            &v_assets_held,
+            &v_assets_ordered,
+            &exchange_assets,
+            ts,
+        );
     }
 
     let mut snapshots_history = db.list_portfolio_snapshots(120).unwrap_or_default();
@@ -810,11 +370,8 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         0
     };
     let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
-    let active_cap_open_count = v_assets_held
-        .iter()
-        .filter(|h| cap_epoch_ms <= 0 || h.opened_at_ms.unwrap_or(h.updated_at_ms) >= cap_epoch_ms)
-        .count();
-    let pre_cap_open_count = v_assets_held.len().saturating_sub(active_cap_open_count);
+    let (active_cap_open_count, pre_cap_open_count) =
+        partition_cap_epoch_holdings(&v_assets_held, cap_epoch_ms);
 
     let perp_wallet_equity_usdc = if is_live_or_testnet && live_eq > 0.0 {
         round_dp(live_eq, 2)
@@ -822,98 +379,9 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         round_dp(snapshot.total_equity_usdc, 2)
     };
     let vault_info = build_vault_info_payload(&cfg, perp_wallet_equity_usdc, ts);
-
-    let spot_usdc = if is_live_or_testnet {
-        round_dp(cfg.get_f64("live_exchange_spot_usdc", 0.0).max(0.0), 2)
-    } else {
-        0.0
-    };
-    let account_mode = if is_live_or_testnet {
-        let m = cfg.get_str("live_exchange_account_mode", "default");
-        if m.trim().is_empty() {
-            "default".to_string()
-        } else {
-            m
-        }
-    } else {
-        "paper".to_string()
-    };
-    let is_unified_account =
-        is_live_or_testnet && aegis_core::is_unified_account_mode(&account_mode);
-    let perp_margin_equity_usdc = if is_unified_account {
-        round_dp(
-            cfg.get_f64("live_exchange_perp_margin_equity_usdc", 0.0)
-                .max(0.0),
-            2,
-        )
-    } else {
-        perp_wallet_equity_usdc
-    };
-    let effective_equity_usdc = round_dp(snapshot.total_equity_usdc, 2);
-    let risk_capital_cap_usdc = if is_live_or_testnet {
-        round_dp(cfg.get_f64("risk_capital_cap_usdc", 0.0).max(0.0), 2)
-    } else {
-        0.0
-    };
-    let is_cap_binding = is_live_or_testnet
-        && risk_capital_cap_usdc >= 10.0
-        && perp_wallet_equity_usdc > risk_capital_cap_usdc + 1e-6;
-    let basis_label = if !is_live_or_testnet {
-        "PAPER_EQUITY"
-    } else if is_cap_binding {
-        "CAPPED_RISK_CAPITAL"
-    } else if is_unified_account {
-        "UNIFIED_ACCOUNT_VALUE"
-    } else {
-        "PERP_ACCOUNT_VALUE"
-    }
-    .to_string();
-    let total_wallet_equity_usdc = if is_unified_account {
-        round_dp(
-            perp_wallet_equity_usdc + vault_info.total_vault_equity_usdc,
-            2,
-        )
-    } else {
-        round_dp(
-            perp_wallet_equity_usdc + spot_usdc + vault_info.total_vault_equity_usdc,
-            2,
-        )
-    };
-    let margin_used_usdc = if is_live_or_testnet {
-        round_dp(
-            cfg.get_f64("live_exchange_margin_used_usdc", 0.0).max(0.0),
-            2,
-        )
-    } else {
-        0.0
-    };
-    let withdrawable_usdc = if is_live_or_testnet {
-        round_dp(
-            cfg.get_f64("live_exchange_withdrawable_usdc", 0.0).max(0.0),
-            2,
-        )
-    } else {
-        round_dp(snapshot.available_cash_usdc.max(0.0), 2)
-    };
-    let synced_at_ms = cfg.get_i64("live_exchange_equity_synced_at_ms", 0).max(0);
-    let is_stale =
-        is_live_or_testnet && (synced_at_ms <= 0 || ts.saturating_sub(synced_at_ms) > 90_000);
-    let equity_basis = EquityBasisSummary {
-        basis_label,
-        effective_equity_usdc,
-        perp_wallet_equity_usdc,
-        risk_capital_cap_usdc,
-        is_cap_binding,
-        spot_usdc,
-        total_wallet_equity_usdc,
-        margin_used_usdc,
-        withdrawable_usdc,
-        synced_at_ms,
-        is_stale,
-        account_mode,
-        is_unified_account,
-        perp_margin_equity_usdc,
-    };
+    let equity_basis =
+        compute_equity_basis_summary(&cfg, &snapshot, vault_info.total_vault_equity_usdc, ts);
+    let synced_at_ms = equity_basis.synced_at_ms;
 
     let dd_window_start = if cap_epoch_ms > 0 {
         (ts - 86_400_000).max(cap_epoch_ms)
@@ -922,34 +390,22 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     };
     let max_dd_frac = cfg
         .get_f64("max_daily_drawdown_pct", 0.15)
-        .clamp(0.01, 0.90);
-    let drawdown_breaker = match db
-        .get_peak_and_latest_equity_since(dd_window_start)
-        .ok()
-        .flatten()
-    {
-        Some((peak, latest))
-            if peak.is_finite() && latest.is_finite() && peak > 0.0 && latest > 0.0 =>
-        {
-            let dd_frac = ((peak - latest) / peak).max(0.0);
-            DrawdownBreakerStatus {
-                tripped: dd_frac >= max_dd_frac,
-                drawdown_pct: round_dp(dd_frac * 100.0, 2),
-                max_daily_drawdown_pct: round_dp(max_dd_frac * 100.0, 2),
-                peak_24h_equity_usdc: round_dp(peak, 2),
-                latest_equity_usdc: round_dp(latest, 2),
-                window_start_ms: dd_window_start,
-            }
-        }
-        _ => DrawdownBreakerStatus {
-            tripped: false,
-            drawdown_pct: 0.0,
-            max_daily_drawdown_pct: round_dp(max_dd_frac * 100.0, 2),
-            peak_24h_equity_usdc: 0.0,
-            latest_equity_usdc: 0.0,
-            window_start_ms: dd_window_start,
-        },
+        .clamp(0.01, 0.95);
+    let min_halt = cfg.get_f64("min_equity_halt_usdc", 50.0);
+    let dd_basis = if is_live_or_testnet {
+        "UNCAPPED_WALLET_EQUITY"
+    } else {
+        "PAPER_EQUITY"
     };
+    let drawdown_breaker = compute_drawdown_breaker_status(
+        db.get_peak_and_latest_equity_since(dd_window_start)
+            .ok()
+            .flatten(),
+        max_dd_frac,
+        min_halt,
+        dd_basis,
+        dd_window_start,
+    );
 
     let attached_tpsl_order_count: usize = v_assets_held
         .iter()

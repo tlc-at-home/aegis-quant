@@ -215,7 +215,14 @@ pub fn compute_capital_ledger(
                 reserved_order_cash_usdc += res;
             }
             PositionStatus::Open => {
-                let side = OrderSide::parse(&pos.side);
+                let Ok(side) = OrderSide::parse(&pos.side) else {
+                    tracing::error!(
+                        position_id = pos.id,
+                        side = %pos.side,
+                        "Skipping position with invalid OrderSide in compute_capital_ledger"
+                    );
+                    continue;
+                };
                 match side {
                     OrderSide::Long => open_long_count += 1,
                     OrderSide::Short => open_short_count += 1,
@@ -293,7 +300,14 @@ pub fn compute_capital_ledger_from_views(
     let mut open_short_count = 0;
 
     for h in held_assets {
-        let side = OrderSide::parse(&h.side);
+        let Ok(side) = OrderSide::parse(&h.side) else {
+            tracing::error!(
+                position_id = h.position_id,
+                side = %h.side,
+                "Skipping held asset with invalid OrderSide in compute_capital_ledger_from_views"
+            );
+            continue;
+        };
         match side {
             OrderSide::Long => open_long_count += 1,
             OrderSide::Short => open_short_count += 1,

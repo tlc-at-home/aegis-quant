@@ -154,8 +154,8 @@ fn settle_full_close(
     s1_attr: &mut f64,
     s2_attr: &mut f64,
     s3_attr: &mut f64,
-) -> PositionRecord {
-    let side = OrderSide::parse(&pos.side);
+) -> Result<PositionRecord> {
+    let side = OrderSide::parse(&pos.side)?;
     let gross_pnl = round_dp(
         (exit_px - pos.entry_price) * pos.filled_quantity * side.sign(),
         4,
@@ -195,7 +195,7 @@ fn settle_full_close(
     pos.closed_at_ms = Some(ts_ms);
     pos.updated_at_ms = ts_ms;
     pos.exit_reason = Some(reason);
-    pos
+    Ok(pos)
 }
 
 /// Primary Aegis Quant v2.0 Multi-Sleeve Walk-Forward Backtest Engine.
@@ -449,7 +449,7 @@ impl BacktestEngine {
                         && pos.entry_price >= cur_bar.low
                         && pos.entry_price <= cur_bar.high
                     {
-                        let side = OrderSide::parse(&pos.side);
+                        let side = OrderSide::parse(&pos.side)?;
                         let bars = point_bars.get(&asset.id).map(Vec::as_slice).unwrap_or(&[]);
                         let atr = compute_atr_from_bars(
                             bars,
@@ -549,7 +549,7 @@ impl BacktestEngine {
                 let Some(cur_bar) = cur_bars_by_asset.get(&asset.id) else {
                     continue;
                 };
-                let side = OrderSide::parse(&pos.side);
+                let side = OrderSide::parse(&pos.side)?;
                 let bars = point_bars.get(&asset.id).map(Vec::as_slice).unwrap_or(&[]);
                 let atr = compute_atr_from_bars(
                     bars,
@@ -691,7 +691,7 @@ impl BacktestEngine {
                         &mut s1_attribution_usdc,
                         &mut s2_attribution_usdc,
                         &mut s3_attribution_usdc,
-                    );
+                    )?;
                     closed_positions.push(closed);
                     if !reason.starts_with("TAKE_PROFIT") {
                         stop_out_count += 1;
@@ -753,7 +753,7 @@ impl BacktestEngine {
                 if matches!(sig.rebalance_action.as_str(), ACTION_CLOSE | ACTION_FLIP) {
                     if let Some(pos) = active_positions.remove(&sig.asset_id) {
                         if PositionStatus::parse(&pos.status) == PositionStatus::Open {
-                            let side = OrderSide::parse(&pos.side);
+                            let side = OrderSide::parse(&pos.side)?;
                             let raw_px = asset.mark_price;
                             let exit_px =
                                 round_dp((raw_px * (1.0 - side.sign() * slip)).max(tick_floor), 8);
@@ -769,7 +769,7 @@ impl BacktestEngine {
                                 &mut s1_attribution_usdc,
                                 &mut s2_attribution_usdc,
                                 &mut s3_attribution_usdc,
-                            );
+                            )?;
                             closed_positions.push(closed);
                         }
                     }
@@ -782,7 +782,7 @@ impl BacktestEngine {
                     } else if existing_status == Some(PositionStatus::Open) {
                         let mut full_close = false;
                         if let Some(pos) = active_positions.get_mut(&sig.asset_id) {
-                            let side = OrderSide::parse(&pos.side);
+                            let side = OrderSide::parse(&pos.side)?;
                             let target_qty = round_to_lot(
                                 (mid_ledger.total_equity_usdc * sig.target_weight.abs())
                                     / asset.mark_price.max(1e-8),
@@ -884,7 +884,7 @@ impl BacktestEngine {
                         }
                         if full_close {
                             if let Some(pos) = active_positions.remove(&sig.asset_id) {
-                                let side = OrderSide::parse(&pos.side);
+                                let side = OrderSide::parse(&pos.side)?;
                                 let raw_px = asset.mark_price;
                                 let exit_px = round_dp(
                                     (raw_px * (1.0 - side.sign() * slip)).max(tick_floor),
@@ -902,7 +902,7 @@ impl BacktestEngine {
                                     &mut s1_attribution_usdc,
                                     &mut s2_attribution_usdc,
                                     &mut s3_attribution_usdc,
-                                );
+                                )?;
                                 closed_positions.push(closed);
                             }
                         }
@@ -917,7 +917,7 @@ impl BacktestEngine {
                             cur_vec.extend(pending_increases.values().cloned());
                             let cur_ledger =
                                 risk_engine.evaluate_ledger(realized_cash_equity, &cur_vec);
-                            let side = OrderSide::parse(&pos.side);
+                            let side = OrderSide::parse(&pos.side)?;
                             let live_current_w = (pos.current_price.max(pos.entry_price)
                                 * pos.filled_quantity
                                 / cur_ledger.total_equity_usdc.max(1.0))
@@ -990,7 +990,7 @@ impl BacktestEngine {
                 // Re-anchor unfilled WORKING orders if they remain valid on the same side
                 if let Some(pos) = active_positions.get_mut(&sig.asset_id) {
                     if PositionStatus::parse(&pos.status) == PositionStatus::Working {
-                        let w_side = OrderSide::parse(&pos.side);
+                        let w_side = OrderSide::parse(&pos.side)?;
                         if sig.target_weight * w_side.sign() <= 0.0 {
                             active_positions.remove(&sig.asset_id);
                         } else {
@@ -1105,6 +1105,7 @@ impl BacktestEngine {
             equity_curve.push(PortfolioSnapshot {
                 id: (equity_curve.len() + 1) as i64,
                 total_equity_usdc: end_ledger.total_equity_usdc,
+                uncapped_equity_usdc: end_ledger.total_equity_usdc,
                 available_cash_usdc: end_ledger.available_cash_usdc,
                 reserved_order_cash_usdc: end_ledger.reserved_order_cash_usdc,
                 committed_notional_usdc: end_ledger.committed_notional_usdc,
@@ -1131,7 +1132,7 @@ impl BacktestEngine {
         // Include remaining open end-of-run positions (unrealized PnL - entry fees + accrued funding) in final attribution
         for pos in active_positions.values() {
             if PositionStatus::parse(&pos.status) == PositionStatus::Open {
-                let side = OrderSide::parse(&pos.side);
+                let side = OrderSide::parse(&pos.side)?;
                 let open_net_pnl = round_dp(
                     pos.unrealized_pnl_usdc - pos.fees_paid_usdc + pos.funding_accrued_usdc,
                     4,
