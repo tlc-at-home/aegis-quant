@@ -9,7 +9,7 @@ Replace the legacy **Aegis Quant `v0.3.0-rc1` PP-50 Two-Book (`Pit` + `Pond` + `
    - Archive current `main` (`v0.3.0-rc1`) to `archive/rust-v0.3.0-rc1` branch and `v0.3.0-rc1-archive` tag on GitHub (`origin`).
    - Create and push a fresh `v2.0` branch on GitHub for all redesign work.
 2. **MariaDB 12.3 LTS / 13.0 Rolling (Latest Official Release) + Server & Network Performance Tuning (Option 2 Selected)**:
-   - Installs the latest official **MariaDB (`12.3.4 LTS` by default, or `13.0.2 ROLLING` via `MARIADB_VERSION=13.0`)** directly from the official MariaDB repository (upgrading past Fedora's older distro-bundled `11.8` package) with a dedicated low-latency performance configuration (`deploy/99-aegis-mariadb.cnf`): `1GB` RAM buffer pool, `innodb_flush_log_at_trx_commit = 2`, `O_DIRECT`, `skip_name_resolve = ON`, Unix socket + `TCP_NODELAY` connection pooling.
+   - Installs the latest official **MariaDB (`12.3.4 LTS` or `13.0.2 ROLLING` via `MARIADB_VERSION=13.0`)** from the GPG-verified official MariaDB RPM repository (`gpgcheck=1`, `repo_gpgcheck=1`, verified signing key fingerprint `177F4010FE56CA3336300305F1656F24C74CD1D8`) with a dedicated ACID-durable, low-latency configuration (`deploy/99-aegis-mariadb.cnf`): `1GB` RAM buffer pool, **`innodb_flush_log_at_trx_commit = 1`**, **`innodb_log_file_size = 256M`** (MariaDB 10.9–13.0.2 active dynamic redo-log variable; `innodb_redo_log_size` does not exist in MariaDB 13.0.2), `innodb_lock_wait_timeout = 10`, `skip_name_resolve = ON`, Unix socket + `TCP_NODELAY` connection pooling.
 3. **Normalized Relational Schema (`id` PK, Foreign Keys, Composite Indexes, Cooldowns & 7 SQL Views)**:
    - Every table uses `id BIGINT PRIMARY KEY AUTO_INCREMENT`, `created_at_ms BIGINT NOT NULL`, and `updated_at_ms BIGINT NOT NULL`.
    - Enforces relational integrity via `asset_id BIGINT NOT NULL REFERENCES exchange_assets(id)` Foreign Keys and covering composite indexes.
@@ -60,7 +60,7 @@ flowchart LR
     end
 
     subgraph STATE["Tuned MariaDB 12.3 LTS / 13.0 Rolling + Showcase Web UI + Telegram"]
-        DB[("MariaDB 12.3 LTS / 13.0 (InnoDB)\n10 Tables (id PK + FKs + Indexes)\n7 SQL Views (v_assets_*)")]
+        DB[("MariaDB 12.3 LTS / 13.0 (InnoDB)\n11 Tables (id PK + FKs + CHECKs)\n7 SQL Views (v_assets_*)")]
         WEB["Marketing-Grade Web UI (:8000)\nAnimated Glassmorphic Terminal,\nLive Charts, Icons & SSE Stream"]
         TG["Telegram HTML Alerts\n(Config-Switchable to Discord)"]
     end
@@ -116,22 +116,25 @@ flowchart LR
 
 ### Component 2: Latest Official MariaDB (`12.3.4 LTS` / `13.0.2 Rolling`) Upgrade, Performance Tuning, Foreign-Key Schema & 7 SQL Views (`deploy/bootstrap_vm.sh`, `deploy/99-aegis-mariadb.cnf`, `sql/schema_v2_mariadb.sql`, `crates/aegis-db`)
 
-#### [MODIFY] [bootstrap_vm.sh](file:///home/tony/dev/AEGIS-LOCAL/deploy/bootstrap_vm.sh) (Install Latest Official MariaDB Server)
+#### [MODIFY] [bootstrap_vm.sh](file:///home/tony/dev/AEGIS-LOCAL/deploy/bootstrap_vm.sh) (GPG-Verified Official MariaDB Server + CSPRNG Least-Privilege Setup)
 ```bash
-# Upgrade distro-bundled MariaDB 11.8 to latest official MariaDB (12.3.4 LTS default, or 13.0.2 Rolling GA)
-MARIADB_VERSION="${MARIADB_VERSION:-12.3}" # Set MARIADB_VERSION=13.0 for Rolling GA
-curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-${MARIADB_VERSION}"
-sudo dnf install -y --allowerasing MariaDB-server MariaDB-client
+# Install MariaDB 13.0 Rolling (or 12.3 LTS) from static GPG-verified repo (gpgcheck=1, repo_gpgcheck=1)
+# after verifying key fingerprint 177F4010FE56CA3336300305F1656F24C74CD1D8, generating a 36-char CSPRNG
+# password under umask 0077 into /etc/aegis-quant.env (0600 root:root), and applying least-privilege
+# grants on aegis_quant.* (no DROP/SUPER/FILE or dev test wildcards unless --enable-dev-test-grants).
 ```
 
 #### [NEW] `deploy/99-aegis-mariadb.cnf` (MariaDB Server & Network Tuning)
 ```ini
 [mysqld]
-# Memory & InnoDB Low-Latency Tuning for 1s Priority Loop
+bind-address                    = 127.0.0.1
+default_time_zone               = '+00:00'
+
+# Memory & InnoDB Durability / Low-Latency Tuning for 1s Priority Loop
 innodb_buffer_pool_size         = 1G
 innodb_log_file_size            = 256M
-innodb_flush_log_at_trx_commit  = 2
-innodb_flush_method             = O_DIRECT
+innodb_flush_log_at_trx_commit  = 1
+innodb_lock_wait_timeout        = 10
 innodb_io_capacity              = 2000
 innodb_io_capacity_max          = 4000
 innodb_read_io_threads          = 4
@@ -148,7 +151,7 @@ character_set_server            = utf8mb4
 collation_server                = utf8mb4_unicode_ci
 ```
 
-#### [NEW] `sql/schema_v2_mariadb.sql` (10 Core Tables + Foreign Keys + Covering Indexes + 7 SQL Views)
+#### [NEW] `sql/schema_v2_mariadb.sql` (11 Core Tables + Foreign Keys + CHECK Constraints + Covering Indexes + 7 SQL Views)
 ```sql
 CREATE DATABASE IF NOT EXISTS aegis_quant
   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -382,6 +385,25 @@ CREATE TABLE IF NOT EXISTS alert_queue (
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL,
     KEY idx_alerts_status_retry (status, next_retry_ms)
+) ENGINE=InnoDB;
+
+-- 11. Reconciled Hyperliquid Per-Event Funding Ledger (windowed open-position PnL attribution)
+CREATE TABLE IF NOT EXISTS funding_events (
+    id             BIGINT PRIMARY KEY AUTO_INCREMENT,
+    asset_id       BIGINT NOT NULL,
+    coin           VARCHAR(24) NOT NULL,
+    event_time_ms  BIGINT NOT NULL,
+    usdc           DECIMAL(20,8) NOT NULL,
+    remaining_usdc DECIMAL(20,8) NOT NULL,
+    position_szi   DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
+    funding_rate   DECIMAL(20,10) NOT NULL DEFAULT 0.0000000000,
+    dedup_key      VARCHAR(128) NOT NULL,
+    created_at_ms  BIGINT NOT NULL,
+    updated_at_ms  BIGINT NOT NULL,
+    CONSTRAINT fk_funding_asset FOREIGN KEY (asset_id) REFERENCES exchange_assets(id) ON DELETE CASCADE,
+    UNIQUE KEY uq_funding_dedup (dedup_key),
+    KEY idx_funding_asset_time (asset_id, event_time_ms DESC),
+    KEY idx_funding_time (event_time_ms DESC)
 ) ENGINE=InnoDB;
 
 -- ============================================================================
@@ -631,11 +653,21 @@ Modularized backend (`server.rs`, `routes.rs`, `handlers.rs`, `payloads.rs`, `au
 
 ---
 
+### Operational Security & Wallet Posture (v2.1 Hardening)
+
+- **`AEGIS_DB_URL` Mandatory Configuration**: Production binaries (`DatabaseManager::connect`) require `AEGIS_DB_URL` (or `$CREDENTIALS_DIRECTORY/aegis_db_url`) and fail closed with zero hardcoded default credentials; isolated test runs (`DatabaseManager::new_isolated_test`) read `AEGIS_TEST_DB_URL` or `AEGIS_DB_URL`.
+- **`db --init` Auto-Provisioned `web_api_token` & Loopback Auth-by-Default**: `aegis-web` enforces Bearer/cookie authentication across all `/api/v1/*` endpoints (except `/api/v1/health` and `/api/v1/auth/login`), including `127.0.0.1` loopback binds unless explicitly disabled via DB-immutable `web_auth_enabled=false`. `aegis-quant db --init` auto-provisions a random 32-byte Fernet-encrypted `web_api_token` if unset/empty and prints it once at provisioning time without logging secrets in steady state.
+- **Monitoring-Only `hyperliquid_vault_address`**: Configured `hyperliquid_vault_address` (`vault_role`, `vault_target_allocation_pct`, `vault_profit_sweep_threshold_usdc`) is strictly read-only/monitoring; all trading requests pass `vaultAddress: null`, and vault equity remains segregated from perp sizing margin.
+- **Hyperliquid API Agent Wallet Setup & Expiry Best Practice**: Register a dedicated Trade-Only API Agent Wallet on Hyperliquid under master `wallet_address` (`hyperliquid_agent_address`), storing only the agent `private_key` (Fernet-encrypted). Rotate agent wallets before Hyperliquid expiry (up to 180 days; startup `extraAgents` check warns within 7 days of expiry).
+- **MariaDB 13.0 Durability & Redo Log Settings**: `deploy/99-aegis-mariadb.cnf` enforces `innodb_flush_log_at_trx_commit = 1` and `innodb_log_file_size = 256M` (the active dynamic redo-log variable in MariaDB 10.9–13.0.2; `innodb_redo_log_size` is invalid in MariaDB 13.0.2 and `innodb_redo_log_capacity` applies only to Oracle MySQL 8).
+
+---
+
 ## Verification Plan
 
 1. **GitHub Archive & Branch Check**: Verify `archive/rust-v0.3.0-rc1` and `v2.0` branches on `origin`.
 2. **Latest Official MariaDB (`12.3.4 LTS` / `13.0.2 Rolling`) Service & Schema Verification**:
-   - Install from the official MariaDB repo, apply `deploy/99-aegis-mariadb.cnf`, enable/start `mariadb.service`, apply `sql/schema_v2_mariadb.sql`, and verify all 10 tables, Foreign Keys, Indexes, and all 7 `v_assets_*` SQL Views.
+   - Install from the GPG-verified official MariaDB repo, apply `deploy/99-aegis-mariadb.cnf`, enable/start `mariadb.service`, apply `sql/schema_v2_mariadb.sql`, and verify all 11 tables, Foreign Keys, CHECK constraints, Indexes, and all 7 `v_assets_*` SQL Views.
 3. **Rust Workspace Build, Lint & Tests**:
    ```bash
    cargo fmt --all -- --check

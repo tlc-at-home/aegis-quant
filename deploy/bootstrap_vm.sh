@@ -5,6 +5,23 @@
 # =============================================================================
 set -euo pipefail
 
+ENABLE_DEV_TEST_GRANTS=0
+for arg in "$@"; do
+    case "${arg}" in
+        --enable-dev-test-grants)
+            ENABLE_DEV_TEST_GRANTS=1
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--enable-dev-test-grants]"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
+
 AEGIS_ROOT="/home/fedora/aegis"
 DATA_DIR="${AEGIS_ROOT}/data"
 LOG_DIR="${AEGIS_ROOT}/logs"
@@ -16,10 +33,64 @@ DEPLOY_DIR="${AEGIS_ROOT}/deploy"
 SQL_SCHEMA="${AEGIS_ROOT}/sql/schema_v2_mariadb.sql"
 SYSTEMD_DIR="/etc/systemd/system"
 MARIADB_VERSION="${MARIADB_VERSION:-13.0}"
-AEGIS_DB_URL_DEFAULT="mysql://aegis:aegis_v2_local@127.0.0.1:3306/aegis_quant"
+MARIADB_RPM_GPG_URL="https://supplychain.mariadb.com/MariaDB-Server-GPG-KEY"
+MARIADB_RPM_GPG_PATH="/etc/pki/rpm-gpg/MariaDB-Server-GPG-KEY"
+MARIADB_RPM_GPG_FPR="177F4010FE56CA3336300305F1656F24C74CD1D8"
+
+if ! [[ "${MARIADB_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: Invalid MARIADB_VERSION '${MARIADB_VERSION}' (expected major.minor)" >&2
+    exit 1
+fi
+
+install_mariadb_gpg_verified_repo() {
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64|aarch64) ;;
+        *)
+            echo "ERROR: Unsupported architecture '${arch}' for official MariaDB RPM repo" >&2
+            exit 1
+            ;;
+    esac
+
+    local tmp_key=""
+    if [ ! -f "${MARIADB_RPM_GPG_PATH}" ]; then
+        tmp_key="$(mktemp)"
+        trap 'rm -f "${tmp_key:-}"' RETURN
+        curl -fsSL "${MARIADB_RPM_GPG_URL}" -o "${tmp_key}"
+        local actual_fpr
+        actual_fpr="$(gpg --batch --show-keys --with-colons "${tmp_key}" | awk -F: '$1 == "fpr" {print $10; exit}')"
+        if [ "${actual_fpr}" != "${MARIADB_RPM_GPG_FPR}" ]; then
+            echo "ERROR: MariaDB GPG key fingerprint mismatch: got '${actual_fpr}', expected '${MARIADB_RPM_GPG_FPR}'" >&2
+            exit 1
+        fi
+        sudo install -m 0644 -o root -g root "${tmp_key}" "${MARIADB_RPM_GPG_PATH}"
+    else
+        local existing_fpr
+        existing_fpr="$(gpg --batch --show-keys --with-colons "${MARIADB_RPM_GPG_PATH}" | awk -F: '$1 == "fpr" {print $10; exit}')"
+        if [ "${existing_fpr}" != "${MARIADB_RPM_GPG_FPR}" ]; then
+            echo "ERROR: Existing ${MARIADB_RPM_GPG_PATH} fingerprint mismatch: '${existing_fpr}'" >&2
+            exit 1
+        fi
+    fi
+
+    sudo rpm --import "${MARIADB_RPM_GPG_PATH}"
+    sudo tee /etc/yum.repos.d/mariadb.repo >/dev/null <<EOF
+[mariadb-main]
+name = MariaDB Server
+baseurl = https://dlm.mariadb.com/repo/mariadb-server/${MARIADB_VERSION}/yum/rhel/9/${arch}
+gpgkey = file://${MARIADB_RPM_GPG_PATH}
+gpgcheck = 1
+repo_gpgcheck = 1
+enabled = 1
+module_hotfixes = 1
+EOF
+    sudo chmod 0644 /etc/yum.repos.d/mariadb.repo
+    sudo dnf install -y --allowerasing MariaDB-server MariaDB-client
+}
 
 echo "[1/8] Installing system dependencies, chronyd time sync, and firewalld..."
-sudo dnf install -y --skip-unavailable chrony curl firewalld gzip policycoreutils-python-utils
+sudo dnf install -y --skip-unavailable chrony curl firewalld gzip openssl gnupg2 policycoreutils-python-utils
 sudo systemctl enable --now chronyd.service
 chronyc tracking || true
 
@@ -34,18 +105,20 @@ sudo mkdir -p /var/lib/mysql
 # Set NOCOW before MariaDB initializes InnoDB tablespaces (safe no-op on non-Btrfs filesystems)
 sudo chattr +C /var/lib/mysql 2>/dev/null || true
 
-if [ -f /etc/fedora-release ]; then
-    sudo dnf install -y mariadb-server mariadb || {
-        curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-${MARIADB_VERSION}"
-        sudo dnf install -y --allowerasing MariaDB-server MariaDB-client
-    }
+if [ -f /etc/fedora-release ] && [ "${MARIADB_USE_DISTRO_PKG:-0}" = "1" ]; then
+    sudo dnf install -y mariadb-server mariadb
 else
-    curl -LsS https://r.mariadb.com/downloads/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-${MARIADB_VERSION}" --os-type=rhel --os-version=9
-    sudo dnf install -y --allowerasing MariaDB-server MariaDB-client
+    install_mariadb_gpg_verified_repo
 fi
 
 sudo cp "${DEPLOY_DIR}/99-aegis-mariadb.cnf" /etc/my.cnf.d/99-aegis-mariadb.cnf
 sudo chmod 644 /etc/my.cnf.d/99-aegis-mariadb.cnf
+
+if mariadbd --help --verbose 2>/dev/null | grep -q -- '--validate-config'; then
+    sudo mariadbd --defaults-file=/etc/my.cnf.d/99-aegis-mariadb.cnf --validate-config
+else
+    sudo mariadbd --defaults-file=/etc/my.cnf.d/99-aegis-mariadb.cnf --verbose --help >/dev/null
+fi
 
 # Raise MariaDB LimitNOFILE to 65536
 sudo mkdir -p "${SYSTEMD_DIR}/mariadb.service.d"
@@ -58,34 +131,76 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now mariadb.service
 sudo systemctl restart mariadb.service
 
-echo "[3/8] Provisioning MariaDB database user & applying schema_v2_mariadb.sql..."
-sudo mariadb <<'SQL'
-CREATE DATABASE IF NOT EXISTS aegis_quant CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS 'aegis'@'localhost' IDENTIFIED BY 'aegis_v2_local';
-CREATE USER IF NOT EXISTS 'aegis'@'127.0.0.1' IDENTIFIED BY 'aegis_v2_local';
-GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis'@'localhost';
-GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis'@'127.0.0.1';
-GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis'@'localhost';
-GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis'@'127.0.0.1';
-FLUSH PRIVILEGES;
-SQL
-sudo mariadb aegis_quant < "${SQL_SCHEMA}"
-
-echo "[4/8] Preparing Aegis Quant directories & 0600 environment secret file (${ENV_FILE})..."
+echo "[3/8] Preparing Aegis Quant directories & 0600 CSPRNG environment secret file (${ENV_FILE})..."
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BIN_DIR}"
 chmod 700 "${DATA_DIR}"
 chmod 750 "${LOG_DIR}"
 chmod 755 "${BIN_DIR}"
 sudo install -d -m 0700 -o root -g root "${BACKUP_DIR}"
 
-if [ ! -f "${ENV_FILE}" ]; then
-    sudo install -m 0600 -o root -g root /dev/null "${ENV_FILE}"
-    sudo tee "${ENV_FILE}" >/dev/null <<EOF
-RUST_LOG=info
-AEGIS_DB_URL=${AEGIS_DB_URL:-${AEGIS_DB_URL_DEFAULT}}
-EOF
+NEW_DB_PASS=""
+TARGET_DB_URL="${AEGIS_DB_URL:-}"
+if [ -z "${TARGET_DB_URL}" ] && sudo test -f "${ENV_FILE}"; then
+    TARGET_DB_URL="$(sudo awk -F= '/^AEGIS_DB_URL=/{sub(/^[^=]*=/,""); print; exit}' "${ENV_FILE}" || true)"
 fi
+
+if [ -z "${TARGET_DB_URL}" ]; then
+    NEW_DB_PASS="$(
+        umask 0077
+        openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 36
+    )"
+    if [ "${#NEW_DB_PASS}" -ne 36 ]; then
+        echo "ERROR: Failed to generate 36-character CSPRNG MariaDB password" >&2
+        exit 1
+    fi
+    TARGET_DB_URL="mysql://aegis:${NEW_DB_PASS}@127.0.0.1:3306/aegis_quant"
+fi
+
+if [ ! -f "${ENV_FILE}" ] || [ -n "${NEW_DB_PASS}" ]; then
+    (
+        umask 0077
+        sudo install -m 0600 -o root -g root /dev/null "${ENV_FILE}"
+        sudo tee "${ENV_FILE}" >/dev/null <<EOF
+RUST_LOG=info
+AEGIS_DB_URL=${TARGET_DB_URL}
+EOF
+    )
+fi
+sudo chown root:root "${ENV_FILE}"
 sudo chmod 0600 "${ENV_FILE}"
+
+echo "[4/8] Provisioning least-privilege MariaDB database user & applying schema_v2_mariadb.sql..."
+if [ -n "${NEW_DB_PASS}" ]; then
+    sudo mariadb <<SQL
+CREATE DATABASE IF NOT EXISTS aegis_quant CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS 'aegis'@'localhost' IDENTIFIED BY '${NEW_DB_PASS}';
+CREATE USER IF NOT EXISTS 'aegis'@'127.0.0.1' IDENTIFIED BY '${NEW_DB_PASS}';
+ALTER USER 'aegis'@'localhost' IDENTIFIED BY '${NEW_DB_PASS}';
+ALTER USER 'aegis'@'127.0.0.1' IDENTIFIED BY '${NEW_DB_PASS}';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, LOCK TABLES ON aegis_quant.* TO 'aegis'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, LOCK TABLES ON aegis_quant.* TO 'aegis'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+    unset NEW_DB_PASS
+else
+    sudo mariadb <<'SQL'
+CREATE DATABASE IF NOT EXISTS aegis_quant CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, LOCK TABLES ON aegis_quant.* TO 'aegis'@'localhost';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, LOCK TABLES ON aegis_quant.* TO 'aegis'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+fi
+
+if [ "${ENABLE_DEV_TEST_GRANTS}" -eq 1 ]; then
+    echo "Granting dev/test isolated database privileges on aegis_quant_test%* (--enable-dev-test-grants)..."
+    sudo mariadb <<'SQL'
+GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis'@'localhost';
+GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+fi
+
+sudo mariadb aegis_quant < "${SQL_SCHEMA}"
 
 echo "[5/8] Building or updating Aegis Quant v2.0 Rust binary (${BIN_DIR}/aegis-quant)..."
 if [ ! -x "${BIN_DIR}/aegis-quant" ] || [ "${AEGIS_REBUILD:-0}" = "1" ]; then
@@ -102,7 +217,8 @@ if [ ! -s "${KEY_PATH}" ]; then
     (umask 0077; "${BIN_DIR}/aegis-quant" db --generate-key > "${KEY_PATH}")
 fi
 chmod 600 "${KEY_PATH}"
-AEGIS_DB_URL="${AEGIS_DB_URL:-${AEGIS_DB_URL_DEFAULT}}" "${BIN_DIR}/aegis-quant" --db "${DATA_DIR}/aegis_quant.db" db --init --migrate
+AEGIS_DB_URL="${TARGET_DB_URL}" "${BIN_DIR}/aegis-quant" --db "${DATA_DIR}/aegis_quant.db" db --init --migrate
+unset TARGET_DB_URL
 
 echo "[7/8] Installing daily mariadb-dump backup script & systemd timer..."
 sudo tee /usr/local/bin/aegis-mariadb-backup.sh >/dev/null <<EOF

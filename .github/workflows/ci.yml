@@ -2,19 +2,35 @@ name: Aegis Quant Rust CI Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, v2.0 ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, v2.0 ]
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  AEGIS_DB_URL: mysql://aegis_ci:aegis_ci_test_pass@127.0.0.1:3306/aegis_quant
+  AEGIS_TEST_DB_URL: mysql://aegis_ci:aegis_ci_test_pass@127.0.0.1:3306/aegis_quant
 
 jobs:
   rust-test-and-build:
     runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:12.3
+        env:
+          MARIADB_ROOT_PASSWORD: ci_root_password
+          MARIADB_DATABASE: aegis_quant
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=20s
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust Toolchain
@@ -27,7 +43,12 @@ jobs:
         run: |
           python3 -c '
           import pathlib, re, subprocess, sys
-          pat = re.compile(r"([0-9]{8,10}:AA[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35})")
+          retired_dev_pw = "aegis_" + "v2_local"
+          pat = re.compile(
+              r"([0-9]{8,10}:AA[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|"
+              + re.escape(retired_dev_pw)
+              + r")"
+          )
           files = subprocess.check_output(
               ["git", "ls-files", "crates/", "web/", "sql/", "deploy/", ".github/"],
               text=True,
@@ -49,14 +70,45 @@ jobs:
               sys.exit(1)
           print(f"R16-U2 secret hygiene check passed across {len(files)} tracked files.")
           '
+      - name: JavaScript Syntax Verification
+        run: |
+          if [ -f web/static/app.js ]; then node --check web/static/app.js; fi
+          if ls web/static/js/*.js >/dev/null 2>&1; then
+            for f in web/static/js/*.js; do
+              node --input-type=module --check < "$f"
+            done
+          fi
+      - name: Provision MariaDB CI User & Test Database Grants
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mariadb-client
+          for _ in $(seq 1 30); do
+            if MYSQL_PWD=ci_root_password mariadb -h 127.0.0.1 -P 3306 -u root -e "SELECT 1" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          MYSQL_PWD=ci_root_password mariadb -h 127.0.0.1 -P 3306 -u root <<'SQL'
+          CREATE DATABASE IF NOT EXISTS aegis_quant CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+          CREATE USER IF NOT EXISTS 'aegis_ci'@'%' IDENTIFIED BY 'aegis_ci_test_pass';
+          CREATE USER IF NOT EXISTS 'aegis_ci'@'127.0.0.1' IDENTIFIED BY 'aegis_ci_test_pass';
+          CREATE USER IF NOT EXISTS 'aegis_ci'@'localhost' IDENTIFIED BY 'aegis_ci_test_pass';
+          GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis_ci'@'%';
+          GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis_ci'@'%';
+          GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis_ci'@'127.0.0.1';
+          GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis_ci'@'127.0.0.1';
+          GRANT ALL PRIVILEGES ON aegis_quant.* TO 'aegis_ci'@'localhost';
+          GRANT ALL PRIVILEGES ON `aegis\_quant\_test%`.* TO 'aegis_ci'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
       - name: Check Code Formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy Linter
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run Workspace Unit & Integration Tests (Enforce >= 172 Tests)
+      - name: Run Workspace Unit & Integration Tests (Enforce >= 235 Tests)
         run: |
           set -o pipefail
-          cargo test --workspace | tee /tmp/aegis_test_output.txt
+          cargo test --workspace -- --test-threads=4 | tee /tmp/aegis_test_output.txt
           TOTAL=$(python3 -c '
           import re
           with open("/tmp/aegis_test_output.txt") as f:
@@ -64,8 +116,8 @@ jobs:
           counts = [int(m.group(1)) for m in re.finditer(r"test result: ok\. (\d+) passed; 0 failed", text)]
           total = sum(counts)
           print(total)
-          if total < 172:
-              raise SystemExit(f"Expected >= 172 passing workspace tests, observed {total}")
+          if total < 235:
+              raise SystemExit(f"Expected >= 235 passing workspace tests, observed {total}")
           ')
           echo "Verified ${TOTAL} passing workspace tests"
       - name: Build Optimized Release Binary

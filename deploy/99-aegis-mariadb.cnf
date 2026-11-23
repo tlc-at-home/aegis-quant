@@ -5,6 +5,9 @@ default_time_zone               = '+00:00'
 
 # Memory & InnoDB Durability / Low-Latency Tuning for 1s Priority Loop
 innodb_buffer_pool_size         = 1G
+# MariaDB 10.9–13.0.2 uses dynamically-resizeable `innodb_log_file_size` for the redo log
+# (`innodb_redo_log_size` does not exist in MariaDB 13.0.2 and crashes startup;
+# `innodb_redo_log_capacity` is Oracle MySQL 8 only).
 innodb_log_file_size            = 256M
 innodb_flush_log_at_trx_commit  = 1
 innodb_lock_wait_timeout        = 10
