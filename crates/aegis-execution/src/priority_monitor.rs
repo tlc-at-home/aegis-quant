@@ -18,6 +18,7 @@ use crate::lock_guard::acquire_execution_lock;
 use crate::order_chaser::{parse_hl_oid, ChaseStepOutcome, OrderChaser};
 use crate::signing::CancelWire;
 use crate::tpsl_sync::{sync_tpsl_batch_for_positions, TpslSyncRequest};
+use crate::ws_client::WsStateCache;
 use aegis_alerts::{format_position_closed_html, AlertEngine, PositionClosedAlert};
 use aegis_core::{
     now_ms, parse_hl_f64, parse_hl_i64_opt, parse_hl_u64_opt, round_dp, AegisError, ConfigMap,
@@ -197,6 +198,7 @@ pub struct PriorityMonitor {
     last_confirmed_open_ms: Arc<Mutex<HashMap<i64, i64>>>,
     health_state: Arc<Mutex<SurveillanceHealthState>>,
     alert_wakeup_tx: Option<SyncSender<usize>>,
+    ws_cache: Option<Arc<WsStateCache>>,
 }
 
 impl PriorityMonitor {
@@ -216,12 +218,21 @@ impl PriorityMonitor {
             last_confirmed_open_ms: Arc::new(Mutex::new(HashMap::new())),
             health_state: Arc::new(Mutex::new(SurveillanceHealthState::default())),
             alert_wakeup_tx: None,
+            ws_cache: None,
         }
     }
 
     /// Attaches an optional bounded wakeup sender for non-blocking background alert dispatch (`R14-L5`).
     pub fn with_alert_wakeup(mut self, wakeup_tx: SyncSender<usize>) -> Self {
         self.alert_wakeup_tx = Some(wakeup_tx);
+        self
+    }
+
+    /// Attaches a shared [`WsStateCache`] so `allMids`, `l2Book`, `clearinghouseState`, and
+    /// `openOrders` are read from fresh WebSocket streams with transparent REST fallback (`R14-H4`).
+    pub fn with_ws_cache(mut self, ws_cache: Arc<WsStateCache>) -> Self {
+        self.chaser = self.chaser.with_ws_cache(Arc::clone(&ws_cache));
+        self.ws_cache = Some(ws_cache);
         self
     }
 
@@ -353,8 +364,12 @@ impl PriorityMonitor {
         };
 
         // Phase 2: Unlocked surveillance reads (`allMids` + single shared `clearinghouseState`)
+        // Prefer fresh WsStateCache frames, falling back transparently to REST when stale/disconnected.
         let mids_opt = if !watchlist.is_empty() && is_live_exchange {
-            self.http.fetch_all_mids(&cfg).ok()
+            self.ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_all_mids())
+                .or_else(|| self.http.fetch_all_mids(&cfg).ok())
         } else {
             None
         };
@@ -363,7 +378,10 @@ impl PriorityMonitor {
             && !wallet.trim().is_empty()
             && (!initial_ordered.is_empty() || initial_has_held)
         {
-            self.http.fetch_clearinghouse_state(&wallet, &cfg).ok()
+            self.ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_clearinghouse_state())
+                .or_else(|| self.http.fetch_clearinghouse_state(&wallet, &cfg).ok())
         } else {
             None
         };
@@ -803,8 +821,19 @@ impl PriorityMonitor {
                     replace_tp: false,
                 })
                 .collect();
-            let batch_results =
-                sync_tpsl_batch_for_positions(&self.http, &self.db, &reqs, None, None, &cfg);
+            let ws_open_orders = self
+                .ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_open_orders())
+                .filter(|s| s.metadata_complete);
+            let batch_results = sync_tpsl_batch_for_positions(
+                &self.http,
+                &self.db,
+                &reqs,
+                None,
+                ws_open_orders.as_ref(),
+                &cfg,
+            );
             for (idx, (pid, res)) in batch_results.into_iter().enumerate() {
                 let sym = tpsl_syncs[idx].held.symbol.clone();
                 match res {
@@ -1063,6 +1092,12 @@ impl PriorityMonitor {
         let pk = cfg.get_str("private_key", "");
         let ch_state = if let Some(s) = shared_ch_state {
             s.clone()
+        } else if let Some(ws_ch) = self
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_clearinghouse_state())
+        {
+            ws_ch
         } else {
             match self.http.fetch_clearinghouse_state(&wallet, cfg) {
                 Ok(s) => s,
@@ -1149,8 +1184,10 @@ impl PriorityMonitor {
         self.passive_closes.remove(held.position_id);
 
         let fresh_ch = self
-            .http
-            .fetch_clearinghouse_state(&wallet, cfg)
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_clearinghouse_state())
+            .or_else(|| self.http.fetch_clearinghouse_state(&wallet, cfg).ok())
             .unwrap_or(ch_state);
         self.execute_exit_with_urgency(
             held,
@@ -1377,6 +1414,12 @@ impl PriorityMonitor {
 
             let ch_state = if let Some(s) = pre_fetched_ch_state {
                 s.clone()
+            } else if let Some(ws_ch) = self
+                .ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_clearinghouse_state())
+            {
+                ws_ch
             } else {
                 match self.http.fetch_clearinghouse_state(&wallet, cfg) {
                     Ok(s) => s,
@@ -1402,10 +1445,15 @@ impl PriorityMonitor {
                 live_close_oid = oid;
             } else if let Some(asset) = asset_opt {
                 let l2_bbo = self
-                    .http
-                    .fetch_l2_book_critical(&asset.coin, cfg)
-                    .ok()
-                    .flatten();
+                    .ws_cache
+                    .as_ref()
+                    .and_then(|c| c.get_fresh_l2_bbo(&asset.coin))
+                    .or_else(|| {
+                        self.http
+                            .fetch_l2_book_critical(&asset.coin, cfg)
+                            .ok()
+                            .flatten()
+                    });
 
                 // Check 15s unfilled breach retry backoff unless fresh book is crossable inside oracle band (`R14-H5`)
                 let now = now_ms();
@@ -1509,8 +1557,12 @@ impl PriorityMonitor {
                 }
 
                 if !already_filled_passively {
-                    let open_orders_snap =
-                        self.http.fetch_open_orders_with_metadata(&wallet, cfg).ok();
+                    let open_orders_snap = self
+                        .ws_cache
+                        .as_ref()
+                        .and_then(|c| c.get_fresh_open_orders())
+                        .filter(|s| s.metadata_complete)
+                        .or_else(|| self.http.fetch_open_orders_with_metadata(&wallet, cfg).ok());
                     let cloid_prefix = if is_tp_exit {
                         "v2-tpexit"
                     } else {

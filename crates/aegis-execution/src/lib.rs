@@ -11,6 +11,7 @@ pub mod priority_monitor;
 pub mod reconcile;
 pub mod signing;
 pub mod tpsl_sync;
+pub mod ws_client;
 
 pub use close_ladder::*;
 pub use engine::*;
@@ -21,3 +22,4 @@ pub use priority_monitor::*;
 pub use reconcile::*;
 pub use signing::*;
 pub use tpsl_sync::*;
+pub use ws_client::*;

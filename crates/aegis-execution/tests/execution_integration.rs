@@ -12,6 +12,7 @@ use aegis_signals::{
     SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP, ACTION_OPEN_LONG,
 };
 use aegis_test_support::mock_http::MockHttpServer;
+use aegis_test_support::mock_ws::MockWsServer;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -5542,4 +5543,901 @@ fn test_wave2_cap_epoch_validation_and_oracle_profit_gate_guards() {
         aegis_execution::AlertDispatchWorker::spawn(aegis_alerts::AlertEngine::new(db));
     drop(tx);
     handle.join().expect("AlertDispatchWorker joins cleanly");
+}
+
+#[test]
+fn test_wave3_ws_ssrf_url_validation_and_2conn_full_channel_ingestion() {
+    use aegis_execution::{
+        derive_hyperliquid_ws_url, resolve_hyperliquid_ws_url, validate_hyperliquid_ws_url,
+        HyperliquidWsManager, WsStreamStatus, WsSubscriptionSet, WsTimingConfig,
+    };
+    use std::time::{Duration, Instant};
+
+    let mut cfg = ConfigMap::new();
+    assert!(validate_hyperliquid_ws_url(
+        "wss://api.hyperliquid.xyz/ws",
+        &cfg
+    ));
+    assert!(validate_hyperliquid_ws_url(
+        "wss://api.hyperliquid-testnet.xyz/ws",
+        &cfg
+    ));
+    assert!(validate_hyperliquid_ws_url("ws://127.0.0.1:19001", &cfg));
+    assert!(validate_hyperliquid_ws_url("ws://localhost:19001/ws", &cfg));
+    assert!(validate_hyperliquid_ws_url("ws://[::1]:19001/ws", &cfg));
+    assert!(!validate_hyperliquid_ws_url(
+        "ws://api.hyperliquid.xyz/ws",
+        &cfg
+    ));
+    assert!(!validate_hyperliquid_ws_url(
+        "wss://evil.attacker.example/ws",
+        &cfg
+    ));
+    assert!(!validate_hyperliquid_ws_url(
+        "http://api.hyperliquid.xyz/ws",
+        &cfg
+    ));
+    cfg.insert("execution_mode", "LIVE");
+    cfg.insert("hyperliquid_api_url", "https://api.hyperliquid.xyz/info");
+    assert_eq!(
+        resolve_hyperliquid_ws_url(&cfg),
+        "wss://api.hyperliquid.xyz/ws"
+    );
+    assert_eq!(
+        derive_hyperliquid_ws_url("http://127.0.0.1:19555", &cfg).as_deref(),
+        Some("ws://127.0.0.1:19555/ws")
+    );
+
+    let ws_srv = MockWsServer::start();
+    let db = fresh_isolated_db();
+    seed_test_assets(&db);
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("hyperliquid_ws_url", &ws_srv.ws_url(), None)
+        .unwrap();
+    db.set_config_value(
+        "wallet_address",
+        "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        None,
+    )
+    .unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    let loaded_cfg = db.load_config_or_default();
+    let (_sub_tx, sub_rx) = tokio::sync::watch::channel(WsSubscriptionSet {
+        ctx_and_candle_coins: vec!["SOL".to_string()],
+        l2_book_coins: vec!["SOL".to_string()],
+    });
+    let timing = WsTimingConfig {
+        ping_interval: Duration::from_secs(5),
+        stale_timeout: Duration::from_secs(15),
+        connect_timeout: Duration::from_secs(2),
+        backoff_min: Duration::from_millis(25),
+        backoff_max: Duration::from_millis(100),
+        healthy_reset_duration: Duration::from_secs(5),
+        subscribe_pace_interval: Duration::from_millis(5),
+        status_persist_interval: Duration::from_millis(80),
+    };
+    let mut mgr = HyperliquidWsManager::start(
+        db.clone(),
+        Arc::clone(&engine.ws_cache),
+        sub_rx,
+        &loaded_cfg,
+        timing,
+    )
+    .unwrap();
+
+    assert!(ws_srv.wait_for_connections(2, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+
+    // Verify all expected subscriptions were sent across Market + User WS
+    let subs = ws_srv.received_json();
+    for expected_type in [
+        "allMids",
+        "activeAssetCtx",
+        "candle",
+        "l2Book",
+        "orderUpdates",
+        "userFills",
+        "userFundings",
+        "userEvents",
+        "webData3",
+    ] {
+        assert!(
+            subs.iter().any(|v| {
+                v.get("method").and_then(Value::as_str) == Some("subscribe")
+                    && v.pointer("/subscription/type").and_then(Value::as_str)
+                        == Some(expected_type)
+            }),
+            "missing subscription for channel '{expected_type}'"
+        );
+    }
+
+    let now = now_ms();
+    ws_srv.push_json(&json!({
+        "channel": "allMids",
+        "data": { "mids": { "SOL": "188.25" } }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "activeAssetCtx",
+        "data": {
+            "coin": "SOL",
+            "ctx": {
+                "markPx": "188.20",
+                "oraclePx": "188.10",
+                "midPx": "188.25",
+                "prevDayPx": "180.00",
+                "funding": "0.000025",
+                "openInterest": "25000.0",
+                "dayNtlVlm": "50000000.0"
+            }
+        }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "candle",
+        "data": {
+            "t": now - 3_600_000,
+            "s": "SOL",
+            "i": "1h",
+            "o": "186.0",
+            "h": "189.0",
+            "l": "185.5",
+            "c": "188.2",
+            "v": "1234.5"
+        }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "l2Book",
+        "data": {
+            "coin": "SOL",
+            "levels": [
+                [{"px": "188.20", "sz": "15.0"}],
+                [{"px": "188.30", "sz": "15.0"}]
+            ]
+        }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "webData3",
+        "data": {
+            "clearinghouseState": {
+                "marginSummary": { "accountValue": "2450.0", "totalMarginUsed": "100.0", "withdrawable": "2350.0" },
+                "assetPositions": []
+            },
+            "openOrders": [
+                { "coin": "SOL", "oid": 5001u64, "orderType": "Stop Limit", "isTrigger": true, "triggerPx": "175.0" }
+            ]
+        }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "orderUpdates",
+        "data": [{
+            "order": { "coin": "SOL", "side": "B", "limitPx": "188.0", "sz": "1.0", "origSz": "1.0", "oid": 5002u64, "cloid": "0x001122" },
+            "status": "open",
+            "statusTimestamp": now
+        }]
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "userFills",
+        "data": {
+            "fills": [{ "coin": "SOL", "side": "B", "px": "188.0", "sz": "0.5", "fee": "0.05", "closedPnl": "0.0", "dir": "Open Long", "time": now, "oid": 5003u64, "tid": 77u64 }]
+        }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "userFundings",
+        "data": {
+            "fundings": [{ "time": now, "coin": "SOL", "usdc": "0.35", "szi": "0.5", "fundingRate": "0.00002", "nSamples": 1 }]
+        }
+    }));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if engine.ws_cache.get_fresh_all_mids().is_some()
+            && engine.ws_cache.get_fresh_active_asset_ctx("SOL").is_some()
+            && engine.ws_cache.get_fresh_candles("SOL", "1h").is_some()
+            && engine.ws_cache.get_fresh_l2_book_depth("SOL").is_some()
+            && engine.ws_cache.get_fresh_clearinghouse_state().is_some()
+            && engine.ws_cache.get_fresh_open_orders().is_some()
+            && engine
+                .ws_cache
+                .get_order_update_by_cloid("0x001122")
+                .is_some()
+            && !engine.ws_cache.get_recent_user_fills().0.is_empty()
+            && !engine.ws_cache.get_recent_user_fundings().0.is_empty()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    assert_eq!(
+        engine
+            .ws_cache
+            .get_fresh_all_mids()
+            .and_then(|m| m.get("SOL").copied()),
+        Some(188.25)
+    );
+    assert!(engine.ws_cache.get_fresh_active_asset_ctx("SOL").is_some());
+    assert!(engine.ws_cache.get_fresh_candles("SOL", "1h").is_some());
+    assert!(engine.ws_cache.get_fresh_l2_book_depth("SOL").is_some());
+    assert!(engine.ws_cache.get_fresh_clearinghouse_state().is_some());
+    assert!(engine
+        .ws_cache
+        .get_fresh_open_orders()
+        .is_some_and(|o| o.metadata_complete && o.orders.len() == 1));
+    assert!(engine
+        .ws_cache
+        .get_order_update_by_cloid("0x001122")
+        .is_some());
+    assert_eq!(engine.ws_cache.get_recent_user_fills().0.len(), 1);
+    assert_eq!(engine.ws_cache.get_recent_user_fundings().0.len(), 1);
+
+    // Ensure execution_lock() is never held by WS network loops
+    assert!(aegis_execution::execution_lock().try_lock().is_some());
+
+    // Ensure ws_stream_status_json was persisted
+    let status_deadline = Instant::now() + Duration::from_secs(2);
+    let mut persisted_connected = false;
+    while Instant::now() < status_deadline {
+        let raw = db
+            .load_config_or_default()
+            .get_str("ws_stream_status_json", "");
+        if let Ok(st) = serde_json::from_str::<WsStreamStatus>(&raw) {
+            if st.market_connected && st.user_connected && st.status == "CONNECTED" {
+                persisted_connected = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        persisted_connected,
+        "ws_stream_status_json must reflect CONNECTED state"
+    );
+
+    mgr.shutdown();
+}
+
+#[test]
+fn test_wave3_ws_heartbeat_reconnect_paced_resubscribe_gap_fill_and_rest_fallback() {
+    use aegis_execution::{HyperliquidWsManager, WsSubscriptionSet, WsTimingConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let ch_rest_calls = Arc::new(AtomicUsize::new(0));
+    let orders_rest_calls = Arc::new(AtomicUsize::new(0));
+    let fills_rest_calls = Arc::new(AtomicUsize::new(0));
+    let mids_rest_calls = Arc::new(AtomicUsize::new(0));
+
+    let ch_srv = ch_rest_calls.clone();
+    let orders_srv = orders_rest_calls.clone();
+    let fills_srv = fills_rest_calls.clone();
+    let mids_srv = mids_rest_calls.clone();
+
+    let http_srv = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => {
+                    ch_srv.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({
+                            "marginSummary": {
+                                "accountValue": "3100.0",
+                                "totalMarginUsed": "0.0",
+                                "withdrawable": "3100.0"
+                            },
+                            "assetPositions": []
+                        }),
+                    )
+                }
+                "frontendOpenOrders" => {
+                    orders_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!([]))
+                }
+                "userFillsByTime" | "userFills" => {
+                    fills_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!([]))
+                }
+                "allMids" => {
+                    mids_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({ "BTC": "66000.0", "SOL": "185.0" }))
+                }
+                "userAbstraction" => (200, Value::String("default".to_string())),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let ws_srv = MockWsServer::start();
+    let db = fresh_isolated_db();
+    seed_test_assets(&db);
+    let btc = db.get_asset_by_symbol("BTC-USDC").unwrap().unwrap();
+    db.set_asset_priority_watch(btc.id, true).unwrap();
+    configure_testnet_mock_db(&db, http_srv.port());
+    db.set_config_value("hyperliquid_ws_url", &ws_srv.ws_url(), None)
+        .unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    let cfg = db.load_config_or_default();
+    let (_sub_tx, sub_rx) = tokio::sync::watch::channel(WsSubscriptionSet {
+        ctx_and_candle_coins: vec!["BTC".to_string(), "SOL".to_string()],
+        l2_book_coins: vec!["BTC".to_string(), "SOL".to_string()],
+    });
+    let timing = WsTimingConfig {
+        ping_interval: Duration::from_millis(80),
+        stale_timeout: Duration::from_millis(280),
+        connect_timeout: Duration::from_secs(2),
+        backoff_min: Duration::from_millis(20),
+        backoff_max: Duration::from_millis(60),
+        healthy_reset_duration: Duration::from_secs(5),
+        subscribe_pace_interval: Duration::from_millis(15),
+        status_persist_interval: Duration::from_millis(80),
+    };
+    let mut mgr = HyperliquidWsManager::start(
+        db.clone(),
+        Arc::clone(&engine.ws_cache),
+        sub_rx,
+        &cfg,
+        timing,
+    )
+    .unwrap();
+
+    assert!(ws_srv.wait_for_connections(2, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+
+    // Expect periodic ping -> pong
+    let ping_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < ping_deadline {
+        if ws_srv
+            .received_json()
+            .iter()
+            .any(|v| v.get("method").and_then(Value::as_str) == Some("ping"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        ws_srv
+            .received_json()
+            .iter()
+            .any(|v| v.get("method").and_then(Value::as_str) == Some("ping")),
+        "WS manager must send JSON ping heartbeat"
+    );
+
+    // 1. Initial connect sets needs_rest_gap_reconcile = true -> first reconcile performs REST gap-fill and clears it
+    assert!(engine.ws_cache.needs_rest_gap_reconcile());
+    let rep1 = engine.reconciler.sync_db_with_hyperliquid().unwrap();
+    assert!(rep1.exchange_reachable);
+    assert_eq!(ch_rest_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(orders_rest_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fills_rest_calls.load(Ordering::SeqCst), 1);
+    assert!(!engine.ws_cache.needs_rest_gap_reconcile());
+
+    // 2. Push fresh webData3 + allMids; steady-state reconcile & PriorityMonitor consume WS cache WITHOUT REST
+    ws_srv.push_json(&json!({
+        "channel": "allMids",
+        "data": { "mids": { "BTC": "66500.0", "SOL": "188.0" } }
+    }));
+    ws_srv.push_json(&json!({
+        "channel": "webData3",
+        "data": {
+            "clearinghouseState": {
+                "marginSummary": { "accountValue": "3250.0", "totalMarginUsed": "0.0", "withdrawable": "3250.0" },
+                "assetPositions": []
+            },
+            "openOrders": []
+        }
+    }));
+    let ch_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < ch_deadline {
+        if engine
+            .ws_cache
+            .get_fresh_clearinghouse_state_if_gap_filled()
+            .is_some()
+            && engine.ws_cache.get_fresh_all_mids().is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    let prio_ws = engine.priority_monitor.run_1s_priority_tick().unwrap();
+    assert_eq!(prio_ws.watchlist_count, 1);
+    assert_eq!(
+        mids_rest_calls.load(Ordering::SeqCst),
+        0,
+        "PriorityMonitor must read fresh allMids from WsStateCache without REST"
+    );
+
+    let rep2 = engine.reconciler.sync_db_with_hyperliquid().unwrap();
+    assert!((rep2.exchange_equity_usdc - 3250.0).abs() < 1e-6);
+    assert_eq!(
+        ch_rest_calls.load(Ordering::SeqCst),
+        1,
+        "steady-state reconcile must reuse fresh User WS clearinghouseState"
+    );
+    assert_eq!(
+        orders_rest_calls.load(Ordering::SeqCst),
+        1,
+        "steady-state reconcile must reuse fresh User WS openOrders"
+    );
+    assert_eq!(
+        fills_rest_calls.load(Ordering::SeqCst),
+        1,
+        "steady-state reconcile must reuse User WS userFills ring"
+    );
+
+    // 3. Post-order-submit 1_500 ms bypass forces REST read instead of stale WS clearinghouseState
+    engine.ws_cache.mark_order_submit();
+    assert!(engine.ws_cache.get_fresh_clearinghouse_state().is_none());
+    let rep_bypass = engine.reconciler.sync_db_with_hyperliquid().unwrap();
+    assert!((rep_bypass.exchange_equity_usdc - 3100.0).abs() < 1e-6);
+    assert_eq!(ch_rest_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(orders_rest_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fills_rest_calls.load(Ordering::SeqCst), 1);
+
+    // 4. Forced disconnect triggers reconnect, paced resubscription, and re-arms needs_rest_gap_reconcile
+    ws_srv.clear_received();
+    let conns_before = ws_srv.connection_count();
+    ws_srv.disconnect_all();
+    assert!(ws_srv.wait_for_connections(conns_before + 2, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+    assert!(engine.ws_cache.needs_rest_gap_reconcile());
+    engine.reconciler.sync_db_with_hyperliquid().unwrap();
+    assert!(!engine.ws_cache.needs_rest_gap_reconcile());
+    assert_eq!(ch_rest_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(orders_rest_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(fills_rest_calls.load(Ordering::SeqCst), 2);
+
+    // 5. Shutdown WS manager -> PriorityMonitor transparently falls back to Phase 1 REST allMids
+    mgr.shutdown();
+    assert!(!engine.ws_cache.is_market_ws_connected());
+    let mids_before = mids_rest_calls.load(Ordering::SeqCst);
+    engine.priority_monitor.run_1s_priority_tick().unwrap();
+    assert!(
+        mids_rest_calls.load(Ordering::SeqCst) > mids_before,
+        "PriorityMonitor must transparently fall back to REST allMids when WS disconnects"
+    );
+}
+
+#[test]
+fn test_wave3_ws_market_watcher_and_priority_monitor_zero_redundant_http() {
+    use aegis_db::BarUpsertInput;
+    use aegis_execution::{HyperliquidWsManager, WsSubscriptionSet, WsTimingConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let meta_calls = Arc::new(AtomicUsize::new(0));
+    let mids_calls = Arc::new(AtomicUsize::new(0));
+    let candle_calls = Arc::new(AtomicUsize::new(0));
+    let ch_calls = Arc::new(AtomicUsize::new(0));
+    let l2_calls = Arc::new(AtomicUsize::new(0));
+    let front_orders_calls = Arc::new(AtomicUsize::new(0));
+
+    let meta_srv = meta_calls.clone();
+    let mids_srv = mids_calls.clone();
+    let candle_srv = candle_calls.clone();
+    let ch_srv = ch_calls.clone();
+    let l2_srv = l2_calls.clone();
+    let front_srv = front_orders_calls.clone();
+
+    let http_srv = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "metaAndAssetCtxs" => {
+                    meta_srv.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!([
+                            {
+                                "universe": [
+                                    { "name": "BTC", "szDecimals": 4, "maxLeverage": 50 },
+                                    { "name": "SOL", "szDecimals": 2, "maxLeverage": 20 }
+                                ]
+                            },
+                            [
+                                {
+                                    "markPx": "65000.0",
+                                    "midPx": "65000.0",
+                                    "oraclePx": "65000.0",
+                                    "prevDayPx": "64000.0",
+                                    "funding": "0.0000125",
+                                    "dayNtlVlm": "500000000.0",
+                                    "openInterest": "2000.0"
+                                },
+                                {
+                                    "markPx": "185.0",
+                                    "midPx": "185.0",
+                                    "oraclePx": "185.0",
+                                    "prevDayPx": "180.0",
+                                    "funding": "0.0000125",
+                                    "dayNtlVlm": "100000000.0",
+                                    "openInterest": "100000.0"
+                                }
+                            ]
+                        ]),
+                    )
+                }
+                "allMids" => {
+                    mids_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!({ "BTC": "65000.0", "SOL": "185.0" }))
+                }
+                "candleSnapshot" => {
+                    candle_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!([]))
+                }
+                "clearinghouseState" => {
+                    ch_srv.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({
+                            "marginSummary": { "accountValue": "2000.0", "totalMarginUsed": "100.0", "withdrawable": "1900.0" },
+                            "assetPositions": []
+                        }),
+                    )
+                }
+                "l2Book" => {
+                    l2_srv.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({
+                            "levels": [
+                                [{"px": "184.95", "sz": "100.0"}],
+                                [{"px": "185.05", "sz": "100.0"}]
+                            ]
+                        }),
+                    )
+                }
+                "frontendOpenOrders" => {
+                    front_srv.fetch_add(1, Ordering::SeqCst);
+                    (200, json!([]))
+                }
+                _ => (200, json!([])),
+            };
+        }
+        (
+            200,
+            json!({
+                "status": "ok",
+                "response": { "type": "order", "data": { "statuses": [{ "resting": { "oid": 88001u64 } }] } }
+            }),
+        )
+    });
+
+    let ws_srv = MockWsServer::start();
+    let db = fresh_isolated_db();
+    configure_testnet_mock_db(&db, http_srv.port());
+    db.set_config_value("hyperliquid_ws_url", &ws_srv.ws_url(), None)
+        .unwrap();
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("live_exchange_equity_usdc", "2000.0", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    let cfg = db.load_config_or_default();
+    let sub_rx = engine.ws_subscription_sender().subscribe();
+    let timing = WsTimingConfig {
+        ping_interval: Duration::from_secs(5),
+        stale_timeout: Duration::from_secs(15),
+        connect_timeout: Duration::from_secs(2),
+        backoff_min: Duration::from_millis(25),
+        backoff_max: Duration::from_millis(100),
+        healthy_reset_duration: Duration::from_secs(5),
+        subscribe_pace_interval: Duration::from_millis(5),
+        status_persist_interval: Duration::from_secs(5),
+    };
+    let mut mgr = HyperliquidWsManager::start(
+        db.clone(),
+        Arc::clone(&engine.ws_cache),
+        sub_rx,
+        &cfg,
+        timing,
+    )
+    .unwrap();
+    assert!(ws_srv.wait_for_connections(2, Duration::from_secs(3)));
+
+    // Initial universe discovery (1 metaAndAssetCtxs call)
+    let scan1 = engine.watcher.run_3s_exchange_scan().unwrap();
+    assert_eq!(scan1.total_assets_upserted, 2);
+    assert_eq!(meta_calls.load(Ordering::SeqCst), 1);
+
+    let btc = db.get_asset_by_symbol("BTC-USDC").unwrap().unwrap();
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    db.set_asset_priority_watch(sol.id, true).unwrap();
+
+    // Seed >= 48 historical 1h & 4h bars in DB so steady-state WS candles skip candleSnapshot REST
+    let now = now_ms();
+    let mut seed_bars = Vec::new();
+    for tf in ["1h", "4h"] {
+        let tf_ms = if tf == "1h" {
+            3_600_000i64
+        } else {
+            14_400_000i64
+        };
+        for asset_id in [btc.id, sol.id] {
+            for i in (1..=48i64).rev() {
+                seed_bars.push(BarUpsertInput {
+                    asset_id,
+                    timeframe: tf.to_string(),
+                    timestamp_ms: now - i * tf_ms,
+                    open: 184.0,
+                    high: 186.0,
+                    low: 183.0,
+                    close: 185.0,
+                    volume: 1000.0,
+                    funding_rate: 0.0,
+                });
+            }
+        }
+    }
+    db.upsert_ohlcv_bars(&seed_bars).unwrap();
+
+    // Seed an active OPEN holding on BTC with existing SL/TP OIDs
+    let (btc_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: btc.id,
+            coin: &btc.coin,
+            side: OrderSide::Long,
+            entry_price: 65000.0,
+            mark_price: 65000.0,
+            quantity: 0.01,
+            committed_notional_usdc: 650.0,
+            unrealized_pnl_usdc: 0.0,
+            portfolio_weight: 0.32,
+            protective_stop_px: 62000.0,
+            take_profit_px: 69000.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 600_000),
+        })
+        .unwrap();
+    db.update_position_tpsl_orders(
+        btc_pid,
+        62000.0,
+        OidUpdate::Set("hl-9101"),
+        69000.0,
+        OidUpdate::Set("hl-9102"),
+    )
+    .unwrap();
+
+    // Reset HTTP call counters, push fresh Market + User WS frames
+    meta_calls.store(0, Ordering::SeqCst);
+    mids_calls.store(0, Ordering::SeqCst);
+    candle_calls.store(0, Ordering::SeqCst);
+    ch_calls.store(0, Ordering::SeqCst);
+    l2_calls.store(0, Ordering::SeqCst);
+    front_orders_calls.store(0, Ordering::SeqCst);
+
+    let _ = engine.ws_subscription_sender().send(WsSubscriptionSet {
+        ctx_and_candle_coins: vec!["BTC".to_string(), "SOL".to_string()],
+        l2_book_coins: vec!["BTC".to_string(), "SOL".to_string()],
+    });
+
+    let push_fresh_ws = || {
+        let cur_ts = now_ms();
+        ws_srv.push_json(&json!({
+            "channel": "allMids",
+            "data": { "mids": { "BTC": "66123.5", "SOL": "189.75" } }
+        }));
+        ws_srv.push_json(&json!({
+            "channel": "activeAssetCtx",
+            "data": {
+                "coin": "BTC",
+                "ctx": {
+                    "markPx": "66120.0",
+                    "oraclePx": "66110.0",
+                    "midPx": "66123.5",
+                    "prevDayPx": "64000.0",
+                    "funding": "0.000015",
+                    "openInterest": "2500.0",
+                    "dayNtlVlm": "550000000.0"
+                }
+            }
+        }));
+        ws_srv.push_json(&json!({
+            "channel": "activeAssetCtx",
+            "data": {
+                "coin": "SOL",
+                "ctx": {
+                    "markPx": "189.70",
+                    "oraclePx": "189.65",
+                    "midPx": "189.75",
+                    "prevDayPx": "180.0",
+                    "funding": "0.00002",
+                    "openInterest": "120000.0",
+                    "dayNtlVlm": "120000000.0"
+                }
+            }
+        }));
+        for (coin, px) in [("BTC", "66120.0"), ("SOL", "189.70")] {
+            for tf in ["1h", "4h"] {
+                ws_srv.push_json(&json!({
+                    "channel": "candle",
+                    "data": {
+                        "t": cur_ts,
+                        "s": coin,
+                        "i": tf,
+                        "o": px,
+                        "h": px,
+                        "l": px,
+                        "c": px,
+                        "v": "500.0"
+                    }
+                }));
+            }
+        }
+        ws_srv.push_json(&json!({
+            "channel": "l2Book",
+            "data": {
+                "coin": "SOL",
+                "levels": [
+                    [{"px": "189.70", "sz": "50.0"}],
+                    [{"px": "189.80", "sz": "50.0"}]
+                ]
+            }
+        }));
+        ws_srv.push_json(&json!({
+            "channel": "webData3",
+            "data": {
+                "clearinghouseState": {
+                    "marginSummary": { "accountValue": "2050.0", "totalMarginUsed": "650.0", "withdrawable": "1400.0" },
+                    "assetPositions": [{ "position": { "coin": "BTC", "szi": "0.01", "entryPx": "65000.0", "positionValue": "661.2" } }]
+                },
+                "openOrders": [
+                    { "coin": "BTC", "oid": 9101u64, "orderType": "Stop Limit", "isTrigger": true, "triggerPx": "62000.0" },
+                    { "coin": "BTC", "oid": 9102u64, "orderType": "Take Profit Limit", "isTrigger": true, "triggerPx": "69000.0" }
+                ]
+            }
+        }));
+    };
+
+    push_fresh_ws();
+    let ready_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < ready_deadline {
+        if engine.ws_cache.get_fresh_all_mids().is_some()
+            && engine.ws_cache.get_fresh_active_asset_ctx("BTC").is_some()
+            && engine.ws_cache.get_fresh_candles("SOL", "1h").is_some()
+            && engine.ws_cache.get_fresh_l2_book_depth("SOL").is_some()
+            && engine.ws_cache.get_fresh_clearinghouse_state().is_some()
+            && engine.ws_cache.get_fresh_open_orders().is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+
+    // Run multiple 3s MarketWatcher scans and 1s PriorityMonitor ticks -> ZERO redundant /info HTTP calls!
+    for _ in 0..2 {
+        let scan = engine.watcher.run_3s_exchange_scan().unwrap();
+        assert!(scan.live_exchange_connected);
+        let tick = engine.priority_monitor.run_1s_priority_tick().unwrap();
+        assert!(tick.watchlist_count >= 1);
+    }
+
+    // Also run rebalance entry L2 gate check on WS-cached SOL without spending REST l2Book weight
+    let sol_fresh = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    assert!((sol_fresh.mid_price - 189.75).abs() < 1e-4);
+    assert!((sol_fresh.mark_price - 189.70).abs() < 1e-4);
+
+    let sigs = make_signal_output(vec![make_signal_input(
+        &sol_fresh,
+        0.25,
+        0.0,
+        ACTION_OPEN_LONG,
+    )]);
+    let reb = engine.execute_signal_rebalance(&sigs, 2000.0).unwrap();
+    assert_eq!(reb.working_orders_placed, 1);
+
+    assert_eq!(
+        meta_calls.load(Ordering::SeqCst),
+        0,
+        "MarketWatcher must not re-poll metaAndAssetCtxs inside 60s window when Market WS is fresh"
+    );
+    assert_eq!(
+        mids_calls.load(Ordering::SeqCst),
+        0,
+        "MarketWatcher & PriorityMonitor must read allMids from WsStateCache"
+    );
+    assert_eq!(
+        candle_calls.load(Ordering::SeqCst),
+        0,
+        "MarketWatcher must consume WS candles without candleSnapshot REST calls when DB has >=48 bars"
+    );
+    assert_eq!(
+        ch_calls.load(Ordering::SeqCst),
+        0,
+        "PriorityMonitor must read clearinghouseState from WsStateCache"
+    );
+    assert_eq!(
+        l2_calls.load(Ordering::SeqCst),
+        0,
+        "Rebalance & OrderChaser L2 gate must read l2Book from WsStateCache"
+    );
+    assert_eq!(
+        front_orders_calls.load(Ordering::SeqCst),
+        0,
+        "PriorityMonitor TP/SL sync must not call frontendOpenOrders when fresh WS openOrders exists"
+    );
+
+    mgr.shutdown();
+}
+
+#[test]
+fn test_wave3_spawn_background_runtime_ws_lifecycle_and_http_only_opt_out() {
+    use std::time::{Duration, Instant};
+
+    // 1. HTTP-only ephemeral test DB without explicit loopback WS URL keeps WS disabled
+    let http_srv = MockHttpServer::start_json(|path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "clearinghouseState" {
+                return (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "1000.0", "totalMarginUsed": "0.0", "withdrawable": "1000.0" },
+                        "assetPositions": []
+                    }),
+                );
+            }
+            return (200, json!([]));
+        }
+        (200, json!({ "status": "ok" }))
+    });
+    let db_http_only = fresh_isolated_db();
+    configure_testnet_mock_db(&db_http_only, http_srv.port());
+    let eng_http_only = ExecutionEngine::new(db_http_only);
+    let tx_http = eng_http_only.spawn_background_runtime();
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(!eng_http_only.ws_cache.is_market_ws_connected());
+    assert!(!eng_http_only.ws_cache.is_user_ws_connected());
+    let _ = tx_http.send(true);
+
+    // 2. Loopback hyperliquid_ws_url spawns Market + User WS via spawn_background_runtime and stops cleanly
+    let ws_srv = MockWsServer::start();
+    let db_ws = fresh_isolated_db();
+    seed_test_assets(&db_ws);
+    configure_testnet_mock_db(&db_ws, http_srv.port());
+    db_ws
+        .set_config_value("hyperliquid_ws_url", &ws_srv.ws_url(), None)
+        .unwrap();
+    db_ws
+        .set_config_value("auto_rebalance_enabled", "false", None)
+        .unwrap();
+
+    let eng_ws = ExecutionEngine::new(db_ws);
+    let tx_ws = eng_ws.spawn_background_runtime();
+    assert!(
+        ws_srv.wait_for_connections(2, Duration::from_secs(4)),
+        "spawn_background_runtime must establish Market + User WS connections when loopback WS URL is set"
+    );
+    let conn_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < conn_deadline {
+        if eng_ws.ws_cache.is_market_ws_connected() && eng_ws.ws_cache.is_user_ws_connected() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(eng_ws.ws_cache.is_market_ws_connected());
+    assert!(eng_ws.ws_cache.is_user_ws_connected());
+
+    let _ = tx_ws.send(true);
+    let stop_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < stop_deadline {
+        if !eng_ws.ws_cache.is_market_ws_connected() && !eng_ws.ws_cache.is_user_ws_connected() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!eng_ws.ws_cache.is_market_ws_connected());
+    assert!(!eng_ws.ws_cache.is_user_ws_connected());
 }

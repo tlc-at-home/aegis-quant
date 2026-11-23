@@ -23,6 +23,10 @@ use crate::reconcile::{
     AuxiliarySyncWorker, CutoverReconcileReport, CutoverReconciler, AUX_SYNC_INTERVAL_MS,
 };
 use crate::signing::CancelWire;
+use crate::ws_client::{
+    build_ws_subscription_set_from_db, has_explicit_loopback_ws_url, should_enable_ws_manager,
+    HyperliquidWsManager, WsStateCache, WsSubscriptionSet, WsTimingConfig,
+};
 use aegis_alerts::{
     format_cutover_reconcile_html, format_position_closed_html, AlertEngine, CutoverReconcileAlert,
     PositionClosedAlert,
@@ -55,7 +59,9 @@ pub fn execution_lock() -> &'static Arc<ReentrantMutex<()>> {
 
 pub(crate) fn is_live_exchange_active(db: &DatabaseManager, cfg: &ConfigMap) -> bool {
     cfg.execution_mode().is_live_or_testnet()
-        && (!db.is_ephemeral_test_db() || endpoints_are_loopback(cfg))
+        && (!db.is_ephemeral_test_db()
+            || endpoints_are_loopback(cfg)
+            || has_explicit_loopback_ws_url(cfg))
 }
 
 pub const MAX_L2_DEPTH_CHECKS_PER_REBALANCE: usize = 6;
@@ -529,12 +535,14 @@ pub struct ExecutionEngine {
     pub reconciler: CutoverReconciler,
     pub aux_sync: AuxiliarySyncWorker,
     pub alerts: AlertEngine,
+    pub ws_cache: Arc<WsStateCache>,
     pub illiquid_close_backoff_ms: Arc<Mutex<HashMap<i64, i64>>>,
     pub in_flight_position_ops: Arc<Mutex<HashSet<i64>>>,
     pub in_flight_entry_assets: Arc<Mutex<HashSet<i64>>>,
     deleverage_confirm_state: Arc<Mutex<DeleverageConfirmState>>,
     signal_bar_cache: Arc<Mutex<BarCloseCache>>,
     alert_wakeup_tx: Option<SyncSender<usize>>,
+    ws_sub_tx: Arc<tokio::sync::watch::Sender<WsSubscriptionSet>>,
 }
 
 impl ExecutionEngine {
@@ -543,30 +551,42 @@ impl ExecutionEngine {
     }
 
     pub fn with_timeout(db: DatabaseManager, timeout_sec: u64) -> Self {
-        let http = HyperliquidHttpClient::new(timeout_sec);
+        let ws_cache = Arc::new(WsStateCache::new());
+        let (ws_sub_tx_raw, _ws_sub_rx) = tokio::sync::watch::channel(WsSubscriptionSet::default());
+        let ws_sub_tx = Arc::new(ws_sub_tx_raw);
+
+        let http = HyperliquidHttpClient::new(timeout_sec).with_ws_cache(Arc::clone(&ws_cache));
         let alerts = AlertEngine::new(db.clone());
-        let watcher = MarketWatcher::new(db.clone(), http.clone());
+        let watcher = MarketWatcher::new(db.clone(), http.clone())
+            .with_ws_cache(Arc::clone(&ws_cache))
+            .with_ws_subscriptions(Arc::clone(&ws_sub_tx));
         let in_flight_position_ops = Arc::new(Mutex::new(HashSet::new()));
         let in_flight_entry_assets = Arc::new(Mutex::new(HashSet::new()));
 
         let (alert_wakeup_tx, chaser, priority_monitor) = if !db.is_ephemeral_test_db() {
             let (tx, _worker) = AlertDispatchWorker::spawn(alerts.clone());
             let chaser = OrderChaser::new(db.clone(), http.clone(), alerts.clone())
-                .with_alert_wakeup(tx.clone());
+                .with_alert_wakeup(tx.clone())
+                .with_ws_cache(Arc::clone(&ws_cache));
             let priority_monitor =
                 PriorityMonitor::new(db.clone(), http.clone(), chaser.clone(), alerts.clone())
-                    .with_alert_wakeup(tx.clone());
+                    .with_alert_wakeup(tx.clone())
+                    .with_ws_cache(Arc::clone(&ws_cache));
             (Some(tx), chaser, priority_monitor)
         } else {
-            let chaser = OrderChaser::new(db.clone(), http.clone(), alerts.clone());
+            let chaser = OrderChaser::new(db.clone(), http.clone(), alerts.clone())
+                .with_ws_cache(Arc::clone(&ws_cache));
             let priority_monitor =
-                PriorityMonitor::new(db.clone(), http.clone(), chaser.clone(), alerts.clone());
+                PriorityMonitor::new(db.clone(), http.clone(), chaser.clone(), alerts.clone())
+                    .with_ws_cache(Arc::clone(&ws_cache));
             (None, chaser, priority_monitor)
         };
 
         let reconciler = CutoverReconciler::new(db.clone(), http.clone())
-            .with_in_flight_position_ops(Arc::clone(&in_flight_position_ops));
-        let aux_sync = AuxiliarySyncWorker::new(db.clone(), http.clone());
+            .with_in_flight_position_ops(Arc::clone(&in_flight_position_ops))
+            .with_ws_cache(Arc::clone(&ws_cache));
+        let aux_sync =
+            AuxiliarySyncWorker::new(db.clone(), http.clone()).with_ws_cache(Arc::clone(&ws_cache));
 
         Self {
             db,
@@ -577,13 +597,23 @@ impl ExecutionEngine {
             reconciler,
             aux_sync,
             alerts,
+            ws_cache,
             illiquid_close_backoff_ms: Arc::new(Mutex::new(HashMap::new())),
             in_flight_position_ops,
             in_flight_entry_assets,
             deleverage_confirm_state: Arc::new(Mutex::new(DeleverageConfirmState::default())),
             signal_bar_cache: Arc::new(Mutex::new(BarCloseCache::default())),
             alert_wakeup_tx,
+            ws_sub_tx,
         }
+    }
+
+    pub fn ws_cache(&self) -> &Arc<WsStateCache> {
+        &self.ws_cache
+    }
+
+    pub fn ws_subscription_sender(&self) -> &Arc<tokio::sync::watch::Sender<WsSubscriptionSet>> {
+        &self.ws_sub_tx
     }
 
     fn wake_alert_worker(&self, batch: usize) {
@@ -638,7 +668,12 @@ impl ExecutionEngine {
         if wallet.trim().is_empty() {
             return;
         }
-        if let Ok(snap) = self.http.fetch_open_orders_with_metadata(wallet, cfg) {
+        let open_orders_opt = self
+            .ws_cache
+            .get_fresh_open_orders()
+            .filter(|s| s.metadata_complete)
+            .or_else(|| self.http.fetch_open_orders_with_metadata(wallet, cfg).ok());
+        if let Some(snap) = open_orders_opt {
             let cancels: Vec<CancelWire> = if include_triggers {
                 snap.orders
                     .iter()
@@ -763,8 +798,7 @@ impl ExecutionEngine {
                     .unwrap_or_default();
             }
             if bars.len() < 16 && asset.mark_price > 0.0 {
-                let use_live_candles = cfg.execution_mode().is_live_or_testnet()
-                    && (!self.db.is_ephemeral_test_db() || endpoints_are_loopback(&cfg));
+                let use_live_candles = is_live_exchange_active(&self.db, &cfg);
                 let bar_inputs =
                     self.watcher
                         .fetch_or_synthesize_bars(asset, "4h", 72, use_live_candles, &cfg);
@@ -1286,15 +1320,20 @@ impl ExecutionEngine {
             );
             return Err(false);
         }
-        if *l2_depth_checks >= MAX_L2_DEPTH_CHECKS_PER_REBALANCE {
-            tracing::debug!(
-                checked = *l2_depth_checks,
-                "Reached per-cycle L2 depth check cap; deferring remaining candidates"
-            );
-            return Err(true);
-        }
-        *l2_depth_checks += 1;
-        match self.http.fetch_l2_book_depth(&asset.coin, cfg) {
+        let book_res = if let Some(ws_book) = self.ws_cache.get_fresh_l2_book_depth(&asset.coin) {
+            Ok(Some(ws_book))
+        } else {
+            if *l2_depth_checks >= MAX_L2_DEPTH_CHECKS_PER_REBALANCE {
+                tracing::debug!(
+                    checked = *l2_depth_checks,
+                    "Reached per-cycle L2 depth check cap; deferring remaining candidates"
+                );
+                return Err(true);
+            }
+            *l2_depth_checks += 1;
+            self.http.fetch_l2_book_depth(&asset.coin, cfg)
+        };
+        match book_res {
             Ok(Some(book)) => {
                 if let Err(reason) = passes_entry_l2_liquidity_gate_with_thresholds(
                     &book,
@@ -1974,22 +2013,26 @@ impl ExecutionEngine {
             };
         }
 
-        let ch_state = match self.http.fetch_clearinghouse_state(&wallet, cfg) {
-            Ok(st) => st,
-            Err(e) => {
-                tracing::warn!(
-                    position_id = pos.id,
-                    symbol = %asset.symbol,
-                    error = %e,
-                    "Hyperliquid clearinghouseState failed during close; refusing to mark DB position CLOSED blindly"
-                );
-                return OpenPositionCloseOutcome {
-                    exit_px,
-                    closed_qty,
-                    fee_usdc,
-                    close_eoid_opt: None,
-                    exchange_close_unfilled: true,
-                };
+        let ch_state = if let Some(ws_ch) = self.ws_cache.get_fresh_clearinghouse_state() {
+            ws_ch
+        } else {
+            match self.http.fetch_clearinghouse_state(&wallet, cfg) {
+                Ok(st) => st,
+                Err(e) => {
+                    tracing::warn!(
+                        position_id = pos.id,
+                        symbol = %asset.symbol,
+                        error = %e,
+                        "Hyperliquid clearinghouseState failed during close; refusing to mark DB position CLOSED blindly"
+                    );
+                    return OpenPositionCloseOutcome {
+                        exit_px,
+                        closed_qty,
+                        fee_usdc,
+                        close_eoid_opt: None,
+                        exchange_close_unfilled: true,
+                    };
+                }
             }
         };
 
@@ -2036,9 +2079,15 @@ impl ExecutionEngine {
             exit_px = implied_mark;
         }
 
-        let l2_bbo = self.http.fetch_l2_book(&asset.coin, cfg).ok().flatten();
-        let open_orders_snap: Option<OpenOrdersSnapshot> =
-            self.http.fetch_open_orders_with_metadata(&wallet, cfg).ok();
+        let l2_bbo = self
+            .ws_cache
+            .get_fresh_l2_bbo(&asset.coin)
+            .or_else(|| self.http.fetch_l2_book(&asset.coin, cfg).ok().flatten());
+        let open_orders_snap: Option<OpenOrdersSnapshot> = self
+            .ws_cache
+            .get_fresh_open_orders()
+            .filter(|s| s.metadata_complete)
+            .or_else(|| self.http.fetch_open_orders_with_metadata(&wallet, cfg).ok());
 
         let cloid_prefix = format!("v2-close-{}", pos.id);
         let ladder_req = ReduceOnlyCloseLadderRequest {
@@ -2416,6 +2465,25 @@ impl ExecutionEngine {
     pub fn spawn_background_runtime(&self) -> tokio::sync::watch::Sender<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
 
+        let startup_cfg = self.db.load_config_or_default();
+        if should_enable_ws_manager(&self.db, &startup_cfg) {
+            let init_subs = build_ws_subscription_set_from_db(&self.db, &startup_cfg);
+            let _ = self.ws_sub_tx.send(init_subs);
+            if let Err(err) = HyperliquidWsManager::spawn_background(
+                self.db.clone(),
+                Arc::clone(&self.ws_cache),
+                self.ws_sub_tx.subscribe(),
+                &startup_cfg,
+                WsTimingConfig::default(),
+                rx.clone(),
+            ) {
+                tracing::warn!(
+                    error = %err,
+                    "Failed starting HyperliquidWsManager; continuing with REST fallback"
+                );
+            }
+        }
+
         let sleep_interruptible = |rx: &tokio::sync::watch::Receiver<bool>, total_ms: u64| {
             let mut slept = 0u64;
             while slept < total_ms && !*rx.borrow() {
@@ -2530,7 +2598,15 @@ impl ExecutionEngine {
                 }
                 let elapsed_ms = tick_start.elapsed().as_millis() as u64;
                 let rem_ms = reconcile_ms.saturating_sub(elapsed_ms).max(250);
-                sleep_interruptible(&rec_rx, rem_ms);
+                let mut slept = 0u64;
+                while slept < rem_ms && !*rec_rx.borrow() {
+                    if rec_engine.ws_cache.needs_rest_gap_reconcile() && slept >= 1000 {
+                        break;
+                    }
+                    let chunk = (rem_ms - slept).min(250);
+                    std::thread::sleep(Duration::from_millis(chunk));
+                    slept += chunk;
+                }
             }
         });
 
