@@ -1,9 +1,14 @@
 //! Exchange assets discovery & live pricing repository (`aegis-db::assets_repo`).
 
 use crate::engine::DatabaseManager;
+use crate::row_decode::{
+    decimal_param, row_get_bool, row_get_f64, row_get_i64, row_get_string, row_get_u32,
+    DEC_20_10_MAX_ABS, DEC_20_8_MAX_ABS, DEC_24_8_MAX_ABS,
+};
 use aegis_core::{normalize_hyperliquid_symbol, now_ms, AegisError, ExchangeAsset, Result};
 use mysql::params;
 use mysql::prelude::*;
+use mysql::PooledConn;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
@@ -40,6 +45,34 @@ pub struct CanonicalAssetUpsert<'a> {
 pub struct CanonicalAssetUpsertBatch<'a> {
     pub input_keys: Vec<(String, String)>,
     pub ordered: BTreeMap<String, CanonicalAssetUpsert<'a>>,
+}
+
+struct PreparedAssetDecimals {
+    tick_size: String,
+    lot_step_size: String,
+    max_leverage: String,
+    mark_price: String,
+    mid_price: String,
+    oracle_price: String,
+    funding_rate_hourly: String,
+    day_volume_usdc: String,
+    open_interest_usdc: String,
+    prev_day_price: String,
+}
+
+fn prepare_asset_decimals(input: &AssetUpsertInput) -> Result<PreparedAssetDecimals> {
+    Ok(PreparedAssetDecimals {
+        tick_size: decimal_param(input.tick_size, 8, DEC_20_8_MAX_ABS)?,
+        lot_step_size: decimal_param(input.lot_step_size, 8, DEC_20_8_MAX_ABS)?,
+        max_leverage: decimal_param(input.max_leverage, 8, DEC_20_8_MAX_ABS)?,
+        mark_price: decimal_param(input.mark_price, 8, DEC_20_8_MAX_ABS)?,
+        mid_price: decimal_param(input.mid_price, 8, DEC_20_8_MAX_ABS)?,
+        oracle_price: decimal_param(input.oracle_price, 8, DEC_20_8_MAX_ABS)?,
+        funding_rate_hourly: decimal_param(input.funding_rate_hourly, 10, DEC_20_10_MAX_ABS)?,
+        day_volume_usdc: decimal_param(input.day_volume_usdc, 8, DEC_24_8_MAX_ABS)?,
+        open_interest_usdc: decimal_param(input.open_interest_usdc, 8, DEC_24_8_MAX_ABS)?,
+        prev_day_price: decimal_param(input.prev_day_price, 8, DEC_20_8_MAX_ABS)?,
+    })
 }
 
 /// Filters, sorts deterministically by `asset_id` ascending, and deduplicates
@@ -102,58 +135,61 @@ pub fn order_asset_upserts_by_lock_key<'b, 'a>(
     items.into_iter().map(|(_, entry)| entry).collect()
 }
 
+const ASSET_UPSERT_SQL: &str = r#"INSERT INTO exchange_assets (
+       symbol, coin, asset_index, sz_decimals, tick_size, lot_step_size, max_leverage,
+       mark_price, mid_price, oracle_price, funding_rate_hourly, day_volume_usdc,
+       open_interest_usdc, prev_day_price, is_core_eligible, is_event_eligible,
+       is_priority_watched, created_at_ms, updated_at_ms
+   ) VALUES (
+       :symbol, :coin, :idx, :sz_dec, :tick, :lot, :max_lev,
+       :mark, :mid, :oracle, :funding, :vol,
+       :oi, :prev_px, :core, :event,
+       :prio, :ts, :ts
+   )
+   ON DUPLICATE KEY UPDATE
+       asset_index = VALUES(asset_index),
+       sz_decimals = VALUES(sz_decimals),
+       tick_size = VALUES(tick_size),
+       lot_step_size = VALUES(lot_step_size),
+       max_leverage = VALUES(max_leverage),
+       mark_price = VALUES(mark_price),
+       mid_price = VALUES(mid_price),
+       oracle_price = VALUES(oracle_price),
+       funding_rate_hourly = VALUES(funding_rate_hourly),
+       day_volume_usdc = VALUES(day_volume_usdc),
+       open_interest_usdc = VALUES(open_interest_usdc),
+       prev_day_price = VALUES(prev_day_price),
+       is_core_eligible = VALUES(is_core_eligible),
+       is_event_eligible = VALUES(is_event_eligible),
+       is_priority_watched = VALUES(is_priority_watched),
+       updated_at_ms = VALUES(updated_at_ms)"#;
+
 impl DatabaseManager {
     /// Upserts a Hyperliquid perpetual asset with canonical `"<COIN>-USDC"` symbol normalization
     /// and returns its MariaDB `exchange_assets.id` primary key.
     pub fn upsert_exchange_asset(&self, input: &AssetUpsertInput) -> Result<i64> {
         let (symbol, coin) = normalize_hyperliquid_symbol(&input.raw_symbol_or_coin)?;
+        let dec = prepare_asset_decimals(input)?;
         let ts = now_ms();
         let mut conn = self.get_conn()?;
 
         conn.exec_drop(
-            r#"INSERT INTO exchange_assets (
-                   symbol, coin, asset_index, sz_decimals, tick_size, lot_step_size, max_leverage,
-                   mark_price, mid_price, oracle_price, funding_rate_hourly, day_volume_usdc,
-                   open_interest_usdc, prev_day_price, is_core_eligible, is_event_eligible,
-                   is_priority_watched, created_at_ms, updated_at_ms
-               ) VALUES (
-                   :symbol, :coin, :idx, :sz_dec, :tick, :lot, :max_lev,
-                   :mark, :mid, :oracle, :funding, :vol,
-                   :oi, :prev_px, :core, :event,
-                   :prio, :ts, :ts
-               )
-               ON DUPLICATE KEY UPDATE
-                   asset_index = VALUES(asset_index),
-                   sz_decimals = VALUES(sz_decimals),
-                   tick_size = VALUES(tick_size),
-                   lot_step_size = VALUES(lot_step_size),
-                   max_leverage = VALUES(max_leverage),
-                   mark_price = VALUES(mark_price),
-                   mid_price = VALUES(mid_price),
-                   oracle_price = VALUES(oracle_price),
-                   funding_rate_hourly = VALUES(funding_rate_hourly),
-                   day_volume_usdc = VALUES(day_volume_usdc),
-                   open_interest_usdc = VALUES(open_interest_usdc),
-                   prev_day_price = VALUES(prev_day_price),
-                   is_core_eligible = VALUES(is_core_eligible),
-                   is_event_eligible = VALUES(is_event_eligible),
-                   is_priority_watched = VALUES(is_priority_watched),
-                   updated_at_ms = VALUES(updated_at_ms)"#,
+            ASSET_UPSERT_SQL,
             params! {
                 "symbol" => &symbol,
                 "coin" => &coin,
                 "idx" => input.asset_index,
                 "sz_dec" => input.sz_decimals,
-                "tick" => input.tick_size,
-                "lot" => input.lot_step_size,
-                "max_lev" => input.max_leverage,
-                "mark" => input.mark_price,
-                "mid" => input.mid_price,
-                "oracle" => input.oracle_price,
-                "funding" => input.funding_rate_hourly,
-                "vol" => input.day_volume_usdc,
-                "oi" => input.open_interest_usdc,
-                "prev_px" => input.prev_day_price,
+                "tick" => &dec.tick_size,
+                "lot" => &dec.lot_step_size,
+                "max_lev" => &dec.max_leverage,
+                "mark" => &dec.mark_price,
+                "mid" => &dec.mid_price,
+                "oracle" => &dec.oracle_price,
+                "funding" => &dec.funding_rate_hourly,
+                "vol" => &dec.day_volume_usdc,
+                "oi" => &dec.open_interest_usdc,
+                "prev_px" => &dec.prev_day_price,
                 "core" => i32::from(input.is_core_eligible),
                 "event" => i32::from(input.is_event_eligible),
                 "prio" => i32::from(input.is_priority_watched),
@@ -174,10 +210,6 @@ impl DatabaseManager {
 
     /// Batch upserts multiple Hyperliquid perpetual assets inside a single MariaDB transaction,
     /// returning their `exchange_assets.id` primary keys in input order.
-    /// Inputs are deduplicated (last-wins) by uppercase normalized `symbol`, then ordered
-    /// deterministically by `(existing_id.unwrap_or(i64::MAX), uppercase_symbol)` before starting
-    /// the transaction so existing rows lock in `id` order (matching live-mid/priority batches)
-    /// and brand-new listings lock at the tail in canonical symbol order.
     pub fn upsert_exchange_assets_batch(&self, inputs: &[AssetUpsertInput]) -> Result<Vec<i64>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -200,62 +232,38 @@ impl DatabaseManager {
             .collect();
         let lock_ordered = order_asset_upserts_by_lock_key(&ordered, &existing_ids);
 
+        let mut prepared = Vec::with_capacity(lock_ordered.len());
+        for entry in lock_ordered {
+            prepared.push((entry, prepare_asset_decimals(entry.input)?));
+        }
+
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| AegisError::Database(format!("Failed to start assets batch tx: {e}")))?;
 
-        let stmt = tx
-            .prep(
-                r#"INSERT INTO exchange_assets (
-                       symbol, coin, asset_index, sz_decimals, tick_size, lot_step_size, max_leverage,
-                       mark_price, mid_price, oracle_price, funding_rate_hourly, day_volume_usdc,
-                       open_interest_usdc, prev_day_price, is_core_eligible, is_event_eligible,
-                       is_priority_watched, created_at_ms, updated_at_ms
-                   ) VALUES (
-                       :symbol, :coin, :idx, :sz_dec, :tick, :lot, :max_lev,
-                       :mark, :mid, :oracle, :funding, :vol,
-                       :oi, :prev_px, :core, :event,
-                       :prio, :ts, :ts
-                   )
-                   ON DUPLICATE KEY UPDATE
-                       asset_index = VALUES(asset_index),
-                       sz_decimals = VALUES(sz_decimals),
-                       tick_size = VALUES(tick_size),
-                       lot_step_size = VALUES(lot_step_size),
-                       max_leverage = VALUES(max_leverage),
-                       mark_price = VALUES(mark_price),
-                       mid_price = VALUES(mid_price),
-                       oracle_price = VALUES(oracle_price),
-                       funding_rate_hourly = VALUES(funding_rate_hourly),
-                       day_volume_usdc = VALUES(day_volume_usdc),
-                       open_interest_usdc = VALUES(open_interest_usdc),
-                       prev_day_price = VALUES(prev_day_price),
-                       is_core_eligible = VALUES(is_core_eligible),
-                       is_event_eligible = VALUES(is_event_eligible),
-                       is_priority_watched = VALUES(is_priority_watched),
-                       updated_at_ms = VALUES(updated_at_ms)"#,
-            )
-            .map_err(|e| AegisError::Database(format!("Failed preparing batch asset upsert: {e}")))?;
+        let stmt = tx.prep(ASSET_UPSERT_SQL).map_err(|e| {
+            AegisError::Database(format!("Failed preparing batch asset upsert: {e}"))
+        })?;
 
         tx.exec_batch(
             &stmt,
-            lock_ordered.into_iter().map(|entry| {
+            prepared.iter().map(|(entry, dec)| {
                 let input = entry.input;
                 params! {
                     "symbol" => &entry.symbol,
                     "coin" => &entry.coin,
                     "idx" => input.asset_index,
                     "sz_dec" => input.sz_decimals,
-                    "tick" => input.tick_size,
-                    "lot" => input.lot_step_size,
-                    "max_lev" => input.max_leverage,
-                    "mark" => input.mark_price,
-                    "mid" => input.mid_price,
-                    "oracle" => input.oracle_price,
-                    "funding" => input.funding_rate_hourly,
-                    "vol" => input.day_volume_usdc,
-                    "oi" => input.open_interest_usdc,
-                    "prev_px" => input.prev_day_price,
+                    "tick" => &dec.tick_size,
+                    "lot" => &dec.lot_step_size,
+                    "max_lev" => &dec.max_leverage,
+                    "mark" => &dec.mark_price,
+                    "mid" => &dec.mid_price,
+                    "oracle" => &dec.oracle_price,
+                    "funding" => &dec.funding_rate_hourly,
+                    "vol" => &dec.day_volume_usdc,
+                    "oi" => &dec.open_interest_usdc,
+                    "prev_px" => &dec.prev_day_price,
                     "core" => i32::from(input.is_core_eligible),
                     "event" => i32::from(input.is_event_eligible),
                     "prio" => i32::from(input.is_priority_watched),
@@ -292,6 +300,7 @@ impl DatabaseManager {
         if !mid_price.is_finite() || mid_price <= 0.0 {
             return Ok(());
         }
+        let mid_dec = decimal_param(mid_price, 8, DEC_20_8_MAX_ABS)?;
         let mut conn = self.get_conn()?;
         let ts = now_ms();
         conn.exec_drop(
@@ -299,7 +308,7 @@ impl DatabaseManager {
                SET mid_price = :mid, updated_at_ms = :ts
                WHERE id = :id"#,
             params! {
-                "mid" => mid_price,
+                "mid" => &mid_dec,
                 "ts" => ts,
                 "id" => asset_id,
             },
@@ -318,6 +327,10 @@ impl DatabaseManager {
         if ordered.is_empty() {
             return Ok(0);
         }
+        let mut prepared = Vec::with_capacity(ordered.len());
+        for (&asset_id, &mid) in &ordered {
+            prepared.push((asset_id, decimal_param(mid, 8, DEC_20_8_MAX_ABS)?));
+        }
         let ts = now_ms();
         let mut conn = self.get_conn()?;
         let mut tx = conn
@@ -332,11 +345,11 @@ impl DatabaseManager {
             .map_err(|e| AegisError::Database(format!("Failed preparing mid batch update: {e}")))?;
         tx.exec_batch(
             &stmt,
-            ordered.iter().map(|(&asset_id, &mid)| {
+            prepared.iter().map(|(asset_id, mid_dec)| {
                 params! {
-                    "mid" => mid,
+                    "mid" => mid_dec,
                     "ts" => ts,
-                    "id" => asset_id,
+                    "id" => *asset_id,
                 }
             }),
         )
@@ -344,7 +357,7 @@ impl DatabaseManager {
         drop(stmt);
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Batch live mid commit failed: {e}")))?;
-        Ok(ordered.len())
+        Ok(prepared.len())
     }
 
     /// Updates live mark/mid price on an existing asset during the 1s Priority Watchlist loop.
@@ -354,6 +367,8 @@ impl DatabaseManager {
         mark_price: f64,
         mid_price: f64,
     ) -> Result<()> {
+        let mark_dec = decimal_param(mark_price, 8, DEC_20_8_MAX_ABS)?;
+        let mid_dec = decimal_param(mid_price, 8, DEC_20_8_MAX_ABS)?;
         let mut conn = self.get_conn()?;
         let ts = now_ms();
         conn.exec_drop(
@@ -361,8 +376,8 @@ impl DatabaseManager {
                SET mark_price = :mark, mid_price = :mid, updated_at_ms = :ts
                WHERE id = :id"#,
             params! {
-                "mark" => mark_price,
-                "mid" => mid_price,
+                "mark" => &mark_dec,
+                "mid" => &mid_dec,
                 "ts" => ts,
                 "id" => asset_id,
             },
@@ -437,7 +452,7 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(format!("get_asset_by_symbol failed: {e}")))?;
 
-        Ok(row.map(row_to_exchange_asset))
+        Ok(row.map(|r| row_to_exchange_asset(&r)))
     }
 
     /// Looks up an `ExchangeAsset` by primary key `id`.
@@ -455,12 +470,18 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(format!("get_asset_by_id failed: {e}")))?;
 
-        Ok(row.map(row_to_exchange_asset))
+        Ok(row.map(|r| row_to_exchange_asset(&r)))
     }
 
     /// Lists all discovered Hyperliquid perpetual assets ordered by 24h USDC volume descending.
     pub fn list_exchange_assets(&self) -> Result<Vec<ExchangeAsset>> {
         let mut conn = self.get_conn()?;
+        Self::list_exchange_assets_with_conn(&mut conn)
+    }
+
+    pub(crate) fn list_exchange_assets_with_conn(
+        conn: &mut PooledConn,
+    ) -> Result<Vec<ExchangeAsset>> {
         let rows: Vec<mysql::Row> = conn
             .query(
                 r#"SELECT id, symbol, coin, asset_index, sz_decimals, tick_size, lot_step_size,
@@ -472,31 +493,31 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(format!("list_exchange_assets failed: {e}")))?;
 
-        Ok(rows.into_iter().map(row_to_exchange_asset).collect())
+        Ok(rows.iter().map(row_to_exchange_asset).collect())
     }
 }
 
-fn row_to_exchange_asset(r: mysql::Row) -> ExchangeAsset {
+fn row_to_exchange_asset(r: &mysql::Row) -> ExchangeAsset {
     ExchangeAsset {
-        id: r.get(0).unwrap_or_default(),
-        symbol: r.get(1).unwrap_or_default(),
-        coin: r.get(2).unwrap_or_default(),
-        asset_index: r.get(3).unwrap_or_default(),
-        sz_decimals: r.get(4).unwrap_or_default(),
-        tick_size: r.get(5).unwrap_or(0.01),
-        lot_step_size: r.get(6).unwrap_or(0.01),
-        max_leverage: r.get(7).unwrap_or(20.0),
-        mark_price: r.get(8).unwrap_or_default(),
-        mid_price: r.get(9).unwrap_or_default(),
-        oracle_price: r.get(10).unwrap_or_default(),
-        funding_rate_hourly: r.get(11).unwrap_or_default(),
-        day_volume_usdc: r.get(12).unwrap_or_default(),
-        open_interest_usdc: r.get(13).unwrap_or_default(),
-        prev_day_price: r.get(14).unwrap_or_default(),
-        is_core_eligible: r.get::<i32, _>(15).unwrap_or(0) != 0,
-        is_event_eligible: r.get::<i32, _>(16).unwrap_or(0) != 0,
-        is_priority_watched: r.get::<i32, _>(17).unwrap_or(0) != 0,
-        created_at_ms: r.get(18).unwrap_or_default(),
-        updated_at_ms: r.get(19).unwrap_or_default(),
+        id: row_get_i64(r, 0, 0),
+        symbol: row_get_string(r, 1, ""),
+        coin: row_get_string(r, 2, ""),
+        asset_index: row_get_u32(r, 3, 0),
+        sz_decimals: row_get_u32(r, 4, 0),
+        tick_size: row_get_f64(r, 5, 0.01),
+        lot_step_size: row_get_f64(r, 6, 0.01),
+        max_leverage: row_get_f64(r, 7, 20.0),
+        mark_price: row_get_f64(r, 8, 0.0),
+        mid_price: row_get_f64(r, 9, 0.0),
+        oracle_price: row_get_f64(r, 10, 0.0),
+        funding_rate_hourly: row_get_f64(r, 11, 0.0),
+        day_volume_usdc: row_get_f64(r, 12, 0.0),
+        open_interest_usdc: row_get_f64(r, 13, 0.0),
+        prev_day_price: row_get_f64(r, 14, 0.0),
+        is_core_eligible: row_get_bool(r, 15, false),
+        is_event_eligible: row_get_bool(r, 16, false),
+        is_priority_watched: row_get_bool(r, 17, false),
+        created_at_ms: row_get_i64(r, 18, 0),
+        updated_at_ms: row_get_i64(r, 19, 0),
     }
 }

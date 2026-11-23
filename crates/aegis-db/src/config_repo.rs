@@ -2,15 +2,17 @@
 
 use crate::engine::DatabaseManager;
 use crate::fernet::{is_encrypted_value, FernetCipher};
+use crate::row_decode::{row_get_i64, row_get_string};
 use aegis_core::{
     default_v2_system_config_seeds, is_sensitive_config_key, now_ms, AegisError, ConfigMap, Result,
     SystemConfigRow,
 };
 use mysql::params;
 use mysql::prelude::*;
+use mysql::PooledConn;
 use std::collections::HashMap;
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const CRITICAL_SECRET_KEYS: &[&str] = &["web_api_token", "private_key"];
 
@@ -44,14 +46,6 @@ impl DatabaseManager {
         if !sqlite_path.is_file() {
             return Ok(0);
         }
-        let sqlite_conn = match rusqlite::Connection::open_with_flags(
-            sqlite_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-            Ok(c) => c,
-            Err(_) => return Ok(0),
-        };
-
         let keys_to_preserve = [
             "wallet_address",
             "private_key",
@@ -66,39 +60,48 @@ impl DatabaseManager {
             "hyperliquid_testnet",
         ];
 
-        let mut stmt = match sqlite_conn
-            .prepare("SELECT config_key, config_value, value_type, description FROM system_config")
-        {
-            Ok(s) => s,
-            Err(_) => return Ok(0),
+        let legacy_rows: Vec<(String, String, String, String)> = {
+            let sqlite_conn = match rusqlite::Connection::open_with_flags(
+                sqlite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(c) => c,
+                Err(_) => return Ok(0),
+            };
+            let mut stmt = match sqlite_conn.prepare(
+                "SELECT config_key, config_value, value_type, description FROM system_config",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Ok(0),
+            };
+            let rows = match stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)
+                        .unwrap_or_else(|_| "string".to_string()),
+                    row.get::<_, String>(3).unwrap_or_default(),
+                ))
+            }) {
+                Ok(r) => r,
+                Err(_) => return Ok(0),
+            };
+            rows.flatten().collect()
         };
 
-        let rows = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)
-                    .unwrap_or_else(|_| "string".to_string()),
-                row.get::<_, String>(3).unwrap_or_default(),
-            ))
-        }) {
-            Ok(r) => r,
-            Err(_) => return Ok(0),
-        };
-
-        let mut migrated = 0usize;
+        // Strict lock order: fernet RwLock -> DB conn
+        let cipher = self.fernet();
         let mut conn = self.get_conn()?;
+        let mut migrated = 0usize;
         let ts = now_ms();
 
-        for row in rows.flatten() {
-            let (k, mut v, vtype, desc) = row;
+        for (k, mut v, vtype, desc) in legacy_rows {
             let clean_k = k.trim().to_ascii_lowercase();
             let trimmed_v = v.trim();
             if !keys_to_preserve.contains(&clean_k.as_str()) || trimmed_v.is_empty() {
                 v.zeroize();
                 continue;
             }
-            // Only overwrite if current MariaDB value is empty
             let current_res: Result<Option<String>> = conn
                 .exec_first(
                     "SELECT config_value FROM system_config WHERE config_key = :k",
@@ -125,7 +128,7 @@ impl DatabaseManager {
                     is_encrypted_value(trimmed_v) || trimmed_v.starts_with("ENC:");
 
                 let mut stored_val = if looks_encrypted {
-                    match self.fernet().decrypt(trimmed_v) {
+                    match cipher.decrypt(trimmed_v) {
                         Ok(mut plain) => {
                             plain.zeroize();
                             trimmed_v.to_string()
@@ -141,7 +144,7 @@ impl DatabaseManager {
                         }
                     }
                 } else if is_secret {
-                    match self.fernet().encrypt(trimmed_v.as_bytes()) {
+                    match cipher.encrypt(trimmed_v.as_bytes()) {
                         Ok(enc) => enc,
                         Err(e) => {
                             v.zeroize();
@@ -197,13 +200,25 @@ impl DatabaseManager {
     /// Fails closed for critical secrets (`web_api_token`, `private_key`), while isolating non-critical
     /// per-row decryption failures so a single corrupt non-critical entry never drops the whole map.
     pub fn load_config(&self) -> Result<ConfigMap> {
-        let mut conn = self.get_conn()?;
-        let rows: Vec<(String, String)> = conn
-            .query("SELECT config_key, config_value FROM system_config")
-            .map_err(|e| AegisError::Database(format!("Failed to query system_config: {e}")))?;
-
-        let mut map = HashMap::with_capacity(rows.len());
+        // Total lock order: fernet RwLock -> DB conn (eliminates TOCTOU key/ciphertext mismatch vs rotation)
         let cipher = self.fernet();
+        let rows: Vec<mysql::Row> = {
+            let mut conn = self.get_conn()?;
+            conn.query("SELECT config_key, config_value FROM system_config")
+                .map_err(|e| AegisError::Database(format!("Failed to query system_config: {e}")))?
+        };
+        let pairs: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|r| (row_get_string(&r, 0, ""), row_get_string(&r, 1, "")))
+            .collect();
+        Self::decrypt_config_pairs_with_cipher(&cipher, pairs)
+    }
+
+    pub(crate) fn decrypt_config_pairs_with_cipher(
+        cipher: &FernetCipher,
+        rows: Vec<(String, String)>,
+    ) -> Result<ConfigMap> {
+        let mut map = HashMap::with_capacity(rows.len());
         for (k, raw_v) in rows {
             let clean_k = k.trim().to_ascii_lowercase();
             if is_encrypted_value(&raw_v) || raw_v.trim().starts_with("ENC:") {
@@ -234,6 +249,25 @@ impl DatabaseManager {
         Ok(ConfigMap::from_map(map))
     }
 
+    /// Single parameterized point-lookup returning a raw integer `system_config` value
+    /// without decrypting secrets (`R14-M6`).
+    pub fn get_config_i64_raw(&self, key: &str) -> Result<Option<i64>> {
+        let clean_key = key.trim().to_ascii_lowercase();
+        if clean_key.is_empty() {
+            return Ok(None);
+        }
+        let mut conn = self.get_conn()?;
+        let raw: Option<String> = conn
+            .exec_first(
+                "SELECT config_value FROM system_config WHERE config_key = :k LIMIT 1",
+                params! { "k" => &clean_key },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("get_config_i64_raw('{clean_key}') failed: {e}"))
+            })?;
+        Ok(raw.and_then(|v| v.trim().parse::<i64>().ok()))
+    }
+
     /// Loads config with fallback to default `ConfigMap` on DB query error.
     pub fn load_config_or_default(&self) -> ConfigMap {
         match self.load_config() {
@@ -248,7 +282,13 @@ impl DatabaseManager {
     /// Lists raw `SystemConfigRow` entries (without decrypting secrets; suitable for Web UI display with redaction).
     pub fn list_system_config_rows(&self) -> Result<Vec<SystemConfigRow>> {
         let mut conn = self.get_conn()?;
-        let rows: Vec<(i64, String, String, String, String, i64, i64)> = conn
+        Self::list_system_config_rows_with_conn(&mut conn)
+    }
+
+    pub(crate) fn list_system_config_rows_with_conn(
+        conn: &mut PooledConn,
+    ) -> Result<Vec<SystemConfigRow>> {
+        let rows: Vec<mysql::Row> = conn
             .query(
                 r#"SELECT id, config_key, config_value, value_type, description, created_at_ms, updated_at_ms
                    FROM system_config
@@ -258,31 +298,20 @@ impl DatabaseManager {
 
         Ok(rows
             .into_iter()
-            .map(
-                |(
-                    id,
-                    config_key,
-                    config_value,
-                    value_type,
-                    description,
-                    created_at_ms,
-                    updated_at_ms,
-                )| {
-                    SystemConfigRow {
-                        id,
-                        config_key,
-                        config_value,
-                        value_type,
-                        description,
-                        created_at_ms,
-                        updated_at_ms,
-                    }
-                },
-            )
+            .map(|r| SystemConfigRow {
+                id: row_get_i64(&r, 0, 0),
+                config_key: row_get_string(&r, 1, ""),
+                config_value: row_get_string(&r, 2, ""),
+                value_type: row_get_string(&r, 3, "string"),
+                description: row_get_string(&r, 4, ""),
+                created_at_ms: row_get_i64(&r, 5, 0),
+                updated_at_ms: row_get_i64(&r, 6, 0),
+            })
             .collect())
     }
 
     /// Updates or inserts a configuration key, automatically Fernet-encrypting sensitive keys (`private_key`, `telegram_bot_token`, etc.).
+    /// Strictly enforces lock order `fernet RwLock -> DB conn -> DB tx` (`R14-M19`).
     pub fn set_config_value(
         &self,
         key: &str,
@@ -297,8 +326,11 @@ impl DatabaseManager {
         }
         let trimmed_val = value.trim();
         let looks_encrypted = is_encrypted_value(trimmed_val) || trimmed_val.starts_with("ENC:");
+
+        // Acquire fernet read lock BEFORE DB conn/tx so key rotation never races with secret writes
+        let cipher = self.fernet();
         if looks_encrypted {
-            let mut decrypted = self.fernet().decrypt(trimmed_val).map_err(|e| {
+            let mut decrypted = cipher.decrypt(trimmed_val).map_err(|e| {
                 AegisError::Validation(format!(
                     "Invalid or undecryptable Fernet ciphertext for '{clean_key}': {e}"
                 ))
@@ -306,8 +338,8 @@ impl DatabaseManager {
             decrypted.zeroize();
         }
         let is_secret = is_sensitive_config_key(&clean_key) && clean_key != "telegram_chat_id";
-        let stored_val = if is_secret && !trimmed_val.is_empty() && !looks_encrypted {
-            self.fernet().encrypt(trimmed_val.as_bytes())?
+        let mut stored_val = if is_secret && !trimmed_val.is_empty() && !looks_encrypted {
+            cipher.encrypt(trimmed_val.as_bytes())?
         } else {
             trimmed_val.to_string()
         };
@@ -340,23 +372,26 @@ impl DatabaseManager {
             false
         };
 
-        tx.exec_drop(
-            r#"INSERT INTO system_config
-               (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
-               VALUES (:k, :v, :vt, :d, :ts, :ts)
-               ON DUPLICATE KEY UPDATE
-               config_key = VALUES(config_key),
-               config_value = VALUES(config_value),
-               updated_at_ms = VALUES(updated_at_ms)"#,
-            params! {
-                "k" => &clean_key,
-                "v" => stored_val,
-                "vt" => vtype,
-                "d" => desc,
-                "ts" => ts,
-            },
-        )
-        .map_err(|e| AegisError::Database(format!("Failed to set config '{clean_key}': {e}")))?;
+        let write_res = tx
+            .exec_drop(
+                r#"INSERT INTO system_config
+                   (config_key, config_value, value_type, description, created_at_ms, updated_at_ms)
+                   VALUES (:k, :v, :vt, :d, :ts, :ts)
+                   ON DUPLICATE KEY UPDATE
+                   config_key = VALUES(config_key),
+                   config_value = VALUES(config_value),
+                   updated_at_ms = VALUES(updated_at_ms)"#,
+                params! {
+                    "k" => &clean_key,
+                    "v" => &stored_val,
+                    "vt" => vtype,
+                    "d" => desc,
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| AegisError::Database(format!("Failed to set config '{clean_key}': {e}")));
+        stored_val.zeroize();
+        write_res?;
 
         if cap_changed {
             tx.exec_drop(
@@ -380,30 +415,39 @@ impl DatabaseManager {
 
         tx.commit()
             .map_err(|e| AegisError::Database(format!("set_config_value commit failed: {e}")))?;
+        drop(conn);
+        drop(cipher);
+        self.invalidate_pnl_cache();
         Ok(())
     }
 
     /// Atomically rotates the Fernet master key across all encrypted rows in `system_config`
-    /// and updates the active in-memory `FernetCipher`.
+    /// under `fernet.write()` + `SELECT ... FOR UPDATE` inside a single transaction,
+    /// installing `new_cipher` in memory ONLY after `tx.commit()` succeeds (`R14-M19`).
     pub fn rotate_fernet_master_key(&self, old_key: &str, new_key: &str) -> Result<usize> {
         let old_cipher = FernetCipher::from_key_str(old_key)?;
         let new_cipher = FernetCipher::from_key_str(new_key)?;
-        let mut conn = self.get_conn()?;
-        let rows: Vec<(String, String)> = conn
-            .query("SELECT config_key, config_value FROM system_config")
-            .map_err(|e| AegisError::Database(format!("Failed to read system_config: {e}")))?;
 
-        let ts = now_ms();
-        let mut rotated = 0usize;
+        // Total lock order: fernet write lock -> DB conn -> DB tx
+        let mut cipher_guard = self.fernet_write();
+        let mut conn = self.get_conn()?;
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| AegisError::Database(format!("Failed to start key rotation tx: {e}")))?;
 
-        for (k, raw_v) in rows {
-            if is_encrypted_value(&raw_v) {
-                let mut plain = old_cipher.decrypt(&raw_v)?;
+        let raw_rows: Vec<mysql::Row> = tx
+            .query("SELECT config_key, config_value FROM system_config ORDER BY config_key ASC FOR UPDATE")
+            .map_err(|e| AegisError::Database(format!("Failed locking system_config for key rotation: {e}")))?;
+
+        let ts = now_ms();
+        let mut rotated = 0usize;
+
+        for r in raw_rows {
+            let k = row_get_string(&r, 0, "");
+            let raw_v = row_get_string(&r, 1, "");
+            if is_encrypted_value(&raw_v) || raw_v.trim().starts_with("ENC:") {
+                let plain: Zeroizing<String> = Zeroizing::new(old_cipher.decrypt(&raw_v)?);
                 let re_enc = new_cipher.encrypt(plain.as_bytes())?;
-                plain.zeroize();
                 tx.exec_drop(
                     "UPDATE system_config SET config_value = :v, updated_at_ms = :ts WHERE config_key = :k",
                     params! { "v" => re_enc, "ts" => ts, "k" => k },
@@ -412,9 +456,10 @@ impl DatabaseManager {
                 rotated += 1;
             }
         }
+
         tx.commit()
             .map_err(|e| AegisError::Database(format!("Key rotation commit error: {e}")))?;
-        self.update_fernet_cipher(new_cipher);
+        *cipher_guard = new_cipher;
         Ok(rotated)
     }
 }

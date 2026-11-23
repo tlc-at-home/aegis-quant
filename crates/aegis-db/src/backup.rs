@@ -1,13 +1,20 @@
 //! MariaDB 13.0 Rolling / 12.3 LTS logical state backup & verification (`aegis-db::backup`).
 
-use crate::engine::DatabaseManager;
+use crate::engine::{DatabaseManager, CANONICAL_TABLES};
+use crate::row_decode::row_get_i64;
 use aegis_core::{now_ms, resolve_project_root, AegisError, Result};
-use mysql::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+static BACKUP_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Summary report returned when verifying the latest MariaDB logical state backup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,14 +39,23 @@ pub fn verify_latest_backup(db: &DatabaseManager) -> Result<BackupVerificationRe
 }
 
 impl DatabaseManager {
-    /// Creates a point-in-time logical JSON snapshot of MariaDB `aegis_quant` tables and views in `data/backups/`.
+    /// Creates a point-in-time logical JSON snapshot of all 11 MariaDB `aegis_quant` tables
+    /// (including `funding_events`) and views in `data/backups/` with `0700` dir and atomic `0600` file
+    /// permissions (`R14-M16`, Sec. 10).
     pub fn create_mariadb_backup(&self) -> Result<PathBuf> {
         let backup_dir = self.resolve_backup_dir();
         fs::create_dir_all(&backup_dir)?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let ts = now_ms();
         let filename = format!("aegis_quant_v2_mariadb_{ts}.json");
-        let path = backup_dir.join(filename);
+        let path = backup_dir.join(&filename);
+        let pid = std::process::id();
+        let seq = BACKUP_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = backup_dir.join(format!(".{filename}.tmp.{pid}.{seq}"));
 
         let table_counts = self.collect_table_row_counts()?;
         let server_ver = self.server_version().unwrap_or_default();
@@ -55,9 +71,37 @@ impl DatabaseManager {
             "assets_ordered": self.get_assets_ordered()?,
             "assets_in_cooldown": self.get_assets_in_cooldown()?,
             "priority_watchlist": self.get_priority_watchlist()?,
+            "funding_events": self.list_all_funding_events()?,
         });
+        let encoded = serde_json::to_string_pretty(&payload)?;
 
-        fs::write(&path, serde_json::to_string_pretty(&payload)?)?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+        }
+
+        let write_res = (|| -> Result<()> {
+            let mut file = opts.open(&tmp_path)?;
+            file.write_all(encoded.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+
         self.set_config_value(
             "last_db_backup_ms",
             &ts.to_string(),
@@ -71,7 +115,8 @@ impl DatabaseManager {
         self.create_mariadb_backup()
     }
 
-    /// Verifies the latest MariaDB JSON backup file in `data/backups/`.
+    /// Verifies the latest MariaDB JSON backup file in `data/backups/`, ensuring all 11 canonical
+    /// tables and `funding_events` payload are present (`R14-M16`).
     pub fn verify_latest_backup(&self) -> Result<BackupVerificationReport> {
         let backup_dir = self.resolve_backup_dir();
         if !backup_dir.is_dir() {
@@ -131,10 +176,16 @@ impl DatabaseManager {
             }
         }
 
+        let all_tables_present = CANONICAL_TABLES
+            .iter()
+            .all(|t| table_counts.contains_key(*t));
+
         let verified = version == "2.0.0"
             && !database.is_empty()
             && timestamp_ms > 0
-            && parsed.get("portfolio").is_some();
+            && parsed.get("portfolio").is_some()
+            && parsed.get("funding_events").is_some()
+            && all_tables_present;
 
         if !verified {
             return Err(AegisError::Database(format!(
@@ -154,27 +205,19 @@ impl DatabaseManager {
         })
     }
 
-    /// Collects row counts for all 10 MariaDB tables.
+    /// Collects row counts for all 11 canonical MariaDB tables (`R14-M16`).
     pub fn collect_table_row_counts(&self) -> Result<BTreeMap<String, u64>> {
-        let tables = [
-            "system_config",
-            "exchange_assets",
-            "asset_cooldowns",
-            "ohlcv_bars",
-            "sleeve_signals",
-            "positions",
-            "order_audit",
-            "portfolio_snapshots",
-            "telemetry_logs",
-            "alert_queue",
-        ];
+        use mysql::prelude::Queryable;
         let mut conn = self.get_conn()?;
         let mut counts = BTreeMap::new();
-        for t in tables {
-            let cnt: Option<u64> = conn
-                .query_first(format!("SELECT COUNT(*) FROM `{t}`"))
-                .map_err(|e| AegisError::Database(format!("COUNT(*) on `{t}` failed: {e}")))?;
-            counts.insert(t.to_string(), cnt.unwrap_or(0));
+        for t in CANONICAL_TABLES {
+            let row: Option<mysql::Row> =
+                conn.query_first(format!("SELECT COUNT(*) FROM `{t}`"))
+                    .map_err(|e| AegisError::Database(format!("COUNT(*) on `{t}` failed: {e}")))?;
+            let cnt = row
+                .map(|r| row_get_i64(&r, 0, 0).max(0) as u64)
+                .unwrap_or(0);
+            counts.insert(t.to_string(), cnt);
         }
         Ok(counts)
     }

@@ -1,6 +1,7 @@
 //! Asset cooldowns repository (`aegis-db::cooldowns_repo`).
 
 use crate::engine::DatabaseManager;
+use crate::row_decode::row_get_i64;
 use aegis_core::{now_ms, AegisError, Result};
 use mysql::params;
 use mysql::prelude::*;
@@ -53,13 +54,13 @@ impl DatabaseManager {
     pub fn is_asset_in_cooldown(&self, asset_id: i64) -> Result<bool> {
         let ts = now_ms();
         let mut conn = self.get_conn()?;
-        let count: Option<i64> = conn
+        let row: Option<mysql::Row> = conn
             .exec_first(
                 r#"SELECT COUNT(*) FROM asset_cooldowns
                    WHERE asset_id = :aid AND is_active = 1 AND expires_at_ms > :ts"#,
                 params! { "aid" => asset_id, "ts" => ts },
             )
             .map_err(|e| AegisError::Database(format!("is_asset_in_cooldown failed: {e}")))?;
-        Ok(count.unwrap_or(0) > 0)
+        Ok(row.map(|r| row_get_i64(&r, 0, 0) > 0).unwrap_or(false))
     }
 }

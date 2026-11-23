@@ -53,19 +53,92 @@ pub fn generate_fernet_key() -> String {
     encoded
 }
 
-/// Normalize a raw key string/bytes into a valid 44-char URL-safe base64 Fernet key (decoding to 32 bytes).
-pub fn normalize_fernet_key(raw_key: &[u8]) -> String {
+/// Validate that `raw_key` is a strict 44-character URL-safe base64 Fernet master key decoding
+/// to exactly 32 bytes, and is not a retired public fallback seed (`R14-L9`).
+pub fn validate_fernet_key(raw_key: &[u8]) -> Result<String> {
     let trimmed = trim_ascii(raw_key);
     if trimmed.is_empty() {
-        return default_host_fernet_key_b64();
+        return Err(AegisError::Crypto(
+            "Fernet master key cannot be empty".to_string(),
+        ));
     }
-    if let Ok(decoded) = URL_SAFE.decode(trimmed) {
-        if decoded.len() == 32 {
-            return String::from_utf8_lossy(trimmed).into_owned();
-        }
+    let key_str = std::str::from_utf8(trimmed).map_err(|_| {
+        AegisError::Crypto("Fernet master key must be valid UTF-8 URL-safe base64".to_string())
+    })?;
+    let mut decoded = URL_SAFE
+        .decode(trimmed)
+        .map_err(|e| AegisError::Crypto(format!("Invalid Fernet base64 key: {e}")))?;
+    let valid_len = trimmed.len() == 44 && decoded.len() == 32;
+    decoded.zeroize();
+    if !valid_len {
+        return Err(AegisError::Crypto(
+            "Fernet master key must be a 44-char URL-safe base64 string decoding to 32 bytes"
+                .to_string(),
+        ));
+    }
+    if is_legacy_public_fallback_key(key_str) {
+        return Err(AegisError::SecurityViolation(
+            "Refusing to initialize FernetCipher with retired public fallback key seed (S1)."
+                .to_string(),
+        ));
+    }
+    Ok(key_str.to_string())
+}
+
+/// Returns true when `AEGIS_ALLOW_LEGACY_PASSPHRASE_KEY` explicitly enables legacy SHA-256
+/// passphrase derivation (`1`/`true`/`yes`/`on`) for migrating pre-v2.1 passphrases.
+pub fn is_allow_legacy_passphrase_key_env() -> bool {
+    std::env::var("AEGIS_ALLOW_LEGACY_PASSPHRASE_KEY")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn legacy_sha256_passphrase_key_b64(raw_passphrase: &[u8]) -> Result<String> {
+    let trimmed = trim_ascii(raw_passphrase);
+    if trimmed.is_empty() {
+        return Err(AegisError::Crypto(
+            "Legacy Fernet passphrase cannot be empty".to_string(),
+        ));
     }
     let digest = Sha256::digest(trimmed);
-    URL_SAFE.encode(digest)
+    let encoded = URL_SAFE.encode(digest);
+    if is_legacy_public_fallback_key(&encoded) {
+        return Err(AegisError::SecurityViolation(
+            "Refusing to initialize FernetCipher with retired public fallback key seed (S1)."
+                .to_string(),
+        ));
+    }
+    tracing::error!(
+        "DEPRECATED: Deriving Fernet master key via legacy single-pass SHA-256 passphrase fallback; rotate to a CSPRNG 32-byte URL-safe base64 key via `aegis-quant db --generate-key`."
+    );
+    Ok(encoded)
+}
+
+fn resolve_key_bytes_with_policy(raw_key: &[u8]) -> Option<String> {
+    let trimmed = trim_ascii(raw_key);
+    if trimmed.is_empty() {
+        return None;
+    }
+    match validate_fernet_key(trimmed) {
+        Ok(k) => Some(k),
+        Err(err) => {
+            if is_allow_legacy_passphrase_key_env() {
+                legacy_sha256_passphrase_key_b64(trimmed).ok()
+            } else {
+                tracing::warn!(
+                    error = %err,
+                    "Ignoring invalid Fernet master key source (expected 44-char URL-safe base64 32-byte key)"
+                );
+                None
+            }
+        }
+    }
 }
 
 pub fn is_usable_env_key(raw_val: &str) -> bool {
@@ -199,11 +272,8 @@ pub fn resolve_fernet_master_key(
     db_path: Option<&Path>,
 ) -> (String, bool) {
     if let Some(explicit) = master_key {
-        if !explicit.trim().is_empty() {
-            let norm = normalize_fernet_key(explicit.as_bytes());
-            if !is_legacy_public_fallback_key(&norm) {
-                return (norm, true);
-            }
+        if let Some(norm) = resolve_key_bytes_with_policy(explicit.as_bytes()) {
+            return (norm, true);
         }
     }
 
@@ -216,12 +286,7 @@ pub fn resolve_fernet_master_key(
                     let cand = dir_path.join(name);
                     if cand.is_file() {
                         if let Ok(mut bytes) = fs::read(&cand) {
-                            let res = if !trim_ascii(&bytes).is_empty() {
-                                let norm = normalize_fernet_key(&bytes);
-                                (!is_legacy_public_fallback_key(&norm)).then_some(norm)
-                            } else {
-                                None
-                            };
+                            let res = resolve_key_bytes_with_policy(&bytes);
                             bytes.zeroize();
                             if let Some(norm) = res {
                                 return (norm, true);
@@ -242,9 +307,9 @@ pub fn resolve_fernet_master_key(
                 .filter(|s| is_usable_env_key(s))
         });
     if let Some(ref mut k) = env_key {
-        let norm = normalize_fernet_key(k.as_bytes());
+        let res = resolve_key_bytes_with_policy(k.as_bytes());
         k.zeroize();
-        if !is_legacy_public_fallback_key(&norm) {
+        if let Some(norm) = res {
             return (norm, true);
         }
     }
@@ -255,12 +320,7 @@ pub fn resolve_fernet_master_key(
                 let key_file = parent.join(".aegis_master_key");
                 if key_file.is_file() {
                     if let Ok(mut bytes) = fs::read(&key_file) {
-                        let res = if !trim_ascii(&bytes).is_empty() {
-                            let norm = normalize_fernet_key(&bytes);
-                            (!is_legacy_public_fallback_key(&norm)).then_some(norm)
-                        } else {
-                            None
-                        };
+                        let res = resolve_key_bytes_with_policy(&bytes);
                         bytes.zeroize();
                         if let Some(norm) = res {
                             return (norm, true);
@@ -284,13 +344,18 @@ pub struct FernetCipher {
 
 impl FernetCipher {
     pub fn from_key_str(raw_key: &str) -> Result<Self> {
-        let norm_b64 = normalize_fernet_key(raw_key.as_bytes());
-        if is_legacy_public_fallback_key(&norm_b64) {
-            return Err(AegisError::SecurityViolation(
-                "Refusing to initialize FernetCipher with retired public fallback key seed (S1)."
-                    .to_string(),
-            ));
-        }
+        let norm_b64 = validate_fernet_key(raw_key.as_bytes())?;
+        Self::from_validated_b64(norm_b64)
+    }
+
+    /// Explicitly derives a Fernet key via single-pass SHA-256 from a legacy non-base64 passphrase.
+    /// Intended solely for migrating pre-v2.1 passphrases to a CSPRNG 32-byte key (`R14-L9`).
+    pub fn from_legacy_sha256_passphrase(passphrase: &str) -> Result<Self> {
+        let norm_b64 = legacy_sha256_passphrase_key_b64(passphrase.as_bytes())?;
+        Self::from_validated_b64(norm_b64)
+    }
+
+    fn from_validated_b64(norm_b64: String) -> Result<Self> {
         let mut decoded = URL_SAFE
             .decode(norm_b64.as_bytes())
             .map_err(|e| AegisError::Crypto(format!("Invalid Fernet base64 key: {e}")))?;
@@ -480,8 +545,42 @@ mod tests {
         assert_eq!(plain, secret);
 
         // Wrong key fails HMAC verification
-        let other = FernetCipher::from_key_str("custom-other-master-key").unwrap();
+        let other_key = generate_fernet_key();
+        let other = FernetCipher::from_key_str(&other_key).unwrap();
         assert!(other.decrypt(&token).is_err());
+    }
+
+    #[test]
+    fn test_r14_l9_validate_fernet_key_rejects_malformed_and_supports_legacy_opt_in() {
+        assert!(validate_fernet_key(b"").is_err());
+        assert!(validate_fernet_key(b"   ").is_err());
+        assert!(validate_fernet_key(b"custom-other-master-key").is_err());
+        assert!(FernetCipher::from_key_str("custom-other-master-key").is_err());
+
+        // Short base64 (16 bytes instead of 32) rejected
+        let short_b64 = URL_SAFE.encode([7u8; 16]);
+        assert!(validate_fernet_key(short_b64.as_bytes()).is_err());
+
+        // Retired public fallback seeds rejected
+        let retired1 = URL_SAFE.encode(Sha256::digest(LEGACY_PUBLIC_FERNET_SEED_V1));
+        assert!(matches!(
+            validate_fernet_key(retired1.as_bytes()),
+            Err(AegisError::SecurityViolation(_))
+        ));
+
+        // Valid 32-byte CSPRNG key passes
+        let valid_key = generate_fernet_key();
+        assert_eq!(
+            validate_fernet_key(valid_key.as_bytes()).unwrap(),
+            valid_key
+        );
+
+        // Explicit legacy passphrase migration constructor remains opt-in and interoperable
+        let legacy =
+            FernetCipher::from_legacy_sha256_passphrase("custom-other-master-key").unwrap();
+        let ct = legacy.encrypt(b"legacy-secret").unwrap();
+        assert_eq!(legacy.decrypt(&ct).unwrap(), "legacy-secret");
+        assert!(FernetCipher::from_legacy_sha256_passphrase("").is_err());
     }
 
     #[test]
