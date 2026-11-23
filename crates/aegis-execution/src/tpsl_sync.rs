@@ -397,9 +397,7 @@ fn resolve_accepted_trigger_eoid(
     http: &HyperliquidHttpClient,
     ack: &ExchangeOrderAck,
     wallet: &str,
-    coin: &str,
-    is_tp: bool,
-    expected_cloid: &str,
+    item: &PendingReplacementWire,
     parsed: &ParsedOpenOrders,
     cfg: &ConfigMap,
 ) -> String {
@@ -407,24 +405,31 @@ fn resolve_accepted_trigger_eoid(
         return eoid.clone();
     }
     if !wallet.is_empty() {
-        if let Ok(Some(st)) = http.fetch_order_status_by_cloid(wallet, expected_cloid, cfg) {
+        if let Ok(Some(st)) = http.fetch_order_status_by_cloid(wallet, &item.expected_cloid, cfg) {
             if st.oid > 0 {
                 return format!("hl-{}", st.oid);
             }
         }
         if let Ok(front_orders) = http.fetch_frontend_open_orders(wallet, cfg) {
-            if let Some(eoid) =
-                find_cloid_or_trigger_eoid(&front_orders, coin, is_tp, expected_cloid)
-            {
+            if let Some(eoid) = find_cloid_or_trigger_eoid(
+                &front_orders,
+                &item.coin,
+                item.is_tp,
+                &item.expected_cloid,
+            ) {
                 return eoid;
             }
         }
     }
-    if let Some(eoid) = find_cloid_or_trigger_eoid(&parsed.raw_orders, coin, is_tp, expected_cloid)
-    {
+    if let Some(eoid) = find_cloid_or_trigger_eoid(
+        &parsed.raw_orders,
+        &item.coin,
+        item.is_tp,
+        &item.expected_cloid,
+    ) {
         return eoid;
     }
-    expected_cloid.to_string()
+    item.expected_cloid.clone()
 }
 
 fn find_cloid_or_trigger_eoid(
@@ -875,7 +880,7 @@ pub fn sync_tpsl_batch_for_positions(
 
         match http.submit_orders_batch(wires, &meta, primary_grouping, &pk, Some(db), cfg) {
             Ok(acks) => {
-                for (item, ack) in pending_wires.iter().zip(acks.into_iter()) {
+                for (item, ack) in pending_wires.iter().zip(acks) {
                     let final_ack = if !ack.accepted {
                         // Retry individually via submit_order_wire (falls back from positionTpsl -> "na")
                         match http.submit_order_wire(
@@ -933,14 +938,7 @@ pub fn sync_tpsl_batch_for_positions(
 
                     if final_ack.accepted {
                         let new_eoid = resolve_accepted_trigger_eoid(
-                            http,
-                            &final_ack,
-                            &wallet,
-                            &item.coin,
-                            item.is_tp,
-                            &item.expected_cloid,
-                            &parsed,
-                            cfg,
+                            http, &final_ack, &wallet, item, &parsed, cfg,
                         );
                         add_retired_cancels(item.asset_index, &item.old_oids_to_cancel, &new_eoid);
                         let target = if item.is_tp {

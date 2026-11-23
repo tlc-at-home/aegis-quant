@@ -839,12 +839,13 @@ mod tests {
         let t0 = Instant::now();
 
         // 1. Seed initial persisted ceiling and simulate daemon restart:
-        //    boot nonce must jump by +NONCE_BOOT_SAFETY_MARGIN_MS (+5_000 ms) and persist +NONCE_PERSIST_LEASE_MS (+10_000 ms).
+        //    boot high_water jumps by +NONCE_BOOT_SAFETY_MARGIN_MS (+5_000 ms), so the first strictly-greater
+        //    boot nonce is base_wall + NONCE_BOOT_SAFETY_MARGIN_MS + 1 and persists +NONCE_PERSIST_LEASE_MS (+10_000 ms).
         db.set_config_value("hyperliquid_last_nonce", &base_wall.to_string(), None)
             .unwrap();
         let state1 = NonceLeaseState::new_isolated();
         let n1 = state1.next_nonce_with_clock(Some(&db), base_wall - 10_000, t0, true);
-        assert_eq!(n1 as i64, base_wall + NONCE_BOOT_SAFETY_MARGIN_MS);
+        assert_eq!(n1 as i64, base_wall + NONCE_BOOT_SAFETY_MARGIN_MS + 1);
 
         let persisted_after_n1 = db
             .get_config_i64_raw("hyperliquid_last_nonce")

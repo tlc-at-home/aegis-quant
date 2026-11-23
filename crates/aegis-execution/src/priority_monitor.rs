@@ -1262,7 +1262,7 @@ impl PriorityMonitor {
             }
 
             // Sort newest-to-oldest and accumulate only contiguous slices (gap <= 60s)
-            matching.sort_by(|a, b| b.0.cmp(&a.0));
+            matching.sort_by_key(|a| std::cmp::Reverse(a.0));
             let mut sz_sum = 0.0_f64;
             let mut ntl_sum = 0.0_f64;
             let mut fee_sum = 0.0_f64;
@@ -1644,7 +1644,7 @@ impl PriorityMonitor {
         resting_passive_px: Option<f64>,
     ) {
         let now = now_ms();
-        let should_alert = {
+        let (should_alert, first_breach_ms, attempt_count, entry_is_tp) = {
             let mut guard = self.unfilled_breaches.lock();
             let entry = guard
                 .entry(held.position_id)
@@ -1660,6 +1660,7 @@ impl PriorityMonitor {
                 });
             entry.last_attempt_ms = now;
             entry.attempt_count = entry.attempt_count.saturating_add(1);
+            entry.is_tp = is_tp;
             if resting_passive_oid.is_some() {
                 entry.passive_close_oid = resting_passive_oid.clone();
             }
@@ -1671,21 +1672,27 @@ impl PriorityMonitor {
             if emit {
                 entry.last_alert_ms = now;
             }
-            emit
+            (
+                emit,
+                entry.first_breach_ms,
+                entry.attempt_count,
+                entry.is_tp,
+            )
         };
 
         if should_alert {
-            let event_type = if is_tp {
+            let event_type = if entry_is_tp {
                 "TP_BREACH_UNFILLED_PASSIVE_RESTING"
             } else {
                 "STOP_BREACH_UNFILLED_PASSIVE_RESTING"
             };
+            let breach_age_sec = now.saturating_sub(first_breach_ms) / 1000;
             let passive_oid_str = resting_passive_oid.as_deref().unwrap_or("none");
             let passive_px_str = resting_passive_px
                 .map(|p| format!("${p:.6}"))
                 .unwrap_or_else(|| "n/a".to_string());
             let html = format!(
-                "<b>[CRITICAL] {} ({})</b><br/>Side: <code>{}</code> | Stop: <code>${:.6}</code> | Mark: <code>${:.6}</code><br/>Remaining Qty: <code>{:.6}</code> | Resting Passive Limit: <code>{}</code> (OID: <code>{}</code>)<br/>Original stop preserved untouched; retrying on 15s backoff.",
+                "<b>[CRITICAL] {} ({})</b><br/>Side: <code>{}</code> | Stop: <code>${:.6}</code> | Mark: <code>${:.6}</code><br/>Remaining Qty: <code>{:.6}</code> | Resting Passive Limit: <code>{}</code> (OID: <code>{}</code>) | Attempts: <code>{}</code> (age {}s)<br/>Original stop preserved untouched; retrying on 15s backoff.",
                 event_type,
                 held.symbol,
                 held.side,
@@ -1693,12 +1700,18 @@ impl PriorityMonitor {
                 mark_px,
                 remaining_qty,
                 passive_px_str,
-                passive_oid_str
+                passive_oid_str,
+                attempt_count,
+                breach_age_sec
             );
             let payload = json!({
                 "position_id": held.position_id,
                 "symbol": held.symbol,
                 "side": held.side,
+                "is_tp": entry_is_tp,
+                "first_breach_ms": first_breach_ms,
+                "breach_age_sec": breach_age_sec,
+                "attempt_count": attempt_count,
                 "protective_stop_px": held.protective_stop_px,
                 "mark_price": mark_px,
                 "remaining_qty": remaining_qty,
@@ -1710,10 +1723,12 @@ impl PriorityMonitor {
                 "ERROR",
                 "execution.priority_monitor",
                 &format!(
-                    "{} on {} (pos #{}): rem={:.6}, stop=${:.6} preserved untouched, passive={} ({})",
+                    "{} on {} (pos #{}, attempt #{}, age {}s): rem={:.6}, stop=${:.6} preserved untouched, passive={} ({})",
                     event_type,
                     held.symbol,
                     held.position_id,
+                    attempt_count,
+                    breach_age_sec,
                     remaining_qty,
                     held.protective_stop_px,
                     passive_px_str,
@@ -1888,6 +1903,8 @@ mod tests {
     fn test_priority_tick_sub_25bps_ratchet_preserves_db_stop_and_skips_hl_replace() {
         let stop_trigger_px = Arc::new(Mutex::new("1720.0".to_string()));
         let stop_trigger_srv = Arc::clone(&stop_trigger_px);
+        let mid_px = Arc::new(Mutex::new("1734.0".to_string()));
+        let mid_px_srv = Arc::clone(&mid_px);
         let exchange_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let exchange_srv = Arc::clone(&exchange_requests);
 
@@ -1899,7 +1916,9 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 match typ {
-                    "allMids" => MockHttpResponse::ok_json(&json!({ "ETH": "1734.0" })),
+                    "allMids" => {
+                        MockHttpResponse::ok_json(&json!({ "ETH": mid_px_srv.lock().clone() }))
+                    }
                     "frontendOpenOrders" | "openOrders" => MockHttpResponse::ok_json(&json!([
                         {
                             "coin": "ETH",
@@ -2042,7 +2061,26 @@ mod tests {
         assert!((pos1.highest_price_seen - 1734.0).abs() < 1e-6);
         assert!(exchange_requests.lock().is_empty());
 
-        db.update_asset_live_quote(eth_id, 1746.0, 1746.0).unwrap();
+        *mid_px.lock() = "1746.0".to_string();
+        db.upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "ETH".to_string(),
+            asset_index: 1,
+            sz_decimals: 3,
+            tick_size: 0.1,
+            lot_step_size: 0.001,
+            max_leverage: 25.0,
+            mark_price: 1746.0,
+            mid_price: 1746.0,
+            oracle_price: 1746.0,
+            funding_rate_hourly: 0.0000125,
+            day_volume_usdc: 20_000_000.0,
+            open_interest_usdc: 8_000_000.0,
+            prev_day_price: 1700.0,
+            is_core_eligible: true,
+            is_event_eligible: true,
+            is_priority_watched: true,
+        })
+        .unwrap();
         let tick2 = monitor.run_1s_priority_tick().unwrap();
         assert_eq!(tick2.stops_ratcheted, 1);
         let pos2 = db.get_position_by_id(pos_id).unwrap().unwrap();
@@ -2330,6 +2368,7 @@ mod tests {
         // 2. R14-M4: Remainder fills on exchange 300s ago (> 120s); contiguous slice resolves exact 94.50 + 0.17 fee
         *scenario.lock() = "exchange_flat";
         monitor.unfilled_breaches.lock().clear();
+        monitor.last_confirmed_open_ms.lock().clear();
         let rep2 = monitor.run_1s_priority_tick().unwrap();
         assert_eq!(rep2.stops_triggered_closed, 1);
         let pos_closed = db.get_position_by_id(pos_id).unwrap().unwrap();

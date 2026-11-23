@@ -807,12 +807,12 @@ pub fn place_passive_reduce_only_close_order(
                 });
             }
             let oid = aegis_core::parse_hl_oid(ack.exchange_order_id.as_deref());
-            return Ok(PassiveClosePlacement::Resting {
+            Ok(PassiveClosePlacement::Resting {
                 oid,
                 eoid: ack.exchange_order_id,
                 cloid: expected_cloid,
                 limit_px: passive_px,
-            });
+            })
         }
         Ok(ack) if is_post_only_crossing_rejection(ack.raw_error.as_deref()) => {
             let fallback_px = if close_is_buy {
@@ -847,26 +847,22 @@ pub fn place_passive_reduce_only_close_order(
                         });
                     }
                     let oid = aegis_core::parse_hl_oid(fb_ack.exchange_order_id.as_deref());
-                    return Ok(PassiveClosePlacement::Resting {
+                    Ok(PassiveClosePlacement::Resting {
                         oid,
                         eoid: fb_ack.exchange_order_id,
                         cloid: fb_cloid,
                         limit_px: fallback_px,
-                    });
+                    })
                 }
-                Ok(fb_ack) => {
-                    return Ok(PassiveClosePlacement::Rejected(
-                        fb_ack.raw_error.unwrap_or(fb_ack.status),
-                    ));
-                }
-                Err(e) => return Err(e),
+                Ok(fb_ack) => Ok(PassiveClosePlacement::Rejected(
+                    fb_ack.raw_error.unwrap_or(fb_ack.status),
+                )),
+                Err(e) => Err(e),
             }
         }
-        Ok(ack) => {
-            return Ok(PassiveClosePlacement::Rejected(
-                ack.raw_error.unwrap_or(ack.status),
-            ));
-        }
+        Ok(ack) => Ok(PassiveClosePlacement::Rejected(
+            ack.raw_error.unwrap_or(ack.status),
+        )),
         Err(e) => Err(e),
     }
 }
@@ -907,9 +903,8 @@ mod tests {
         let asset = sample_sol_asset();
         let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
 
-        // 1. Wide ask at 95.0 (below oracle band_lo 96.20): rungs 0..=2 all clamp to 96.20!
-        //    Deduplication must submit ONLY ONE IOC order at 96.20, break early on iocCancelRejected
-        //    at band limit, and submit ONE passive GTC fallback at 96.20!
+        // 1. Wide illiquid book (bid 95.0 < band_lo 96.20, ask 105.0 > band_hi 103.80):
+        //    skips un-crossable IOC attempts and rests ONE passive GTC clamped to band_hi 103.80!
         let srv = MockHttpServer::start(|req| {
             let tif = req
                 .json_body
@@ -965,7 +960,7 @@ mod tests {
         // Since bid 95.0 < band_lo 96.20, book_crossable_in_band is false -> 0 IOC attempts + 1 passive GTC
         assert_eq!(res.attempts_submitted, 1);
         assert_eq!(res.resting_passive_oid.as_deref(), Some("hl-55501"));
-        assert!((res.resting_passive_px.unwrap() - 96.20).abs() < 1e-6);
+        assert!((res.resting_passive_px.unwrap() - 103.80).abs() < 1e-6);
 
         // 2. When BBO IS barely inside band (bid = 96.20, ask = 100.50), rungs 0..=3 all clamp to 96.20:
         //    only 1 unique IOC price is submitted, breaks early at band, then 1 passive GTC rests.
@@ -997,7 +992,7 @@ mod tests {
         srv.clear_requests();
         let (passive_px, passive_wire_px) =
             compute_passive_close_px(&asset, false, Some((95.0, 105.0)), 100.0, 96.20, 103.80);
-        assert!((passive_px - 96.20).abs() < 1e-6);
+        assert!((passive_px - 103.80).abs() < 1e-6);
         let existing_snap = OpenOrdersSnapshot {
             metadata_complete: true,
             orders: vec![json!({
