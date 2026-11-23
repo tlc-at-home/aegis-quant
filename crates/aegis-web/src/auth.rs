@@ -1,7 +1,7 @@
-//! Web API authentication, CSRF origin checks, bearer token verification, and security header middleware (`aegis-web::auth`).
+//! Web API authentication, CSRF origin checks, trusted-proxy extraction, and strict CSP middleware (`aegis-web::auth`).
 
 use crate::payloads::ApiErrorBody;
-use crate::server::{normalize_host_without_port, AppState, ClientIpKey};
+use crate::server::{hash_session_token, normalize_host_without_port, AppState, ClientIpKey};
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
@@ -12,7 +12,20 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 
-pub const DEFAULT_CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'";
+/// Strict Content Security Policy removing Google Fonts and all `'unsafe-inline'` directives (`R14-L17`).
+pub const DEFAULT_CSP_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'none'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+
+/// Request extension recording whether the direct TCP peer belongs to `web_trusted_proxies` (`R14-M27`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTrustedProxy(pub bool);
+
+/// Request extension capturing how the caller authenticated for continuous SSE session checks (`R14-L15`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticatedPrincipal {
+    UnauthenticatedAllowed,
+    BearerToken,
+    SessionCookie { token_hash: [u8; 32] },
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthLoginPayload {
@@ -176,6 +189,7 @@ pub(crate) fn auth_error_response(status: StatusCode, detail: impl Into<String>)
         Json(ApiErrorBody {
             error: status.canonical_reason().unwrap_or("Error").to_string(),
             detail: detail.into(),
+            correlation_id: None,
         }),
     )
         .into_response()
@@ -192,31 +206,52 @@ pub(crate) fn too_many_requests_response(retry_after_secs: u64) -> Response {
     resp
 }
 
-fn extract_client_ip(state: &AppState, req: &Request) -> ClientIpKey {
-    if state.trust_proxy_headers {
+/// Extracts client IP using right-to-left `X-Forwarded-For` traversal ONLY when the direct TCP
+/// peer IP matches `web_trusted_proxies` (`R14-M27`).
+fn extract_client_ip(state: &AppState, req: &Request) -> (ClientIpKey, PeerTrustedProxy) {
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    let peer_is_trusted_proxy = peer_ip.is_some_and(|ip| state.is_trusted_proxy(ip));
+
+    if peer_is_trusted_proxy {
         if let Some(xff) = req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
         {
-            if let Some(ip) = xff
-                .split(',')
-                .next()
-                .and_then(|s| s.trim().parse::<IpAddr>().ok())
-            {
-                return ClientIpKey::Ip(ip);
+            for raw_hop in xff.rsplit(',') {
+                let hop_str = raw_hop.trim();
+                if hop_str.is_empty() {
+                    continue;
+                }
+                match hop_str.parse::<IpAddr>() {
+                    Ok(hop_ip) => {
+                        if !state.is_trusted_proxy(hop_ip) {
+                            return (ClientIpKey::Ip(hop_ip), PeerTrustedProxy(true));
+                        }
+                    }
+                    Err(_) => {
+                        // Malformed client hop -> fail closed to peer_ip
+                        break;
+                    }
+                }
             }
         }
         if let Some(xri) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
             if let Ok(ip) = xri.trim().parse::<IpAddr>() {
-                return ClientIpKey::Ip(ip);
+                if !state.is_trusted_proxy(ip) {
+                    return (ClientIpKey::Ip(ip), PeerTrustedProxy(true));
+                }
             }
         }
     }
-    if let Some(connect_info) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return ClientIpKey::Ip(connect_info.0.ip());
-    }
-    ClientIpKey::Local
+
+    (
+        peer_ip.map(ClientIpKey::Ip).unwrap_or(ClientIpKey::Local),
+        PeerTrustedProxy(peer_is_trusted_proxy),
+    )
 }
 
 fn validate_api_host_header(
@@ -256,14 +291,15 @@ fn validate_api_host_header(
 }
 
 /// Security headers, Host allowlist, CSRF validation, rate limiting, and separated bearer/cookie authentication middleware.
-/// When `require_bearer_auth` is enabled, requires valid auth on ALL `/api/v1/*` routes except `/api/v1/health` and `/api/v1/auth/login`.
+/// When `require_bearer_auth` is enabled, requires valid auth on ALL `/api/v1/*` routes except `/api/v1/health`, `/api/v1/auth/login`, and `/api/v1/auth/logout`.
 pub async fn security_and_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let client_ip = extract_client_ip(&state, &req);
+    let (client_ip, peer_trusted_proxy) = extract_client_ip(&state, &req);
     req.extensions_mut().insert(client_ip);
+    req.extensions_mut().insert(peer_trusted_proxy);
 
     let path = req.uri().path().to_string();
     let method = req.method().clone();
@@ -291,6 +327,7 @@ pub async fn security_and_auth_middleware(
         && path.starts_with("/api/v1/")
         && path != "/api/v1/health"
         && path != "/api/v1/auth/login"
+        && path != "/api/v1/auth/logout"
     {
         let Some(expected) = state
             .configured_api_token
@@ -314,15 +351,19 @@ pub async fn security_and_auth_middleware(
             }
         }
 
-        let valid = if let Some(ref h) = header_tok {
-            constant_time_eq(h, expected)
+        let authenticated_principal = if let Some(ref h) = header_tok {
+            constant_time_eq(h, expected).then_some(AuthenticatedPrincipal::BearerToken)
         } else if let Some(ref c) = cookie_tok {
-            state.validate_session_cookie(c)
+            state
+                .validate_session_cookie(c)
+                .then(|| AuthenticatedPrincipal::SessionCookie {
+                    token_hash: hash_session_token(c),
+                })
         } else {
-            false
+            None
         };
 
-        if !valid {
+        let Some(principal) = authenticated_principal else {
             if supplied_credentials {
                 state.auth_rate_limiter.record_failure(client_ip);
             }
@@ -330,9 +371,13 @@ pub async fn security_and_auth_middleware(
                 StatusCode::UNAUTHORIZED,
                 "Valid Bearer token, X-Aegis-Token, or session cookie required",
             ));
-        }
+        };
 
         state.auth_rate_limiter.reset(client_ip);
+        req.extensions_mut().insert(principal);
+    } else {
+        req.extensions_mut()
+            .insert(AuthenticatedPrincipal::UnauthenticatedAllowed);
     }
 
     with_security_headers(next.run(req).await)

@@ -3,12 +3,13 @@
 use aegis_core::{
     build_vault_info_payload_from_config, compute_drawdown_breaker_status,
     compute_equity_basis_summary, is_sensitive_config_key, mask_identifier, now_iso8601_utc,
-    now_ms, partition_cap_epoch_holdings, round_dp, synthesize_fallback_snapshot,
-    validate_core_config_key_value, AegisError, ClosedPositionView, ConfigMap, CooldownAssetView,
-    DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset, HeldAssetView, OrderAuditRecord,
-    OrderedAssetView, PnlSummary, PortfolioSnapshot, PriorityWatchView, Result, RiskTier,
-    SleeveS1AssetView, SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord,
-    VaultInfoPayload, VaultPositionInfo, PLATFORM_VERSION,
+    now_ms, partition_cap_epoch_holdings, round_dp, sanitize_telemetry_message,
+    synthesize_fallback_snapshot, validate_core_config_key_value, AegisError, ClosedPositionView,
+    ConfigMap, CooldownAssetView, DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset,
+    HeldAssetView, OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot,
+    PriorityMonitorHealth, PriorityWatchView, Result, RiskTier, SleeveS1AssetView,
+    SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord, VaultInfoPayload,
+    VaultPositionInfo, IMMUTABLE_SECURITY_CONFIG_KEYS, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -16,42 +17,69 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
-type ViewsHealthEntry = (Instant, Vec<String>, Vec<String>);
-type ViewsHealthCache = Mutex<HashMap<String, ViewsHealthEntry>>;
+static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(1);
+static ERROR_CORRELATION_SEQ: AtomicU64 = AtomicU64::new(1);
+static SERVER_BOOT_ID: OnceLock<i64> = OnceLock::new();
 
-static VIEWS_HEALTH_CACHE: OnceLock<ViewsHealthCache> = OnceLock::new();
+/// Critical dashboard sections whose failure triggers HTTP `503 Service Unavailable`
+/// on `/api/v1/dashboard` and `/api/v1/state` (`R14-M22`).
+pub const CRITICAL_DASHBOARD_SECTIONS: &[&str] = &[
+    "database",
+    "system_config",
+    "portfolio_snapshot",
+    "v_assets_held",
+    "v_assets_ordered",
+];
 
-const VIEWS_CACHE_TTL: Duration = Duration::from_secs(30);
+fn default_true() -> bool {
+    true
+}
 
-fn get_cached_tables_and_views(db: &DatabaseManager) -> Result<(Vec<String>, Vec<String>)> {
-    let db_key = db.db_name().to_string();
-    let cache = VIEWS_HEALTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let guard = cache.lock();
-        if let Some((captured_at, tables, views)) = guard.get(&db_key) {
-            if captured_at.elapsed() < VIEWS_CACHE_TTL {
-                return Ok((tables.clone(), views.clone()));
-            }
-        }
-    }
-    let (tables, views) = db.list_tables_and_views()?;
-    cache
-        .lock()
-        .insert(db_key, (Instant::now(), tables.clone(), views.clone()));
-    Ok((tables, views))
+/// Returns the monotonic server boot identifier for frontend restart detection (`R14-M24`).
+pub fn server_boot_id() -> i64 {
+    *SERVER_BOOT_ID.get_or_init(now_ms)
+}
+
+/// Allocates the next monotonic snapshot sequence number across REST and SSE (`R14-M24`).
+pub fn next_snapshot_seq() -> u64 {
+    SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Generates a short unique correlation reference ID for sanitized 500/503 API errors (`R14-L16`).
+pub fn next_error_correlation_id() -> String {
+    let seq = ERROR_CORRELATION_SEQ.fetch_add(1, Ordering::Relaxed) & 0xffff;
+    format!("err-{:x}-{seq:04x}", now_ms() as u64)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorBody {
     pub error: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+/// Explicit degraded SSE event emitted on MariaDB / critical-view outage (`R14-M22`).
+/// Intentionally omits `v_assets_held`, `v_assets_ordered`, and `snapshot` so connected
+/// frontends preserve dimmed last-known holdings rather than wiping them to empty arrays.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DegradedDashboardEvent {
+    pub snapshot_seq: u64,
+    pub generated_at_ms: i64,
+    pub server_boot_id: i64,
+    pub timestamp_ms: i64,
+    pub degraded: bool,
+    pub database_reachable: bool,
+    pub degraded_sections: Vec<String>,
+    pub degraded_errors: Vec<String>,
 }
 
 /// Response payload for `GET /api/v1/health`.
@@ -115,6 +143,24 @@ pub struct DashboardPayload {
     pub telemetry_logs: Vec<TelemetryLogRecord>,
     pub system_config: Vec<SystemConfigRow>,
     pub timestamp_ms: i64,
+    #[serde(default)]
+    pub snapshot_seq: u64,
+    #[serde(default)]
+    pub generated_at_ms: i64,
+    #[serde(default)]
+    pub server_boot_id: i64,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default = "default_true")]
+    pub database_reachable: bool,
+    #[serde(default)]
+    pub degraded_sections: Vec<String>,
+    #[serde(default)]
+    pub degraded_errors: Vec<String>,
+    #[serde(default)]
+    pub immutable_config_keys: Vec<String>,
+    #[serde(default)]
+    pub priority_monitor_health: PriorityMonitorHealth,
 }
 
 /// Request payload for `POST /api/v1/risk-tier`.
@@ -249,7 +295,7 @@ pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
 pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
     let mariadb_version = db.server_version()?;
     let (tables, views) = db.list_tables_and_views()?;
-    let cfg = db.load_config_or_default();
+    let cfg = db.load_config()?;
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
     let prio_ms = cfg.get_i64("priority_monitor_interval_ms", 1000);
@@ -287,48 +333,210 @@ pub fn build_vault_info_payload(
     build_vault_info_payload_from_config(cfg, perp_equity_usdc, now_ms_val)
 }
 
-/// Builds the unified `DashboardPayload` querying MariaDB 13.0 tables and all 7 SQL Views.
-/// Uses a 30-second cache for the `SHOW FULL TABLES` view-health check and performs zero writes.
+fn collect_section<T: Default>(
+    res: Result<T>,
+    section: &str,
+    degraded_sections: &mut Vec<String>,
+    degraded_errors: &mut Vec<String>,
+) -> T {
+    match res {
+        Ok(val) => val,
+        Err(err) => {
+            let cid = next_error_correlation_id();
+            tracing::error!(
+                correlation_id = %cid,
+                section = section,
+                error = %err,
+                "Dashboard section query failed"
+            );
+            degraded_sections.push(section.to_string());
+            degraded_errors.push(format!("Section '{section}' unavailable (ref: {cid})"));
+            T::default()
+        }
+    }
+}
+
+/// Builds a sanitized HTTP `503 Service Unavailable` JSON body for `/api/v1/dashboard` and `/api/v1/state` (`R14-M22`, `R14-L16`).
+pub fn build_degraded_dashboard_body(
+    database_reachable: bool,
+    degraded_sections: Vec<String>,
+    degraded_errors: Vec<String>,
+    correlation_id: String,
+    snapshot_seq: u64,
+    generated_at_ms: i64,
+    server_boot_id: i64,
+) -> Value {
+    json!({
+        "error": "Service Unavailable",
+        "detail": if database_reachable {
+            "Critical dashboard telemetry sections are unavailable. Reference server logs with correlation_id."
+        } else {
+            "MariaDB database unavailable. Reference server logs with correlation_id."
+        },
+        "correlation_id": correlation_id,
+        "degraded": true,
+        "database_reachable": database_reachable,
+        "degraded_sections": degraded_sections,
+        "degraded_errors": degraded_errors,
+        "snapshot_seq": snapshot_seq,
+        "generated_at_ms": generated_at_ms,
+        "server_boot_id": server_boot_id,
+    })
+}
+
+/// Builds a sanitized SSE `DegradedDashboardEvent` JSON string omitting `v_assets_held`/`v_assets_ordered`/`snapshot`.
+pub fn build_degraded_sse_event_json(
+    database_reachable: bool,
+    degraded_sections: Vec<String>,
+    degraded_errors: Vec<String>,
+    snapshot_seq: u64,
+    generated_at_ms: i64,
+    boot_id: i64,
+) -> String {
+    let ev = DegradedDashboardEvent {
+        snapshot_seq,
+        generated_at_ms,
+        server_boot_id: boot_id,
+        timestamp_ms: generated_at_ms,
+        degraded: true,
+        database_reachable,
+        degraded_sections,
+        degraded_errors,
+    };
+    serde_json::to_string(&ev).unwrap_or_else(|_| {
+        format!(
+            r#"{{"snapshot_seq":{snapshot_seq},"generated_at_ms":{generated_at_ms},"server_boot_id":{boot_id},"timestamp_ms":{generated_at_ms},"degraded":true,"database_reachable":{database_reachable},"degraded_sections":["database"],"degraded_errors":["Telemetry temporarily unavailable"]}}"#
+        )
+    })
+}
+
+/// Returns `true` when any section in `degraded_sections` is a critical dashboard section.
+pub fn has_critical_degradation(payload: &DashboardPayload) -> bool {
+    !payload.database_reachable
+        || payload
+            .degraded_sections
+            .iter()
+            .any(|s| CRITICAL_DASHBOARD_SECTIONS.contains(&s.as_str()))
+}
+
+/// Builds the unified `DashboardPayload` over a single pooled read-only MariaDB connection
+/// (`load_dashboard_read_bundle`), tracking section failures without swallowing DB outages (`R14-M22`, `R14-M28`).
 pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload> {
-    let mariadb_version = db.server_version()?;
-    let (_, views) = get_cached_tables_and_views(db)?;
-    let cfg = db.load_config_or_default();
+    let snapshot_seq = next_snapshot_seq();
+    let generated_at_ms = now_ms();
+    let boot_id = server_boot_id();
+
+    let bundle = db.load_dashboard_read_bundle()?;
+    let mariadb_version = bundle.mariadb_version?;
+    let cfg = bundle.config?;
+    let latest_snapshot_opt = bundle.latest_snapshot?;
+
+    let mut degraded_sections = Vec::new();
+    let mut degraded_errors = Vec::new();
+
+    let (_, views) = collect_section(
+        bundle.tables_and_views,
+        "tables_and_views",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
-    let ts = now_ms();
+    let ts = generated_at_ms;
 
-    let v_assets_held = db.get_assets_held().unwrap_or_default();
-    let v_assets_ordered = db.get_assets_ordered().unwrap_or_default();
-    let recent_closed_positions = db
-        .list_recent_closed_positions_view(100)
-        .unwrap_or_default();
-    let v_assets_in_cooldown = db.get_assets_in_cooldown().unwrap_or_default();
-    let v_assets_sleeve_s1 = db.get_sleeve_s1_view().unwrap_or_default();
-    let v_assets_sleeve_s2 = db.get_sleeve_s2_view().unwrap_or_default();
-    let v_assets_sleeve_s3 = db.get_sleeve_s3_view().unwrap_or_default();
-    let v_priority_watchlist = db.get_priority_watchlist().unwrap_or_default();
-    let exchange_assets = db.list_exchange_assets().unwrap_or_default();
-    let order_audit = db.list_recent_order_audits(50).unwrap_or_default();
-    let telemetry_logs = db.list_recent_telemetry(50).unwrap_or_default();
+    let v_assets_held = collect_section(
+        bundle.assets_held,
+        "v_assets_held",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_assets_ordered = collect_section(
+        bundle.assets_ordered,
+        "v_assets_ordered",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let recent_closed_positions = collect_section(
+        bundle.recent_closed_positions,
+        "recent_closed_positions",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_assets_in_cooldown = collect_section(
+        bundle.assets_in_cooldown,
+        "v_assets_in_cooldown",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_assets_sleeve_s1 = collect_section(
+        bundle.sleeve_s1,
+        "v_assets_sleeve_s1",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_assets_sleeve_s2 = collect_section(
+        bundle.sleeve_s2,
+        "v_assets_sleeve_s2",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_assets_sleeve_s3 = collect_section(
+        bundle.sleeve_s3,
+        "v_assets_sleeve_s3",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let v_priority_watchlist = collect_section(
+        bundle.priority_watchlist,
+        "v_priority_watchlist",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let exchange_assets = collect_section(
+        bundle.exchange_assets,
+        "exchange_assets",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let order_audit = collect_section(
+        bundle.order_audit,
+        "order_audit",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let telemetry_logs = collect_section(
+        bundle.telemetry_logs,
+        "telemetry_logs",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
 
     let is_live_or_testnet = cfg.execution_mode().is_live_or_testnet();
     let live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
 
-    let mut snapshot = db.get_latest_portfolio_snapshot()?;
-    // Ensure snapshot reflects live risk tier & live working/open counts if synthesized or updated
-    snapshot.risk_tier = tier.as_str().to_string();
-    snapshot.leverage_multiplier = mult;
-    if snapshot.id == 0 {
-        snapshot = synthesize_fallback_snapshot(
+    let mut snapshot = match latest_snapshot_opt {
+        Some(mut s) if s.id > 0 => {
+            s.risk_tier = tier.as_str().to_string();
+            s.leverage_multiplier = mult;
+            s
+        }
+        _ => synthesize_fallback_snapshot(
             &cfg,
             &v_assets_held,
             &v_assets_ordered,
             &exchange_assets,
             ts,
-        );
-    }
+        ),
+    };
+    snapshot.risk_tier = tier.as_str().to_string();
+    snapshot.leverage_multiplier = mult;
 
-    let mut snapshots_history = db.list_portfolio_snapshots(120).unwrap_or_default();
+    let mut snapshots_history = collect_section(
+        bundle.snapshots_history,
+        "snapshots_history",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
     if snapshots_history.is_empty() {
         snapshots_history.push(snapshot.clone());
     }
@@ -338,11 +546,19 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .iter()
         .map(|h| h.funding_accrued_usdc - h.fees_paid_usdc)
         .sum();
-    let pnl_summary = db
-        .compute_pnl_summary(current_upnl, open_fees_funding, snapshot.total_equity_usdc)
-        .unwrap_or_default();
+    let pnl_summary = collect_section(
+        db.compute_pnl_summary(current_upnl, open_fees_funding, snapshot.total_equity_usdc),
+        "pnl_summary",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
 
-    let raw_configs = db.list_system_config_rows().unwrap_or_default();
+    let raw_configs = collect_section(
+        bundle.system_config_rows,
+        "system_config",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
     let system_config: Vec<SystemConfigRow> = raw_configs
         .into_iter()
         .map(|mut r| {
@@ -383,11 +599,8 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         compute_equity_basis_summary(&cfg, &snapshot, vault_info.total_vault_equity_usdc, ts);
     let synced_at_ms = equity_basis.synced_at_ms;
 
-    let dd_window_start = if cap_epoch_ms > 0 {
-        (ts - 86_400_000).max(cap_epoch_ms)
-    } else {
-        ts - 86_400_000
-    };
+    // Evaluate true 24h uncapped drawdown (never truncated by cap_epoch_ms)
+    let dd_window_start = ts - 86_400_000;
     let max_dd_frac = cfg
         .get_f64("max_daily_drawdown_pct", 0.15)
         .clamp(0.01, 0.95);
@@ -397,10 +610,19 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     } else {
         "PAPER_EQUITY"
     };
-    let drawdown_breaker = compute_drawdown_breaker_status(
+    let dd_peak_res = if is_live_or_testnet {
+        db.get_peak_and_latest_uncapped_equity_since(dd_window_start)
+    } else {
         db.get_peak_and_latest_equity_since(dd_window_start)
-            .ok()
-            .flatten(),
+    };
+    let dd_peak_latest = collect_section(
+        dd_peak_res,
+        "drawdown_breaker",
+        &mut degraded_sections,
+        &mut degraded_errors,
+    );
+    let drawdown_breaker = compute_drawdown_breaker_status(
+        dd_peak_latest,
         max_dd_frac,
         min_halt,
         dd_basis,
@@ -427,6 +649,28 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
     } else {
         fallback_open_orders
     };
+
+    let mut priority_monitor_health: PriorityMonitorHealth = cfg
+        .get("priority_monitor_health_json")
+        .and_then(|raw| serde_json::from_str::<PriorityMonitorHealth>(raw.trim()).ok())
+        .unwrap_or_default();
+    let prio_interval_ms = cfg.get_i64("priority_monitor_interval_ms", 1000).max(250);
+    let stale_threshold_ms = (prio_interval_ms * 15).max(30_000);
+    if priority_monitor_health.last_tick_at_ms > 0
+        && ts.saturating_sub(priority_monitor_health.last_tick_at_ms) > stale_threshold_ms
+        && (!v_assets_held.is_empty() || !v_assets_ordered.is_empty())
+    {
+        priority_monitor_health.is_stale = true;
+        if priority_monitor_health.status == "HEALTHY" || priority_monitor_health.status == "IDLE" {
+            priority_monitor_health.status = "UNMONITORED".to_string();
+        }
+    }
+
+    let immutable_config_keys: Vec<String> = IMMUTABLE_SECURITY_CONFIG_KEYS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let degraded = !degraded_sections.is_empty();
 
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
@@ -462,6 +706,15 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         telemetry_logs,
         system_config,
         timestamp_ms: ts,
+        snapshot_seq,
+        generated_at_ms,
+        server_boot_id: boot_id,
+        degraded,
+        database_reachable: true,
+        degraded_sections,
+        degraded_errors,
+        immutable_config_keys,
+        priority_monitor_health,
     })
 }
 
@@ -479,8 +732,8 @@ pub fn execute_close_position_or_order(
     let engine = aegis_execution::ExecutionEngine::new(db.clone());
 
     if req.close_all {
-        let held = db.get_assets_held().unwrap_or_default();
-        let ordered = db.get_assets_ordered().unwrap_or_default();
+        let held = db.get_assets_held()?;
+        let ordered = db.get_assets_ordered()?;
         let total_targets = held.len() + ordered.len();
         let mut total_rpnl = 0.0;
         let mut closed_count = 0usize;
@@ -685,8 +938,7 @@ pub fn execute_vault_inspect(
 }
 
 /// Forces an immediate Hyperliquid vault sync (`min_interval_ms = 0`) in TESTNET/LIVE mode
-/// and returns the refreshed [`VaultSyncResponse`]. In PAPER mode, returns `synced: false` with
-/// the cached payload without issuing network calls.
+/// strictly without holding `execution_lock()` over network HTTP IO (`R14-H2`).
 pub fn execute_vault_sync(db: &DatabaseManager) -> Result<VaultSyncResponse> {
     let cfg = db.load_config_or_default();
     let mode = cfg.execution_mode();
@@ -708,7 +960,6 @@ pub fn execute_vault_sync(db: &DatabaseManager) -> Result<VaultSyncResponse> {
     }
 
     let synced_opt = {
-        let _exec_guard = aegis_execution::execution_lock().lock();
         let fresh_cfg = db.load_config_or_default();
         if !fresh_cfg.execution_mode().is_live_or_testnet() {
             None
@@ -768,16 +1019,61 @@ pub fn execute_vault_sync(db: &DatabaseManager) -> Result<VaultSyncResponse> {
     }
 }
 
-/// Converts an `AegisError` into an HTTP JSON response with appropriate status code.
+/// Converts an `AegisError` into a sanitized HTTP JSON response with appropriate status code (`R14-L16`).
+/// Logs full error diagnostics internally under a correlation ID and never leaks raw SQL/DSNs/paths.
 pub fn map_aegis_error_response(err: AegisError) -> Response {
-    let status = match err {
-        AegisError::Validation(_) | AegisError::Config(_) => StatusCode::BAD_REQUEST,
-        AegisError::SecurityViolation(_) => StatusCode::FORBIDDEN,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    let body = ApiErrorBody {
-        error: status.canonical_reason().unwrap_or("Error").to_string(),
-        detail: err.to_string(),
-    };
-    (status, Json(body)).into_response()
+    match err {
+        AegisError::Validation(ref msg) | AegisError::Config(ref msg) => {
+            let body = ApiErrorBody {
+                error: StatusCode::BAD_REQUEST
+                    .canonical_reason()
+                    .unwrap_or("Bad Request")
+                    .to_string(),
+                detail: sanitize_telemetry_message(msg),
+                correlation_id: None,
+            };
+            (StatusCode::BAD_REQUEST, Json(body)).into_response()
+        }
+        AegisError::SecurityViolation(ref msg) => {
+            let body = ApiErrorBody {
+                error: StatusCode::FORBIDDEN
+                    .canonical_reason()
+                    .unwrap_or("Forbidden")
+                    .to_string(),
+                detail: sanitize_telemetry_message(msg),
+                correlation_id: None,
+            };
+            (StatusCode::FORBIDDEN, Json(body)).into_response()
+        }
+        AegisError::Database(_) => {
+            let cid = next_error_correlation_id();
+            tracing::error!(correlation_id = %cid, error = %err, "Database API error");
+            let body = ApiErrorBody {
+                error: StatusCode::SERVICE_UNAVAILABLE
+                    .canonical_reason()
+                    .unwrap_or("Service Unavailable")
+                    .to_string(),
+                detail:
+                    "Database operation unavailable. Reference server logs with correlation_id."
+                        .to_string(),
+                correlation_id: Some(cid),
+            };
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+        }
+        _ => {
+            let cid = next_error_correlation_id();
+            tracing::error!(correlation_id = %cid, error = %err, "Internal API error");
+            let body = ApiErrorBody {
+                error: StatusCode::INTERNAL_SERVER_ERROR
+                    .canonical_reason()
+                    .unwrap_or("Internal Server Error")
+                    .to_string(),
+                detail:
+                    "Internal server error occurred. Reference server logs with correlation_id."
+                        .to_string(),
+                correlation_id: Some(cid),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+        }
+    }
 }

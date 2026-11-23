@@ -174,7 +174,7 @@ dependencies = [
  "aegis-core",
  "aegis-db",
  "aegis-execution",
- "aegis-telemetry",
+ "aegis-test-support",
  "anyhow",
  "axum",
  "mysql",

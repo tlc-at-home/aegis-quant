@@ -39,7 +39,7 @@
 
     <div class="telemetry-badges">
       <div class="t-badge mariadb-badge" id="badge-mariadb" title="MariaDB 13.0 Rolling Engine Health">
-        <span class="pulse-dot cyan"></span>
+        <span class="pulse-dot cyan" id="mariadb-pulse-dot"></span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
           <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
@@ -49,8 +49,8 @@
       </div>
 
       <div class="t-badge pulse-1s" id="badge-prio-pulse" title="1-Second High-Frequency Priority Watchlist & Maker Chaser Loop">
-        <span class="pulse-dot emerald"></span>
-        <span>1s PRIORITY WATCH: <strong id="prio-watch-count">0</strong></span>
+        <span class="pulse-dot emerald" id="prio-pulse-dot"></span>
+        <span id="prio-watch-label">1s PRIORITY WATCH: <strong id="prio-watch-count">0</strong></span>
       </div>
 
       <div class="t-badge pulse-3s" id="badge-scan-pulse" title="3-Second Full-Exchange 150+ Perp Scanner Loop">
@@ -107,6 +107,9 @@
        ======================================================================== -->
   <main class="terminal-container">
     <p id="table-sort-status" role="status" class="visually-hidden"></p>
+
+    <div id="db-outage-banner" class="alert-banner alert-banner-critical" role="alert" aria-live="assertive" hidden></div>
+    <div id="surveillance-alert-banner" class="alert-banner alert-banner-warn" role="alert" aria-live="assertive" hidden></div>
 
     <!-- ======================================================================
          4-CARD PNL HORIZON RIBBON (DAILY 24H · WEEKLY 7D · MONTHLY 30D · YTD)
@@ -199,13 +202,11 @@
         <div class="kpi-value" id="kpi-total-equity">$10,000.00</div>
         <div class="kpi-wallet-strip" id="kpi-wallet-summary" hidden></div>
         <div class="kpi-sub">
-          <span id="kpi-tier-badge" style="color: #fda4af; font-weight: 700;">🔥 EXTREME (1.85x)</span>
+          <span id="kpi-tier-badge" class="kpi-tier-badge">🔥 EXTREME (1.85x)</span>
           <span id="kpi-eligible-coins">0 Eligible Perps</span>
         </div>
         <div class="kpi-sub kpi-sync-row" id="kpi-equity-sync-sub" hidden></div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" style="width: 100%"></div>
-        </div>
+        <progress id="kpi-equity-meter" class="kpi-meter-bar" max="100" value="100"></progress>
       </article>
 
       <!-- 2. Available Cash -->
@@ -224,9 +225,7 @@
           <span id="kpi-cash-pct">100.0% of Equity</span>
           <span>Unspent Liquidity</span>
         </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-cash-meter" style="width: 100%"></div>
-        </div>
+        <progress id="kpi-cash-meter" class="kpi-meter-bar" max="100" value="100"></progress>
       </article>
 
       <!-- 3. Reserved Order Margin (WORKING) -->
@@ -241,12 +240,10 @@
         </div>
         <div class="kpi-value" id="kpi-reserved-margin">$0.00</div>
         <div class="kpi-sub">
-          <span id="kpi-working-count" style="color: #fbbf24;">0 Working Entry ALO</span>
+          <span id="kpi-working-count" class="text-amber">0 Working Entry ALO</span>
           <span id="kpi-exchange-orders-sub">1s Maker Chaser</span>
         </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill amber" id="kpi-reserved-meter" style="width: 0%"></div>
-        </div>
+        <progress id="kpi-reserved-meter" class="kpi-meter-bar amber" max="100" value="0"></progress>
       </article>
 
       <!-- 4. Committed Notional (OPEN) -->
@@ -265,9 +262,7 @@
           <span id="kpi-open-counts">0 Long · 0 Short</span>
           <span id="kpi-net-notional">Net: $0.00</span>
         </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-committed-meter" style="width: 0%"></div>
-        </div>
+        <progress id="kpi-committed-meter" class="kpi-meter-bar" max="100" value="0"></progress>
       </article>
 
       <!-- 5. Gross / Net Leverage -->
@@ -282,15 +277,16 @@
             </svg>
           </div>
         </div>
-        <div class="kpi-value"><span id="kpi-gross-leverage">0.00x</span> <small style="font-size: 13px; color: var(--text-muted);">/ <span id="kpi-net-leverage">0.00x</span></small></div>
-        <span class="dd-halt-pill" id="kpi-drawdown-pill" hidden></span>
+        <div class="kpi-value"><span id="kpi-gross-leverage">0.00x</span> <small class="kpi-leverage-net">/ <span id="kpi-net-leverage">0.00x</span></small></div>
+        <div class="dd-status-row">
+          <span class="dd-halt-pill is-ok" id="kpi-drawdown-pill">24h DD: 0.0% / 15.0%</span>
+          <span class="ruin-halt-pill" id="kpi-ruin-halt-pill" hidden>RUIN HALT</span>
+        </div>
         <div class="kpi-sub">
           <span id="kpi-leverage-target">Target: 1.85x Extreme</span>
           <span id="kpi-leverage-cap">Cap: 2.50x</span>
         </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill amber" id="kpi-leverage-meter" style="width: 0%"></div>
-        </div>
+        <progress id="kpi-leverage-meter" class="kpi-meter-bar amber" max="100" value="0"></progress>
       </article>
 
       <!-- 6. Market Regime & Breadth Gauge -->
@@ -304,14 +300,12 @@
             </svg>
           </div>
         </div>
-        <div class="kpi-value" id="kpi-regime-label" style="font-size: 16px;">NEUTRAL</div>
+        <div class="kpi-value kpi-value-compact" id="kpi-regime-label">NEUTRAL</div>
         <div class="kpi-sub">
           <span id="kpi-breadth-pct">Bull Breadth: 50.0%</span>
           <span id="kpi-beta-exp">Beta: 0.00</span>
         </div>
-        <div class="kpi-meter">
-          <div class="kpi-meter-fill" id="kpi-breadth-meter" style="width: 50%"></div>
-        </div>
+        <progress id="kpi-breadth-meter" class="kpi-meter-bar" max="100" value="50"></progress>
       </article>
     </section>
 
@@ -494,26 +488,30 @@
           </div>
           <div class="chart-legend">
             <span class="legend-item">
-              <span class="legend-swatch" style="background: #00f2fe;"></span>
+              <span class="legend-swatch swatch-cyan"></span>
               <span>Total Equity</span>
-              <strong class="legend-val" id="legend-eq-val" style="color: #00f2fe;">$0.00</strong>
+              <strong class="legend-val text-cyan" id="legend-eq-val">$0.00</strong>
+            </span>
+            <span class="legend-item" id="legend-uncapped-item" hidden>
+              <span class="legend-swatch swatch-violet"></span>
+              <span>Uncapped Wallet</span>
+              <strong class="legend-val text-cyan" id="legend-uncapped-val">$0.00</strong>
             </span>
             <span class="legend-item">
-              <span class="legend-swatch" style="background: #10b981;"></span>
+              <span class="legend-swatch swatch-emerald"></span>
               <span>Committed (OPEN)</span>
-              <strong class="legend-val" id="legend-comm-val" style="color: #34d399;">$0.00</strong>
+              <strong class="legend-val text-emerald" id="legend-comm-val">$0.00</strong>
             </span>
             <span class="legend-item">
-              <span class="legend-swatch" style="background: #f59e0b;"></span>
+              <span class="legend-swatch swatch-amber"></span>
               <span>Reserved (WORKING)</span>
-              <strong class="legend-val" id="legend-res-val" style="color: #fbbf24;">$0.00</strong>
+              <strong class="legend-val text-amber" id="legend-res-val">$0.00</strong>
             </span>
           </div>
         </div>
         <figure class="canvas-wrapper">
           <canvas id="equity-curve-canvas" role="img" aria-label="Portfolio equity, committed notional, and reserved margin over time"></canvas>
           <figcaption id="equity-curve-caption" class="visually-hidden">Portfolio equity, committed notional, and reserved margin curve over time</figcaption>
-          <div id="equity-chart-tooltip" class="chart-tooltip" hidden></div>
         </figure>
       </div>
 
@@ -534,28 +532,28 @@
           <div class="panel-actions">
             <span class="status-pill watch" id="sleeve-total-gross">Total Gross: 0.0%</span>
             <div class="chart-legend">
-              <span class="legend-item"><span class="legend-swatch" style="background: #00f2fe;"></span>S1 Carry</span>
-              <span class="legend-item"><span class="legend-swatch" style="background: #10b981;"></span>S2 Trend</span>
-              <span class="legend-item"><span class="legend-swatch" style="background: #f59e0b;"></span>S3 Event</span>
+              <span class="legend-item"><span class="legend-swatch swatch-cyan"></span>S1 Carry</span>
+              <span class="legend-item"><span class="legend-swatch swatch-emerald"></span>S2 Trend</span>
+              <span class="legend-item"><span class="legend-swatch swatch-amber"></span>S3 Event</span>
             </div>
           </div>
         </div>
-        <figure class="canvas-wrapper" style="height: 165px;">
+        <figure class="canvas-wrapper canvas-wrapper-sleeve">
           <canvas id="sleeve-attr-canvas" role="img" aria-label="Multi-sleeve gross target exposure breakdown"></canvas>
           <figcaption id="sleeve-attr-caption" class="visually-hidden">Multi-sleeve gross target exposure bars</figcaption>
         </figure>
         <div class="sleeve-bars-list">
           <div class="sleeve-stat-box s1">
             <div class="sleeve-stat-name">S1 Carry-Mom</div>
-            <div class="sleeve-stat-val" id="sleeve-s1-weight" style="color: var(--neon-cyan);">0.0%</div>
+            <div class="sleeve-stat-val text-cyan" id="sleeve-s1-weight">0.0%</div>
           </div>
           <div class="sleeve-stat-box s2">
             <div class="sleeve-stat-name">S2 Trend-Breakout</div>
-            <div class="sleeve-stat-val" id="sleeve-s2-weight" style="color: #34d399;">0.0%</div>
+            <div class="sleeve-stat-val text-emerald" id="sleeve-s2-weight">0.0%</div>
           </div>
           <div class="sleeve-stat-box s3">
             <div class="sleeve-stat-name">S3 Event-Reversion</div>
-            <div class="sleeve-stat-val" id="sleeve-s3-weight" style="color: #fbbf24;">0.0%</div>
+            <div class="sleeve-stat-val text-amber" id="sleeve-s3-weight">0.0%</div>
           </div>
         </div>
       </div>
@@ -580,7 +578,7 @@
           </div>
           <div class="panel-actions">
             <span class="watch-split-note" id="watch-split-note" hidden></span>
-            <button type="button" class="cfg-cat-btn" id="btn-toggle-watch-all" style="display: none;">Show All Watchlist</button>
+            <button type="button" class="cfg-cat-btn" id="btn-toggle-watch-all" hidden>Show All Watchlist</button>
             <span class="status-pill working"><span class="pulse-dot emerald"></span>1000ms Loop</span>
           </div>
         </div>
@@ -898,8 +896,8 @@
     <!-- ======================================================================
          ACTIVE ASSET COOLDOWNS (v_assets_in_cooldown)
          ====================================================================== -->
-    <section class="glass-panel" id="cooldown-panel" style="padding: 12px 18px; gap: 10px;">
-      <div class="panel-header" style="padding-bottom: 8px;">
+    <section class="glass-panel glass-panel-compact" id="cooldown-panel">
+      <div class="panel-header panel-header-compact">
         <div class="panel-title-cluster">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <circle cx="12" cy="12" r="10"></circle>
@@ -1443,7 +1441,7 @@
       <div class="tab-pane" id="tab-pane-console">
         <div class="audit-telemetry-split">
           <div>
-            <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: var(--neon-cyan);">
+            <div class="panel-subtitle console-subhead-cyan">
               1-SECOND MAKER LIMIT CHASER EXECUTION AUDIT
             </div>
             <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-order-audit">
@@ -1522,7 +1520,7 @@
           </div>
 
           <div>
-            <div class="panel-subtitle" style="margin-bottom: 8px; font-weight: 700; color: #34d399;">
+            <div class="panel-subtitle console-subhead-emerald">
               LIVE OPERATIONAL TELEMETRY STREAM
             </div>
             <div class="telemetry-log-stream" id="telemetry-log-container"></div>
@@ -1532,7 +1530,7 @@
 
       <!-- TAB 6: System Config & Encrypted Vault -->
       <div class="tab-pane" id="tab-pane-config">
-        <div class="config-toolbar" style="margin-bottom: 14px;">
+        <div class="config-toolbar config-toolbar-spaced">
           <div class="config-category-pills" id="tab-config-cat-pills">
             <button type="button" class="cfg-cat-btn active" data-cat="all">All Settings</button>
             <button type="button" class="cfg-cat-btn" data-cat="risk">Risk & Leverage</button>
@@ -1541,9 +1539,9 @@
             <button type="button" class="cfg-cat-btn" data-cat="alerts">Alerts & Telegram</button>
             <button type="button" class="cfg-cat-btn" data-cat="wallet">Wallet & Vault</button>
           </div>
-          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-            <input type="text" id="cfg-key-input" class="search-input" placeholder="Config key (e.g. max_gross_leverage_x)" style="min-width: 220px;" />
-            <input type="text" id="cfg-val-input" class="search-input" placeholder="New value..." style="min-width: 200px;" />
+          <div class="config-quick-form">
+            <input type="text" id="cfg-key-input" class="search-input cfg-key-input" placeholder="Config key (e.g. max_gross_leverage_x)" />
+            <input type="text" id="cfg-val-input" class="search-input cfg-val-input" placeholder="New value..." />
             <button type="button" class="action-btn cycle-btn" id="btn-submit-config-update">Update Key</button>
           </div>
         </div>
@@ -1624,7 +1622,7 @@
             <div class="panel-subtitle">Edit runtime parameters, sleeve budgets, risk limits, and Fernet-encrypted API credentials</div>
           </div>
         </div>
-        <button type="button" class="close-btn" id="btn-close-config-modal" style="padding: 6px 12px; font-size: 11.5px;">✕ Close</button>
+        <button type="button" class="close-btn modal-close-btn" id="btn-close-config-modal">✕ Close</button>
       </div>
 
       <div class="config-modal-body">
@@ -1645,7 +1643,7 @@
           />
         </div>
 
-        <div class="table-scroll" tabindex="0" role="region" aria-labelledby="caption-modal-system-config" style="max-height: 60vh; overflow-y: auto;">
+        <div class="table-scroll modal-table-scroll" tabindex="0" role="region" aria-labelledby="caption-modal-system-config">
           <table class="quant-table" id="table-modal-system-config" data-vt="true">
             <caption id="caption-modal-system-config" class="visually-hidden">System Configuration Modal</caption>
             <thead>
@@ -1709,7 +1707,7 @@
        AUTHENTICATION / BEARER TOKEN MODAL (SHOWN ON 401 UNAUTHORIZED)
        ======================================================================== -->
   <div class="config-modal-backdrop" id="auth-login-modal">
-    <div class="config-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title" style="max-width: 460px;">
+    <div class="config-modal-dialog auth-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
       <div class="config-modal-header">
         <div class="panel-title-cluster">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1722,17 +1720,16 @@
           </div>
         </div>
       </div>
-      <form id="auth-login-form" class="config-modal-body" style="gap: 12px;">
+      <form id="auth-login-form" class="config-modal-body auth-login-form">
         <input
           type="password"
           id="auth-token-input"
-          class="search-input"
+          class="search-input input-full"
           placeholder="Enter Web API Bearer Token..."
           autocomplete="current-password"
-          style="width: 100%;"
         />
-        <div id="auth-login-error" class="pnl-neg" style="font-family: var(--font-mono); font-size: 11px; display: none;"></div>
-        <div style="display: flex; justify-content: flex-end; gap: 8px;">
+        <div id="auth-login-error" class="pnl-neg auth-login-error" hidden></div>
+        <div class="auth-login-actions">
           <button type="submit" class="action-btn cycle-btn" id="btn-auth-login-submit">Unlock Terminal</button>
         </div>
       </form>
@@ -1957,11 +1954,11 @@
               <span class="status-pill watch" id="vault-barbell-role-pill">FOLLOWER</span>
             </div>
             <div class="vault-barbell-bar-wrap">
-              <div class="vault-barbell-bar" id="vault-barbell-bar" role="img" aria-label="Portfolio allocation bar across Perps, Spot, and Vaults">
-                <div class="vault-bar-seg seg-perp" id="vault-bar-seg-perp"></div>
-                <div class="vault-bar-seg seg-spot" id="vault-bar-seg-spot"></div>
-                <div class="vault-bar-seg seg-vault" id="vault-bar-seg-vault"></div>
-              </div>
+              <svg class="vault-barbell-svg" id="vault-barbell-bar" viewBox="0 0 100 10" preserveAspectRatio="none" role="img" aria-label="Portfolio allocation bar across Perps, Spot, and Vaults">
+                <rect class="vault-bar-seg-svg seg-perp" id="vault-bar-seg-perp" x="0" y="0" width="0" height="10"></rect>
+                <rect class="vault-bar-seg-svg seg-spot" id="vault-bar-seg-spot" x="0" y="0" width="0" height="10"></rect>
+                <rect class="vault-bar-seg-svg seg-vault" id="vault-bar-seg-vault" x="0" y="0" width="0" height="10"></rect>
+              </svg>
               <div class="vault-barbell-legend" id="vault-barbell-legend"></div>
             </div>
             <div class="vault-barbell-metrics" id="vault-barbell-metrics"></div>
@@ -1988,6 +1985,6 @@
   <!-- Toast Banner -->
   <div class="toast-banner" id="toast-banner"></div>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>
