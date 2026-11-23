@@ -2,72 +2,213 @@
 
 pub use aegis_core::{
     derive_evm_address_from_private_key, validate_evm_address, validate_private_key,
-    verify_signer_matches_wallet,
+    verify_signer_matches_wallet, HL_ORACLE_BAND_PCT,
 };
 use aegis_core::{now_ms, round_dp, AegisError, OrderSide, Result};
 use aegis_db::DatabaseManager;
 use k256::ecdsa::{SigningKey, VerifyingKey};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
-/// Hyperliquid L1 oracle price band margin (`±3.95%`), safely inside the exchange's `±4.0%`
-/// (`Price too far from oracle`) rejection boundary.
-pub const HL_ORACLE_BAND_PCT: f64 = 0.0395;
+/// Default Stop-Limit protective trigger limit slippage band (`1.0% = 100 bps`) (`P0-Exec-2`, `R14-M5`).
+pub const HL_SL_TRIGGER_LIMIT_SLIPPAGE_PCT: f64 = 0.01;
 
-static LAST_NONCE_HIGH_WATER: AtomicI64 = AtomicI64::new(0);
-static NONCE_DB_SEEDED: AtomicBool = AtomicBool::new(false);
-static LAST_NONCE_PERSISTED_MS: AtomicI64 = AtomicI64::new(0);
-const NONCE_LAZY_PERSIST_INTERVAL_MS: i64 = 30_000;
+/// Maximum actions allowed in a single Hyperliquid `/exchange` batch request (`Sec. 11`).
+pub const HL_EXCHANGE_MAX_BATCH_ACTIONS: usize = 40;
 
-/// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicI64`
-/// high-water floor (seeded once from `now_ms().max(db_nonce)` and persisted lazily to MariaDB).
-pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
-    let wall_ms = now_ms();
-    if !NONCE_DB_SEEDED.load(Ordering::Acquire) {
-        if let Some(d) = db {
-            if let Ok(cfg) = d.load_config() {
-                let db_floor = cfg.get_i64("hyperliquid_last_nonce", 0).max(0);
-                if db_floor > 0 {
-                    LAST_NONCE_HIGH_WATER.fetch_max(db_floor, Ordering::SeqCst);
-                }
-            }
-            NONCE_DB_SEEDED.store(true, Ordering::Release);
+/// Optimal `/exchange` batch chunk size (`39`, paying weight `1` since `weight = 1 + floor(len / 40)`).
+pub const HL_EXCHANGE_OPTIMAL_BATCH_CHUNK: usize = 39;
+
+/// Lease horizon (`10_000 ms`) synchronously persisted to `system_config.hyperliquid_last_nonce`
+/// before returning any nonce that reaches or crosses the persisted ceiling (`R14-M6`).
+pub const NONCE_PERSIST_LEASE_MS: i64 = 10_000;
+
+/// Safety margin (`5_000 ms`) added to persisted DB nonce floor on daemon restart (`R14-M6`).
+pub const NONCE_BOOT_SAFETY_MARGIN_MS: i64 = 5_000;
+
+/// Encapsulated monotonic lease-backed Hyperliquid nonce allocator (`R14-M6`).
+pub(crate) struct NonceLeaseState {
+    high_water: AtomicI64,
+    persisted_ceiling: AtomicI64,
+    seeded: Mutex<bool>,
+    persist_lock: Mutex<()>,
+    mono_anchor: OnceLock<(i64, Instant)>,
+}
+
+impl NonceLeaseState {
+    const fn new() -> Self {
+        Self {
+            high_water: AtomicI64::new(0),
+            persisted_ceiling: AtomicI64::new(0),
+            seeded: Mutex::new(false),
+            persist_lock: Mutex::new(()),
+            mono_anchor: OnceLock::new(),
         }
     }
 
-    let mut prev = LAST_NONCE_HIGH_WATER.load(Ordering::SeqCst);
-    let next = loop {
-        let n = if wall_ms > prev {
-            wall_ms
-        } else {
-            prev.saturating_add(1)
-        };
-        match LAST_NONCE_HIGH_WATER.compare_exchange(prev, n, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => break n,
-            Err(actual) => prev = actual,
-        }
-    };
+    #[cfg(test)]
+    pub(crate) fn new_isolated() -> Self {
+        Self::new()
+    }
 
-    if let Some(d) = db {
-        if !d.is_ephemeral_test_db() {
-            let last_persist = LAST_NONCE_PERSISTED_MS.load(Ordering::Relaxed);
-            if wall_ms.saturating_sub(last_persist) >= NONCE_LAZY_PERSIST_INTERVAL_MS
-                && LAST_NONCE_PERSISTED_MS
-                    .compare_exchange(last_persist, wall_ms, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let _ = d.set_config_value(
-                    "hyperliquid_last_nonce",
-                    &next.to_string(),
-                    Some("Monotonic Hyperliquid L1 EIP-712 action nonce"),
+    #[inline]
+    fn monotonic_candidate(&self, wall_ms: i64, now_inst: Instant) -> i64 {
+        let (boot_wall_ms, boot_inst) = *self.mono_anchor.get_or_init(|| (wall_ms, now_inst));
+        let elapsed_ms = now_inst.saturating_duration_since(boot_inst).as_millis() as i64;
+        let mono_ms = boot_wall_ms.saturating_add(elapsed_ms);
+        if (wall_ms - mono_ms).abs() > 60_000 {
+            tracing::error!(
+                wall_ms,
+                mono_ms,
+                drift_ms = wall_ms - mono_ms,
+                "Detected large wall-clock jump (>60s); guarding nonce monotonicity with Instant anchor"
+            );
+        }
+        wall_ms.max(mono_ms)
+    }
+
+    fn ensure_seeded_from_db(&self, db: &DatabaseManager, allow_ephemeral_db: bool) {
+        if !allow_ephemeral_db && db.is_ephemeral_test_db() {
+            return;
+        }
+        let mut seeded_guard = self.seeded.lock();
+        if *seeded_guard {
+            return;
+        }
+        match db.get_config_i64_raw("hyperliquid_last_nonce") {
+            Ok(opt) => {
+                if let Some(db_floor) = opt.filter(|&v| v > 0) {
+                    let boot_floor = db_floor.saturating_add(NONCE_BOOT_SAFETY_MARGIN_MS);
+                    self.high_water.fetch_max(boot_floor, Ordering::SeqCst);
+                    self.persisted_ceiling.fetch_max(db_floor, Ordering::SeqCst);
+                }
+                *seeded_guard = true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to seed hyperliquid_last_nonce from DB; will retry on next nonce request"
                 );
             }
         }
     }
-    next as u64
+
+    fn persist_lease_if_crossed(&self, next: i64, db: &DatabaseManager, allow_ephemeral_db: bool) {
+        if !allow_ephemeral_db && db.is_ephemeral_test_db() {
+            return;
+        }
+        if next < self.persisted_ceiling.load(Ordering::Acquire) {
+            return;
+        }
+        let _persist_guard = self.persist_lock.lock();
+        if next < self.persisted_ceiling.load(Ordering::Acquire) {
+            return;
+        }
+        let new_ceiling = next.saturating_add(NONCE_PERSIST_LEASE_MS);
+        match db.set_config_value(
+            "hyperliquid_last_nonce",
+            &new_ceiling.to_string(),
+            Some("Monotonic Hyperliquid L1 EIP-712 action nonce lease ceiling"),
+        ) {
+            Ok(()) => {
+                self.persisted_ceiling
+                    .fetch_max(new_ceiling, Ordering::SeqCst);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    next_nonce = next,
+                    "Failed to synchronously persist hyperliquid_last_nonce lease ceiling; will retry"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn next_nonce_with_clock(
+        &self,
+        db: Option<&DatabaseManager>,
+        wall_ms: i64,
+        now_inst: Instant,
+        allow_ephemeral_db: bool,
+    ) -> u64 {
+        if let Some(d) = db {
+            self.ensure_seeded_from_db(d, allow_ephemeral_db);
+        }
+
+        let candidate = self.monotonic_candidate(wall_ms, now_inst);
+        let mut prev = self.high_water.load(Ordering::SeqCst);
+        let next = loop {
+            let n = if candidate > prev {
+                candidate
+            } else {
+                prev.saturating_add(1)
+            };
+            match self
+                .high_water
+                .compare_exchange(prev, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break n,
+                Err(actual) => prev = actual,
+            }
+        };
+
+        if let Some(d) = db {
+            self.persist_lease_if_crossed(next, d, allow_ephemeral_db);
+        }
+        next as u64
+    }
+
+    pub(crate) fn bump_high_water_with_clock(
+        &self,
+        min_step_ms: i64,
+        db: Option<&DatabaseManager>,
+        wall_ms: i64,
+        now_inst: Instant,
+        allow_ephemeral_db: bool,
+    ) -> u64 {
+        if let Some(d) = db {
+            self.ensure_seeded_from_db(d, allow_ephemeral_db);
+        }
+
+        let step = min_step_ms.max(1);
+        let candidate = self.monotonic_candidate(wall_ms, now_inst);
+        let mut prev = self.high_water.load(Ordering::SeqCst);
+        let next = loop {
+            let n = candidate.max(prev).saturating_add(step);
+            match self
+                .high_water
+                .compare_exchange(prev, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break n,
+                Err(actual) => prev = actual,
+            }
+        };
+
+        if let Some(d) = db {
+            self.persist_lease_if_crossed(next, d, allow_ephemeral_db);
+        }
+        next as u64
+    }
+}
+
+static GLOBAL_NONCE_STATE: NonceLeaseState = NonceLeaseState::new();
+
+/// Generates a strictly monotonic Hyperliquid L1 nonce backed by an in-process `AtomicI64`
+/// high-water floor, monotonic `Instant` NTP guard, and synchronous `+10_000 ms` lease persistence (`R14-M6`).
+pub fn next_monotonic_nonce(db: Option<&DatabaseManager>) -> u64 {
+    GLOBAL_NONCE_STATE.next_nonce_with_clock(db, now_ms(), Instant::now(), false)
+}
+
+/// Advances the global nonce high-water mark by at least `min_step_ms` and synchronously persists
+/// the extended lease ceiling if crossed (`R14-M6` nonce-collision recovery).
+pub fn bump_nonce_high_water(min_step_ms: i64, db: Option<&DatabaseManager>) -> u64 {
+    GLOBAL_NONCE_STATE.bump_high_water_with_clock(min_step_ms, db, now_ms(), Instant::now(), false)
 }
 
 /// Formats a float into a wire string matching Hyperliquid's `float_to_wire` specification.
@@ -103,6 +244,21 @@ pub fn infer_tick_size(mark_price: f64, sz_decimals: u32) -> f64 {
     let sig_fig_decimals = (4 - mag).max(0) as usize;
     let allowed_decimals = sig_fig_decimals.min(max_perp_decimals);
     10_f64.powi(-(allowed_decimals as i32)).max(1e-8)
+}
+
+/// Computes the effective Hyperliquid wire tick size at `price` aligned with `format_hl_wire_price`
+/// (5 significant figures and at most `6 - sz_decimals` decimal places).
+/// Returns `None` when `price` is non-finite or non-positive (`Sec. 11`).
+pub fn effective_hl_tick_size(price: f64, asset_tick: f64, sz_decimals: u32) -> Option<f64> {
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let wire_tick = infer_tick_size(price, sz_decimals);
+    if asset_tick.is_finite() && asset_tick > 0.0 {
+        Some(asset_tick.max(wire_tick))
+    } else {
+        Some(wire_tick)
+    }
 }
 
 /// Snaps a price to the nearest valid tick increment.
@@ -256,36 +412,16 @@ pub struct CancelAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CancelByCloidWire {
-    pub asset: u32,
-    pub cloid: String,
+pub struct ModifyWire {
+    pub oid: u64,
+    pub order: OrderWire,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CancelByCloidAction {
+pub struct BatchModifyAction {
     #[serde(rename = "type")]
     pub action_type: String,
-    pub cancels: Vec<CancelByCloidWire>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultTransferAction {
-    #[serde(rename = "type")]
-    pub action_type: String,
-    pub vault_address: String,
-    pub is_deposit: bool,
-    pub usd: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct SubAccountTransferAction {
-    #[serde(rename = "type")]
-    pub action_type: String,
-    pub sub_account_user: String,
-    pub is_deposit: bool,
-    pub usd: i64,
+    pub modifies: Vec<ModifyWire>,
 }
 
 /// Builds a Hyperliquid L1 limit `OrderWire` (`"Alo"`, `"Ioc"`, or `"Gtc"`).
@@ -327,13 +463,15 @@ pub fn build_limit_order_wire(
     }
 }
 
-/// Builds a Hyperliquid L1 reduce-only trigger `OrderWire` (`tpsl = "sl"` or `"tp"`).
+/// Builds a Hyperliquid L1 reduce-only trigger `OrderWire` (`tpsl = "sl"` or `"tp"`) with explicit `is_market` and `limit_price`.
 #[allow(clippy::too_many_arguments)]
 fn build_trigger_tpsl_order_wire(
     asset_index: u32,
     position_side: OrderSide,
     quantity: f64,
     trigger_price: f64,
+    limit_price: f64,
+    is_market: bool,
     tick_size: f64,
     lot_step_size: f64,
     sz_decimals: u32,
@@ -343,12 +481,7 @@ fn build_trigger_tpsl_order_wire(
     // Trigger order closes the open position: SELL (b=false) for LONG, BUY (b=true) for SHORT
     let close_is_buy = !position_side.is_buy();
     let trigger_px_str = format_hl_wire_price(trigger_price, tick_size, sz_decimals);
-    let limit_fallback = if close_is_buy {
-        trigger_price * (1.0 + HL_ORACLE_BAND_PCT)
-    } else {
-        (trigger_price * (1.0 - HL_ORACLE_BAND_PCT)).max(tick_size.max(1e-8))
-    };
-    let limit_px_str = format_hl_wire_price(limit_fallback, tick_size, sz_decimals);
+    let limit_px_str = format_hl_wire_price(limit_price, tick_size, sz_decimals);
     let mut sz_str = format_hl_wire_size_floor(quantity, lot_step_size, sz_decimals);
     if sz_str == "0" {
         sz_str = format_hl_wire_size(quantity, lot_step_size, sz_decimals);
@@ -365,7 +498,7 @@ fn build_trigger_tpsl_order_wire(
         t: OrderTypeWire {
             limit: None,
             trigger: Some(TriggerOrderTypeWire {
-                is_market: true,
+                is_market,
                 trigger_px: trigger_px_str,
                 tpsl: tpsl.to_string(),
             }),
@@ -374,7 +507,51 @@ fn build_trigger_tpsl_order_wire(
     }
 }
 
-/// Builds a Hyperliquid L1 protective stop-loss trigger `OrderWire` (`reduce_only = true`, `tpsl = "sl"`).
+/// Builds a Hyperliquid L1 protective stop-loss trigger `OrderWire` (`reduce_only = true`, `tpsl = "sl"`,
+/// `is_market = false` `"Stop Limit"` bounded within `±band_bps` of `trigger_price`) (`P0-Exec-2`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_protective_stop_order_wire_with_band_bps(
+    asset_index: u32,
+    position_side: OrderSide,
+    quantity: f64,
+    trigger_price: f64,
+    tick_size: f64,
+    lot_step_size: f64,
+    sz_decimals: u32,
+    band_bps: f64,
+    client_order_id: Option<&str>,
+) -> OrderWire {
+    let eff_band_bps = if band_bps.is_finite() {
+        band_bps.clamp(20.0, HL_ORACLE_BAND_PCT * 10_000.0)
+    } else {
+        HL_SL_TRIGGER_LIMIT_SLIPPAGE_PCT * 10_000.0
+    };
+    let band_pct = eff_band_bps / 10_000.0;
+    let eff_tick = effective_hl_tick_size(trigger_price, tick_size, sz_decimals)
+        .unwrap_or_else(|| tick_size.max(1e-8));
+    let close_is_buy = !position_side.is_buy();
+    let bounded_limit_px = if close_is_buy {
+        trigger_price * (1.0 + band_pct)
+    } else {
+        (trigger_price * (1.0 - band_pct)).max(eff_tick)
+    };
+    build_trigger_tpsl_order_wire(
+        asset_index,
+        position_side,
+        quantity,
+        trigger_price,
+        bounded_limit_px,
+        false,
+        tick_size,
+        lot_step_size,
+        sz_decimals,
+        "sl",
+        client_order_id,
+    )
+}
+
+/// Builds a Hyperliquid L1 protective stop-loss trigger `OrderWire` (`reduce_only = true`, `tpsl = "sl"`,
+/// `is_market = false` `"Stop Limit"` bounded at `±1.0%` = `100 bps`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_protective_stop_order_wire(
     asset_index: u32,
@@ -386,7 +563,7 @@ pub fn build_protective_stop_order_wire(
     sz_decimals: u32,
     client_order_id: Option<&str>,
 ) -> OrderWire {
-    build_trigger_tpsl_order_wire(
+    build_protective_stop_order_wire_with_band_bps(
         asset_index,
         position_side,
         quantity,
@@ -394,12 +571,13 @@ pub fn build_protective_stop_order_wire(
         tick_size,
         lot_step_size,
         sz_decimals,
-        "sl",
+        HL_SL_TRIGGER_LIMIT_SLIPPAGE_PCT * 10_000.0,
         client_order_id,
     )
 }
 
-/// Builds a Hyperliquid L1 take-profit trigger `OrderWire` (`reduce_only = true`, `tpsl = "tp"`).
+/// Builds a Hyperliquid L1 take-profit trigger `OrderWire` (`reduce_only = true`, `tpsl = "tp"`,
+/// `is_market = false` `"Take Profit Limit"` anchored at exact `trigger_price`) (`P0-Exec-2`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_take_profit_order_wire(
     asset_index: u32,
@@ -416,6 +594,8 @@ pub fn build_take_profit_order_wire(
         position_side,
         quantity,
         trigger_price,
+        trigger_price,
+        false,
         tick_size,
         lot_step_size,
         sz_decimals,
@@ -551,6 +731,7 @@ pub fn sign_l1_action<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_eip712_sign_l1_action_and_protective_stop_wire() {
@@ -585,8 +766,25 @@ mod tests {
         assert!(!stop.b);
         assert!(stop.r);
         assert_eq!(stop.s, "14.52");
-        assert_eq!(stop.t.trigger.as_ref().unwrap().trigger_px, "176.82");
-        assert_eq!(stop.t.trigger.as_ref().unwrap().tpsl, "sl");
+        assert_eq!(stop.p, "175.05");
+        let stop_trig = stop.t.trigger.as_ref().unwrap();
+        assert!(!stop_trig.is_market);
+        assert_eq!(stop_trig.trigger_px, "176.82");
+        assert_eq!(stop_trig.tpsl, "sl");
+
+        let short_stop = build_protective_stop_order_wire(
+            3,
+            OrderSide::Short,
+            14.528,
+            176.82,
+            0.01,
+            0.01,
+            2,
+            Some("sl-sol-short-1"),
+        );
+        assert!(short_stop.b);
+        assert!(!short_stop.t.trigger.as_ref().unwrap().is_market);
+        assert_eq!(short_stop.p, "178.59");
 
         let tp = build_take_profit_order_wire(
             3,
@@ -601,12 +799,15 @@ mod tests {
         assert!(!tp.b);
         assert!(tp.r);
         assert_eq!(tp.s, "14.52");
-        assert_eq!(tp.t.trigger.as_ref().unwrap().trigger_px, "199.15");
-        assert_eq!(tp.t.trigger.as_ref().unwrap().tpsl, "tp");
+        assert_eq!(tp.p, "199.15");
+        let tp_trig = tp.t.trigger.as_ref().unwrap();
+        assert!(!tp_trig.is_market);
+        assert_eq!(tp_trig.trigger_px, "199.15");
+        assert_eq!(tp_trig.tpsl, "tp");
 
         let action = OrderAction {
             action_type: "order".to_string(),
-            orders: vec![order, stop, tp],
+            orders: vec![order.clone(), stop, tp],
             grouping: "na".to_string(),
         };
         let n1 = next_monotonic_nonce(None);
@@ -622,5 +823,78 @@ mod tests {
         assert!(sig["s"].as_str().unwrap().starts_with("0x"));
         let v = sig["v"].as_u64().unwrap();
         assert!(v == 27 || v == 28);
+
+        // Verify BatchModifyAction MessagePack hash computes cleanly
+        let batch_modify = BatchModifyAction {
+            action_type: "batchModify".to_string(),
+            modifies: vec![ModifyWire { oid: 42, order }],
+        };
+        assert!(compute_l1_action_hash(&batch_modify, None, n2, None).is_ok());
+    }
+
+    #[test]
+    fn test_r14_m6_nonce_lease_survives_restart_backward_ntp_and_db_seed_retry() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let base_wall = 2_000_000_000_000i64;
+        let t0 = Instant::now();
+
+        // 1. Seed initial persisted ceiling and simulate daemon restart:
+        //    boot nonce must jump by +NONCE_BOOT_SAFETY_MARGIN_MS (+5_000 ms) and persist +NONCE_PERSIST_LEASE_MS (+10_000 ms).
+        db.set_config_value("hyperliquid_last_nonce", &base_wall.to_string(), None)
+            .unwrap();
+        let state1 = NonceLeaseState::new_isolated();
+        let n1 = state1.next_nonce_with_clock(Some(&db), base_wall - 10_000, t0, true);
+        assert_eq!(n1 as i64, base_wall + NONCE_BOOT_SAFETY_MARGIN_MS);
+
+        let persisted_after_n1 = db
+            .get_config_i64_raw("hyperliquid_last_nonce")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_after_n1, (n1 as i64) + NONCE_PERSIST_LEASE_MS);
+
+        // 2. Subsequent nonce within the 10s lease stays strictly > n1 without overwriting ceiling yet
+        let n2 = state1.next_nonce_with_clock(
+            Some(&db),
+            base_wall - 120_000, // Simulated 2m backward NTP step!
+            t0 + Duration::from_millis(500),
+            true,
+        );
+        assert!(n2 > n1);
+        let persisted_after_n2 = db
+            .get_config_i64_raw("hyperliquid_last_nonce")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_after_n2, persisted_after_n1);
+
+        // 3. Crossing the lease advances persisted ceiling synchronously BEFORE returning nonce
+        let n3 = state1.next_nonce_with_clock(
+            Some(&db),
+            persisted_after_n1 + 250,
+            t0 + Duration::from_secs(12),
+            true,
+        );
+        assert_eq!(n3 as i64, persisted_after_n1 + 250);
+        let persisted_after_n3 = db
+            .get_config_i64_raw("hyperliquid_last_nonce")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_after_n3, (n3 as i64) + NONCE_PERSIST_LEASE_MS);
+
+        // 4. Simulated crash-restart right after n3: new NonceLeaseState starts strictly > n3
+        let state2 = NonceLeaseState::new_isolated();
+        let n4 = state2.next_nonce_with_clock(Some(&db), base_wall, t0, true);
+        assert!(n4 > n3);
+        assert!(n4 as i64 >= persisted_after_n3 + NONCE_BOOT_SAFETY_MARGIN_MS);
+
+        // 5. DB seed failure retries instead of latching `seeded = true`
+        let bad_db = DatabaseManager::connect(Some(std::path::Path::new(":memory:")), None);
+        if let Ok(uninit_db) = bad_db {
+            // Even if connected without schema, seed fails cleanly and remains unseeded until success
+            let state_retry = NonceLeaseState::new_isolated();
+            let _ = state_retry.next_nonce_with_clock(Some(&uninit_db), 1_000, t0, true);
+            // When valid DB is passed afterwards, it still reads the persisted floor
+            let n_ok = state_retry.next_nonce_with_clock(Some(&db), 1_000, t0, true);
+            assert!(n_ok > n4);
+        }
     }
 }

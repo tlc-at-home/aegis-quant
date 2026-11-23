@@ -2,19 +2,30 @@
 //!
 //! Enforces the Rev 3.1 strict Order-to-Open Capital Lifecycle:
 //! - Places new entries as `WORKING` (`WORKING_ALO`), reserving `reserved_margin_usdc` without spending cash into `committed_notional_usdc`.
-//! - Chases top-of-book at 1s frequency (`record_working_order_chase`), escalating to `CROSSING_IOC` after `max_alo_chase_ticks`.
-//! - Upon fill confirmation, calls `promote_working_to_open` (moving funds from `reserved_margin_usdc` into `committed_notional_usdc`),
-//!   places an exchange-side protective stop order, and enqueues a rich HTML Telegram alert.
+//! - Chases top-of-book at 1s frequency (`record_working_order_chase`) with cumulative initial-limit & oracle drift caps,
+//!   live L2 spread aborts, native 1-tick wire-equivalence preservation, and `±25 bps` entry IOC escalation.
+//! - Upon fill confirmation, unconditionally recomputes protective stop & TP from actual fill price,
+//!   calls `promote_working_to_open`, attaches SL/TP via `tpsl_sync`, and enqueues non-blocking HTML alerts.
 
-use crate::http_client::HyperliquidHttpClient;
+use crate::http_client::{HyperliquidHttpClient, OpenOrdersSnapshot};
+use crate::lock_guard::acquire_execution_lock;
 use crate::signing::{
-    build_limit_order_wire, build_protective_stop_order_wire, build_take_profit_order_wire,
-    derive_hl_cloid_hex, format_hl_wire_price, format_hl_wire_size, format_hl_wire_size_floor,
-    snap_to_lot, snap_to_tick, CancelWire, HL_ORACLE_BAND_PCT,
+    build_limit_order_wire, derive_hl_cloid_hex, effective_hl_tick_size, format_hl_wire_price,
+    snap_to_lot, snap_to_tick,
 };
-use aegis_alerts::{AlertEngine, OrderFilledOpenAlert, WorkingOrderPlacedAlert};
+use crate::tpsl_sync::{ensure_exchange_tpsl_orders_detailed, TpslSyncRequest};
+use aegis_alerts::{
+    format_order_filled_open_html, format_working_order_placed_html, AlertEngine,
+    OrderFilledOpenAlert, WorkingOrderPlacedAlert,
+};
+use aegis_core::hl_parse::{
+    is_entry_fill_complete as core_is_entry_fill_complete,
+    remaining_entry_qty_for_lot as core_remaining_entry_qty_for_lot, ENTRY_PARTIAL_GRACE_MS,
+    HL_ORACLE_BAND_PCT,
+};
+use aegis_core::indicators::compute_one_tick_bps_opt;
 use aegis_core::{
-    now_ms, round_dp, AegisError, ConfigMap, ExchangeAsset, OrderFsmState, OrderSide,
+    now_ms, parse_hl_f64, round_dp, AegisError, ConfigMap, ExchangeAsset, OrderFsmState, OrderSide,
     OrderedAssetView, Result,
 };
 use aegis_db::{DatabaseManager, WorkingOrderInput};
@@ -22,58 +33,95 @@ use aegis_risk::{
     compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
     RiskLimitsConfig,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 
-pub(crate) const ENTRY_PARTIAL_GRACE_MS: i64 = 45_000;
-const ENTRY_FILL_COMPLETE_RATIO: f64 = 0.85;
+// Re-export consolidated HL OID parsers for internal modules (e.g., `reconcile.rs`, `priority_monitor.rs`) (`R14-L2`).
+pub(crate) use aegis_core::{extract_hl_oid as extract_order_oid, parse_hl_oid};
 
-pub(crate) fn remaining_entry_qty(
-    requested_qty: f64,
-    filled_qty: f64,
-    asset: &ExchangeAsset,
-) -> f64 {
-    snap_to_lot(
-        (requested_qty - filled_qty).max(0.0),
-        asset.lot_step_size,
-        asset.sz_decimals,
-        true,
-    )
-}
+/// Default multiplier applied to single-tick bps when computing effective chase threshold (`R14-M5`).
+pub const ALO_ONE_TICK_THRESHOLD_MULT: f64 = 1.5;
 
-pub(crate) fn is_entry_fill_complete(
-    requested_qty: f64,
-    filled_qty: f64,
-    asset: &ExchangeAsset,
-) -> bool {
-    if filled_qty <= 1e-9 || requested_qty <= 1e-9 {
-        return false;
-    }
-    let rem_qty = remaining_entry_qty(requested_qty, filled_qty, asset);
-    filled_qty + 1e-9 >= requested_qty * ENTRY_FILL_COMPLETE_RATIO
-        || rem_qty <= asset.lot_step_size * 0.5
-        || rem_qty <= 1e-9
-}
+/// Default maximum entry IOC slippage in basis points (`±25 bps`) (`P0-Exec-1`, `R14-M5`).
+pub const ENTRY_IOC_DEFAULT_MAX_SLIPPAGE_BPS: f64 = 25.0;
+
+const REJECT_WINDOW_MS: i64 = 900_000; // 15m sliding window
+const EXPIRY_WINDOW_MS: i64 = 1_800_000; // 30m sliding window
 
 enum CancelEntryOutcome {
     Proceed { saw_filled_hint: bool },
     Aborted,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TriggerOrderInfo {
-    oid: u64,
-    is_tp: bool,
-    trigger_px: f64,
-    qty: f64,
+#[derive(Debug, Default)]
+struct AssetFailureCounters {
+    reject_timestamps_ms: VecDeque<i64>,
+    expiry_timestamps_ms: VecDeque<i64>,
 }
 
-pub(crate) fn compute_one_tick_bps(tick: f64, mid: f64) -> f64 {
-    if mid.is_finite() && mid > 0.0 && tick.is_finite() && tick > 0.0 {
-        (tick / mid) * 10_000.0
-    } else {
-        0.0
+enum UncertainSubmitProbe {
+    Resting {
+        eoid: Option<String>,
+    },
+    Filled {
+        eoid: Option<String>,
+        fill_px: f64,
+        fill_qty: f64,
+        est_fee: f64,
+    },
+    ConfirmedAbsent,
+    ProbeUnreachable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChaserConfig {
+    max_chases: u32,
+    chase_threshold_bps: f64,
+    max_entry_spread_bps: f64,
+    max_alo_chase_drift_bps: f64,
+    max_alo_oracle_drift_bps: f64,
+    chase_reject_cooldown_sec: i64,
+    entry_ioc_max_slippage_bps: f64,
+    hl_reject_backoff_threshold: usize,
+    alo_expiry_backoff_threshold: usize,
+    maker_fee_bps: f64,
+    taker_fee_bps: f64,
+}
+
+impl ChaserConfig {
+    fn from_config(cfg: &ConfigMap) -> Self {
+        Self {
+            max_chases: cfg.get_usize("max_alo_chase_ticks", 3).max(1) as u32,
+            chase_threshold_bps: cfg.get_f64("alo_chase_threshold_bps", 8.0).max(0.5),
+            max_entry_spread_bps: cfg.get_f64("max_entry_spread_bps", 10.0).max(1.0),
+            max_alo_chase_drift_bps: cfg
+                .get_f64("max_alo_chase_drift_bps", 60.0)
+                .clamp(5.0, 300.0),
+            max_alo_oracle_drift_bps: cfg
+                .get_f64("max_alo_oracle_drift_bps", 150.0)
+                .clamp(20.0, 500.0),
+            chase_reject_cooldown_sec: cfg
+                .get_i64("chase_reject_cooldown_sec", 300)
+                .clamp(30, 3600),
+            entry_ioc_max_slippage_bps: cfg
+                .get_f64(
+                    "entry_ioc_max_slippage_bps",
+                    ENTRY_IOC_DEFAULT_MAX_SLIPPAGE_BPS,
+                )
+                .clamp(5.0, 200.0),
+            hl_reject_backoff_threshold: cfg
+                .get_usize("hl_reject_backoff_threshold", 3)
+                .clamp(1, 20),
+            alo_expiry_backoff_threshold: cfg
+                .get_usize("alo_expiry_backoff_threshold", 2)
+                .clamp(1, 10),
+            maker_fee_bps: cfg.get_f64("maker_fee_bps", 1.5).max(0.0),
+            taker_fee_bps: cfg.get_f64("taker_fee_bps", 4.5).max(0.0),
+        }
     }
 }
 
@@ -185,21 +233,81 @@ pub(crate) fn is_post_only_crossing_rejection(raw_error: Option<&str>) -> bool {
         || lower.contains("would have immediately matched")
 }
 
-pub(crate) fn parse_hl_oid(raw: Option<&str>) -> Option<u64> {
-    raw.and_then(|s| s.trim().strip_prefix("hl-").or_else(|| Some(s.trim())))
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&v| v > 0)
+fn is_hard_non_transient_reject(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("insufficient margin")
+        || lower.contains("minimum value")
+        || lower.contains("price too far from oracle")
+        || lower.contains("exceeds max position")
+        || lower.contains("max open interest")
+        || lower.contains("reduce only")
 }
 
-pub(crate) fn extract_order_oid(ord: &Value) -> Option<u64> {
-    ord.get("oid")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            ord.get("oid")
-                .and_then(Value::as_str)
-                .and_then(|s| s.trim().parse::<u64>().ok())
-        })
-        .filter(|&v| v > 0)
+fn ensure_wire_price_strictly_passive(
+    side: OrderSide,
+    candidate_px: f64,
+    bbo: Option<(f64, f64)>,
+    eff_tick: f64,
+    sz_decimals: u32,
+) -> f64 {
+    let Some((bid, ask)) =
+        bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+    else {
+        return candidate_px;
+    };
+    let mut px = candidate_px;
+    let wire_val = |p: f64| -> f64 {
+        format_hl_wire_price(p, eff_tick, sz_decimals)
+            .parse::<f64>()
+            .unwrap_or(p)
+    };
+    let ask_wire = wire_val(ask);
+    let bid_wire = wire_val(bid);
+    for _ in 0..2 {
+        let cur_wire = wire_val(px);
+        if side.is_buy() && cur_wire >= ask_wire - 1e-12 && ask_wire > eff_tick * 1.5 {
+            px = snap_to_tick((px - eff_tick).max(eff_tick), eff_tick);
+        } else if !side.is_buy() && cur_wire <= bid_wire + 1e-12 {
+            px = snap_to_tick(px + eff_tick, eff_tick);
+        } else {
+            break;
+        }
+    }
+    px
+}
+
+fn extract_position_state_from_ch_value(
+    ch_state: &Value,
+    asset: &ExchangeAsset,
+    side: OrderSide,
+) -> Option<(f64, f64)> {
+    let arr = ch_state.get("assetPositions").and_then(Value::as_array)?;
+    for item in arr {
+        let p = item.get("position").unwrap_or(item);
+        let coin = p.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+        if !coin.eq_ignore_ascii_case(&asset.coin) {
+            continue;
+        }
+        let szi = parse_hl_f64(p.get("szi"));
+        if szi.abs() > 1e-9 && (szi > 0.0) == side.is_buy() {
+            let qty = szi.abs();
+            let entry_px = parse_hl_f64(p.get("entryPx"));
+            let pos_val = parse_hl_f64(p.get("positionValue"));
+            let fill_px = if entry_px > 0.0 {
+                entry_px
+            } else if pos_val > 0.0 {
+                round_dp(pos_val / qty, 6)
+            } else if asset.mark_price > 0.0 {
+                asset.mark_price
+            } else {
+                asset.mid_price
+            };
+            if fill_px > 0.0 {
+                return Some((fill_px, qty));
+            }
+        }
+    }
+    None
 }
 
 /// Request payload to place a new `WORKING` (`WORKING_ALO`) order reserving margin.
@@ -258,110 +366,258 @@ pub struct OrderChaser {
     pub db: DatabaseManager,
     pub http: HyperliquidHttpClient,
     pub alerts: AlertEngine,
+    working_initial_limits: Arc<Mutex<HashMap<i64, f64>>>,
+    asset_failure_counters: Arc<Mutex<HashMap<i64, AssetFailureCounters>>>,
+    alert_wakeup_tx: Option<SyncSender<usize>>,
 }
 
 impl OrderChaser {
     pub fn new(db: DatabaseManager, http: HyperliquidHttpClient, alerts: AlertEngine) -> Self {
-        Self { db, http, alerts }
+        Self {
+            db,
+            http,
+            alerts,
+            working_initial_limits: Arc::new(Mutex::new(HashMap::new())),
+            asset_failure_counters: Arc::new(Mutex::new(HashMap::new())),
+            alert_wakeup_tx: None,
+        }
+    }
+
+    /// Attaches an optional bounded wakeup sender for non-blocking background alert dispatch (`R14-L5`).
+    pub fn with_alert_wakeup(mut self, wakeup_tx: SyncSender<usize>) -> Self {
+        self.alert_wakeup_tx = Some(wakeup_tx);
+        self
+    }
+
+    /// Prunes cached `working_initial_limits` and expired failure windows to prevent unbounded growth (`R14-L6`).
+    pub fn prune_tracking_maps(&self, active_working_ids: &HashSet<i64>) {
+        self.working_initial_limits
+            .lock()
+            .retain(|pid, _| active_working_ids.contains(pid));
+
+        let now = now_ms();
+        let mut counters = self.asset_failure_counters.lock();
+        counters.retain(|_, c| {
+            while c
+                .reject_timestamps_ms
+                .front()
+                .is_some_and(|&t| now.saturating_sub(t) > REJECT_WINDOW_MS)
+            {
+                c.reject_timestamps_ms.pop_front();
+            }
+            while c
+                .expiry_timestamps_ms
+                .front()
+                .is_some_and(|&t| now.saturating_sub(t) > EXPIRY_WINDOW_MS)
+            {
+                c.expiry_timestamps_ms.pop_front();
+            }
+            !c.reject_timestamps_ms.is_empty() || !c.expiry_timestamps_ms.is_empty()
+        });
+    }
+
+    fn wake_alert_worker(&self) {
+        if let Some(ref tx) = self.alert_wakeup_tx {
+            let _ = tx.try_send(1);
+        }
+    }
+
+    fn resolve_initial_limit_price(&self, position_id: i64, fallback_limit_px: f64) -> f64 {
+        if let Some(&px) = self.working_initial_limits.lock().get(&position_id) {
+            if px.is_finite() && px > 0.0 {
+                return px;
+            }
+        }
+        let resolved = self
+            .db
+            .get_working_order_initial_limit_price(position_id)
+            .ok()
+            .flatten()
+            .filter(|&p| p.is_finite() && p > 0.0)
+            .unwrap_or(fallback_limit_px);
+        if resolved.is_finite() && resolved > 0.0 {
+            self.working_initial_limits
+                .lock()
+                .insert(position_id, resolved);
+        }
+        resolved
+    }
+
+    fn record_hl_reject_and_maybe_cooldown(
+        &self,
+        asset_id: i64,
+        symbol: &str,
+        reason: &str,
+        ccfg: &ChaserConfig,
+    ) {
+        let now = now_ms();
+        let count = {
+            let mut map = self.asset_failure_counters.lock();
+            let entry = map.entry(asset_id).or_default();
+            while entry
+                .reject_timestamps_ms
+                .front()
+                .is_some_and(|&t| now.saturating_sub(t) > REJECT_WINDOW_MS)
+            {
+                entry.reject_timestamps_ms.pop_front();
+            }
+            entry.reject_timestamps_ms.push_back(now);
+            entry.reject_timestamps_ms.len()
+        };
+        if is_hard_non_transient_reject(reason) || count >= ccfg.hl_reject_backoff_threshold {
+            let cd_reason = format!(
+                "CHURN_GUARD: Hyperliquid rejected {} ({count} rejects in 15m; latest='{reason}')",
+                symbol
+            );
+            let _ = self.db.insert_asset_cooldown(
+                asset_id,
+                "CHURN_GUARD",
+                &cd_reason,
+                ccfg.chase_reject_cooldown_sec,
+            );
+        }
+    }
+
+    fn record_alo_expiry_and_maybe_cooldown(
+        &self,
+        asset_id: i64,
+        symbol: &str,
+        reason: &str,
+        ccfg: &ChaserConfig,
+    ) {
+        let now = now_ms();
+        let count = {
+            let mut map = self.asset_failure_counters.lock();
+            let entry = map.entry(asset_id).or_default();
+            while entry
+                .expiry_timestamps_ms
+                .front()
+                .is_some_and(|&t| now.saturating_sub(t) > EXPIRY_WINDOW_MS)
+            {
+                entry.expiry_timestamps_ms.pop_front();
+            }
+            entry.expiry_timestamps_ms.push_back(now);
+            entry.expiry_timestamps_ms.len()
+        };
+        let cd_sec = if count >= ccfg.alo_expiry_backoff_threshold {
+            ccfg.chase_reject_cooldown_sec
+        } else {
+            60
+        };
+        let cd_reason = format!(
+            "CHURN_GUARD: {} on {} ({count} expiry/unfilled events in 30m)",
+            reason, symbol
+        );
+        let _ = self
+            .db
+            .insert_asset_cooldown(asset_id, "CHURN_GUARD", &cd_reason, cd_sec);
     }
 
     /// Places a new `WORKING` (`WORKING_ALO`) order, reserving `reserved_margin_usdc`
-    /// without deducting `committed_notional_usdc` yet, and notifies Telegram.
+    /// without deducting `committed_notional_usdc` yet, and enqueues a non-blocking HTML alert.
     pub fn place_working_order(&self, req: &NewWorkingOrderRequest) -> Result<i64> {
-        if self.db.is_asset_in_cooldown(req.asset.id)? {
-            return Err(AegisError::Validation(format!(
-                "Asset '{}' is currently in active cooldown; blocking new WORKING order",
-                req.asset.symbol
-            )));
-        }
-        if let Some(existing) = self.db.get_active_position_for_asset(req.asset.id)? {
-            return Err(AegisError::Validation(format!(
-                "Asset '{}' already has active position #{} (status={})",
-                req.asset.symbol, existing.id, existing.status
-            )));
-        }
+        let (cfg, ccfg, is_live_exchange, ref_mid, tick, qty, stop_px, tp_px) = {
+            let _guard = acquire_execution_lock();
+            if self.db.is_asset_in_cooldown(req.asset.id)? {
+                return Err(AegisError::Validation(format!(
+                    "Asset '{}' is currently in active cooldown; blocking new WORKING order",
+                    req.asset.symbol
+                )));
+            }
+            if let Some(existing) = self.db.get_active_position_for_asset(req.asset.id)? {
+                return Err(AegisError::Validation(format!(
+                    "Asset '{}' already has active position #{} (status={})",
+                    req.asset.symbol, existing.id, existing.status
+                )));
+            }
 
-        let cfg = self.db.load_config()?;
-        let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
-        let min_entry_interval_sec = cfg.get_i64("min_entry_interval_sec", 150).max(0);
-        let cap_epoch_ms = if cfg.execution_mode().is_live_or_testnet() {
-            cfg.get_i64("risk_capital_cap_updated_at_ms", 0)
-        } else {
-            0
-        };
+            let cfg = self.db.load_config()?;
+            let ccfg = ChaserConfig::from_config(&cfg);
+            let max_open_positions = cfg.get_usize("max_open_positions", 6).max(1);
+            let min_entry_interval_sec = cfg.get_i64("min_entry_interval_sec", 150).max(0);
 
-        let active_held_cnt = self
-            .db
-            .get_assets_held()
-            .map(|v| {
-                v.iter()
-                    .filter(|h| crate::engine::is_active_cap_holding(h, cap_epoch_ms))
-                    .count()
-            })
-            .unwrap_or(0);
-        let active_ord_cnt = self
-            .db
-            .get_assets_ordered()
-            .map(|v| {
-                v.iter()
-                    .filter(|o| crate::engine::is_active_cap_order(o, cap_epoch_ms))
-                    .count()
-            })
-            .unwrap_or(0);
-        let total_active = active_held_cnt + active_ord_cnt;
-        if total_active >= max_open_positions {
-            return Err(AegisError::Validation(format!(
-                "MAX_OPEN_POSITIONS_REACHED: active={total_active} >= max_open_positions={max_open_positions}"
-            )));
-        }
+            // R14-H1: Always count ALL OPEN + WORKING positions regardless of cap_epoch_ms.
+            let active_held_cnt = self.db.get_assets_held()?.len();
+            let active_ord_cnt = self.db.get_assets_ordered()?.len();
+            let total_active = active_held_cnt + active_ord_cnt;
+            if total_active >= max_open_positions {
+                return Err(AegisError::Validation(format!(
+                    "MAX_OPEN_POSITIONS_REACHED: active={total_active} >= max_open_positions={max_open_positions}"
+                )));
+            }
 
-        if min_entry_interval_sec > 0 && !req.bypass_entry_interval {
-            if let Ok(Some(last_entry_ms)) = self.db.last_position_entry_timestamp_ms() {
-                let elapsed_ms = now_ms().saturating_sub(last_entry_ms);
-                if elapsed_ms < min_entry_interval_sec * 1000 {
-                    return Err(AegisError::Validation(format!(
-                        "MIN_ENTRY_INTERVAL_COOLDOWN: elapsed={}s < min_entry_interval_sec={}s",
-                        elapsed_ms / 1000,
-                        min_entry_interval_sec
-                    )));
+            if min_entry_interval_sec > 0 && !req.bypass_entry_interval {
+                if let Some(last_entry_ms) = self.db.last_position_entry_timestamp_ms()? {
+                    let elapsed_ms = now_ms().saturating_sub(last_entry_ms);
+                    if elapsed_ms < min_entry_interval_sec * 1000 {
+                        return Err(AegisError::Validation(format!(
+                            "MIN_ENTRY_INTERVAL_COOLDOWN: elapsed={}s < min_entry_interval_sec={}s",
+                            elapsed_ms / 1000,
+                            min_entry_interval_sec
+                        )));
+                    }
                 }
             }
-        }
 
-        let ref_mid = if req.asset.mid_price > 0.0 {
-            req.asset.mid_price
-        } else {
-            req.asset.mark_price
+            let ref_mid = if req.asset.mid_price > 0.0 {
+                req.asset.mid_price
+            } else {
+                req.asset.mark_price
+            };
+            if !ref_mid.is_finite() || ref_mid <= 0.0 {
+                return Err(AegisError::Validation(format!(
+                    "Asset '{}' has invalid reference price {ref_mid}",
+                    req.asset.symbol
+                )));
+            }
+
+            let tick = effective_hl_tick_size(ref_mid, req.asset.tick_size, req.asset.sz_decimals)
+                .unwrap_or_else(|| req.asset.tick_size.max(1e-8));
+            let qty = snap_to_lot(
+                req.requested_quantity,
+                req.asset.lot_step_size,
+                req.asset.sz_decimals,
+                true,
+            );
+            if qty <= 0.0 {
+                return Err(AegisError::Validation(format!(
+                    "Requested quantity {:.6} rounds to zero for '{}'",
+                    req.requested_quantity, req.asset.symbol
+                )));
+            }
+
+            let limits = RiskLimitsConfig::from_config_map(&cfg);
+            let bars_1h = self
+                .db
+                .get_ohlcv_bars(req.asset.id, "1h", 20)
+                .unwrap_or_default();
+            let atr_opt = (!bars_1h.is_empty()).then(|| {
+                compute_atr_from_bars(&bars_1h, 14, ref_mid, limits.protective_stop_default_pct)
+            });
+            let stop_px = if req.protective_stop_px.is_finite() && req.protective_stop_px > 0.0 {
+                snap_to_tick(req.protective_stop_px, tick)
+            } else {
+                compute_initial_protective_stop(req.side, ref_mid, atr_opt, tick, &limits)
+            };
+            let tp_px = compute_initial_take_profit(req.side, ref_mid, atr_opt, tick, &limits);
+            let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
+            (
+                cfg,
+                ccfg,
+                is_live_exchange,
+                ref_mid,
+                tick,
+                qty,
+                stop_px,
+                tp_px,
+            )
         };
-        if ref_mid <= 0.0 {
-            return Err(AegisError::Validation(format!(
-                "Asset '{}' has invalid reference price {ref_mid}",
-                req.asset.symbol
-            )));
-        }
 
-        let tick = req.asset.tick_size.max(1e-8);
         let mut limit_price = if req.side.is_buy() {
             snap_to_tick((ref_mid - tick).max(tick), tick)
         } else {
             snap_to_tick(ref_mid + tick, tick)
         };
-        let qty = snap_to_lot(
-            req.requested_quantity,
-            req.asset.lot_step_size,
-            req.asset.sz_decimals,
-            true,
-        );
-        if qty <= 0.0 {
-            return Err(AegisError::Validation(format!(
-                "Requested quantity {:.6} rounds to zero for '{}'",
-                req.requested_quantity, req.asset.symbol
-            )));
-        }
-
-        let default_stop_pct = cfg
-            .get_f64("protective_stop_default_pct", 0.04)
-            .clamp(0.005, 0.25);
 
         let coid = format!(
             "v2-{}-{}-{}",
@@ -369,12 +625,10 @@ impl OrderChaser {
             req.side.as_str().to_ascii_lowercase(),
             now_ms()
         );
+        let expected_cloid = derive_hl_cloid_hex(&coid);
 
         let mut exchange_oid: Option<String> = None;
         let mut live_filled_immediately: Option<(f64, f64, f64)> = None;
-
-        let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
-        let max_entry_spread_bps = cfg.get_f64("max_entry_spread_bps", 20.0).max(1.0);
 
         if is_live_exchange {
             let pk = cfg.get_str("private_key", "");
@@ -388,21 +642,33 @@ impl OrderChaser {
                     req.asset.symbol
                 )));
             }
-            if let Ok(Some((bid, ask))) = self.http.fetch_l2_book(&req.asset.coin, &cfg) {
+            let l2_bbo = self
+                .http
+                .fetch_l2_book(&req.asset.coin, &cfg)
+                .ok()
+                .flatten()
+                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b);
+            if let Some((bid, ask)) = l2_bbo {
                 let mid_bbo = (bid + ask) * 0.5;
-                if mid_bbo > 0.0 && ask >= bid {
+                if mid_bbo > 0.0 {
                     let spread_bps = ((ask - bid) / mid_bbo) * 10_000.0;
-                    if spread_bps > max_entry_spread_bps {
+                    if spread_bps > ccfg.max_entry_spread_bps {
                         return Err(AegisError::Validation(format!(
-                            "ENTRY_SPREAD_TOO_WIDE: {} spread={spread_bps:.2}bps > max_entry_spread_bps={max_entry_spread_bps:.2}bps",
-                            req.asset.symbol
+                            "ENTRY_SPREAD_TOO_WIDE: {} spread={spread_bps:.2}bps > max_entry_spread_bps={:.2}bps",
+                            req.asset.symbol, ccfg.max_entry_spread_bps
                         )));
                     }
                 }
-                if bid > 0.0 && ask >= bid {
-                    limit_price = clamp_initial_alo_price(req.side, ref_mid, bid, ask, tick);
-                }
+                limit_price = clamp_initial_alo_price(req.side, ref_mid, bid, ask, tick);
+                limit_price = ensure_wire_price_strictly_passive(
+                    req.side,
+                    limit_price,
+                    Some((bid, ask)),
+                    tick,
+                    req.asset.sz_decimals,
+                );
             }
+
             let wire = build_limit_order_wire(
                 req.asset.asset_index,
                 req.side.is_buy(),
@@ -415,55 +681,93 @@ impl OrderChaser {
                 "Alo",
                 Some(&coid),
             );
-            let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
-            let ack = match self.http.submit_order_wire(
+            match self.http.submit_order_wire(
                 wire,
                 qty,
                 limit_price,
-                maker_fee_bps,
+                ccfg.maker_fee_bps,
                 &pk,
                 Some(&self.db),
                 &cfg,
             ) {
-                Ok(ack) => ack,
+                Ok(ack) => {
+                    if !ack.accepted {
+                        let reason = ack.raw_error.unwrap_or_else(|| "REJECTED".to_string());
+                        tracing::warn!(
+                            symbol = %req.asset.symbol,
+                            limit_price = limit_price,
+                            status = %ack.status,
+                            error = %reason,
+                            "Hyperliquid rejected initial WORKING ALO order"
+                        );
+                        self.record_hl_reject_and_maybe_cooldown(
+                            req.asset.id,
+                            &req.asset.symbol,
+                            &reason,
+                            &ccfg,
+                        );
+                        return Err(AegisError::Execution(format!(
+                            "Hyperliquid rejected WORKING ALO order on {}: {reason}",
+                            req.asset.symbol
+                        )));
+                    }
+                    exchange_oid = ack.exchange_order_id.clone();
+                    if ack.status == "FILLED" && ack.filled_quantity > 0.0 {
+                        live_filled_immediately =
+                            Some((ack.avg_fill_price, ack.filled_quantity, ack.fee_usdc));
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         symbol = %req.asset.symbol,
                         limit_price = limit_price,
+                        expected_cloid = %expected_cloid,
                         error = %err,
-                        "Hyperliquid WORKING ALO submit_order_wire failed"
+                        "Hyperliquid WORKING ALO submit_order_wire failed; probing cloid status (R14-M1)"
                     );
-                    return Err(err);
+                    match self.probe_uncertain_working_submit_by_cloid(
+                        req,
+                        &expected_cloid,
+                        qty,
+                        ccfg.maker_fee_bps,
+                        &cfg,
+                    ) {
+                        UncertainSubmitProbe::Resting { eoid } => {
+                            exchange_oid = eoid;
+                        }
+                        UncertainSubmitProbe::Filled {
+                            eoid,
+                            fill_px,
+                            fill_qty,
+                            est_fee,
+                        } => {
+                            exchange_oid = eoid;
+                            live_filled_immediately = Some((fill_px, fill_qty, est_fee));
+                        }
+                        UncertainSubmitProbe::ConfirmedAbsent => return Err(err),
+                        UncertainSubmitProbe::ProbeUnreachable => {
+                            let detail = format!(
+                                "CHURN_GUARD: Uncertain WORKING ALO submit on {} (cloid={}); probe unreachable, pausing 60s",
+                                req.asset.symbol, expected_cloid
+                            );
+                            let _ = self.db.insert_asset_cooldown(
+                                req.asset.id,
+                                "CHURN_GUARD",
+                                &detail,
+                                60,
+                            );
+                            let _ = self.db.log_telemetry(
+                                "WARN",
+                                "execution.order_chaser",
+                                &detail,
+                                None,
+                            );
+                            return Err(err);
+                        }
+                    }
                 }
-            };
-            if !ack.accepted {
-                let reason = ack.raw_error.unwrap_or_else(|| "REJECTED".to_string());
-                tracing::warn!(
-                    symbol = %req.asset.symbol,
-                    limit_price = limit_price,
-                    status = %ack.status,
-                    error = %reason,
-                    "Hyperliquid rejected initial WORKING ALO order"
-                );
-                return Err(AegisError::Execution(format!(
-                    "Hyperliquid rejected WORKING ALO order on {}: {reason}",
-                    req.asset.symbol
-                )));
-            }
-            exchange_oid = ack.exchange_order_id.clone();
-            if ack.status == "FILLED" && ack.filled_quantity > 0.0 {
-                live_filled_immediately =
-                    Some((ack.avg_fill_price, ack.filled_quantity, ack.fee_usdc));
             }
         }
-
-        let stop_px = if req.protective_stop_px > 0.0 {
-            snap_to_tick(req.protective_stop_px, tick)
-        } else if req.side.is_buy() {
-            snap_to_tick(limit_price * (1.0 - default_stop_pct), tick)
-        } else {
-            snap_to_tick(limit_price * (1.0 + default_stop_pct), tick)
-        };
 
         let reserved_usdc = if req.reserved_margin_usdc > 0.0 {
             round_dp(req.reserved_margin_usdc, 4)
@@ -471,51 +775,66 @@ impl OrderChaser {
             round_dp(limit_price * qty, 4)
         };
 
-        let pos_id = self.db.create_working_order(&WorkingOrderInput {
-            asset_id: req.asset.id,
-            client_order_id: coid.clone(),
-            side: req.side,
-            limit_price,
-            requested_quantity: qty,
-            reserved_margin_usdc: reserved_usdc,
-            portfolio_weight: req.portfolio_weight,
-            s1_weight_contrib: req.s1_weight_contrib,
-            s2_weight_contrib: req.s2_weight_contrib,
-            s3_weight_contrib: req.s3_weight_contrib,
-            protective_stop_px: stop_px,
-            exchange_order_id: exchange_oid.clone(),
-            reason: req.reason.clone(),
-        })?;
-
-        let _ = self.db.record_position_entry_timestamp_ms(now_ms());
-        let _ = self.db.set_asset_priority_watch(req.asset.id, true);
-
-        if let Ok(snap) = self.db.get_latest_portfolio_snapshot() {
-            let dist_bps = if ref_mid > 0.0 {
-                round_dp(((ref_mid - limit_price) / ref_mid) * 10_000.0, 2)
-            } else {
-                0.0
-            };
-            let alert = WorkingOrderPlacedAlert {
-                symbol: req.asset.symbol.clone(),
+        let pos_id = {
+            let _guard = acquire_execution_lock();
+            let pos_id = self.db.create_working_order(&WorkingOrderInput {
+                asset_id: req.asset.id,
+                client_order_id: coid.clone(),
                 side: req.side,
-                risk_tier: cfg.risk_tier(),
-                leverage_multiplier: Some(cfg.target_leverage_multiplier()),
-                fsm_state: OrderFsmState::WorkingAlo.as_str().to_string(),
                 limit_price,
-                requested_qty: qty,
+                requested_quantity: qty,
                 reserved_margin_usdc: reserved_usdc,
-                available_cash_usdc: (snap.available_cash_usdc - reserved_usdc).max(0.0),
-                distance_from_mid_bps: dist_bps,
-                s1_weight: req.s1_weight_contrib,
-                s2_weight: req.s2_weight_contrib,
-                s3_weight: req.s3_weight_contrib,
-                timestamp_ms: now_ms(),
-            };
-            let _ = self.alerts.notify_working_order_placed(&alert);
-        }
+                portfolio_weight: req.portfolio_weight,
+                s1_weight_contrib: req.s1_weight_contrib,
+                s2_weight_contrib: req.s2_weight_contrib,
+                s3_weight_contrib: req.s3_weight_contrib,
+                protective_stop_px: stop_px,
+                take_profit_px: Some(tp_px),
+                exchange_order_id: exchange_oid.clone(),
+                reason: req.reason.clone(),
+            })?;
 
-        // If the exchange filled the order immediately upon placement, promote it WORKING -> OPEN now
+            self.working_initial_limits
+                .lock()
+                .insert(pos_id, limit_price);
+            let _ = self.db.record_position_entry_timestamp_ms(now_ms());
+            let _ = self.db.set_asset_priority_watch(req.asset.id, true);
+
+            if let Ok(snap) = self.db.get_latest_portfolio_snapshot() {
+                let dist_bps = if ref_mid > 0.0 {
+                    round_dp(((ref_mid - limit_price) / ref_mid) * 10_000.0, 2)
+                } else {
+                    0.0
+                };
+                let alert = WorkingOrderPlacedAlert {
+                    symbol: req.asset.symbol.clone(),
+                    side: req.side,
+                    risk_tier: cfg.risk_tier(),
+                    leverage_multiplier: Some(cfg.target_leverage_multiplier()),
+                    fsm_state: OrderFsmState::WorkingAlo.as_str().to_string(),
+                    limit_price,
+                    requested_qty: qty,
+                    reserved_margin_usdc: reserved_usdc,
+                    available_cash_usdc: (snap.available_cash_usdc - reserved_usdc).max(0.0),
+                    distance_from_mid_bps: dist_bps,
+                    s1_weight: req.s1_weight_contrib,
+                    s2_weight: req.s2_weight_contrib,
+                    s3_weight: req.s3_weight_contrib,
+                    timestamp_ms: now_ms(),
+                };
+                let html = format_working_order_placed_html(&alert);
+                let payload = serde_json::to_value(&alert).ok();
+                let _ = self.alerts.enqueue_html_alert(
+                    "WORKING_ORDER_RESERVED",
+                    "INFO",
+                    &html,
+                    payload.as_ref(),
+                );
+                self.wake_alert_worker();
+            }
+            pos_id
+        };
+
         if let Some((fill_px, fill_qty, fee_usdc)) = live_filled_immediately {
             self.finalize_fill_to_open(
                 pos_id,
@@ -524,7 +843,6 @@ impl OrderChaser {
                 fill_px,
                 fill_qty,
                 fee_usdc,
-                stop_px,
                 exchange_oid.as_deref(),
                 "HL_IMMEDIATE_FILL_ON_SUBMIT",
                 &cfg,
@@ -534,29 +852,123 @@ impl OrderChaser {
         Ok(pos_id)
     }
 
+    fn probe_uncertain_working_submit_by_cloid(
+        &self,
+        req: &NewWorkingOrderRequest,
+        expected_cloid: &str,
+        requested_qty: f64,
+        maker_fee_bps: f64,
+        cfg: &ConfigMap,
+    ) -> UncertainSubmitProbe {
+        let wallet = cfg.get_str("wallet_address", "");
+        if wallet.trim().is_empty() {
+            return UncertainSubmitProbe::ProbeUnreachable;
+        }
+        match self
+            .http
+            .fetch_order_status_by_cloid(&wallet, expected_cloid, cfg)
+        {
+            Ok(Some(st)) => {
+                let st_lower = st.status.trim().to_ascii_lowercase();
+                let eoid = (st.oid > 0).then(|| format!("hl-{}", st.oid));
+                if st_lower == "filled"
+                    || (st.filled_sz > 1e-9
+                        && core_is_entry_fill_complete(
+                            st.filled_sz,
+                            requested_qty,
+                            req.asset.lot_step_size,
+                            req.asset.sz_decimals,
+                        ))
+                {
+                    let fill_qty = if st.filled_sz > 1e-9 {
+                        st.filled_sz
+                    } else {
+                        requested_qty
+                    };
+                    let fill_px = if st.avg_px > 0.0 {
+                        st.avg_px
+                    } else {
+                        st.limit_px
+                    };
+                    let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+                    return UncertainSubmitProbe::Filled {
+                        eoid,
+                        fill_px,
+                        fill_qty,
+                        est_fee,
+                    };
+                }
+                if matches!(
+                    st_lower.as_str(),
+                    "open" | "resting" | "triggered" | "waitingfortrigger" | "waitingforfill"
+                ) {
+                    return UncertainSubmitProbe::Resting { eoid };
+                }
+                UncertainSubmitProbe::ConfirmedAbsent
+            }
+            Ok(None) => {
+                if let Ok(front) = self.http.fetch_frontend_open_orders(&wallet, cfg) {
+                    for ord in &front {
+                        if ord
+                            .get("cloid")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| c.trim().eq_ignore_ascii_case(expected_cloid))
+                        {
+                            let eoid = extract_order_oid(ord).map(|o| format!("hl-{o}"));
+                            return UncertainSubmitProbe::Resting { eoid };
+                        }
+                    }
+                }
+                if let Ok(Some((fill_px, fill_qty))) =
+                    self.query_exchange_position_state(&req.asset, req.side, cfg)
+                {
+                    let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+                    return UncertainSubmitProbe::Filled {
+                        eoid: None,
+                        fill_px,
+                        fill_qty,
+                        est_fee,
+                    };
+                }
+                UncertainSubmitProbe::ConfirmedAbsent
+            }
+            Err(_) => UncertainSubmitProbe::ProbeUnreachable,
+        }
+    }
+
     /// Advances a single `WORKING` order from `v_assets_ordered` during the 1-second surveillance loop.
     pub fn advance_working_order(&self, ordered: &OrderedAssetView) -> Result<ChaseStepOutcome> {
-        let cfg = self.db.load_config()?;
-        let max_chases = cfg.get_usize("max_alo_chase_ticks", 5).max(1) as u32;
-        let chase_threshold_bps = cfg.get_f64("alo_chase_threshold_bps", 4.0).max(0.5);
-        let maker_fee_bps = cfg.get_f64("maker_fee_bps", 1.5);
-        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-        let default_stop_pct = cfg
-            .get_f64("protective_stop_default_pct", 0.04)
-            .clamp(0.005, 0.25);
+        self.advance_working_order_with_ch_state(ordered, None)
+    }
 
-        let asset = self
-            .db
-            .get_asset_by_id(ordered.asset_id)?
-            .ok_or_else(|| AegisError::Database(format!("Asset {} not found", ordered.asset_id)))?;
-        let pos = self
-            .db
-            .get_position_by_id(ordered.position_id)?
-            .ok_or_else(|| {
-                AegisError::Database(format!("Position {} not found", ordered.position_id))
+    /// Advances a single `WORKING` order using an optional pre-fetched `clearinghouseState` snapshot
+    /// shared across the 1s `PriorityMonitor` tick (`R14-H4`, `R14-H2`).
+    pub fn advance_working_order_with_ch_state(
+        &self,
+        ordered: &OrderedAssetView,
+        pre_fetched_ch_state: Option<&Value>,
+    ) -> Result<ChaseStepOutcome> {
+        let (cfg, ccfg, asset, pos, is_live_exchange) = {
+            let _guard = acquire_execution_lock();
+            let cfg = self.db.load_config()?;
+            let ccfg = ChaserConfig::from_config(&cfg);
+            let asset = self.db.get_asset_by_id(ordered.asset_id)?.ok_or_else(|| {
+                AegisError::Database(format!("Asset {} not found", ordered.asset_id))
             })?;
+            let pos = self
+                .db
+                .get_position_by_id(ordered.position_id)?
+                .ok_or_else(|| {
+                    AegisError::Database(format!("Position {} not found", ordered.position_id))
+                })?;
+            let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
+            (cfg, ccfg, asset, pos, is_live_exchange)
+        };
 
         if pos.status != "WORKING" {
+            self.working_initial_limits
+                .lock()
+                .remove(&ordered.position_id);
             return Ok(ChaseStepOutcome::Resting {
                 position_id: ordered.position_id,
                 symbol: ordered.symbol.clone(),
@@ -566,7 +978,6 @@ impl OrderChaser {
         }
 
         let side = OrderSide::parse(&ordered.side)?;
-        let tick = asset.tick_size.max(1e-8);
         let live_mid = if asset.mid_price > 0.0 {
             asset.mid_price
         } else if ordered.mid_price > 0.0 {
@@ -576,8 +987,9 @@ impl OrderChaser {
         } else {
             ordered.limit_price
         };
+        let eff_tick = effective_hl_tick_size(live_mid, asset.tick_size, asset.sz_decimals)
+            .unwrap_or_else(|| asset.tick_size.max(1e-8));
 
-        let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
         if is_live_exchange && cfg.get_str("private_key", "").trim().is_empty() {
             tracing::error!(
                 position_id = ordered.position_id,
@@ -592,70 +1004,34 @@ impl OrderChaser {
             });
         }
 
-        // Only use simulated price_touched / paper IOC promotion in PAPER mode or isolated unit tests!
-        // In live Testnet/Mainnet mode, orders are only promoted WORKING -> OPEN when Hyperliquid confirms a fill.
         if !is_live_exchange {
-            let price_touched = match side {
-                OrderSide::Long => live_mid <= ordered.limit_price * 1.0005,
-                OrderSide::Short => live_mid >= ordered.limit_price * 0.9995,
-            };
-            let is_crossing_ioc = ordered.fsm_state == OrderFsmState::CrossingIoc.as_str();
-
-            if price_touched || is_crossing_ioc {
-                let fill_price = if is_crossing_ioc {
-                    snap_to_tick(live_mid, tick)
-                } else {
-                    ordered.limit_price
-                };
-                let fee_bps = if is_crossing_ioc {
-                    taker_fee_bps
-                } else {
-                    maker_fee_bps
-                };
-                let filled_qty = ordered.requested_quantity;
-                let fees_paid_usdc = round_dp(fill_price * filled_qty * (fee_bps / 10_000.0), 4);
-                let stop_px = if pos.protective_stop_px > 0.0 {
-                    pos.protective_stop_px
-                } else if side.is_buy() {
-                    snap_to_tick(fill_price * (1.0 - default_stop_pct), tick)
-                } else {
-                    snap_to_tick(fill_price * (1.0 + default_stop_pct), tick)
-                };
-                let reason = if is_crossing_ioc {
-                    "IOC_CROSSING_FILL_CONFIRMED"
-                } else {
-                    "ALO_MAKER_FILL_CONFIRMED"
-                };
-
-                let committed_usdc = self.finalize_fill_to_open(
-                    ordered.position_id,
-                    &asset,
-                    side,
-                    fill_price,
-                    filled_qty,
-                    fees_paid_usdc,
-                    stop_px,
-                    ordered.exchange_order_id.as_deref(),
-                    reason,
-                    &cfg,
-                )?;
-
-                return Ok(ChaseStepOutcome::FilledOpen {
-                    position_id: ordered.position_id,
-                    asset_id: ordered.asset_id,
-                    symbol: ordered.symbol.clone(),
-                    side: side.as_str().to_string(),
-                    fill_price,
-                    filled_quantity: filled_qty,
-                    committed_notional_usdc: committed_usdc,
-                    protective_stop_px: stop_px,
-                    fees_paid_usdc,
-                });
+            if let Some(outcome) = self.advance_paper_working_order(
+                ordered, &asset, side, live_mid, eff_tick, &ccfg, &cfg,
+            )? {
+                return Ok(outcome);
             }
         }
 
-        let one_tick_bps = compute_one_tick_bps(tick, live_mid);
-        let effective_chase_threshold_bps = chase_threshold_bps.max(one_tick_bps * 1.5);
+        // Fail-closed tick calculation (`R14-M8`): never chase on invalid tick/mid.
+        let Some(one_tick_bps) = compute_one_tick_bps_opt(eff_tick, live_mid) else {
+            tracing::warn!(
+                position_id = ordered.position_id,
+                symbol = %ordered.symbol,
+                tick = eff_tick,
+                live_mid = live_mid,
+                "Invalid tick or mid price for WORKING order; keeping Resting fail-closed"
+            );
+            return Ok(ChaseStepOutcome::Resting {
+                position_id: ordered.position_id,
+                symbol: ordered.symbol.clone(),
+                limit_price: ordered.limit_price,
+                distance_from_mid_bps: ordered.distance_from_mid_bps,
+            });
+        };
+
+        let effective_chase_threshold_bps = ccfg
+            .chase_threshold_bps
+            .max(one_tick_bps * ALO_ONE_TICK_THRESHOLD_MULT);
         let abs_dist_bps = if live_mid > 0.0 {
             ((live_mid - ordered.limit_price).abs() / live_mid) * 10_000.0
         } else {
@@ -665,343 +1041,61 @@ impl OrderChaser {
         let missing_exchange_order =
             is_live_exchange && ordered.exchange_order_id.as_deref() == Some("");
 
-        // Check for immediate exchange fills while resting (< effective_chase_threshold_bps) and inside the 45s
-        // grace window: promote >= 85% (or within 1 lot step) fills cleanly, while holding smaller partial
-        // fills in WORKING so the remaining resting ALO order can finish filling.
         if is_live_exchange
-            && ordered.chase_count < max_chases
+            && ordered.chase_count < ccfg.max_chases
             && abs_dist_bps < effective_chase_threshold_bps
             && !is_expired
         {
             if let Some(outcome) = self.try_finalize_existing_exchange_fill(
                 ordered,
-                pos.protective_stop_px,
                 &asset,
                 side,
-                default_stop_pct,
-                maker_fee_bps,
-                tick,
+                &ccfg,
+                pre_fetched_ch_state,
                 &cfg,
             )? {
                 return Ok(outcome);
             }
         }
 
-        // Upon expiry (>= 45_000 ms), pull any remaining resting entry order and finalize any non-zero
-        // partial fill cleanly to OPEN with SL/TP attached (or cancel if unfilled).
         if is_live_exchange && is_expired {
             return self.handle_expired_working_order(
                 ordered,
-                pos.protective_stop_px,
                 &asset,
                 side,
-                default_stop_pct,
-                maker_fee_bps,
-                tick,
+                &ccfg,
+                pre_fetched_ch_state,
                 &cfg,
             );
         }
 
-        // Escalate to IOC crossing after reaching max_chases
-        if ordered.chase_count >= max_chases {
-            let ioc_price = if is_live_exchange {
-                let band_lo = (live_mid * (1.0 - HL_ORACLE_BAND_PCT)).max(tick);
-                let band_hi = live_mid * (1.0 + HL_ORACLE_BAND_PCT);
-                let raw = if side.is_buy() {
-                    live_mid * 1.02
-                } else {
-                    (live_mid * 0.98).max(tick)
-                };
-                snap_to_tick(raw.clamp(band_lo, band_hi), tick)
-            } else {
-                snap_to_tick(live_mid, tick)
-            };
-
-            if is_live_exchange {
-                let pk = cfg.get_str("private_key", "");
-                if matches!(
-                    self.cancel_working_entry_oid(ordered, &asset, &cfg),
-                    CancelEntryOutcome::Aborted
-                ) {
-                    return Ok(ChaseStepOutcome::Resting {
-                        position_id: ordered.position_id,
-                        symbol: ordered.symbol.clone(),
-                        limit_price: ordered.limit_price,
-                        distance_from_mid_bps: ordered.distance_from_mid_bps,
-                    });
-                }
-
-                let live_pos_opt = match self.query_exchange_position_state(&asset, side, &cfg) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            symbol = %ordered.symbol,
-                            error = %e,
-                            "clearinghouseState unreachable before CROSSING_IOC escalation; keeping WORKING"
-                        );
-                        return Ok(ChaseStepOutcome::Resting {
-                            position_id: ordered.position_id,
-                            symbol: ordered.symbol.clone(),
-                            limit_price: ordered.limit_price,
-                            distance_from_mid_bps: ordered.distance_from_mid_bps,
-                        });
-                    }
-                };
-                let (live_fill_px, live_qty) = live_pos_opt.unwrap_or((live_mid, 0.0));
-                let rem_qty = remaining_entry_qty(ordered.requested_quantity, live_qty, &asset);
-                if is_entry_fill_complete(ordered.requested_quantity, live_qty, &asset) {
-                    return self.finalize_known_fill_outcome(
-                        ordered,
-                        pos.protective_stop_px,
-                        &asset,
-                        side,
-                        live_fill_px,
-                        live_qty,
-                        round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                        default_stop_pct,
-                        tick,
-                        "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
-                        &cfg,
-                    );
-                }
-                if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
-                    self.db
-                        .cancel_working_order(ordered.position_id, "HL_IOC_ZERO_REM_CANCELLED")?;
-                    return Ok(ChaseStepOutcome::Cancelled {
-                        position_id: ordered.position_id,
-                        symbol: ordered.symbol.clone(),
-                        reason: "HL_IOC_ZERO_REM_CANCELLED".to_string(),
-                    });
-                }
-
-                let wire = build_limit_order_wire(
-                    asset.asset_index,
-                    side.is_buy(),
-                    ioc_price,
-                    rem_qty,
-                    tick,
-                    asset.lot_step_size,
-                    asset.sz_decimals,
-                    false,
-                    "Ioc",
-                    Some(&format!("{}-ioc", ordered.client_order_id)),
-                );
-                match self.http.submit_order_wire(
-                    wire,
-                    rem_qty,
-                    ioc_price,
-                    taker_fee_bps,
-                    &pk,
-                    Some(&self.db),
-                    &cfg,
-                ) {
-                    Ok(ack)
-                        if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 =>
-                    {
-                        let ioc_eoid = ack.exchange_order_id.or(ordered.exchange_order_id.clone());
-                        let total_qty = live_qty + ack.filled_quantity;
-                        let blended_px = if total_qty > 1e-9 {
-                            (live_fill_px * live_qty + ack.avg_fill_price * ack.filled_quantity)
-                                / total_qty
-                        } else {
-                            ack.avg_fill_price
-                        };
-                        let prior_fee = if live_qty > 1e-9 {
-                            round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4)
-                        } else {
-                            0.0
-                        };
-                        let total_fee = round_dp(prior_fee + ack.fee_usdc, 4);
-                        let _ = self.db.record_working_order_chase(
-                            ordered.position_id,
-                            blended_px,
-                            OrderFsmState::CrossingIoc.as_str(),
-                            ioc_eoid.as_deref(),
-                            &format!(
-                                "Escalated to CROSSING_IOC after {} ALO chases (filled {:.4} @ ${:.6})",
-                                ordered.chase_count, total_qty, blended_px
-                            ),
-                        )?;
-                        let stop_px = if pos.protective_stop_px > 0.0 {
-                            pos.protective_stop_px
-                        } else if side.is_buy() {
-                            snap_to_tick(blended_px * (1.0 - default_stop_pct), tick)
-                        } else {
-                            snap_to_tick(blended_px * (1.0 + default_stop_pct), tick)
-                        };
-                        let committed_usdc = self.finalize_fill_to_open(
-                            ordered.position_id,
-                            &asset,
-                            side,
-                            blended_px,
-                            total_qty,
-                            total_fee,
-                            stop_px,
-                            ioc_eoid.as_deref(),
-                            "HL_IOC_ESCALATION_FILLED",
-                            &cfg,
-                        )?;
-                        return Ok(ChaseStepOutcome::FilledOpen {
-                            position_id: ordered.position_id,
-                            asset_id: ordered.asset_id,
-                            symbol: ordered.symbol.clone(),
-                            side: side.as_str().to_string(),
-                            fill_price: blended_px,
-                            filled_quantity: total_qty,
-                            committed_notional_usdc: committed_usdc,
-                            protective_stop_px: stop_px,
-                            fees_paid_usdc: total_fee,
-                        });
-                    }
-                    Ok(ack) => {
-                        tracing::warn!(
-                            symbol = %ordered.symbol,
-                            position_id = ordered.position_id,
-                            chase_count = ordered.chase_count,
-                            limit_price = ioc_price,
-                            accepted = ack.accepted,
-                            status = %ack.status,
-                            error = ?ack.raw_error,
-                            "Hyperliquid CROSSING_IOC order rejected or unfilled"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            symbol = %ordered.symbol,
-                            position_id = ordered.position_id,
-                            chase_count = ordered.chase_count,
-                            limit_price = ioc_price,
-                            error = %e,
-                            "Hyperliquid CROSSING_IOC submit_order_wire failed"
-                        );
-                    }
-                }
-                // Re-query clearinghouseState after IOC timeout/non-fill before marking CANCELLED
-                match self.query_exchange_position_state(&asset, side, &cfg) {
-                    Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
-                        let est_fee = if post_qty <= live_qty + 1e-9 {
-                            round_dp(post_px * post_qty * (maker_fee_bps / 10_000.0), 4)
-                        } else {
-                            round_dp(post_px * post_qty * (taker_fee_bps / 10_000.0), 4)
-                        };
-                        return self.finalize_known_fill_outcome(
-                            ordered,
-                            pos.protective_stop_px,
-                            &asset,
-                            side,
-                            post_px,
-                            post_qty,
-                            est_fee,
-                            default_stop_pct,
-                            tick,
-                            "HL_IOC_FILL_CONFIRMED_ON_STATE",
-                            &cfg,
-                        );
-                    }
-                    Err(e) => {
-                        if live_qty > 1e-9 {
-                            return self.finalize_known_fill_outcome(
-                                ordered,
-                                pos.protective_stop_px,
-                                &asset,
-                                side,
-                                live_fill_px,
-                                live_qty,
-                                round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                                default_stop_pct,
-                                tick,
-                                "HL_ALO_PARTIAL_FILL_ON_EXCHANGE",
-                                &cfg,
-                            );
-                        }
-                        tracing::warn!(
-                            symbol = %ordered.symbol,
-                            error = %e,
-                            "clearinghouseState unreachable after IOC submit; deferring cancel"
-                        );
-                        return Ok(ChaseStepOutcome::Resting {
-                            position_id: ordered.position_id,
-                            symbol: ordered.symbol.clone(),
-                            limit_price: ordered.limit_price,
-                            distance_from_mid_bps: ordered.distance_from_mid_bps,
-                        });
-                    }
-                    Ok(_) => {}
-                }
-                // Live IOC did not fill on Hyperliquid -> cancel the WORKING order so no phantom order remains
-                self.db
-                    .cancel_working_order(ordered.position_id, "HL_IOC_UNFILLED_CANCELLED")?;
-                return Ok(ChaseStepOutcome::Cancelled {
-                    position_id: ordered.position_id,
-                    symbol: ordered.symbol.clone(),
-                    reason: "HL_IOC_UNFILLED_CANCELLED".to_string(),
-                });
-            }
-
-            let ioc_eoid = ordered.exchange_order_id.clone();
-            let _ = self.db.record_working_order_chase(
-                ordered.position_id,
-                ioc_price,
-                OrderFsmState::CrossingIoc.as_str(),
-                ioc_eoid.as_deref(),
-                &format!(
-                    "Escalated to CROSSING_IOC after {} ALO chases (drift {:.2} bps)",
-                    ordered.chase_count, abs_dist_bps
-                ),
-            )?;
-
-            let filled_qty = ordered.requested_quantity;
-            let fees_paid_usdc = round_dp(ioc_price * filled_qty * (taker_fee_bps / 10_000.0), 4);
-            let stop_px = if pos.protective_stop_px > 0.0 {
-                pos.protective_stop_px
-            } else if side.is_buy() {
-                snap_to_tick(ioc_price * (1.0 - default_stop_pct), tick)
-            } else {
-                snap_to_tick(ioc_price * (1.0 + default_stop_pct), tick)
-            };
-
-            let committed_usdc = self.finalize_fill_to_open(
-                ordered.position_id,
-                &asset,
-                side,
-                ioc_price,
-                filled_qty,
-                fees_paid_usdc,
-                stop_px,
-                ioc_eoid.as_deref(),
-                "IOC_ESCALATION_FILLED",
-                &cfg,
-            )?;
-
-            return Ok(ChaseStepOutcome::FilledOpen {
-                position_id: ordered.position_id,
-                asset_id: ordered.asset_id,
-                symbol: ordered.symbol.clone(),
-                side: side.as_str().to_string(),
-                fill_price: ioc_price,
-                filled_quantity: filled_qty,
-                committed_notional_usdc: committed_usdc,
-                protective_stop_px: stop_px,
-                fees_paid_usdc,
-            });
-        }
-
-        // Perform a 1s top-of-book ALO chase step if mid drifted >= effective_chase_threshold_bps
-        // (or if a prior rejected chase left no resting order on the exchange).
-        if abs_dist_bps >= effective_chase_threshold_bps || missing_exchange_order {
-            return self.chase_working_order(
+        if ordered.chase_count >= ccfg.max_chases {
+            return self.escalate_working_to_crossing_ioc(
                 ordered,
-                pos.protective_stop_px,
                 &asset,
                 side,
                 live_mid,
                 abs_dist_bps,
-                max_chases,
-                maker_fee_bps,
-                default_stop_pct,
-                tick,
+                eff_tick,
+                is_live_exchange,
+                &ccfg,
+                pre_fetched_ch_state,
+                &cfg,
+            );
+        }
+
+        if abs_dist_bps >= effective_chase_threshold_bps || missing_exchange_order {
+            return self.chase_working_order(
+                ordered,
+                &asset,
+                side,
+                live_mid,
+                abs_dist_bps,
+                eff_tick,
                 is_live_exchange,
                 missing_exchange_order,
+                &ccfg,
+                pre_fetched_ch_state,
                 &cfg,
             );
         }
@@ -1015,20 +1109,139 @@ impl OrderChaser {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn chase_working_order(
+    fn advance_paper_working_order(
         &self,
         ordered: &OrderedAssetView,
-        existing_stop_px: f64,
         asset: &ExchangeAsset,
         side: OrderSide,
         live_mid: f64,
-        abs_dist_bps: f64,
-        max_chases: u32,
-        maker_fee_bps: f64,
-        default_stop_pct: f64,
-        tick: f64,
+        eff_tick: f64,
+        ccfg: &ChaserConfig,
+        cfg: &ConfigMap,
+    ) -> Result<Option<ChaseStepOutcome>> {
+        let price_touched = match side {
+            OrderSide::Long => live_mid <= ordered.limit_price * 1.0005,
+            OrderSide::Short => live_mid >= ordered.limit_price * 0.9995,
+        };
+        let is_crossing_ioc = ordered.fsm_state == OrderFsmState::CrossingIoc.as_str();
+        if !price_touched && !is_crossing_ioc {
+            return Ok(None);
+        }
+
+        let fill_price = if is_crossing_ioc {
+            snap_to_tick(live_mid, eff_tick)
+        } else {
+            ordered.limit_price
+        };
+        let fee_bps = if is_crossing_ioc {
+            ccfg.taker_fee_bps
+        } else {
+            ccfg.maker_fee_bps
+        };
+        let filled_qty = ordered.requested_quantity;
+        let fees_paid_usdc = round_dp(fill_price * filled_qty * (fee_bps / 10_000.0), 4);
+        let reason = if is_crossing_ioc {
+            "IOC_CROSSING_FILL_CONFIRMED"
+        } else {
+            "ALO_MAKER_FILL_CONFIRMED"
+        };
+
+        let (committed_usdc, stop_px) = self.finalize_fill_to_open(
+            ordered.position_id,
+            asset,
+            side,
+            fill_price,
+            filled_qty,
+            fees_paid_usdc,
+            ordered.exchange_order_id.as_deref(),
+            reason,
+            cfg,
+        )?;
+
+        Ok(Some(ChaseStepOutcome::FilledOpen {
+            position_id: ordered.position_id,
+            asset_id: ordered.asset_id,
+            symbol: ordered.symbol.clone(),
+            side: side.as_str().to_string(),
+            fill_price,
+            filled_quantity: filled_qty,
+            committed_notional_usdc: committed_usdc,
+            protective_stop_px: stop_px,
+            fees_paid_usdc,
+        }))
+    }
+
+    fn evaluate_working_drift_and_spread_abort(
+        &self,
+        ordered: &OrderedAssetView,
+        asset: &ExchangeAsset,
+        candidate_px: f64,
+        initial_limit_px: f64,
+        l2_bbo: Option<(f64, f64)>,
+        ccfg: &ChaserConfig,
+    ) -> Option<String> {
+        if initial_limit_px.is_finite() && initial_limit_px > 0.0 && candidate_px.is_finite() {
+            let drift_bps = ((candidate_px - initial_limit_px).abs() / initial_limit_px) * 10_000.0;
+            if drift_bps > ccfg.max_alo_chase_drift_bps {
+                tracing::warn!(
+                    position_id = ordered.position_id,
+                    symbol = %ordered.symbol,
+                    initial_limit_px,
+                    candidate_px,
+                    drift_bps,
+                    max_drift_bps = ccfg.max_alo_chase_drift_bps,
+                    "Aborting WORKING chase: cumulative drift exceeded max_alo_chase_drift_bps"
+                );
+                return Some("HL_ALO_CHASE_DRIFT_ABORT".to_string());
+            }
+        }
+        if asset.oracle_price.is_finite() && asset.oracle_price > 0.0 && candidate_px.is_finite() {
+            let oracle_drift_bps =
+                ((candidate_px - asset.oracle_price).abs() / asset.oracle_price) * 10_000.0;
+            if oracle_drift_bps > ccfg.max_alo_oracle_drift_bps {
+                tracing::warn!(
+                    position_id = ordered.position_id,
+                    symbol = %ordered.symbol,
+                    oracle_price = asset.oracle_price,
+                    candidate_px,
+                    oracle_drift_bps,
+                    max_oracle_drift_bps = ccfg.max_alo_oracle_drift_bps,
+                    "Aborting WORKING chase: oracle drift exceeded max_alo_oracle_drift_bps"
+                );
+                return Some("HL_ALO_ORACLE_DRIFT_ABORT".to_string());
+            }
+        }
+        if let Some((bid, ask)) =
+            l2_bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        {
+            let mid_bbo = (bid + ask) * 0.5;
+            if mid_bbo > 0.0 {
+                let spread_bps = ((ask - bid) / mid_bbo) * 10_000.0;
+                if spread_bps > ccfg.max_entry_spread_bps {
+                    tracing::warn!(
+                        position_id = ordered.position_id,
+                        symbol = %ordered.symbol,
+                        spread_bps,
+                        max_entry_spread_bps = ccfg.max_entry_spread_bps,
+                        "Aborting WORKING chase: live L2 spread exceeded max_entry_spread_bps"
+                    );
+                    return Some("HL_ALO_SPREAD_ABORT".to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn abort_working_order_with_cooldown(
+        &self,
+        ordered: &OrderedAssetView,
+        asset: &ExchangeAsset,
+        side: OrderSide,
         is_live_exchange: bool,
-        missing_exchange_order: bool,
+        maker_fee_bps: f64,
+        abort_reason: &str,
+        cooldown_sec: i64,
         cfg: &ConfigMap,
     ) -> Result<ChaseStepOutcome> {
         let resting_outcome = || ChaseStepOutcome::Resting {
@@ -1037,6 +1250,79 @@ impl OrderChaser {
             limit_price: ordered.limit_price,
             distance_from_mid_bps: ordered.distance_from_mid_bps,
         };
+
+        if is_live_exchange {
+            if matches!(
+                self.cancel_working_entry_oid(ordered, asset, cfg),
+                CancelEntryOutcome::Aborted
+            ) {
+                return Ok(resting_outcome());
+            }
+            match self.query_exchange_position_state(asset, side, cfg) {
+                Ok(Some((fill_px, fill_qty))) if fill_qty > 1e-9 => {
+                    let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+                    return self.finalize_known_fill_outcome(
+                        ordered,
+                        asset,
+                        side,
+                        fill_px,
+                        fill_qty,
+                        est_fee,
+                        "HL_ALO_ABORT_RESCUED_FILL_OPEN",
+                        cfg,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        position_id = ordered.position_id,
+                        symbol = %ordered.symbol,
+                        error = %e,
+                        "clearinghouseState unreachable after chase abort cancel; deferring cancel"
+                    );
+                    return Ok(resting_outcome());
+                }
+                Ok(_) => {}
+            }
+        }
+
+        {
+            let _guard = acquire_execution_lock();
+            self.db
+                .cancel_working_order(ordered.position_id, abort_reason)?;
+            self.working_initial_limits
+                .lock()
+                .remove(&ordered.position_id);
+            let cd_msg = format!("CHURN_GUARD: {} aborted ({abort_reason})", ordered.symbol);
+            let _ = self.db.insert_asset_cooldown(
+                ordered.asset_id,
+                "CHURN_GUARD",
+                &cd_msg,
+                cooldown_sec,
+            );
+        }
+        Ok(ChaseStepOutcome::Cancelled {
+            position_id: ordered.position_id,
+            symbol: ordered.symbol.clone(),
+            reason: abort_reason.to_string(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn escalate_working_to_crossing_ioc(
+        &self,
+        ordered: &OrderedAssetView,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        live_mid: f64,
+        abs_dist_bps: f64,
+        eff_tick: f64,
+        is_live_exchange: bool,
+        ccfg: &ChaserConfig,
+        pre_fetched_ch_state: Option<&Value>,
+        cfg: &ConfigMap,
+    ) -> Result<ChaseStepOutcome> {
+        let initial_limit_px =
+            self.resolve_initial_limit_price(ordered.position_id, ordered.limit_price);
 
         let l2_bbo = if is_live_exchange {
             self.http
@@ -1047,11 +1333,415 @@ impl OrderChaser {
         } else {
             None
         };
-        let new_limit_price = clamp_chase_alo_price(side, live_mid, l2_bbo, tick);
 
-        // Preserve queue priority & avoid burn/self-cancels when clamped limit price did not move.
-        if (new_limit_price - ordered.limit_price).abs() < tick * 0.5 && !missing_exchange_order {
+        let ioc_price = if is_live_exchange {
+            let oracle_anchor = if asset.oracle_price.is_finite() && asset.oracle_price > 0.0 {
+                asset.oracle_price
+            } else {
+                live_mid
+            };
+            let band_lo = (oracle_anchor * (1.0 - HL_ORACLE_BAND_PCT)).max(eff_tick);
+            let band_hi = (oracle_anchor * (1.0 + HL_ORACLE_BAND_PCT)).max(band_lo);
+            let anchor = l2_bbo
+                .map(|(bid, ask)| if side.is_buy() { ask } else { bid })
+                .filter(|&p| p > 0.0)
+                .unwrap_or(live_mid);
+            let slip = ccfg.entry_ioc_max_slippage_bps / 10_000.0;
+            let raw = if side.is_buy() {
+                anchor * (1.0 + slip)
+            } else {
+                (anchor * (1.0 - slip)).max(eff_tick)
+            };
+            snap_to_tick(raw.clamp(band_lo, band_hi), eff_tick)
+        } else {
+            snap_to_tick(live_mid, eff_tick)
+        };
+
+        if let Some(abort_reason) = self.evaluate_working_drift_and_spread_abort(
+            ordered,
+            asset,
+            ioc_price,
+            initial_limit_px,
+            l2_bbo,
+            ccfg,
+        ) {
+            return self.abort_working_order_with_cooldown(
+                ordered,
+                asset,
+                side,
+                is_live_exchange,
+                ccfg.maker_fee_bps,
+                &abort_reason,
+                ccfg.chase_reject_cooldown_sec,
+                cfg,
+            );
+        }
+
+        if is_live_exchange {
+            let pk = cfg.get_str("private_key", "");
+            if matches!(
+                self.cancel_working_entry_oid(ordered, asset, cfg),
+                CancelEntryOutcome::Aborted
+            ) {
+                return Ok(ChaseStepOutcome::Resting {
+                    position_id: ordered.position_id,
+                    symbol: ordered.symbol.clone(),
+                    limit_price: ordered.limit_price,
+                    distance_from_mid_bps: ordered.distance_from_mid_bps,
+                });
+            }
+
+            // Re-check exchange state (using pre-fetched state only if no cancel wire had to be sent)
+            let had_resting_oid = parse_hl_oid(ordered.exchange_order_id.as_deref()).is_some();
+            let live_pos_opt = if !had_resting_oid {
+                if let Some(ch_val) = pre_fetched_ch_state {
+                    Ok(extract_position_state_from_ch_value(ch_val, asset, side))
+                } else {
+                    self.query_exchange_position_state(asset, side, cfg)
+                }
+            } else {
+                self.query_exchange_position_state(asset, side, cfg)
+            };
+
+            let live_pos_opt = match live_pos_opt {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        symbol = %ordered.symbol,
+                        error = %e,
+                        "clearinghouseState unreachable before CROSSING_IOC escalation; keeping WORKING"
+                    );
+                    return Ok(ChaseStepOutcome::Resting {
+                        position_id: ordered.position_id,
+                        symbol: ordered.symbol.clone(),
+                        limit_price: ordered.limit_price,
+                        distance_from_mid_bps: ordered.distance_from_mid_bps,
+                    });
+                }
+            };
+            let (live_fill_px, live_qty) = live_pos_opt.unwrap_or((live_mid, 0.0));
+            let rem_qty = core_remaining_entry_qty_for_lot(
+                live_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            );
+            if core_is_entry_fill_complete(
+                live_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            ) {
+                return self.finalize_known_fill_outcome(
+                    ordered,
+                    asset,
+                    side,
+                    live_fill_px,
+                    live_qty,
+                    round_dp(live_fill_px * live_qty * (ccfg.maker_fee_bps / 10_000.0), 4),
+                    "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
+                    cfg,
+                );
+            }
+            if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
+                let _guard = acquire_execution_lock();
+                self.db
+                    .cancel_working_order(ordered.position_id, "HL_IOC_ZERO_REM_CANCELLED")?;
+                self.working_initial_limits
+                    .lock()
+                    .remove(&ordered.position_id);
+                return Ok(ChaseStepOutcome::Cancelled {
+                    position_id: ordered.position_id,
+                    symbol: ordered.symbol.clone(),
+                    reason: "HL_IOC_ZERO_REM_CANCELLED".to_string(),
+                });
+            }
+
+            let wire = build_limit_order_wire(
+                asset.asset_index,
+                side.is_buy(),
+                ioc_price,
+                rem_qty,
+                eff_tick,
+                asset.lot_step_size,
+                asset.sz_decimals,
+                false,
+                "Ioc",
+                Some(&format!("{}-ioc", ordered.client_order_id)),
+            );
+            match self.http.submit_order_wire(
+                wire,
+                rem_qty,
+                ioc_price,
+                ccfg.taker_fee_bps,
+                &pk,
+                Some(&self.db),
+                cfg,
+            ) {
+                Ok(ack) if ack.accepted && ack.status == "FILLED" && ack.filled_quantity > 0.0 => {
+                    let ioc_eoid = ack.exchange_order_id.or(ordered.exchange_order_id.clone());
+                    let total_qty = live_qty + ack.filled_quantity;
+                    let blended_px = if total_qty > 1e-9 {
+                        (live_fill_px * live_qty + ack.avg_fill_price * ack.filled_quantity)
+                            / total_qty
+                    } else {
+                        ack.avg_fill_price
+                    };
+                    let prior_fee = if live_qty > 1e-9 {
+                        round_dp(live_fill_px * live_qty * (ccfg.maker_fee_bps / 10_000.0), 4)
+                    } else {
+                        0.0
+                    };
+                    let total_fee = round_dp(prior_fee + ack.fee_usdc, 4);
+                    {
+                        let _guard = acquire_execution_lock();
+                        let _ = self.db.record_working_order_chase(
+                            ordered.position_id,
+                            blended_px,
+                            OrderFsmState::CrossingIoc.as_str(),
+                            ioc_eoid.as_deref(),
+                            &format!(
+                                "Escalated to CROSSING_IOC after {} ALO chases (filled {:.4} @ ${:.6})",
+                                ordered.chase_count, total_qty, blended_px
+                            ),
+                        )?;
+                    }
+                    let (committed_usdc, stop_px) = self.finalize_fill_to_open(
+                        ordered.position_id,
+                        asset,
+                        side,
+                        blended_px,
+                        total_qty,
+                        total_fee,
+                        ioc_eoid.as_deref(),
+                        "HL_IOC_ESCALATION_FILLED",
+                        cfg,
+                    )?;
+                    return Ok(ChaseStepOutcome::FilledOpen {
+                        position_id: ordered.position_id,
+                        asset_id: ordered.asset_id,
+                        symbol: ordered.symbol.clone(),
+                        side: side.as_str().to_string(),
+                        fill_price: blended_px,
+                        filled_quantity: total_qty,
+                        committed_notional_usdc: committed_usdc,
+                        protective_stop_px: stop_px,
+                        fees_paid_usdc: total_fee,
+                    });
+                }
+                Ok(ack) => {
+                    tracing::warn!(
+                        symbol = %ordered.symbol,
+                        position_id = ordered.position_id,
+                        chase_count = ordered.chase_count,
+                        limit_price = ioc_price,
+                        accepted = ack.accepted,
+                        status = %ack.status,
+                        error = ?ack.raw_error,
+                        "Hyperliquid CROSSING_IOC order rejected or unfilled"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        symbol = %ordered.symbol,
+                        position_id = ordered.position_id,
+                        chase_count = ordered.chase_count,
+                        limit_price = ioc_price,
+                        error = %e,
+                        "Hyperliquid CROSSING_IOC submit_order_wire failed"
+                    );
+                }
+            }
+
+            match self.query_exchange_position_state(asset, side, cfg) {
+                Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
+                    let est_fee = if post_qty <= live_qty + 1e-9 {
+                        round_dp(post_px * post_qty * (ccfg.maker_fee_bps / 10_000.0), 4)
+                    } else {
+                        round_dp(post_px * post_qty * (ccfg.taker_fee_bps / 10_000.0), 4)
+                    };
+                    return self.finalize_known_fill_outcome(
+                        ordered,
+                        asset,
+                        side,
+                        post_px,
+                        post_qty,
+                        est_fee,
+                        "HL_IOC_FILL_CONFIRMED_ON_STATE",
+                        cfg,
+                    );
+                }
+                Err(e) => {
+                    if live_qty > 1e-9 {
+                        return self.finalize_known_fill_outcome(
+                            ordered,
+                            asset,
+                            side,
+                            live_fill_px,
+                            live_qty,
+                            round_dp(live_fill_px * live_qty * (ccfg.maker_fee_bps / 10_000.0), 4),
+                            "HL_ALO_PARTIAL_FILL_ON_EXCHANGE",
+                            cfg,
+                        );
+                    }
+                    tracing::warn!(
+                        symbol = %ordered.symbol,
+                        error = %e,
+                        "clearinghouseState unreachable after IOC submit; deferring cancel"
+                    );
+                    return Ok(ChaseStepOutcome::Resting {
+                        position_id: ordered.position_id,
+                        symbol: ordered.symbol.clone(),
+                        limit_price: ordered.limit_price,
+                        distance_from_mid_bps: ordered.distance_from_mid_bps,
+                    });
+                }
+                Ok(_) => {}
+            }
+
+            {
+                let _guard = acquire_execution_lock();
+                self.db
+                    .cancel_working_order(ordered.position_id, "HL_IOC_UNFILLED_CANCELLED")?;
+                self.working_initial_limits
+                    .lock()
+                    .remove(&ordered.position_id);
+                self.record_alo_expiry_and_maybe_cooldown(
+                    ordered.asset_id,
+                    &ordered.symbol,
+                    "HL_IOC_UNFILLED_CANCELLED",
+                    ccfg,
+                );
+            }
+            return Ok(ChaseStepOutcome::Cancelled {
+                position_id: ordered.position_id,
+                symbol: ordered.symbol.clone(),
+                reason: "HL_IOC_UNFILLED_CANCELLED".to_string(),
+            });
+        }
+
+        let ioc_eoid = ordered.exchange_order_id.clone();
+        {
+            let _guard = acquire_execution_lock();
+            let _ = self.db.record_working_order_chase(
+                ordered.position_id,
+                ioc_price,
+                OrderFsmState::CrossingIoc.as_str(),
+                ioc_eoid.as_deref(),
+                &format!(
+                    "Escalated to CROSSING_IOC after {} ALO chases (drift {:.2} bps)",
+                    ordered.chase_count, abs_dist_bps
+                ),
+            )?;
+        }
+
+        let filled_qty = ordered.requested_quantity;
+        let fees_paid_usdc = round_dp(ioc_price * filled_qty * (ccfg.taker_fee_bps / 10_000.0), 4);
+        let (committed_usdc, stop_px) = self.finalize_fill_to_open(
+            ordered.position_id,
+            asset,
+            side,
+            ioc_price,
+            filled_qty,
+            fees_paid_usdc,
+            ioc_eoid.as_deref(),
+            "IOC_ESCALATION_FILLED",
+            cfg,
+        )?;
+
+        Ok(ChaseStepOutcome::FilledOpen {
+            position_id: ordered.position_id,
+            asset_id: ordered.asset_id,
+            symbol: ordered.symbol.clone(),
+            side: side.as_str().to_string(),
+            fill_price: ioc_price,
+            filled_quantity: filled_qty,
+            committed_notional_usdc: committed_usdc,
+            protective_stop_px: stop_px,
+            fees_paid_usdc,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chase_working_order(
+        &self,
+        ordered: &OrderedAssetView,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        live_mid: f64,
+        abs_dist_bps: f64,
+        eff_tick: f64,
+        is_live_exchange: bool,
+        missing_exchange_order: bool,
+        ccfg: &ChaserConfig,
+        pre_fetched_ch_state: Option<&Value>,
+        cfg: &ConfigMap,
+    ) -> Result<ChaseStepOutcome> {
+        let resting_outcome = || ChaseStepOutcome::Resting {
+            position_id: ordered.position_id,
+            symbol: ordered.symbol.clone(),
+            limit_price: ordered.limit_price,
+            distance_from_mid_bps: ordered.distance_from_mid_bps,
+        };
+
+        let initial_limit_px =
+            self.resolve_initial_limit_price(ordered.position_id, ordered.limit_price);
+
+        let l2_bbo = if is_live_exchange {
+            self.http
+                .fetch_l2_book(&asset.coin, cfg)
+                .ok()
+                .flatten()
+                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        } else {
+            None
+        };
+        let mut new_limit_price = clamp_chase_alo_price(side, live_mid, l2_bbo, eff_tick);
+        new_limit_price = ensure_wire_price_strictly_passive(
+            side,
+            new_limit_price,
+            l2_bbo,
+            eff_tick,
+            asset.sz_decimals,
+        );
+
+        // Native ALO 1-tick wire-equivalence & 1-tick BBO spread queue preservation (`Sec. 11`)
+        let old_wire_px = format_hl_wire_price(ordered.limit_price, eff_tick, asset.sz_decimals);
+        let new_wire_px = format_hl_wire_price(new_limit_price, eff_tick, asset.sz_decimals);
+        let one_tick_bbo_keep = l2_bbo.is_some_and(|(bid, ask)| {
+            ask - bid <= eff_tick * 1.05
+                && if side.is_buy() {
+                    (ordered.limit_price - bid).abs() < eff_tick * 0.5
+                } else {
+                    (ordered.limit_price - ask).abs() < eff_tick * 0.5
+                }
+        });
+        if !missing_exchange_order
+            && ((new_limit_price - ordered.limit_price).abs() < eff_tick * 0.5
+                || new_wire_px == old_wire_px
+                || one_tick_bbo_keep)
+        {
             return Ok(resting_outcome());
+        }
+
+        if let Some(abort_reason) = self.evaluate_working_drift_and_spread_abort(
+            ordered,
+            asset,
+            new_limit_price,
+            initial_limit_px,
+            l2_bbo,
+            ccfg,
+        ) {
+            return self.abort_working_order_with_cooldown(
+                ordered,
+                asset,
+                side,
+                is_live_exchange,
+                ccfg.maker_fee_bps,
+                &abort_reason,
+                ccfg.chase_reject_cooldown_sec,
+                cfg,
+            );
         }
 
         let mut final_limit_price = new_limit_price;
@@ -1072,7 +1762,17 @@ impl OrderChaser {
                 return Ok(resting_outcome());
             }
 
-            let live_pos_opt = match self.query_exchange_position_state(asset, side, cfg) {
+            let had_resting_oid = parse_hl_oid(ordered.exchange_order_id.as_deref()).is_some();
+            let live_pos_opt = if !had_resting_oid {
+                if let Some(ch_val) = pre_fetched_ch_state {
+                    Ok(extract_position_state_from_ch_value(ch_val, asset, side))
+                } else {
+                    self.query_exchange_position_state(asset, side, cfg)
+                }
+            } else {
+                self.query_exchange_position_state(asset, side, cfg)
+            };
+            let live_pos_opt = match live_pos_opt {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
@@ -1084,25 +1784,36 @@ impl OrderChaser {
                 }
             };
             let (live_fill_px, live_qty) = live_pos_opt.unwrap_or((live_mid, 0.0));
-            let rem_qty = remaining_entry_qty(ordered.requested_quantity, live_qty, asset);
-            if is_entry_fill_complete(ordered.requested_quantity, live_qty, asset) {
+            let rem_qty = core_remaining_entry_qty_for_lot(
+                live_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            );
+            if core_is_entry_fill_complete(
+                live_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            ) {
                 return self.finalize_known_fill_outcome(
                     ordered,
-                    existing_stop_px,
                     asset,
                     side,
                     live_fill_px,
                     live_qty,
-                    round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                    default_stop_pct,
-                    tick,
+                    round_dp(live_fill_px * live_qty * (ccfg.maker_fee_bps / 10_000.0), 4),
                     "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
                     cfg,
                 );
             }
             if rem_qty <= asset.lot_step_size * 0.5 || rem_qty <= 1e-9 {
+                let _guard = acquire_execution_lock();
                 self.db
                     .cancel_working_order(ordered.position_id, "HL_CHASE_ZERO_REM_CANCELLED")?;
+                self.working_initial_limits
+                    .lock()
+                    .remove(&ordered.position_id);
                 return Ok(ChaseStepOutcome::Cancelled {
                     position_id: ordered.position_id,
                     symbol: ordered.symbol.clone(),
@@ -1120,7 +1831,7 @@ impl OrderChaser {
                 side.is_buy(),
                 new_limit_price,
                 rem_qty,
-                tick,
+                eff_tick,
                 asset.lot_step_size,
                 asset.sz_decimals,
                 false,
@@ -1131,7 +1842,7 @@ impl OrderChaser {
                 wire,
                 rem_qty,
                 new_limit_price,
-                maker_fee_bps,
+                ccfg.maker_fee_bps,
                 &pk,
                 Some(&self.db),
                 cfg,
@@ -1140,7 +1851,6 @@ impl OrderChaser {
                     if ack.status == "FILLED" && ack.filled_quantity > 0.0 {
                         return self.finalize_accepted_chase_fill(
                             ordered,
-                            existing_stop_px,
                             asset,
                             side,
                             live_fill_px,
@@ -1149,9 +1859,7 @@ impl OrderChaser {
                             ack.filled_quantity,
                             ack.fee_usdc,
                             ack.exchange_order_id.as_deref(),
-                            maker_fee_bps,
-                            default_stop_pct,
-                            tick,
+                            ccfg.maker_fee_bps,
                             cfg,
                         );
                     }
@@ -1192,14 +1900,11 @@ impl OrderChaser {
                     if live_qty > 1e-9 {
                         return self.finalize_known_fill_outcome(
                             ordered,
-                            existing_stop_px,
                             asset,
                             side,
                             live_fill_px,
                             live_qty,
-                            round_dp(live_fill_px * live_qty * (maker_fee_bps / 10_000.0), 4),
-                            default_stop_pct,
-                            tick,
+                            round_dp(live_fill_px * live_qty * (ccfg.maker_fee_bps / 10_000.0), 4),
                             "HL_ALO_PARTIAL_FILL_ON_EXCHANGE",
                             cfg,
                         );
@@ -1208,14 +1913,11 @@ impl OrderChaser {
                         Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
                             return self.finalize_known_fill_outcome(
                                 ordered,
-                                existing_stop_px,
                                 asset,
                                 side,
                                 post_px,
                                 post_qty,
-                                round_dp(post_px * post_qty * (maker_fee_bps / 10_000.0), 4),
-                                default_stop_pct,
-                                tick,
+                                round_dp(post_px * post_qty * (ccfg.maker_fee_bps / 10_000.0), 4),
                                 "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
                                 cfg,
                             );
@@ -1224,7 +1926,28 @@ impl OrderChaser {
                         Ok(_) => {}
                     }
 
-                    // Confirmed 0 live fill on exchange; recover cleanly instead of fatally killing at chase_count = 0.
+                    if !is_crossing_reject {
+                        self.record_hl_reject_and_maybe_cooldown(
+                            ordered.asset_id,
+                            &ordered.symbol,
+                            &reject_summary,
+                            ccfg,
+                        );
+                        let _guard = acquire_execution_lock();
+                        self.db.cancel_working_order(
+                            ordered.position_id,
+                            "HL_CHASE_REJECT_CANCELLED",
+                        )?;
+                        self.working_initial_limits
+                            .lock()
+                            .remove(&ordered.position_id);
+                        return Ok(ChaseStepOutcome::Cancelled {
+                            position_id: ordered.position_id,
+                            symbol: ordered.symbol.clone(),
+                            reason: "HL_CHASE_REJECT_CANCELLED".to_string(),
+                        });
+                    }
+
                     new_eoid = Some(String::new());
                     chase_reason = format!(
                         "1s ALO chase #{} rejected ({}); queued retry/IOC escalation",
@@ -1232,7 +1955,7 @@ impl OrderChaser {
                         reject_summary
                     );
 
-                    if is_crossing_reject && ordered.chase_count.saturating_add(1) < max_chases {
+                    if ordered.chase_count.saturating_add(1) < ccfg.max_chases {
                         let fresh_bbo = self
                             .http
                             .fetch_l2_book(&asset.coin, cfg)
@@ -1241,15 +1964,20 @@ impl OrderChaser {
                             .filter(|(b, a)| {
                                 b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b
                             });
-                        let requote_px =
-                            step_more_passive_alo_price(side, new_limit_price, fresh_bbo, tick);
+                        let requote_px = ensure_wire_price_strictly_passive(
+                            side,
+                            step_more_passive_alo_price(side, new_limit_price, fresh_bbo, eff_tick),
+                            fresh_bbo,
+                            eff_tick,
+                            asset.sz_decimals,
+                        );
                         let requote_coid = format!("{chase_coid}-r1");
                         let requote_wire = build_limit_order_wire(
                             asset.asset_index,
                             side.is_buy(),
                             requote_px,
                             rem_qty,
-                            tick,
+                            eff_tick,
                             asset.lot_step_size,
                             asset.sz_decimals,
                             false,
@@ -1260,7 +1988,7 @@ impl OrderChaser {
                             requote_wire,
                             rem_qty,
                             requote_px,
-                            maker_fee_bps,
+                            ccfg.maker_fee_bps,
                             &pk,
                             Some(&self.db),
                             cfg,
@@ -1270,7 +1998,6 @@ impl OrderChaser {
                                 if re_ack.status == "FILLED" && re_ack.filled_quantity > 0.0 {
                                     return self.finalize_accepted_chase_fill(
                                         ordered,
-                                        existing_stop_px,
                                         asset,
                                         side,
                                         live_fill_px,
@@ -1279,9 +2006,7 @@ impl OrderChaser {
                                         re_ack.filled_quantity,
                                         re_ack.fee_usdc,
                                         re_ack.exchange_order_id.as_deref(),
-                                        maker_fee_bps,
-                                        default_stop_pct,
-                                        tick,
+                                        ccfg.maker_fee_bps,
                                         cfg,
                                     );
                                 }
@@ -1325,17 +2050,16 @@ impl OrderChaser {
                                     Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
                                         return self.finalize_known_fill_outcome(
                                             ordered,
-                                            existing_stop_px,
                                             asset,
                                             side,
                                             post_px,
                                             post_qty,
                                             round_dp(
-                                                post_px * post_qty * (maker_fee_bps / 10_000.0),
+                                                post_px
+                                                    * post_qty
+                                                    * (ccfg.maker_fee_bps / 10_000.0),
                                                 4,
                                             ),
-                                            default_stop_pct,
-                                            tick,
                                             "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
                                             cfg,
                                         );
@@ -1352,13 +2076,16 @@ impl OrderChaser {
             }
         }
 
-        let new_cc = self.db.record_working_order_chase(
-            ordered.position_id,
-            final_limit_price,
-            OrderFsmState::ChasingAlo.as_str(),
-            new_eoid.as_deref(),
-            &chase_reason,
-        )?;
+        let new_cc = {
+            let _guard = acquire_execution_lock();
+            self.db.record_working_order_chase(
+                ordered.position_id,
+                final_limit_price,
+                OrderFsmState::ChasingAlo.as_str(),
+                new_eoid.as_deref(),
+                &chase_reason,
+            )?
+        };
 
         Ok(ChaseStepOutcome::Chased {
             position_id: ordered.position_id,
@@ -1373,7 +2100,6 @@ impl OrderChaser {
     fn finalize_accepted_chase_fill(
         &self,
         ordered: &OrderedAssetView,
-        existing_stop_px: f64,
         asset: &ExchangeAsset,
         side: OrderSide,
         live_fill_px: f64,
@@ -1383,8 +2109,6 @@ impl OrderChaser {
         ack_fee_usdc: f64,
         ack_exchange_order_id: Option<&str>,
         maker_fee_bps: f64,
-        default_stop_pct: f64,
-        tick: f64,
         cfg: &ConfigMap,
     ) -> Result<ChaseStepOutcome> {
         let total_qty = live_qty + ack_filled_qty;
@@ -1399,21 +2123,13 @@ impl OrderChaser {
             0.0
         };
         let total_fee = round_dp(prior_fee + ack_fee_usdc, 4);
-        let stop_px = if existing_stop_px > 0.0 {
-            existing_stop_px
-        } else if side.is_buy() {
-            snap_to_tick(blended_px * (1.0 - default_stop_pct), tick)
-        } else {
-            snap_to_tick(blended_px * (1.0 + default_stop_pct), tick)
-        };
-        let committed_usdc = self.finalize_fill_to_open(
+        let (committed_usdc, stop_px) = self.finalize_fill_to_open(
             ordered.position_id,
             asset,
             side,
             blended_px,
             total_qty,
             total_fee,
-            stop_px,
             ack_exchange_order_id,
             "HL_ALO_CHASE_FILLED",
             cfg,
@@ -1500,16 +2216,13 @@ impl OrderChaser {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn handle_expired_working_order(
         &self,
         ordered: &OrderedAssetView,
-        existing_stop_px: f64,
         asset: &ExchangeAsset,
         side: OrderSide,
-        default_stop_pct: f64,
-        maker_fee_bps: f64,
-        tick: f64,
+        ccfg: &ChaserConfig,
+        pre_fetched_ch_state: Option<&Value>,
         cfg: &ConfigMap,
     ) -> Result<ChaseStepOutcome> {
         let resting_outcome = || ChaseStepOutcome::Resting {
@@ -1519,7 +2232,12 @@ impl OrderChaser {
             distance_from_mid_bps: ordered.distance_from_mid_bps,
         };
 
-        let pre_state = match self.query_exchange_position_state(asset, side, cfg) {
+        let pre_state = if let Some(ch_val) = pre_fetched_ch_state {
+            Ok(extract_position_state_from_ch_value(ch_val, asset, side))
+        } else {
+            self.query_exchange_position_state(asset, side, cfg)
+        };
+        let pre_state = match pre_state {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -1532,7 +2250,12 @@ impl OrderChaser {
         };
 
         if let Some((mut fill_px, mut fill_qty)) = pre_state {
-            let rem_qty = remaining_entry_qty(ordered.requested_quantity, fill_qty, asset);
+            let rem_qty = core_remaining_entry_qty_for_lot(
+                fill_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            );
             if rem_qty > asset.lot_step_size * 0.5 && rem_qty > 1e-9 {
                 match self.cancel_working_entry_oid(ordered, asset, cfg) {
                     CancelEntryOutcome::Aborted => return Ok(resting_outcome()),
@@ -1546,24 +2269,19 @@ impl OrderChaser {
                     }
                 }
             }
-            let reason = if is_entry_fill_complete(ordered.requested_quantity, fill_qty, asset) {
+            let reason = if core_is_entry_fill_complete(
+                fill_qty,
+                ordered.requested_quantity,
+                asset.lot_step_size,
+                asset.sz_decimals,
+            ) {
                 "HL_ALO_FILL_DETECTED_ON_EXCHANGE"
             } else {
                 "HL_ALO_PARTIAL_FILL_EXPIRED_OPEN"
             };
-            let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+            let est_fee = round_dp(fill_px * fill_qty * (ccfg.maker_fee_bps / 10_000.0), 4);
             return self.finalize_known_fill_outcome(
-                ordered,
-                existing_stop_px,
-                asset,
-                side,
-                fill_px,
-                fill_qty,
-                est_fee,
-                default_stop_pct,
-                tick,
-                reason,
-                cfg,
+                ordered, asset, side, fill_px, fill_qty, est_fee, reason, cfg,
             );
         }
 
@@ -1573,29 +2291,20 @@ impl OrderChaser {
                 if saw_filled_hint {
                     match self.query_exchange_position_state(asset, side, cfg) {
                         Ok(Some((post_px, post_qty))) if post_qty > 1e-9 => {
-                            let reason = if is_entry_fill_complete(
-                                ordered.requested_quantity,
+                            let reason = if core_is_entry_fill_complete(
                                 post_qty,
-                                asset,
+                                ordered.requested_quantity,
+                                asset.lot_step_size,
+                                asset.sz_decimals,
                             ) {
                                 "HL_ALO_FILL_DETECTED_ON_EXCHANGE"
                             } else {
                                 "HL_ALO_PARTIAL_FILL_EXPIRED_OPEN"
                             };
                             let est_fee =
-                                round_dp(post_px * post_qty * (maker_fee_bps / 10_000.0), 4);
+                                round_dp(post_px * post_qty * (ccfg.maker_fee_bps / 10_000.0), 4);
                             return self.finalize_known_fill_outcome(
-                                ordered,
-                                existing_stop_px,
-                                asset,
-                                side,
-                                post_px,
-                                post_qty,
-                                est_fee,
-                                default_stop_pct,
-                                tick,
-                                reason,
-                                cfg,
+                                ordered, asset, side, post_px, post_qty, est_fee, reason, cfg,
                             );
                         }
                         Err(_) => return Ok(resting_outcome()),
@@ -1605,8 +2314,20 @@ impl OrderChaser {
             }
         }
 
-        self.db
-            .cancel_working_order(ordered.position_id, "HL_ALO_EXPIRED_CANCELLED")?;
+        {
+            let _guard = acquire_execution_lock();
+            self.db
+                .cancel_working_order(ordered.position_id, "HL_ALO_EXPIRED_CANCELLED")?;
+            self.working_initial_limits
+                .lock()
+                .remove(&ordered.position_id);
+            self.record_alo_expiry_and_maybe_cooldown(
+                ordered.asset_id,
+                &ordered.symbol,
+                "HL_ALO_EXPIRED_CANCELLED",
+                ccfg,
+            );
+        }
         Ok(ChaseStepOutcome::Cancelled {
             position_id: ordered.position_id,
             symbol: ordered.symbol.clone(),
@@ -1614,30 +2335,37 @@ impl OrderChaser {
         })
     }
 
-    /// Promotes a resting `WORKING` order inside the active `< 45_000 ms` grace window only when
-    /// `clearinghouseState` confirms fill completeness (`>= 85%` of `requested_quantity`, or `< 1` lot
-    /// step remaining), cancelling any small resting remainder before going `OPEN`.
-    #[allow(clippy::too_many_arguments)]
     fn try_finalize_existing_exchange_fill(
         &self,
         ordered: &OrderedAssetView,
-        existing_stop_px: f64,
         asset: &ExchangeAsset,
         side: OrderSide,
-        default_stop_pct: f64,
-        maker_fee_bps: f64,
-        tick: f64,
+        ccfg: &ChaserConfig,
+        pre_fetched_ch_state: Option<&Value>,
         cfg: &ConfigMap,
     ) -> Result<Option<ChaseStepOutcome>> {
-        let Some((mut fill_px, mut fill_qty)) =
+        let existing = if let Some(ch_val) = pre_fetched_ch_state {
+            extract_position_state_from_ch_value(ch_val, asset, side)
+        } else {
             self.check_if_working_order_filled_on_exchange(asset, side, cfg)
-        else {
+        };
+        let Some((mut fill_px, mut fill_qty)) = existing else {
             return Ok(None);
         };
-        if !is_entry_fill_complete(ordered.requested_quantity, fill_qty, asset) {
+        if !core_is_entry_fill_complete(
+            fill_qty,
+            ordered.requested_quantity,
+            asset.lot_step_size,
+            asset.sz_decimals,
+        ) {
             return Ok(None);
         }
-        let rem_qty = remaining_entry_qty(ordered.requested_quantity, fill_qty, asset);
+        let rem_qty = core_remaining_entry_qty_for_lot(
+            fill_qty,
+            ordered.requested_quantity,
+            asset.lot_step_size,
+            asset.sz_decimals,
+        );
         if rem_qty > asset.lot_step_size * 0.5 && rem_qty > 1e-9 {
             match self.cancel_working_entry_oid(ordered, asset, cfg) {
                 CancelEntryOutcome::Aborted => return Ok(None),
@@ -1651,17 +2379,14 @@ impl OrderChaser {
                 }
             }
         }
-        let est_fee = round_dp(fill_px * fill_qty * (maker_fee_bps / 10_000.0), 4);
+        let est_fee = round_dp(fill_px * fill_qty * (ccfg.maker_fee_bps / 10_000.0), 4);
         self.finalize_known_fill_outcome(
             ordered,
-            existing_stop_px,
             asset,
             side,
             fill_px,
             fill_qty,
             est_fee,
-            default_stop_pct,
-            tick,
             "HL_ALO_FILL_DETECTED_ON_EXCHANGE",
             cfg,
         )
@@ -1672,32 +2397,21 @@ impl OrderChaser {
     fn finalize_known_fill_outcome(
         &self,
         ordered: &OrderedAssetView,
-        existing_stop_px: f64,
         asset: &ExchangeAsset,
         side: OrderSide,
         fill_px: f64,
         fill_qty: f64,
         fees_paid_usdc: f64,
-        default_stop_pct: f64,
-        tick: f64,
         reason: &str,
         cfg: &ConfigMap,
     ) -> Result<ChaseStepOutcome> {
-        let stop_px = if existing_stop_px > 0.0 {
-            existing_stop_px
-        } else if side.is_buy() {
-            snap_to_tick(fill_px * (1.0 - default_stop_pct), tick)
-        } else {
-            snap_to_tick(fill_px * (1.0 + default_stop_pct), tick)
-        };
-        let committed_usdc = self.finalize_fill_to_open(
+        let (committed_usdc, stop_px) = self.finalize_fill_to_open(
             ordered.position_id,
             asset,
             side,
             fill_px,
             fill_qty,
             fees_paid_usdc,
-            stop_px,
             ordered.exchange_order_id.as_deref(),
             reason,
             cfg,
@@ -1715,8 +2429,6 @@ impl OrderChaser {
         })
     }
 
-    /// Queries Hyperliquid `clearinghouseState` returning `Ok(Some((fill_px, qty)))` if a matching-side
-    /// position exists on `asset.coin`, `Ok(None)` if flat, or `Err(...)` if the exchange query failed.
     fn query_exchange_position_state(
         &self,
         asset: &ExchangeAsset,
@@ -1730,47 +2442,9 @@ impl OrderChaser {
             ));
         }
         let ch_state = self.http.fetch_clearinghouse_state(&wallet, cfg)?;
-        let parse_f = |v: Option<&Value>| -> f64 {
-            v.and_then(|x| {
-                x.as_f64()
-                    .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
-            })
-            .filter(|val| val.is_finite())
-            .unwrap_or(0.0)
-        };
-        let Some(arr) = ch_state.get("assetPositions").and_then(Value::as_array) else {
-            return Ok(None);
-        };
-        for item in arr {
-            let p = item.get("position").unwrap_or(item);
-            let coin = p.get("coin").and_then(Value::as_str).unwrap_or("").trim();
-            if !coin.eq_ignore_ascii_case(&asset.coin) {
-                continue;
-            }
-            let szi = parse_f(p.get("szi"));
-            if szi.abs() > 1e-9 && (szi > 0.0) == side.is_buy() {
-                let qty = szi.abs();
-                let entry_px = parse_f(p.get("entryPx"));
-                let pos_val = parse_f(p.get("positionValue"));
-                let fill_px = if entry_px > 0.0 {
-                    entry_px
-                } else if pos_val > 0.0 {
-                    round_dp(pos_val / qty, 6)
-                } else if asset.mark_price > 0.0 {
-                    asset.mark_price
-                } else {
-                    asset.mid_price
-                };
-                if fill_px > 0.0 {
-                    return Ok(Some((fill_px, qty)));
-                }
-            }
-        }
-        Ok(None)
+        Ok(extract_position_state_from_ch_value(&ch_state, asset, side))
     }
 
-    /// Queries Hyperliquid `clearinghouseState` to check if a `WORKING` order on `asset.coin`
-    /// already filled on-chain before cancelling/re-submitting a chase/IOC order.
     fn check_if_working_order_filled_on_exchange(
         &self,
         asset: &ExchangeAsset,
@@ -1782,8 +2456,7 @@ impl OrderChaser {
             .flatten()
     }
 
-    /// Ensures an active `OPEN` position has valid Stop-Loss (`tpsl = "sl"`) and Take-Profit (`tpsl = "tp"`)
-    /// prices and exchange trigger orders (or paper IDs in PAPER/test mode), persisting them to MariaDB.
+    /// Backwards-compatible wrapper delegating SL/TP sync to [`crate::tpsl_sync`].
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_exchange_tpsl_orders(
         &self,
@@ -1801,26 +2474,71 @@ impl OrderChaser {
         resting_exchange_oids: Option<&HashSet<u64>>,
         cfg: &ConfigMap,
     ) -> Result<(f64, Option<String>, f64, Option<String>)> {
-        self.ensure_exchange_tpsl_orders_inner(
-            position_id,
-            asset,
-            side,
-            quantity,
-            mark_price,
-            desired_stop_px,
-            desired_tp_px,
-            existing_sl_oid,
-            existing_tp_oid,
-            replace_sl,
-            replace_tp,
+        let rep = ensure_exchange_tpsl_orders_detailed(
+            &self.http,
+            &self.db,
+            &TpslSyncRequest {
+                position_id,
+                asset,
+                side,
+                quantity,
+                mark_price,
+                desired_stop_px,
+                desired_tp_px,
+                existing_sl_oid,
+                existing_tp_oid,
+                replace_sl,
+                replace_tp,
+            },
             resting_exchange_oids,
             None,
             cfg,
-        )
+        )?;
+        Ok((rep.stop_px, rep.sl_oid, rep.tp_px, rep.tp_oid))
     }
 
-    /// Ensures SL/TP trigger orders using a pre-fetched `frontendOpenOrders` snapshot so callers such as
-    /// `CutoverReconciler` preserve `cloid` resolution and duplicate trigger cleanup without extra HTTP polls.
+    /// Snapshot-aware TP/SL sync preserving [`OpenOrdersSnapshot::metadata_complete`] (`R14-M7`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_exchange_tpsl_orders_with_snapshot(
+        &self,
+        position_id: i64,
+        asset: &ExchangeAsset,
+        side: OrderSide,
+        quantity: f64,
+        mark_price: f64,
+        desired_stop_px: f64,
+        desired_tp_px: f64,
+        existing_sl_oid: Option<&str>,
+        existing_tp_oid: Option<&str>,
+        replace_sl: bool,
+        replace_tp: bool,
+        open_orders_snapshot: Option<&OpenOrdersSnapshot>,
+        cfg: &ConfigMap,
+    ) -> Result<(f64, Option<String>, f64, Option<String>)> {
+        let rep = ensure_exchange_tpsl_orders_detailed(
+            &self.http,
+            &self.db,
+            &TpslSyncRequest {
+                position_id,
+                asset,
+                side,
+                quantity,
+                mark_price,
+                desired_stop_px,
+                desired_tp_px,
+                existing_sl_oid,
+                existing_tp_oid,
+                replace_sl,
+                replace_tp,
+            },
+            None,
+            open_orders_snapshot,
+            cfg,
+        )?;
+        Ok((rep.stop_px, rep.sl_oid, rep.tp_px, rep.tp_oid))
+    }
+
+    /// Backwards-compatible slice wrapper for callers passing raw `frontendOpenOrders` slices.
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_exchange_tpsl_orders_with_orders(
         &self,
@@ -1838,7 +2556,11 @@ impl OrderChaser {
         open_orders_snapshot: Option<&[Value]>,
         cfg: &ConfigMap,
     ) -> Result<(f64, Option<String>, f64, Option<String>)> {
-        self.ensure_exchange_tpsl_orders_inner(
+        let owned_snap = open_orders_snapshot.map(|orders| OpenOrdersSnapshot {
+            orders: orders.to_vec(),
+            metadata_complete: true,
+        });
+        self.ensure_exchange_tpsl_orders_with_snapshot(
             position_id,
             asset,
             side,
@@ -1850,515 +2572,14 @@ impl OrderChaser {
             existing_tp_oid,
             replace_sl,
             replace_tp,
-            None,
-            open_orders_snapshot,
+            owned_snap.as_ref(),
             cfg,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn ensure_exchange_tpsl_orders_inner(
-        &self,
-        position_id: i64,
-        asset: &ExchangeAsset,
-        side: OrderSide,
-        quantity: f64,
-        mark_price: f64,
-        desired_stop_px: f64,
-        desired_tp_px: f64,
-        existing_sl_oid: Option<&str>,
-        existing_tp_oid: Option<&str>,
-        replace_sl: bool,
-        replace_tp: bool,
-        resting_exchange_oids: Option<&HashSet<u64>>,
-        open_orders_snapshot: Option<&[Value]>,
-        cfg: &ConfigMap,
-    ) -> Result<(f64, Option<String>, f64, Option<String>)> {
-        let tick = asset.tick_size.max(1e-8);
-        let ref_mark = if mark_price > 0.0 {
-            mark_price
-        } else if asset.mark_price > 0.0 {
-            asset.mark_price
-        } else {
-            asset.mid_price
-        };
-        let default_sl_pct = cfg
-            .get_f64("protective_stop_default_pct", 0.04)
-            .clamp(0.005, 0.35);
-        let default_tp_pct = cfg
-            .get_f64("take_profit_default_pct", 0.055)
-            .clamp(0.01, 0.80);
-
-        let stop_px = if desired_stop_px > 0.0
-            && (ref_mark <= 0.0
-                || match side {
-                    OrderSide::Long => desired_stop_px < ref_mark - tick * 0.5,
-                    OrderSide::Short => desired_stop_px > ref_mark + tick * 0.5,
-                }) {
-            snap_to_tick(desired_stop_px, tick)
-        } else if ref_mark > 0.0 {
-            match side {
-                OrderSide::Long => {
-                    snap_to_tick((ref_mark * (1.0 - default_sl_pct)).max(tick), tick)
-                }
-                OrderSide::Short => snap_to_tick(ref_mark * (1.0 + default_sl_pct), tick),
-            }
-        } else {
-            0.0
-        };
-
-        let tp_px = if desired_tp_px > 0.0
-            && (ref_mark <= 0.0
-                || match side {
-                    OrderSide::Long => desired_tp_px > ref_mark + tick * 0.5,
-                    OrderSide::Short => desired_tp_px < ref_mark - tick * 0.5,
-                }) {
-            snap_to_tick(desired_tp_px, tick)
-        } else if ref_mark > 0.0 {
-            match side {
-                OrderSide::Long => snap_to_tick(ref_mark * (1.0 + default_tp_pct), tick),
-                OrderSide::Short => {
-                    snap_to_tick((ref_mark * (1.0 - default_tp_pct)).max(tick), tick)
-                }
-            }
-        } else {
-            0.0
-        };
-
-        let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, cfg);
-
-        if !is_live_exchange {
-            let sl_oid = Some(format!("paper-sl-{position_id}"));
-            let tp_oid = Some(format!("paper-tp-{position_id}"));
-            self.db.update_position_tpsl_orders(
-                position_id,
-                stop_px,
-                sl_oid.as_deref(),
-                tp_px,
-                tp_oid.as_deref(),
-            )?;
-            return Ok((stop_px, sl_oid, tp_px, tp_oid));
-        }
-
-        let pk = cfg.get_str("private_key", "");
-        if pk.trim().is_empty() {
-            tracing::warn!(
-                position_id = position_id,
-                symbol = %asset.symbol,
-                "private_key is empty/missing in live mode; skipping TP/SL exchange sync without writing paper OIDs"
-            );
-            return Ok((
-                stop_px,
-                existing_sl_oid.map(str::to_string),
-                tp_px,
-                existing_tp_oid.map(str::to_string),
-            ));
-        }
-        let wallet = cfg.get_str("wallet_address", "");
-        let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5);
-
-        let mut resting_oids: HashSet<u64> = HashSet::new();
-        let mut cloid_to_oid: HashMap<String, u64> = HashMap::new();
-        let mut trigger_orders: Vec<TriggerOrderInfo> = Vec::new();
-        let mut have_resting_snapshot = false;
-        let mut has_trigger_metadata = false;
-
-        let parse_f = |v: Option<&Value>| -> f64 {
-            v.and_then(|x| {
-                x.as_f64()
-                    .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
-            })
-            .filter(|val| val.is_finite())
-            .unwrap_or(0.0)
-        };
-        let collect_orders =
-            |orders: &[Value],
-             resting_oids: &mut HashSet<u64>,
-             cloid_to_oid: &mut HashMap<String, u64>,
-             trigger_orders: &mut Vec<TriggerOrderInfo>| {
-                for ord in orders {
-                    let Some(oid) = extract_order_oid(ord) else {
-                        continue;
-                    };
-                    resting_oids.insert(oid);
-                    if let Some(cloid) = ord.get("cloid").and_then(Value::as_str) {
-                        cloid_to_oid.insert(cloid.trim().to_ascii_lowercase(), oid);
-                    }
-                    let coin_match = ord
-                        .get("coin")
-                        .and_then(Value::as_str)
-                        .is_some_and(|c| c.trim().eq_ignore_ascii_case(&asset.coin));
-                    let is_trigger = ord
-                        .get("isTrigger")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if coin_match && is_trigger {
-                        let order_type = ord
-                            .get("orderType")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        let is_tp_flag = if order_type.contains("take profit") || order_type == "tp"
-                        {
-                            Some(true)
-                        } else if order_type.contains("stop") || order_type == "sl" {
-                            Some(false)
-                        } else {
-                            None
-                        };
-                        if let Some(is_tp_val) = is_tp_flag {
-                            trigger_orders.push(TriggerOrderInfo {
-                                oid,
-                                is_tp: is_tp_val,
-                                trigger_px: parse_f(ord.get("triggerPx")),
-                                qty: parse_f(ord.get("origSz")).max(parse_f(ord.get("sz"))),
-                            });
-                        }
-                    }
-                }
-            };
-
-        if let Some(orders) = open_orders_snapshot {
-            have_resting_snapshot = true;
-            has_trigger_metadata = true;
-            collect_orders(
-                orders,
-                &mut resting_oids,
-                &mut cloid_to_oid,
-                &mut trigger_orders,
-            );
-        } else if let Some(set) = resting_exchange_oids {
-            have_resting_snapshot = true;
-            resting_oids.extend(set.iter().copied());
-            if set.is_empty() {
-                has_trigger_metadata = true;
-            } else if !wallet.is_empty() {
-                if let Ok(orders) = self
-                    .http
-                    .fetch_frontend_open_orders(&wallet, cfg)
-                    .or_else(|_| self.http.fetch_open_orders(&wallet, cfg))
-                {
-                    has_trigger_metadata = true;
-                    collect_orders(
-                        &orders,
-                        &mut resting_oids,
-                        &mut cloid_to_oid,
-                        &mut trigger_orders,
-                    );
-                }
-            }
-        } else if !wallet.is_empty() {
-            match self
-                .http
-                .fetch_frontend_open_orders(&wallet, cfg)
-                .or_else(|_| self.http.fetch_open_orders(&wallet, cfg))
-            {
-                Ok(orders) => {
-                    have_resting_snapshot = true;
-                    has_trigger_metadata = true;
-                    collect_orders(
-                        &orders,
-                        &mut resting_oids,
-                        &mut cloid_to_oid,
-                        &mut trigger_orders,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        symbol = %asset.symbol,
-                        error = %e,
-                        "Failed to fetch frontendOpenOrders before TP/SL reconciliation"
-                    );
-                }
-            }
-        }
-
-        let sl_oid = if stop_px > 0.0 && quantity > 0.0 {
-            self.ensure_single_trigger_leg(
-                false,
-                position_id,
-                asset,
-                side,
-                quantity,
-                stop_px,
-                existing_sl_oid,
-                replace_sl,
-                have_resting_snapshot,
-                has_trigger_metadata,
-                &resting_oids,
-                &cloid_to_oid,
-                &trigger_orders,
-                &pk,
-                &wallet,
-                taker_fee_bps,
-                cfg,
-            )
-        } else {
-            None
-        };
-
-        let tp_oid = if tp_px > 0.0 && quantity > 0.0 {
-            self.ensure_single_trigger_leg(
-                true,
-                position_id,
-                asset,
-                side,
-                quantity,
-                tp_px,
-                existing_tp_oid,
-                replace_tp,
-                have_resting_snapshot,
-                has_trigger_metadata,
-                &resting_oids,
-                &cloid_to_oid,
-                &trigger_orders,
-                &pk,
-                &wallet,
-                taker_fee_bps,
-                cfg,
-            )
-        } else {
-            None
-        };
-
-        self.db.update_position_tpsl_orders(
-            position_id,
-            stop_px,
-            sl_oid.as_deref(),
-            tp_px,
-            tp_oid.as_deref(),
-        )?;
-
-        Ok((stop_px, sl_oid, tp_px, tp_oid))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn ensure_single_trigger_leg(
-        &self,
-        is_tp: bool,
-        position_id: i64,
-        asset: &ExchangeAsset,
-        side: OrderSide,
-        quantity: f64,
-        trigger_px: f64,
-        existing_oid_str: Option<&str>,
-        force_replace: bool,
-        have_resting_snapshot: bool,
-        has_trigger_metadata: bool,
-        resting_oids: &HashSet<u64>,
-        cloid_to_oid: &HashMap<String, u64>,
-        trigger_orders: &[TriggerOrderInfo],
-        pk: &str,
-        wallet: &str,
-        taker_fee_bps: f64,
-        cfg: &ConfigMap,
-    ) -> Option<String> {
-        let leg_label = if is_tp { "TP" } else { "SL" };
-        let tick = asset.tick_size.max(1e-8);
-        let existing_num_oid = parse_hl_oid(existing_oid_str).or_else(|| {
-            existing_oid_str
-                .map(|s| s.trim().to_ascii_lowercase())
-                .and_then(|c| cloid_to_oid.get(&c).copied())
-        });
-
-        let leg_triggers: Vec<&TriggerOrderInfo> =
-            trigger_orders.iter().filter(|t| t.is_tp == is_tp).collect();
-        let exp_px_str = format_hl_wire_price(trigger_px, tick, asset.sz_decimals);
-        let exp_sz_str = {
-            let floored =
-                format_hl_wire_size_floor(quantity, asset.lot_step_size, asset.sz_decimals);
-            if floored == "0" {
-                format_hl_wire_size(quantity, asset.lot_step_size, asset.sz_decimals)
-            } else {
-                floored
-            }
-        };
-        let matches_canonical = |t: &TriggerOrderInfo| -> bool {
-            let px_ok = (t.trigger_px > 0.0
-                && format_hl_wire_price(t.trigger_px, tick, asset.sz_decimals) == exp_px_str)
-                || (t.trigger_px > 0.0 && (t.trigger_px - trigger_px).abs() <= tick * 1.5);
-            let sz_ok = (t.qty > 0.0
-                && format_hl_wire_size_floor(t.qty, asset.lot_step_size, asset.sz_decimals)
-                    == exp_sz_str)
-                || (t.qty > 0.0 && (t.qty - quantity).abs() <= asset.lot_step_size.max(1e-8) * 1.5);
-            px_ok && sz_ok
-        };
-
-        if !force_replace {
-            if have_resting_snapshot && has_trigger_metadata {
-                let canonical_oid = existing_num_oid
-                    .filter(|oid| {
-                        leg_triggers
-                            .iter()
-                            .any(|t| t.oid == *oid && matches_canonical(t))
-                    })
-                    .or_else(|| {
-                        leg_triggers
-                            .iter()
-                            .find(|t| matches_canonical(t))
-                            .map(|t| t.oid)
-                    });
-                if let Some(keep_oid) = canonical_oid {
-                    let mut dup_cancels: Vec<CancelWire> = Vec::new();
-                    let mut seen: HashSet<u64> = HashSet::new();
-                    for t in &leg_triggers {
-                        if t.oid != keep_oid && seen.insert(t.oid) {
-                            dup_cancels.push(CancelWire {
-                                a: asset.asset_index,
-                                o: t.oid,
-                            });
-                        }
-                    }
-                    if !dup_cancels.is_empty() {
-                        let _ = self
-                            .http
-                            .cancel_orders_batch(dup_cancels, pk, Some(&self.db), cfg);
-                    }
-                    return Some(format!("hl-{keep_oid}"));
-                }
-            } else if let Some(oid) = existing_num_oid {
-                if !have_resting_snapshot || resting_oids.contains(&oid) {
-                    return Some(format!("hl-{oid}"));
-                }
-            }
-        }
-
-        // Cancel all stale/duplicate trigger orders for this (coin, leg) and any tracked old_oid before replacing
-        let mut stale_cancels: Vec<CancelWire> = Vec::new();
-        let mut cancel_seen: HashSet<u64> = HashSet::new();
-        for t in &leg_triggers {
-            if cancel_seen.insert(t.oid) {
-                stale_cancels.push(CancelWire {
-                    a: asset.asset_index,
-                    o: t.oid,
-                });
-            }
-        }
-        if let Some(old_oid) = existing_num_oid {
-            if (!have_resting_snapshot || resting_oids.contains(&old_oid))
-                && cancel_seen.insert(old_oid)
-            {
-                stale_cancels.push(CancelWire {
-                    a: asset.asset_index,
-                    o: old_oid,
-                });
-            }
-        }
-        if !stale_cancels.is_empty() {
-            let _ = self
-                .http
-                .cancel_orders_batch(stale_cancels, pk, Some(&self.db), cfg);
-        }
-
-        let coid = format!(
-            "v2-{}-{position_id}-{}",
-            if is_tp { "tp" } else { "sl" },
-            now_ms()
-        );
-        let expected_cloid = derive_hl_cloid_hex(&coid);
-        let wire = if is_tp {
-            build_take_profit_order_wire(
-                asset.asset_index,
-                side,
-                quantity,
-                trigger_px,
-                asset.tick_size,
-                asset.lot_step_size,
-                asset.sz_decimals,
-                Some(&coid),
-            )
-        } else {
-            build_protective_stop_order_wire(
-                asset.asset_index,
-                side,
-                quantity,
-                trigger_px,
-                asset.tick_size,
-                asset.lot_step_size,
-                asset.sz_decimals,
-                Some(&coid),
-            )
-        };
-
-        match self.http.submit_order_wire(
-            wire,
-            quantity,
-            trigger_px,
-            taker_fee_bps,
-            pk,
-            Some(&self.db),
-            cfg,
-        ) {
-            Ok(ack) if ack.accepted => {
-                if let Some(eoid) = ack.exchange_order_id {
-                    return Some(eoid);
-                }
-                if !wallet.is_empty() {
-                    if let Ok(front_orders) = self.http.fetch_frontend_open_orders(wallet, cfg) {
-                        for ord in &front_orders {
-                            let cloid_match = ord
-                                .get("cloid")
-                                .and_then(Value::as_str)
-                                .is_some_and(|c| c.trim().eq_ignore_ascii_case(&expected_cloid));
-                            if cloid_match {
-                                if let Some(oid) = extract_order_oid(ord) {
-                                    return Some(format!("hl-{oid}"));
-                                }
-                            }
-                        }
-                        for ord in &front_orders {
-                            let coin_match = ord
-                                .get("coin")
-                                .and_then(Value::as_str)
-                                .is_some_and(|c| c.trim().eq_ignore_ascii_case(&asset.coin));
-                            let is_trigger = ord
-                                .get("isTrigger")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            let type_match = ord
-                                .get("orderType")
-                                .and_then(Value::as_str)
-                                .is_some_and(|t| {
-                                    let lower = t.to_ascii_lowercase();
-                                    if is_tp {
-                                        lower.contains("take profit")
-                                    } else {
-                                        lower.contains("stop") && !lower.contains("take profit")
-                                    }
-                                });
-                            if coin_match && is_trigger && type_match {
-                                if let Some(oid) = extract_order_oid(ord) {
-                                    return Some(format!("hl-{oid}"));
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(expected_cloid)
-            }
-            Ok(ack) => {
-                tracing::warn!(
-                    symbol = %asset.symbol,
-                    leg = leg_label,
-                    trigger_px = trigger_px,
-                    error = ?ack.raw_error,
-                    "Hyperliquid rejected exchange trigger order"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    symbol = %asset.symbol,
-                    leg = leg_label,
-                    trigger_px = trigger_px,
-                    error = %e,
-                    "Failed to submit exchange trigger order"
-                );
-                None
-            }
-        }
-    }
-
+    /// Unconditionally recomputes `protective_stop_px` and `take_profit_px` from actual `fill_price`
+    /// (`P0-Exec-1`, `P1-Strat` without 2.0R override), promotes `WORKING -> OPEN`, attaches SL/TP triggers,
+    /// and enqueues a non-blocking HTML alert. Returns `(committed_usdc, final_stop_px)`.
     #[allow(clippy::too_many_arguments)]
     fn finalize_fill_to_open(
         &self,
@@ -2368,47 +2589,42 @@ impl OrderChaser {
         fill_price: f64,
         filled_qty: f64,
         fees_paid_usdc: f64,
-        stop_px: f64,
         exchange_order_id: Option<&str>,
         reason: &str,
         cfg: &ConfigMap,
-    ) -> Result<f64> {
-        let bars_1h = self
-            .db
-            .get_ohlcv_bars(asset.id, "1h", 20)
-            .unwrap_or_default();
-        let limits = RiskLimitsConfig::from_config_map(cfg);
-        let atr_opt = (!bars_1h.is_empty()).then(|| {
-            compute_atr_from_bars(&bars_1h, 14, fill_price, limits.protective_stop_default_pct)
-        });
-        let tick = asset.tick_size.max(1e-8);
-        let eff_stop_px = if stop_px > 0.0
-            && match side {
-                OrderSide::Long => stop_px < fill_price - tick * 0.5,
-                OrderSide::Short => stop_px > fill_price + tick * 0.5,
-            } {
-            snap_to_tick(stop_px, tick)
-        } else {
-            compute_initial_protective_stop(side, fill_price, atr_opt, tick, &limits)
-        };
-        let atr_tp_px = compute_initial_take_profit(side, fill_price, atr_opt, tick, &limits);
-        let min_2r_dist = (fill_price - eff_stop_px).abs() * 2.0;
-        let eff_tp_dist = (atr_tp_px - fill_price).abs().max(min_2r_dist);
-        let eff_tp_px = match side {
-            OrderSide::Long => snap_to_tick(fill_price + eff_tp_dist, tick),
-            OrderSide::Short => snap_to_tick((fill_price - eff_tp_dist).max(tick), tick),
+    ) -> Result<(f64, f64)> {
+        let (eff_stop_px, eff_tp_px) = {
+            let _guard = acquire_execution_lock();
+            let bars_1h = self
+                .db
+                .get_ohlcv_bars(asset.id, "1h", 20)
+                .unwrap_or_default();
+            let limits = RiskLimitsConfig::from_config_map(cfg);
+            let atr_opt = (!bars_1h.is_empty()).then(|| {
+                compute_atr_from_bars(&bars_1h, 14, fill_price, limits.protective_stop_default_pct)
+            });
+            let eff_tick = effective_hl_tick_size(fill_price, asset.tick_size, asset.sz_decimals)
+                .unwrap_or_else(|| asset.tick_size.max(1e-8));
+            let eff_stop_px =
+                compute_initial_protective_stop(side, fill_price, atr_opt, eff_tick, &limits);
+            let eff_tp_px =
+                compute_initial_take_profit(side, fill_price, atr_opt, eff_tick, &limits);
+
+            self.db.promote_working_to_open(
+                position_id,
+                fill_price,
+                filled_qty,
+                fees_paid_usdc,
+                eff_stop_px,
+                Some(eff_tp_px),
+                exchange_order_id,
+                reason,
+            )?;
+            self.working_initial_limits.lock().remove(&position_id);
+            (eff_stop_px, eff_tp_px)
         };
 
-        self.db.promote_working_to_open(
-            position_id,
-            fill_price,
-            filled_qty,
-            fees_paid_usdc,
-            eff_stop_px,
-            exchange_order_id,
-            reason,
-        )?;
-
+        // Unlocked HTTP TP/SL attachment (`R14-H2`)
         let (final_stop_px, _sl_oid, final_tp_px, _tp_oid) = self.ensure_exchange_tpsl_orders(
             position_id,
             asset,
@@ -2427,6 +2643,7 @@ impl OrderChaser {
 
         let committed_usdc = round_dp(fill_price * filled_qty, 4);
 
+        let _guard = acquire_execution_lock();
         if let (Ok(Some(pos)), Ok(snap)) = (
             self.db.get_position_by_id(position_id),
             self.db.get_latest_portfolio_snapshot(),
@@ -2450,33 +2667,74 @@ impl OrderChaser {
                 s3_weight: pos.s3_weight_contrib,
                 timestamp_ms: now_ms(),
             };
-            let _ = self.alerts.notify_order_filled_open(&alert);
+            let html = format_order_filled_open_html(&alert);
+            let payload = serde_json::to_value(&alert).ok();
+            let _ = self.alerts.enqueue_html_alert(
+                "ORDER_FILLED_OPEN",
+                "INFO",
+                &html,
+                payload.as_ref(),
+            );
+            self.wake_alert_worker();
         }
 
-        Ok(committed_usdc)
+        Ok((committed_usdc, final_stop_px))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aegis_db::{AssetUpsertInput, BarUpsertInput};
+    use aegis_test_support::mock_http::{MockHttpResponse, MockHttpServer};
+    use serde_json::json;
+
+    fn seed_test_asset(
+        db: &DatabaseManager,
+        coin: &str,
+        idx: u32,
+        px: f64,
+        tick: f64,
+    ) -> ExchangeAsset {
+        let id = db
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: coin.to_string(),
+                asset_index: idx,
+                sz_decimals: 2,
+                tick_size: tick,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: px,
+                mid_price: px,
+                oracle_price: px,
+                funding_rate_hourly: 0.0,
+                day_volume_usdc: 25_000_000.0,
+                open_interest_usdc: 10_000_000.0,
+                prev_day_price: px * 0.99,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+        db.get_asset_by_id(id).unwrap().unwrap()
+    }
 
     #[test]
     fn test_one_tick_bps_and_effective_chase_threshold() {
         let tick = 1e-6;
         let mid = 0.002488;
-        let one_tick_bps = compute_one_tick_bps(tick, mid);
+        let one_tick_bps = compute_one_tick_bps_opt(tick, mid).unwrap();
         assert!((one_tick_bps - 4.01929).abs() < 0.01);
         let eff_thresh = 4.0_f64.max(one_tick_bps * 1.5);
         assert!(one_tick_bps < eff_thresh);
         assert!((eff_thresh - 6.0289).abs() < 0.01);
-        assert_eq!(compute_one_tick_bps(tick, 0.0), 0.0);
+        assert!(compute_one_tick_bps_opt(tick, 0.0).is_none());
+        assert!(compute_one_tick_bps_opt(0.0, mid).is_none());
     }
 
     #[test]
     fn test_clamp_initial_and_chase_alo_prices_stay_strictly_passive() {
         let tick = 1e-6;
-        // PUMP-like tight book: bid=0.002488, ask=0.002489
         let buy_init = clamp_initial_alo_price(OrderSide::Long, 0.002495, 0.002488, 0.002489, tick);
         assert!((buy_init - 0.002488).abs() < 1e-9);
         assert!(buy_init < 0.002489);
@@ -2486,7 +2744,6 @@ mod tests {
         assert!((sell_init - 0.002489).abs() < 1e-9);
         assert!(sell_init > 0.002488);
 
-        // Locked book (bid == ask) still clamps strictly passive
         let buy_locked =
             clamp_initial_alo_price(OrderSide::Long, 0.002489, 0.002489, 0.002489, tick);
         assert!((buy_locked - 0.002488).abs() < 1e-9);
@@ -2494,7 +2751,6 @@ mod tests {
             clamp_initial_alo_price(OrderSide::Short, 0.002489, 0.002489, 0.002489, tick);
         assert!((sell_locked - 0.002490).abs() < 1e-9);
 
-        // Chase clamp prevents stale allMids from crossing live l2Book BBO
         let buy_chase =
             clamp_chase_alo_price(OrderSide::Long, 0.002495, Some((0.002488, 0.002489)), tick);
         assert!((buy_chase - 0.002488).abs() < 1e-9);
@@ -2502,7 +2758,6 @@ mod tests {
             clamp_chase_alo_price(OrderSide::Short, 0.002484, Some((0.002488, 0.002489)), tick);
         assert!((sell_chase - 0.002489).abs() < 1e-9);
 
-        // Immediate passive re-quote steps 1 extra tick passive from fresh l2Book
         let sell_rq = step_more_passive_alo_price(
             OrderSide::Short,
             0.002489,
@@ -2532,5 +2787,411 @@ mod tests {
             "Insufficient margin"
         )));
         assert!(!is_post_only_crossing_rejection(None));
+    }
+
+    #[test]
+    fn test_r14_m1_place_working_order_network_error_recovers_resting_and_filled_via_cloid() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let sol = seed_test_asset(&db, "SOL", 3, 180.0, 0.01);
+        let eth = seed_test_asset(&db, "ETH", 1, 2000.0, 0.1);
+
+        let scenario = Arc::new(Mutex::new("resting"));
+        let scenario_srv = Arc::clone(&scenario);
+        let srv = MockHttpServer::start(move |req| {
+            let mode = *scenario_srv.lock();
+            if req.path == "/exchange" {
+                let is_trigger = req
+                    .json_body
+                    .pointer("/action/orders/0/t/trigger")
+                    .is_some();
+                if is_trigger {
+                    return MockHttpResponse::ok_json(&json!({
+                        "status": "ok",
+                        "response": { "type": "order", "data": { "statuses": [{ "waitingForTrigger": { "oid": 88001u64 } }] } }
+                    }));
+                }
+                return MockHttpResponse::json(500, &json!({ "error": "timeout" }));
+            }
+            match req
+                .json_body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+            {
+                "l2Book" => MockHttpResponse::ok_json(&json!({
+                    "levels": [
+                        [{ "px": "180.00", "sz": "50.0" }],
+                        [{ "px": "180.05", "sz": "50.0" }]
+                    ]
+                })),
+                "orderStatus" => match mode {
+                    "resting" => MockHttpResponse::ok_json(&json!({
+                        "status": "order",
+                        "order": {
+                            "status": "open",
+                            "order": { "oid": 44111u64, "origSz": "1.0", "sz": "1.0", "limitPx": "180.00" }
+                        }
+                    })),
+                    "filled" => MockHttpResponse::ok_json(&json!({
+                        "status": "order",
+                        "order": {
+                            "status": "filled",
+                            "order": { "oid": 44222u64, "origSz": "0.5", "sz": "0.0", "limitPx": "2000.0", "avgPx": "1999.8" }
+                        }
+                    })),
+                    _ => MockHttpResponse::ok_json(&json!({ "status": "unknownOid" })),
+                },
+                _ => MockHttpResponse::ok_json(&json!([])),
+            }
+        });
+
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("hyperliquid_allowed_hosts", "127.0.0.1", None)
+            .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "private_key",
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            None,
+        )
+        .unwrap();
+
+        let chaser = OrderChaser::new(
+            db.clone(),
+            HyperliquidHttpClient::new(5),
+            AlertEngine::new(db.clone()),
+        );
+
+        // 1. Recover resting WORKING order via cloid probe
+        let pid1 = chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: sol,
+                side: OrderSide::Long,
+                requested_quantity: 1.0,
+                reserved_margin_usdc: 180.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 170.0,
+                reason: "R14_M1_RESTING".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+        let p1 = db.get_position_by_id(pid1).unwrap().unwrap();
+        assert_eq!(p1.status, "WORKING");
+        assert_eq!(p1.exchange_order_id.as_deref(), Some("hl-44111"));
+
+        // 2. Recover immediate filled order via cloid probe -> promotes to OPEN with SL/TP
+        *scenario.lock() = "filled";
+        let pid2 = chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: eth,
+                side: OrderSide::Long,
+                requested_quantity: 0.5,
+                reserved_margin_usdc: 1000.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 1900.0,
+                reason: "R14_M1_FILLED".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+        let p2 = db.get_position_by_id(pid2).unwrap().unwrap();
+        assert_eq!(p2.status, "OPEN");
+        assert!((p2.entry_price - 1999.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_p0_exec1_p1_strat_drift_abort_fill_stop_recompute_and_no_2r_override() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let sol = seed_test_asset(&db, "SOL", 3, 100.0, 0.01);
+        let base_ts = now_ms() - 20 * 3_600_000;
+        let bars: Vec<BarUpsertInput> = (0..20)
+            .map(|i| BarUpsertInput {
+                asset_id: sol.id,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + i * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1000.0,
+                funding_rate: 0.0,
+            })
+            .collect();
+        db.upsert_ohlcv_bars(&bars).unwrap();
+
+        let chaser = OrderChaser::new(
+            db.clone(),
+            HyperliquidHttpClient::new(5),
+            AlertEngine::new(db.clone()),
+        );
+
+        // 1. Place WORKING order at ~99.99 (mid=100.0), then chase drifts > 60 bps (to 101.0 = +101 bps):
+        //    must abort WORKING order and insert CHURN_GUARD cooldown!
+        let pid1 = chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: sol.clone(),
+                side: OrderSide::Long,
+                requested_quantity: 1.0,
+                reserved_margin_usdc: 100.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 95.6,
+                reason: "DRIFT_ABORT_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+        db.update_asset_live_quote(sol.id, 101.0, 101.0).unwrap();
+        let ord1 = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pid1)
+            .unwrap();
+        let outcome = chaser.advance_working_order(&ord1).unwrap();
+        assert!(matches!(
+            outcome,
+            ChaseStepOutcome::Cancelled { ref reason, .. } if reason == "HL_ALO_CHASE_DRIFT_ABORT"
+        ));
+        assert!(db.is_asset_in_cooldown(sol.id).unwrap());
+
+        // 2. Clear cooldown, place order, fill at 105.0 (above initial 99.99):
+        //    must recompute protective_stop_px from 105.0 (NOT keep stale 95.6!) and honor 2.8x ATR TP
+        //    WITHOUT forcing a 2.0 * stop_dist override!
+        let eth = seed_test_asset(&db, "ETH", 1, 100.0, 0.01);
+        let eth_bars: Vec<BarUpsertInput> = (0..20)
+            .map(|i| BarUpsertInput {
+                asset_id: eth.id,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + i * 3_600_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1000.0,
+                funding_rate: 0.0,
+            })
+            .collect();
+        db.upsert_ohlcv_bars(&eth_bars).unwrap();
+
+        let cfg = db.load_config().unwrap();
+        let pid2 = chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: eth.clone(),
+                side: OrderSide::Long,
+                requested_quantity: 1.0,
+                reserved_margin_usdc: 100.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 95.6,
+                reason: "STOP_RECOMPUTE_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+        let (_comm, recomputed_stop) = chaser
+            .finalize_fill_to_open(
+                pid2,
+                &eth,
+                OrderSide::Long,
+                105.0,
+                1.0,
+                0.01,
+                None,
+                "TEST_FILL",
+                &cfg,
+            )
+            .unwrap();
+        let pos2 = db.get_position_by_id(pid2).unwrap().unwrap();
+        // ATR=2.0 -> stop_dist = 2.2 * 2.0 = 4.4 -> stop = 105.0 - 4.4 = 100.60 (NOT stale 95.6!)
+        assert!((recomputed_stop - 100.60).abs() < 0.05);
+        assert!((pos2.protective_stop_px - recomputed_stop).abs() < 1e-6);
+        // ATR=2.0 -> tp_dist = 2.8 * 2.0 = 5.6 -> tp = 105.0 + 5.6 = 110.60 (NOT 105 + 2*4.4 = 113.8!)
+        assert!((pos2.take_profit_px - 110.60).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_sec11_native_alo_1tick_wire_equivalence_preservation() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let pump = seed_test_asset(&db, "PUMP", 9, 1000.0, 0.1);
+
+        // Mock L2 book with 1-tick spread (1000.0 / 1000.1)
+        let srv = MockHttpServer::start(|req| {
+            if req.path == "/info" {
+                match req
+                    .json_body
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "l2Book" => MockHttpResponse::ok_json(&json!({
+                        "levels": [
+                            [{ "px": "1000.0", "sz": "10.0" }],
+                            [{ "px": "1000.1", "sz": "10.0" }]
+                        ]
+                    })),
+                    _ => MockHttpResponse::ok_json(&json!([])),
+                }
+            } else {
+                MockHttpResponse::ok_json(&json!({
+                    "status": "ok",
+                    "response": { "type": "order", "data": { "statuses": [{ "resting": { "oid": 9991u64 } }] } }
+                }))
+            }
+        });
+
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("hyperliquid_allowed_hosts", "127.0.0.1", None)
+            .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "private_key",
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            None,
+        )
+        .unwrap();
+
+        let chaser = OrderChaser::new(
+            db.clone(),
+            HyperliquidHttpClient::new(5),
+            AlertEngine::new(db.clone()),
+        );
+        let pid = chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: pump.clone(),
+                side: OrderSide::Long,
+                requested_quantity: 1.0,
+                reserved_margin_usdc: 1000.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 950.0,
+                reason: "1TICK_PRESERVE".to_string(),
+                bypass_entry_interval: true,
+            })
+            .unwrap();
+
+        // Simulate minor allMids drift to 1000.9 while BBO stays 1000.0 / 1000.1 ->
+        // already resting at bid 1000.0 -> must preserve queue with ZERO /exchange cancels!
+        srv.clear_requests();
+        db.update_asset_live_quote(pump.id, 1000.9, 1000.9).unwrap();
+        let ord = db
+            .get_assets_ordered()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.position_id == pid)
+            .unwrap();
+        let res = chaser.advance_working_order(&ord).unwrap();
+        assert!(matches!(res, ChaseStepOutcome::Resting { .. }));
+        assert!(srv.requests().into_iter().all(|r| r.path != "/exchange"));
+    }
+
+    #[test]
+    fn test_p0_exec1_repeated_hl_rejects_and_alo_expiries_insert_cooldown() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let doge = seed_test_asset(&db, "DOGE", 2, 0.25, 0.0001);
+        let kpepe = seed_test_asset(&db, "kPEPE", 7, 0.015, 0.00001);
+
+        let srv = MockHttpServer::start(|req| {
+            if req.path == "/info" {
+                match req
+                    .json_body
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "l2Book" => MockHttpResponse::ok_json(&json!({
+                        "levels": [
+                            [{ "px": "0.01499", "sz": "10000" }],
+                            [{ "px": "0.01500", "sz": "10000" }]
+                        ]
+                    })),
+                    _ => MockHttpResponse::ok_json(&json!([])),
+                }
+            } else {
+                MockHttpResponse::ok_json(&json!({
+                    "status": "ok",
+                    "response": { "type": "order", "data": { "statuses": [{ "error": "Insufficient margin to place order" }] } }
+                }))
+            }
+        });
+
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &srv.base_url(), None)
+            .unwrap();
+        db.set_config_value("hyperliquid_allowed_hosts", "127.0.0.1", None)
+            .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+            None,
+        )
+        .unwrap();
+        db.set_config_value(
+            "private_key",
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+            None,
+        )
+        .unwrap();
+
+        let chaser = OrderChaser::new(
+            db.clone(),
+            HyperliquidHttpClient::new(5),
+            AlertEngine::new(db.clone()),
+        );
+
+        // 1. Hard non-transient reject immediately activates CHURN_GUARD cooldown on kPEPE
+        assert!(chaser
+            .place_working_order(&NewWorkingOrderRequest {
+                asset: kpepe.clone(),
+                side: OrderSide::Long,
+                requested_quantity: 1000.0,
+                reserved_margin_usdc: 15.0,
+                portfolio_weight: 0.05,
+                s1_weight_contrib: 0.05,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 0.014,
+                reason: "HARD_REJECT_TEST".to_string(),
+                bypass_entry_interval: true,
+            })
+            .is_err());
+        assert!(db.is_asset_in_cooldown(kpepe.id).unwrap());
+
+        // 2. Repeated ALO expiry window activates cooldown on DOGE
+        let cfg = db.load_config().unwrap();
+        let ccfg = ChaserConfig::from_config(&cfg);
+        chaser.record_alo_expiry_and_maybe_cooldown(
+            doge.id,
+            &doge.symbol,
+            "HL_ALO_EXPIRED_CANCELLED",
+            &ccfg,
+        );
+        assert!(db.is_asset_in_cooldown(doge.id).unwrap());
     }
 }
