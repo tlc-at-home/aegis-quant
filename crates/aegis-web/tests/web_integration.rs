@@ -3576,7 +3576,7 @@ async fn test_dashboard_db_failure_returns_503_and_sse_broadcasts_degraded_witho
         let sections = json["degraded_sections"].as_array().unwrap();
         assert!(sections.iter().any(|s| s == "v_assets_held"));
         assert!(!body_str.contains("mysql://"));
-        assert!(!body_str.contains("aegis_v2_local"));
+        assert!(!body_str.contains("synthetic_test_pw_99"));
         assert!(!body_str.contains("SELECT "));
     }
 
@@ -4079,7 +4079,7 @@ async fn test_sse_stream_terminates_immediately_on_session_revocation_and_expiry
 #[tokio::test]
 async fn test_health_503_and_internal_500_sanitize_mysql_errors_with_correlation_id() {
     let secret_dsn_err =
-        "mysql://aegis:aegis_v2_local@10.0.0.5:3306/aegis_quant Access denied SELECT * FROM system_config";
+        "mysql://aegis:synthetic_test_pw_99@10.0.0.5:3306/aegis_quant Access denied SELECT * FROM system_config";
     let resp_503 = health_result_to_response(Err(AegisError::Database(secret_dsn_err.to_string())));
     assert_eq!(resp_503.status(), StatusCode::SERVICE_UNAVAILABLE);
     let bytes_503 = axum::body::to_bytes(resp_503.into_body(), 64 * 1024)
@@ -4091,7 +4091,7 @@ async fn test_health_503_and_internal_500_sanitize_mysql_errors_with_correlation
     assert!(json_503["correlation_id"]
         .as_str()
         .is_some_and(|c| c.starts_with("err-")));
-    for secret in ["aegis_v2_local", "mysql://", "10.0.0.5", "SELECT *"] {
+    for secret in ["synthetic_test_pw_99", "mysql://", "10.0.0.5", "SELECT *"] {
         assert!(!str_503.contains(secret), "503 leaked {secret}: {str_503}");
     }
 
