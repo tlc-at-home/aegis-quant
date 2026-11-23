@@ -14,6 +14,7 @@ use crate::signing::{
     snap_to_lot, snap_to_tick,
 };
 use crate::tpsl_sync::{ensure_exchange_tpsl_orders_detailed, TpslSyncRequest};
+use crate::ws_client::WsStateCache;
 use aegis_alerts::{
     format_order_filled_open_html, format_working_order_placed_html, AlertEngine,
     OrderFilledOpenAlert, WorkingOrderPlacedAlert,
@@ -369,6 +370,7 @@ pub struct OrderChaser {
     working_initial_limits: Arc<Mutex<HashMap<i64, f64>>>,
     asset_failure_counters: Arc<Mutex<HashMap<i64, AssetFailureCounters>>>,
     alert_wakeup_tx: Option<SyncSender<usize>>,
+    ws_cache: Option<Arc<WsStateCache>>,
 }
 
 impl OrderChaser {
@@ -380,6 +382,7 @@ impl OrderChaser {
             working_initial_limits: Arc::new(Mutex::new(HashMap::new())),
             asset_failure_counters: Arc::new(Mutex::new(HashMap::new())),
             alert_wakeup_tx: None,
+            ws_cache: None,
         }
     }
 
@@ -387,6 +390,29 @@ impl OrderChaser {
     pub fn with_alert_wakeup(mut self, wakeup_tx: SyncSender<usize>) -> Self {
         self.alert_wakeup_tx = Some(wakeup_tx);
         self
+    }
+
+    /// Attaches a shared [`WsStateCache`] so `l2Book` and `clearinghouseState` reads avoid REST
+    /// polling when fresh WebSocket frames are available (`R14-H4` Phase 2).
+    pub fn with_ws_cache(mut self, ws_cache: Arc<WsStateCache>) -> Self {
+        self.ws_cache = Some(ws_cache);
+        self
+    }
+
+    fn fetch_fresh_l2_bbo(&self, coin: &str, cfg: &ConfigMap) -> Option<(f64, f64)> {
+        if let Some(bbo) = self
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_l2_bbo(coin))
+            .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+        {
+            return Some(bbo);
+        }
+        self.http
+            .fetch_l2_book(coin, cfg)
+            .ok()
+            .flatten()
+            .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
     }
 
     /// Prunes cached `working_initial_limits` and expired failure windows to prevent unbounded growth (`R14-L6`).
@@ -642,12 +668,7 @@ impl OrderChaser {
                     req.asset.symbol
                 )));
             }
-            let l2_bbo = self
-                .http
-                .fetch_l2_book(&req.asset.coin, &cfg)
-                .ok()
-                .flatten()
-                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b);
+            let l2_bbo = self.fetch_fresh_l2_bbo(&req.asset.coin, &cfg);
             if let Some((bid, ask)) = l2_bbo {
                 let mid_bbo = (bid + ask) * 0.5;
                 if mid_bbo > 0.0 {
@@ -1325,11 +1346,7 @@ impl OrderChaser {
             self.resolve_initial_limit_price(ordered.position_id, ordered.limit_price);
 
         let l2_bbo = if is_live_exchange {
-            self.http
-                .fetch_l2_book(&asset.coin, cfg)
-                .ok()
-                .flatten()
-                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+            self.fetch_fresh_l2_bbo(&asset.coin, cfg)
         } else {
             None
         };
@@ -1688,11 +1705,7 @@ impl OrderChaser {
             self.resolve_initial_limit_price(ordered.position_id, ordered.limit_price);
 
         let l2_bbo = if is_live_exchange {
-            self.http
-                .fetch_l2_book(&asset.coin, cfg)
-                .ok()
-                .flatten()
-                .filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b)
+            self.fetch_fresh_l2_bbo(&asset.coin, cfg)
         } else {
             None
         };
@@ -2441,7 +2454,15 @@ impl OrderChaser {
                 "wallet_address is empty; cannot verify clearinghouseState".to_string(),
             ));
         }
-        let ch_state = self.http.fetch_clearinghouse_state(&wallet, cfg)?;
+        let ch_state = if let Some(ws_ch) = self
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_clearinghouse_state())
+        {
+            ws_ch
+        } else {
+            self.http.fetch_clearinghouse_state(&wallet, cfg)?
+        };
         Ok(extract_position_state_from_ch_value(&ch_state, asset, side))
     }
 

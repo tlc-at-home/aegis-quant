@@ -28,6 +28,7 @@ use crate::http_client::{
     is_testnet_configured, HyperliquidHttpClient, OpenOrdersSnapshot, RequestOptions,
 };
 use crate::lock_guard::acquire_execution_lock;
+use crate::ws_client::WsStateCache;
 use aegis_core::{
     extract_hl_oid, mask_identifier, now_ms, CachedHlPortfolioPnl, ConfigMap, ExchangeAsset,
     ExecutionMode, HeldAssetView, Result, VaultInfoPayload,
@@ -46,7 +47,7 @@ use equity::{
     refresh_equity_snapshot_unlocked,
 };
 use ledger::{
-    compute_fifo_closed_orders_and_funding, fetch_windowed_fills_unlocked,
+    compute_fifo_closed_orders_and_funding, fetch_windowed_fills_with_ws_unlocked,
     group_db_funding_records, FifoFundingReplayOutput, ReconcileLedgerCache,
     LEDGER_REPLAY_MIN_INTERVAL_MS,
 };
@@ -81,6 +82,7 @@ pub struct CutoverReconciler {
     pub http: HyperliquidHttpClient,
     in_flight_position_ops: Arc<Mutex<HashSet<i64>>>,
     ledger_cache: Arc<Mutex<HashMap<(String, String), ReconcileLedgerCache>>>,
+    ws_cache: Option<Arc<WsStateCache>>,
 }
 
 impl CutoverReconciler {
@@ -90,6 +92,7 @@ impl CutoverReconciler {
             http,
             in_flight_position_ops: Arc::new(Mutex::new(HashSet::new())),
             ledger_cache: Arc::new(Mutex::new(HashMap::new())),
+            ws_cache: None,
         }
     }
 
@@ -100,6 +103,13 @@ impl CutoverReconciler {
         in_flight_position_ops: Arc<Mutex<HashSet<i64>>>,
     ) -> Self {
         self.in_flight_position_ops = in_flight_position_ops;
+        self
+    }
+
+    /// Attaches a shared [`WsStateCache`] so steady-state reconciliation consumes fresh User WS
+    /// snapshots when connected & gap-filled and runs an immediate REST gap-fill on WS reconnect (`R14-H4`).
+    pub fn with_ws_cache(mut self, ws_cache: Arc<WsStateCache>) -> Self {
+        self.ws_cache = Some(ws_cache);
         self
     }
 
@@ -220,28 +230,61 @@ impl CutoverReconciler {
             ..Default::default()
         };
 
-        // Phase 2: Unlocked HTTP IO (ZERO execution_lock())
+        // Phase 2: Unlocked HTTP IO (ZERO execution_lock()), consuming fresh User WS when connected & gap-filled
         let bg_opts =
             RequestOptions::background_sync().with_timeout_sec(self.http.timeout_sec.min(8));
-        let ch_state = match self
-            .http
-            .fetch_clearinghouse_state_with_options(&wallet, &cfg, bg_opts)
-        {
-            Ok(val) => {
-                report.exchange_reachable = true;
-                val
-            }
-            Err(e) => {
-                report
-                    .details
-                    .push(format!("Clearinghouse state unreachable: {e}"));
-                let _ = self.db.log_telemetry(
-                    "WARN",
-                    "execution.reconcile",
-                    &format!("Hyperliquid clearinghouseState unreachable during cutover: {e}"),
-                    Some(serde_json::to_value(&report).unwrap_or_default()),
-                );
-                return Ok(report);
+        let user_reconnect_seq = self
+            .ws_cache
+            .as_ref()
+            .map(|c| c.user_reconnect_count())
+            .unwrap_or(0);
+        let needs_gap_fill = self
+            .ws_cache
+            .as_ref()
+            .is_some_and(|c| c.needs_rest_gap_reconcile());
+        let ws_disconnected_since = self
+            .ws_cache
+            .as_ref()
+            .map(|c| c.user_disconnected_since_ms())
+            .unwrap_or(0);
+        let ws_user_ready = !force_ledger_replay
+            && !close_legacy_positions
+            && self
+                .ws_cache
+                .as_ref()
+                .is_some_and(|c| c.is_user_ws_ready_for_reconcile());
+
+        let ws_ch_opt = if ws_user_ready {
+            self.ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_clearinghouse_state_if_gap_filled())
+        } else {
+            None
+        };
+        let ch_state = if let Some(ws_ch) = ws_ch_opt {
+            report.exchange_reachable = true;
+            ws_ch
+        } else {
+            match self
+                .http
+                .fetch_clearinghouse_state_with_options(&wallet, &cfg, bg_opts)
+            {
+                Ok(val) => {
+                    report.exchange_reachable = true;
+                    val
+                }
+                Err(e) => {
+                    report
+                        .details
+                        .push(format!("Clearinghouse state unreachable: {e}"));
+                    let _ = self.db.log_telemetry(
+                        "WARN",
+                        "execution.reconcile",
+                        &format!("Hyperliquid clearinghouseState unreachable during cutover: {e}"),
+                        Some(serde_json::to_value(&report).unwrap_or_default()),
+                    );
+                    return Ok(report);
+                }
             }
         };
 
@@ -262,12 +305,24 @@ impl CutoverReconciler {
             ));
         }
 
-        let (open_orders_snap_opt, open_orders_fetch_ok) = match self
-            .http
-            .fetch_open_orders_with_metadata_opts(&wallet, &cfg, bg_opts)
-        {
-            Ok(snap) => (Some(snap), true),
-            Err(_) => (None, false),
+        let ws_orders_opt = if ws_user_ready {
+            self.ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_open_orders())
+                .filter(|s| s.metadata_complete)
+        } else {
+            None
+        };
+        let (open_orders_snap_opt, open_orders_fetch_ok) = if let Some(ws_orders) = ws_orders_opt {
+            (Some(ws_orders), true)
+        } else {
+            match self
+                .http
+                .fetch_open_orders_with_metadata_opts(&wallet, &cfg, bg_opts)
+            {
+                Ok(snap) => (Some(snap), true),
+                Err(_) => (None, false),
+            }
         };
         let open_orders_snap = open_orders_snap_opt.unwrap_or(OpenOrdersSnapshot {
             orders: Vec::new(),
@@ -345,10 +400,13 @@ impl CutoverReconciler {
                 cache_map.clear();
             }
             let cache_entry = cache_map.entry(cache_key.clone()).or_default();
-            let fills_res = fetch_windowed_fills_unlocked(
+            let fills_res = fetch_windowed_fills_with_ws_unlocked(
                 &self.http,
                 &wallet,
                 cache_entry,
+                self.ws_cache.as_deref(),
+                force_ledger_replay || needs_gap_fill,
+                ws_disconnected_since,
                 earliest_local_open_ms,
                 snapshot_ts_ms,
                 &cfg,
@@ -372,6 +430,16 @@ impl CutoverReconciler {
                 }
             }
         };
+
+        if needs_gap_fill
+            && report.exchange_reachable
+            && open_orders_fetch_ok
+            && user_fills_fetch_ok
+        {
+            if let Some(ref ws_cache) = self.ws_cache {
+                ws_cache.try_clear_rest_gap_reconcile(user_reconnect_seq);
+            }
+        }
 
         let funding_by_coin = group_db_funding_records(&db_funding_records);
         let replay_out = if user_fills_fetch_ok {

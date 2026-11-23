@@ -7,6 +7,10 @@
 
 use crate::http_client::{is_testnet_configured, HyperliquidHttpClient};
 use crate::signing::infer_tick_size;
+use crate::ws_client::{
+    build_ws_subscription_set_from_assets, WsActiveAssetCtx, WsStateCache, WsSubscriptionSet,
+    WS_ACTIVE_CTX_FRESH_MS, WS_CANDLE_FRESH_MS, WS_MIDS_FRESH_MS,
+};
 use aegis_core::{
     normalize_hyperliquid_symbol, now_ms, parse_hl_f64, parse_hl_f64_opt, round_dp, ConfigMap,
     ExchangeAsset, Result,
@@ -25,6 +29,89 @@ const CANDLE_POST_BOUNDARY_TRIGGER_MS: i64 = 15_000;
 const CANDLE_INCREMENTAL_DB_MIN_BARS: usize = 48;
 const DEFAULT_CANDLE_REFRESH_MAX_ASSETS: usize = 30;
 const MAX_CANDLE_ASSETS_PER_3S_TICK: usize = 2;
+const META_UNIVERSE_DISCOVERY_INTERVAL_MS: i64 = 60_000;
+
+struct RawParsedAsset {
+    coin: String,
+    asset_index: u32,
+    sz_decimals: u32,
+    max_leverage: f64,
+    mark_price: f64,
+    mid_price: f64,
+    oracle_price: f64,
+    funding_rate_hourly: f64,
+    day_volume_usdc: f64,
+    open_interest_usdc: f64,
+    prev_day_price: f64,
+}
+
+fn finalize_asset_upsert_inputs(
+    parsed: Vec<RawParsedAsset>,
+    cfg: &ConfigMap,
+) -> Vec<AssetUpsertInput> {
+    let is_testnet = is_testnet_configured(cfg);
+    let (core_min_vol, event_min_vol, core_min_oi, event_min_oi) = if is_testnet {
+        (
+            cfg.get_f64("testnet_core_min_day_volume_usdc", 50_000.0)
+                .max(0.0),
+            cfg.get_f64("testnet_event_min_day_volume_usdc", 50_000.0)
+                .max(0.0),
+            cfg.get_f64("testnet_core_min_open_interest_usdc", 50_000.0)
+                .max(0.0),
+            cfg.get_f64("testnet_event_min_open_interest_usdc", 50_000.0)
+                .max(0.0),
+        )
+    } else {
+        (
+            cfg.get_f64("core_min_day_volume_usdc", 2_000_000.0)
+                .max(0.0),
+            cfg.get_f64("event_min_day_volume_usdc", 500_000.0).max(0.0),
+            cfg.get_f64("core_min_open_interest_usdc", 250_000.0)
+                .max(0.0),
+            cfg.get_f64("event_min_open_interest_usdc", 100_000.0)
+                .max(0.0),
+        )
+    };
+
+    let mut inputs = Vec::with_capacity(parsed.len());
+    for p in parsed {
+        let lot_step_size = 10_f64.powi(-(p.sz_decimals as i32)).max(1e-6);
+        let tick_size = infer_tick_size(p.mark_price, p.sz_decimals);
+        let passes_core_liquidity =
+            p.day_volume_usdc >= core_min_vol && p.open_interest_usdc >= core_min_oi;
+        let passes_event_liquidity =
+            p.day_volume_usdc >= event_min_vol && p.open_interest_usdc >= event_min_oi;
+        let is_core = passes_core_liquidity;
+        let is_event = is_core || passes_event_liquidity;
+
+        let day_change_pct = if p.prev_day_price > 0.0 {
+            ((p.mark_price - p.prev_day_price) / p.prev_day_price).abs()
+        } else {
+            0.0
+        };
+        let is_prio = is_event && (p.funding_rate_hourly.abs() >= 0.0004 || day_change_pct >= 0.08);
+
+        inputs.push(AssetUpsertInput {
+            raw_symbol_or_coin: p.coin,
+            asset_index: p.asset_index,
+            sz_decimals: p.sz_decimals,
+            tick_size,
+            lot_step_size,
+            max_leverage: p.max_leverage,
+            mark_price: p.mark_price,
+            mid_price: p.mid_price,
+            oracle_price: p.oracle_price,
+            funding_rate_hourly: p.funding_rate_hourly,
+            day_volume_usdc: p.day_volume_usdc,
+            open_interest_usdc: p.open_interest_usdc,
+            prev_day_price: p.prev_day_price,
+            is_core_eligible: is_core,
+            is_event_eligible: is_event,
+            is_priority_watched: is_prio,
+        });
+    }
+    inputs
+}
 
 fn is_timeframe_sync_due(last_sync_ms: Option<i64>, now: i64, tf_ms: i64, ttl_ms: i64) -> bool {
     let Some(last) = last_sync_ms else {
@@ -56,6 +143,9 @@ pub struct MarketWatcher {
     pub db: DatabaseManager,
     pub http: HyperliquidHttpClient,
     last_bar_sync_ms: Arc<Mutex<HashMap<(i64, String), i64>>>,
+    last_meta_rest_poll_ms: Arc<Mutex<i64>>,
+    ws_cache: Option<Arc<WsStateCache>>,
+    ws_sub_tx: Option<Arc<tokio::sync::watch::Sender<WsSubscriptionSet>>>,
 }
 
 impl MarketWatcher {
@@ -64,7 +154,27 @@ impl MarketWatcher {
             db,
             http,
             last_bar_sync_ms: Arc::new(Mutex::new(HashMap::new())),
+            last_meta_rest_poll_ms: Arc::new(Mutex::new(0)),
+            ws_cache: None,
+            ws_sub_tx: None,
         }
+    }
+
+    /// Attaches a shared [`WsStateCache`] so `allMids`, `activeAssetCtx`, and WS candles
+    /// are consumed directly when fresh, reducing `metaAndAssetCtxs` REST polling to 60s.
+    pub fn with_ws_cache(mut self, ws_cache: Arc<WsStateCache>) -> Self {
+        self.ws_cache = Some(ws_cache);
+        self
+    }
+
+    /// Attaches a `watch::Sender<WsSubscriptionSet>` to dynamically synchronize Market WS
+    /// `activeAssetCtx`/`candle`/`l2Book` subscriptions as active/priority/top-30 coins change.
+    pub fn with_ws_subscriptions(
+        mut self,
+        ws_sub_tx: Arc<tokio::sync::watch::Sender<WsSubscriptionSet>>,
+    ) -> Self {
+        self.ws_sub_tx = Some(ws_sub_tx);
+        self
     }
 
     /// Executes a single 3-second full-exchange scan:
@@ -192,6 +302,28 @@ impl MarketWatcher {
             }
         }
 
+        if let Some(ref sub_tx) = self.ws_sub_tx {
+            if let Ok(all_assets) = self.db.list_exchange_assets() {
+                let candle_max = cfg.get_usize(
+                    "candle_refresh_max_assets",
+                    DEFAULT_CANDLE_REFRESH_MAX_ASSETS,
+                );
+                let next_set = build_ws_subscription_set_from_assets(
+                    &all_assets,
+                    &active_asset_ids,
+                    candle_max,
+                );
+                sub_tx.send_if_modified(|cur| {
+                    if *cur != next_set {
+                        *cur = next_set;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+
         let bars_refreshed = self
             .refresh_bars_for_eligible_assets(
                 MAX_CANDLE_ASSETS_PER_3S_TICK,
@@ -213,15 +345,62 @@ impl MarketWatcher {
         })
     }
 
-    /// Parses live `metaAndAssetCtxs` from Hyperliquid into normalized [`AssetUpsertInput`] records.
-    ///
-    /// Uses `midPx` embedded in `metaAndAssetCtxs`, falling back to `allMids` only when `midPx`
-    /// is absent across the universe (`R14-H4`).
+    /// Parses live `metaAndAssetCtxs` or fresh Market WS cache (`allMids` + `activeAssetCtx`) into
+    /// normalized [`AssetUpsertInput`] records, reducing REST `metaAndAssetCtxs` polling to 60s
+    /// universe discovery whenever Market WS is connected and fresh (`R14-H4` Phase 2).
     pub fn fetch_live_asset_inputs(&self, cfg: &ConfigMap) -> Option<Vec<AssetUpsertInput>> {
         if !crate::engine::is_live_exchange_active(&self.db, cfg) {
             return None;
         }
-        let meta_ctxs = self.http.fetch_meta_and_asset_ctxs(cfg).ok()?;
+        let now = now_ms();
+        let ws_mids = self
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_all_mids_at(now, WS_MIDS_FRESH_MS));
+        let ws_ctxs = self
+            .ws_cache
+            .as_ref()
+            .and_then(|c| c.get_fresh_active_asset_ctxs_map_at(now, WS_ACTIVE_CTX_FRESH_MS));
+        let ws_market_fresh = self
+            .ws_cache
+            .as_ref()
+            .is_some_and(|c| c.is_market_ws_connected())
+            && (ws_mids.is_some() || ws_ctxs.is_some());
+
+        let existing_assets = self.db.list_exchange_assets().unwrap_or_default();
+        let last_meta_ms = *self.last_meta_rest_poll_ms.lock();
+        if ws_market_fresh
+            && !existing_assets.is_empty()
+            && last_meta_ms > 0
+            && now.saturating_sub(last_meta_ms) < META_UNIVERSE_DISCOVERY_INTERVAL_MS
+        {
+            let inputs = Self::build_asset_inputs_from_ws_overlay(
+                &existing_assets,
+                ws_mids.as_ref(),
+                ws_ctxs.as_ref(),
+                cfg,
+            );
+            if !inputs.is_empty() {
+                return Some(inputs);
+            }
+        }
+
+        let Ok(meta_ctxs) = self.http.fetch_meta_and_asset_ctxs(cfg) else {
+            if ws_market_fresh && !existing_assets.is_empty() {
+                let inputs = Self::build_asset_inputs_from_ws_overlay(
+                    &existing_assets,
+                    ws_mids.as_ref(),
+                    ws_ctxs.as_ref(),
+                    cfg,
+                );
+                if !inputs.is_empty() {
+                    return Some(inputs);
+                }
+            }
+            return None;
+        };
+        *self.last_meta_rest_poll_ms.lock() = now;
+
         let has_ctx_mids = meta_ctxs
             .as_array()
             .and_then(|arr| arr.get(1))
@@ -230,12 +409,87 @@ impl MarketWatcher {
                 ctxs.iter()
                     .any(|c| parse_hl_f64_opt(c.get("midPx")).is_some_and(|p| p > 0.0))
             });
-        let mids = if has_ctx_mids {
+        let mids = if let Some(m) = ws_mids {
+            m
+        } else if has_ctx_mids {
             HashMap::new()
         } else {
             self.http.fetch_all_mids(cfg).unwrap_or_default()
         };
-        Self::parse_live_asset_inputs(&meta_ctxs, &mids, cfg)
+        Self::parse_live_asset_inputs_with_ws_ctx(&meta_ctxs, &mids, ws_ctxs.as_ref(), cfg)
+    }
+
+    fn build_asset_inputs_from_ws_overlay(
+        existing: &[ExchangeAsset],
+        ws_mids: Option<&HashMap<String, f64>>,
+        ws_ctxs: Option<&HashMap<String, WsActiveAssetCtx>>,
+        cfg: &ConfigMap,
+    ) -> Vec<AssetUpsertInput> {
+        let mut parsed = Vec::with_capacity(existing.len());
+        for asset in existing {
+            let coin_upper = asset.coin.to_ascii_uppercase();
+            let ctx_opt = ws_ctxs.and_then(|m| m.get(&coin_upper));
+            let ws_mid_opt = ws_mids
+                .and_then(|m| m.get(&asset.coin).or_else(|| m.get(&coin_upper)))
+                .copied()
+                .filter(|&p| p > 0.0);
+
+            let mark_price = ctx_opt
+                .map(|c| c.mark_px)
+                .filter(|&p| p > 0.0)
+                .or(ws_mid_opt)
+                .unwrap_or(asset.mark_price);
+            if mark_price <= 0.0 {
+                continue;
+            }
+            let mid_price = ws_mid_opt
+                .or_else(|| ctx_opt.map(|c| c.mid_px).filter(|&p| p > 0.0))
+                .unwrap_or(if asset.mid_price > 0.0 {
+                    asset.mid_price
+                } else {
+                    mark_price
+                });
+            let oracle_price = ctx_opt.map(|c| c.oracle_px).filter(|&p| p > 0.0).unwrap_or(
+                if asset.oracle_price > 0.0 {
+                    asset.oracle_price
+                } else {
+                    mark_price
+                },
+            );
+            let prev_day_price = ctx_opt
+                .map(|c| c.prev_day_px)
+                .filter(|&p| p > 0.0)
+                .unwrap_or(if asset.prev_day_price > 0.0 {
+                    asset.prev_day_price
+                } else {
+                    mark_price
+                });
+            let funding_rate_hourly = ctx_opt
+                .map(|c| c.funding_rate_hourly)
+                .unwrap_or(asset.funding_rate_hourly);
+            let day_volume_usdc = ctx_opt
+                .map(|c| round_dp(c.day_ntl_vlm.max(0.0), 2))
+                .unwrap_or(asset.day_volume_usdc);
+            let open_interest_usdc = ctx_opt
+                .filter(|c| c.open_interest > 0.0)
+                .map(|c| round_dp(c.open_interest * mark_price, 2))
+                .unwrap_or(asset.open_interest_usdc);
+
+            parsed.push(RawParsedAsset {
+                coin: asset.coin.clone(),
+                asset_index: asset.asset_index,
+                sz_decimals: asset.sz_decimals,
+                max_leverage: asset.max_leverage,
+                mark_price,
+                mid_price,
+                oracle_price,
+                funding_rate_hourly,
+                day_volume_usdc,
+                open_interest_usdc,
+                prev_day_price,
+            });
+        }
+        finalize_asset_upsert_inputs(parsed, cfg)
     }
 
     /// Pure parser and 24h volume + open-interest liquidity gate for Hyperliquid `metaAndAssetCtxs` + `allMids`.
@@ -244,26 +498,21 @@ impl MarketWatcher {
         mids: &HashMap<String, f64>,
         cfg: &ConfigMap,
     ) -> Option<Vec<AssetUpsertInput>> {
+        Self::parse_live_asset_inputs_with_ws_ctx(meta_ctxs, mids, None, cfg)
+    }
+
+    fn parse_live_asset_inputs_with_ws_ctx(
+        meta_ctxs: &Value,
+        mids: &HashMap<String, f64>,
+        ws_ctxs: Option<&HashMap<String, WsActiveAssetCtx>>,
+        cfg: &ConfigMap,
+    ) -> Option<Vec<AssetUpsertInput>> {
         let arr = meta_ctxs.as_array()?;
         if arr.len() < 2 {
             return None;
         }
         let universe = arr[0].get("universe")?.as_array()?;
         let ctxs = arr[1].as_array()?;
-
-        struct RawParsedAsset {
-            coin: String,
-            asset_index: u32,
-            sz_decimals: u32,
-            max_leverage: f64,
-            mark_price: f64,
-            mid_price: f64,
-            oracle_price: f64,
-            funding_rate_hourly: f64,
-            day_volume_usdc: f64,
-            open_interest_usdc: f64,
-            prev_day_price: f64,
-        }
 
         let mut parsed = Vec::with_capacity(universe.len());
         for (idx, (u, c)) in universe.iter().zip(ctxs.iter()).enumerate() {
@@ -280,6 +529,9 @@ impl MarketWatcher {
             let Ok((_, coin)) = normalize_hyperliquid_symbol(raw_name) else {
                 continue;
             };
+            let coin_upper = coin.to_ascii_uppercase();
+            let ws_ctx_opt = ws_ctxs.and_then(|m| m.get(&coin_upper));
+
             let sz_decimals = u
                 .get("szDecimals")
                 .and_then(Value::as_u64)
@@ -291,8 +543,14 @@ impl MarketWatcher {
                 .unwrap_or(20.0)
                 .max(1.0);
 
-            let mark_px = parse_hl_f64(c.get("markPx"));
-            let ctx_mid_px = parse_hl_f64(c.get("midPx"));
+            let mark_px = ws_ctx_opt
+                .map(|w| w.mark_px)
+                .filter(|&p| p > 0.0)
+                .unwrap_or_else(|| parse_hl_f64(c.get("markPx")));
+            let ctx_mid_px = ws_ctx_opt
+                .map(|w| w.mid_px)
+                .filter(|&p| p > 0.0)
+                .unwrap_or_else(|| parse_hl_f64(c.get("midPx")));
             let live_mid = mids
                 .get(raw_name)
                 .copied()
@@ -307,25 +565,39 @@ impl MarketWatcher {
             if eff_mark <= 0.0 {
                 continue;
             }
-            let oracle_px = {
-                let o = parse_hl_f64(c.get("oraclePx"));
-                if o > 0.0 {
-                    o
-                } else {
-                    eff_mark
-                }
-            };
-            let prev_day_px = {
-                let p = parse_hl_f64(c.get("prevDayPx"));
-                if p > 0.0 {
-                    p
-                } else {
-                    eff_mark
-                }
-            };
-            let funding_hourly = parse_hl_f64(c.get("funding"));
-            let day_vol_usdc = parse_hl_f64(c.get("dayNtlVlm")).max(0.0);
-            let oi_coins = parse_hl_f64(c.get("openInterest")).max(0.0);
+            let oracle_px = ws_ctx_opt
+                .map(|w| w.oracle_px)
+                .filter(|&p| p > 0.0)
+                .unwrap_or_else(|| {
+                    let o = parse_hl_f64(c.get("oraclePx"));
+                    if o > 0.0 {
+                        o
+                    } else {
+                        eff_mark
+                    }
+                });
+            let prev_day_px = ws_ctx_opt
+                .map(|w| w.prev_day_px)
+                .filter(|&p| p > 0.0)
+                .unwrap_or_else(|| {
+                    let p = parse_hl_f64(c.get("prevDayPx"));
+                    if p > 0.0 {
+                        p
+                    } else {
+                        eff_mark
+                    }
+                });
+            let funding_hourly = ws_ctx_opt
+                .map(|w| w.funding_rate_hourly)
+                .unwrap_or_else(|| parse_hl_f64(c.get("funding")));
+            let day_vol_usdc = ws_ctx_opt
+                .map(|w| w.day_ntl_vlm)
+                .filter(|&v| v > 0.0)
+                .unwrap_or_else(|| parse_hl_f64(c.get("dayNtlVlm")).max(0.0));
+            let oi_coins = ws_ctx_opt
+                .map(|w| w.open_interest)
+                .filter(|&v| v > 0.0)
+                .unwrap_or_else(|| parse_hl_f64(c.get("openInterest")).max(0.0));
             let oi_usdc = round_dp(oi_coins * eff_mark, 2);
 
             parsed.push(RawParsedAsset {
@@ -347,71 +619,7 @@ impl MarketWatcher {
             return None;
         }
 
-        let is_testnet = is_testnet_configured(cfg);
-        let (core_min_vol, event_min_vol, core_min_oi, event_min_oi) = if is_testnet {
-            (
-                cfg.get_f64("testnet_core_min_day_volume_usdc", 50_000.0)
-                    .max(0.0),
-                cfg.get_f64("testnet_event_min_day_volume_usdc", 50_000.0)
-                    .max(0.0),
-                cfg.get_f64("testnet_core_min_open_interest_usdc", 50_000.0)
-                    .max(0.0),
-                cfg.get_f64("testnet_event_min_open_interest_usdc", 50_000.0)
-                    .max(0.0),
-            )
-        } else {
-            (
-                cfg.get_f64("core_min_day_volume_usdc", 2_000_000.0)
-                    .max(0.0),
-                cfg.get_f64("event_min_day_volume_usdc", 500_000.0).max(0.0),
-                cfg.get_f64("core_min_open_interest_usdc", 250_000.0)
-                    .max(0.0),
-                cfg.get_f64("event_min_open_interest_usdc", 100_000.0)
-                    .max(0.0),
-            )
-        };
-
-        let mut inputs = Vec::with_capacity(parsed.len());
-        for p in parsed {
-            let lot_step_size = 10_f64.powi(-(p.sz_decimals as i32)).max(1e-6);
-            let tick_size = infer_tick_size(p.mark_price, p.sz_decimals);
-            let passes_core_liquidity =
-                p.day_volume_usdc >= core_min_vol && p.open_interest_usdc >= core_min_oi;
-            let passes_event_liquidity =
-                p.day_volume_usdc >= event_min_vol && p.open_interest_usdc >= event_min_oi;
-            let is_core = passes_core_liquidity;
-            let is_event = is_core || passes_event_liquidity;
-
-            // Flag extreme funding dislocation or >8% intraday move on liquid assets for 1s priority surveillance
-            let day_change_pct = if p.prev_day_price > 0.0 {
-                ((p.mark_price - p.prev_day_price) / p.prev_day_price).abs()
-            } else {
-                0.0
-            };
-            let is_prio =
-                is_event && (p.funding_rate_hourly.abs() >= 0.0004 || day_change_pct >= 0.08);
-
-            inputs.push(AssetUpsertInput {
-                raw_symbol_or_coin: p.coin,
-                asset_index: p.asset_index,
-                sz_decimals: p.sz_decimals,
-                tick_size,
-                lot_step_size,
-                max_leverage: p.max_leverage,
-                mark_price: p.mark_price,
-                mid_price: p.mid_price,
-                oracle_price: p.oracle_price,
-                funding_rate_hourly: p.funding_rate_hourly,
-                day_volume_usdc: p.day_volume_usdc,
-                open_interest_usdc: p.open_interest_usdc,
-                prev_day_price: p.prev_day_price,
-                is_core_eligible: is_core,
-                is_event_eligible: is_event,
-                is_priority_watched: is_prio,
-            });
-        }
-
-        Some(inputs)
+        Some(finalize_asset_upsert_inputs(parsed, cfg))
     }
 
     /// Refreshes 1h and 4h OHLCV bars for up to `max_assets_per_tick` active, priority-watched,
@@ -489,13 +697,72 @@ impl MarketWatcher {
         refresh_set.extend(volume_eligible);
 
         let mut due_candidates: Vec<(ExchangeAsset, bool, bool, i64)> = Vec::new();
+        let mut ws_refreshed_asset_ids: HashSet<i64> = HashSet::new();
+        let mut ws_sync_timestamps: Vec<((i64, String), i64)> = Vec::new();
         {
             let guard = self.last_bar_sync_ms.lock();
             for asset in refresh_set {
                 let last_1h = guard.get(&(asset.id, "1h".to_string())).copied();
                 let last_4h = guard.get(&(asset.id, "4h".to_string())).copied();
-                let needs_1h = is_timeframe_sync_due(last_1h, now, 3_600_000, CANDLE_1H_TTL_MS);
-                let needs_4h = is_timeframe_sync_due(last_4h, now, 14_400_000, CANDLE_4H_TTL_MS);
+                let mut needs_1h = is_timeframe_sync_due(last_1h, now, 3_600_000, CANDLE_1H_TTL_MS);
+                let mut needs_4h =
+                    is_timeframe_sync_due(last_4h, now, 14_400_000, CANDLE_4H_TTL_MS);
+
+                if let Some(ref ws_cache) = self.ws_cache {
+                    if ws_cache.is_market_ws_connected() {
+                        for (tf, tf_ms, last_sync, needs_flag) in [
+                            ("1h", 3_600_000i64, last_1h, &mut needs_1h),
+                            ("4h", 14_400_000i64, last_4h, &mut needs_4h),
+                        ] {
+                            if let Some((ws_bars, ws_ts)) = ws_cache.get_fresh_candles_at(
+                                &asset.coin,
+                                tf,
+                                now,
+                                WS_CANDLE_FRESH_MS,
+                            ) {
+                                let existing_bars = self
+                                    .db
+                                    .get_ohlcv_bars(asset.id, tf, CANDLE_INCREMENTAL_DB_MIN_BARS)
+                                    .unwrap_or_default();
+                                let has_enough = existing_bars.len()
+                                    >= CANDLE_INCREMENTAL_DB_MIN_BARS
+                                    || ws_bars.len() >= CANDLE_INCREMENTAL_DB_MIN_BARS;
+                                let no_gap = existing_bars.last().is_none_or(|db_last| {
+                                    ws_bars.first().is_none_or(|ws_first| {
+                                        ws_first.timestamp_ms.saturating_sub(db_last.timestamp_ms)
+                                            <= tf_ms
+                                    })
+                                });
+                                if ws_ts > last_sync.unwrap_or(0) || existing_bars.is_empty() {
+                                    let inputs: Vec<BarUpsertInput> = ws_bars
+                                        .iter()
+                                        .map(|b| BarUpsertInput {
+                                            asset_id: asset.id,
+                                            timeframe: tf.to_string(),
+                                            timestamp_ms: b.timestamp_ms,
+                                            open: b.open,
+                                            high: b.high,
+                                            low: b.low,
+                                            close: b.close,
+                                            volume: b.volume,
+                                            funding_rate: b.funding_rate,
+                                        })
+                                        .collect();
+                                    if !inputs.is_empty()
+                                        && self.db.upsert_ohlcv_bars(&inputs).is_ok()
+                                    {
+                                        ws_refreshed_asset_ids.insert(asset.id);
+                                    }
+                                }
+                                if has_enough && no_gap {
+                                    *needs_flag = false;
+                                    ws_sync_timestamps.push(((asset.id, tf.to_string()), now));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !needs_1h && !needs_4h {
                     continue;
                 }
@@ -508,6 +775,12 @@ impl MarketWatcher {
                 due_candidates.push((asset, needs_1h, needs_4h, earliest_last));
             }
         }
+        if !ws_sync_timestamps.is_empty() {
+            let mut guard = self.last_bar_sync_ms.lock();
+            for (k, ts_val) in ws_sync_timestamps {
+                guard.insert(k, ts_val);
+            }
+        }
 
         due_candidates.sort_by(|(a, _, _, a_ts), (b, _, _, b_ts)| {
             (!active_asset_ids.contains(&a.id))
@@ -517,7 +790,7 @@ impl MarketWatcher {
                 .then_with(|| b.day_volume_usdc.total_cmp(&a.day_volume_usdc))
         });
 
-        let mut refreshed_assets = 0usize;
+        let mut rest_refreshed_ids: HashSet<i64> = HashSet::new();
         for (asset, needs_1h, needs_4h, _) in due_candidates.into_iter().take(max_assets_per_tick) {
             for (tf, due) in [("1h", needs_1h), ("4h", needs_4h)] {
                 if !due {
@@ -537,10 +810,10 @@ impl MarketWatcher {
                     .lock()
                     .insert((asset.id, tf.to_string()), now);
             }
-            refreshed_assets += 1;
+            rest_refreshed_ids.insert(asset.id);
         }
 
-        Ok(refreshed_assets)
+        Ok(ws_refreshed_asset_ids.union(&rest_refreshed_ids).count())
     }
 
     pub fn fetch_or_synthesize_bars(
@@ -576,7 +849,9 @@ impl MarketWatcher {
         };
 
         let is_live_mode = cfg.execution_mode().is_live_or_testnet()
-            && (!self.db.is_ephemeral_test_db() || crate::http_client::endpoints_are_loopback(cfg));
+            && (!self.db.is_ephemeral_test_db()
+                || crate::http_client::endpoints_are_loopback(cfg)
+                || crate::ws_client::has_explicit_loopback_ws_url(cfg));
 
         if live_connected {
             if let Ok(raw_list) =

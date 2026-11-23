@@ -3,6 +3,7 @@
 //! (`aegis-execution::reconcile::ledger`, `R14-H4`, `P1-Acct`).
 
 use crate::http_client::HyperliquidHttpClient;
+use crate::ws_client::WsStateCache;
 use aegis_core::{
     normalize_hyperliquid_symbol, parse_hl_f64, parse_hl_f64_opt, parse_hl_i64_opt,
     parse_hl_u64_opt, ConfigMap, HeldAssetView, OrderSide, Result,
@@ -36,6 +37,7 @@ pub(crate) struct ParsedHlFill {
 #[derive(Default)]
 pub(crate) struct ReconcileLedgerCache {
     pub last_fill_watermark_ms: i64,
+    pub last_rest_verify_ms: i64,
     pub cached_fills: Vec<ParsedHlFill>,
     pub seen_fill_keys: HashSet<(i64, u64, u64, String, String, u64, u64)>,
     pub last_replay_ms: i64,
@@ -722,30 +724,15 @@ pub(crate) fn parse_raw_fills(raw_fills: &[Value], fallback_ts: i64) -> Vec<Pars
     out
 }
 
-/// Fetches windowed `userFillsByTime` starting at `watermark - 600_000` (after initial lookback),
-/// updates `cache`, and returns causally sorted fills grouped by uppercase coin (`R14-H4`).
-pub(crate) fn fetch_windowed_fills_unlocked(
-    http: &HyperliquidHttpClient,
-    wallet: &str,
+const WS_FILLS_REST_VERIFY_INTERVAL_MS: i64 = 300_000;
+
+fn merge_raw_fills_into_cache(
     cache: &mut ReconcileLedgerCache,
+    raw_fills: &[Value],
     earliest_local_open_ms: Option<i64>,
     ts: i64,
-    cfg: &ConfigMap,
-) -> Result<BTreeMap<String, Vec<ParsedHlFill>>> {
-    let start_ms = if cache.last_fill_watermark_ms > 0 {
-        cache
-            .last_fill_watermark_ms
-            .saturating_sub(USER_FILLS_WATERMARK_OVERLAP_MS)
-            .max(0)
-    } else {
-        let base_lookback = ts.saturating_sub(USER_FILLS_INITIAL_LOOKBACK_MS).max(0);
-        earliest_local_open_ms
-            .map(|t| t.saturating_sub(86_400_000).min(base_lookback).max(0))
-            .unwrap_or(base_lookback)
-    };
-
-    let raw_fills = http.fetch_user_fills_by_time(wallet, start_ms, None, false, cfg)?;
-    let parsed = parse_raw_fills(&raw_fills, ts);
+) -> BTreeMap<String, Vec<ParsedHlFill>> {
+    let parsed = parse_raw_fills(raw_fills, ts);
     let mut max_fill_ts = 0i64;
     for f in parsed {
         max_fill_ts = max_fill_ts.max(f.time_ms);
@@ -763,11 +750,9 @@ pub(crate) fn fetch_windowed_fills_unlocked(
         }
     }
 
-    cache.last_fill_watermark_ms = if max_fill_ts > 0 {
-        cache.last_fill_watermark_ms.max(max_fill_ts)
-    } else {
-        cache.last_fill_watermark_ms.max(ts)
-    };
+    if max_fill_ts > 0 {
+        cache.last_fill_watermark_ms = cache.last_fill_watermark_ms.max(max_fill_ts);
+    }
 
     let min_keep_ts = earliest_local_open_ms
         .map(|t| t.saturating_sub(86_400_000))
@@ -798,6 +783,69 @@ pub(crate) fn fetch_windowed_fills_unlocked(
     for fills in by_coin.values_mut() {
         sort_fills_causally(fills);
     }
+    by_coin
+}
+
+/// Fetches windowed `userFillsByTime` or consumes fresh User WS `userFills` ring when connected &
+/// gap-filled (`R14-H4` Phase 2), falling back to REST on reconnect gap-fill or periodic 5m verify.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fetch_windowed_fills_with_ws_unlocked(
+    http: &HyperliquidHttpClient,
+    wallet: &str,
+    cache: &mut ReconcileLedgerCache,
+    ws_cache: Option<&WsStateCache>,
+    force_rest: bool,
+    ws_disconnected_since_ms: i64,
+    earliest_local_open_ms: Option<i64>,
+    ts: i64,
+    cfg: &ConfigMap,
+) -> Result<BTreeMap<String, Vec<ParsedHlFill>>> {
+    if !force_rest {
+        if let Some(ws) = ws_cache {
+            if ws.is_user_ws_ready_for_reconcile()
+                && cache.last_rest_verify_ms > 0
+                && ts.saturating_sub(cache.last_rest_verify_ms) < WS_FILLS_REST_VERIFY_INTERVAL_MS
+            {
+                let (ws_fills, _) = ws.get_recent_user_fills();
+                return Ok(merge_raw_fills_into_cache(
+                    cache,
+                    &ws_fills,
+                    earliest_local_open_ms,
+                    ts,
+                ));
+            }
+        }
+    }
+
+    let mut start_ms = if cache.last_fill_watermark_ms > 0 {
+        cache
+            .last_fill_watermark_ms
+            .saturating_sub(USER_FILLS_WATERMARK_OVERLAP_MS)
+            .max(0)
+    } else {
+        let base_lookback = ts.saturating_sub(USER_FILLS_INITIAL_LOOKBACK_MS).max(0);
+        earliest_local_open_ms
+            .map(|t| t.saturating_sub(86_400_000).min(base_lookback).max(0))
+            .unwrap_or(base_lookback)
+    };
+    if ws_disconnected_since_ms > 0 {
+        start_ms = start_ms
+            .min(ws_disconnected_since_ms.saturating_sub(60_000))
+            .max(0);
+    }
+
+    let raw_fills = http.fetch_user_fills_by_time(wallet, start_ms, None, false, cfg)?;
+    let mut by_coin = merge_raw_fills_into_cache(cache, &raw_fills, earliest_local_open_ms, ts);
+    if let Some(ws) = ws_cache {
+        if ws.is_user_ws_connected() {
+            let (ws_fills, _) = ws.get_recent_user_fills();
+            if !ws_fills.is_empty() {
+                by_coin = merge_raw_fills_into_cache(cache, &ws_fills, earliest_local_open_ms, ts);
+            }
+        }
+    }
+    cache.last_fill_watermark_ms = cache.last_fill_watermark_ms.max(ts);
+    cache.last_rest_verify_ms = ts;
     Ok(by_coin)
 }
 

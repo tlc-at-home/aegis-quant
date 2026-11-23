@@ -1230,6 +1230,7 @@ pub struct HyperliquidHttpClient {
     pub timeout_sec: u64,
     client: Client,
     custom_governor: Option<Arc<RestWeightGovernor>>,
+    ws_cache: Option<Arc<crate::ws_client::WsStateCache>>,
 }
 
 impl HyperliquidHttpClient {
@@ -1239,12 +1240,20 @@ impl HyperliquidHttpClient {
             timeout_sec: t,
             client: shared_blocking_client(t),
             custom_governor: None,
+            ws_cache: None,
         }
     }
 
     /// Attaches an explicit [`RestWeightGovernor`] (primarily for testing rate limits against loopback mocks).
     pub fn with_governor(mut self, governor: Arc<RestWeightGovernor>) -> Self {
         self.custom_governor = Some(governor);
+        self
+    }
+
+    /// Attaches a shared [`crate::ws_client::WsStateCache`] so `/exchange` order mutations
+    /// automatically trigger the `1_500 ms` post-submit user-cache bypass (`R14-H4`).
+    pub fn with_ws_cache(mut self, ws_cache: Arc<crate::ws_client::WsStateCache>) -> Self {
+        self.ws_cache = Some(ws_cache);
         self
     }
 
@@ -1822,6 +1831,9 @@ impl HyperliquidHttpClient {
         let is_testnet = is_testnet_configured(cfg);
         let url = resolve_exchange_url_for_network(cfg, is_testnet);
         let opts = RequestOptions::exchange_action().with_timeout_sec(self.timeout_sec.min(5));
+        if let Some(ref cache) = self.ws_cache {
+            cache.mark_order_submit();
+        }
         for attempt in 0..2 {
             let nonce = next_monotonic_nonce(db);
             let sig = sign_l1_action(private_key, action, None, nonce, None, !is_testnet)?;

@@ -9,6 +9,7 @@ use crate::http_client::{parse_user_fee_rates_bps, HyperliquidHttpClient, Reques
 use crate::reconcile::equity::VAULT_SYNC_MIN_INTERVAL_MS;
 use crate::reconcile::ledger::{funding_dedup_key, ParsedHlFunding};
 use crate::signing::derive_evm_address_from_private_key;
+use crate::ws_client::WsStateCache;
 use aegis_core::{
     compute_vault_pnl_pct, is_unified_account_mode, mask_identifier, normalize_hyperliquid_symbol,
     now_ms, parse_hl_f64, parse_hl_f64_opt, parse_hl_i64_opt, parse_hl_u64_opt, round_dp,
@@ -20,7 +21,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub const MAX_VAULTS_TO_FETCH: usize = 10;
 pub const AUX_SYNC_INTERVAL_MS: i64 = 60_000;
@@ -377,17 +378,35 @@ pub struct AuxiliarySyncReport {
     pub extra_agent_warning: Option<String>,
 }
 
+const USER_FUNDING_WS_REST_VERIFY_MS: i64 = 300_000;
+
+type FundingRestStateMap = HashMap<(String, String), (i64, u64)>;
+
 /// Unlocked 60-second background worker for Hyperliquid auxiliary syncs (`portfolio`, `vaultDetails`,
 /// watermarked `userFunding`, 6h `userFees`, and startup `extraAgents` expiry check) (`R14-H2`, Sec. 11).
 #[derive(Clone)]
 pub struct AuxiliarySyncWorker {
     pub db: DatabaseManager,
     pub http: HyperliquidHttpClient,
+    ws_cache: Option<Arc<WsStateCache>>,
+    last_funding_rest_state: Arc<Mutex<FundingRestStateMap>>,
 }
 
 impl AuxiliarySyncWorker {
     pub fn new(db: DatabaseManager, http: HyperliquidHttpClient) -> Self {
-        Self { db, http }
+        Self {
+            db,
+            http,
+            ws_cache: None,
+            last_funding_rest_state: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Attaches a shared [`WsStateCache`] so steady-state `sync_funding_events` consumes User WS
+    /// `userFundings` when connected & gap-filled, falling back to REST on reconnect or 5m check.
+    pub fn with_ws_cache(mut self, ws_cache: Arc<WsStateCache>) -> Self {
+        self.ws_cache = Some(ws_cache);
+        self
     }
 
     /// Runs startup pre-reconcile auxiliary tasks (`extraAgents` check, `userFees`, and
@@ -629,8 +648,72 @@ impl AuxiliarySyncWorker {
             ),
         };
 
-        let raw_events =
-            fetch_user_funding_windowed(&self.http, &wallet_trimmed, start_ms, max_pages, cfg)?;
+        let ws_key = (
+            self.db.db_name().to_string(),
+            wallet_trimmed.to_ascii_lowercase(),
+        );
+        let mut raw_events = if !is_startup {
+            if let Some(ref ws) = self.ws_cache {
+                if ws.is_user_ws_ready_for_reconcile() {
+                    let cur_reconn = ws.user_reconnect_count();
+                    let skip_rest = self
+                        .last_funding_rest_state
+                        .lock()
+                        .get(&ws_key)
+                        .is_some_and(|&(last_ms, last_reconn)| {
+                            last_reconn == cur_reconn
+                                && last_ms > 0
+                                && now_ms_val.saturating_sub(last_ms)
+                                    < USER_FUNDING_WS_REST_VERIFY_MS
+                        });
+                    if skip_rest {
+                        ws.get_recent_user_fundings().0
+                    } else {
+                        let fetched = fetch_user_funding_windowed(
+                            &self.http,
+                            &wallet_trimmed,
+                            start_ms,
+                            max_pages,
+                            cfg,
+                        )?;
+                        self.last_funding_rest_state
+                            .lock()
+                            .insert(ws_key, (now_ms_val, cur_reconn));
+                        fetched
+                    }
+                } else {
+                    fetch_user_funding_windowed(
+                        &self.http,
+                        &wallet_trimmed,
+                        start_ms,
+                        max_pages,
+                        cfg,
+                    )?
+                }
+            } else {
+                fetch_user_funding_windowed(&self.http, &wallet_trimmed, start_ms, max_pages, cfg)?
+            }
+        } else {
+            let fetched =
+                fetch_user_funding_windowed(&self.http, &wallet_trimmed, start_ms, max_pages, cfg)?;
+            if let Some(ref ws) = self.ws_cache {
+                self.last_funding_rest_state
+                    .lock()
+                    .insert(ws_key, (now_ms_val, ws.user_reconnect_count()));
+            }
+            fetched
+        };
+
+        if let Some(ref ws) = self.ws_cache {
+            if ws.is_user_ws_connected() {
+                let (ws_fundings, _) = ws.get_recent_user_fundings();
+                if !ws_fundings.is_empty() && !raw_events.is_empty() {
+                    raw_events.extend(ws_fundings);
+                } else if raw_events.is_empty() {
+                    raw_events = ws_fundings;
+                }
+            }
+        }
         if raw_events.is_empty() {
             return Ok(0);
         }
