@@ -19,8 +19,9 @@ import {
   toFiniteNumber,
   fmtUsd,
   fmtSignedUsd,
-  fmtLocalShortTime,
-  fmtLocalMonthDayTime,
+  fmtSignedPct,
+  pnlToneClass,
+  fmtLocalTime,
   getConfigFloatFromDash,
   createWalletStripItem,
   compareSortValues,
@@ -196,7 +197,7 @@ function renderHealthAndTopBar(health, dash) {
 function renderPnlHorizonRibbon(dash, force = false) {
   const summary = (dash && dash.pnl_summary) || {};
   const fallbackUpnl = ((dash && dash.v_assets_held) || []).reduce(
-    (acc, heldItem) => acc + Number(heldItem.unrealized_pnl_usdc ?? 0),
+    (acc, heldItem) => acc + (toFiniteNumber(heldItem.unrealized_pnl_usdc) ?? 0),
     0
   );
   const totalEq =
@@ -210,12 +211,11 @@ function renderPnlHorizonRibbon(dash, force = false) {
 
   const paintHorizon = (key, defaultObj) => {
     const hz = summary[key] || defaultObj;
-    const netPnl = Number(hz.net_pnl_usdc ?? fallbackUpnl);
-    const retPct = Number(
-      hz.return_pct ?? (totalEq > 0 ? (netPnl / totalEq) * 100.0 : 0.0)
-    );
-    const rpnl = Number(hz.realized_pnl_usdc ?? 0);
-    const upnl = Number(hz.unrealized_pnl_usdc ?? fallbackUpnl);
+    const netPnl = toFiniteNumber(hz.net_pnl_usdc) ?? fallbackUpnl;
+    const retPct =
+      toFiniteNumber(hz.return_pct) ?? (totalEq > 0 ? (netPnl / totalEq) * 100.0 : 0.0);
+    const rpnl = toFiniteNumber(hz.realized_pnl_usdc) ?? 0;
+    const upnl = toFiniteNumber(hz.unrealized_pnl_usdc) ?? fallbackUpnl;
     const trades = Number(hz.trade_count ?? 0);
     const wins = Number(hz.win_count ?? 0);
     const winStartMs = Number(hz.window_start_ms ?? 0);
@@ -224,7 +224,7 @@ function renderPnlHorizonRibbon(dash, force = false) {
       (capEpochMs > 0 && winStartMs > 0 && capEpochMs > winStartMs);
     const clampTs = capEpochMs > 0 ? capEpochMs : winStartMs;
 
-    const tone = netPnl > 0.005 ? 'pos' : netPnl < -0.005 ? 'neg' : 'flat';
+    const tone = pnlToneClass(netPnl).slice(4);
 
     const cardEl = getEl(`pnl-card-${key}`);
     const pctEl = getEl(`pnl-${key}-pct`);
@@ -250,7 +250,7 @@ function renderPnlHorizonRibbon(dash, force = false) {
     }
     if (clampEl) {
       if (isClamped && clampTs > 0) {
-        const dtLabel = fmtLocalMonthDayTime(clampTs);
+        const dtLabel = fmtLocalTime(clampTs, '');
         clampEl.textContent = dtLabel ? `Since Cap · ${dtLabel}` : 'Since Cap';
         clampEl.hidden = false;
       } else {
@@ -261,7 +261,7 @@ function renderPnlHorizonRibbon(dash, force = false) {
     if (pctEl) {
       pctEl.classList.remove('pos', 'neg', 'flat');
       pctEl.classList.add(tone);
-      pctEl.textContent = `${retPct > 0.001 ? '+' : ''}${retPct.toFixed(2)}%`;
+      pctEl.textContent = fmtSignedPct(retPct, 2) ?? '0.00%';
     }
     if (usdcEl) {
       usdcEl.classList.remove('pos', 'neg', 'flat');
@@ -272,9 +272,20 @@ function renderPnlHorizonRibbon(dash, force = false) {
       const tradeStr =
         trades > 0 ? `${trades} Trades (${wins}W)` : '0 Closed · Live Mark';
       subEl.replaceChildren(
-        h('span', {
-          text: `Realized: ${fmtSignedUsd(rpnl)} · Unrealized: ${fmtSignedUsd(upnl)}`,
-        }),
+        h(
+          'span',
+          null,
+          'Realized: ',
+          h('span', {
+            className: `pnl-inline-val ${pnlToneClass(rpnl)}`,
+            text: fmtSignedUsd(rpnl),
+          }),
+          ' · Unrealized: ',
+          h('span', {
+            className: `pnl-inline-val ${pnlToneClass(upnl)}`,
+            text: fmtSignedUsd(upnl),
+          })
+        ),
         h('span', { text: tradeStr })
       );
     }
@@ -422,8 +433,8 @@ function renderKpiCards(dash, force = false) {
       const capSpan = h('span', {
         text: capUsdc >= 10 ? `Cap: ${fmtUsd(capUsdc)}` : 'Uncapped Perp',
       });
-      const syncTimeStr =
-        syncedAtMs > 0 ? `Synced ${fmtLocalShortTime(syncedAtMs)}` : 'Awaiting Sync';
+      const syncLabel = fmtLocalTime(syncedAtMs, '');
+      const syncTimeStr = syncLabel ? `Synced ${syncLabel}` : 'Awaiting Sync';
       const syncSpan = h(
         'span',
         { className: 'kpi-sync-status' },

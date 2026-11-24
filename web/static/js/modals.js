@@ -14,8 +14,7 @@ import {
   fmtSignedPct,
   pnlToneClass,
   fmtLocalTime,
-  fmtLocalShortTime,
-  fmtLocalMonthDayTime,
+  computeVaultPnlPct,
   getConfigFloatFromDash,
   getConfigNonNegFloatFromDash,
   getConfigValueFromDash,
@@ -832,7 +831,8 @@ export function renderVaultFactsDisplay(dash) {
     activeVault = state.vaultModal.previewVault;
     const isTestnet = Boolean(state.vaultModal.previewMeta?.is_testnet);
     const inspectedAt = toFiniteNumber(state.vaultModal.previewMeta?.inspected_at_ms);
-    const tsStr = inspectedAt ? ` · ${fmtLocalShortTime(inspectedAt)}` : '';
+    const tsLabel = fmtLocalTime(inspectedAt, '');
+    const tsStr = tsLabel ? ` · ${tsLabel}` : '';
     sourceText = `LIVE PREVIEW · ${isTestnet ? 'TESTNET' : 'MAINNET'}${tsStr}`;
     sourceCls = 'status-pill relationship';
   } else if (vaults.length > 0) {
@@ -848,7 +848,8 @@ export function renderVaultFactsDisplay(dash) {
     }
     const mode = String(dash?.execution_mode || 'TESTNET').toUpperCase();
     const syncedAt = toFiniteNumber(dash?.vault_info?.synced_at_ms);
-    const tsStr = syncedAt ? ` · ${fmtLocalShortTime(syncedAt)}` : '';
+    const tsLabel = fmtLocalTime(syncedAt, '');
+    const tsStr = tsLabel ? ` · ${tsLabel}` : '';
     sourceText = `LIVE SYNCED · ${mode === 'LIVE' ? 'MAINNET' : mode}${tsStr}`;
     sourceCls = 'status-pill open';
   }
@@ -1030,16 +1031,16 @@ export function renderVaultFactsDisplay(dash) {
   );
 
   const isLocked = Boolean(v.is_locked);
-  const lockedUntilMs = toFiniteNumber(v.locked_until_ms) ?? 0;
+  const lockedUntilLabel = fmtLocalTime(v.locked_until_ms, '');
   const tileLockup = createVaultFactTile(
     'Lockup Status',
     isLocked ? 'LOCKED' : 'UNLOCKED',
     isLocked
-      ? lockedUntilMs > 0
-        ? `Until ${fmtLocalTime(lockedUntilMs)}`
+      ? lockedUntilLabel
+        ? `Until ${lockedUntilLabel}`
         : 'Deposit lock active'
-      : lockedUntilMs > 0
-      ? `Unlocked since ${fmtLocalMonthDayTime(lockedUntilMs)}`
+      : lockedUntilLabel
+      ? `Unlocked since ${lockedUntilLabel}`
       : 'No active deposit lock',
     isLocked ? 'cell-sl-dist' : 'pnl-pos'
   );
@@ -1243,10 +1244,21 @@ export function renderVaultBarbellCard(dash) {
     'div',
     { className: 'vault-metric-box' },
     h('span', { className: 'vault-metric-label', text: 'Realized PnL vs Sweep Threshold' }),
-    h('div', {
-      className: `vault-metric-val ${pnlToneClass(realizedYtd, 0.005)}`,
-      text: `YTD ${fmtSignedUsd(realizedYtd, 2)} (30D ${fmtSignedUsd(realizedMonthly, 2)})`,
-    }),
+    h(
+      'div',
+      { className: 'vault-metric-val' },
+      'YTD ',
+      h('span', {
+        className: `pnl-inline-val ${pnlToneClass(realizedYtd)}`,
+        text: fmtSignedUsd(realizedYtd, 2),
+      }),
+      ' (30D ',
+      h('span', {
+        className: `pnl-inline-val ${pnlToneClass(realizedMonthly)}`,
+        text: fmtSignedUsd(realizedMonthly, 2),
+      }),
+      ')'
+    ),
     sweepSub
   );
 
@@ -1483,13 +1495,13 @@ export async function triggerVaultLiveSync() {
       data?.vault_info?.vault_count ??
         (Array.isArray(data?.vault_info?.vaults) ? data.vault_info.vaults.length : 0)
     );
-    const tsLabel = fmtLocalShortTime(data?.synced_at_ms || Date.now());
+    const tsLabel = fmtLocalTime(data?.synced_at_ms || Date.now(), '');
     const msg =
       data.synced === false
         ? `Vault sync skipped in ${data.execution_mode || 'PAPER'} mode (no live wallet or configured vault).`
         : `Live Hyperliquid vault sync completed (${syncedVaultCount} ${
             syncedVaultCount === 1 ? 'vault' : 'vaults'
-          } · ${tsLabel}).`;
+          }${tsLabel ? ` · ${tsLabel}` : ''}).`;
     setVaultFormStatus(msg, data.synced === false ? 'warn' : 'success');
     showToast(msg);
   } catch (err) {

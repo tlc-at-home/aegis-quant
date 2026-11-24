@@ -20,7 +20,6 @@ import {
   fmtPrice,
   fmtPct,
   fmtLocalTime,
-  fmtLocalShortTime,
   formatCooldownRemaining,
   computeOpenPnlPct,
   computeClosedEntryNotional,
@@ -264,12 +263,12 @@ export function renderVaultPanel(dash, force = false) {
     }
   }
 
+  const syncLabel = fmtLocalTime(syncedAtMs, '');
   const syncPill = getEl('vault-sync-pill');
   if (syncPill) {
     const countLabel = `${vaultCount} ${vaultCount === 1 ? 'VAULT' : 'VAULTS'}`;
-    const shortSync = syncedAtMs > 0 ? fmtLocalShortTime(syncedAtMs) : '';
-    syncPill.textContent = shortSync ? `${countLabel} · ${shortSync}` : countLabel;
-    syncPill.title = syncedAtMs > 0 ? `Last synced: ${fmtLocalTime(syncedAtMs)}` : 'No vault sync recorded yet';
+    syncPill.textContent = syncLabel ? `${countLabel} · ${syncLabel}` : countLabel;
+    syncPill.title = syncLabel ? `Last synced: ${syncLabel}` : 'No vault sync recorded yet';
   }
 
   const closedCount = rawVaults.filter((v) => Boolean(v?.is_closed)).length;
@@ -285,7 +284,7 @@ export function renderVaultPanel(dash, force = false) {
   );
   setTxt(
     'vault-synced-sub',
-    syncedAtMs > 0 ? `Synced ${fmtLocalTime(syncedAtMs)}` : 'Awaiting vault sync'
+    syncLabel ? `Synced ${syncLabel}` : 'Awaiting vault sync'
   );
 
   setTxt(
@@ -353,15 +352,24 @@ export function renderVaultPanel(dash, force = false) {
 
   const allTimeEl = getEl('vault-alltime-pnl');
   if (allTimeEl) {
+    const atVal = rawVaults.length > 0 ? sumAllTime : 0;
     const atPctStr = rawVaults.length > 0 ? fmtSignedPct(aggAtPct, 2) : null;
-    allTimeEl.textContent =
-      rawVaults.length > 0
-        ? `All-Time: ${fmtSignedUsd(sumAllTime, 2)}${atPctStr ? ` (${atPctStr})` : ''}`
-        : 'All-Time: $0.00';
+    const atText = `${fmtSignedUsd(atVal, 2)}${atPctStr ? ` (${atPctStr})` : ''}`;
+    allTimeEl.replaceChildren(
+      document.createTextNode('All-Time: '),
+      h('span', {
+        className: `pnl-inline-val ${pnlToneClass(atVal)}`,
+        text: atText,
+      })
+    );
   }
 
   const avgAprStr = weightedApr !== null ? fmtSignedPct(weightedApr, 2) : null;
-  setTxt('vault-avg-apr', avgAprStr ? `APR: ${avgAprStr}` : 'APR: —');
+  const avgAprEl = getEl('vault-avg-apr');
+  if (avgAprEl) {
+    avgAprEl.className = `vault-segregated-tag ${pnlToneClass(weightedApr, 0.005)}`;
+    avgAprEl.textContent = avgAprStr ? `APR: ${avgAprStr}` : 'APR: —';
+  }
   setTxt(
     'vault-lock-summary',
     rawVaults.length === 0
@@ -382,8 +390,8 @@ export function renderVaultPanel(dash, force = false) {
         document.createTextNode('No active Hyperliquid vault deposits synced yet · Configured Vault: '),
         createAddressChip(configuredAddr)
       );
-      if (syncedAtMs > 0) {
-        td.append(document.createTextNode(` · Last checked ${fmtLocalTime(syncedAtMs)}`));
+      if (syncLabel) {
+        td.append(document.createTextNode(` · Last checked ${syncLabel}`));
       }
     } else {
       td.textContent =
@@ -451,16 +459,16 @@ export function renderVaultPanel(dash, force = false) {
       text: daysVal !== null ? `${Math.max(0, Math.floor(daysVal))}d` : '—',
     });
 
-    const lockedUntil = toFiniteNumber(v?.locked_until_ms) ?? 0;
+    const lockedUntilLabel = fmtLocalTime(v?.locked_until_ms, '');
     const pill = v?.is_locked
       ? h('span', {
           className: 'status-pill working',
-          text: lockedUntil > 0 ? `Locked · ${fmtLocalTime(lockedUntil)}` : 'Locked',
+          text: lockedUntilLabel ? `Locked · ${lockedUntilLabel}` : 'Locked',
         })
       : h('span', {
           className: 'status-pill open',
           text: 'Unlocked',
-          title: lockedUntil > 0 ? `Unlocked since ${fmtLocalTime(lockedUntil)}` : '',
+          title: lockedUntilLabel ? `Unlocked since ${lockedUntilLabel}` : '',
         });
     const tdLock = h('td', null, pill);
 
@@ -851,7 +859,7 @@ export function renderOpenHoldingsTable(dash, forceRender = false) {
     const sideStr = String(heldItem.side ?? '');
     const sideCls = sideStr.toUpperCase() === 'SHORT' ? 'short' : 'long';
     const isShort = sideCls === 'short';
-    const upnl = toFiniteNumber(heldItem.unrealized_pnl_usdc) ?? 0;
+    const upnl = toFiniteNumber(heldItem.unrealized_pnl_usdc);
     const upnlPct = computeOpenPnlPct(heldItem);
     const stopPx = toFiniteNumber(heldItem.protective_stop_px);
     const markPx = toFiniteNumber(heldItem.mark_price);
@@ -1122,7 +1130,7 @@ export function renderClosedPositionsTable(dash, force = false) {
       ),
       tdRpnl,
       h('td', {
-        className: `num-cell ${pnlToneClass(netFeesFunding, 0.001)}`,
+        className: `num-cell ${pnlToneClass(netFeesFunding)}`,
         text: fmtSignedUsd(netFeesFunding, 2),
       }),
       h('td', { className: 'reason-cell', title: reasonText, text: reasonText })
@@ -1192,12 +1200,8 @@ function renderSleeveS1Table(s1, force) {
   }
 
   const rows = sliced.map((r) => {
-    const wCls =
-      r.w_s1_carry_mom > 0.001
-        ? 'pnl-pos'
-        : r.w_s1_carry_mom < -0.001
-        ? 'pnl-neg'
-        : 'pnl-flat';
+    const fundingApr = toFiniteNumber(r.funding_apr_pct);
+    const wCls = pnlToneClass(r.w_s1_carry_mom, 0.0005);
     return h(
       'tr',
       null,
@@ -1209,8 +1213,8 @@ function renderSleeveS1Table(s1, force) {
         text: `${(Number(r.funding_rate_hourly || 0) * 100).toFixed(4)}%`,
       }),
       h('td', {
-        className: `num-cell ${r.funding_apr_pct >= 0 ? 'pnl-pos' : 'pnl-neg'}`,
-        text: `${Number(r.funding_apr_pct || 0).toFixed(2)}%`,
+        className: `num-cell ${pnlToneClass(fundingApr, 0.005)}`,
+        text: fmtSignedPct(fundingApr, 2) ?? '—',
       }),
       h('td', {
         className: 'num-cell',
@@ -1252,12 +1256,7 @@ function renderSleeveS2Table(s2, force) {
         : align < 0
         ? h('span', { className: 'side-pill short', text: 'BEAR (-1)' })
         : h('span', { className: 'pnl-flat', text: 'NEUTRAL (0)' });
-    const wCls =
-      r.w_s2_trend_breakout > 0.001
-        ? 'pnl-pos'
-        : r.w_s2_trend_breakout < -0.001
-        ? 'pnl-neg'
-        : 'pnl-flat';
+    const wCls = pnlToneClass(r.w_s2_trend_breakout, 0.0005);
     return h(
       'tr',
       null,
@@ -1307,12 +1306,8 @@ function renderSleeveS3Table(s3, force) {
   }
 
   const rows = sliced.map((r) => {
-    const wCls =
-      r.w_s3_event_reversion > 0.001
-        ? 'pnl-pos'
-        : r.w_s3_event_reversion < -0.001
-        ? 'pnl-neg'
-        : 'pnl-flat';
+    const fundingApr = toFiniteNumber(r.funding_apr_pct);
+    const wCls = pnlToneClass(r.w_s3_event_reversion, 0.0005);
     return h(
       'tr',
       null,
@@ -1320,8 +1315,8 @@ function renderSleeveS3Table(s3, force) {
       h('td', { className: 'num-cell', text: fmtPrice(r.mark_price) }),
       h('td', { className: 'num-cell', text: fmtUsd(r.day_volume_usdc, 0) }),
       h('td', {
-        className: 'num-cell',
-        text: `${Number(r.funding_apr_pct || 0).toFixed(2)}%`,
+        className: `num-cell ${pnlToneClass(fundingApr, 0.005)}`,
+        text: fmtSignedPct(fundingApr, 2) ?? '—',
       }),
       h('td', {
         className: 'num-cell text-amber-bold',

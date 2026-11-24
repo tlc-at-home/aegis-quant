@@ -11,7 +11,12 @@ const SORT_COLLATOR = new Intl.Collator(undefined, {
 });
 
 export function toFiniteNumber(val) {
-  if (val === null || val === undefined || val === '') return null;
+  if (val === null || val === undefined || typeof val === 'boolean') return null;
+  if (typeof val === 'string') {
+    if (val.trim() === '') return null;
+  } else if (typeof val !== 'number') {
+    return null;
+  }
   const n = Number(val);
   return Number.isFinite(n) ? n : null;
 }
@@ -45,8 +50,19 @@ export function isOfficialHlpAddress(rawAddr) {
 }
 
 export function fmtSignedUsd(val, decimals = 2) {
-  const num = Number(val || 0);
-  const sign = num > 0.0001 ? '+' : num < -0.0001 ? '-' : '';
+  const num = toFiniteNumber(val);
+  if (num === null) return '—';
+  const eps = 0.5 * Math.pow(10, -decimals);
+  if (Math.abs(num) < eps) {
+    return (
+      '$' +
+      (0).toLocaleString('en-US', {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+      })
+    );
+  }
+  const sign = num > 0 ? '+' : '-';
   return (
     sign +
     '$' +
@@ -61,15 +77,16 @@ export function fmtSignedPct(pct, decimals = 2) {
   const n = toFiniteNumber(pct);
   if (n === null) return null;
   const eps = 0.5 * Math.pow(10, -decimals);
-  const sign = n >= eps ? '+' : n <= -eps ? '-' : '';
+  if (Math.abs(n) < eps) return `${(0).toFixed(decimals)}%`;
+  const sign = n > 0 ? '+' : '-';
   return `${sign}${Math.abs(n).toFixed(decimals)}%`;
 }
 
-export function pnlToneClass(val, eps = 0.001) {
+export function pnlToneClass(val, eps = 0.005) {
   const n = toFiniteNumber(val);
   if (n === null) return 'pnl-flat';
-  if (n > eps) return 'pnl-pos';
-  if (n < -eps) return 'pnl-neg';
+  if (n >= eps) return 'pnl-pos';
+  if (n <= -eps) return 'pnl-neg';
   return 'pnl-flat';
 }
 
@@ -82,9 +99,11 @@ export function fmtPrice(px) {
 }
 
 export function fmtPct(fracOrPct, isFraction = true, decimals = 1) {
-  const v = Number(fracOrPct || 0) * (isFraction ? 100.0 : 1.0);
-  const sign = v > 0.0001 ? '+' : '';
-  return `${sign}${v.toFixed(decimals)}%`;
+  const v = (toFiniteNumber(fracOrPct) ?? 0) * (isFraction ? 100.0 : 1.0);
+  const eps = 0.5 * Math.pow(10, -decimals);
+  if (Math.abs(v) < eps) return `${(0).toFixed(decimals)}%`;
+  const sign = v > 0 ? '+' : '-';
+  return `${sign}${Math.abs(v).toFixed(decimals)}%`;
 }
 
 export function getLocalTzAbbrev(dateObj) {
@@ -101,40 +120,58 @@ export function getLocalTzAbbrev(dateObj) {
   return mm === '00' ? `GMT${sign}${hh}` : `GMT${sign}${hh}:${mm}`;
 }
 
-export function fmtLocalTime(tsMs) {
-  if (!tsMs || tsMs <= 0) return '—';
-  const d = new Date(Number(tsMs));
-  if (Number.isNaN(d.getTime())) return '—';
-  const yyyy = d.getFullYear();
+const NUMERIC_TS_RE = /^[+-]?\d+(\.\d+)?$/;
+const NAIVE_ISO_TS_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/;
+const SPACE_ISO_TZ_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i;
+
+function parseTimestampMs(raw) {
+  if (raw === null || raw === undefined || typeof raw === 'boolean') return null;
+  if (raw instanceof Date) {
+    const ms = raw.getTime();
+    return Number.isFinite(ms) && ms > 0 ? ms : null;
+  }
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) && raw > 0 ? raw : null;
+  }
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s) return null;
+    if (NUMERIC_TS_RE.test(s)) {
+      const n = Number(s);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }
+    let normalized = s;
+    if (NAIVE_ISO_TS_RE.test(s)) {
+      normalized = `${s.replace(' ', 'T')}Z`;
+    } else if (SPACE_ISO_TZ_RE.test(s)) {
+      normalized = s.replace(' ', 'T');
+    }
+    const parsed = Date.parse(normalized);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+export function fmtLocalTime(tsMs, emptyFallback = '—') {
+  const ms = parseTimestampMs(tsMs);
+  if (ms === null) return emptyFallback;
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return emptyFallback;
+  const yyyy = String(d.getFullYear()).padStart(4, '0');
   const mm = String(d.getMonth() + 1).padStart(2, '0');
   const dd = String(d.getDate()).padStart(2, '0');
   const hh = String(d.getHours()).padStart(2, '0');
   const mi = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
-  const tz = getLocalTzAbbrev(d);
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} ${tz}`;
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
 export function fmtLocalShortTime(tsMs) {
-  if (!tsMs || tsMs <= 0) return '';
-  const d = new Date(Number(tsMs));
-  if (Number.isNaN(d.getTime())) return '';
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${hh}:${mi}:${ss}`;
+  return fmtLocalTime(tsMs, '');
 }
 
 export function fmtLocalMonthDayTime(tsMs) {
-  const n = toFiniteNumber(tsMs);
-  if (n === null || n <= 0) return '';
-  const d = new Date(n);
-  if (Number.isNaN(d.getTime())) return '';
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
-  return `${mm}/${dd} ${hh}:${mi}`;
+  return fmtLocalTime(tsMs, '');
 }
 
 export function fmtCompactDuration(ms) {

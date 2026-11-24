@@ -12,10 +12,7 @@ import {
   toFiniteNumber,
   fmtUsd,
   fmtLocalTime,
-  fmtLocalShortTime,
-  fmtLocalMonthDayTime,
   fmtCompactDuration,
-  getLocalTzAbbrev,
 } from '/js/format.js';
 
 function prepareCanvas(canvasId) {
@@ -244,36 +241,41 @@ export function drawEquityCurveCanvas(dash, force = false) {
   }
 
   if (coords.length > 0) {
-    const dMin = new Date(tMin);
-    const dMax = new Date(tMax);
-    const crossesMidnight =
-      dMin.getFullYear() !== dMax.getFullYear() ||
-      dMin.getMonth() !== dMax.getMonth() ||
-      dMin.getDate() !== dMax.getDate();
-    const useLongFmt = spanMs >= 18 * 3600 * 1000 || crossesMidnight;
-    const formatAxisTs = (tsMs) =>
-      useLongFmt ? fmtLocalMonthDayTime(tsMs) : fmtLocalShortTime(tsMs);
-
-    const tickPositions =
-      spanMs > 0
-        ? [
-            { ts: tMin, x: padL, align: 'left', isEnd: false },
-            { ts: tMin + spanMs * 0.5, x: padL + plotW * 0.5, align: 'center', isEnd: false },
-            { ts: tMax, x: padL + plotW, align: 'right', isEnd: true },
-          ]
-        : [
-            { ts: tMin, x: padL, align: 'left', isEnd: false },
-            { ts: tMax, x: padL + plotW, align: 'right', isEnd: true },
-          ];
-
     ctx.font = '10px "JetBrains Mono", monospace';
     ctx.fillStyle = '#94a3b8';
+
+    const startLabel = fmtLocalTime(tMin, '');
+    const midLabel = spanMs > 0 ? fmtLocalTime(tMin + spanMs * 0.5, '') : '';
+    const endLabel = fmtLocalTime(tMax, '');
+
+    const startW = startLabel ? ctx.measureText(startLabel).width : 0;
+    const midW = midLabel ? ctx.measureText(midLabel).width : 0;
+    const endW = endLabel ? ctx.measureText(endLabel).width : 0;
+    const minGapPx = 14;
+
+    const tickPositions = [];
+    if (startLabel) {
+      tickPositions.push({ label: startLabel, x: padL, align: 'left' });
+    }
+    const canShowEnd =
+      Boolean(endLabel) && (startW === 0 || startW + endW + minGapPx <= plotW);
+    const canShowMid =
+      spanMs > 0 &&
+      canShowEnd &&
+      Boolean(midLabel) &&
+      startW + minGapPx <= plotW * 0.5 - midW / 2 &&
+      plotW * 0.5 + midW / 2 + minGapPx <= plotW - endW;
+
+    if (canShowMid) {
+      tickPositions.push({ label: midLabel, x: padL + plotW * 0.5, align: 'center' });
+    }
+    if (canShowEnd) {
+      tickPositions.push({ label: endLabel, x: padL + plotW, align: 'right' });
+    }
+
     tickPositions.forEach((tk) => {
-      const baseTime = formatAxisTs(tk.ts);
-      if (!baseTime) return;
-      const tzSuffix = tk.isEnd ? ` ${getLocalTzAbbrev(new Date(tk.ts))}` : '';
       ctx.textAlign = tk.align;
-      ctx.fillText(baseTime + tzSuffix, tk.x, padT + plotH + 17);
+      ctx.fillText(tk.label, tk.x, padT + plotH + 17);
     });
     ctx.textAlign = 'left';
   }
@@ -426,7 +428,7 @@ export function drawEquityCurveCanvas(dash, force = false) {
 
     const pt = hp.pt;
     const tipLines = [
-      { text: fmtLocalTime(pt.created_at_ms), color: '#00f2fe', bold: true },
+      { text: fmtLocalTime(hp.ts ?? pt.created_at_ms ?? pt.updated_at_ms), color: '#00f2fe', bold: true },
       { text: `Equity: ${fmtUsd(pt.total_equity_usdc ?? 0)}`, color: '#f8fafc', bold: true },
     ];
     if (showUncappedSeries) {

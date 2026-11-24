@@ -31,6 +31,23 @@
   --neon-violet: #8b5cf6;
   --neon-violet-soft: rgba(139, 92, 246, 0.16);
 
+  /* Semantic PnL Palette (Obsidian Glassmorphism · WCAG AA+/AAA) */
+  --pnl-profit: #34d399;
+  --pnl-profit-soft: rgba(52, 211, 153, 0.86);
+  --pnl-profit-bg: rgba(16, 185, 129, 0.09);
+  --pnl-profit-bg-hover: rgba(16, 185, 129, 0.14);
+  --pnl-profit-border: rgba(16, 185, 129, 0.34);
+
+  --pnl-loss: #fb7185;
+  --pnl-loss-soft: rgba(251, 113, 133, 0.9);
+  --pnl-loss-pill: #fda4af;
+  --pnl-loss-bg: rgba(244, 63, 94, 0.09);
+  --pnl-loss-bg-hover: rgba(244, 63, 94, 0.14);
+  --pnl-loss-border: rgba(244, 63, 94, 0.36);
+
+  --pnl-flat: #94a3b8;
+  --pnl-flat-soft: rgba(148, 163, 184, 0.85);
+
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Consolas, monospace;
 
@@ -505,6 +522,8 @@ html, body {
   font-size: 9.5px;
   font-weight: 700;
   letter-spacing: 0.2px;
+  font-variant-numeric: tabular-nums;
+  max-inline-size: 100%;
   white-space: nowrap;
 }
 
@@ -551,13 +570,13 @@ html, body {
 
 .pnl-ret-pill.pos {
   background: var(--neon-emerald-soft);
-  color: #34d399;
+  color: var(--pnl-profit);
   border: 1px solid var(--border-glow-emerald);
 }
 
 .pnl-ret-pill.neg {
   background: var(--neon-rose-soft);
-  color: #fda4af;
+  color: var(--pnl-loss-pill);
   border: 1px solid var(--border-glow-rose);
 }
 
@@ -574,8 +593,8 @@ html, body {
   letter-spacing: -0.5px;
 }
 
-.pnl-main-val.pos { color: #34d399; }
-.pnl-main-val.neg { color: #fb7185; }
+.pnl-main-val.pos { color: var(--pnl-profit); }
+.pnl-main-val.neg { color: var(--pnl-loss); }
 .pnl-main-val.flat { color: var(--text-primary); }
 
 .pnl-sub-breakdown {
@@ -586,7 +605,8 @@ html, body {
   gap: 6px;
   font-family: var(--font-mono);
   font-size: 10.5px;
-  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  color: var(--pnl-flat);
   border-top: 1px solid rgba(148, 163, 184, 0.1);
   padding-top: 7px;
 }
@@ -748,15 +768,19 @@ html, body {
 }
 
 .kpi-sync-row {
-  font-size: 10.5px;
+  font-size: 10px;
   color: #94a3b8;
+  font-variant-numeric: tabular-nums;
 }
 
 .kpi-sync-status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+  max-inline-size: 100%;
+  white-space: normal;
+  font-variant-numeric: tabular-nums;
 }
 
 .sync-stale-pill {
@@ -999,6 +1023,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   border: 1px solid rgba(0, 242, 254, 0.5);
   font-family: var(--font-mono);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-primary);
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.65);
   white-space: nowrap;
@@ -1155,6 +1180,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   padding: 9px 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.08);
   color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
@@ -1219,6 +1245,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   text-align: center;
   color: var(--text-muted);
   padding: 18px;
+  white-space: normal;
 }
 
 .quant-table td.table-error-cell {
@@ -1318,6 +1345,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   border-radius: 5px;
   font-size: 10px;
   font-weight: 700;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
@@ -1376,9 +1404,9 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   border: 1px solid rgba(245, 158, 11, 0.3);
 }
 
-.pnl-pos { color: #34d399; font-weight: 700; }
-.pnl-neg { color: #fb7185; font-weight: 700; }
-.pnl-flat { color: var(--text-muted); }
+.pnl-pos { color: var(--pnl-profit); font-weight: 700; }
+.pnl-neg { color: var(--pnl-loss); font-weight: 700; }
+.pnl-flat { color: var(--pnl-flat); }
 
 .close-btn {
   padding: 3px 9px;
@@ -1529,8 +1557,17 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 10px;
   font-size: 10px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
+}
+
+.t-log-meta > span:last-child {
+  color: var(--pnl-flat);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .t-log-lvl {
@@ -1549,6 +1586,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   bottom: 24px;
   right: 24px;
   z-index: 1200;
+  max-inline-size: min(560px, calc(100vw - 48px));
   padding: 12px 18px;
   border-radius: 10px;
   background: rgba(14, 21, 38, 0.95);
@@ -1556,6 +1594,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.75), 0 0 20px rgba(0, 242, 254, 0.25);
   font-family: var(--font-mono);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
   color: #fff;
   transform: translateY(120%);
   opacity: 0;
@@ -1791,6 +1830,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   font-size: 20px;
   font-weight: 800;
   letter-spacing: -0.3px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-primary);
 }
 
@@ -1802,6 +1842,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
   gap: 6px;
   font-family: var(--font-mono);
   font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
 
@@ -2036,7 +2077,7 @@ progress.kpi-meter-bar.amber::-moz-progress-bar {
 .pnl-pct {
   font-size: 10.5px;
   font-weight: 600;
-  opacity: 0.88;
+  opacity: 0.9;
 }
 
 .reason-cell {
@@ -2456,6 +2497,7 @@ dialog.aegis-native-dialog[open] {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.45;
+  font-variant-numeric: tabular-nums;
   border: 1px solid rgba(0, 242, 254, 0.35);
   background: rgba(0, 242, 254, 0.08);
   color: var(--text-primary);
@@ -2682,8 +2724,9 @@ dialog.aegis-native-dialog[open] {
   font-family: var(--font-mono);
   font-size: 10px;
   line-height: 1.35;
+  font-variant-numeric: tabular-nums;
   color: var(--text-muted);
-  word-break: break-word;
+  overflow-wrap: break-word;
 }
 
 /* Insight Cards (Barbell Portfolio Allocation & Operator Readiness) */
@@ -2948,9 +2991,237 @@ dialog.aegis-native-dialog[open] {
   border: 1px solid rgba(139, 92, 246, 0.45);
 }
 
+/* ============================================================================
+   SEMANTIC PNL COLORING, TABLE CELL TINTING & CASCADE OVERRIDES
+   ============================================================================ */
+
+/* Table cells: override .quant-table td (0,1,1) with (0,2,1) */
+.quant-table td.pnl-pos {
+  color: var(--pnl-profit);
+  font-weight: 700;
+}
+
+.quant-table td.pnl-neg {
+  color: var(--pnl-loss);
+  font-weight: 700;
+}
+
+.quant-table td.pnl-flat {
+  color: var(--pnl-flat);
+  font-weight: 400;
+}
+
+/* Subtle profit/loss cell tinting (flat stays neutral & untinted) */
+.quant-table td.pnl-cell.pnl-pos,
+.quant-table td.num-cell.pnl-pos {
+  background-color: var(--pnl-profit-bg);
+  box-shadow: inset 2px 0 0 var(--pnl-profit-border);
+  transition: background-color 0.15s ease;
+}
+
+.quant-table td.pnl-cell.pnl-neg,
+.quant-table td.num-cell.pnl-neg {
+  background-color: var(--pnl-loss-bg);
+  box-shadow: inset 2px 0 0 var(--pnl-loss-border);
+  transition: background-color 0.15s ease;
+}
+
+/* Row hover harmony */
+.quant-table tbody tr:hover td.pnl-cell.pnl-pos,
+.quant-table tbody tr:hover td.num-cell.pnl-pos {
+  background-color: var(--pnl-profit-bg-hover);
+}
+
+.quant-table tbody tr:hover td.pnl-cell.pnl-neg,
+.quant-table tbody tr:hover td.num-cell.pnl-neg {
+  background-color: var(--pnl-loss-bg-hover);
+}
+
+/* Surveillance alert row harmony (.row-surveillance-alert td is 0,2,3; these are 0,4,3 / 0,5,3) */
+.quant-table tbody tr.row-surveillance-alert td.pnl-cell.pnl-pos,
+.quant-table tbody tr.row-surveillance-alert td.num-cell.pnl-pos {
+  background-color: var(--pnl-profit-bg);
+}
+
+.quant-table tbody tr.row-surveillance-alert td.pnl-cell.pnl-neg,
+.quant-table tbody tr.row-surveillance-alert td.num-cell.pnl-neg {
+  background-color: rgba(244, 63, 94, 0.13);
+}
+
+.quant-table tbody tr.row-surveillance-alert:hover td.pnl-cell.pnl-pos,
+.quant-table tbody tr.row-surveillance-alert:hover td.num-cell.pnl-pos {
+  background-color: var(--pnl-profit-bg-hover);
+}
+
+.quant-table tbody tr.row-surveillance-alert:hover td.pnl-cell.pnl-neg,
+.quant-table tbody tr.row-surveillance-alert:hover td.num-cell.pnl-neg {
+  background-color: rgba(244, 63, 94, 0.17);
+}
+
+/* Child elements inside PnL cells (populatePnlElement .pnl-val / .pnl-pct / .pnl-sub) */
+.pnl-pos .pnl-val,
+.pnl-neg .pnl-val,
+.pnl-flat .pnl-val {
+  color: inherit;
+}
+
+.pnl-pos :is(.pnl-pct, .pnl-sub) {
+  color: var(--pnl-profit-soft);
+  opacity: 1;
+}
+
+.pnl-neg :is(.pnl-pct, .pnl-sub) {
+  color: var(--pnl-loss-soft);
+  opacity: 1;
+}
+
+.pnl-flat :is(.pnl-pct, .pnl-sub) {
+  color: var(--pnl-flat-soft);
+  opacity: 1;
+}
+
+.vault-kpi-value.pnl-cell .pnl-pct {
+  font-size: 12px;
+}
+
+/* Vault KPI cards, modal fact tiles & barbell metrics cascade overrides (0,2,0) */
+.vault-kpi-value.pnl-pos,
+.vault-fact-value.pnl-pos,
+.vault-metric-val.pnl-pos {
+  color: var(--pnl-profit);
+}
+
+.vault-kpi-value.pnl-neg,
+.vault-fact-value.pnl-neg,
+.vault-metric-val.pnl-neg {
+  color: var(--pnl-loss);
+}
+
+.vault-kpi-value.pnl-flat,
+.vault-fact-value.pnl-flat,
+.vault-metric-val.pnl-flat {
+  color: var(--pnl-flat);
+}
+
+.vault-metric-sub.pnl-pos {
+  color: var(--pnl-profit);
+  font-weight: 700;
+}
+
+.vault-metric-sub.pnl-neg {
+  color: var(--pnl-loss);
+  font-weight: 700;
+}
+
+.vault-metric-sub.pnl-flat {
+  color: var(--pnl-flat);
+}
+
+.vault-segregated-tag.pnl-pos {
+  color: var(--pnl-profit);
+  background: var(--neon-emerald-soft);
+  border-color: var(--border-glow-emerald);
+}
+
+.vault-segregated-tag.pnl-neg {
+  color: var(--pnl-loss-pill);
+  background: var(--neon-rose-soft);
+  border-color: var(--border-glow-rose);
+}
+
+.vault-segregated-tag.pnl-flat {
+  color: var(--pnl-flat);
+  background: rgba(148, 163, 184, 0.12);
+  border-color: var(--border-subtle);
+}
+
+/* Inline PnL breakdown spans (#pnl-{key}-sub, #vault-alltime-pnl) */
+.pnl-inline-val {
+  font-variant-numeric: tabular-nums;
+}
+
+.pnl-inline-val.pnl-pos {
+  color: var(--pnl-profit);
+  font-weight: 700;
+}
+
+.pnl-inline-val.pnl-neg {
+  color: var(--pnl-loss);
+  font-weight: 700;
+}
+
+.pnl-inline-val.pnl-flat {
+  color: var(--pnl-flat);
+  font-weight: 600;
+}
+
+.vault-metric-val .pnl-inline-val {
+  font-weight: inherit;
+}
+
+/* Local 19-char timestamp pills & subtext polish */
+#vault-sync-pill,
+#vault-fact-source-pill {
+  font-variant-numeric: tabular-nums;
+  max-inline-size: 100%;
+}
+
+#vault-synced-sub {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (max-width: 520px) {
+  #vault-sync-pill,
+  #vault-fact-source-pill,
+  #vault-synced-sub,
+  .pnl-clamp-tag {
+    white-space: normal;
+    line-height: 1.35;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --pnl-profit: #6ee7b7;
+    --pnl-profit-soft: #6ee7b7;
+    --pnl-profit-border: rgba(52, 211, 153, 0.72);
+    --pnl-loss: #fda4af;
+    --pnl-loss-soft: #fda4af;
+    --pnl-loss-pill: #fecdd3;
+    --pnl-loss-border: rgba(251, 113, 133, 0.75);
+    --pnl-flat: #cbd5e1;
+    --pnl-flat-soft: #cbd5e1;
+  }
+}
+
 @media (forced-colors: active) {
+  :root {
+    --pnl-profit: CanvasText;
+    --pnl-profit-soft: CanvasText;
+    --pnl-profit-bg: Canvas;
+    --pnl-profit-bg-hover: Canvas;
+    --pnl-profit-border: Highlight;
+    --pnl-loss: CanvasText;
+    --pnl-loss-soft: CanvasText;
+    --pnl-loss-pill: CanvasText;
+    --pnl-loss-bg: Canvas;
+    --pnl-loss-bg-hover: Canvas;
+    --pnl-loss-border: Highlight;
+    --pnl-flat: CanvasText;
+    --pnl-flat-soft: CanvasText;
+  }
+
   .pnl-clamp-tag,
   .pnl-source-tag,
+  .pnl-ret-pill,
+  .pnl-ret-pill.pos,
+  .pnl-ret-pill.neg,
+  .pnl-ret-pill.flat,
+  .vault-segregated-tag,
+  .vault-segregated-tag.pnl-pos,
+  .vault-segregated-tag.pnl-neg,
+  .vault-segregated-tag.pnl-flat,
   .sync-stale-pill,
   .dd-halt-pill,
   .watch-split-note,
@@ -2965,6 +3236,28 @@ dialog.aegis-native-dialog[open] {
     border: 1px solid CanvasText;
     color: CanvasText;
     background-color: Canvas;
+  }
+
+  .quant-table td.pnl-cell.pnl-pos,
+  .quant-table td.num-cell.pnl-pos,
+  .quant-table td.pnl-cell.pnl-neg,
+  .quant-table td.num-cell.pnl-neg,
+  .quant-table tbody tr:hover td.pnl-cell.pnl-pos,
+  .quant-table tbody tr:hover td.num-cell.pnl-pos,
+  .quant-table tbody tr:hover td.pnl-cell.pnl-neg,
+  .quant-table tbody tr:hover td.num-cell.pnl-neg,
+  .quant-table tbody tr.row-surveillance-alert td.pnl-cell.pnl-pos,
+  .quant-table tbody tr.row-surveillance-alert td.num-cell.pnl-pos,
+  .quant-table tbody tr.row-surveillance-alert td.pnl-cell.pnl-neg,
+  .quant-table tbody tr.row-surveillance-alert td.num-cell.pnl-neg,
+  .quant-table tbody tr.row-surveillance-alert:hover td.pnl-cell.pnl-pos,
+  .quant-table tbody tr.row-surveillance-alert:hover td.num-cell.pnl-pos,
+  .quant-table tbody tr.row-surveillance-alert:hover td.pnl-cell.pnl-neg,
+  .quant-table tbody tr.row-surveillance-alert:hover td.num-cell.pnl-neg {
+    background-color: Canvas;
+    color: CanvasText;
+    box-shadow: none;
+    border-inline-start: 2px solid Highlight;
   }
 }
 
