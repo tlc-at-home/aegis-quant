@@ -98,6 +98,7 @@ pub struct RequestOptions {
     pub max_retries: usize,
     pub max_retry_sleep_ms: u64,
     pub priority: RequestPriority,
+    pub blocking_pace: bool,
 }
 
 impl RequestOptions {
@@ -108,6 +109,7 @@ impl RequestOptions {
             max_retries: 1,
             max_retry_sleep_ms: 300,
             priority: RequestPriority::High,
+            blocking_pace: false,
         }
     }
 
@@ -118,6 +120,7 @@ impl RequestOptions {
             max_retries: 1,
             max_retry_sleep_ms: 300,
             priority: RequestPriority::Critical,
+            blocking_pace: false,
         }
     }
 
@@ -128,6 +131,7 @@ impl RequestOptions {
             max_retries: 0,
             max_retry_sleep_ms: 0,
             priority: RequestPriority::Critical,
+            blocking_pace: false,
         }
     }
 
@@ -138,6 +142,7 @@ impl RequestOptions {
             max_retries: 2,
             max_retry_sleep_ms: 2_000,
             priority: RequestPriority::Normal,
+            blocking_pace: false,
         }
     }
 
@@ -148,6 +153,18 @@ impl RequestOptions {
             max_retries: 2,
             max_retry_sleep_ms: 2_000,
             priority: RequestPriority::Low,
+            blocking_pace: false,
+        }
+    }
+
+    /// Blocking-paced historical backfill lane (`12s` timeout, 4 retries, `Normal` priority, paces under governor instead of shedding).
+    pub const fn historical_backfill() -> Self {
+        Self {
+            timeout_sec: 12,
+            max_retries: 4,
+            max_retry_sleep_ms: 5_000,
+            priority: RequestPriority::Normal,
+            blocking_pace: true,
         }
     }
 
@@ -337,9 +354,9 @@ impl RestWeightGovernor {
             | "orderStatus"
             | "exchangeStatus" => 2,
             "metaAndAssetCtxs" | "meta" | "frontendOpenOrders" | "openOrders" | "userFills"
-            | "userFillsByTime" | "userFunding" | "userAbstraction" | "portfolio"
-            | "userVaultEquities" | "vaultDetails" | "candleSnapshot" | "userFees"
-            | "extraAgents" => 20,
+            | "userFillsByTime" | "userFunding" | "fundingHistory" | "userAbstraction"
+            | "portfolio" | "userVaultEquities" | "vaultDetails" | "candleSnapshot"
+            | "userFees" | "extraAgents" => 20,
             _ => 20,
         }
     }
@@ -354,7 +371,9 @@ impl RestWeightGovernor {
         }
         match payload.get("type").and_then(Value::as_str).unwrap_or("") {
             "candleSnapshot" => items.len().div_ceil(60) as u32,
-            "userFills" | "userFillsByTime" | "userFunding" => items.len().div_ceil(20) as u32,
+            "userFills" | "userFillsByTime" | "userFunding" | "fundingHistory" => {
+                items.len().div_ceil(20) as u32
+            }
             _ => 0,
         }
     }
@@ -409,6 +428,31 @@ impl RestWeightGovernor {
                 }
                 std::thread::sleep(Duration::from_millis(wait_ms));
                 self.try_acquire(priority, weight).is_ok()
+            }
+        }
+    }
+
+    /// Acquires weight for a backfill/batch request by pacing up to `max_total_wait_ms`
+    /// in bounded sleeps rather than shedding immediately when tokens refill cleanly.
+    pub fn acquire_for_request_blocking(
+        &self,
+        priority: RequestPriority,
+        weight: u32,
+        max_total_wait_ms: u64,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(max_total_wait_ms.max(1));
+        loop {
+            match self.try_acquire(priority, weight) {
+                Ok(()) => return true,
+                Err(wait_ms) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return false;
+                    }
+                    let remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+                    let sleep_ms = wait_ms.min(1_000).min(remaining_ms).max(1);
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
             }
         }
     }
@@ -750,7 +794,12 @@ pub fn http_post_json_with_options(
 
     for attempt in 0..max_attempts {
         if let Some(gov) = active_governor {
-            if !gov.acquire_for_request(opts.priority, base_weight) {
+            let acquired = if opts.blocking_pace {
+                gov.acquire_for_request_blocking(opts.priority, base_weight, 30_000)
+            } else {
+                gov.acquire_for_request(opts.priority, base_weight)
+            };
+            if !acquired {
                 tracing::debug!(
                     url = url,
                     priority = ?opts.priority,
@@ -848,6 +897,7 @@ pub fn http_post_json(
             max_retries: HL_INFO_MAX_RETRIES,
             max_retry_sleep_ms: HL_INFO_MAX_RETRY_AFTER_MS,
             priority: RequestPriority::Normal,
+            blocking_pace: false,
         }
     } else {
         RequestOptions {
@@ -855,6 +905,7 @@ pub fn http_post_json(
             max_retries: 0,
             max_retry_sleep_ms: 0,
             priority: RequestPriority::Critical,
+            blocking_pace: false,
         }
     };
     http_post_json_with_options(
@@ -1257,13 +1308,14 @@ impl HyperliquidHttpClient {
         self
     }
 
-    pub fn post_info_with_options(
+    pub fn post_info_for_network_with_options(
         &self,
         payload: &Value,
         cfg: &ConfigMap,
+        is_testnet: bool,
         opts: RequestOptions,
     ) -> Result<Value> {
-        let url = resolve_info_url(cfg);
+        let url = resolve_info_url_for_network(cfg, is_testnet);
         http_post_json_with_options(
             &self.client,
             self.timeout_sec,
@@ -1278,15 +1330,39 @@ impl HyperliquidHttpClient {
         })
     }
 
+    pub fn post_info_with_options(
+        &self,
+        payload: &Value,
+        cfg: &ConfigMap,
+        opts: RequestOptions,
+    ) -> Result<Value> {
+        self.post_info_for_network_with_options(payload, cfg, is_testnet_configured(cfg), opts)
+    }
+
     pub fn post_info(&self, payload: &Value, cfg: &ConfigMap) -> Result<Value> {
         let opts = RequestOptions::background_sync().with_timeout_sec(self.timeout_sec);
         self.post_info_with_options(payload, cfg, opts)
     }
 
+    /// Polls `metaAndAssetCtxs` on an explicit Hyperliquid network (`is_testnet = false` for Mainnet).
+    pub fn fetch_meta_and_asset_ctxs_for_network(
+        &self,
+        cfg: &ConfigMap,
+        is_testnet: bool,
+        opts: RequestOptions,
+    ) -> Result<Value> {
+        self.post_info_for_network_with_options(
+            &json!({ "type": "metaAndAssetCtxs" }),
+            cfg,
+            is_testnet,
+            opts,
+        )
+    }
+
     /// Polls `metaAndAssetCtxs` returning universe metadata and live contexts across all 150+ Hyperliquid perps.
     pub fn fetch_meta_and_asset_ctxs(&self, cfg: &ConfigMap) -> Result<Value> {
         let opts = RequestOptions::background_sync().with_timeout_sec(self.timeout_sec.min(8));
-        self.post_info_with_options(&json!({ "type": "metaAndAssetCtxs" }), cfg, opts)
+        self.fetch_meta_and_asset_ctxs_for_network(cfg, is_testnet_configured(cfg), opts)
     }
 
     /// Polls `allMids` returning `coin -> mid_price` across all Hyperliquid markets (`Surveillance <= 2s`).
@@ -1346,14 +1422,17 @@ impl HyperliquidHttpClient {
             .map(|snap| (snap.best_bid, snap.best_ask)))
     }
 
-    /// Polls `candleSnapshot` for `(coin, interval)` between `start_ms` and `end_ms` (`Low` priority).
-    pub fn fetch_candle_snapshot(
+    /// Polls `candleSnapshot` on an explicit Hyperliquid network with explicit [`RequestOptions`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn fetch_candle_snapshot_for_network(
         &self,
         coin: &str,
         interval: &str,
         start_ms: i64,
         end_ms: i64,
         cfg: &ConfigMap,
+        is_testnet: bool,
+        opts: RequestOptions,
     ) -> Result<Vec<Value>> {
         let payload = json!({
             "type": "candleSnapshot",
@@ -1364,9 +1443,111 @@ impl HyperliquidHttpClient {
                 "endTime": end_ms,
             }
         });
-        let opts = RequestOptions::low_priority_sync().with_timeout_sec(self.timeout_sec.min(8));
-        let raw = self.post_info_with_options(&payload, cfg, opts)?;
+        let raw = self.post_info_for_network_with_options(&payload, cfg, is_testnet, opts)?;
         Ok(raw.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Polls `candleSnapshot` for `(coin, interval)` between `start_ms` and `end_ms` (`Low` priority).
+    pub fn fetch_candle_snapshot(
+        &self,
+        coin: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+        cfg: &ConfigMap,
+    ) -> Result<Vec<Value>> {
+        let opts = RequestOptions::low_priority_sync().with_timeout_sec(self.timeout_sec.min(8));
+        self.fetch_candle_snapshot_for_network(
+            coin,
+            interval,
+            start_ms,
+            end_ms,
+            cfg,
+            is_testnet_configured(cfg),
+            opts,
+        )
+    }
+
+    /// Polls paginated public `fundingHistory` for `coin` on an explicit network (`is_testnet = false` for Mainnet).
+    pub fn fetch_funding_history_for_network(
+        &self,
+        coin: &str,
+        start_ms: i64,
+        end_ms: Option<i64>,
+        cfg: &ConfigMap,
+        is_testnet: bool,
+        opts: RequestOptions,
+    ) -> Result<Vec<Value>> {
+        const HL_FUNDING_HISTORY_PAGE_LIMIT: usize = 500;
+        const HL_FUNDING_HISTORY_MAX_PAGES: usize = 20;
+
+        let mut cursor_ms = start_ms.max(0);
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen_times: HashSet<i64> = HashSet::new();
+
+        for page_idx in 0..HL_FUNDING_HISTORY_MAX_PAGES {
+            if end_ms.is_some_and(|e| cursor_ms > e) {
+                break;
+            }
+            let mut payload = json!({
+                "type": "fundingHistory",
+                "coin": coin,
+                "startTime": cursor_ms,
+            });
+            if let Some(end) = end_ms {
+                payload["endTime"] = json!(end.max(0));
+            }
+            let raw = match self.post_info_for_network_with_options(&payload, cfg, is_testnet, opts)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    if page_idx == 0 {
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        coin = coin,
+                        page = page_idx,
+                        cursor_ms,
+                        error = %e,
+                        "Hyperliquid fundingHistory pagination interrupted; returning partial history"
+                    );
+                    break;
+                }
+            };
+            let page = raw.as_array().cloned().unwrap_or_default();
+            let page_len = page.len();
+            if page_len == 0 {
+                break;
+            }
+
+            let mut max_time_ms: Option<i64> = None;
+            let mut added = 0usize;
+            for ev in page {
+                if let Some(t) = parse_hl_i64_opt(ev.get("time")) {
+                    max_time_ms = Some(max_time_ms.map_or(t, |m| m.max(t)));
+                    if seen_times.insert(t) {
+                        out.push(ev);
+                        added += 1;
+                    }
+                }
+            }
+
+            if page_len < HL_FUNDING_HISTORY_PAGE_LIMIT {
+                break;
+            }
+            let Some(page_max) = max_time_ms else {
+                break;
+            };
+            if page_max >= cursor_ms {
+                cursor_ms = page_max.saturating_add(1);
+            } else if added == 0 {
+                break;
+            } else {
+                cursor_ms = cursor_ms.saturating_add(1);
+            }
+        }
+
+        Ok(out)
     }
 
     /// Polls `clearinghouseState` for `user_wallet` with explicit [`RequestOptions`].
@@ -2880,5 +3061,75 @@ mod tests {
         let client = HyperliquidHttpClient::new(2);
         let _guard = crate::lock_guard::acquire_execution_lock();
         let _ = client.fetch_all_mids(&cfg);
+    }
+
+    #[test]
+    fn test_funding_history_pagination_variable_debit_and_blocking_pace() {
+        let fh_req = json!({ "type": "fundingHistory" });
+        assert_eq!(
+            RestWeightGovernor::base_weight_for_request(
+                "https://api.hyperliquid.xyz/info",
+                &fh_req
+            ),
+            20
+        );
+        assert_eq!(
+            RestWeightGovernor::variable_item_debit(&fh_req, &Value::Array(vec![json!({}); 41])),
+            3
+        );
+
+        let srv = MockHttpServer::start_json(|_path, body| {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ != "fundingHistory" {
+                return (404, json!({}));
+            }
+            let start_t = body.get("startTime").and_then(Value::as_i64).unwrap_or(0);
+            if start_t == 1_000 {
+                let page: Vec<Value> = (0..500i64)
+                    .map(|i| {
+                        json!({
+                            "coin": "BTC",
+                            "fundingRate": "0.0000125",
+                            "time": 1_000 + i * 3_600_000,
+                        })
+                    })
+                    .collect();
+                (200, Value::Array(page))
+            } else {
+                (
+                    200,
+                    json!([
+                        { "coin": "BTC", "fundingRate": "0.00002", "time": start_t },
+                        { "coin": "BTC", "fundingRate": "0.00003", "time": start_t + 3_600_000 }
+                    ]),
+                )
+            }
+        });
+
+        let gov = Arc::new(RestWeightGovernor::new_enforced(900));
+        // Drain below Normal floor (300) slightly, then confirm blocking_pace waits for refill
+        for _ in 0..16 {
+            let _ = gov.try_acquire(RequestPriority::Normal, 20);
+        }
+        assert!(gov.try_acquire(RequestPriority::Normal, 20).is_err());
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_mainnet_url", srv.base_url());
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let client = HyperliquidHttpClient::new(5).with_governor(Arc::clone(&gov));
+        let history = client
+            .fetch_funding_history_for_network(
+                "BTC",
+                1_000,
+                None,
+                &cfg,
+                false,
+                RequestOptions::historical_backfill(),
+            )
+            .expect("paginated fundingHistory succeeds with blocking pace");
+        assert_eq!(history.len(), 502);
+        assert_eq!(srv.request_count(), 2);
     }
 }

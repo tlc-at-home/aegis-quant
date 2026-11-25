@@ -124,6 +124,14 @@ fn resolve_test_db_url() -> Result<String> {
     ))
 }
 
+fn isolated_test_db_name(base_opts: &Opts, pid: u32, ts: u64, seq: u64) -> String {
+    if base_opts.get_db_name().map(str::trim) == Some("test") {
+        format!("test_aegis_quant_{pid}_{ts}_{seq}")
+    } else {
+        format!("aegis_quant_test_{pid}_{ts}_{seq}")
+    }
+}
+
 fn validate_explicit_master_key_if_present(explicit_master_key: Option<&str>) -> Result<()> {
     if let Some(raw) = explicit_master_key {
         if !is_allow_legacy_passphrase_key_env() {
@@ -243,14 +251,11 @@ impl DatabaseManager {
         })
     }
 
-    /// Creates an isolated MariaDB test database (`aegis_quant_test_<pid>_<ts>_<seq>`)
+    /// Creates an isolated MariaDB test database (`test_aegis_quant_<pid>_<ts>_<seq>` when
+    /// targeting the `test` schema, or `aegis_quant_test_<pid>_<ts>_<seq>` otherwise)
     /// backed by real MariaDB 13.0 InnoDB & SQL Views (`AEGIS_TEST_DB_URL` or `AEGIS_DB_URL`).
     pub fn new_isolated_test(explicit_master_key: Option<&str>) -> Result<Self> {
         validate_explicit_master_key_if_present(explicit_master_key)?;
-        let seq = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let ts = (now_ms() as u64) % 1_000_000;
-        let test_db_name = format!("aegis_quant_test_{pid}_{ts}_{seq}");
 
         let (key_b64, has_ext) = resolve_fernet_master_key(explicit_master_key, None);
         let fernet = FernetCipher::from_key_str(&key_b64)?;
@@ -262,6 +267,11 @@ impl DatabaseManager {
                 redact_db_url(&db_url)
             ))
         })?;
+
+        let seq = TEST_DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let ts = (now_ms() as u64) % 1_000_000;
+        let test_db_name = isolated_test_db_name(&base_opts, pid, ts, seq);
 
         let bootstrap_pool = Self::build_pool(&base_opts, None)?;
         {
@@ -1267,5 +1277,26 @@ mod tests {
         assert!(DatabaseManager::connect(Some(Path::new("test_memory.db")), None).is_err());
         assert!(DatabaseManager::connect(None, Some("not-a-valid-fernet-key")).is_err());
         assert!(DatabaseManager::new_isolated_test(Some("not-a-valid-fernet-key")).is_err());
+    }
+
+    #[test]
+    fn test_isolated_test_db_name_uses_test_prefix_only_for_test_schema() {
+        let test_opts = Opts::from_url("mysql://localhost/test").unwrap();
+        assert_eq!(
+            isolated_test_db_name(&test_opts, 12, 34, 5),
+            "test_aegis_quant_12_34_5"
+        );
+
+        let ci_opts = Opts::from_url("mysql://aegis:pw@localhost/aegis_quant").unwrap();
+        assert_eq!(
+            isolated_test_db_name(&ci_opts, 12, 34, 5),
+            "aegis_quant_test_12_34_5"
+        );
+
+        let root_opts = Opts::from_url("mysql://localhost").unwrap();
+        assert_eq!(
+            isolated_test_db_name(&root_opts, 12, 34, 5),
+            "aegis_quant_test_12_34_5"
+        );
     }
 }

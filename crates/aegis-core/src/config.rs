@@ -190,6 +190,15 @@ impl ConfigMap {
         )
     }
 
+    /// Populates a `ConfigMap` from `default_v2_system_config_seeds()`.
+    pub fn from_defaults() -> Self {
+        let mut cfg = Self::new();
+        for (k, v, _, _) in default_v2_system_config_seeds() {
+            cfg.insert(k, v);
+        }
+        cfg
+    }
+
     pub fn insert(&mut self, key: impl Into<String>, val: impl Into<String>) {
         self.0
             .insert(key.into().trim().to_ascii_lowercase(), val.into());
@@ -385,6 +394,7 @@ pub fn default_v2_system_config_seeds(
         ("emergency_ioc_breach_pct", "0.015", "float", "Stop-breach gap fraction bypassing passive close wait for immediate IOC exit"),
         ("hl_rest_weight_limit_per_min", "900", "int", "Self-imposed Hyperliquid REST weight budget per minute (300-1150)"),
         ("candle_refresh_max_assets", "30", "int", "Maximum non-active top-volume assets refreshed per candle cycle"),
+        ("backtest_warmup_bars", "24", "int", "Number of warmup bars preceding backtest evaluation window (1-500)"),
         ("hl_websocket_enabled", "true", "bool", "Enable 2-connection Hyperliquid WebSocket Market+User cache with REST fallback"),
         ("retention_snapshots_days", "30", "int", "Days to retain intraday portfolio_snapshots (daily YTD anchors preserved 400d)"),
         ("retention_telemetry_days", "14", "int", "Days to retain telemetry_logs rows"),
@@ -720,6 +730,9 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
         "candle_refresh_max_assets" => {
             parse_i64_bounded(clean_key, clean_val, 5, 150)?;
         }
+        "backtest_warmup_bars" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 500)?;
+        }
         "breadth_bull_block_shorts_threshold" => {
             parse_f64_bounded(clean_key, clean_val, 0.55, 0.95)?;
         }
@@ -733,7 +746,7 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
             parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
         }
         "stagnation_time_stop_hours" => {
-            parse_f64_bounded(clean_key, clean_val, 0.0, 72.0)?;
+            parse_f64_bounded(clean_key, clean_val, 0.0, 168.0)?;
         }
         "stagnation_min_mfe_r" => {
             parse_f64_bounded(clean_key, clean_val, 0.05, 2.0)?;
@@ -933,6 +946,7 @@ mod tests {
         assert_eq!(find("auto_deleverage_confirm_ticks"), Some("2"));
         assert_eq!(find("hl_rest_weight_limit_per_min"), Some("900"));
         assert_eq!(find("candle_refresh_max_assets"), Some("30"));
+        assert_eq!(find("backtest_warmup_bars"), Some("24"));
         assert_eq!(find("hl_websocket_enabled"), Some("true"));
         assert_eq!(find("enable_breadth_regime_gate"), Some("true"));
         assert_eq!(find("breadth_bull_block_shorts_threshold"), Some("0.68"));
@@ -1014,6 +1028,12 @@ mod tests {
         assert!(validate_core_config_key_value("risk_per_trade_equity_pct", "0.06").is_err());
         assert!(validate_core_config_key_value("retention_ohlcv_bars_days", "29").is_err());
         assert!(validate_core_config_key_value("retention_ohlcv_bars_days", "180").is_ok());
+        assert!(validate_core_config_key_value("backtest_warmup_bars", "0").is_err());
+        assert!(validate_core_config_key_value("backtest_warmup_bars", "1").is_ok());
+        assert!(validate_core_config_key_value("backtest_warmup_bars", "500").is_ok());
+        assert!(validate_core_config_key_value("backtest_warmup_bars", "501").is_err());
+        assert!(validate_core_config_key_value("stagnation_time_stop_hours", "168.0").is_ok());
+        assert!(validate_core_config_key_value("stagnation_time_stop_hours", "168.1").is_err());
         assert!(validate_core_config_key_value("hl_websocket_enabled", "maybe").is_err());
         assert!(matches!(
             validate_core_config_key_value("schema_migration_version", "2.1.0"),
@@ -1052,5 +1072,12 @@ mod tests {
         assert_eq!(cfg.get_usize("max_open_positions", 0), 4);
         assert!(cfg.get_bool("web_auth_enabled", false));
         assert!(cfg.get_bool("WEB_AUTH_ENABLED", false));
+    }
+
+    #[test]
+    fn test_config_map_from_defaults() {
+        let cfg = ConfigMap::from_defaults();
+        assert_eq!(cfg.risk_tier(), RiskTier::Extreme);
+        assert!((cfg.get_f64("core_min_day_volume_usdc", 0.0) - 2_000_000.0).abs() < 1e-6);
     }
 }

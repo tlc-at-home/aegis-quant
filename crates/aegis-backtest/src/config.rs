@@ -116,7 +116,7 @@ impl BacktestConfig {
                 .max(100.0),
             risk_tier: allocator.risk_tier,
             days: days.max(5),
-            warmup_bars: 24,
+            warmup_bars: cfg.get_i64("backtest_warmup_bars", 24).clamp(1, 500) as usize,
             maker_fee_bps: risk_limits.maker_fee_bps,
             taker_fee_bps: risk_limits.taker_fee_bps,
             slippage_bps: 2.0,
@@ -199,3 +199,24 @@ pub struct BacktestReport {
 }
 
 pub type BacktestTearSheet = BacktestReport;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backtest_config_warmup_bars_from_config_map_clamping() {
+        let default_cfg = BacktestConfig::from_config_map(&ConfigMap::new(), 30);
+        assert_eq!(default_cfg.warmup_bars, 24);
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("backtest_warmup_bars", "480");
+        assert_eq!(BacktestConfig::from_config_map(&cfg, 30).warmup_bars, 480);
+
+        cfg.insert("backtest_warmup_bars", "0");
+        assert_eq!(BacktestConfig::from_config_map(&cfg, 30).warmup_bars, 1);
+
+        cfg.insert("backtest_warmup_bars", "900");
+        assert_eq!(BacktestConfig::from_config_map(&cfg, 30).warmup_bars, 500);
+    }
+}

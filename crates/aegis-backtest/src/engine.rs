@@ -1,7 +1,10 @@
 //! Aegis Quant v2.0 Multi-Sleeve Walk-Forward Backtest Orchestrator (`aegis-backtest`).
 
 use crate::config::{BacktestConfig, BacktestReport};
-use crate::dataset::{generate_canonical_dataset as build_canonical_dataset, HistoricalDataset};
+use crate::dataset::{
+    count_timeline_bars_before, generate_canonical_dataset as build_canonical_dataset,
+    HistoricalDataset,
+};
 use crate::metrics::compute_backtest_report;
 use crate::settlement::{
     build_active_cooldown_views, execute_rebalance_actions, fill_working_orders,
@@ -45,8 +48,16 @@ impl BacktestEngine {
         self.run_walk_forward(&assets, &bars_by_asset)
     }
 
-    /// Runs a walk-forward simulation against a pre-assembled [`HistoricalDataset`] (`--source db` or `synthetic`).
+    /// Runs a walk-forward simulation against a pre-assembled [`HistoricalDataset`] (`--source db`, `mainnet`, or `synthetic`).
     pub fn run_dataset(&self, dataset: &HistoricalDataset) -> Result<BacktestReport> {
+        if let Some(cutoff_ms) = dataset.eval_start_ms {
+            let eval_warmup = count_timeline_bars_before(&dataset.bars_by_asset, cutoff_ms);
+            if eval_warmup > 0 {
+                let mut cloned = self.clone();
+                cloned.config.warmup_bars = eval_warmup;
+                return cloned.run_walk_forward(&dataset.assets, &dataset.bars_by_asset);
+            }
+        }
         self.run_walk_forward(&dataset.assets, &dataset.bars_by_asset)
     }
 
@@ -139,7 +150,7 @@ impl BacktestEngine {
                 if count_up_to == 0 {
                     continue;
                 }
-                let rolling = &series[count_up_to.saturating_sub(240)..count_up_to];
+                let rolling = &series[count_up_to.saturating_sub(480)..count_up_to];
                 let prefix = &series[..count_up_to];
                 let cur_bar = &rolling[rolling.len() - 1];
                 if cur_bar.timestamp_ms == ts_ms {
@@ -157,7 +168,15 @@ impl BacktestEngine {
                     .iter()
                     .rev()
                     .take_while(|b| b.timestamp_ms > ts_ms - 86_400_000)
-                    .map(|b| b.volume.max(0.0))
+                    .map(|b| {
+                        let v = b.volume.max(0.0);
+                        let px = b.close.max(0.0);
+                        if v.is_finite() && px.is_finite() {
+                            v * px
+                        } else {
+                            0.0
+                        }
+                    })
                     .sum();
 
                 let mut point_asset = asset.clone();
@@ -859,5 +878,82 @@ mod tests {
         assert_eq!(abort_state.chase_abort_count, 1);
         assert!(!abort_state.active_positions.contains_key(&btc.id));
         assert!(abort_state.cooldown_until_ms.contains_key(&btc.id));
+    }
+
+    #[test]
+    fn test_notional_24h_volume_and_eval_start_ms_alignment() {
+        use aegis_signals::liquidity::evaluate_asset_liquidity_quality;
+
+        // High-priced coin ($550, 500 coins per 4h bar => 3000 coins/24h => $1.65M/24h USDC volume).
+        // Previously summing raw coins gave 3000 < 25000, triggering a severe vol_factor penalty!
+        let (mut assets, _) = BacktestEngine::generate_canonical_dataset(10, 15);
+        let mut bnb = assets.remove(0);
+        bnb.id = 10;
+        bnb.symbol = "BNB-USDC".to_string();
+        bnb.coin = "BNB".to_string();
+        bnb.mark_price = 550.0;
+        bnb.mid_price = 550.0;
+        bnb.oracle_price = 550.0;
+        bnb.day_volume_usdc = 1_650_000.0;
+
+        let step = 14_400_000i64;
+        let base_ts = 1_700_000_000_000i64;
+        let mut bars = Vec::with_capacity(42);
+        let mut px = 500.0;
+        for i in 0..42i64 {
+            let open = px;
+            px *= 1.005;
+            bars.push(OhlcvBar {
+                id: i + 1,
+                asset_id: bnb.id,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + i * step,
+                open,
+                high: px * 1.006,
+                low: open * 0.994,
+                close: px,
+                volume: 500.0,
+                funding_rate: 0.00001,
+                created_at_ms: base_ts + i * step,
+                updated_at_ms: base_ts + i * step,
+            });
+        }
+        let mut map = HashMap::new();
+        map.insert(bnb.id, bars.clone());
+
+        // Cutoff at bar index 24 => 24 warmup bars, 18 evaluated bars
+        let eval_cutoff_ms = base_ts + 24 * step;
+        let ds = HistoricalDataset {
+            source: "mainnet".to_string(),
+            timeframe: "4h".to_string(),
+            eval_start_ms: Some(eval_cutoff_ms),
+            assets: vec![bnb.clone()],
+            bars_by_asset: map,
+        };
+        assert_eq!(
+            count_timeline_bars_before(&ds.bars_by_asset, eval_cutoff_ms),
+            24
+        );
+
+        let engine = BacktestEngine::new(BacktestConfig {
+            days: 5,
+            warmup_bars: 5, // should be overridden by eval_start_ms => 24
+            ..BacktestConfig::default()
+        });
+        let report = engine.run_dataset(&ds).unwrap();
+        assert_eq!(report.bars_evaluated, 18);
+        assert_eq!(report.equity_curve[0].created_at_ms, eval_cutoff_ms + step);
+
+        // Verify notional 24h volume produces full vol_factor=1.0 (> $25k) rather than penalized 0.45
+        let mut bnb_check = bnb;
+        bnb_check.mark_price = bars.last().unwrap().close;
+        let notional_24h_vol: f64 = bars[bars.len() - 6..]
+            .iter()
+            .map(|b| b.volume * b.close)
+            .sum();
+        assert!(notional_24h_vol > 1_500_000.0);
+        bnb_check.day_volume_usdc = notional_24h_vol;
+        let q = evaluate_asset_liquidity_quality(&bnb_check, &bars);
+        assert!((q.activity_scale - 1.0).abs() < 1e-6);
     }
 }

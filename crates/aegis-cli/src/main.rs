@@ -5,18 +5,20 @@
 //! `aegis-backtest` (Multi-Sleeve S1/S2/S3 Walk-Forward Simulation), and `aegis-telemetry`.
 
 use aegis_alerts::{send_test_alert, AlertDispatchResult};
-use aegis_backtest::dataset::assemble_db_dataset;
+use aegis_backtest::dataset::{assemble_db_dataset, HistoricalDataset};
 use aegis_backtest::{BacktestEngine, BacktestReport};
 use aegis_core::indicators::timeframe_to_ms;
 use aegis_core::{
-    now_ms, resolve_project_root, AegisError, AlertQueueRecord, Result, PLATFORM_VERSION,
+    now_ms, resolve_project_root, AegisError, AlertQueueRecord, ConfigMap, Result, PLATFORM_VERSION,
 };
 use aegis_db::{
     create_mariadb_backup, generate_fernet_key, master_key_file_for_db, validate_fernet_key,
     verify_latest_backup, write_master_key_file, BackupVerificationReport, DatabaseManager,
     DestructiveResetToken, FernetCipher, RetentionPolicy, RetentionPruneReport,
 };
-use aegis_execution::ExecutionEngine;
+use aegis_execution::{
+    fetch_mainnet_raw_history, ExecutionEngine, HyperliquidHttpClient, MainnetHistoryFetchOptions,
+};
 use aegis_telemetry::{init_tracing, TelemetryBus};
 use aegis_web::{build_dashboard_payload, build_health_payload, serve_web_with_shutdown};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -29,6 +31,7 @@ use std::time::Duration;
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum BacktestSource {
     Db,
+    Mainnet,
     Synthetic,
 }
 
@@ -36,6 +39,7 @@ impl BacktestSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Db => "db",
+            Self::Mainnet => "mainnet",
             Self::Synthetic => "synthetic",
         }
     }
@@ -158,13 +162,57 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         days: usize,
 
-        /// Historical data source (`db` loads MariaDB candles & funding; `synthetic` uses deterministic generator)
+        /// Historical data source (`db` loads MariaDB; `mainnet` fetches Hyperliquid Mainnet public API; `synthetic` uses deterministic generator)
         #[arg(long, value_enum, default_value_t = BacktestSource::Synthetic)]
         source: BacktestSource,
 
-        /// Candle timeframe (`1h` or `4h`) used with `--source db`
+        /// Candle timeframe (`1h` or `4h`) used with `--source db` or `--source mainnet`
         #[arg(long, value_enum, default_value_t = BacktestTimeframe::H4)]
         timeframe: BacktestTimeframe,
+
+        /// Maximum top-volume eligible Mainnet assets to fetch with `--source mainnet` (1-150)
+        #[arg(long, default_value_t = 30)]
+        max_assets: usize,
+
+        /// Warmup bars preceding the evaluation window (1-500)
+        #[arg(long, default_value_t = 72)]
+        warmup_bars: usize,
+
+        /// Optional risk-tier override for sensitivity analysis (`conservative`, `standard`, `aggressive`, `extreme`, `custom`)
+        #[arg(long)]
+        risk_tier: Option<String>,
+
+        /// Optional starting equity override in USDC (>= 100.0)
+        #[arg(long)]
+        equity: Option<f64>,
+
+        /// Optional override for `profit_gate_signal_exits` (`true` or `false`)
+        #[arg(long)]
+        profit_gate: Option<bool>,
+
+        /// Optional override for `max_open_positions` (1-100)
+        #[arg(long)]
+        max_open_positions: Option<usize>,
+
+        /// Optional override for `min_entry_interval_sec` in seconds (0-86400)
+        #[arg(long)]
+        min_entry_interval_sec: Option<i64>,
+
+        /// Optional override for `stagnation_time_stop_hours` (0.0-168.0; 0 disables stagnation stop)
+        #[arg(long)]
+        stagnation_hours: Option<f64>,
+
+        /// Optional override for `risk_per_trade_equity_pct` (0.0-0.05; 0 disables risk-budget cap)
+        #[arg(long)]
+        risk_per_trade_pct: Option<f64>,
+
+        /// Optional path to save the assembled `HistoricalDataset` JSON for deterministic replay
+        #[arg(long)]
+        save_dataset: Option<PathBuf>,
+
+        /// Optional path to load a saved `HistoricalDataset` JSON directly (bypassing network/DB fetch)
+        #[arg(long)]
+        load_dataset: Option<PathBuf>,
     },
 
     /// Print live MariaDB 13.0 health, 7 SQL Views summary, risk tier, and portfolio snapshot status
@@ -499,25 +547,150 @@ fn execute_alert_command(db: &DatabaseManager, test: bool) -> Result<AlertComman
     })
 }
 
-fn run_backtest_blocking(
-    db: &DatabaseManager,
+struct BacktestRunOptions {
     days: usize,
     source: BacktestSource,
     timeframe: BacktestTimeframe,
+    max_assets: usize,
+    warmup_bars: usize,
+    risk_tier: Option<String>,
+    equity: Option<f64>,
+    profit_gate: Option<bool>,
+    max_open_positions: Option<usize>,
+    min_entry_interval_sec: Option<i64>,
+    stagnation_hours: Option<f64>,
+    risk_per_trade_pct: Option<f64>,
+    save_dataset: Option<PathBuf>,
+    load_dataset: Option<PathBuf>,
+}
+
+fn apply_backtest_config_overrides(cfg: &mut ConfigMap, opts: &BacktestRunOptions) -> Result<()> {
+    if !(1..=500).contains(&opts.warmup_bars) {
+        return Err(AegisError::Validation(format!(
+            "Invalid --warmup-bars '{}': must be within 1..=500",
+            opts.warmup_bars
+        )));
+    }
+    cfg.insert("backtest_warmup_bars", opts.warmup_bars.to_string());
+
+    if let Some(ref tier_raw) = opts.risk_tier {
+        let normalized = tier_raw.trim().to_ascii_lowercase();
+        if !matches!(
+            normalized.as_str(),
+            "conservative" | "standard" | "aggressive" | "extreme" | "custom"
+        ) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --risk-tier '{tier_raw}' (expected conservative, standard, aggressive, extreme, or custom)"
+            )));
+        }
+        cfg.insert("risk_tier", normalized);
+    }
+    if let Some(eq) = opts.equity {
+        if !eq.is_finite() || eq < 100.0 {
+            return Err(AegisError::Validation(format!(
+                "Invalid --equity '{eq}': must be finite and >= 100.0 USDC"
+            )));
+        }
+        cfg.insert("initial_paper_equity_usdc", format!("{eq}"));
+    }
+    if let Some(pg) = opts.profit_gate {
+        cfg.insert(
+            "profit_gate_signal_exits",
+            if pg { "true" } else { "false" },
+        );
+    }
+    if let Some(v) = opts.max_open_positions {
+        if !(1..=100).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --max-open-positions '{v}': must be within 1..=100"
+            )));
+        }
+        cfg.insert("max_open_positions", v.to_string());
+    }
+    if let Some(v) = opts.min_entry_interval_sec {
+        if !(0..=86_400).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --min-entry-interval-sec '{v}': must be within 0..=86400"
+            )));
+        }
+        cfg.insert("min_entry_interval_sec", v.to_string());
+    }
+    if let Some(v) = opts.stagnation_hours {
+        if !v.is_finite() || !(0.0..=168.0).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --stagnation-hours '{v}': must be finite and within 0.0..=168.0"
+            )));
+        }
+        cfg.insert("stagnation_time_stop_hours", format!("{v}"));
+    }
+    if let Some(v) = opts.risk_per_trade_pct {
+        if !v.is_finite() || !(0.0..=0.05).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --risk-per-trade-pct '{v}': must be finite and within 0.0..=0.05"
+            )));
+        }
+        cfg.insert("risk_per_trade_equity_pct", format!("{v}"));
+    }
+    Ok(())
+}
+
+fn save_historical_dataset_json(path: &Path, dataset: &HistoricalDataset) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(AegisError::Io)?;
+    }
+    let json_text = serde_json::to_string(dataset)
+        .map_err(|e| AegisError::Validation(format!("Failed serializing dataset JSON: {e}")))?;
+    std::fs::write(path, json_text).map_err(AegisError::Io)
+}
+
+fn load_historical_dataset_json(path: &Path) -> Result<HistoricalDataset> {
+    let raw = std::fs::read_to_string(path).map_err(AegisError::Io)?;
+    serde_json::from_str::<HistoricalDataset>(&raw).map_err(|e| {
+        AegisError::Validation(format!(
+            "Failed parsing dataset JSON '{}': {e}",
+            path.display()
+        ))
+    })
+}
+
+fn run_backtest_with_options(
+    db_opt: Option<&DatabaseManager>,
+    opts: BacktestRunOptions,
 ) -> Result<BacktestReport> {
-    db.init_schema()?;
-    let cfg = db.load_config_or_default();
-    let bt = BacktestEngine::from_config_map(&cfg, days);
-    match source {
+    let mut cfg = if let Some(db) = db_opt {
+        if opts.source == BacktestSource::Db && opts.load_dataset.is_none() {
+            db.init_schema()?;
+        }
+        db.load_config_or_default()
+    } else {
+        ConfigMap::from_defaults()
+    };
+
+    apply_backtest_config_overrides(&mut cfg, &opts)?;
+
+    let bt = BacktestEngine::from_config_map(&cfg, opts.days);
+
+    if let Some(ref load_path) = opts.load_dataset {
+        let dataset = load_historical_dataset_json(load_path)?;
+        if let Some(ref save_path) = opts.save_dataset {
+            save_historical_dataset_json(save_path, &dataset)?;
+        }
+        return bt.run_dataset(&dataset);
+    }
+
+    match opts.source {
         BacktestSource::Synthetic => bt.run_default_simulation(),
         BacktestSource::Db => {
-            let tf_str = timeframe.as_str();
+            let db = db_opt.ok_or_else(|| {
+                AegisError::Validation("MariaDB connection required for --source db".to_string())
+            })?;
+            let tf_str = opts.timeframe.as_str();
             let bar_ms = timeframe_to_ms(tf_str).ok_or_else(|| {
                 AegisError::Validation(format!("Unsupported timeframe '{tf_str}'"))
             })?;
             let until_ms = now_ms();
             let warmup_ms = (bt.config.warmup_bars as i64 + 12).saturating_mul(bar_ms);
-            let window_ms = (days.max(5) as i64).saturating_mul(86_400_000);
+            let window_ms = (opts.days.max(5) as i64).saturating_mul(86_400_000);
             let since_ms = until_ms.saturating_sub(window_ms.saturating_add(warmup_ms));
 
             let assets = db.list_exchange_assets()?;
@@ -525,9 +698,58 @@ fn run_backtest_blocking(
             let funding_events = db.list_funding_events_window(since_ms, until_ms)?;
             let min_bars = bt.config.warmup_bars.saturating_add(2);
             let dataset = assemble_db_dataset(assets, bars_by_asset, funding_events, min_bars)?;
+            if let Some(ref save_path) = opts.save_dataset {
+                save_historical_dataset_json(save_path, &dataset)?;
+            }
+            bt.run_dataset(&dataset)
+        }
+        BacktestSource::Mainnet => {
+            let http = HyperliquidHttpClient::new(12);
+            let fetch_opts = MainnetHistoryFetchOptions {
+                days: opts.days,
+                timeframe: opts.timeframe.as_str().to_string(),
+                warmup_bars: opts.warmup_bars,
+                max_assets: opts.max_assets,
+            };
+            let raw = fetch_mainnet_raw_history(&http, &cfg, &fetch_opts)?;
+            let mut dataset =
+                assemble_db_dataset(raw.assets, raw.bars_by_asset, raw.funding_events, 24)?;
+            dataset.source = "mainnet".to_string();
+            dataset.eval_start_ms = Some(raw.eval_start_ms);
+            if let Some(ref save_path) = opts.save_dataset {
+                save_historical_dataset_json(save_path, &dataset)?;
+            }
             bt.run_dataset(&dataset)
         }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_backtest_blocking(
+    db: &DatabaseManager,
+    days: usize,
+    source: BacktestSource,
+    timeframe: BacktestTimeframe,
+) -> Result<BacktestReport> {
+    run_backtest_with_options(
+        Some(db),
+        BacktestRunOptions {
+            days,
+            source,
+            timeframe,
+            max_assets: 30,
+            warmup_bars: 24,
+            risk_tier: None,
+            equity: None,
+            profit_gate: None,
+            max_open_positions: None,
+            min_entry_interval_sec: None,
+            stagnation_hours: None,
+            risk_per_trade_pct: None,
+            save_dataset: None,
+            load_dataset: None,
+        },
+    )
 }
 
 fn print_db_outcome(outcome: &DbCommandOutcome, json_mode: bool) -> anyhow::Result<()> {
@@ -1018,6 +1240,99 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    if let Some(Commands::Backtest {
+        days,
+        source,
+        timeframe,
+        max_assets,
+        warmup_bars,
+        risk_tier,
+        equity,
+        profit_gate,
+        max_open_positions,
+        min_entry_interval_sec,
+        stagnation_hours,
+        risk_per_trade_pct,
+        save_dataset,
+        load_dataset,
+    }) = cli.command.clone()
+    {
+        let anchor_clone = cli.db.clone();
+        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<BacktestReport> {
+            let requires_db = source == BacktestSource::Db && load_dataset.is_none();
+            let has_db_url = std::env::var("AEGIS_DB_URL")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty());
+            let db_opt = if requires_db || has_db_url {
+                Some(DatabaseManager::connect(anchor_clone.as_deref(), None)?)
+            } else {
+                None
+            };
+            let report = run_backtest_with_options(
+                db_opt.as_ref(),
+                BacktestRunOptions {
+                    days,
+                    source,
+                    timeframe,
+                    max_assets,
+                    warmup_bars,
+                    risk_tier,
+                    equity,
+                    profit_gate,
+                    max_open_positions,
+                    min_entry_interval_sec,
+                    stagnation_hours,
+                    risk_per_trade_pct,
+                    save_dataset,
+                    load_dataset,
+                },
+            )?;
+            Ok(report)
+        })
+        .await??;
+
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "AEGIS QUANT v{} // MULTI-SLEEVE WALK-FORWARD BACKTEST ({} days | tf={} | src={} | Tier={} {:.2}x)",
+                PLATFORM_VERSION,
+                report.days_evaluated,
+                report.timeframe,
+                source.as_str(),
+                report.risk_tier,
+                report.leverage_multiplier
+            );
+            println!(
+                "Equity  : ${:.2} -> ${:.2} USDC ({:+.2}%)",
+                report.initial_equity_usdc, report.final_equity_usdc, report.total_return_pct
+            );
+            println!(
+                "Metrics : Sharpe {:.2} | Sortino {:.2} | MaxDD {:.2}% | WinRate {:.1}% | PF {:.2} | Trades {}",
+                report.sharpe_ratio,
+                report.sortino_ratio,
+                report.max_drawdown_pct,
+                report.win_rate_pct,
+                report.profit_factor,
+                report.total_trades
+            );
+            println!(
+                "Sleeves : S1 Carry ${:+.2} | S2 Trend ${:+.2} | S3 Event ${:+.2}",
+                report.s1_attribution_usdc, report.s2_attribution_usdc, report.s3_attribution_usdc
+            );
+            println!(
+                "Costs   : Fees ${:.2} | Funding ${:+.2} | Stops {} | Stag {} | Assets {} | Bars {}",
+                report.total_fees_usdc,
+                report.total_funding_usdc,
+                report.stop_out_count,
+                report.stagnation_stop_count,
+                report.assets_evaluated,
+                report.bars_evaluated
+            );
+        }
+        return Ok(());
+    }
+
     let anchor_clone = cli.db.clone();
     let db = tokio::task::spawn_blocking(move || {
         DatabaseManager::connect(anchor_clone.as_deref(), None)
@@ -1025,7 +1340,7 @@ async fn main() -> anyhow::Result<()> {
     .await??;
 
     match cli.command.clone().unwrap_or(Commands::Run) {
-        Commands::Db { .. } => Ok(()),
+        Commands::Db { .. } | Commands::Backtest { .. } => Ok(()),
 
         Commands::Cutover { close_legacy } => {
             let db_clone = db.clone();
@@ -1072,51 +1387,6 @@ async fn main() -> anyhow::Result<()> {
                 tokio::task::spawn_blocking(move || execute_alert_command(&db_clone, test))
                     .await??;
             print_alert_outcome(&outcome, cli.json)
-        }
-
-        Commands::Backtest {
-            days,
-            source,
-            timeframe,
-        } => {
-            let db_clone = db.clone();
-            let report = tokio::task::spawn_blocking(move || {
-                run_backtest_blocking(&db_clone, days, source, timeframe)
-            })
-            .await??;
-
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!(
-                    "AEGIS QUANT v{} // MULTI-SLEEVE WALK-FORWARD BACKTEST ({} days | tf={} | src={} | Tier={} {:.2}x)",
-                    PLATFORM_VERSION,
-                    report.days_evaluated,
-                    report.timeframe,
-                    source.as_str(),
-                    report.risk_tier,
-                    report.leverage_multiplier
-                );
-                println!(
-                    "Equity  : ${:.2} -> ${:.2} USDC ({:+.2}%)",
-                    report.initial_equity_usdc, report.final_equity_usdc, report.total_return_pct
-                );
-                println!(
-                    "Metrics : Sharpe {:.2} | Sortino {:.2} | MaxDD {:.2}% | WinRate {:.1}% | Trades {}",
-                    report.sharpe_ratio,
-                    report.sortino_ratio,
-                    report.max_drawdown_pct,
-                    report.win_rate_pct,
-                    report.total_trades
-                );
-                println!(
-                    "Sleeves : S1 Carry ${:+.2} | S2 Trend ${:+.2} | S3 Event ${:+.2}",
-                    report.s1_attribution_usdc,
-                    report.s2_attribution_usdc,
-                    report.s3_attribution_usdc
-                );
-            }
-            Ok(())
         }
 
         Commands::Status => {
@@ -1248,6 +1518,17 @@ mod tests {
                 days: 45,
                 source: BacktestSource::Synthetic,
                 timeframe: BacktestTimeframe::H4,
+                max_assets: 30,
+                warmup_bars: 72,
+                risk_tier: None,
+                equity: None,
+                profit_gate: None,
+                max_open_positions: None,
+                min_entry_interval_sec: None,
+                stagnation_hours: None,
+                risk_per_trade_pct: None,
+                save_dataset: None,
+                load_dataset: None,
             })
         ));
 
@@ -1266,8 +1547,77 @@ mod tests {
                 days: 30,
                 source: BacktestSource::Db,
                 timeframe: BacktestTimeframe::H1,
+                ..
             })
         ));
+
+        let cli_bt_mainnet = Cli::try_parse_from([
+            "aegis-quant",
+            "backtest",
+            "--source",
+            "mainnet",
+            "--days",
+            "7",
+            "--timeframe",
+            "4h",
+            "--max-assets",
+            "42",
+            "--warmup-bars",
+            "72",
+            "--risk-tier",
+            "standard",
+            "--equity",
+            "25000",
+            "--profit-gate",
+            "true",
+            "--max-open-positions",
+            "10",
+            "--min-entry-interval-sec",
+            "0",
+            "--stagnation-hours",
+            "12.5",
+            "--risk-per-trade-pct",
+            "0.015",
+            "--save-dataset",
+            "/tmp/ds.json",
+            "--load-dataset",
+            "/tmp/ds_in.json",
+        ])
+        .unwrap();
+        match cli_bt_mainnet.command {
+            Some(Commands::Backtest {
+                days,
+                source,
+                timeframe,
+                max_assets,
+                warmup_bars,
+                risk_tier,
+                equity,
+                profit_gate,
+                max_open_positions,
+                min_entry_interval_sec,
+                stagnation_hours,
+                risk_per_trade_pct,
+                save_dataset,
+                load_dataset,
+            }) => {
+                assert_eq!(days, 7);
+                assert_eq!(source, BacktestSource::Mainnet);
+                assert_eq!(timeframe, BacktestTimeframe::H4);
+                assert_eq!(max_assets, 42);
+                assert_eq!(warmup_bars, 72);
+                assert_eq!(risk_tier.as_deref(), Some("standard"));
+                assert_eq!(equity, Some(25_000.0));
+                assert_eq!(profit_gate, Some(true));
+                assert_eq!(max_open_positions, Some(10));
+                assert_eq!(min_entry_interval_sec, Some(0));
+                assert_eq!(stagnation_hours, Some(12.5));
+                assert_eq!(risk_per_trade_pct, Some(0.015));
+                assert_eq!(save_dataset, Some(PathBuf::from("/tmp/ds.json")));
+                assert_eq!(load_dataset, Some(PathBuf::from("/tmp/ds_in.json")));
+            }
+            _ => panic!("expected Backtest command"),
+        }
 
         assert!(Cli::try_parse_from([
             "aegis-quant",
@@ -1282,6 +1632,150 @@ mod tests {
         let cli_status = Cli::try_parse_from(["aegis-quant", "status", "--json"]).unwrap();
         assert!(cli_status.json);
         assert!(matches!(cli_status.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn test_backtest_cli_overrides_validation_and_config_propagation() {
+        let base_opts = || BacktestRunOptions {
+            days: 14,
+            source: BacktestSource::Synthetic,
+            timeframe: BacktestTimeframe::H4,
+            max_assets: 42,
+            warmup_bars: 72,
+            risk_tier: None,
+            equity: None,
+            profit_gate: None,
+            max_open_positions: None,
+            min_entry_interval_sec: None,
+            stagnation_hours: None,
+            risk_per_trade_pct: None,
+            save_dataset: None,
+            load_dataset: None,
+        };
+
+        let mut cfg = ConfigMap::from_defaults();
+        let mut valid_opts = base_opts();
+        valid_opts.warmup_bars = 480;
+        valid_opts.max_open_positions = Some(10);
+        valid_opts.min_entry_interval_sec = Some(0);
+        valid_opts.stagnation_hours = Some(12.5);
+        valid_opts.risk_per_trade_pct = Some(0.015);
+        apply_backtest_config_overrides(&mut cfg, &valid_opts).unwrap();
+        assert_eq!(cfg.get_i64("backtest_warmup_bars", 0), 480);
+        assert_eq!(cfg.get_usize("max_open_positions", 0), 10);
+        assert_eq!(cfg.get_i64("min_entry_interval_sec", -1), 0);
+        assert!((cfg.get_f64("stagnation_time_stop_hours", -1.0) - 12.5).abs() < 1e-9);
+        assert!((cfg.get_f64("risk_per_trade_equity_pct", -1.0) - 0.015).abs() < 1e-9);
+
+        let bt = BacktestEngine::from_config_map(&cfg, 14);
+        assert_eq!(bt.config.warmup_bars, 480);
+        assert_eq!(bt.config.max_open_positions, 10);
+        assert_eq!(bt.config.min_entry_interval_sec, 0);
+        assert!((bt.config.risk_limits.stagnation_time_stop_hours - 12.5).abs() < 1e-9);
+        assert!((bt.config.risk_limits.risk_per_trade_equity_pct - 0.015).abs() < 1e-9);
+
+        // Boundary valid checks
+        for (opts, exp_warmup, exp_stag) in [
+            (
+                BacktestRunOptions {
+                    warmup_bars: 1,
+                    max_open_positions: Some(1),
+                    min_entry_interval_sec: Some(0),
+                    stagnation_hours: Some(0.0),
+                    risk_per_trade_pct: Some(0.0),
+                    ..base_opts()
+                },
+                1,
+                0.0,
+            ),
+            (
+                BacktestRunOptions {
+                    warmup_bars: 500,
+                    max_open_positions: Some(100),
+                    min_entry_interval_sec: Some(86_400),
+                    stagnation_hours: Some(168.0),
+                    risk_per_trade_pct: Some(0.05),
+                    ..base_opts()
+                },
+                500,
+                168.0,
+            ),
+        ] {
+            let mut c = ConfigMap::from_defaults();
+            assert!(apply_backtest_config_overrides(&mut c, &opts).is_ok());
+            let bt_bound = BacktestEngine::from_config_map(&c, 14);
+            assert_eq!(bt_bound.config.warmup_bars, exp_warmup);
+            assert!(
+                (bt_bound.config.risk_limits.stagnation_time_stop_hours - exp_stag).abs() < 1e-9
+            );
+        }
+
+        // Out-of-range / non-finite validation errors
+        let invalid_cases = [
+            BacktestRunOptions {
+                warmup_bars: 0,
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                warmup_bars: 501,
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                max_open_positions: Some(0),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                max_open_positions: Some(101),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                min_entry_interval_sec: Some(-1),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                min_entry_interval_sec: Some(86_401),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                stagnation_hours: Some(-0.1),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                stagnation_hours: Some(168.1),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                stagnation_hours: Some(f64::NAN),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                stagnation_hours: Some(f64::INFINITY),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                risk_per_trade_pct: Some(-0.001),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                risk_per_trade_pct: Some(0.051),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                risk_per_trade_pct: Some(f64::NAN),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                risk_per_trade_pct: Some(f64::NEG_INFINITY),
+                ..base_opts()
+            },
+        ];
+        for opts in invalid_cases {
+            let mut c = ConfigMap::from_defaults();
+            assert!(matches!(
+                apply_backtest_config_overrides(&mut c, &opts),
+                Err(AegisError::Validation(_))
+            ));
+        }
     }
 
     #[test]

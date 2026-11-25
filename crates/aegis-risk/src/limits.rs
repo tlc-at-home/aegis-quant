@@ -122,7 +122,7 @@ impl RiskLimitsConfig {
             breakeven_lock_r: cfg.get_f64("breakeven_lock_r", 0.05).clamp(0.0, 0.50),
             stagnation_time_stop_hours: cfg
                 .get_f64("stagnation_time_stop_hours", 5.0)
-                .clamp(0.0, 72.0),
+                .clamp(0.0, 168.0),
             stagnation_min_mfe_r: cfg.get_f64("stagnation_min_mfe_r", 0.35).clamp(0.05, 2.0),
             risk_per_trade_equity_pct: cfg
                 .get_f64("risk_per_trade_equity_pct", 0.005)
@@ -483,9 +483,16 @@ mod tests {
         let mut custom = ConfigMap::new();
         custom.insert("take_profit_atr_mult", "0.2");
         custom.insert("take_profit_default_pct", "1.5");
+        custom.insert("stagnation_time_stop_hours", "168.0");
         let clamped_low_high = RiskLimitsConfig::from_config_map(&custom);
         assert!((clamped_low_high.take_profit_atr_mult - 1.0).abs() < 1e-9);
         assert!((clamped_low_high.take_profit_default_pct - 0.80).abs() < 1e-9);
+        assert!((clamped_low_high.stagnation_time_stop_hours - 168.0).abs() < 1e-9);
+
+        let mut over_max = ConfigMap::new();
+        over_max.insert("stagnation_time_stop_hours", "200.0");
+        let clamped_stagnation = RiskLimitsConfig::from_config_map(&over_max);
+        assert!((clamped_stagnation.stagnation_time_stop_hours - 168.0).abs() < 1e-9);
     }
 
     #[test]

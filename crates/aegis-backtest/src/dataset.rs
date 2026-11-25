@@ -4,15 +4,33 @@ use aegis_core::indicators::timeframe_to_ms;
 use aegis_core::{round_dp, AegisError, ExchangeAsset, OhlcvBar, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Normalized historical OHLCV + funding dataset ready for `BacktestEngine::run_walk_forward`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoricalDataset {
     pub source: String,
     pub timeframe: String,
+    #[serde(default)]
+    pub eval_start_ms: Option<i64>,
     pub assets: Vec<ExchangeAsset>,
     pub bars_by_asset: HashMap<i64, Vec<OhlcvBar>>,
+}
+
+/// Counts distinct bar open timestamps strictly preceding `cutoff_ts_ms` across all assets.
+pub fn count_timeline_bars_before(
+    bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+    cutoff_ts_ms: i64,
+) -> usize {
+    let mut ts_set = BTreeSet::new();
+    for bars in bars_by_asset.values() {
+        for bar in bars {
+            if bar.timestamp_ms < cutoff_ts_ms {
+                ts_set.insert(bar.timestamp_ms);
+            }
+        }
+    }
+    ts_set.len()
 }
 
 /// Generates a deterministic multi-asset Hyperliquid perpetual dataset (`BTC-USDC`, `ETH-USDC`,
@@ -212,6 +230,7 @@ pub fn assemble_db_dataset(
     Ok(HistoricalDataset {
         source: "db".to_string(),
         timeframe,
+        eval_start_ms: None,
         assets: valid_assets,
         bars_by_asset,
     })
