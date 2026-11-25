@@ -261,12 +261,19 @@ pub async fn post_config_handler(
 
             let mut keys = Vec::with_capacity(pending_writes.len());
             let mut risk_tier_updated: Option<String> = None;
-            let mut explicit_mult_updated = false;
+            let mut explicit_mult_updated: Option<f64> = None;
+            let mut explicit_risk_pct_updated = false;
+            let mut explicit_max_weight_updated = false;
             for (k, val_str, desc) in &pending_writes {
                 if k == "risk_tier" {
                     risk_tier_updated = Some(val_str.clone());
                 } else if k == "target_leverage_multiplier" {
-                    explicit_mult_updated = true;
+                    explicit_mult_updated =
+                        val_str.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+                } else if k == "risk_per_trade_equity_pct" {
+                    explicit_risk_pct_updated = true;
+                } else if k == "max_single_asset_weight" {
+                    explicit_max_weight_updated = true;
                 }
                 db.set_config_value(k, val_str, desc.as_deref())?;
                 keys.push(k.clone());
@@ -281,17 +288,42 @@ pub async fn post_config_handler(
                 keys.push("hyperliquid_testnet".to_string());
             }
 
-            // Keep target_leverage_multiplier synchronized if risk_tier was changed directly
+            // Keep target_leverage_multiplier, risk_per_trade_equity_pct, and max_single_asset_weight
+            // synchronized when risk_tier changes unless explicitly overridden in the same write
             if let Some(raw_tier) = risk_tier_updated {
-                if !explicit_mult_updated && !raw_tier.eq_ignore_ascii_case("custom") {
-                    let tier = aegis_core::RiskTier::parse(&raw_tier);
-                    let mult = tier.leverage_multiplier(None);
+                let tier = aegis_core::RiskTier::parse(&raw_tier);
+                let mult = if tier == aegis_core::RiskTier::Custom {
+                    explicit_mult_updated
+                        .unwrap_or_else(|| db.load_config_or_default().target_leverage_multiplier())
+                } else {
+                    let m = tier.leverage_multiplier(None);
+                    if explicit_mult_updated.is_none() {
+                        db.set_config_value(
+                            "target_leverage_multiplier",
+                            &format!("{m:.2}"),
+                            Some("Synchronized with risk_tier update"),
+                        )?;
+                        keys.push("target_leverage_multiplier".to_string());
+                    }
+                    m
+                };
+                if !explicit_risk_pct_updated {
+                    let risk_pct = tier.default_risk_per_trade_equity_pct(Some(mult));
                     db.set_config_value(
-                        "target_leverage_multiplier",
-                        &format!("{mult:.2}"),
+                        "risk_per_trade_equity_pct",
+                        &format!("{risk_pct:.4}"),
                         Some("Synchronized with risk_tier update"),
                     )?;
-                    keys.push("target_leverage_multiplier".to_string());
+                    keys.push("risk_per_trade_equity_pct".to_string());
+                }
+                if !explicit_max_weight_updated {
+                    let max_w = tier.default_max_single_asset_weight(Some(mult));
+                    db.set_config_value(
+                        "max_single_asset_weight",
+                        &format!("{max_w:.4}"),
+                        Some("Synchronized with risk_tier update"),
+                    )?;
+                    keys.push("max_single_asset_weight".to_string());
                 }
             }
 

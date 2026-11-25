@@ -5492,6 +5492,7 @@ fn test_wave2_cap_epoch_validation_and_oracle_profit_gate_guards() {
         entry_price: 3400.0,
         mark_price: 3400.0,
         protective_stop_px: 3200.0,
+        entry_r0: 200.0,
         protective_stop_oid: None,
         stop_distance_pct: None,
         take_profit_px: 3700.0,

@@ -233,6 +233,8 @@ pub struct PositionRecord {
     pub s2_weight_contrib: f64,
     pub s3_weight_contrib: f64,
     pub protective_stop_px: f64,
+    #[serde(default)]
+    pub entry_r0: f64,
     pub protective_stop_oid: Option<String>,
     #[serde(default)]
     pub take_profit_px: f64,

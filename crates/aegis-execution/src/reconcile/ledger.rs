@@ -1118,6 +1118,7 @@ mod tests {
             entry_price: 90_000.0,
             mark_price: 88_000.0,
             protective_stop_px: 88_500.0,
+            entry_r0: 1_500.0,
             protective_stop_oid: None,
             stop_distance_pct: None,
             take_profit_px: 95_000.0,

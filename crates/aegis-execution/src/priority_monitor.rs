@@ -653,6 +653,7 @@ impl PriorityMonitor {
                     tick_size,
                     check_tp: true,
                     held_duration_ms: Some(held_duration_ms),
+                    entry_r0: (h.entry_r0 > 0.0).then_some(h.entry_r0),
                 });
 
                 if eval.triggered {
@@ -2539,7 +2540,9 @@ mod tests {
         // Basis is 1000 bps > 50 bps -> must switch surveillance reference to oracle 100.0!
         assert!((resolve_surveillance_trigger_price(Some(&sol), 90.0, 50.0) - 100.0).abs() < 1e-6);
 
-        // Create a position opened 6 hours ago with stagnation time-stop trigger -> PassiveFirst rests ALO limit, then fills!
+        // Create a position opened 6 hours ago with stagnation time-stop pinned to 5h -> PassiveFirst rests ALO limit, then fills!
+        db.set_config_value("stagnation_time_stop_hours", "5.0", None)
+            .unwrap();
         let (pos_id, _) = db
             .sync_open_position_from_exchange_v2(&aegis_db::ExchangeOpenPositionSyncInput {
                 asset_id: sol_id,

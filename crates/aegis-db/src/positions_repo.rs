@@ -112,12 +112,33 @@ struct ActiveSyncRow {
     status: String,
     side: String,
     protective_stop_px: f64,
+    entry_r0: f64,
     protective_stop_oid: Option<String>,
     take_profit_px: f64,
     take_profit_oid: Option<String>,
     client_order_id: String,
     fsm_state: String,
     requested_quantity: f64,
+}
+
+fn derive_entry_r0_from_stop(entry_price: f64, entry_stop: f64) -> f64 {
+    if entry_price.is_finite() && entry_price > 0.0 && entry_stop.is_finite() && entry_stop > 0.0 {
+        round_dp((entry_price - entry_stop).abs(), 8)
+    } else {
+        0.0
+    }
+}
+
+fn derive_entry_r0_for_sync(side: OrderSide, entry_price: f64, entry_stop: f64) -> f64 {
+    let valid_initial_side = match side {
+        OrderSide::Long => entry_stop < entry_price,
+        OrderSide::Short => entry_stop > entry_price,
+    };
+    if valid_initial_side {
+        derive_entry_r0_from_stop(entry_price, entry_stop)
+    } else {
+        0.0
+    }
 }
 
 fn truncate_exit_reason(reason: &str) -> String {
@@ -442,6 +463,8 @@ impl DatabaseManager {
         let s2_dec = decimal_param(input.s2_weight_contrib, 8, DEC_20_8_MAX_ABS)?;
         let s3_dec = decimal_param(input.s3_weight_contrib, 8, DEC_20_8_MAX_ABS)?;
         let stop_dec = decimal_param(input.protective_stop_px, 8, DEC_20_8_MAX_ABS)?;
+        let entry_r0 = derive_entry_r0_from_stop(input.limit_price, input.protective_stop_px);
+        let entry_r0_dec = decimal_param(entry_r0, 8, DEC_20_8_MAX_ABS)?;
         let tp_dec = decimal_param(take_profit_px, 8, DEC_20_8_MAX_ABS)?;
 
         let mut conn = self.get_conn()?;
@@ -454,13 +477,13 @@ impl DatabaseManager {
                    asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
                    requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
                    portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                   protective_stop_px, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
+                   protective_stop_px, entry_r0, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
                    exchange_order_id, created_at_ms, updated_at_ms
                ) VALUES (
                    :aid, :coid, :side, 'WORKING', 'WORKING_ALO', :px, :px,
                    :qty, 0.00000000, :res_usdc, 0.00000000,
                    :pw, :s1, :s2, :s3,
-                   :stop_px, :tp_px, :px, :px, 0,
+                   :stop_px, :entry_r0, :tp_px, :px, :px, 0,
                    :eoid, :ts, :ts
                )"#,
             params! {
@@ -475,6 +498,7 @@ impl DatabaseManager {
                 "s2" => &s2_dec,
                 "s3" => &s3_dec,
                 "stop_px" => &stop_dec,
+                "entry_r0" => &entry_r0_dec,
                 "tp_px" => &tp_dec,
                 "eoid" => &input.exchange_order_id,
                 "ts" => ts,
@@ -546,7 +570,6 @@ impl DatabaseManager {
         let px_dec = decimal_param(fill_price, 8, DEC_20_8_MAX_ABS)?;
         let qty_dec = decimal_param(filled_quantity, 8, DEC_20_8_MAX_ABS)?;
         let comm_dec = decimal_param(committed_usdc, 8, DEC_20_8_MAX_ABS)?;
-        let stop_dec = decimal_param(protective_stop_px, 8, DEC_20_8_MAX_ABS)?;
         let fees_dec = decimal_param(fees_rounded, 8, DEC_20_8_MAX_ABS)?;
 
         let mut conn = self.get_conn()?;
@@ -556,13 +579,16 @@ impl DatabaseManager {
 
         let row: Option<mysql::Row> = tx
             .exec_first(
-                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price, requested_quantity, take_profit_px
+                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          requested_quantity, protective_stop_px, take_profit_px
                    FROM positions
                    WHERE id = :pid
                    FOR UPDATE"#,
                 params! { "pid" => position_id },
             )
-            .map_err(|e| AegisError::Database(format!("promote_working_to_open lock failed: {e}")))?;
+            .map_err(|e| {
+                AegisError::Database(format!("promote_working_to_open lock failed: {e}"))
+            })?;
 
         let locked =
             row.ok_or_else(|| AegisError::Database(format!("Position {position_id} not found")))?;
@@ -573,7 +599,8 @@ impl DatabaseManager {
         let fsm_state = row_get_string(&locked, 4, "");
         let limit_px = row_get_f64(&locked, 5, 0.0);
         let requested_qty = row_get_f64(&locked, 6, 0.0);
-        let existing_tp_px = row_get_f64(&locked, 7, 0.0);
+        let existing_stop_px = row_get_f64(&locked, 7, 0.0);
+        let existing_tp_px = row_get_f64(&locked, 8, 0.0);
 
         if !status.eq_ignore_ascii_case("WORKING") {
             return Err(AegisError::Database(format!(
@@ -582,12 +609,26 @@ impl DatabaseManager {
         }
 
         let side = OrderSide::parse(&side_str)?;
+        let eff_stop_px = if protective_stop_px.is_finite() && protective_stop_px > 0.0 {
+            protective_stop_px
+        } else if existing_stop_px.is_finite() && existing_stop_px > 0.0 {
+            existing_stop_px
+        } else {
+            0.0
+        };
+        let entry_r0 = if eff_stop_px > 0.0 {
+            round_dp((fill_price - eff_stop_px).abs().max(0.0), 8)
+        } else {
+            0.0
+        };
+        let stop_dec = decimal_param(eff_stop_px, 8, DEC_20_8_MAX_ABS)?;
+        let entry_r0_dec = decimal_param(entry_r0, 8, DEC_20_8_MAX_ABS)?;
         let eff_tp = take_profit_px
             .filter(|v| v.is_finite() && *v > 0.0)
             .or_else(|| {
                 (existing_tp_px.is_finite() && existing_tp_px > 0.0).then_some(existing_tp_px)
             })
-            .unwrap_or_else(|| derive_take_profit_px(side, fill_price, protective_stop_px));
+            .unwrap_or_else(|| derive_take_profit_px(side, fill_price, eff_stop_px));
         let tp_dec = decimal_param(eff_tp, 8, DEC_20_8_MAX_ABS)?;
         let req_qty_dec = decimal_param(requested_qty, 8, DEC_20_8_MAX_ABS)?;
         let lim_px_dec = decimal_param(limit_px, 8, DEC_20_8_MAX_ABS)?;
@@ -602,6 +643,7 @@ impl DatabaseManager {
                    reserved_margin_usdc = 0.00000000,
                    committed_notional_usdc = :comm_usdc,
                    protective_stop_px = :stop_px,
+                   entry_r0 = :entry_r0,
                    take_profit_px = :tp_px,
                    highest_price_seen = :px,
                    lowest_price_seen = :px,
@@ -615,6 +657,7 @@ impl DatabaseManager {
                 "qty" => &qty_dec,
                 "comm_usdc" => &comm_dec,
                 "stop_px" => &stop_dec,
+                "entry_r0" => &entry_r0_dec,
                 "tp_px" => &tp_dec,
                 "fees" => &fees_dec,
                 "eoid" => exchange_order_id,
@@ -1554,7 +1597,7 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          protective_stop_px, entry_r0, protective_stop_oid, take_profit_px, take_profit_oid,
                           highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
                           unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
                           slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
@@ -1576,7 +1619,7 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          protective_stop_px, entry_r0, protective_stop_oid, take_profit_px, take_profit_oid,
                           highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
                           unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
                           slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
@@ -1602,7 +1645,7 @@ impl DatabaseManager {
                           current_price, exit_price, requested_quantity, filled_quantity,
                           reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
                           s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-                          protective_stop_px, protective_stop_oid, take_profit_px, take_profit_oid,
+                          protective_stop_px, entry_r0, protective_stop_oid, take_profit_px, take_profit_oid,
                           highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
                           unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
                           slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
@@ -2168,6 +2211,15 @@ impl DatabaseManager {
             Some("Timestamp (ms) of the most recent new position entry order"),
         )
     }
+
+    /// Sums `realized_pnl_usdc` across all rows in `positions`.
+    pub fn sum_realized_pnl_usdc(&self) -> Result<f64> {
+        let mut conn = self.get_conn()?;
+        let row: Option<mysql::Row> = conn
+            .query_first("SELECT COALESCE(SUM(realized_pnl_usdc), 0) FROM positions")
+            .map_err(|e| AegisError::Database(format!("sum_realized_pnl_usdc failed: {e}")))?;
+        Ok(row.map(|r| row_get_f64(&r, 0, 0.0)).unwrap_or(0.0))
+    }
 }
 
 struct ExactClosedCandidate {
@@ -2235,7 +2287,7 @@ fn lock_active_rows_for_asset(
 ) -> Result<Vec<ActiveSyncRow>> {
     let raw_active: Vec<mysql::Row> = tx
         .exec(
-            r#"SELECT id, status, side, protective_stop_px, protective_stop_oid,
+            r#"SELECT id, status, side, protective_stop_px, entry_r0, protective_stop_oid,
                       take_profit_px, take_profit_oid, client_order_id, fsm_state,
                       requested_quantity
                FROM positions
@@ -2257,12 +2309,13 @@ fn lock_active_rows_for_asset(
             status: row_get_string(r, 1, ""),
             side: row_get_string(r, 2, "LONG"),
             protective_stop_px: row_get_f64(r, 3, 0.0),
-            protective_stop_oid: row_get_opt_string(r, 4),
-            take_profit_px: row_get_f64(r, 5, 0.0),
-            take_profit_oid: row_get_opt_string(r, 6),
-            client_order_id: row_get_string(r, 7, ""),
-            fsm_state: row_get_string(r, 8, ""),
-            requested_quantity: row_get_f64(r, 9, 0.0),
+            entry_r0: row_get_f64(r, 4, 0.0),
+            protective_stop_oid: row_get_opt_string(r, 5),
+            take_profit_px: row_get_f64(r, 6, 0.0),
+            take_profit_oid: row_get_opt_string(r, 7),
+            client_order_id: row_get_string(r, 8, ""),
+            fsm_state: row_get_string(r, 9, ""),
+            requested_quantity: row_get_f64(r, 10, 0.0),
         })
         .collect())
 }
@@ -2319,6 +2372,11 @@ fn update_existing_open_row_on_sync(
         input.take_profit_px,
     );
 
+    let eff_r0 = if open_row.entry_r0.is_finite() && open_row.entry_r0 > 0.0 {
+        open_row.entry_r0
+    } else {
+        derive_entry_r0_for_sync(input.side, input.entry_price, eff_stop)
+    };
     let opened_at_param = input.opened_at_ms.filter(|&t| t > 0);
     tx.exec_drop(
         r#"UPDATE positions
@@ -2335,6 +2393,10 @@ fn update_existing_open_row_on_sync(
                funding_accrued_usdc = :funding,
                portfolio_weight = :pw,
                protective_stop_px = :stop_px,
+               entry_r0 = CASE
+                   WHEN entry_r0 > 0 THEN entry_r0
+                   ELSE CAST(:entry_r0 AS DECIMAL(20,8))
+               END,
                protective_stop_oid = :sl_oid,
                take_profit_px = :tp_px,
                take_profit_oid = :tp_oid,
@@ -2356,6 +2418,7 @@ fn update_existing_open_row_on_sync(
             "funding" => decimal_param(round_dp(input.funding_accrued_usdc, 4), 8, DEC_20_8_MAX_ABS)?,
             "pw" => decimal_param(round_dp(input.portfolio_weight, 4), 8, DEC_20_8_MAX_ABS)?,
             "stop_px" => decimal_param(eff_stop, 8, DEC_20_8_MAX_ABS)?,
+            "entry_r0" => decimal_param(eff_r0, 8, DEC_20_8_MAX_ABS)?,
             "sl_oid" => eff_sl_oid,
             "tp_px" => decimal_param(eff_tp, 8, DEC_20_8_MAX_ABS)?,
             "tp_oid" => eff_tp_oid,
@@ -2394,6 +2457,11 @@ fn promote_same_side_working_row_on_sync(
         input.take_profit_px,
     );
 
+    let eff_r0 = if w.entry_r0.is_finite() && w.entry_r0 > 0.0 {
+        w.entry_r0
+    } else {
+        derive_entry_r0_for_sync(input.side, input.entry_price, eff_stop)
+    };
     let comm_dec = decimal_param(
         round_dp(input.committed_notional_usdc, 4),
         8,
@@ -2417,6 +2485,10 @@ fn promote_same_side_working_row_on_sync(
                funding_accrued_usdc = :funding,
                portfolio_weight = :pw,
                protective_stop_px = :stop_px,
+               entry_r0 = CASE
+                   WHEN entry_r0 > 0 THEN entry_r0
+                   ELSE CAST(:entry_r0 AS DECIMAL(20,8))
+               END,
                take_profit_px = :tp_px,
                highest_price_seen = GREATEST(highest_price_seen, CAST(:high AS DECIMAL(20,8))),
                lowest_price_seen = CASE
@@ -2435,6 +2507,7 @@ fn promote_same_side_working_row_on_sync(
             "funding" => decimal_param(round_dp(input.funding_accrued_usdc, 4), 8, DEC_20_8_MAX_ABS)?,
             "pw" => decimal_param(round_dp(input.portfolio_weight, 4), 8, DEC_20_8_MAX_ABS)?,
             "stop_px" => decimal_param(eff_stop, 8, DEC_20_8_MAX_ABS)?,
+            "entry_r0" => decimal_param(eff_r0, 8, DEC_20_8_MAX_ABS)?,
             "tp_px" => decimal_param(eff_tp, 8, DEC_20_8_MAX_ABS)?,
             "high" => decimal_param(high, 8, DEC_20_8_MAX_ABS)?,
             "low" => decimal_param(low, 8, DEC_20_8_MAX_ABS)?,
@@ -2512,6 +2585,7 @@ fn adopt_new_open_row_on_sync(
     let eff_opened_at = input.opened_at_ms.filter(|&t| t > 0).unwrap_or(ts);
     let eff_created_at = eff_opened_at.min(ts);
 
+    let eff_r0 = derive_entry_r0_for_sync(input.side, input.entry_price, eff_stop);
     let entry_dec = decimal_param(input.entry_price, 8, DEC_20_8_MAX_ABS)?;
     let qty_dec = decimal_param(input.quantity, 8, DEC_20_8_MAX_ABS)?;
     let comm_dec = decimal_param(
@@ -2525,13 +2599,13 @@ fn adopt_new_open_row_on_sync(
                asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
                requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
                portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
-               protective_stop_px, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
+               protective_stop_px, entry_r0, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
                unrealized_pnl_usdc, funding_accrued_usdc, exchange_order_id, created_at_ms, opened_at_ms, updated_at_ms
            ) VALUES (
                :aid, :coid, :side, 'OPEN', 'FILLED_OPEN', :entry_px, :mark_px,
                :qty, :qty, 0.00000000, :comm_usdc,
                :pw, :pw, 0.00000000, 0.00000000,
-               :stop_px, :tp_px, :high, :low, 0,
+               :stop_px, :entry_r0, :tp_px, :high, :low, 0,
                :upnl, :funding, 'hl-reconciled', :cts, :ots, :ts
            )"#,
         params! {
@@ -2544,6 +2618,7 @@ fn adopt_new_open_row_on_sync(
             "comm_usdc" => &comm_dec,
             "pw" => decimal_param(round_dp(input.portfolio_weight, 4), 8, DEC_20_8_MAX_ABS)?,
             "stop_px" => decimal_param(eff_stop, 8, DEC_20_8_MAX_ABS)?,
+            "entry_r0" => decimal_param(eff_r0, 8, DEC_20_8_MAX_ABS)?,
             "tp_px" => decimal_param(eff_tp, 8, DEC_20_8_MAX_ABS)?,
             "high" => decimal_param(high, 8, DEC_20_8_MAX_ABS)?,
             "low" => decimal_param(low, 8, DEC_20_8_MAX_ABS)?,
@@ -2613,22 +2688,23 @@ fn row_to_position_record(r: &mysql::Row) -> PositionRecord {
         s2_weight_contrib: row_get_f64(r, 15, 0.0),
         s3_weight_contrib: row_get_f64(r, 16, 0.0),
         protective_stop_px: row_get_f64(r, 17, 0.0),
-        protective_stop_oid: row_get_opt_string(r, 18),
-        take_profit_px: row_get_f64(r, 19, 0.0),
-        take_profit_oid: row_get_opt_string(r, 20),
-        highest_price_seen: row_get_f64(r, 21, 0.0),
-        lowest_price_seen: row_get_f64(r, 22, 0.0),
-        chase_count: row_get_u32(r, 23, 0),
-        realized_pnl_usdc: row_get_f64(r, 24, 0.0),
-        unrealized_pnl_usdc: row_get_f64(r, 25, 0.0),
-        fees_paid_usdc: row_get_f64(r, 26, 0.0),
-        funding_accrued_usdc: row_get_f64(r, 27, 0.0),
-        slippage_paid_usdc: row_get_f64(r, 28, 0.0),
-        exchange_order_id: row_get_opt_string(r, 29),
-        created_at_ms: row_get_i64(r, 30, 0),
-        opened_at_ms: row_get_opt_i64(r, 31),
-        closed_at_ms: row_get_opt_i64(r, 32),
-        updated_at_ms: row_get_i64(r, 33, 0),
-        exit_reason: row_get_opt_string(r, 34),
+        entry_r0: row_get_f64(r, 18, 0.0),
+        protective_stop_oid: row_get_opt_string(r, 19),
+        take_profit_px: row_get_f64(r, 20, 0.0),
+        take_profit_oid: row_get_opt_string(r, 21),
+        highest_price_seen: row_get_f64(r, 22, 0.0),
+        lowest_price_seen: row_get_f64(r, 23, 0.0),
+        chase_count: row_get_u32(r, 24, 0),
+        realized_pnl_usdc: row_get_f64(r, 25, 0.0),
+        unrealized_pnl_usdc: row_get_f64(r, 26, 0.0),
+        fees_paid_usdc: row_get_f64(r, 27, 0.0),
+        funding_accrued_usdc: row_get_f64(r, 28, 0.0),
+        slippage_paid_usdc: row_get_f64(r, 29, 0.0),
+        exchange_order_id: row_get_opt_string(r, 30),
+        created_at_ms: row_get_i64(r, 31, 0),
+        opened_at_ms: row_get_opt_i64(r, 32),
+        closed_at_ms: row_get_opt_i64(r, 33),
+        updated_at_ms: row_get_i64(r, 34, 0),
+        exit_reason: row_get_opt_string(r, 35),
     }
 }

@@ -674,6 +674,11 @@ mod tests {
                 s2_weight_contrib: 0.0,
                 s3_weight_contrib: 0.0,
                 protective_stop_px: stop,
+                entry_r0: if stop > 0.0 {
+                    (entry - stop).abs()
+                } else {
+                    0.0
+                },
                 protective_stop_oid: None,
                 take_profit_px: tp,
                 take_profit_oid: None,

@@ -16,8 +16,8 @@ use crate::stops::{
     StopRatchetEvaluation,
 };
 use aegis_core::{
-    round_dp, ConfigMap, ExchangeAsset, HeldAssetView, OrderSide, OrderedAssetView, PositionRecord,
-    SleeveSignal,
+    round_dp, AegisError, ConfigMap, ExchangeAsset, HeldAssetView, OrderSide, OrderedAssetView,
+    PositionRecord, Result, SleeveSignal,
 };
 use serde::{Deserialize, Serialize};
 
@@ -239,20 +239,23 @@ impl RiskEngine {
             return reject("RUIN_HALT_EQUITY_BELOW_FLOOR".to_string());
         }
 
-        if delta_w.abs() < self.limits.min_rebalance_delta_weight {
+        let eff_lev = if self.limits.target_leverage_multiplier.is_finite() {
+            self.limits.target_leverage_multiplier.max(0.10)
+        } else {
+            1.0
+        };
+        let eff_min_delta = (self.limits.min_rebalance_delta_weight * eff_lev)
+            .max(1e-4)
+            .min(self.limits.max_single_asset_weight.max(1e-4));
+        if delta_w.abs() < eff_min_delta {
             return reject(format!(
                 "DELTA_BELOW_THRESHOLD: |delta_w|={:.4} < min={:.4}",
                 delta_w.abs(),
-                self.limits.min_rebalance_delta_weight
+                eff_min_delta
             ));
         }
 
         let equity = ledger.total_equity_usdc;
-        let eff_lev = if self.limits.target_leverage_multiplier.is_finite() {
-            self.limits.target_leverage_multiplier.max(0.1)
-        } else {
-            1.0
-        };
         let max_gross_notional = equity * self.limits.max_gross_leverage_x;
         let existing_reserved_notional = ledger.reserved_order_cash_usdc.max(0.0) * eff_lev;
         let remaining_gross_notional =
@@ -516,6 +519,57 @@ impl RiskEngine {
     ) -> StopRatchetEvaluation {
         evaluate_1s_position_lifecycle(input, &self.limits)
     }
+
+    /// Validates aggregate gross leverage (`<= max_gross_leverage_x`) and open stop-loss portfolio heat
+    /// (`open_stop_risk_usdc / equity_usdc <= max_portfolio_heat_pct`) prior to admitting a fill.
+    pub fn check_portfolio_heat_and_gross_at_fill(
+        &self,
+        equity_usdc: f64,
+        open_notional_usdc: f64,
+        open_stop_risk_usdc: f64,
+    ) -> Result<()> {
+        if !equity_usdc.is_finite()
+            || equity_usdc <= 0.0
+            || !open_notional_usdc.is_finite()
+            || open_notional_usdc < 0.0
+            || !open_stop_risk_usdc.is_finite()
+            || open_stop_risk_usdc < 0.0
+        {
+            return Err(AegisError::Validation(format!(
+                "Invalid portfolio heat/gross check inputs: equity={equity_usdc}, open_notional={open_notional_usdc}, open_stop_risk={open_stop_risk_usdc}"
+            )));
+        }
+
+        let gross_lev = open_notional_usdc / equity_usdc;
+        let max_gross = if self.limits.max_gross_leverage_x.is_finite()
+            && self.limits.max_gross_leverage_x > 0.0
+        {
+            self.limits.max_gross_leverage_x
+        } else {
+            2.50
+        };
+        if gross_lev > max_gross + 1e-9 {
+            return Err(AegisError::Validation(format!(
+                "PORTFOLIO_GROSS_LEVERAGE_EXCEEDED: gross={gross_lev:.4}x > max={max_gross:.4}x"
+            )));
+        }
+
+        let heat_pct = open_stop_risk_usdc / equity_usdc;
+        let max_heat = if self.limits.max_portfolio_heat_pct.is_finite()
+            && self.limits.max_portfolio_heat_pct > 0.0
+        {
+            self.limits.max_portfolio_heat_pct
+        } else {
+            0.12
+        };
+        if heat_pct > max_heat + 1e-9 {
+            return Err(AegisError::Validation(format!(
+                "PORTFOLIO_HEAT_EXCEEDED: heat={heat_pct:.4} > max={max_heat:.4}"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -597,6 +651,7 @@ mod tests {
             s2_weight_contrib: plan.s2_weight_contrib,
             s3_weight_contrib: plan.s3_weight_contrib,
             protective_stop_px: plan.protective_stop_px,
+            entry_r0: (plan.limit_price - plan.protective_stop_px).abs(),
             protective_stop_oid: None,
             take_profit_px: plan.take_profit_px,
             take_profit_oid: None,
@@ -887,9 +942,10 @@ mod tests {
 
     #[test]
     fn test_risk_parity_sizing_interacts_with_weight_and_gross_caps() {
-        let risk = RiskEngine::default();
-        assert!((risk.limits.max_single_asset_weight - 0.15).abs() < 1e-9);
-        assert!((risk.limits.risk_per_trade_equity_pct - 0.005).abs() < 1e-9);
+        // 1. Default Extreme tier: 25% single-asset cap, 2.0% per-trade risk budget
+        let extreme = RiskEngine::default();
+        assert!((extreme.limits.max_single_asset_weight - 0.25).abs() < 1e-9);
+        assert!((extreme.limits.risk_per_trade_equity_pct - 0.02).abs() < 1e-9);
 
         let mut asset = sample_sol_asset();
         asset.mark_price = 100.0;
@@ -897,10 +953,47 @@ mod tests {
         asset.oracle_price = 100.0;
         asset.tick_size = 0.01;
         asset.lot_step_size = 0.01;
+        let extreme_ledger = extreme.evaluate_ledger(1_000.0, &[]);
+
+        // On 4% stop (atr = None): risk-parity = $20 / 0.04 = $500, capped by max_single_asset_weight (0.25) to $250
+        let ext_med = extreme.size_working_order_from_weights(
+            &asset,
+            0.25,
+            0.0,
+            0.25,
+            0.0,
+            0.0,
+            &extreme_ledger,
+            None,
+        );
+        assert!(ext_med.approved);
+        assert!((ext_med.risk_budget_usdc - 20.0).abs() < 1e-6);
+        assert!((ext_med.target_notional_usdc - 250.0).abs() < 1.5);
+
+        // On 10% stop (atr = 10.0 / 2.2): risk-parity = $20 / 0.10 = $200 (< $250 weight cap)
+        let ext_wide = extreme.size_working_order_from_weights(
+            &asset,
+            0.25,
+            0.0,
+            0.25,
+            0.0,
+            0.0,
+            &extreme_ledger,
+            Some(10.0 / 2.2),
+        );
+        assert!(ext_wide.approved);
+        assert!((ext_wide.target_notional_usdc - 200.0).abs() < 1.5);
+
+        // 2. Conservative tier (0.65x): 15% single-asset cap, 0.5% per-trade risk budget
+        let mut cons_cfg = ConfigMap::new();
+        cons_cfg.insert("risk_tier", "conservative");
+        let risk = RiskEngine::from_config_map(&cons_cfg);
+        assert!((risk.limits.max_single_asset_weight - 0.15).abs() < 1e-9);
+        assert!((risk.limits.risk_per_trade_equity_pct - 0.005).abs() < 1e-9);
         let ledger = risk.evaluate_ledger(1_000.0, &[]);
 
-        // 1. Tight 2% stop (stop_dist = 2.0 -> atr = 2.0 / 2.2 = 0.9091):
-        //    Risk-parity = $5 / 0.02 = $250, capped by max_single_asset_weight (0.15) to $150!
+        // Tight 2% stop (stop_dist = 2.0 -> atr = 2.0 / 2.2):
+        // Risk-parity = $5 / 0.02 = $250, capped by max_single_asset_weight (0.15) to $150!
         let tight = risk.size_working_order_from_weights(
             &asset,
             0.15,
@@ -915,15 +1008,15 @@ mod tests {
         assert!((tight.risk_budget_usdc - 5.0).abs() < 1e-6);
         assert!((tight.target_notional_usdc - 150.0).abs() < 1.5);
 
-        // 2. Medium 4% stop (atr = None -> default 4%):
-        //    Risk-parity = $5 / 0.04 = $125 (< $150 weight cap), exact 0.50% equity risk!
+        // Medium 4% stop (atr = None -> default 4%):
+        // Risk-parity = $5 / 0.04 = $125 (< $150 weight cap), exact 0.50% equity risk!
         let med =
             risk.size_working_order_from_weights(&asset, 0.15, 0.0, 0.15, 0.0, 0.0, &ledger, None);
         assert!(med.approved);
         assert!((med.target_notional_usdc - 125.0).abs() < 1.5);
 
-        // 3. Wide 8% stop (atr = 8.0 / 2.2):
-        //    Risk-parity = $5 / 0.08 = $62.50 (< $150 weight cap), exact 0.50% equity risk!
+        // Wide 8% stop (atr = 8.0 / 2.2):
+        // Risk-parity = $5 / 0.08 = $62.50 (< $150 weight cap), exact 0.50% equity risk!
         let wide = risk.size_working_order_from_weights(
             &asset,
             0.15,
@@ -937,8 +1030,8 @@ mod tests {
         assert!(wide.approved);
         assert!((wide.target_notional_usdc - 62.5).abs() < 1.5);
 
-        // 4. ACTION_INCREASE with existing same-side weight 0.08 ($80) on 4% stop ($125 cap):
-        //    Remaining add cap = $125 - $80 = $45!
+        // ACTION_INCREASE with existing same-side weight 0.08 ($80) on 4% stop ($125 cap):
+        // Remaining add cap = $125 - $80 = $45!
         let inc =
             risk.size_working_order_from_weights(&asset, 0.15, 0.08, 0.15, 0.0, 0.0, &ledger, None);
         assert!(inc.approved);
@@ -947,6 +1040,94 @@ mod tests {
             "ACTION_INCREASE must account for existing $80 notional against $125 risk-parity cap, got {}",
             inc.target_notional_usdc
         );
+    }
+
+    #[test]
+    fn test_eff_min_delta_tier_scaling_and_portfolio_heat_gross_check() {
+        let asset = sample_sol_asset();
+        // 1. Extreme tier (1.85x): eff_min_delta = 0.025 * 1.85 = 0.04625 -> delta 0.04 rejected, 0.05 approved
+        let ext = RiskEngine::default();
+        let ext_ledger = ext.evaluate_ledger(10_000.0, &[]);
+        let too_small_ext = ext.size_working_order_from_weights(
+            &asset,
+            0.04,
+            0.0,
+            0.04,
+            0.0,
+            0.0,
+            &ext_ledger,
+            None,
+        );
+        assert!(!too_small_ext.approved);
+        assert!(too_small_ext
+            .rejection_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("DELTA_BELOW_THRESHOLD")));
+        let big_enough_ext = ext.size_working_order_from_weights(
+            &asset,
+            0.05,
+            0.0,
+            0.05,
+            0.0,
+            0.0,
+            &ext_ledger,
+            None,
+        );
+        assert!(big_enough_ext.approved);
+
+        // Conservative tier (0.65x): eff_min_delta = 0.025 * 0.65 = 0.01625 -> delta 0.02 approved
+        let mut cons_cfg = ConfigMap::new();
+        cons_cfg.insert("risk_tier", "conservative");
+        let cons = RiskEngine::from_config_map(&cons_cfg);
+        let cons_ledger = cons.evaluate_ledger(10_000.0, &[]);
+        let ok_cons = cons.size_working_order_from_weights(
+            &asset,
+            0.02,
+            0.0,
+            0.02,
+            0.0,
+            0.0,
+            &cons_ledger,
+            None,
+        );
+        assert!(ok_cons.approved);
+
+        // Small max_single_asset_weight (0.01) caps eff_min_delta to 0.01 so delta=0.01 is not blocked
+        let tiny_cap = RiskEngine::new(RiskLimitsConfig {
+            max_single_asset_weight: 0.01,
+            ..RiskLimitsConfig::default()
+        });
+        let tiny_ok = tiny_cap.size_working_order_from_weights(
+            &asset,
+            0.01,
+            0.0,
+            0.01,
+            0.0,
+            0.0,
+            &ext_ledger,
+            None,
+        );
+        assert!(tiny_ok.approved);
+
+        // 2. check_portfolio_heat_and_gross_at_fill: boundary passes, breach fails
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(10_000.0, 25_000.0, 1_200.0)
+            .is_ok());
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(10_000.0, 25_001.0, 1_000.0)
+            .is_err());
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(10_000.0, 20_000.0, 1_201.0)
+            .is_err());
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(0.0, 0.0, 0.0)
+            .is_err());
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(10_000.0, f64::NAN, 100.0)
+            .is_err());
+        assert!(ext
+            .check_portfolio_heat_and_gross_at_fill(10_000.0, 100.0, -1.0)
+            .is_err());
     }
 
     #[test]

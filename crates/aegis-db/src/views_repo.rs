@@ -127,7 +127,7 @@ impl DatabaseManager {
             .query(
                 r#"SELECT position_id, asset_id, symbol, coin, client_order_id, side, quantity,
                           committed_notional_usdc, portfolio_weight, entry_price, mark_price,
-                          protective_stop_px, protective_stop_oid, stop_distance_pct,
+                          protective_stop_px, entry_r0, protective_stop_oid, stop_distance_pct,
                           take_profit_px, take_profit_oid, tp_distance_pct,
                           highest_price_seen, lowest_price_seen, unrealized_pnl_usdc,
                           realized_pnl_usdc, funding_accrued_usdc, fees_paid_usdc,
@@ -145,7 +145,7 @@ impl DatabaseManager {
                 let quantity = row_get_f64(r, 6, 0.0);
                 let committed_notional_usdc = row_get_f64(r, 7, 0.0);
                 let entry_price = row_get_f64(r, 9, 0.0);
-                let unrealized_pnl_usdc = row_get_f64(r, 19, 0.0);
+                let unrealized_pnl_usdc = row_get_f64(r, 20, 0.0);
                 let unrealized_pnl_pct = compute_position_pnl_pct(
                     unrealized_pnl_usdc,
                     entry_price,
@@ -165,26 +165,27 @@ impl DatabaseManager {
                     entry_price,
                     mark_price: row_get_f64(r, 10, 0.0),
                     protective_stop_px: row_get_f64(r, 11, 0.0),
-                    protective_stop_oid: row_get_opt_string(r, 12),
-                    stop_distance_pct: row_get_opt_f64(r, 13),
-                    take_profit_px: row_get_f64(r, 14, 0.0),
-                    take_profit_oid: row_get_opt_string(r, 15),
-                    tp_distance_pct: row_get_opt_f64(r, 16),
-                    highest_price_seen: row_get_f64(r, 17, 0.0),
-                    lowest_price_seen: row_get_f64(r, 18, 0.0),
+                    entry_r0: row_get_f64(r, 12, 0.0),
+                    protective_stop_oid: row_get_opt_string(r, 13),
+                    stop_distance_pct: row_get_opt_f64(r, 14),
+                    take_profit_px: row_get_f64(r, 15, 0.0),
+                    take_profit_oid: row_get_opt_string(r, 16),
+                    tp_distance_pct: row_get_opt_f64(r, 17),
+                    highest_price_seen: row_get_f64(r, 18, 0.0),
+                    lowest_price_seen: row_get_f64(r, 19, 0.0),
                     unrealized_pnl_usdc,
                     unrealized_pnl_pct,
-                    realized_pnl_usdc: row_get_f64(r, 20, 0.0),
-                    funding_accrued_usdc: row_get_f64(r, 21, 0.0),
-                    fees_paid_usdc: row_get_f64(r, 22, 0.0),
-                    s1_weight_contrib: row_get_f64(r, 23, 0.0),
-                    s2_weight_contrib: row_get_f64(r, 24, 0.0),
-                    s3_weight_contrib: row_get_f64(r, 25, 0.0),
-                    latest_target_weight: row_get_f64(r, 26, 0.0),
-                    latest_delta_weight: row_get_f64(r, 27, 0.0),
-                    created_at_ms: row_get_i64(r, 28, 0),
-                    opened_at_ms: row_get_opt_i64(r, 29),
-                    updated_at_ms: row_get_i64(r, 30, 0),
+                    realized_pnl_usdc: row_get_f64(r, 21, 0.0),
+                    funding_accrued_usdc: row_get_f64(r, 22, 0.0),
+                    fees_paid_usdc: row_get_f64(r, 23, 0.0),
+                    s1_weight_contrib: row_get_f64(r, 24, 0.0),
+                    s2_weight_contrib: row_get_f64(r, 25, 0.0),
+                    s3_weight_contrib: row_get_f64(r, 26, 0.0),
+                    latest_target_weight: row_get_f64(r, 27, 0.0),
+                    latest_delta_weight: row_get_f64(r, 28, 0.0),
+                    created_at_ms: row_get_i64(r, 29, 0),
+                    opened_at_ms: row_get_opt_i64(r, 30),
+                    updated_at_ms: row_get_i64(r, 31, 0),
                 }
             })
             .collect())

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use zeroize::Zeroize;
 
 pub const CANONICAL_V2_SCHEMA_SQL: &str = include_str!("../../../sql/schema_v2_mariadb.sql");
-pub const SCHEMA_MIGRATION_VERSION: &str = "2.1.0";
+pub const SCHEMA_MIGRATION_VERSION: &str = "2.2.0";
 
 /// Canonical list of all 11 InnoDB tables in topological creation order
 /// (reverse order is valid FK drop order).
@@ -374,7 +374,7 @@ impl DatabaseManager {
 
     /// Strictly non-destructive, idempotent schema initialization: ensures all 11 InnoDB tables,
     /// Foreign Keys, `CHECK` constraints, Composite Indexes, and 7 SQL Views exist, executes
-    /// versioned schema migrations (`2.1.0`), and seeds default `system_config` keys without
+    /// versioned schema migrations (`2.2.0`), and seeds default `system_config` keys without
     /// overwriting existing customized values (`R14-H6`, `R14-L25`).
     pub fn init_schema(&self) -> Result<()> {
         let mut conn = self.get_conn()?;
@@ -512,9 +512,9 @@ impl DatabaseManager {
         Ok(())
     }
 
-    /// Idempotent versioned schema migration (`2.1.0`):
-    /// - Adds `take_profit_*`, `portfolio_snapshots.uncapped_equity_usdc`, `alert_queue.dispatched_at_ms`.
-    /// - Backfills `positions.closed_at_ms` and pre-clamps any invalid legacy rows before `CHECK`s.
+    /// Idempotent versioned schema migration (`2.2.0`):
+    /// - Adds `positions.entry_r0`, `take_profit_*`, `portfolio_snapshots.uncapped_equity_usdc`, `alert_queue.dispatched_at_ms`.
+    /// - Backfills `positions.closed_at_ms` and `positions.entry_r0`, and pre-clamps any invalid legacy rows before `CHECK`s.
     /// - Batch-converts `DOUBLE -> DECIMAL` columns per table via `information_schema.COLUMNS`.
     /// - Adds missing `CHECK` constraints via `information_schema.TABLE_CONSTRAINTS`.
     /// - Drops the 6 redundant/dead indexes (`sleeve_signals` x5, `portfolio_snapshots.idx_snapshots_created`).
@@ -532,6 +532,7 @@ impl DatabaseManager {
 
         // 1. Ensure newly added columns exist on legacy tables
         let add_column_ddls = [
+            "ALTER TABLE positions ADD COLUMN IF NOT EXISTS entry_r0 DECIMAL(20,8) NOT NULL DEFAULT 0.00000000 AFTER protective_stop_px",
             "ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_px DECIMAL(20,8) NOT NULL DEFAULT 0.00000000 AFTER protective_stop_oid",
             "ALTER TABLE positions ADD COLUMN IF NOT EXISTS take_profit_oid VARCHAR(64) NULL AFTER take_profit_px",
             "ALTER TABLE portfolio_snapshots ADD COLUMN IF NOT EXISTS uncapped_equity_usdc DECIMAL(20,8) NOT NULL DEFAULT 0.00000000 AFTER total_equity_usdc",
@@ -553,6 +554,7 @@ impl DatabaseManager {
                    current_price = GREATEST(0, current_price),
                    exit_price = CASE WHEN exit_price IS NOT NULL AND exit_price <= 0 THEN NULL ELSE exit_price END,
                    protective_stop_px = GREATEST(0, protective_stop_px),
+                   entry_r0 = GREATEST(0, entry_r0),
                    take_profit_px = GREATEST(0, take_profit_px),
                    highest_price_seen = GREATEST(0, highest_price_seen),
                    lowest_price_seen = GREATEST(0, lowest_price_seen),
@@ -562,7 +564,7 @@ impl DatabaseManager {
                        WHEN fsm_state IN ('NEW','WORKING_ALO','CHASING_ALO','CROSSING_IOC','FILLED_OPEN','STOP_TRIGGERED','CLOSED','CANCELLED')
                        THEN fsm_state ELSE 'CLOSED' END
                WHERE requested_quantity < 0 OR filled_quantity < 0 OR entry_price <= 0 OR current_price < 0
-                  OR (exit_price IS NOT NULL AND exit_price <= 0) OR protective_stop_px < 0 OR take_profit_px < 0
+                  OR (exit_price IS NOT NULL AND exit_price <= 0) OR protective_stop_px < 0 OR entry_r0 < 0 OR take_profit_px < 0
                   OR highest_price_seen < 0 OR lowest_price_seen < 0 OR reserved_margin_usdc < 0
                   OR committed_notional_usdc < 0
                   OR fsm_state NOT IN ('NEW','WORKING_ALO','CHASING_ALO','CROSSING_IOC','FILLED_OPEN','STOP_TRIGGERED','CLOSED','CANCELLED')"#,
@@ -648,6 +650,25 @@ impl DatabaseManager {
 
         // 3. Batch DOUBLE -> DECIMAL column conversions per table
         Self::migrate_double_columns_to_decimal(conn)?;
+
+        // 3b. Backfill frozen entry_r0 on legacy positions where entry_r0 <= 0 AND entry_price > 0
+        conn.query_drop(
+            r#"UPDATE positions
+               SET entry_r0 = ROUND(
+                   CASE
+                       WHEN protective_stop_px > 0
+                            AND ((side = 'LONG' AND protective_stop_px < entry_price)
+                                 OR (side = 'SHORT' AND protective_stop_px > entry_price))
+                       THEN ABS(entry_price - protective_stop_px)
+                       WHEN take_profit_px > 0
+                       THEN ABS(take_profit_px - entry_price) * (2.2 / 2.8)
+                       ELSE entry_price * 0.04
+                   END,
+                   8
+               )
+               WHERE entry_r0 <= 0 AND entry_price > 0"#,
+        )
+        .map_err(|e| AegisError::Database(format!("Failed backfilling positions.entry_r0: {e}")))?;
 
         // 4. Add CHECK constraints idempotently
         Self::ensure_check_constraints(conn)?;
@@ -823,6 +844,11 @@ impl DatabaseManager {
             (
                 "positions",
                 "protective_stop_px",
+                "DECIMAL(20,8) NOT NULL DEFAULT 0.00000000",
+            ),
+            (
+                "positions",
+                "entry_r0",
                 "DECIMAL(20,8) NOT NULL DEFAULT 0.00000000",
             ),
             (
@@ -1058,6 +1084,7 @@ impl DatabaseManager {
                 "chk_positions_margin",
                 "reserved_margin_usdc >= 0 AND committed_notional_usdc >= 0",
             ),
+            ("positions", "chk_positions_entry_r0", "entry_r0 >= 0"),
             (
                 "positions",
                 "chk_positions_fsm",

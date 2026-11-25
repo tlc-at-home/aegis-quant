@@ -4442,3 +4442,147 @@ async fn test_forensic_tier1_and_p0_p1_config_validation_uncapped_drawdown_and_p
         .iter()
         .any(|k| k == "web_trusted_proxies"));
 }
+
+#[tokio::test]
+async fn test_web_risk_tier_switch_and_config_sync_with_override_preservation() {
+    let db = tokio::task::spawn_blocking(new_test_db_noauth)
+        .await
+        .unwrap();
+    let app = create_web_router(db.clone(), None);
+
+    // 1. POST /api/v1/risk-tier synchronizes target_leverage_multiplier, risk_per_trade_equity_pct, and max_single_asset_weight
+    for (tier, custom_mult, exp_mult, exp_risk, exp_weight) in [
+        ("conservative", None, 0.65, 0.005, 0.15),
+        ("standard", None, 1.00, 0.010, 0.15),
+        ("aggressive", None, 1.35, 0.015, 0.20),
+        ("extreme", None, 1.85, 0.020, 0.25),
+        ("custom", Some(1.50), 1.50, 0.015, 0.225),
+    ] {
+        let req = RiskTierUpdateRequest {
+            risk_tier: tier.to_string(),
+            custom_leverage_multiplier: custom_mult,
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/risk-tier")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let cfg = db.load_config().unwrap();
+        assert_eq!(cfg.get_str("risk_tier", ""), tier);
+        assert!((cfg.get_f64("target_leverage_multiplier", 0.0) - exp_mult).abs() < 1e-6);
+        assert!((cfg.get_f64("risk_per_trade_equity_pct", 0.0) - exp_risk).abs() < 1e-6);
+        assert!((cfg.get_f64("max_single_asset_weight", 0.0) - exp_weight).abs() < 1e-6);
+    }
+
+    // 2. POST /api/v1/config changing risk_tier directly syncs all 3 unless explicitly overridden in same write
+    let res_sync = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"updates":{"risk_tier":"standard"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_sync.status(), StatusCode::OK);
+    let cfg_std = db.load_config().unwrap();
+    assert!((cfg_std.get_f64("target_leverage_multiplier", 0.0) - 1.00).abs() < 1e-6);
+    assert!((cfg_std.get_f64("risk_per_trade_equity_pct", 0.0) - 0.010).abs() < 1e-6);
+    assert!((cfg_std.get_f64("max_single_asset_weight", 0.0) - 0.15).abs() < 1e-6);
+
+    // Override risk_per_trade_equity_pct in the same tier switch write -> override preserved, weight synced
+    let res_override = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":{"risk_tier":"aggressive","risk_per_trade_equity_pct":"0.0300"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_override.status(), StatusCode::OK);
+    let cfg_ovr = db.load_config().unwrap();
+    assert!((cfg_ovr.get_f64("target_leverage_multiplier", 0.0) - 1.35).abs() < 1e-6);
+    assert!((cfg_ovr.get_f64("risk_per_trade_equity_pct", 0.0) - 0.030).abs() < 1e-6);
+    assert!((cfg_ovr.get_f64("max_single_asset_weight", 0.0) - 0.20).abs() < 1e-6);
+
+    // Custom tier switch via POST /api/v1/config with explicit weight override preserves weight & syncs risk_pct
+    let res_custom_ovr = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":{"risk_tier":"custom","target_leverage_multiplier":"1.50","max_single_asset_weight":"0.18"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_custom_ovr.status(), StatusCode::OK);
+    let cfg_cust = db.load_config().unwrap();
+    assert!((cfg_cust.get_f64("target_leverage_multiplier", 0.0) - 1.50).abs() < 1e-6);
+    assert!((cfg_cust.get_f64("risk_per_trade_equity_pct", 0.0) - 0.015).abs() < 1e-6);
+    assert!((cfg_cust.get_f64("max_single_asset_weight", 0.0) - 0.18).abs() < 1e-6);
+
+    // 3. New v2.2.0 keys writable via POST /api/v1/config and out-of-range values rejected with 400
+    let res_new_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":{"signal_timeframe":"1h","max_portfolio_heat_pct":"0.18","wall_clock_normalize_indicators":false,"max_entries_per_bar":4,"maker_only_rest_ttl_ms":30000}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_new_ok.status(), StatusCode::OK);
+    let cfg_new = db.load_config().unwrap();
+    assert_eq!(cfg_new.get_str("signal_timeframe", ""), "1h");
+    assert!((cfg_new.get_f64("max_portfolio_heat_pct", 0.0) - 0.18).abs() < 1e-6);
+    assert!(!cfg_new.get_bool("wall_clock_normalize_indicators", true));
+    assert_eq!(cfg_new.get_i64("max_entries_per_bar", 0), 4);
+    assert_eq!(cfg_new.get_i64("maker_only_rest_ttl_ms", 0), 30_000);
+
+    for bad_payload in [
+        r#"{"config_key":"signal_timeframe","config_value":"30m"}"#,
+        r#"{"config_key":"max_portfolio_heat_pct","config_value":"1.5"}"#,
+        r#"{"config_key":"signal_exit_confirm_bars","config_value":"9"}"#,
+    ] {
+        let bad_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad_payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+    }
+}

@@ -20,6 +20,8 @@ pub struct StopEvaluationInput {
     pub tick_size: f64,
     pub check_tp: bool,
     pub held_duration_ms: Option<i64>,
+    #[serde(default)]
+    pub entry_r0: Option<f64>,
 }
 
 /// Result of a 1-second protective stop ratchet & take-profit evaluation on an `OPEN` position.
@@ -219,6 +221,7 @@ pub fn evaluate_1s_protective_stop(
         tick_size,
         check_tp: false,
         held_duration_ms: None,
+        entry_r0: None,
     };
     evaluate_1s_position_lifecycle(&input, limits)
 }
@@ -251,6 +254,7 @@ pub fn evaluate_1s_position_tpsl(
         tick_size,
         check_tp: true,
         held_duration_ms: None,
+        entry_r0: None,
     };
     evaluate_1s_position_lifecycle(&input, limits)
 }
@@ -321,6 +325,10 @@ pub fn evaluate_1s_position_lifecycle(
     };
     let unrealized_pnl_usdc = round_dp((ref_mark - entry_price) * qty * side.sign(), 4);
     let stop_dist = resolve_stop_distance(ref_mark, atr_opt, tick_size, limits);
+    let r0 = input
+        .entry_r0
+        .filter(|r| r.is_finite() && *r > 1e-12)
+        .unwrap_or(stop_dist);
     let init_stop = compute_initial_protective_stop(side, entry_price, atr_opt, tick_size, limits);
     let init_tp = compute_initial_take_profit(side, entry_price, atr_opt, tick_size, limits);
     let step = tick_step(tick_size);
@@ -413,8 +421,8 @@ pub fn evaluate_1s_position_lifecycle(
             .held_duration_ms
             .is_some_and(|held_ms| held_ms >= min_held_ms)
         {
-            let mfe_r = excursion / stop_dist.max(1e-8);
-            let cur_r = ((ref_mark - entry_price) * side.sign()) / stop_dist.max(1e-8);
+            let mfe_r = excursion / r0.max(1e-8);
+            let cur_r = ((ref_mark - entry_price) * side.sign()) / r0.max(1e-8);
             if mfe_r < limits.stagnation_min_mfe_r && cur_r <= 0.15 {
                 let stop_dist_pct = round_dp(
                     (((ref_mark - active_stop) * side.sign()).max(0.0) / ref_mark) * 100.0,
@@ -450,11 +458,10 @@ pub fn evaluate_1s_position_lifecycle(
         OrderSide::Long => {
             let max_safe_stop = (ref_mark - min_buf).max(step);
             let mut ratcheted = active_stop;
-            if let Some((trail_mult, lock_mult)) =
-                stepped_chandelier_params(excursion, stop_dist, limits)
+            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, r0, limits)
             {
                 if new_highest > entry_price + step && active_stop < max_safe_stop {
-                    let profit_lock = entry_price + lock_mult * stop_dist;
+                    let profit_lock = entry_price + lock_mult * r0;
                     let candidate = (new_highest - trail_mult * stop_dist).max(profit_lock);
                     let capped_candidate = candidate.min(max_safe_stop);
                     let rounded_candidate = round_to_tick(capped_candidate, tick_size, true);
@@ -470,14 +477,13 @@ pub fn evaluate_1s_position_lifecycle(
         OrderSide::Short => {
             let min_safe_stop = ref_mark + min_buf;
             let mut ratcheted = active_stop;
-            if let Some((trail_mult, lock_mult)) =
-                stepped_chandelier_params(excursion, stop_dist, limits)
+            if let Some((trail_mult, lock_mult)) = stepped_chandelier_params(excursion, r0, limits)
             {
                 if new_lowest > 0.0
                     && new_lowest < entry_price - step
                     && active_stop > min_safe_stop
                 {
-                    let profit_lock = (entry_price - lock_mult * stop_dist).max(step);
+                    let profit_lock = (entry_price - lock_mult * r0).max(step);
                     let candidate = (new_lowest + trail_mult * stop_dist).min(profit_lock);
                     let capped_candidate = candidate.max(min_safe_stop);
                     let rounded_candidate = round_to_tick(capped_candidate, tick_size, false);
@@ -1029,6 +1035,7 @@ mod tests {
                 tick_size: 0.01,
                 check_tp: true,
                 held_duration_ms: Some(1_000_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1050,6 +1057,7 @@ mod tests {
                 tick_size: 0.01,
                 check_tp: true,
                 held_duration_ms: Some(1_000_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1057,8 +1065,8 @@ mod tests {
         assert!(short_be.stop_ratcheted);
         assert!((short_be.new_protective_stop_px - 99.78).abs() < 1e-9);
 
-        // 2. Stagnation time-stop LONG: held 5h (18_000_000 ms), mfe_r < 0.35 (highest=101.0 -> 0.227R), cur_r <= 0.15
-        let long_stag = evaluate_1s_position_lifecycle(
+        // 2. Below default 12h (5h = 18_000_000 ms) must NOT trigger stagnation time-stop
+        let pre_12h_exempt = evaluate_1s_position_lifecycle(
             &StopEvaluationInput {
                 side: OrderSide::Long,
                 entry_price: 100.0,
@@ -1072,6 +1080,28 @@ mod tests {
                 tick_size: 0.01,
                 check_tp: true,
                 held_duration_ms: Some(18_000_000),
+                entry_r0: None,
+            },
+            &limits,
+        );
+        assert!(!pre_12h_exempt.triggered);
+
+        // 3. Stagnation time-stop LONG: held 12h (43_200_000 ms), mfe_r < 0.35 (highest=101.0 -> 0.227R), cur_r <= 0.15
+        let long_stag = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.20,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 105.60,
+                highest_price_seen: 101.00,
+                lowest_price_seen: 99.20,
+                atr_opt: Some(2.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(43_200_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1082,7 +1112,7 @@ mod tests {
         );
         assert_eq!(long_stag.cooldown_duration_ms, 600_000);
 
-        // 3. Stagnation time-stop SHORT: held 5h, mfe_r < 0.35 (lowest=99.0 -> 0.227R), cur_r <= 0.15
+        // 4. Stagnation time-stop SHORT: held 12h, mfe_r < 0.35 (lowest=99.0 -> 0.227R), cur_r <= 0.15
         let short_stag = evaluate_1s_position_lifecycle(
             &StopEvaluationInput {
                 side: OrderSide::Short,
@@ -1096,7 +1126,8 @@ mod tests {
                 atr_opt: Some(2.0),
                 tick_size: 0.01,
                 check_tp: true,
-                held_duration_ms: Some(18_000_000),
+                held_duration_ms: Some(43_200_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1107,7 +1138,7 @@ mod tests {
         );
         assert_eq!(short_stag.cooldown_duration_ms, 600_000);
 
-        // 4. Exempt if actively breaking out (cur_r > 0.15) OR held < 5h OR MFE >= 0.35R OR disabled (hours=0.0)
+        // 5. Exempt if actively breaking out (cur_r > 0.15) OR held < 12h OR MFE >= 0.35R OR disabled (hours=0.0)
         let exempt_breakout = evaluate_1s_position_lifecycle(
             &StopEvaluationInput {
                 side: OrderSide::Long,
@@ -1121,7 +1152,8 @@ mod tests {
                 atr_opt: Some(2.0),
                 tick_size: 0.01,
                 check_tp: true,
-                held_duration_ms: Some(18_000_000),
+                held_duration_ms: Some(43_200_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1140,7 +1172,8 @@ mod tests {
                 atr_opt: Some(2.0),
                 tick_size: 0.01,
                 check_tp: true,
-                held_duration_ms: Some(18_000_000),
+                held_duration_ms: Some(43_200_000),
+                entry_r0: None,
             },
             &limits,
         );
@@ -1163,10 +1196,112 @@ mod tests {
                 atr_opt: Some(2.0),
                 tick_size: 0.01,
                 check_tp: true,
-                held_duration_ms: Some(36_000_000),
+                held_duration_ms: Some(86_400_000),
+                entry_r0: None,
             },
             &disabled_limits,
         );
         assert!(!disabled_stag.triggered);
+    }
+
+    #[test]
+    fn test_frozen_entry_r0_protects_stagnation_and_chandelier_floors_under_2x_atr_expansion() {
+        let limits = RiskLimitsConfig::default();
+        // Entry at 100.0 with initial ATR = 2.0 => frozen entry_r0 = 4.40 (0.35R = 1.54, 0.40R = 1.76).
+        // Later, live ATR doubles to 4.0 (live stop_dist = 8.80, so 0.35 * 8.80 = 3.08, 0.40 * 8.80 = 3.52).
+        // 1. Stagnation exemption: excursion = 1.60 => 0.3636 R_0 (>= 0.35), even though 1.60 / 8.80 = 0.182 < 0.35!
+        let frozen_stag_exempt = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.10,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 112.00,
+                highest_price_seen: 101.60,
+                lowest_price_seen: 99.50,
+                atr_opt: Some(4.0), // 2x ATR expansion
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(43_200_000),
+                entry_r0: Some(4.40),
+            },
+            &limits,
+        );
+        assert!(
+            !frozen_stag_exempt.triggered,
+            "Frozen R_0 (4.40) must exempt excursion=1.60 (0.364 R_0 >= 0.35) even under 2x ATR expansion"
+        );
+
+        // Without frozen entry_r0, same 2x ATR expansion falsely triggers stagnation!
+        let unfrozen_stag = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.10,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 112.00,
+                highest_price_seen: 101.60,
+                lowest_price_seen: 99.50,
+                atr_opt: Some(4.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(43_200_000),
+                entry_r0: None,
+            },
+            &limits,
+        );
+        assert!(unfrozen_stag.triggered);
+        assert_eq!(
+            unfrozen_stag.exit_reason.as_deref(),
+            Some("STAGNATION_TIME_STOP_LONG")
+        );
+
+        // 2. Breakeven 0.40 R_0 & Chandelier profit-lock floor under 2x ATR expansion (LONG & SHORT):
+        // excursion = 1.98 (= 0.45 R_0 >= 0.40 R_0, but only 0.225 * 8.80).
+        // With entry_r0 = 4.40 and atr = 4.0 (min_buf = 2.20), at mark = 103.0:
+        // max_safe_stop = 100.80 >= profit_lock = 100.0 + 0.05 * 4.40 = 100.22 -> stop ratchets to 100.22!
+        let long_be_frozen = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 103.00,
+                quantity: 5.0,
+                current_stop_px: 95.60,
+                current_tp_px: 112.00,
+                highest_price_seen: 103.00, // 0.68 R_0 -> tier [0.60, 1.00) -> lock 0.10 R_0 = 100.44
+                lowest_price_seen: 99.80,
+                atr_opt: Some(4.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(3_600_000),
+                entry_r0: Some(4.40),
+            },
+            &limits,
+        );
+        assert!(long_be_frozen.stop_ratcheted);
+        assert!((long_be_frozen.new_protective_stop_px - 100.44).abs() < 1e-9);
+
+        let short_be_frozen = evaluate_1s_position_lifecycle(
+            &StopEvaluationInput {
+                side: OrderSide::Short,
+                entry_price: 100.0,
+                mark_price: 97.00,
+                quantity: 5.0,
+                current_stop_px: 104.40,
+                current_tp_px: 88.00,
+                highest_price_seen: 100.20,
+                lowest_price_seen: 97.00, // 0.68 R_0 -> lock 0.10 R_0 = 99.56
+                atr_opt: Some(4.0),
+                tick_size: 0.01,
+                check_tp: true,
+                held_duration_ms: Some(3_600_000),
+                entry_r0: Some(4.40),
+            },
+            &limits,
+        );
+        assert!(short_be_frozen.stop_ratcheted);
+        assert!((short_be_frozen.new_protective_stop_px - 99.56).abs() < 1e-9);
     }
 }

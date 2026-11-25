@@ -3290,7 +3290,7 @@ fn test_r14_m30_decimal_precision_check_constraints_and_legacy_migration() {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(ver, "2.1.0");
+        assert_eq!(ver, "2.2.0");
     }
 }
 
@@ -3614,4 +3614,201 @@ fn test_r14_m15_m17_m22_l14_bars_window_telemetry_batch_dashboard_bundle_and_ale
     assert!(bundle_partial.config.is_ok());
     assert!(bundle_partial.assets_held.is_ok());
     assert!(bundle_partial.latest_snapshot.is_ok());
+}
+
+#[test]
+fn test_schema_v2_2_0_entry_r0_backfill_immutability_and_sum_realized_pnl() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = seed_test_asset(&db, "SOL", 5, 100.0);
+    let eth_id = seed_test_asset(&db, "ETH", 1, 2000.0);
+    let btc_id = seed_test_asset(&db, "BTC", 0, 50000.0);
+    let avax_id = seed_test_asset(&db, "AVAX", 3, 25.0);
+    let link_id = seed_test_asset(&db, "LINK", 4, 15.0);
+
+    // 0. sum_realized_pnl_usdc returns 0.0 when positions table is empty
+    assert!((db.sum_realized_pnl_usdc().unwrap() - 0.0).abs() < 1e-9);
+
+    // 1. create_working_order populates entry_r0, promote_working_to_open re-anchors to fill_price
+    let pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "coid-r0-imm".to_string(),
+            side: OrderSide::Long,
+            limit_price: 100.0,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 500.0,
+            portfolio_weight: 0.10,
+            s1_weight_contrib: 0.10,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 95.0,
+            take_profit_px: Some(115.0),
+            exchange_order_id: Some("hl-r0-1".to_string()),
+            reason: "entry_r0 lifecycle".to_string(),
+        })
+        .unwrap();
+    let working = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((working.entry_r0 - 5.0).abs() < 1e-6);
+
+    db.promote_working_to_open(pid, 102.0, 10.0, 0.5, 96.0, None, None, "filled")
+        .unwrap();
+    let opened = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((opened.entry_r0 - 6.0).abs() < 1e-6);
+
+    // 2. Ratcheting stops (single + batch), partial exits, and exchange sync NEVER overwrite positive entry_r0
+    db.update_open_position_mark_and_stop(pid, 110.0, 103.5)
+        .unwrap();
+    db.update_open_positions_mark_and_stop_batch(&[(pid, 112.0, 105.0)])
+        .unwrap();
+    let net_partial = db
+        .record_partial_position_exit(pid, 4.0, 6.0, 112.0, 0.4, "TP1")
+        .unwrap();
+    assert!((net_partial - 39.6).abs() < 1e-4);
+
+    db.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+        asset_id: sol_id,
+        coin: "SOL",
+        side: OrderSide::Long,
+        entry_price: 102.0,
+        mark_price: 113.0,
+        quantity: 6.0,
+        committed_notional_usdc: 678.0,
+        unrealized_pnl_usdc: 66.0,
+        portfolio_weight: 0.10,
+        protective_stop_px: 108.0,
+        take_profit_px: 115.0,
+        funding_accrued_usdc: 0.0,
+        opened_at_ms: None,
+    })
+    .unwrap();
+
+    let after_ratchets = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((after_ratchets.entry_r0 - 6.0).abs() < 1e-6);
+    assert!((after_ratchets.protective_stop_px - 105.0).abs() < 1e-6);
+
+    let held = db.get_assets_held().unwrap();
+    let held_sol = held.iter().find(|h| h.position_id == pid).unwrap();
+    assert!((held_sol.entry_r0 - 6.0).abs() < 1e-6);
+
+    // Fresh exchange adoption sets entry_r0 = |entry_price - entry_stop| when on initial loss side
+    let (adopted_pid, newly_adopted) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: eth_id,
+            coin: "ETH",
+            side: OrderSide::Short,
+            entry_price: 2000.0,
+            mark_price: 1980.0,
+            quantity: 1.0,
+            committed_notional_usdc: 1980.0,
+            unrealized_pnl_usdc: 20.0,
+            portfolio_weight: -0.10,
+            protective_stop_px: 2080.0,
+            take_profit_px: 1898.2,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: None,
+        })
+        .unwrap();
+    assert!(newly_adopted);
+    let adopted = db.get_position_by_id(adopted_pid).unwrap().unwrap();
+    assert!((adopted.entry_r0 - 80.0).abs() < 1e-6);
+
+    // Close ETH with negative PnL and check sum_realized_pnl_usdc across OPEN partial + CLOSED
+    let eth_pnl = db
+        .close_position(adopted_pid, 2050.0, 1.0, "SL_HIT")
+        .unwrap();
+    let total_rpnl = db.sum_realized_pnl_usdc().unwrap();
+    assert!((total_rpnl - (net_partial + eth_pnl)).abs() < 1e-4);
+
+    // 3. v2.1.0 -> v2.2.0 schema migration & backfill across all 3 CASE branches
+    let ts = now_ms();
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.query_drop("ALTER TABLE positions DROP CONSTRAINT chk_positions_entry_r0")
+            .unwrap();
+        conn.query_drop("ALTER TABLE positions DROP COLUMN entry_r0")
+            .unwrap();
+        conn.query_drop(
+            "UPDATE system_config SET config_value = '2.1.0' WHERE config_key = 'schema_migration_version'",
+        )
+        .unwrap();
+
+        // Insert 5 legacy CLOSED rows representing all backfill branches:
+        // a) unratcheted LONG stop: entry=100, stop=93 => 7.0
+        // b) unratcheted SHORT stop: entry=100, stop=106 => 6.0
+        // c) ratcheted LONG stop (>= entry), TP=114 => |114-100| * 2.2/2.8 = 11.0
+        // d) ratcheted SHORT stop (<= entry), TP=86 => |86-100| * 2.2/2.8 = 11.0
+        // e) neither stop nor TP, entry=250 => 250 * 0.04 = 10.0
+        for (aid, coid, side, entry, stop, tp) in [
+            (btc_id, "leg-a-long-stop", "LONG", 100.0, 93.0, 120.0),
+            (btc_id, "leg-b-short-stop", "SHORT", 100.0, 106.0, 80.0),
+            (avax_id, "leg-c-long-tp", "LONG", 100.0, 102.0, 114.0),
+            (avax_id, "leg-d-short-tp", "SHORT", 100.0, 98.0, 86.0),
+            (link_id, "leg-e-fallback", "LONG", 250.0, 0.0, 0.0),
+        ] {
+            conn.exec_drop(
+                r#"INSERT INTO positions (
+                       asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
+                       exit_price, requested_quantity, filled_quantity, protective_stop_px, take_profit_px,
+                       created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :aid, :coid, :side, 'CLOSED', 'CLOSED', :entry, :entry,
+                       :entry, 1.0, 1.0, :stop, :tp, :ts, :ts
+                   )"#,
+                params! {
+                    "aid" => aid,
+                    "coid" => coid,
+                    "side" => side,
+                    "entry" => entry,
+                    "stop" => stop,
+                    "tp" => tp,
+                    "ts" => ts,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    db.init_schema()
+        .expect("v2.1.0 -> v2.2.0 init_schema migration must succeed before views");
+
+    {
+        let mut conn = db.get_conn().unwrap();
+        let ver: String = conn
+            .query_first(
+                "SELECT config_value FROM system_config WHERE config_key = 'schema_migration_version'",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(ver, "2.2.0");
+
+        for (coid, expected_r0) in [
+            ("leg-a-long-stop", 7.0),
+            ("leg-b-short-stop", 6.0),
+            ("leg-c-long-tp", 11.0),
+            ("leg-d-short-tp", 11.0),
+            ("leg-e-fallback", 10.0),
+        ] {
+            let r0: f64 = conn
+                .exec_first(
+                    "SELECT CAST(entry_r0 AS DOUBLE) FROM positions WHERE client_order_id = :coid",
+                    params! { "coid" => coid },
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                (r0 - expected_r0).abs() < 1e-6,
+                "Backfill mismatch for {coid}: got {r0}, expected {expected_r0}"
+            );
+        }
+
+        let chk_err = conn
+            .query_drop(format!(
+                "INSERT INTO positions (asset_id, client_order_id, side, status, fsm_state, entry_price, current_price, requested_quantity, entry_r0, created_at_ms, updated_at_ms) VALUES ({btc_id}, 'bad-neg-r0', 'LONG', 'CLOSED', 'CLOSED', 100, 100, 1, -0.01, {ts}, {ts})"
+            ))
+            .expect_err("Negative entry_r0 must violate chk_positions_entry_r0");
+        assert!(
+            chk_err.to_string().contains("chk_positions_entry_r0"),
+            "Expected chk_positions_entry_r0 violation, got: {chk_err}"
+        );
+    }
 }

@@ -68,6 +68,35 @@ impl RiskTier {
                 .clamp(0.10, 3.00),
         }
     }
+
+    pub fn default_risk_per_trade_equity_pct(&self, custom_mult: Option<f64>) -> f64 {
+        match self {
+            Self::Conservative => 0.005,
+            Self::Standard => 0.010,
+            Self::Aggressive => 0.015,
+            Self::Extreme => 0.020,
+            Self::Custom => (0.010
+                * custom_mult
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0))
+            .clamp(0.0025, 0.05),
+        }
+    }
+
+    pub fn default_max_single_asset_weight(&self, custom_mult: Option<f64>) -> f64 {
+        match self {
+            Self::Conservative => 0.15,
+            Self::Standard => 0.15,
+            Self::Aggressive => 0.20,
+            Self::Extreme => 0.25,
+            Self::Custom => (0.15
+                * custom_mult
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0)
+                    .max(1.0))
+            .clamp(0.15, 0.35),
+        }
+    }
 }
 
 /// Execution routing mode (`PAPER`, `TESTNET`, `LIVE`).
@@ -314,7 +343,7 @@ pub fn default_v2_system_config_seeds(
         ("max_gross_leverage_x", "2.50", "float", "Hard portfolio gross leverage ceiling (2.50x)"),
         ("max_open_positions", "6", "int", "Hard cap on total concurrent active positions (OPEN + WORKING combined)"),
         ("min_entry_interval_sec", "150", "int", "Minimum cooldown interval in seconds between opening new positions (150s default)"),
-        ("max_single_asset_weight", "0.15", "float", "Maximum single-asset portfolio weight cap (15% of equity)"),
+        ("max_single_asset_weight", "0.25", "float", "Maximum single-asset portfolio weight cap (25% of equity at extreme tier)"),
         ("min_rebalance_delta_weight", "0.025", "float", "Minimum weight delta (2.5% of equity) required to submit a rebalance order"),
         ("min_order_notional_usdc", "12.0", "float", "Hyperliquid minimum order notional floor in USDC ($12.00)"),
         ("initial_paper_equity_usdc", "10000.0", "float", "Default starting equity in USDC for PAPER mode or empty account fallback"),
@@ -349,7 +378,8 @@ pub fn default_v2_system_config_seeds(
         ("min_entry_l2_depth_usdc", "150.0", "float", "Minimum absolute 15bps L2 book depth floor in USDC on both bid and ask sides"),
         ("max_daily_drawdown_pct", "0.15", "float", "Maximum 24h peak-to-trough uncapped equity drawdown fraction before halting new entries"),
         ("min_equity_halt_usdc", "50.0", "float", "Minimum live equity floor in USDC below which ruin-halt blocks all new entries (R14-M12)"),
-        ("risk_per_trade_equity_pct", "0.005", "float", "Risk-parity per-trade equity risk budget fraction (0.5% default; 0.0 disables risk-parity cap)"),
+        ("risk_per_trade_equity_pct", "0.02", "float", "Risk-parity per-trade equity risk budget fraction (2.0% extreme default; 0.0 disables risk-parity cap)"),
+        ("max_portfolio_heat_pct", "0.12", "float", "Maximum aggregate open stop-loss risk as a fraction of equity (12% default)"),
         ("auto_deleverage_confirm_ticks", "2", "int", "Consecutive breach ticks required before AUTO_DELEVERAGE closes OPEN holdings (1-5)"),
         ("scanner_interval_ms", "3000", "int", "Full-exchange 150+ perp scanner cadence in milliseconds (3s)"),
         ("priority_monitor_interval_ms", "1000", "int", "High-frequency priority watchlist & active order monitor cadence in milliseconds (1s)"),
@@ -374,7 +404,7 @@ pub fn default_v2_system_config_seeds(
         ("protective_stop_default_pct", "0.04", "float", "Default protective stop distance fraction of entry price (4.0%)"),
         ("breakeven_trigger_r", "0.40", "float", "MFE excursion multiple in R-units activating the breakeven stop lock"),
         ("breakeven_lock_r", "0.05", "float", "Profit lock multiple in R-units applied when breakeven tier activates"),
-        ("stagnation_time_stop_hours", "5.0", "float", "Hours open below stagnation_min_mfe_r before closing stagnant position (0 disables)"),
+        ("stagnation_time_stop_hours", "12.0", "float", "Hours open below stagnation_min_mfe_r before closing stagnant position (0 disables)"),
         ("stagnation_min_mfe_r", "0.35", "float", "Minimum MFE in R-units required to keep a trade exempt from stagnation time-stop"),
         ("take_profit_atr_mult", "2.8", "float", "Take-profit target distance multiplier in ATR units (~1.27x reward-to-risk vs 2.2x ATR stop)"),
         ("take_profit_default_pct", "0.055", "float", "Default take-profit target distance fraction of entry price (5.5%)"),
@@ -395,6 +425,24 @@ pub fn default_v2_system_config_seeds(
         ("hl_rest_weight_limit_per_min", "900", "int", "Self-imposed Hyperliquid REST weight budget per minute (300-1150)"),
         ("candle_refresh_max_assets", "30", "int", "Maximum non-active top-volume assets refreshed per candle cycle"),
         ("backtest_warmup_bars", "24", "int", "Number of warmup bars preceding backtest evaluation window (1-500)"),
+        ("signal_timeframe", "4h", "string", "Canonical bar timeframe used for multi-sleeve signal generation and ATR stops (1m, 5m, 15m, 1h, 4h, 1d)"),
+        ("wall_clock_normalize_indicators", "true", "bool", "Normalize indicator lookbacks by bar duration wall-clock time across timeframes"),
+        ("s3_strict_admission_enabled", "true", "bool", "Enforce strict Sleeve 3 capitulation flush and funding dislocation admission filters"),
+        ("enable_scale_in_out_rebalance", "true", "bool", "Allow incremental scale-in and scale-out rebalance orders on existing open positions"),
+        ("enforce_slot_spread_weight_cap", "false", "bool", "Cap per-position weight by slot-spread leverage quota when enabled"),
+        ("max_entries_per_bar", "0", "int", "Maximum new entries permitted per signal bar (0 disables bar-level cap)"),
+        ("enable_regime_budget_multipliers", "false", "bool", "Apply directional regime multipliers in chop and neutral breadth regimes"),
+        ("chop_long_weight_mult", "0.50", "float", "Long target weight multiplier in CHOP regime when regime budget multipliers are enabled"),
+        ("chop_short_weight_mult", "0.65", "float", "Short target weight multiplier in CHOP regime when regime budget multipliers are enabled"),
+        ("neutral_long_weight_mult", "0.65", "float", "Long target weight multiplier in NEUTRAL regime when regime budget multipliers are enabled"),
+        ("signal_exit_confirm_bars", "1", "int", "Consecutive signal bars required to confirm a signal-driven close exit (1-5)"),
+        ("suppress_direct_flips", "false", "bool", "Close existing position instead of direct single-step side flip when true"),
+        ("max_net_exposure_ratio_of_gross", "1.0", "float", "Maximum allowed net exposure as a fraction of total gross exposure (0.10-1.0)"),
+        ("maker_first_low_urgency_entries", "false", "bool", "Prefer resting maker-only post-only entries for low-urgency rebalances"),
+        ("maker_only_rest_ttl_ms", "60000", "int", "Maximum resting TTL in milliseconds for maker-only low-urgency entries (5000-600000)"),
+        ("funding_entry_timing_enabled", "false", "bool", "Defer entries shortly before adverse hourly funding settlement when enabled"),
+        ("funding_entry_defer_min_rate_hourly", "0.0001", "float", "Minimum adverse hourly funding rate threshold triggering entry deferral (0.0-0.05)"),
+        ("funding_entry_defer_window_sec", "900", "int", "Seconds before hourly funding settlement within which adverse entries are deferred (0-3600)"),
         ("hl_websocket_enabled", "true", "bool", "Enable 2-connection Hyperliquid WebSocket Market+User cache with REST fallback"),
         ("retention_snapshots_days", "30", "int", "Days to retain intraday portfolio_snapshots (daily YTD anchors preserved 400d)"),
         ("retention_telemetry_days", "14", "int", "Days to retain telemetry_logs rows"),
@@ -530,8 +578,23 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
         | "profit_gate_signal_exits"
         | "hl_websocket_enabled"
         | "enable_breadth_regime_gate"
-        | "early_loser_invalidation_enabled" => {
+        | "early_loser_invalidation_enabled"
+        | "wall_clock_normalize_indicators"
+        | "s3_strict_admission_enabled"
+        | "enable_scale_in_out_rebalance"
+        | "enforce_slot_spread_weight_cap"
+        | "enable_regime_budget_multipliers"
+        | "suppress_direct_flips"
+        | "maker_first_low_urgency_entries"
+        | "funding_entry_timing_enabled" => {
             parse_bool_strict(clean_key, clean_val)?;
+        }
+        "signal_timeframe" => {
+            if !matches!(clean_val, "1m" | "5m" | "15m" | "1h" | "4h" | "1d") {
+                return Err(AegisError::Validation(format!(
+                    "Invalid signal_timeframe '{clean_val}': expected one of 1m, 5m, 15m, 1h, 4h, 1d"
+                )));
+            }
         }
         "signal_exit_min_net_profit_pct" => {
             parse_f64_bounded(clean_key, clean_val, 0.0, 0.50)?;
@@ -760,6 +823,30 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
         "risk_per_trade_equity_pct" => {
             parse_f64_bounded(clean_key, clean_val, 0.0, 0.05)?;
         }
+        "max_portfolio_heat_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.01, 1.0)?;
+        }
+        "max_entries_per_bar" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 100)?;
+        }
+        "chop_long_weight_mult" | "chop_short_weight_mult" | "neutral_long_weight_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 1.0)?;
+        }
+        "signal_exit_confirm_bars" => {
+            parse_i64_bounded(clean_key, clean_val, 1, 5)?;
+        }
+        "max_net_exposure_ratio_of_gross" => {
+            parse_f64_bounded(clean_key, clean_val, 0.10, 1.0)?;
+        }
+        "maker_only_rest_ttl_ms" => {
+            parse_i64_bounded(clean_key, clean_val, 5_000, 600_000)?;
+        }
+        "funding_entry_defer_min_rate_hourly" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 0.05)?;
+        }
+        "funding_entry_defer_window_sec" => {
+            parse_i64_bounded(clean_key, clean_val, 0, 3_600)?;
+        }
         "min_equity_halt_usdc" => {
             parse_f64_bounded(clean_key, clean_val, 1.0, 100_000.0)?;
         }
@@ -910,7 +997,7 @@ mod tests {
         // Tier-1 & R14-H1 updated seed defaults
         assert_eq!(find("risk_capital_cap_usdc"), Some("1000.0"));
         assert_eq!(find("risk_capital_cap_updated_at_ms"), Some("0"));
-        assert_eq!(find("max_single_asset_weight"), Some("0.15"));
+        assert_eq!(find("max_single_asset_weight"), Some("0.25"));
         assert_eq!(find("min_position_hold_sec"), Some("900"));
         assert_eq!(find("profit_gate_signal_exits"), Some("false"));
         assert_eq!(find("signal_exit_min_net_profit_pct"), Some("0.0025"));
@@ -953,7 +1040,7 @@ mod tests {
         assert_eq!(find("breadth_bear_block_longs_threshold"), Some("0.32"));
         assert_eq!(find("breakeven_trigger_r"), Some("0.40"));
         assert_eq!(find("breakeven_lock_r"), Some("0.05"));
-        assert_eq!(find("stagnation_time_stop_hours"), Some("5.0"));
+        assert_eq!(find("stagnation_time_stop_hours"), Some("12.0"));
         assert_eq!(find("stagnation_min_mfe_r"), Some("0.35"));
         assert_eq!(find("early_loser_invalidation_enabled"), Some("true"));
         assert_eq!(find("hysteresis_s1_reversal_mom_threshold"), Some("0.08"));
@@ -961,7 +1048,26 @@ mod tests {
             find("hysteresis_s1_support_composite_threshold"),
             Some("0.025")
         );
-        assert_eq!(find("risk_per_trade_equity_pct"), Some("0.005"));
+        assert_eq!(find("risk_per_trade_equity_pct"), Some("0.02"));
+        assert_eq!(find("max_portfolio_heat_pct"), Some("0.12"));
+        assert_eq!(find("signal_timeframe"), Some("4h"));
+        assert_eq!(find("wall_clock_normalize_indicators"), Some("true"));
+        assert_eq!(find("s3_strict_admission_enabled"), Some("true"));
+        assert_eq!(find("enable_scale_in_out_rebalance"), Some("true"));
+        assert_eq!(find("enforce_slot_spread_weight_cap"), Some("false"));
+        assert_eq!(find("max_entries_per_bar"), Some("0"));
+        assert_eq!(find("enable_regime_budget_multipliers"), Some("false"));
+        assert_eq!(find("chop_long_weight_mult"), Some("0.50"));
+        assert_eq!(find("chop_short_weight_mult"), Some("0.65"));
+        assert_eq!(find("neutral_long_weight_mult"), Some("0.65"));
+        assert_eq!(find("signal_exit_confirm_bars"), Some("1"));
+        assert_eq!(find("suppress_direct_flips"), Some("false"));
+        assert_eq!(find("max_net_exposure_ratio_of_gross"), Some("1.0"));
+        assert_eq!(find("maker_first_low_urgency_entries"), Some("false"));
+        assert_eq!(find("maker_only_rest_ttl_ms"), Some("60000"));
+        assert_eq!(find("funding_entry_timing_enabled"), Some("false"));
+        assert_eq!(find("funding_entry_defer_min_rate_hourly"), Some("0.0001"));
+        assert_eq!(find("funding_entry_defer_window_sec"), Some("900"));
         assert_eq!(find("min_equity_halt_usdc"), Some("50.0"));
         assert_eq!(find("retention_snapshots_days"), Some("30"));
         assert_eq!(find("retention_telemetry_days"), Some("14"));
@@ -1036,9 +1142,77 @@ mod tests {
         assert!(validate_core_config_key_value("stagnation_time_stop_hours", "168.1").is_err());
         assert!(validate_core_config_key_value("hl_websocket_enabled", "maybe").is_err());
         assert!(matches!(
-            validate_core_config_key_value("schema_migration_version", "2.1.0"),
+            validate_core_config_key_value("schema_migration_version", "2.2.0"),
             Err(AegisError::SecurityViolation(_))
         ));
+
+        for tf in ["1m", "5m", "15m", "1h", "4h", "1d"] {
+            assert!(validate_core_config_key_value("signal_timeframe", tf).is_ok());
+        }
+        assert!(validate_core_config_key_value("signal_timeframe", "30m").is_err());
+        assert!(validate_core_config_key_value("max_portfolio_heat_pct", "0.01").is_ok());
+        assert!(validate_core_config_key_value("max_portfolio_heat_pct", "1.0").is_ok());
+        assert!(validate_core_config_key_value("max_portfolio_heat_pct", "0.009").is_err());
+        assert!(validate_core_config_key_value("max_portfolio_heat_pct", "1.01").is_err());
+        assert!(validate_core_config_key_value("max_entries_per_bar", "0").is_ok());
+        assert!(validate_core_config_key_value("max_entries_per_bar", "100").is_ok());
+        assert!(validate_core_config_key_value("max_entries_per_bar", "101").is_err());
+        assert!(validate_core_config_key_value("chop_long_weight_mult", "0.0").is_ok());
+        assert!(validate_core_config_key_value("chop_long_weight_mult", "1.01").is_err());
+        assert!(validate_core_config_key_value("signal_exit_confirm_bars", "1").is_ok());
+        assert!(validate_core_config_key_value("signal_exit_confirm_bars", "5").is_ok());
+        assert!(validate_core_config_key_value("signal_exit_confirm_bars", "0").is_err());
+        assert!(validate_core_config_key_value("signal_exit_confirm_bars", "6").is_err());
+        assert!(validate_core_config_key_value("max_net_exposure_ratio_of_gross", "0.10").is_ok());
+        assert!(validate_core_config_key_value("max_net_exposure_ratio_of_gross", "0.09").is_err());
+        assert!(validate_core_config_key_value("maker_only_rest_ttl_ms", "5000").is_ok());
+        assert!(validate_core_config_key_value("maker_only_rest_ttl_ms", "600000").is_ok());
+        assert!(validate_core_config_key_value("maker_only_rest_ttl_ms", "4999").is_err());
+        assert!(validate_core_config_key_value("maker_only_rest_ttl_ms", "600001").is_err());
+        assert!(
+            validate_core_config_key_value("funding_entry_defer_min_rate_hourly", "0.05").is_ok()
+        );
+        assert!(
+            validate_core_config_key_value("funding_entry_defer_min_rate_hourly", "0.051").is_err()
+        );
+        assert!(validate_core_config_key_value("funding_entry_defer_window_sec", "3600").is_ok());
+        assert!(validate_core_config_key_value("funding_entry_defer_window_sec", "3601").is_err());
+    }
+
+    #[test]
+    fn test_risk_tier_scaled_risk_budget_and_weight_defaults() {
+        assert!(
+            (RiskTier::Conservative.default_risk_per_trade_equity_pct(None) - 0.005).abs() < 1e-9
+        );
+        assert!((RiskTier::Standard.default_risk_per_trade_equity_pct(None) - 0.010).abs() < 1e-9);
+        assert!(
+            (RiskTier::Aggressive.default_risk_per_trade_equity_pct(None) - 0.015).abs() < 1e-9
+        );
+        assert!((RiskTier::Extreme.default_risk_per_trade_equity_pct(None) - 0.020).abs() < 1e-9);
+        assert!(
+            (RiskTier::Custom.default_risk_per_trade_equity_pct(Some(1.5)) - 0.015).abs() < 1e-9
+        );
+        assert!(
+            (RiskTier::Custom.default_risk_per_trade_equity_pct(Some(0.1)) - 0.0025).abs() < 1e-9
+        );
+        assert!(
+            (RiskTier::Custom.default_risk_per_trade_equity_pct(Some(10.0)) - 0.05).abs() < 1e-9
+        );
+        assert!(
+            (RiskTier::Custom.default_risk_per_trade_equity_pct(Some(f64::NAN)) - 0.010).abs()
+                < 1e-9
+        );
+
+        assert!((RiskTier::Conservative.default_max_single_asset_weight(None) - 0.15).abs() < 1e-9);
+        assert!((RiskTier::Standard.default_max_single_asset_weight(None) - 0.15).abs() < 1e-9);
+        assert!((RiskTier::Aggressive.default_max_single_asset_weight(None) - 0.20).abs() < 1e-9);
+        assert!((RiskTier::Extreme.default_max_single_asset_weight(None) - 0.25).abs() < 1e-9);
+        assert!((RiskTier::Custom.default_max_single_asset_weight(Some(0.5)) - 0.15).abs() < 1e-9);
+        assert!((RiskTier::Custom.default_max_single_asset_weight(Some(1.5)) - 0.225).abs() < 1e-9);
+        assert!((RiskTier::Custom.default_max_single_asset_weight(Some(3.0)) - 0.35).abs() < 1e-9);
+        assert!(
+            (RiskTier::Custom.default_max_single_asset_weight(Some(f64::NAN)) - 0.15).abs() < 1e-9
+        );
     }
 
     #[test]

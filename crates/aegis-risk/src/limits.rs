@@ -36,6 +36,8 @@ pub struct RiskLimitsConfig {
     pub stagnation_min_mfe_r: f64,
     #[serde(default = "default_risk_per_trade_equity_pct")]
     pub risk_per_trade_equity_pct: f64,
+    #[serde(default = "default_max_portfolio_heat_pct")]
+    pub max_portfolio_heat_pct: f64,
     #[serde(default = "default_min_equity_halt_usdc")]
     pub min_equity_halt_usdc: f64,
 }
@@ -49,7 +51,7 @@ fn default_breakeven_lock_r() -> f64 {
 }
 
 fn default_stagnation_time_stop_hours() -> f64 {
-    5.0
+    12.0
 }
 
 fn default_stagnation_min_mfe_r() -> f64 {
@@ -57,7 +59,11 @@ fn default_stagnation_min_mfe_r() -> f64 {
 }
 
 fn default_risk_per_trade_equity_pct() -> f64 {
-    0.005
+    0.02
+}
+
+fn default_max_portfolio_heat_pct() -> f64 {
+    0.12
 }
 
 fn default_min_equity_halt_usdc() -> f64 {
@@ -70,7 +76,7 @@ impl Default for RiskLimitsConfig {
             risk_tier: RiskTier::Extreme,
             target_leverage_multiplier: 1.85,
             max_gross_leverage_x: 2.50,
-            max_single_asset_weight: 0.15,
+            max_single_asset_weight: 0.25,
             min_rebalance_delta_weight: 0.025,
             min_order_notional_usdc: 12.0,
             protective_stop_atr_mult: 2.2,
@@ -82,9 +88,10 @@ impl Default for RiskLimitsConfig {
             taker_fee_bps: 4.5,
             breakeven_trigger_r: 0.40,
             breakeven_lock_r: 0.05,
-            stagnation_time_stop_hours: 5.0,
+            stagnation_time_stop_hours: 12.0,
             stagnation_min_mfe_r: 0.35,
-            risk_per_trade_equity_pct: 0.005,
+            risk_per_trade_equity_pct: 0.02,
+            max_portfolio_heat_pct: 0.12,
             min_equity_halt_usdc: 50.0,
         }
     }
@@ -94,12 +101,16 @@ impl RiskLimitsConfig {
     pub fn from_config_map(cfg: &ConfigMap) -> Self {
         let risk_tier = cfg.risk_tier();
         let target_leverage_multiplier = cfg.target_leverage_multiplier();
+        let default_max_weight =
+            risk_tier.default_max_single_asset_weight(Some(target_leverage_multiplier));
+        let default_risk_pct =
+            risk_tier.default_risk_per_trade_equity_pct(Some(target_leverage_multiplier));
         Self {
             risk_tier,
             target_leverage_multiplier,
             max_gross_leverage_x: cfg.get_f64("max_gross_leverage_x", 2.50).clamp(0.20, 5.00),
             max_single_asset_weight: cfg
-                .get_f64("max_single_asset_weight", 0.15)
+                .get_f64("max_single_asset_weight", default_max_weight)
                 .clamp(0.01, 1.00),
             min_rebalance_delta_weight: cfg
                 .get_f64("min_rebalance_delta_weight", 0.025)
@@ -121,12 +132,15 @@ impl RiskLimitsConfig {
             breakeven_trigger_r: cfg.get_f64("breakeven_trigger_r", 0.40).clamp(0.15, 1.50),
             breakeven_lock_r: cfg.get_f64("breakeven_lock_r", 0.05).clamp(0.0, 0.50),
             stagnation_time_stop_hours: cfg
-                .get_f64("stagnation_time_stop_hours", 5.0)
+                .get_f64("stagnation_time_stop_hours", 12.0)
                 .clamp(0.0, 168.0),
             stagnation_min_mfe_r: cfg.get_f64("stagnation_min_mfe_r", 0.35).clamp(0.05, 2.0),
             risk_per_trade_equity_pct: cfg
-                .get_f64("risk_per_trade_equity_pct", 0.005)
+                .get_f64("risk_per_trade_equity_pct", default_risk_pct)
                 .clamp(0.0, 0.05),
+            max_portfolio_heat_pct: cfg
+                .get_f64("max_portfolio_heat_pct", 0.12)
+                .clamp(0.01, 1.00),
             min_equity_halt_usdc: cfg
                 .get_f64("min_equity_halt_usdc", 50.0)
                 .clamp(1.0, 100_000.0),
@@ -462,32 +476,65 @@ mod tests {
     #[test]
     fn test_risk_limits_defaults_and_config_map_clamping() {
         let defaults = RiskLimitsConfig::default();
-        assert!((defaults.max_single_asset_weight - 0.15).abs() < 1e-9);
+        assert!((defaults.max_single_asset_weight - 0.25).abs() < 1e-9);
         assert!((defaults.protective_stop_atr_mult - 2.2).abs() < 1e-9);
         assert!((defaults.protective_stop_default_pct - 0.04).abs() < 1e-9);
         assert!((defaults.take_profit_atr_mult - 2.8).abs() < 1e-9);
         assert!((defaults.take_profit_default_pct - 0.055).abs() < 1e-9);
         assert!((defaults.breakeven_trigger_r - 0.40).abs() < 1e-9);
         assert!((defaults.breakeven_lock_r - 0.05).abs() < 1e-9);
-        assert!((defaults.stagnation_time_stop_hours - 5.0).abs() < 1e-9);
+        assert!((defaults.stagnation_time_stop_hours - 12.0).abs() < 1e-9);
         assert!((defaults.stagnation_min_mfe_r - 0.35).abs() < 1e-9);
-        assert!((defaults.risk_per_trade_equity_pct - 0.005).abs() < 1e-9);
+        assert!((defaults.risk_per_trade_equity_pct - 0.02).abs() < 1e-9);
+        assert!((defaults.max_portfolio_heat_pct - 0.12).abs() < 1e-9);
         assert!((defaults.min_equity_halt_usdc - 50.0).abs() < 1e-9);
 
         let empty_cfg = ConfigMap::new();
         let from_empty = RiskLimitsConfig::from_config_map(&empty_cfg);
-        assert!((from_empty.max_single_asset_weight - 0.15).abs() < 1e-9);
+        assert!((from_empty.max_single_asset_weight - 0.25).abs() < 1e-9);
+        assert!((from_empty.risk_per_trade_equity_pct - 0.02).abs() < 1e-9);
+        assert!((from_empty.stagnation_time_stop_hours - 12.0).abs() < 1e-9);
+        assert!((from_empty.max_portfolio_heat_pct - 0.12).abs() < 1e-9);
         assert!((from_empty.take_profit_atr_mult - 2.8).abs() < 1e-9);
         assert!((from_empty.take_profit_default_pct - 0.055).abs() < 1e-9);
+
+        // Tier-aware fallback when risk_per_trade_equity_pct / max_single_asset_weight absent
+        for (tier_str, exp_risk, exp_weight) in [
+            ("conservative", 0.005, 0.15),
+            ("standard", 0.010, 0.15),
+            ("aggressive", 0.015, 0.20),
+            ("extreme", 0.020, 0.25),
+        ] {
+            let mut tier_cfg = ConfigMap::new();
+            tier_cfg.insert("risk_tier", tier_str);
+            let lim = RiskLimitsConfig::from_config_map(&tier_cfg);
+            assert!((lim.risk_per_trade_equity_pct - exp_risk).abs() < 1e-9);
+            assert!((lim.max_single_asset_weight - exp_weight).abs() < 1e-9);
+        }
+
+        // Custom tier fallback scales by target_leverage_multiplier, and explicit overrides win
+        let mut custom_tier = ConfigMap::new();
+        custom_tier.insert("risk_tier", "custom");
+        custom_tier.insert("target_leverage_multiplier", "1.50");
+        let custom_lim = RiskLimitsConfig::from_config_map(&custom_tier);
+        assert!((custom_lim.risk_per_trade_equity_pct - 0.015).abs() < 1e-9);
+        assert!((custom_lim.max_single_asset_weight - 0.225).abs() < 1e-9);
+        custom_tier.insert("risk_per_trade_equity_pct", "0.03");
+        custom_tier.insert("max_single_asset_weight", "0.18");
+        let override_lim = RiskLimitsConfig::from_config_map(&custom_tier);
+        assert!((override_lim.risk_per_trade_equity_pct - 0.03).abs() < 1e-9);
+        assert!((override_lim.max_single_asset_weight - 0.18).abs() < 1e-9);
 
         let mut custom = ConfigMap::new();
         custom.insert("take_profit_atr_mult", "0.2");
         custom.insert("take_profit_default_pct", "1.5");
         custom.insert("stagnation_time_stop_hours", "168.0");
+        custom.insert("max_portfolio_heat_pct", "2.0");
         let clamped_low_high = RiskLimitsConfig::from_config_map(&custom);
         assert!((clamped_low_high.take_profit_atr_mult - 1.0).abs() < 1e-9);
         assert!((clamped_low_high.take_profit_default_pct - 0.80).abs() < 1e-9);
         assert!((clamped_low_high.stagnation_time_stop_hours - 168.0).abs() < 1e-9);
+        assert!((clamped_low_high.max_portfolio_heat_pct - 1.0).abs() < 1e-9);
 
         let mut over_max = ConfigMap::new();
         over_max.insert("stagnation_time_stop_hours", "200.0");
@@ -532,6 +579,7 @@ mod tests {
             entry_price: 100_000.0,
             mark_price: 50_000.0,
             protective_stop_px: 95_000.0,
+            entry_r0: 5_000.0,
             protective_stop_oid: None,
             stop_distance_pct: None,
             take_profit_px: 110_000.0,

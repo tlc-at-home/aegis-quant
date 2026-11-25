@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS positions (
     s2_weight_contrib         DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
     s3_weight_contrib         DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
     protective_stop_px        DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
+    entry_r0                  DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
     protective_stop_oid       VARCHAR(64),
     take_profit_px            DECIMAL(20,8) NOT NULL DEFAULT 0.00000000,
     take_profit_oid           VARCHAR(64),
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS positions (
         AND highest_price_seen >= 0 AND lowest_price_seen >= 0
     ),
     CONSTRAINT chk_positions_margin CHECK (reserved_margin_usdc >= 0 AND committed_notional_usdc >= 0),
+    CONSTRAINT chk_positions_entry_r0 CHECK (entry_r0 >= 0),
     CONSTRAINT chk_positions_fsm CHECK (
         fsm_state IN ('NEW','WORKING_ALO','CHASING_ALO','CROSSING_IOC','FILLED_OPEN','STOP_TRIGGERED','CLOSED','CANCELLED')
     ),
@@ -321,6 +323,7 @@ SELECT
     p.entry_price,
     a.mark_price,
     p.protective_stop_px,
+    p.entry_r0,
     p.protective_stop_oid,
     CASE
         WHEN p.protective_stop_px > 0 AND a.mark_price > 0 AND p.side = 'LONG'

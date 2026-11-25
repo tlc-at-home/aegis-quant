@@ -861,6 +861,8 @@ pub fn execute_risk_tier_switch(
         }
     }
     let mult = tier.leverage_multiplier(req.custom_leverage_multiplier);
+    let risk_pct = tier.default_risk_per_trade_equity_pct(Some(mult));
+    let max_w = tier.default_max_single_asset_weight(Some(mult));
 
     db.set_config_value(
         "risk_tier",
@@ -871,6 +873,16 @@ pub fn execute_risk_tier_switch(
         "target_leverage_multiplier",
         &format!("{mult:.2}"),
         Some("Active target leverage multiplier L_tier"),
+    )?;
+    db.set_config_value(
+        "risk_per_trade_equity_pct",
+        &format!("{risk_pct:.4}"),
+        Some("Per-trade equity risk budget synchronized with risk_tier"),
+    )?;
+    db.set_config_value(
+        "max_single_asset_weight",
+        &format!("{max_w:.4}"),
+        Some("Single-asset weight cap synchronized with risk_tier"),
     )?;
 
     // Immediately enforce max_open_positions & target_leverage_multiplier cap upon switching risk tier

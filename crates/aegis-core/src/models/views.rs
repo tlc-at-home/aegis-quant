@@ -18,6 +18,8 @@ pub struct HeldAssetView {
     pub mark_price: f64,
     pub protective_stop_px: f64,
     #[serde(default)]
+    pub entry_r0: f64,
+    #[serde(default)]
     pub protective_stop_oid: Option<String>,
     pub stop_distance_pct: Option<f64>,
     #[serde(default)]

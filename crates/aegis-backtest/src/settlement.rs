@@ -528,6 +528,7 @@ pub fn process_intrabar_stops_and_funding(
             tick_size: asset.tick_size,
             check_tp: true,
             held_duration_ms,
+            entry_r0: None,
         });
 
         pos.current_price = asset.mark_price;
@@ -1124,6 +1125,7 @@ fn build_working_position(
         s2_weight_contrib: plan.s2_weight_contrib,
         s3_weight_contrib: plan.s3_weight_contrib,
         protective_stop_px: plan.protective_stop_px,
+        entry_r0: 0.0,
         protective_stop_oid: None,
         take_profit_px: plan.take_profit_px,
         take_profit_oid: None,
