@@ -1171,7 +1171,9 @@ impl DatabaseManager {
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0)
                    FROM positions
-                   WHERE status = 'CLOSED' AND closed_at_ms >= :min_s"#,
+                   WHERE status = 'CLOSED'
+                     AND closed_at_ms >= :min_s
+                     AND COALESCE(exit_reason, '') != 'SCALE_IN_MERGED'"#,
                 params! {
                     "d_s" => eff_starts[0],
                     "w_s" => eff_starts[1],

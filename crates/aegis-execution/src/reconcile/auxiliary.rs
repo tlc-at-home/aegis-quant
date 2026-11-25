@@ -13,8 +13,8 @@ use crate::ws_client::WsStateCache;
 use aegis_core::{
     compute_vault_pnl_pct, is_unified_account_mode, mask_identifier, normalize_hyperliquid_symbol,
     now_ms, parse_hl_f64, parse_hl_f64_opt, parse_hl_i64_opt, parse_hl_u64_opt, round_dp,
-    CachedHlPortfolioPnl, ConfigMap, HlPortfolioWindowCache, Result, VaultInfoPayload,
-    VaultPositionInfo,
+    CachedHlPortfolioPnl, ConfigMap, ExchangeAsset, HlPortfolioWindowCache, OrderSide, Result,
+    VaultInfoPayload, VaultPositionInfo,
 };
 use aegis_db::{AssetUpsertInput, DatabaseManager, FundingEventUpsertInput};
 use parking_lot::Mutex;
@@ -453,10 +453,15 @@ impl AuxiliarySyncWorker {
     /// Runs one complete auxiliary sync cycle strictly without `execution_lock()`.
     pub fn run_once(&self, is_startup: bool) -> AuxiliarySyncReport {
         let cfg = self.db.load_config_or_default();
-        if !cfg.execution_mode().is_live_or_testnet() {
-            return AuxiliarySyncReport::default();
-        }
         let ts = now_ms();
+        if !cfg.execution_mode().is_live_or_testnet() {
+            let funding_events_inserted =
+                self.sync_funding_events(&cfg, ts, is_startup).unwrap_or(0);
+            return AuxiliarySyncReport {
+                funding_events_inserted,
+                ..Default::default()
+            };
+        }
         let extra_agent_warning = if is_startup {
             self.verify_extra_agents_on_startup(&cfg, ts)
         } else {
@@ -612,9 +617,87 @@ impl AuxiliarySyncWorker {
         Some((maker_bps, taker_bps))
     }
 
+    fn sync_paper_funding_events(&self, now_ms_val: i64) -> Result<usize> {
+        const HOUR_MS: i64 = 3_600_000;
+        const MAX_PAPER_FUNDING_BACKFILL_HOURS: i64 = 720;
+
+        let current_hour_ms = now_ms_val - now_ms_val.rem_euclid(HOUR_MS);
+        let held = self.db.get_assets_held()?;
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let assets: HashMap<i64, ExchangeAsset> = self
+            .db
+            .list_exchange_assets()?
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
+
+        let mut paper_events: Vec<(i64, FundingEventUpsertInput)> = Vec::new();
+        for h in held {
+            let Some(asset) = assets.get(&h.asset_id) else {
+                continue;
+            };
+            let Ok(side) = OrderSide::parse(&h.side) else {
+                continue;
+            };
+            if !asset.funding_rate_hourly.is_finite() || asset.funding_rate_hourly.abs() <= 1e-12 {
+                continue;
+            }
+            let opened_ts = h.opened_at_ms.unwrap_or(h.created_at_ms);
+            let first_hour_ms = (opened_ts - opened_ts.rem_euclid(HOUR_MS)) + HOUR_MS;
+            if first_hour_ms > current_hour_ms {
+                continue;
+            }
+            let min_hour_ms = current_hour_ms - MAX_PAPER_FUNDING_BACKFILL_HOURS * HOUR_MS;
+            let start_hour_ms = first_hour_ms.max(min_hour_ms);
+            let ref_px = if asset.mark_price > 0.0 {
+                asset.mark_price
+            } else if h.mark_price > 0.0 {
+                h.mark_price
+            } else {
+                h.entry_price
+            };
+            let mark_notional = (ref_px * h.quantity).abs();
+            if !mark_notional.is_finite() || mark_notional <= 0.0 {
+                continue;
+            }
+            let cashflow_usdc =
+                round_dp(-side.sign() * asset.funding_rate_hourly * mark_notional, 4);
+            if cashflow_usdc.abs() <= 1e-12 {
+                continue;
+            }
+            let pos_szi = round_dp(h.quantity * side.sign(), 8);
+
+            let mut hour_ts_ms = start_hour_ms;
+            while hour_ts_ms <= current_hour_ms {
+                paper_events.push((
+                    h.position_id,
+                    FundingEventUpsertInput {
+                        asset_id: h.asset_id,
+                        coin: asset.coin.clone(),
+                        event_time_ms: hour_ts_ms,
+                        usdc: cashflow_usdc,
+                        remaining_usdc: 0.0,
+                        position_szi: pos_szi,
+                        funding_rate: asset.funding_rate_hourly,
+                        dedup_key: format!("paper:{}:{}", h.position_id, hour_ts_ms),
+                    },
+                ));
+                hour_ts_ms = hour_ts_ms.saturating_add(HOUR_MS);
+            }
+        }
+
+        if paper_events.is_empty() {
+            return Ok(0);
+        }
+        self.db.accrue_paper_funding_events(&paper_events)
+    }
+
     /// Incrementally fetches watermarked `userFunding` (`startTime = max(event_time_ms) - 3_600_000`,
     /// `max_pages = 5` periodic / `25` startup backfill) and inserts ONLY new `funding_events`
-    /// without clobbering already-settled `remaining_usdc`.
+    /// without clobbering already-settled `remaining_usdc`, or accrues deterministic UTC `:00`
+    /// hourly funding for `PAPER` mode `OPEN` positions.
     pub fn sync_funding_events(
         &self,
         cfg: &ConfigMap,
@@ -622,7 +705,7 @@ impl AuxiliarySyncWorker {
         is_startup: bool,
     ) -> Result<usize> {
         if !cfg.execution_mode().is_live_or_testnet() {
-            return Ok(0);
+            return self.sync_paper_funding_events(now_ms_val);
         }
         let wallet_trimmed = cfg.get_str("wallet_address", "").trim().to_string();
         if wallet_trimmed.is_empty() {
@@ -1502,5 +1585,100 @@ mod tests {
         let cfg_after = db.load_config_or_default();
         assert!((cfg_after.get_f64("live_exchange_maker_fee_bps", 0.0) - 1.2).abs() < 1e-6);
         assert!((cfg_after.get_f64("live_exchange_taker_fee_bps", 0.0) - 3.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_paper_mode_hourly_utc_funding_accrual_and_idempotency() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        db.init_schema().unwrap();
+        db.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+
+        let sol_id = db
+            .upsert_exchange_asset(&aegis_db::AssetUpsertInput {
+                raw_symbol_or_coin: "SOL".to_string(),
+                asset_index: 3,
+                sz_decimals: 2,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: 100.0,
+                mid_price: 100.0,
+                oracle_price: 100.0,
+                funding_rate_hourly: 0.0005, // +5 bps/hr -> Long pays -0.50/hr on 10 * 100 = $1000
+                day_volume_usdc: 20_000_000.0,
+                open_interest_usdc: 5_000_000.0,
+                prev_day_price: 99.0,
+                is_core_eligible: true,
+                is_event_eligible: false,
+                is_priority_watched: true,
+            })
+            .unwrap();
+
+        let now = now_ms();
+        let current_hour = now - now.rem_euclid(3_600_000);
+        // Opened 2h+ ago across exactly 2 completed UTC :00 hours (current_hour - 3_600_000 and current_hour)
+        let opened_ts = current_hour - 3_600_000 - 300_000;
+        let pid = db
+            .create_working_order(&aegis_db::WorkingOrderInput {
+                asset_id: sol_id,
+                client_order_id: "v2-paper-fund-1".to_string(),
+                side: aegis_core::OrderSide::Long,
+                limit_price: 100.0,
+                requested_quantity: 10.0,
+                reserved_margin_usdc: 500.0,
+                portfolio_weight: 0.1,
+                s1_weight_contrib: 0.1,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 95.0,
+                take_profit_px: Some(110.0),
+                exchange_order_id: None,
+                reason: "PAPER_FUND_TEST".to_string(),
+            })
+            .unwrap();
+        db.promote_working_to_open(
+            pid,
+            100.0,
+            10.0,
+            0.45,
+            95.0,
+            Some(110.0),
+            None,
+            "PAPER_FUND_FILL",
+        )
+        .unwrap();
+        // Set opened_at_ms to 2 hours back via sync_open_position or direct? Wait: sync_open_position_from_exchange_v2 updates opened_at_ms!
+        let _ = db
+            .sync_open_position_from_exchange_v2(&aegis_db::ExchangeOpenPositionSyncInput {
+                asset_id: sol_id,
+                coin: "SOL",
+                side: aegis_core::OrderSide::Long,
+                entry_price: 100.0,
+                mark_price: 100.0,
+                quantity: 10.0,
+                committed_notional_usdc: 1000.0,
+                unrealized_pnl_usdc: 0.0,
+                portfolio_weight: 0.1,
+                protective_stop_px: 95.0,
+                take_profit_px: 110.0,
+                funding_accrued_usdc: 0.0,
+                opened_at_ms: Some(opened_ts),
+            })
+            .unwrap();
+
+        let worker = AuxiliarySyncWorker::new(db.clone(), HyperliquidHttpClient::new(2));
+        let rep1 = worker.run_once(true);
+        assert_eq!(rep1.funding_events_inserted, 2);
+
+        let pos1 = db.get_position_by_id(pid).unwrap().unwrap();
+        // - (10.0 * 100.0 * 0.0005) * 2 = -1.0 USDC
+        assert!((pos1.funding_accrued_usdc - (-1.0)).abs() < 1e-4);
+
+        // Second run within same UTC hour must be strictly idempotent (0 new inserts)
+        let rep2 = worker.run_once(true);
+        assert_eq!(rep2.funding_events_inserted, 0);
+        let pos2 = db.get_position_by_id(pid).unwrap().unwrap();
+        assert!((pos2.funding_accrued_usdc - (-1.0)).abs() < 1e-4);
     }
 }

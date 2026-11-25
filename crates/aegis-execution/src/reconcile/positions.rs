@@ -16,13 +16,10 @@ use aegis_core::{
     OrderSide, Result, ENTRY_PARTIAL_GRACE_MS,
 };
 use aegis_db::{
-    AssetUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput, FundingEventUpsertInput,
-    ReconciledClosedTradeInput,
+    AssetUpsertInput, BarUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput,
+    FundingEventUpsertInput, ReconciledClosedTradeInput,
 };
-use aegis_risk::{
-    compute_atr_from_bars, compute_initial_protective_stop, compute_initial_take_profit,
-    RiskLimitsConfig,
-};
+use aegis_risk::{compute_initial_protective_stop, compute_initial_take_profit, RiskLimitsConfig};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -348,6 +345,7 @@ pub(crate) fn commit_positions_and_ledger_locked(
     run_ledger_replay: bool,
     meta_catalog: Option<&MetaCatalog>,
     assets_by_symbol: &mut HashMap<String, ExchangeAsset>,
+    prefetched_bars_by_coin: &HashMap<String, Vec<BarUpsertInput>>,
     in_flight_positions: &HashSet<i64>,
     close_legacy_positions: bool,
     details: &mut Vec<String>,
@@ -405,6 +403,26 @@ pub(crate) fn commit_positions_and_ledger_locked(
         coin_asset_id_cache.insert(prep.coin_upper.clone(), asset.id);
         legacy_positions_found += 1;
 
+        if let Some(prefetched) = prefetched_bars_by_coin.get(&prep.coin_upper) {
+            if !prefetched.is_empty() {
+                let retargeted: Vec<BarUpsertInput> = prefetched
+                    .iter()
+                    .map(|b| BarUpsertInput {
+                        asset_id: asset.id,
+                        timeframe: b.timeframe.clone(),
+                        timestamp_ms: b.timestamp_ms,
+                        open: b.open,
+                        high: b.high,
+                        low: b.low,
+                        close: b.close,
+                        volume: b.volume,
+                        funding_rate: b.funding_rate,
+                    })
+                    .collect();
+                let _ = db.upsert_ohlcv_bars(&retargeted);
+            }
+        }
+
         let _ = db.update_asset_live_quote(asset.id, prep.mark_px, prep.live_mid);
 
         if prep.closed_on_exchange {
@@ -456,15 +474,13 @@ pub(crate) fn commit_positions_and_ledger_locked(
         };
 
         let tick = asset.tick_size.max(1e-8);
-        let bars_1h = db.get_ohlcv_bars(asset.id, "1h", 20).unwrap_or_default();
-        let atr_opt = (!bars_1h.is_empty()).then(|| {
-            compute_atr_from_bars(
-                &bars_1h,
-                14,
-                prep.mark_px,
-                limits.protective_stop_default_pct,
-            )
-        });
+        let atr_opt = crate::engine::resolve_signal_matched_atr_from_db(
+            db,
+            asset.id,
+            fresh_cfg,
+            prep.mark_px,
+            limits.protective_stop_default_pct,
+        );
         let entry_stop =
             compute_initial_protective_stop(prep.side, prep.entry_px, atr_opt, tick, &limits);
         let stop_px = if match prep.side {

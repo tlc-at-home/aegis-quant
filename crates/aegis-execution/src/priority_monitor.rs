@@ -22,10 +22,10 @@ use crate::ws_client::WsStateCache;
 use aegis_alerts::{format_position_closed_html, AlertEngine, PositionClosedAlert};
 use aegis_core::{
     now_ms, parse_hl_f64, parse_hl_i64_opt, parse_hl_u64_opt, round_dp, AegisError, ConfigMap,
-    ExchangeAsset, HeldAssetView, OhlcvBar, OrderSide, PriorityMonitorHealth, Result,
+    ExchangeAsset, HeldAssetView, OrderSide, PriorityMonitorHealth, Result,
 };
 use aegis_db::DatabaseManager;
-use aegis_risk::{compute_atr_from_bars, RiskEngine, StopEvaluationInput};
+use aegis_risk::{RiskEngine, StopEvaluationInput};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -506,6 +506,38 @@ impl PriorityMonitor {
         let mut tpsl_syncs: Vec<PendingTpslItem> = Vec::new();
         let mut failed_position_ids: HashSet<i64> = HashSet::new();
 
+        // Warm sparse signal_timeframe ATR bars unlocked before entering the short locked Phase 4A block (`P0-1`, `R14-H2`)
+        {
+            let signal_tf = cfg.get_str("signal_timeframe", "4h");
+            let wall_clock_norm = cfg.get_bool("wall_clock_normalize_indicators", true);
+            let (atr_tf, query_limit, _, _) =
+                crate::engine::atr_params_for_timeframe(&signal_tf, wall_clock_norm);
+            if let Ok(held_pre) = self.db.get_assets_held() {
+                for h in &held_pre {
+                    let local_bars = self
+                        .db
+                        .get_ohlcv_bars(h.asset_id, &atr_tf, query_limit)
+                        .unwrap_or_default();
+                    if local_bars.len() < 16 {
+                        let ref_px = if h.mark_price > 0.0 {
+                            h.mark_price
+                        } else {
+                            h.entry_price
+                        };
+                        let _ = crate::engine::resolve_signal_matched_atr_unlocked(
+                            &self.db,
+                            &self.http,
+                            None,
+                            h.asset_id,
+                            &cfg,
+                            ref_px,
+                            risk.limits.protective_stop_default_pct,
+                        );
+                    }
+                }
+            }
+        }
+
         {
             let _guard = acquire_execution_lock();
             match self.db.get_assets_held() {
@@ -625,18 +657,13 @@ impl PriorityMonitor {
                     live_mark,
                     trigger_oracle_fallback_basis_bps,
                 );
-                let bars_1h: Vec<OhlcvBar> = self
-                    .db
-                    .get_ohlcv_bars(h.asset_id, "1h", 20)
-                    .unwrap_or_default();
-                let atr_opt = (!bars_1h.is_empty()).then(|| {
-                    compute_atr_from_bars(
-                        &bars_1h,
-                        14,
-                        surveillance_ref_px,
-                        risk.limits.protective_stop_default_pct,
-                    )
-                });
+                let atr_opt = crate::engine::resolve_signal_matched_atr_from_db(
+                    &self.db,
+                    h.asset_id,
+                    &cfg,
+                    surveillance_ref_px,
+                    risk.limits.protective_stop_default_pct,
+                );
                 let held_duration_ms = ts
                     .saturating_sub(h.opened_at_ms.unwrap_or(h.created_at_ms))
                     .max(0);
@@ -2065,12 +2092,12 @@ mod tests {
             })
             .unwrap();
 
-        let base_ts = now_ms() - 20 * 3_600_000;
+        let base_ts = now_ms() - 20 * 14_400_000;
         let bars: Vec<BarUpsertInput> = (0..20)
             .map(|i| BarUpsertInput {
                 asset_id: eth_id,
-                timeframe: "1h".to_string(),
-                timestamp_ms: base_ts + i * 3_600_000,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + i * 14_400_000,
                 open: 1718.0,
                 high: 1724.0,
                 low: 1712.0,

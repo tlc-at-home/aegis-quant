@@ -3812,3 +3812,183 @@ fn test_schema_v2_2_0_entry_r0_backfill_immutability_and_sum_realized_pnl() {
         );
     }
 }
+
+#[test]
+fn test_merge_working_scale_in_into_open_and_paper_funding_idempotency() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = seed_test_asset(&db, "SOL", 5, 100.0);
+    let eth_id = seed_test_asset(&db, "ETH", 1, 2000.0);
+
+    // 1. Place initial WORKING order and promote to OPEN (entry=100, qty=10, stop=94 => entry_r0=6.0)
+    let open_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "v2-sol-long-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 100.0,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 500.0,
+            portfolio_weight: 0.10,
+            s1_weight_contrib: 0.08,
+            s2_weight_contrib: 0.02,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 94.0,
+            take_profit_px: Some(115.0),
+            exchange_order_id: Some("hl-open-1".to_string()),
+            reason: "OPEN_LONG".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        open_pid,
+        100.0,
+        10.0,
+        1.5,
+        94.0,
+        Some(115.0),
+        None,
+        "filled",
+    )
+    .unwrap();
+    let initial_open = db.get_position_by_id(open_pid).unwrap().unwrap();
+    let initial_opened_at = initial_open.opened_at_ms.unwrap();
+    assert!((initial_open.entry_r0 - 6.0).abs() < 1e-6);
+
+    // Simulate stop ratchet so protective_stop_px moves up while entry_r0 stays frozen at 6.0
+    db.update_open_position_mark_and_stop(open_pid, 108.0, 101.0)
+        .unwrap();
+
+    // Wait >= 2ms so opened_at_ms preservation is distinguishable from merge timestamp
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // 2. Place a scale-in WORKING order on SOL (same side)
+    let inc_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "v2-sol-long-2".to_string(),
+            side: OrderSide::Long,
+            limit_price: 112.0,
+            requested_quantity: 5.0,
+            reserved_margin_usdc: 300.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 104.0,
+            take_profit_px: Some(124.0),
+            exchange_order_id: Some("hl-inc-2".to_string()),
+            reason: "INCREASE".to_string(),
+        })
+        .unwrap();
+    let active_rows = db.list_active_positions_for_asset(sol_id).unwrap();
+    assert_eq!(active_rows.len(), 2);
+    assert_eq!(
+        db.get_working_order_initial_reason(inc_pid)
+            .unwrap()
+            .as_deref(),
+        Some("INCREASE")
+    );
+    assert_eq!(db.count_entries_since(initial_opened_at - 1000).unwrap(), 2);
+
+    // Opposite-side merge must reject cleanly
+    let bad_short_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "v2-sol-short-bad".to_string(),
+            side: OrderSide::Short,
+            limit_price: 112.0,
+            requested_quantity: 2.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: -0.02,
+            s1_weight_contrib: -0.02,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 118.0,
+            take_profit_px: None,
+            exchange_order_id: None,
+            reason: "BAD_SIDE".to_string(),
+        })
+        .unwrap();
+    assert!(db
+        .merge_working_scale_in_into_open(bad_short_pid, open_pid, 112.0, 2.0, 0.2, None, "bad")
+        .is_err());
+    db.cancel_working_order(bad_short_pid, "TEST_CLEANUP")
+        .unwrap();
+    // Cancelled row must NOT be counted in count_entries_since
+    assert_eq!(db.count_entries_since(initial_opened_at - 1000).unwrap(), 2);
+
+    // 3. Merge filled scale-in into OPEN: 10 @ 100 + 5 @ 112 => VWAP 104.0, qty 15.0, committed 1560.0, fees 1.5 + 0.8 = 2.3
+    db.merge_working_scale_in_into_open(
+        inc_pid,
+        open_pid,
+        112.0,
+        5.0,
+        0.8,
+        Some("hl-inc-filled-2"),
+        "INCREASE_FILLED",
+    )
+    .unwrap();
+
+    let merged_open = db.get_position_by_id(open_pid).unwrap().unwrap();
+    assert_eq!(merged_open.status, "OPEN");
+    assert!((merged_open.entry_price - 104.0).abs() < 1e-6);
+    assert!((merged_open.filled_quantity - 15.0).abs() < 1e-6);
+    assert!((merged_open.committed_notional_usdc - 1560.0).abs() < 1e-4);
+    assert!((merged_open.fees_paid_usdc - 2.3).abs() < 1e-4);
+    assert!((merged_open.portfolio_weight - 0.15).abs() < 1e-4);
+    assert!((merged_open.s1_weight_contrib - 0.13).abs() < 1e-4);
+    assert!((merged_open.s2_weight_contrib - 0.02).abs() < 1e-4);
+    assert!(
+        (merged_open.entry_r0 - 6.0).abs() < 1e-6,
+        "Positive entry_r0 must be preserved across scale-in merge"
+    );
+    assert_eq!(
+        merged_open.opened_at_ms,
+        Some(initial_opened_at),
+        "opened_at_ms must be preserved across scale-in merge"
+    );
+
+    let merged_child = db.get_position_by_id(inc_pid).unwrap().unwrap();
+    assert_eq!(merged_child.status, "CLOSED");
+    assert_eq!(merged_child.fsm_state, "CLOSED");
+    assert_eq!(merged_child.exit_reason.as_deref(), Some("SCALE_IN_MERGED"));
+    assert!((merged_child.fees_paid_usdc - 0.0).abs() < 1e-9);
+    assert!((merged_child.realized_pnl_usdc - 0.0).abs() < 1e-9);
+    assert!((db.sum_realized_pnl_usdc().unwrap() - 0.0).abs() < 1e-9);
+
+    // 4. Paper-mode hourly funding accrual idempotency
+    let hour_ts = 1_700_006_400_000i64;
+    let ev1 = aegis_db::FundingEventUpsertInput {
+        asset_id: sol_id,
+        coin: "SOL".to_string(),
+        event_time_ms: hour_ts,
+        usdc: -1.56,
+        remaining_usdc: 0.0,
+        position_szi: 15.0,
+        funding_rate: 0.001,
+        dedup_key: format!("paper:{open_pid}:{hour_ts}"),
+    };
+    let ev2 = aegis_db::FundingEventUpsertInput {
+        asset_id: eth_id,
+        coin: "ETH".to_string(),
+        event_time_ms: hour_ts,
+        usdc: 0.25,
+        remaining_usdc: 0.0,
+        position_szi: -1.0,
+        funding_rate: 0.000125,
+        dedup_key: format!("paper:99999:{hour_ts}"),
+    };
+    let ins1 = db
+        .accrue_paper_funding_events(&[(open_pid, ev1.clone()), (99999, ev2.clone())])
+        .unwrap();
+    assert_eq!(ins1, 2);
+    let after_f1 = db.get_position_by_id(open_pid).unwrap().unwrap();
+    assert!((after_f1.funding_accrued_usdc - (-1.56)).abs() < 1e-4);
+
+    // Duplicate call for same (position_id, hour_ts) must insert 0 and NOT double-accrue
+    let ins2 = db
+        .accrue_paper_funding_events(&[(open_pid, ev1), (99999, ev2)])
+        .unwrap();
+    assert_eq!(ins2, 0);
+    let after_f2 = db.get_position_by_id(open_pid).unwrap().unwrap();
+    assert!((after_f2.funding_accrued_usdc - (-1.56)).abs() < 1e-4);
+}

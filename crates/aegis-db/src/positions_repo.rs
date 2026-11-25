@@ -5,9 +5,10 @@
 
 use crate::engine::DatabaseManager;
 use crate::orders_repo::truncate_audit_reason;
+use crate::portfolio_repo::FundingEventUpsertInput;
 use crate::row_decode::{
     decimal_param, row_get_bool, row_get_f64, row_get_i64, row_get_opt_f64, row_get_opt_i64,
-    row_get_opt_string, row_get_string, row_get_u32, DEC_20_8_MAX_ABS,
+    row_get_opt_string, row_get_string, row_get_u32, DEC_20_10_MAX_ABS, DEC_20_8_MAX_ABS,
 };
 use aegis_core::{
     compute_position_pnl_pct, now_ms, resolve_position_entry_notional_usdc, round_dp, AegisError,
@@ -1684,6 +1685,7 @@ impl DatabaseManager {
                    FROM positions p
                    INNER JOIN exchange_assets a ON a.id = p.asset_id
                    WHERE p.status = 'CLOSED'
+                     AND COALESCE(p.exit_reason, '') != 'SCALE_IN_MERGED'
                    ORDER BY COALESCE(p.closed_at_ms, p.updated_at_ms) DESC, p.id DESC
                    LIMIT :lim"#,
                 params! { "lim" => limit.max(1) as u64 },
@@ -2219,6 +2221,499 @@ impl DatabaseManager {
             .query_first("SELECT COALESCE(SUM(realized_pnl_usdc), 0) FROM positions")
             .map_err(|e| AegisError::Database(format!("sum_realized_pnl_usdc failed: {e}")))?;
         Ok(row.map(|r| row_get_f64(&r, 0, 0.0)).unwrap_or(0.0))
+    }
+
+    /// Returns all active (`WORKING` or `OPEN`) rows for `asset_id` ordered by `id ASC`.
+    pub fn list_active_positions_for_asset(&self, asset_id: i64) -> Result<Vec<PositionRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                r#"SELECT id, asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          current_price, exit_price, requested_quantity, filled_quantity,
+                          reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
+                          s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                          protective_stop_px, entry_r0, protective_stop_oid, take_profit_px, take_profit_oid,
+                          highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
+                          unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
+                          slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                          closed_at_ms, updated_at_ms, exit_reason
+                   FROM positions
+                   WHERE asset_id = :aid AND status IN ('WORKING', 'OPEN')
+                   ORDER BY id ASC"#,
+                params! { "aid" => asset_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("list_active_positions_for_asset failed: {e}"))
+            })?;
+        Ok(rows.iter().map(row_to_position_record).collect())
+    }
+
+    /// Counts non-cancelled v2 entry orders created at or after `since_ms` (for `max_entries_per_bar`).
+    pub fn count_entries_since(&self, since_ms: i64) -> Result<usize> {
+        let mut conn = self.get_conn()?;
+        let cnt: Option<i64> = conn
+            .exec_first(
+                r#"SELECT COUNT(*)
+                   FROM positions
+                   WHERE created_at_ms >= :since_ms
+                     AND client_order_id LIKE 'v2-%'
+                     AND status != 'CANCELLED'"#,
+                params! { "since_ms" => since_ms.max(0) },
+            )
+            .map_err(|e| AegisError::Database(format!("count_entries_since failed: {e}")))?;
+        Ok(cnt.unwrap_or(0).max(0) as usize)
+    }
+
+    /// Reads the initial `WORKING_ALO` `order_audit.reason` recorded when `position_id` was placed.
+    pub fn get_working_order_initial_reason(&self, position_id: i64) -> Result<Option<String>> {
+        let mut conn = self.get_conn()?;
+        let row: Option<mysql::Row> = conn
+            .exec_first(
+                r#"SELECT reason
+                   FROM order_audit
+                   WHERE position_id = :pid AND to_state = 'WORKING_ALO'
+                   ORDER BY id ASC
+                   LIMIT 1"#,
+                params! { "pid" => position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("get_working_order_initial_reason failed: {e}"))
+            })?;
+        Ok(row
+            .map(|r| row_get_string(&r, 0, ""))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
+    /// Atomically merges a filled scale-in `WORKING` row (`working_position_id`) into an existing
+    /// same-side `OPEN` row (`open_position_id`) under `SELECT ... FOR UPDATE`:
+    /// - Recomputes VWAP `entry_price` and cumulative `filled_quantity`, `committed_notional_usdc`,
+    ///   `fees_paid_usdc`, and sleeve/portfolio weights on the `OPEN` row.
+    /// - Preserves existing positive `entry_r0` and `opened_at_ms` on the `OPEN` row.
+    /// - Marks the add-on `WORKING` row `CLOSED` with `exit_reason = 'SCALE_IN_MERGED'`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_working_scale_in_into_open(
+        &self,
+        working_position_id: i64,
+        open_position_id: i64,
+        fill_price: f64,
+        filled_quantity: f64,
+        fees_paid_usdc: f64,
+        exchange_order_id: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        if working_position_id == open_position_id {
+            return Err(AegisError::Validation(
+                "merge_working_scale_in_into_open requires distinct working and open position IDs"
+                    .to_string(),
+            ));
+        }
+        if !fill_price.is_finite() || fill_price <= 0.0 {
+            return Err(AegisError::Validation(format!(
+                "merge_working_scale_in_into_open requires positive fill_price, got {fill_price}"
+            )));
+        }
+        if !filled_quantity.is_finite() || filled_quantity <= 0.0 {
+            return Err(AegisError::Validation(format!(
+                "merge_working_scale_in_into_open requires positive filled_quantity, got {filled_quantity}"
+            )));
+        }
+        if !fees_paid_usdc.is_finite() || fees_paid_usdc < 0.0 {
+            return Err(AegisError::Validation(format!(
+                "merge_working_scale_in_into_open requires non-negative finite fees_paid_usdc, got {fees_paid_usdc}"
+            )));
+        }
+
+        let ts = now_ms();
+        let fees_rounded = round_dp(fees_paid_usdc, 4);
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("merge_working_scale_in_into_open tx failed: {e}"))
+            })?;
+
+        let rows: Vec<mysql::Row> = tx
+            .exec(
+                r#"SELECT id, asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          requested_quantity, filled_quantity, committed_notional_usdc,
+                          portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                          protective_stop_px, entry_r0, highest_price_seen, lowest_price_seen,
+                          fees_paid_usdc, opened_at_ms
+                   FROM positions
+                   WHERE id IN (:wid, :oid)
+                   ORDER BY id ASC
+                   FOR UPDATE"#,
+                params! { "wid" => working_position_id, "oid" => open_position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("merge_working_scale_in_into_open lock failed: {e}"))
+            })?;
+
+        let mut working_row: Option<&mysql::Row> = None;
+        let mut open_row: Option<&mysql::Row> = None;
+        for r in &rows {
+            let id = row_get_i64(r, 0, 0);
+            if id == working_position_id {
+                working_row = Some(r);
+            } else if id == open_position_id {
+                open_row = Some(r);
+            }
+        }
+        let w = working_row.ok_or_else(|| {
+            AegisError::Database(format!("Working position {working_position_id} not found"))
+        })?;
+        let o = open_row.ok_or_else(|| {
+            AegisError::Database(format!("Open position {open_position_id} not found"))
+        })?;
+
+        let w_asset_id = row_get_i64(w, 1, 0);
+        let w_coid = row_get_string(w, 2, "");
+        let w_side_str = row_get_string(w, 3, "LONG");
+        let w_status = row_get_string(w, 4, "");
+        let w_fsm = row_get_string(w, 5, "WORKING_ALO");
+        let w_req_qty = row_get_f64(w, 7, 0.0);
+        let w_pw = row_get_f64(w, 10, 0.0);
+        let w_s1 = row_get_f64(w, 11, 0.0);
+        let w_s2 = row_get_f64(w, 12, 0.0);
+        let w_s3 = row_get_f64(w, 13, 0.0);
+
+        let o_asset_id = row_get_i64(o, 1, 0);
+        let o_coid = row_get_string(o, 2, "");
+        let o_side_str = row_get_string(o, 3, "LONG");
+        let o_status = row_get_string(o, 4, "");
+        let o_fsm = row_get_string(o, 5, "FILLED_OPEN");
+        let o_entry_px = row_get_f64(o, 6, 0.0);
+        let o_req_qty = row_get_f64(o, 7, 0.0);
+        let o_filled_qty = row_get_f64(o, 8, 0.0);
+        let o_pw = row_get_f64(o, 10, 0.0);
+        let o_s1 = row_get_f64(o, 11, 0.0);
+        let o_s2 = row_get_f64(o, 12, 0.0);
+        let o_s3 = row_get_f64(o, 13, 0.0);
+        let o_stop_px = row_get_f64(o, 14, 0.0);
+        let o_entry_r0 = row_get_f64(o, 15, 0.0);
+        let o_fees = row_get_f64(o, 18, 0.0);
+        let o_opened_at_ms = row_get_opt_i64(o, 19);
+
+        if !w_status.eq_ignore_ascii_case("WORKING") {
+            return Err(AegisError::Database(format!(
+                "Scale-in working position {working_position_id} has status '{w_status}' (expected 'WORKING')"
+            )));
+        }
+        if !o_status.eq_ignore_ascii_case("OPEN") {
+            return Err(AegisError::Database(format!(
+                "Scale-in target open position {open_position_id} has status '{o_status}' (expected 'OPEN')"
+            )));
+        }
+        if w_asset_id != o_asset_id {
+            return Err(AegisError::Validation(format!(
+                "Scale-in asset mismatch: working={w_asset_id}, open={o_asset_id}"
+            )));
+        }
+        if OrderSide::parse(&w_side_str)? != OrderSide::parse(&o_side_str)? {
+            return Err(AegisError::Validation(format!(
+                "Scale-in side mismatch: working={w_side_str}, open={o_side_str}"
+            )));
+        }
+
+        let old_qty = o_filled_qty.max(0.0);
+        let add_qty = round_dp(filled_quantity, 8);
+        let new_qty = round_dp(old_qty + add_qty, 8);
+        let old_notional = o_entry_px * old_qty;
+        let add_notional = fill_price * add_qty;
+        let total_notional = old_notional + add_notional;
+        let vwap_entry = round_dp(total_notional / new_qty.max(1e-12), 8);
+        let new_committed = round_dp(total_notional, 4);
+        let new_req_qty = round_dp(o_req_qty.max(old_qty) + add_qty, 8);
+        let new_fees = round_dp(o_fees + fees_rounded, 4);
+        let new_pw = round_dp(o_pw + w_pw, 4);
+        let new_s1 = round_dp(o_s1 + w_s1, 4);
+        let new_s2 = round_dp(o_s2 + w_s2, 4);
+        let new_s3 = round_dp(o_s3 + w_s3, 4);
+        let preserved_r0 = if o_entry_r0.is_finite() && o_entry_r0 > 0.0 {
+            o_entry_r0
+        } else {
+            derive_entry_r0_from_stop(o_entry_px, o_stop_px)
+        };
+        let preserved_opened_at = o_opened_at_ms.filter(|&t| t > 0).unwrap_or(ts);
+
+        let vwap_dec = decimal_param(vwap_entry, 8, DEC_20_8_MAX_ABS)?;
+        let fill_px_dec = decimal_param(fill_price, 8, DEC_20_8_MAX_ABS)?;
+        let new_req_qty_dec = decimal_param(new_req_qty, 8, DEC_20_8_MAX_ABS)?;
+        let new_qty_dec = decimal_param(new_qty, 8, DEC_20_8_MAX_ABS)?;
+        let add_qty_dec = decimal_param(add_qty, 8, DEC_20_8_MAX_ABS)?;
+        let w_req_qty_dec = decimal_param(w_req_qty, 8, DEC_20_8_MAX_ABS)?;
+        let new_comm_dec = decimal_param(new_committed, 8, DEC_20_8_MAX_ABS)?;
+        let add_comm_dec = decimal_param(round_dp(add_notional, 4), 8, DEC_20_8_MAX_ABS)?;
+        let new_fees_dec = decimal_param(new_fees, 8, DEC_20_8_MAX_ABS)?;
+        let add_fees_dec = decimal_param(fees_rounded, 8, DEC_20_8_MAX_ABS)?;
+        let new_pw_dec = decimal_param(new_pw, 8, DEC_20_8_MAX_ABS)?;
+        let new_s1_dec = decimal_param(new_s1, 8, DEC_20_8_MAX_ABS)?;
+        let new_s2_dec = decimal_param(new_s2, 8, DEC_20_8_MAX_ABS)?;
+        let new_s3_dec = decimal_param(new_s3, 8, DEC_20_8_MAX_ABS)?;
+        let r0_dec = decimal_param(preserved_r0, 8, DEC_20_8_MAX_ABS)?;
+
+        tx.exec_drop(
+            r#"UPDATE positions
+               SET entry_price = :vwap_px,
+                   current_price = :fill_px,
+                   requested_quantity = :new_req_qty,
+                   filled_quantity = :new_qty,
+                   committed_notional_usdc = :new_comm,
+                   portfolio_weight = :new_pw,
+                   s1_weight_contrib = :new_s1,
+                   s2_weight_contrib = :new_s2,
+                   s3_weight_contrib = :new_s3,
+                   entry_r0 = CASE
+                       WHEN entry_r0 > 0 THEN entry_r0
+                       ELSE CAST(:entry_r0 AS DECIMAL(20,8))
+                   END,
+                   highest_price_seen = GREATEST(highest_price_seen, CAST(:fill_px AS DECIMAL(20,8))),
+                   lowest_price_seen = CASE
+                       WHEN lowest_price_seen > 0 THEN LEAST(lowest_price_seen, CAST(:fill_px AS DECIMAL(20,8)))
+                       ELSE CAST(:fill_px AS DECIMAL(20,8))
+                   END,
+                   fees_paid_usdc = :new_fees,
+                   opened_at_ms = COALESCE(opened_at_ms, :opened_at),
+                   updated_at_ms = :ts
+               WHERE id = :oid AND status = 'OPEN'"#,
+            params! {
+                "vwap_px" => &vwap_dec,
+                "fill_px" => &fill_px_dec,
+                "new_req_qty" => &new_req_qty_dec,
+                "new_qty" => &new_qty_dec,
+                "new_comm" => &new_comm_dec,
+                "new_pw" => &new_pw_dec,
+                "new_s1" => &new_s1_dec,
+                "new_s2" => &new_s2_dec,
+                "new_s3" => &new_s3_dec,
+                "entry_r0" => &r0_dec,
+                "new_fees" => &new_fees_dec,
+                "opened_at" => preserved_opened_at,
+                "ts" => ts,
+                "oid" => open_position_id,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("merge_working_scale_in_into_open update open failed: {e}"))
+        })?;
+        if tx.affected_rows() == 0 {
+            return Err(AegisError::Database(format!(
+                "merge_working_scale_in_into_open affected 0 rows on open position {open_position_id}"
+            )));
+        }
+
+        // Fees and notional are moved onto the parent OPEN row; keep 0.00 fees/realized_pnl on the
+        // SCALE_IN_MERGED child row so compute_pnl_summary does not double-count closed fees.
+        tx.exec_drop(
+            r#"UPDATE positions
+               SET status = 'CLOSED',
+                   fsm_state = 'CLOSED',
+                   current_price = :fill_px,
+                   exit_price = :fill_px,
+                   filled_quantity = :add_qty,
+                   reserved_margin_usdc = 0.00000000,
+                   committed_notional_usdc = 0.00000000,
+                   realized_pnl_usdc = 0.00000000,
+                   unrealized_pnl_usdc = 0.00000000,
+                   fees_paid_usdc = 0.00000000,
+                   exchange_order_id = COALESCE(:eoid, exchange_order_id),
+                   opened_at_ms = COALESCE(opened_at_ms, :ts),
+                   closed_at_ms = :ts,
+                   updated_at_ms = :ts,
+                   exit_reason = 'SCALE_IN_MERGED'
+               WHERE id = :wid AND status = 'WORKING'"#,
+            params! {
+                "fill_px" => &fill_px_dec,
+                "add_qty" => &add_qty_dec,
+                "eoid" => exchange_order_id,
+                "ts" => ts,
+                "wid" => working_position_id,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "merge_working_scale_in_into_open close working failed: {e}"
+            ))
+        })?;
+        if tx.affected_rows() == 0 {
+            return Err(AegisError::Database(format!(
+                "merge_working_scale_in_into_open affected 0 rows on working position {working_position_id}"
+            )));
+        }
+
+        let safe_reason = truncate_audit_reason(&format!(
+            "SCALE_IN_MERGED into #{open_position_id}: {reason}"
+        ));
+        tx.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :wid, :aid, :w_coid, :side, :w_fsm, 'SCALE_IN_MERGED',
+                   :w_req_qty, :add_qty, :fill_px, :fill_px,
+                   0.00000000, :add_comm, :add_fees, :reason, :ts, :ts
+               )"#,
+            params! {
+                "wid" => working_position_id,
+                "aid" => w_asset_id,
+                "w_coid" => w_coid,
+                "side" => w_side_str,
+                "w_fsm" => w_fsm,
+                "w_req_qty" => &w_req_qty_dec,
+                "add_qty" => &add_qty_dec,
+                "fill_px" => &fill_px_dec,
+                "add_comm" => &add_comm_dec,
+                "add_fees" => &add_fees_dec,
+                "reason" => &safe_reason,
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "merge_working_scale_in_into_open working audit failed: {e}"
+            ))
+        })?;
+
+        let open_audit_reason = truncate_audit_reason(&format!(
+            "SCALE_IN_MERGED +{add_qty} from #{working_position_id}"
+        ));
+        tx.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :oid, :aid, :o_coid, :side, :o_fsm, 'FILLED_OPEN',
+                   :new_req_qty, :new_qty, :vwap_px, :fill_px,
+                   0.00000000, :new_comm, :add_fees, :reason, :ts, :ts
+               )"#,
+            params! {
+                "oid" => open_position_id,
+                "aid" => o_asset_id,
+                "o_coid" => o_coid,
+                "side" => o_side_str,
+                "o_fsm" => o_fsm,
+                "new_req_qty" => &new_req_qty_dec,
+                "new_qty" => &new_qty_dec,
+                "vwap_px" => &vwap_dec,
+                "fill_px" => &fill_px_dec,
+                "new_comm" => &new_comm_dec,
+                "add_fees" => &add_fees_dec,
+                "reason" => &open_audit_reason,
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "merge_working_scale_in_into_open open audit failed: {e}"
+            ))
+        })?;
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "merge_working_scale_in_into_open commit failed: {e}"
+            ))
+        })?;
+        self.invalidate_pnl_cache();
+        Ok(())
+    }
+
+    /// Atomically and idempotently accrues hourly `PAPER`-mode funding events into `funding_events`
+    /// (keyed by `dedup_key`) and increments `positions.funding_accrued_usdc` ONLY for newly
+    /// inserted events whose `(position_id, hour_ts_ms)` key had not yet been recorded.
+    pub fn accrue_paper_funding_events(
+        &self,
+        events: &[(i64, FundingEventUpsertInput)],
+    ) -> Result<usize> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("accrue_paper_funding_events tx failed: {e}"))
+            })?;
+
+        let mut inserted = 0usize;
+        for &(position_id, ref ev) in events {
+            let safe_usdc = if ev.usdc.is_finite() { ev.usdc } else { 0.0 };
+            if safe_usdc.abs() <= 1e-12 {
+                continue;
+            }
+            let coin: String = ev.coin.trim().chars().take(24).collect();
+            let dkey: String = ev.dedup_key.chars().take(128).collect();
+            let usdc_dec = decimal_param(round_dp(safe_usdc, 4), 8, DEC_20_8_MAX_ABS)?;
+            let rem_dec = decimal_param(0.0, 8, DEC_20_8_MAX_ABS)?;
+            let szi_dec = decimal_param(
+                if ev.position_szi.is_finite() {
+                    ev.position_szi
+                } else {
+                    0.0
+                },
+                8,
+                DEC_20_8_MAX_ABS,
+            )?;
+            let fr_dec = decimal_param(
+                if ev.funding_rate.is_finite() {
+                    ev.funding_rate
+                } else {
+                    0.0
+                },
+                10,
+                DEC_20_10_MAX_ABS,
+            )?;
+
+            tx.exec_drop(
+                r#"INSERT IGNORE INTO funding_events
+                   (asset_id, coin, event_time_ms, usdc, remaining_usdc, position_szi, funding_rate, dedup_key, created_at_ms, updated_at_ms)
+                   VALUES (:aid, :coin, :ev_ts, :usdc, :rem_usdc, :szi, :fr, :dkey, :ts, :ts)"#,
+                params! {
+                    "aid" => ev.asset_id,
+                    "coin" => &coin,
+                    "ev_ts" => ev.event_time_ms,
+                    "usdc" => &usdc_dec,
+                    "rem_usdc" => &rem_dec,
+                    "szi" => &szi_dec,
+                    "fr" => &fr_dec,
+                    "dkey" => &dkey,
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("accrue_paper_funding_events insert failed: {e}"))
+            })?;
+
+            if tx.affected_rows() > 0 {
+                tx.exec_drop(
+                    r#"UPDATE positions
+                       SET funding_accrued_usdc = funding_accrued_usdc + CAST(:delta AS DECIMAL(20,8)),
+                           updated_at_ms = :ts
+                       WHERE id = :pid AND status = 'OPEN'"#,
+                    params! {
+                        "delta" => &usdc_dec,
+                        "ts" => ts,
+                        "pid" => position_id,
+                    },
+                )
+                .map_err(|e| {
+                    AegisError::Database(format!(
+                        "accrue_paper_funding_events position update failed: {e}"
+                    ))
+                })?;
+                inserted += 1;
+            }
+        }
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!("accrue_paper_funding_events commit failed: {e}"))
+        })?;
+        if inserted > 0 {
+            self.invalidate_pnl_cache();
+        }
+        Ok(inserted)
     }
 }
 

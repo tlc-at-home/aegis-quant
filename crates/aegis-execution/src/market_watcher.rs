@@ -11,6 +11,7 @@ use crate::ws_client::{
     build_ws_subscription_set_from_assets, WsActiveAssetCtx, WsStateCache, WsSubscriptionSet,
     WS_ACTIVE_CTX_FRESH_MS, WS_CANDLE_FRESH_MS, WS_MIDS_FRESH_MS,
 };
+use aegis_core::indicators::timeframe_to_ms;
 use aegis_core::{
     normalize_hyperliquid_symbol, now_ms, parse_hl_f64, parse_hl_f64_opt, round_dp, ConfigMap,
     ExchangeAsset, Result,
@@ -824,19 +825,39 @@ impl MarketWatcher {
         live_connected: bool,
         cfg: &ConfigMap,
     ) -> Vec<BarUpsertInput> {
-        let tf_ms = match timeframe {
-            "1h" => 3_600_000i64,
-            "4h" => 14_400_000i64,
-            _ => 3_600_000i64,
-        };
+        Self::fetch_or_synthesize_bars_for_db(
+            &self.db,
+            &self.http,
+            asset,
+            timeframe,
+            lookback_bars,
+            live_connected,
+            cfg,
+        )
+    }
+
+    pub fn fetch_or_synthesize_bars_for_db(
+        db: &DatabaseManager,
+        http: &HyperliquidHttpClient,
+        asset: &ExchangeAsset,
+        timeframe: &str,
+        lookback_bars: usize,
+        live_connected: bool,
+        cfg: &ConfigMap,
+    ) -> Vec<BarUpsertInput> {
+        let tf_ms = timeframe_to_ms(timeframe).unwrap_or(3_600_000);
         let now = now_ms();
         let full_start_ms = now - (lookback_bars as i64 + 6) * tf_ms;
+        let incremental_min_bars = if lookback_bars >= 120 {
+            lookback_bars
+        } else {
+            CANDLE_INCREMENTAL_DB_MIN_BARS
+        };
         let start_ms = if live_connected {
-            let existing_bars = self
-                .db
-                .get_ohlcv_bars(asset.id, timeframe, CANDLE_INCREMENTAL_DB_MIN_BARS)
+            let existing_bars = db
+                .get_ohlcv_bars(asset.id, timeframe, incremental_min_bars)
                 .unwrap_or_default();
-            if existing_bars.len() >= CANDLE_INCREMENTAL_DB_MIN_BARS {
+            if existing_bars.len() >= incremental_min_bars {
                 existing_bars
                     .last()
                     .map(|b| (b.timestamp_ms - 2 * tf_ms).max(0))
@@ -849,14 +870,13 @@ impl MarketWatcher {
         };
 
         let is_live_mode = cfg.execution_mode().is_live_or_testnet()
-            && (!self.db.is_ephemeral_test_db()
+            && (!db.is_ephemeral_test_db()
                 || crate::http_client::endpoints_are_loopback(cfg)
                 || crate::ws_client::has_explicit_loopback_ws_url(cfg));
 
         if live_connected {
             if let Ok(raw_list) =
-                self.http
-                    .fetch_candle_snapshot(&asset.coin, timeframe, start_ms, now, cfg)
+                http.fetch_candle_snapshot(&asset.coin, timeframe, start_ms, now, cfg)
             {
                 let mut live_bars = Vec::with_capacity(raw_list.len());
                 for item in &raw_list {
@@ -925,10 +945,7 @@ impl MarketWatcher {
         day_volume_usdc: f64,
     ) -> Vec<BarUpsertInput> {
         let count = num_bars.max(24);
-        let tf_ms = match timeframe {
-            "4h" => 14_400_000i64,
-            _ => 3_600_000i64,
-        };
+        let tf_ms = timeframe_to_ms(timeframe).unwrap_or(3_600_000);
         let now_aligned = (now_ms() / tf_ms) * tf_ms;
         let start_ms = now_aligned - ((count.saturating_sub(1)) as i64) * tf_ms;
 
