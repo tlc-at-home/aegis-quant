@@ -11,7 +11,7 @@ use crate::features::{
 use crate::liquidity::{
     compute_unfloored_atr, default_passes_quality, evaluate_asset_liquidity_quality,
 };
-use aegis_core::indicators::{causal_ema as core_causal_ema, top_k_normalized};
+use aegis_core::indicators::{causal_ema as core_causal_ema, infer_bar_hours, top_k_normalized};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,6 +87,16 @@ pub(crate) fn compute_asset_trend_breakout_with_features(
             && asset.mark_price > 0.0
             && last_bar_close.is_none_or(|c| (asset.mark_price - c).abs() > tick_tol);
 
+        let (mult, atr_4h_scale) = if let Some(feat) = feat_opt {
+            (feat.norm_mult, feat.atr_4h_scale)
+        } else {
+            let bar_hours = infer_bar_hours(bars);
+            (
+                (4.0 / bar_hours).clamp(0.25, 16.0),
+                (4.0 / bar_hours).sqrt().clamp(0.5, 4.0),
+            )
+        };
+
         let (mut f, mut m, mut s) = if let Some(feat) = feat_opt {
             (feat.ema8_bars, feat.ema21_bars, feat.ema55_bars)
         } else {
@@ -96,17 +106,17 @@ pub(crate) fn compute_asset_trend_breakout_with_features(
             let mut e55 = e8;
             for b in &bars[1..] {
                 let c = b.close.max(1e-12);
-                e8 = ema_step(e8, c, 8.0);
-                e21 = ema_step(e21, c, 21.0);
-                e55 = ema_step(e55, c, 55.0);
+                e8 = ema_step(e8, c, 8.0 * mult);
+                e21 = ema_step(e21, c, 21.0 * mult);
+                e55 = ema_step(e55, c, 55.0 * mult);
             }
             (e8, e21, e55)
         };
 
         let live_px = if append_mark {
-            f = ema_step(f, asset.mark_price, 8.0);
-            m = ema_step(m, asset.mark_price, 21.0);
-            s = ema_step(s, asset.mark_price, 55.0);
+            f = ema_step(f, asset.mark_price, 8.0 * mult);
+            m = ema_step(m, asset.mark_price, 21.0 * mult);
+            s = ema_step(s, asset.mark_price, 55.0 * mult);
             asset.mark_price
         } else {
             last_bar_close.map(|c| c.max(1e-12)).unwrap_or(1e-12)
@@ -129,7 +139,8 @@ pub(crate) fn compute_asset_trend_breakout_with_features(
                 feat.last_bar_vol,
             )
         } else {
-            let lookback = bars.len().min(20);
+            let vol_cap = (20.0 * mult).round().max(1.0) as usize;
+            let lookback = bars.len().min(vol_cap);
             let recent_bars = &bars[bars.len() - lookback..];
             let mut sum = 0.0;
             let mut count = 0usize;
@@ -160,7 +171,8 @@ pub(crate) fn compute_asset_trend_breakout_with_features(
         let (channel_high, channel_low) = if let Some(feat) = feat_opt {
             (feat.channel_high_18, feat.channel_low_18)
         } else {
-            let chan_len = bars.len().saturating_sub(1).clamp(4, 18);
+            let max_chan = (18.0 * mult).round().max(4.0) as usize;
+            let chan_len = bars.len().saturating_sub(1).clamp(4, max_chan);
             let prior_slice = &bars[bars.len() - 1 - chan_len..bars.len() - 1];
             let ch = prior_slice.iter().map(|b| b.high).fold(f64::MIN, f64::max);
             let cl = prior_slice.iter().map(|b| b.low).fold(f64::MAX, f64::min);
@@ -170,8 +182,9 @@ pub(crate) fn compute_asset_trend_breakout_with_features(
         let raw_atr = feat_opt
             .map(|feat| feat.quality.raw_atr)
             .unwrap_or_else(|| compute_unfloored_atr(bars, 14));
-        let high_margin = (0.20 * raw_atr).max(channel_high * 0.0015);
-        let low_margin = (0.20 * raw_atr).max(channel_low * 0.0015);
+        let raw_atr_4h = raw_atr * atr_4h_scale;
+        let high_margin = (0.20 * raw_atr_4h).max(channel_high * 0.0015);
+        let low_margin = (0.20 * raw_atr_4h).max(channel_low * 0.0015);
         let broke_high = channel_high > 0.0 && live_px > channel_high + high_margin;
         let broke_low = channel_low > 0.0 && live_px < channel_low - low_margin;
 
@@ -259,6 +272,7 @@ pub(crate) fn evaluate_sleeve_s2_with_features<B: AsRef<[OhlcvBar]>>(
     regime_gate: &RegimeGateState,
     market_breadth_bull: f64,
     s2_budget: f64,
+    top_k: usize,
 ) -> HashMap<i64, TrendBreakoutMetrics> {
     evaluate_sleeve_s2_inner(
         assets,
@@ -267,6 +281,7 @@ pub(crate) fn evaluate_sleeve_s2_with_features<B: AsRef<[OhlcvBar]>>(
         regime_gate,
         market_breadth_bull,
         s2_budget,
+        top_k,
     )
 }
 
@@ -284,6 +299,7 @@ pub fn evaluate_sleeve_s2<B: AsRef<[OhlcvBar]>>(
         &RegimeGateState::default(),
         market_breadth_bull,
         s2_budget,
+        8,
     )
 }
 
@@ -294,6 +310,7 @@ fn evaluate_sleeve_s2_inner<B: AsRef<[OhlcvBar]>>(
     regime_gate: &RegimeGateState,
     market_breadth_bull: f64,
     s2_budget: f64,
+    top_k: usize,
 ) -> HashMap<i64, TrendBreakoutMetrics> {
     struct RawS2Item {
         asset_id: i64,
@@ -370,7 +387,7 @@ fn evaluate_sleeve_s2_inner<B: AsRef<[OhlcvBar]>>(
         .iter()
         .map(|item| (item.asset_id, item.confirmed_score, item.day_volume_usdc))
         .collect();
-    let weights = top_k_normalized(&scored, 8, budget);
+    let weights = top_k_normalized(&scored, top_k.max(1), budget);
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for item in raw_items {
@@ -630,8 +647,8 @@ mod tests {
             trend_bars.push(OhlcvBar {
                 id: (i + 1) as i64,
                 asset_id: 11,
-                timeframe: "1h".to_string(),
-                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                timeframe: "4h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 14_400_000,
                 open,
                 high: p * 1.008,
                 low: open * 0.992,
@@ -670,5 +687,49 @@ mod tests {
         assert_eq!(a_brk, 1);
         assert!(s_brk >= 1.85);
         assert_eq!(trig_brk.as_deref(), Some(TRIGGER_LIVE_BREAKOUT_SURGE));
+    }
+
+    #[test]
+    fn test_s2_1h_wall_clock_normalization_and_breakout_margin() {
+        // 80 1h bars rising smoothly so EMA(32) > EMA(84) > EMA(220) and 4h-ref ATR = 2.0 * raw_1h_atr
+        let mut bars_1h = Vec::with_capacity(80);
+        let mut p = 100.0;
+        for i in 0..80 {
+            let open = p;
+            p *= 1.002;
+            bars_1h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 21,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open,
+                high: p * 1.005,
+                low: open * 0.995,
+                close: p,
+                volume: 10_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let chan_high = bars_1h[7..79]
+            .iter()
+            .map(|b| b.high)
+            .fold(f64::MIN, f64::max);
+        let raw_1h_atr = compute_unfloored_atr(&bars_1h, 14);
+        let atr_4h_ref = raw_1h_atr * 2.0;
+
+        // 0.30 * raw_1h_atr is BELOW 0.20 * atr_4h_ref (= 0.40 * raw_1h_atr) -> no breakout
+        let sub_break = test_asset(21, chan_high + 0.30 * raw_1h_atr);
+        let (a_sub, _, _, t_sub) = compute_asset_trend_breakout(&sub_break, &bars_1h);
+        assert_eq!(a_sub, 1);
+        assert_eq!(t_sub, None);
+
+        // 0.25 * atr_4h_ref clears 0.20 * atr_4h_ref -> fires LIVE_BREAKOUT_SURGE
+        let full_break = test_asset(21, chan_high + 0.25 * atr_4h_ref);
+        let (a_full, s_full, _, t_full) = compute_asset_trend_breakout(&full_break, &bars_1h);
+        assert_eq!(a_full, 1);
+        assert!(s_full >= 1.85);
+        assert_eq!(t_full.as_deref(), Some(TRIGGER_LIVE_BREAKOUT_SURGE));
     }
 }

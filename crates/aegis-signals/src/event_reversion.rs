@@ -4,13 +4,16 @@
 //! and detects `"CAPITULATION_FLUSH"` and `"FUNDING_SQUEEZE"` triggers.
 
 use crate::breadth::RegimeGateState;
-use crate::features::{ema_step, CycleFeatureCache, PrecomputedAssetFeatures};
+use crate::features::{
+    compute_finite_atr_core, ema_step, CycleFeatureCache, PrecomputedAssetFeatures,
+};
 use crate::liquidity::{
     default_passes_quality, evaluate_asset_liquidity_quality, AssetLiquidityQuality,
+    ATR_LOOKBACK_PERIOD,
 };
 use crate::trend_breakout::compute_rsi_and_range_position;
 use aegis_core::indicators::{
-    compute_atr as core_compute_atr, cross_sectional_zscore, top_k_normalized,
+    compute_atr as core_compute_atr, cross_sectional_zscore, infer_bar_hours, top_k_normalized,
 };
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
@@ -67,12 +70,21 @@ fn compute_flush_atr_multiple_with_features(
         let (anchor, atr) = if let Some(feat) = feat_opt {
             (feat.ema12_bars, feat.floored_atr)
         } else {
+            let h = infer_bar_hours(bars);
+            let mult = (4.0 / h).clamp(0.25, 16.0);
+            let atr_4h_scale = (4.0 / h).sqrt().clamp(0.5, 4.0);
             let init = bars[0].close.max(1e-12);
             let mut e12 = if init.is_finite() { init } else { 0.0 };
             for b in &bars[1..] {
-                e12 = ema_step(e12, b.close.max(1e-12), 12.0);
+                e12 = ema_step(e12, b.close.max(1e-12), 12.0 * mult);
             }
-            (e12, compute_atr(bars, 14, live_px))
+            let safe_ref = live_px.max(1e-8);
+            let atr_floor = (safe_ref * 0.012).max(1e-8);
+            let atr_4h = compute_finite_atr_core(bars, ATR_LOOKBACK_PERIOD)
+                .map(|raw| raw * atr_4h_scale)
+                .unwrap_or(atr_floor)
+                .max(atr_floor);
+            (e12, atr_4h)
         };
         let mult = ((live_px - anchor) / atr.max(1e-8)).clamp(-8.0, 8.0);
         return round_dp(mult, 4);
@@ -94,6 +106,7 @@ pub(crate) fn evaluate_sleeve_s3_with_features<B: AsRef<[OhlcvBar]>>(
     features: &CycleFeatureCache,
     regime_gate: &RegimeGateState,
     s3_budget: f64,
+    s3_strict_admission_enabled: bool,
 ) -> HashMap<i64, EventReversionMetrics> {
     evaluate_sleeve_s3_inner(
         assets,
@@ -101,10 +114,12 @@ pub(crate) fn evaluate_sleeve_s3_with_features<B: AsRef<[OhlcvBar]>>(
         Some(features),
         regime_gate,
         s3_budget,
+        s3_strict_admission_enabled,
     )
 }
 
-/// Evaluates Sleeve 3 (Live Capitulation Flush & Funding Dislocation Harvester) across the universe.
+/// Evaluates Sleeve 3 (Live Capitulation Flush & Funding Dislocation Harvester) across the universe
+/// using legacy standalone parameters (`s3_strict_admission_enabled = false`, `top_k = 8`).
 pub fn evaluate_sleeve_s3<B: AsRef<[OhlcvBar]>>(
     assets: &[ExchangeAsset],
     bars_by_asset: &HashMap<i64, B>,
@@ -116,6 +131,24 @@ pub fn evaluate_sleeve_s3<B: AsRef<[OhlcvBar]>>(
         None,
         &RegimeGateState::default(),
         s3_budget,
+        false,
+    )
+}
+
+/// Evaluates Sleeve 3 with explicit `s3_strict_admission_enabled` control (`top_k = 4` and strict bottom admission when `true`).
+pub fn evaluate_sleeve_s3_with_strict<B: AsRef<[OhlcvBar]>>(
+    assets: &[ExchangeAsset],
+    bars_by_asset: &HashMap<i64, B>,
+    s3_budget: f64,
+    s3_strict_admission_enabled: bool,
+) -> HashMap<i64, EventReversionMetrics> {
+    evaluate_sleeve_s3_inner(
+        assets,
+        bars_by_asset,
+        None,
+        &RegimeGateState::default(),
+        s3_budget,
+        s3_strict_admission_enabled,
     )
 }
 
@@ -125,6 +158,7 @@ fn evaluate_sleeve_s3_inner<B: AsRef<[OhlcvBar]>>(
     features_opt: Option<&CycleFeatureCache>,
     regime_gate: &RegimeGateState,
     s3_budget: f64,
+    s3_strict_admission_enabled: bool,
 ) -> HashMap<i64, EventReversionMetrics> {
     struct RawS3Item {
         asset_id: i64,
@@ -203,11 +237,19 @@ fn evaluate_sleeve_s3_inner<B: AsRef<[OhlcvBar]>>(
         let is_capitulation = flush_atr <= -2.0 || (flush_atr >= 2.0 && range_pos > 0.55);
         let is_funding_squeeze =
             f_zscore <= -1.8 || (f_zscore >= 1.8 && flush_atr > 0.25 && range_pos > 0.35);
-        let is_bottom_reversion = bars_len >= 8
-            && range_pos <= 0.20
-            && rsi_14 < 54.0
-            && flush_atr <= 0.25
-            && bouncing_from_low;
+        let is_bottom_reversion = if s3_strict_admission_enabled {
+            bars_len >= 8
+                && range_pos <= 0.20
+                && rsi_14 < 38.0
+                && flush_atr <= -1.0
+                && bouncing_from_low
+        } else {
+            bars_len >= 8
+                && range_pos <= 0.20
+                && rsi_14 < 54.0
+                && flush_atr <= 0.25
+                && bouncing_from_low
+        };
 
         let trigger = if !eligible {
             None
@@ -271,7 +313,8 @@ fn evaluate_sleeve_s3_inner<B: AsRef<[OhlcvBar]>>(
         .iter()
         .map(|item| (item.asset_id, item.raw_score, item.day_volume_usdc))
         .collect();
-    let weights = top_k_normalized(&scored, 8, budget);
+    let s3_top_k = if s3_strict_admission_enabled { 4 } else { 8 };
+    let weights = top_k_normalized(&scored, s3_top_k, budget);
     let mut out = HashMap::with_capacity(raw_items.len());
 
     for item in raw_items {
@@ -501,5 +544,194 @@ mod tests {
         assert!(!res[&4].passes_quality);
         assert_eq!(res[&4].event_trigger, None);
         assert_eq!(res[&4].w_s3_event_reversion, 0.0);
+    }
+
+    #[test]
+    fn test_s3_strict_admission_top_k_4_and_legacy_parity() {
+        // 1. Mild bottom bounce with 38 <= RSI < 54 and shallow flush (> -1.0 ATR):
+        //    legacy mode admits TRIGGER_CAPITULATION_FLUSH, strict mode rejects it.
+        let mut mild_bars = Vec::with_capacity(20);
+        let base_ts = 1_700_000_000_000i64;
+        // First 6 bars decline from 108 to 100 (establishing range high 108), then 14 sideways bars
+        // oscillating near 100 with 7 up and 7 down ending on a green bounce (RSI ~ 46, rpos <= 0.20, flush > -1.0).
+        for i in 0..6 {
+            let c = 108.0 - (i as f64) * 1.5;
+            mild_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 14_400_000,
+                open: c + 0.5,
+                high: c + 1.0,
+                low: c - 0.5,
+                close: c,
+                volume: 100_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mut px = mild_bars.last().unwrap().close;
+        for i in 6..20 {
+            let open = px;
+            // Net mild drift near bottom with slightly larger down steps than up steps, ending green
+            px *= if i == 19 {
+                1.003
+            } else if i % 2 == 0 {
+                0.9965
+            } else {
+                1.0030
+            };
+            mild_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 14_400_000,
+                open,
+                high: open.max(px) * 1.002,
+                low: open.min(px) * 0.998,
+                close: px,
+                volume: 100_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mild_close = mild_bars.last().unwrap().close;
+        let mild_asset = test_asset(1, "MILD", 0.0, mild_close, true);
+        let mut mild_map = HashMap::new();
+        mild_map.insert(1, mild_bars.clone());
+        let flush = compute_flush_atr_multiple(&mild_asset, &mild_bars);
+        assert!(flush > -1.0 && flush <= 0.25, "flush={flush}");
+        let (rsi, rpos, bouncing) = compute_rsi_and_range_position(&mild_bars, mild_close);
+        assert!(
+            rpos <= 0.20 && bouncing && (38.0..54.0).contains(&rsi),
+            "rsi={rsi}, rpos={rpos}, bouncing={bouncing}"
+        );
+
+        let legacy_mild = evaluate_sleeve_s3_with_strict(
+            std::slice::from_ref(&mild_asset),
+            &mild_map,
+            0.10,
+            false,
+        );
+        assert_eq!(
+            legacy_mild[&1].event_trigger.as_deref(),
+            Some(TRIGGER_CAPITULATION_FLUSH)
+        );
+        assert!(legacy_mild[&1].w_s3_event_reversion > 0.0);
+
+        let strict_mild = evaluate_sleeve_s3_with_strict(&[mild_asset], &mild_map, 0.10, true);
+        assert_eq!(strict_mild[&1].event_trigger, None);
+        assert_eq!(strict_mild[&1].w_s3_event_reversion, 0.0);
+
+        // 2. 8 equal qualifying strict S3 oversold flush assets: strict concentrates into top_k = 4 (0.025 each)
+        let mut strict_assets = Vec::new();
+        let mut strict_map = HashMap::new();
+        for id in 1..=8i64 {
+            let mut bars = make_downtrend_bars(id, 100.0, -0.018, 25);
+            let prev = bars.last().unwrap().close;
+            let bounce = prev * 1.005;
+            bars.push(OhlcvBar {
+                id: 26,
+                asset_id: id,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + 25 * 14_400_000,
+                open: prev,
+                high: bounce * 1.002,
+                low: prev * 0.998,
+                close: bounce,
+                volume: 100_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+            let mut a = test_asset(id, &format!("S{id}"), 0.0, bounce, true);
+            a.day_volume_usdc = (id as f64) * 1_000_000.0;
+            strict_assets.push(a);
+            strict_map.insert(id, bars);
+        }
+        let strict_res = evaluate_sleeve_s3_with_strict(&strict_assets, &strict_map, 0.10, true);
+        let nz: Vec<i64> = strict_res
+            .values()
+            .filter(|m| m.w_s3_event_reversion > 1e-6)
+            .map(|m| m.asset_id)
+            .collect();
+        assert_eq!(nz.len(), 4, "Strict S3 must concentrate into top_k = 4");
+        for id in 5..=8 {
+            assert!(nz.contains(&id));
+            assert!((strict_res[&id].w_s3_event_reversion - 0.025).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_s3_1h_vs_4h_flush_atr_invariance() {
+        let base_ts = 1_700_000_000_000i64;
+        // 30 4h bars trending mildly down then flushing -6%
+        let mut bars_4h = make_downtrend_bars(1, 100.0, -0.004, 29);
+        let p4 = bars_4h.last().unwrap().close;
+        let flush_4 = p4 * 0.94;
+        bars_4h.push(OhlcvBar {
+            id: 30,
+            asset_id: 1,
+            timeframe: "4h".to_string(),
+            timestamp_ms: base_ts + 29 * 14_400_000,
+            open: p4,
+            high: p4,
+            low: flush_4,
+            close: flush_4,
+            volume: 100_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+
+        // Equivalent 120 1h bars (1/4 drift per bar, 0.5x per-bar TR range -> identical 4h-ref ATR) ending at same -6% flush
+        let mut bars_1h = Vec::with_capacity(120);
+        let mut px = 100.0;
+        let step_1h = 1.0 - 0.004 / 4.0;
+        for i in 0..119 {
+            let open = px;
+            px *= step_1h;
+            bars_1h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open,
+                high: open.max(px) * 1.002,
+                low: open.min(px) * 0.998,
+                close: px,
+                volume: 25_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let p1 = bars_1h.last().unwrap().close;
+        let flush_1 = p1 * 0.94;
+        bars_1h.push(OhlcvBar {
+            id: 120,
+            asset_id: 1,
+            timeframe: "1h".to_string(),
+            timestamp_ms: base_ts + 119 * 3_600_000,
+            open: p1,
+            high: p1,
+            low: flush_1,
+            close: flush_1,
+            volume: 100_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+
+        let a4 = test_asset(1, "FLUSH", 0.0, flush_4, true);
+        let a1 = test_asset(1, "FLUSH", 0.0, flush_1, true);
+        let f4 = compute_flush_atr_multiple(&a4, &bars_4h);
+        let f1 = compute_flush_atr_multiple(&a1, &bars_1h);
+        assert!(
+            (f4 - f1).abs() < 0.75,
+            "1h ({f1}) and 4h ({f4}) flush_atr_mult must stay wall-clock invariant"
+        );
     }
 }

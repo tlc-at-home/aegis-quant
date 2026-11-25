@@ -249,6 +249,29 @@ pub fn timeframe_to_ms(tf: &str) -> Option<i64> {
     }
 }
 
+/// Infers canonical bar duration in hours from observed positive timestamp deltas (`dt_ms >= 60_000`),
+/// falling back to `timeframe_to_ms` on `bars.first()` when timestamps are absent, and defaulting to `4.0`.
+pub fn infer_bar_hours(bars: &[OhlcvBar]) -> f64 {
+    if bars.len() >= 2 {
+        let mut dts: Vec<i64> = bars
+            .windows(2)
+            .filter_map(|w| {
+                let dt = w[1].timestamp_ms.saturating_sub(w[0].timestamp_ms);
+                (dt >= 60_000).then_some(dt)
+            })
+            .collect();
+        if !dts.is_empty() {
+            dts.sort_unstable();
+            let median_dt = dts[dts.len() / 2];
+            return ((median_dt as f64) / 3_600_000.0).clamp(1.0 / 60.0, 24.0);
+        }
+    }
+    if let Some(tf_ms) = bars.first().and_then(|b| timeframe_to_ms(&b.timeframe)) {
+        return ((tf_ms as f64) / 3_600_000.0).clamp(1.0 / 60.0, 24.0);
+    }
+    4.0
+}
+
 /// Estimates time-normalized annualized volatility from OHLCV bars (`R14-M9`).
 ///
 /// Uses observed positive timestamp deltas (`dt_ms >= 60_000`) across mixed-timeframe or
@@ -528,5 +551,49 @@ mod tests {
         assert!((zs[&2] - 0.0).abs() < 1e-9);
         assert!((zs[&1] + 1.0).abs() < 1e-9);
         assert!((zs[&3] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_infer_bar_hours_deltas_fallback_and_defaults() {
+        assert!((infer_bar_hours(&[]) - 4.0).abs() < 1e-9);
+
+        let bars_1h: Vec<OhlcvBar> = (0..5)
+            .map(|i| {
+                mk_bar(
+                    1_700_000_000_000 + i * 3_600_000,
+                    "4h",
+                    10.0,
+                    10.0,
+                    10.0,
+                    10.0,
+                )
+            })
+            .collect();
+        assert!((infer_bar_hours(&bars_1h) - 1.0).abs() < 1e-9);
+
+        let bars_4h: Vec<OhlcvBar> = (0..5)
+            .map(|i| {
+                mk_bar(
+                    1_700_000_000_000 + i * 14_400_000,
+                    "1h",
+                    10.0,
+                    10.0,
+                    10.0,
+                    10.0,
+                )
+            })
+            .collect();
+        assert!((infer_bar_hours(&bars_4h) - 4.0).abs() < 1e-9);
+
+        // Zero timestamps fall back to bars.first().timeframe
+        let zero_ts_1h = vec![
+            mk_bar(0, "1h", 10.0, 10.0, 10.0, 10.0),
+            mk_bar(0, "1h", 10.0, 10.0, 10.0, 10.0),
+        ];
+        assert!((infer_bar_hours(&zero_ts_1h) - 1.0).abs() < 1e-9);
+
+        // Unknown timeframe with zero timestamps defaults to 4.0
+        let unknown = vec![mk_bar(0, "weird", 10.0, 10.0, 10.0, 10.0)];
+        assert!((infer_bar_hours(&unknown) - 4.0).abs() < 1e-9);
     }
 }

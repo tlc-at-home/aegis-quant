@@ -4,7 +4,7 @@
 //! Cross-Sectional Market Breadth (`breadth`), and Risk-Tier Portfolio Allocation (`allocator`).
 
 use crate::allocator::{
-    allocate_multi_sleeve_weights_with_context, AllocatorConfig, HeldPositionContext,
+    allocate_multi_sleeve_weights_with_exit_confirm, AllocatorConfig, HeldPositionContext,
     RiskTierLeverageExt, SleeveSignalInput,
 };
 use crate::breadth::{compute_regime_gate_state, MarketBreadthSnapshot};
@@ -117,9 +117,15 @@ impl SignalEngine {
         active_cooldowns: &[CooldownAssetView],
         bar_cache: &mut BarCloseCache,
     ) -> SignalCycleOutput {
-        let features = CycleFeatureCache::build(assets, bars_by_asset, bar_cache);
+        let features = CycleFeatureCache::build_with_options(
+            assets,
+            bars_by_asset,
+            bar_cache,
+            self.config.wall_clock_normalize_indicators,
+        );
         let gate_cfg = self.config.regime_gate_config();
         let mut regime_gate = features.initial_regime_gate(&gate_cfg);
+        let sleeve_top_k = self.config.max_open_positions.max(8);
 
         let s1_map = evaluate_sleeve_s1_with_features(
             assets,
@@ -127,6 +133,7 @@ impl SignalEngine {
             &features,
             &regime_gate,
             self.config.s1_carry_mom_budget,
+            sleeve_top_k,
         );
         let s2_map = evaluate_sleeve_s2_with_features(
             assets,
@@ -135,6 +142,7 @@ impl SignalEngine {
             &regime_gate,
             features.prelim_breadth_bull,
             self.config.s2_trend_breakout_budget,
+            sleeve_top_k,
         );
         let s3_map = evaluate_sleeve_s3_with_features(
             assets,
@@ -142,6 +150,7 @@ impl SignalEngine {
             &features,
             &regime_gate,
             self.config.s3_event_reversion_budget,
+            self.config.s3_strict_admission_enabled,
         );
 
         let capitulation_count = s3_map
@@ -156,7 +165,13 @@ impl SignalEngine {
             &gate_cfg,
         );
 
-        let signals = allocate_multi_sleeve_weights_with_context(
+        let bar_ts_by_asset: HashMap<i64, i64> = features
+            .per_asset
+            .iter()
+            .map(|(&aid, feat)| (aid, feat.last_bar_ts_ms))
+            .collect();
+
+        let signals = allocate_multi_sleeve_weights_with_exit_confirm(
             assets,
             &s1_map,
             &s2_map,
@@ -165,6 +180,8 @@ impl SignalEngine {
             active_cooldowns,
             &regime_gate,
             &self.config,
+            &bar_ts_by_asset,
+            &mut bar_cache.exit_confirm_by_asset,
         );
 
         let beta_by_asset: HashMap<i64, f64> = s1_map
@@ -1079,5 +1096,489 @@ mod tests {
             first.breadth.market_regime_label,
             second.breadth.market_regime_label
         );
+    }
+
+    #[test]
+    fn test_p1_1_s1_s2_top_k_scales_with_max_open_positions_and_s3_strict_default() {
+        use aegis_core::ConfigMap;
+
+        let mut assets = Vec::with_capacity(15);
+        let mut bars_by_asset = HashMap::new();
+        for id in 1..=15i64 {
+            let mut bars = build_trend_bars(id, 100.0, 0.012, 26, 2.0);
+            let close = bars.last().unwrap().close;
+            let a = sample_asset(
+                id,
+                &format!("M{id}"),
+                close * 1.01,
+                100.0,
+                -0.00015,
+                (id as f64) * 1_000_000.0,
+            );
+            bars.last_mut().unwrap().volume *= 2.0;
+            bars_by_asset.insert(id, bars);
+            assets.push(a);
+        }
+
+        let mut cm = ConfigMap::new();
+        cm.insert("max_open_positions", "10");
+        let engine_10 = SignalEngine::from_config_map(&cm);
+        assert!(engine_10.config.s3_strict_admission_enabled);
+        assert!(engine_10.config.wall_clock_normalize_indicators);
+
+        let out_10 = engine_10.evaluate_universe(&assets, &bars_by_asset, &HashMap::new(), &[]);
+        let s1_nz = out_10
+            .signals
+            .iter()
+            .filter(|s| s.w_s1_carry_mom.abs() > 1e-6)
+            .count();
+        let s2_nz = out_10
+            .signals
+            .iter()
+            .filter(|s| s.w_s2_trend_breakout.abs() > 1e-6)
+            .count();
+        assert_eq!(s1_nz, 10, "S1 top_k must scale to max_open_positions=10");
+        assert_eq!(s2_nz, 10, "S2 top_k must scale to max_open_positions=10");
+
+        let engine_6 = SignalEngine::default();
+        let out_6 = engine_6.evaluate_universe(&assets, &bars_by_asset, &HashMap::new(), &[]);
+        let s1_6 = out_6
+            .signals
+            .iter()
+            .filter(|s| s.w_s1_carry_mom.abs() > 1e-6)
+            .count();
+        let s2_6 = out_6
+            .signals
+            .iter()
+            .filter(|s| s.w_s2_trend_breakout.abs() > 1e-6)
+            .count();
+        assert_eq!(s1_6, 8);
+        assert_eq!(s2_6, 8);
+    }
+
+    #[test]
+    fn test_p1_2_end_to_end_1h_vs_4h_invariance_and_bar_cache_toggle() {
+        let base_ts = 1_700_000_000_000i64;
+        let mut bars_4h = Vec::with_capacity(60);
+        let mut p4 = 100.0;
+        for i in 0..60 {
+            let open = p4;
+            p4 *= 1.006;
+            bars_4h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 14_400_000,
+                open,
+                high: p4 * 1.003,
+                low: open * 0.997,
+                close: p4,
+                volume: 50_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let mut bars_1h = Vec::with_capacity(240);
+        let mut p1 = 100.0;
+        let r_1h = 1.006_f64.powf(0.25);
+        for i in 0..240 {
+            let open = p1;
+            p1 *= r_1h;
+            bars_1h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 3_600_000,
+                open,
+                high: p1 * 1.0015,
+                low: open * 0.9985,
+                close: p1,
+                volume: 12_500.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+
+        let a4 = sample_asset(
+            1,
+            "SOL",
+            bars_4h.last().unwrap().close,
+            100.0,
+            0.0,
+            20_000_000.0,
+        );
+        let a1 = sample_asset(
+            1,
+            "SOL",
+            bars_1h.last().unwrap().close,
+            100.0,
+            0.0,
+            20_000_000.0,
+        );
+        let mut m4 = HashMap::new();
+        m4.insert(1, bars_4h);
+        let mut m1 = HashMap::new();
+        m1.insert(1, bars_1h);
+
+        let eng_norm = SignalEngine::default();
+        let out_4h = eng_norm.evaluate_universe(&[a4], &m4, &HashMap::new(), &[]);
+        let out_1h =
+            eng_norm.evaluate_universe(std::slice::from_ref(&a1), &m1, &HashMap::new(), &[]);
+        assert_eq!(out_4h.signals[0].s2_trend_alignment, 1);
+        assert_eq!(out_1h.signals[0].s2_trend_alignment, 1);
+        assert!(
+            (out_4h.signals[0].s1_mom_score - out_1h.signals[0].s1_mom_score).abs() < 0.03,
+            "1h ({}) vs 4h ({}) S1 momentum parity",
+            out_1h.signals[0].s1_mom_score,
+            out_4h.signals[0].s1_mom_score
+        );
+
+        // Toggle wall_clock_normalize_indicators on a shared BarCloseCache must invalidate and recompute
+        let mut shared_cache = BarCloseCache::new();
+        let norm_on = eng_norm.evaluate_universe_with_cache(
+            std::slice::from_ref(&a1),
+            &m1,
+            &HashMap::new(),
+            &[],
+            &mut shared_cache,
+        );
+        let mut eng_off = SignalEngine::default();
+        eng_off.config.wall_clock_normalize_indicators = false;
+        let norm_off = eng_off.evaluate_universe_with_cache(
+            &[a1],
+            &m1,
+            &HashMap::new(),
+            &[],
+            &mut shared_cache,
+        );
+        assert!(
+            (norm_on.signals[0].s1_mom_score - norm_off.signals[0].s1_mom_score).abs() > 0.05,
+            "BarCloseCache must respect wall_clock_normalize_indicators toggle in cache key"
+        );
+    }
+
+    #[test]
+    fn test_n2_signal_exit_confirm_bars_and_mandatory_r13_s1_bypasses() {
+        let base_ts = 1_700_000_000_000i64;
+        let step = 3_600_000i64;
+        let mut bar_cache = BarCloseCache::new();
+        let mut cfg = AllocatorConfig {
+            signal_exit_confirm_bars: 2,
+            ..AllocatorConfig::default()
+        };
+        let engine = SignalEngine::new(cfg.clone());
+
+        // Neutral flat bars (zero sleeves -> non-emergency ACTION_CLOSE candidate)
+        let mut neutral_bars: Vec<OhlcvBar> = (0..20)
+            .map(|i| OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * step,
+                open: 100.0,
+                high: 100.4,
+                low: 99.6,
+                close: 100.0,
+                volume: 50_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .collect();
+        let asset = sample_asset(1, "SOL", 100.0, 100.0, 0.0000125, 20_000_000.0);
+        let mut held = HashMap::new();
+        held.insert(
+            1,
+            HeldPositionContext {
+                current_weight: 0.12,
+                unrealized_pnl_pct: 0.0,
+            },
+        );
+        let mut map = HashMap::new();
+        map.insert(1, neutral_bars.clone());
+
+        // 1. Bar 1 (t1): first exit signal -> held at cur_w (count = 1 < 2)
+        let out1 = engine.evaluate_universe_with_cache(
+            std::slice::from_ref(&asset),
+            &map,
+            &held,
+            &[],
+            &mut bar_cache,
+        );
+        assert_eq!(out1.signals[0].rebalance_action, ACTION_HOLD);
+        assert!((out1.signals[0].target_weight - 0.12).abs() < 1e-6);
+        assert_eq!(bar_cache.exit_confirm_state(1).unwrap().count, 1);
+
+        // 2. Repeated 3s tick on SAME bar (same timestamp_ms, forming bar volume updated) -> STILL count=1 -> HOLD
+        neutral_bars.last_mut().unwrap().volume = 50_100.0;
+        map.insert(1, neutral_bars.clone());
+        let out_same_bar = engine.evaluate_universe_with_cache(
+            std::slice::from_ref(&asset),
+            &map,
+            &held,
+            &[],
+            &mut bar_cache,
+        );
+        assert_eq!(out_same_bar.signals[0].rebalance_action, ACTION_HOLD);
+        assert_eq!(bar_cache.exit_confirm_state(1).unwrap().count, 1);
+
+        // 3. New bar (t2 > t1) still neutral -> count increments to 2 -> ACTION_CLOSE!
+        neutral_bars.push(OhlcvBar {
+            id: 21,
+            asset_id: 1,
+            timeframe: "1h".to_string(),
+            timestamp_ms: base_ts + 20 * step,
+            open: 100.0,
+            high: 100.4,
+            low: 99.6,
+            close: 100.0,
+            volume: 50_000.0,
+            funding_rate: 0.0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        });
+        map.insert(1, neutral_bars.clone());
+        let out2 = engine.evaluate_universe_with_cache(
+            std::slice::from_ref(&asset),
+            &map,
+            &held,
+            &[],
+            &mut bar_cache,
+        );
+        assert_eq!(out2.signals[0].rebalance_action, ACTION_CLOSE);
+        assert_eq!(out2.signals[0].target_weight, 0.0);
+
+        // 4. Signal re-alignment clears state, then new exit restarts at count=1
+        let mut bull_bars = build_trend_bars(1, 100.0, 0.015, 25, 2.0);
+        let bull_asset = sample_asset(
+            1,
+            "SOL",
+            bull_bars.last().unwrap().close * 1.01,
+            100.0,
+            -0.0002,
+            20_000_000.0,
+        );
+        let mut bull_map = HashMap::new();
+        bull_map.insert(1, bull_bars.clone());
+        let _realigned = engine.evaluate_universe_with_cache(
+            &[bull_asset],
+            &bull_map,
+            &held,
+            &[],
+            &mut bar_cache,
+        );
+        assert_eq!(bar_cache.exit_confirm_state(1), None);
+        let mut fresh_neutral = neutral_bars.clone();
+        fresh_neutral.last_mut().unwrap().timestamp_ms = base_ts + 40 * step;
+        map.insert(1, fresh_neutral);
+        let restarted = engine.evaluate_universe_with_cache(
+            std::slice::from_ref(&asset),
+            &map,
+            &held,
+            &[],
+            &mut bar_cache,
+        );
+        assert_eq!(restarted.signals[0].rebalance_action, ACTION_HOLD);
+        assert_eq!(bar_cache.exit_confirm_state(1).unwrap().count, 1);
+
+        // 5. Mandatory R13-S1 immediate bypass regression tests (signal_exit_confirm_bars = 3):
+        //    Each must fire ACTION_CLOSE immediately on bar 1!
+        cfg.signal_exit_confirm_bars = 3;
+        let strict_engine = SignalEngine::new(cfg.clone());
+
+        // 5a. !hysteresis_eligible (0/12 active dead book)
+        let mut cache_5a = BarCloseCache::new();
+        let dead_bars: Vec<OhlcvBar> = (0..16)
+            .map(|i| OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 2,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * step,
+                open: 10.0,
+                high: 10.0,
+                low: 10.0,
+                close: 10.0,
+                volume: 0.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .collect();
+        let dead_asset = sample_asset(2, "DEAD", 10.0, 10.0, 0.0, 10_000.0);
+        let mut dead_map = HashMap::new();
+        dead_map.insert(2, dead_bars);
+        let mut dead_held = HashMap::new();
+        dead_held.insert(
+            2,
+            HeldPositionContext {
+                current_weight: 0.12,
+                unrealized_pnl_pct: 0.01,
+            },
+        );
+        let r5a = strict_engine.evaluate_universe_with_cache(
+            &[dead_asset],
+            &dead_map,
+            &dead_held,
+            &[],
+            &mut cache_5a,
+        );
+        assert_eq!(
+            r5a.signals[0].rebalance_action, ACTION_CLOSE,
+            "R13-S1 !hysteresis_eligible must bypass exit_confirm_bars immediately on bar 1"
+        );
+
+        // 5b. counter_regime_held (BEAR_CONTRACTION blocking longs while holding LONG)
+        let mut cache_5b = BarCloseCache::new();
+        let mut bear_assets = Vec::new();
+        let mut bear_map = HashMap::new();
+        for id in 10..=13i64 {
+            let b = build_trend_bars(id, 100.0, -0.012, 26, 2.0);
+            let close = b.last().unwrap().close;
+            bear_assets.push(sample_asset(
+                id,
+                &format!("B{id}"),
+                close * 0.99,
+                100.0,
+                0.0002,
+                20_000_000.0,
+            ));
+            bear_map.insert(id, b);
+        }
+        // Asset 14 held LONG in BEAR_CONTRACTION with neutral bars & neutral funding z-score
+        // (would otherwise be held by N2 confirm_bars=3 without R13-S1 counter_regime_held bypass)
+        let b14 = build_trend_bars(14, 100.0, 0.0, 26, 1.0);
+        let c14 = b14.last().unwrap().close;
+        bear_assets.push(sample_asset(
+            14,
+            "HELDLONG",
+            c14,
+            100.0,
+            0.0002,
+            20_000_000.0,
+        ));
+        bear_map.insert(14, b14);
+        let mut held_5b = HashMap::new();
+        held_5b.insert(
+            14,
+            HeldPositionContext {
+                current_weight: 0.12,
+                unrealized_pnl_pct: 0.0,
+            },
+        );
+        let r5b = strict_engine.evaluate_universe_with_cache(
+            &bear_assets,
+            &bear_map,
+            &held_5b,
+            &[],
+            &mut cache_5b,
+        );
+        assert_eq!(r5b.breadth.market_regime_label, "BEAR_CONTRACTION");
+        let sig14 = r5b.signals.iter().find(|s| s.asset_id == 14).unwrap();
+        assert_eq!(
+            sig14.rebalance_action, ACTION_CLOSE,
+            "R13-S1 counter_regime_held must bypass exit_confirm_bars immediately on bar 1"
+        );
+
+        // 5c. is_downward_flush (s3_flush_atr_mult <= -3.5) on held SHORT
+        let mut cache_5c = BarCloseCache::new();
+        let mut crash_bars = build_trend_bars(20, 100.0, -0.004, 25, 1.0);
+        let c_prev = crash_bars.last().unwrap().close;
+        let c_flush = c_prev * 0.85;
+        let mut c_last = crash_bars.last().unwrap().clone();
+        c_last.id = 26;
+        c_last.timestamp_ms += 14_400_000;
+        c_last.open = c_prev;
+        c_last.low = c_flush;
+        c_last.close = c_flush;
+        c_last.high = c_prev;
+        crash_bars.push(c_last);
+        let crash_asset = sample_asset(20, "CRASH", c_flush, 100.0, 0.0, 20_000_000.0);
+        let mut crash_map = HashMap::new();
+        crash_map.insert(20, crash_bars);
+        let mut held_5c = HashMap::new();
+        held_5c.insert(
+            20,
+            HeldPositionContext {
+                current_weight: -0.12,
+                unrealized_pnl_pct: 0.02,
+            },
+        );
+        let r5c = strict_engine.evaluate_universe_with_cache(
+            &[crash_asset],
+            &crash_map,
+            &held_5c,
+            &[],
+            &mut cache_5c,
+        );
+        assert!(r5c.signals[0].s3_flush_atr_mult <= -3.5);
+        assert!(
+            matches!(
+                r5c.signals[0].rebalance_action.as_str(),
+                ACTION_CLOSE | ACTION_FLIP
+            ),
+            "R13-S1 downward flush <= -3.5 ATR on held SHORT must never hold on bar 1, got {}",
+            r5c.signals[0].rebalance_action
+        );
+
+        // 5d. is_loser && invalidated: underwater loser with mild bearish momentum (RSI > 36, s2 == 0, w_s1 == 0)
+        //     must immediately emit ACTION_CLOSE on bar 1 (never held by exit_confirm_bars = 3)
+        let mut cache_5d = BarCloseCache::new();
+        let mut loser_bars = Vec::with_capacity(26);
+        let closes_5d: [f64; 26] = [
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+            100.0, 100.0, 100.0, 100.0, 102.0, 102.0, 102.0, 102.0, 102.0, 102.0, 100.2, 100.0,
+            99.8, 99.6,
+        ];
+        for (i, &c) in closes_5d.iter().enumerate() {
+            let open = if i == 0 { 100.0 } else { closes_5d[i - 1] };
+            let high = if i == 0 { 108.0 } else { open.max(c) * 1.004 };
+            let low = if i == 0 { 85.0 } else { open.min(c) * 0.996 };
+            loser_bars.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 21,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * 14_400_000,
+                open,
+                high,
+                low,
+                close: c,
+                volume: 50_000.0,
+                funding_rate: -0.00010,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+        let loser_close = *closes_5d.last().unwrap();
+        let loser_asset = sample_asset(21, "LOSER", loser_close, 100.0, -0.00010, 20_000_000.0);
+        let mut loser_map = HashMap::new();
+        loser_map.insert(21, loser_bars);
+        let mut held_5d = HashMap::new();
+        held_5d.insert(
+            21,
+            HeldPositionContext {
+                current_weight: 0.12,
+                unrealized_pnl_pct: -0.006, // <= -0.003 loser!
+            },
+        );
+        let r5d = strict_engine.evaluate_universe_with_cache(
+            &[loser_asset],
+            &loser_map,
+            &held_5d,
+            &[],
+            &mut cache_5d,
+        );
+        assert!(
+            r5d.signals[0].s1_mom_score < 0.0,
+            "s1_mom={}",
+            r5d.signals[0].s1_mom_score
+        );
+        assert_eq!(
+            r5d.signals[0].rebalance_action, ACTION_CLOSE,
+            "R13-S1 is_loser && invalidated must bypass exit_confirm_bars immediately on bar 1, got {}",
+            r5d.signals[0].rebalance_action
+        );
+        let _ = &mut bull_bars;
     }
 }
