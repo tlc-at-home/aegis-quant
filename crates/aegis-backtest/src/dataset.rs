@@ -13,6 +13,8 @@ pub struct HistoricalDataset {
     pub timeframe: String,
     #[serde(default)]
     pub eval_start_ms: Option<i64>,
+    #[serde(default)]
+    pub eval_end_ms: Option<i64>,
     pub assets: Vec<ExchangeAsset>,
     pub bars_by_asset: HashMap<i64, Vec<OhlcvBar>>,
 }
@@ -31,6 +33,89 @@ pub fn count_timeline_bars_before(
         }
     }
     ts_set.len()
+}
+
+/// Returns sorted distinct bar open timestamps across all assets in `bars_by_asset`.
+pub fn collect_timeline_timestamps(bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>) -> Vec<i64> {
+    let mut ts_set = BTreeSet::new();
+    for bars in bars_by_asset.values() {
+        for bar in bars {
+            ts_set.insert(bar.timestamp_ms);
+        }
+    }
+    ts_set.into_iter().collect()
+}
+
+/// Slices a [`HistoricalDataset`] cleanly to `[eval_start_ms, eval_end_ms)` while preserving
+/// all pre-window warmup bars (`< eval_start_ms`) and removing future bars (`>= eval_end_ms`).
+pub fn slice_dataset_window(
+    dataset: &HistoricalDataset,
+    eval_start_ms: Option<i64>,
+    eval_end_ms: Option<i64>,
+) -> Result<HistoricalDataset> {
+    let eff_start = eval_start_ms.or(dataset.eval_start_ms);
+    let eff_end = eval_end_ms.or(dataset.eval_end_ms);
+    if let (Some(start), Some(end)) = (eff_start, eff_end) {
+        if start >= end {
+            return Err(AegisError::Validation(format!(
+                "Invalid backtest window: eval_start_ms ({start}) must be strictly less than eval_end_ms ({end})"
+            )));
+        }
+    }
+
+    let mut sliced_bars: HashMap<i64, Vec<OhlcvBar>> =
+        HashMap::with_capacity(dataset.bars_by_asset.len());
+    for (&asset_id, bars) in &dataset.bars_by_asset {
+        let mut filtered: Vec<OhlcvBar> = if let Some(end_ms) = eff_end {
+            bars.iter()
+                .filter(|b| b.timestamp_ms < end_ms)
+                .cloned()
+                .collect()
+        } else {
+            bars.clone()
+        };
+        filtered.sort_by_key(|b| b.timestamp_ms);
+        filtered.dedup_by_key(|b| b.timestamp_ms);
+        if !filtered.is_empty() {
+            sliced_bars.insert(asset_id, filtered);
+        }
+    }
+
+    let valid_assets: Vec<ExchangeAsset> = dataset
+        .assets
+        .iter()
+        .filter(|a| sliced_bars.contains_key(&a.id))
+        .cloned()
+        .collect();
+    if valid_assets.is_empty() {
+        return Err(AegisError::Validation(
+            "Empty backtest dataset after window slicing: no asset bars remain before eval_end_ms"
+                .to_string(),
+        ));
+    }
+
+    let timeline = collect_timeline_timestamps(&sliced_bars);
+    if timeline.len() < 2 {
+        return Err(AegisError::Validation(
+            "Insufficient bars after window slicing: need at least 2 timeline bars".to_string(),
+        ));
+    }
+    if let Some(start) = eff_start {
+        if !timeline.iter().any(|&ts| ts >= start) {
+            return Err(AegisError::Validation(format!(
+                "No evaluation bars remain at or after eval_start_ms ({start})"
+            )));
+        }
+    }
+
+    Ok(HistoricalDataset {
+        source: dataset.source.clone(),
+        timeframe: dataset.timeframe.clone(),
+        eval_start_ms: eff_start,
+        eval_end_ms: eff_end,
+        assets: valid_assets,
+        bars_by_asset: sliced_bars,
+    })
 }
 
 /// Generates a deterministic multi-asset Hyperliquid perpetual dataset (`BTC-USDC`, `ETH-USDC`,
@@ -231,6 +316,7 @@ pub fn assemble_db_dataset(
         source: "db".to_string(),
         timeframe,
         eval_start_ms: None,
+        eval_end_ms: None,
         assets: valid_assets,
         bars_by_asset,
     })

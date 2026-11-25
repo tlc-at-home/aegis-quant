@@ -5,11 +5,12 @@
 //! `aegis-backtest` (Multi-Sleeve S1/S2/S3 Walk-Forward Simulation), and `aegis-telemetry`.
 
 use aegis_alerts::{send_test_alert, AlertDispatchResult};
-use aegis_backtest::dataset::{assemble_db_dataset, HistoricalDataset};
-use aegis_backtest::{BacktestEngine, BacktestReport};
+use aegis_backtest::dataset::{assemble_db_dataset, slice_dataset_window, HistoricalDataset};
+use aegis_backtest::{BacktestEngine, BacktestReport, SensitivityGridReport, WalkForwardReport};
 use aegis_core::indicators::timeframe_to_ms;
 use aegis_core::{
-    now_ms, resolve_project_root, AegisError, AlertQueueRecord, ConfigMap, Result, PLATFORM_VERSION,
+    now_ms, resolve_project_root, AegisError, AlertQueueRecord, ConfigMap, Result, RiskTier,
+    PLATFORM_VERSION,
 };
 use aegis_db::{
     create_mariadb_backup, generate_fernet_key, master_key_file_for_db, validate_fernet_key,
@@ -102,6 +103,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the unified v2.0 daemon (1s Priority Loop + 3s Exchange Scanner + WebUI on :8000)
     Run,
@@ -213,6 +215,58 @@ enum Commands {
         /// Optional path to load a saved `HistoricalDataset` JSON directly (bypassing network/DB fetch)
         #[arg(long)]
         load_dataset: Option<PathBuf>,
+
+        /// Optional inclusive evaluation window start timestamp in epoch milliseconds (retains prior bars as warmup)
+        #[arg(long)]
+        eval_start_ms: Option<i64>,
+
+        /// Optional exclusive evaluation window end timestamp in epoch milliseconds
+        #[arg(long)]
+        eval_end_ms: Option<i64>,
+
+        /// Run `N` rolling out-of-sample walk-forward folds (`1..=50`) instead of a single pass
+        #[arg(long)]
+        walk_forward_folds: Option<usize>,
+
+        /// Rolling walk-forward in-sample/warmup window in days (default: 14)
+        #[arg(long, default_value_t = 14)]
+        train_days: usize,
+
+        /// Rolling walk-forward out-of-sample test window in days (default: 7)
+        #[arg(long, default_value_t = 7)]
+        test_days: usize,
+
+        /// Run the 3x3 sensitivity matrix (`stagnation_hours in [12, 16, 24]` x `risk_per_trade_pct in [1.5%, 2.0%, 2.5%]`)
+        #[arg(long)]
+        sensitivity_grid: bool,
+
+        /// Lever N1: enable directional chop/neutral regime budget multipliers (`true` or `false`)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        regime_budget_mult: Option<bool>,
+
+        /// Lever N2: consecutive bars required to confirm a non-emergency signal exit (`1..=5`)
+        #[arg(long)]
+        exit_confirm_bars: Option<usize>,
+
+        /// Lever N3: close to flat instead of direct single-step side flips (`true` or `false`)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        suppress_flips: Option<bool>,
+
+        /// Lever N5: cap portfolio net exposure as a fraction of gross exposure (`0.10..=1.0`)
+        #[arg(long)]
+        net_exposure_cap: Option<f64>,
+
+        /// Lever N4: route low-urgency entries as resting passive maker-only orders (`true` or `false`)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        maker_first_entries: Option<bool>,
+
+        /// Lever N6: defer adverse-funding non-flip entries near hourly funding settlement (`true` or `false`)
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        funding_timing: Option<bool>,
+
+        /// Parity cap on maximum new entries allowed per signal bar (`0..=100`; 0 disables cap)
+        #[arg(long)]
+        max_entries_per_bar: Option<usize>,
     },
 
     /// Print live MariaDB 13.0 health, 7 SQL Views summary, risk tier, and portfolio snapshot status
@@ -562,9 +616,59 @@ struct BacktestRunOptions {
     risk_per_trade_pct: Option<f64>,
     save_dataset: Option<PathBuf>,
     load_dataset: Option<PathBuf>,
+    eval_start_ms: Option<i64>,
+    eval_end_ms: Option<i64>,
+    walk_forward_folds: Option<usize>,
+    train_days: usize,
+    test_days: usize,
+    sensitivity_grid: bool,
+    regime_budget_mult: Option<bool>,
+    exit_confirm_bars: Option<usize>,
+    suppress_flips: Option<bool>,
+    net_exposure_cap: Option<f64>,
+    maker_first_entries: Option<bool>,
+    funding_timing: Option<bool>,
+    max_entries_per_bar: Option<usize>,
+}
+
+enum BacktestCommandOutcome {
+    Single(Box<BacktestReport>),
+    WalkForward(WalkForwardReport),
+    SensitivityGrid(SensitivityGridReport),
+}
+
+fn validate_backtest_run_options(opts: &BacktestRunOptions) -> Result<()> {
+    if opts.sensitivity_grid && opts.walk_forward_folds.is_some() {
+        return Err(AegisError::Validation(
+            "Cannot combine --sensitivity-grid with --walk-forward-folds in one run".to_string(),
+        ));
+    }
+    if let (Some(start), Some(end)) = (opts.eval_start_ms, opts.eval_end_ms) {
+        if start >= end {
+            return Err(AegisError::Validation(format!(
+                "Invalid evaluation window: --eval-start-ms ({start}) must be strictly less than --eval-end-ms ({end})"
+            )));
+        }
+    }
+    if let Some(folds) = opts.walk_forward_folds {
+        if !(1..=50).contains(&folds) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --walk-forward-folds '{folds}': must be within 1..=50"
+            )));
+        }
+        if opts.train_days == 0 || opts.test_days == 0 {
+            return Err(AegisError::Validation(
+                "Invalid walk-forward window: --train-days and --test-days must be >= 1"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_backtest_config_overrides(cfg: &mut ConfigMap, opts: &BacktestRunOptions) -> Result<()> {
+    validate_backtest_run_options(opts)?;
+
     if !(1..=500).contains(&opts.warmup_bars) {
         return Err(AegisError::Validation(format!(
             "Invalid --warmup-bars '{}': must be within 1..=500",
@@ -572,6 +676,7 @@ fn apply_backtest_config_overrides(cfg: &mut ConfigMap, opts: &BacktestRunOption
         )));
     }
     cfg.insert("backtest_warmup_bars", opts.warmup_bars.to_string());
+    cfg.insert("signal_timeframe", opts.timeframe.as_str());
 
     if let Some(ref tier_raw) = opts.risk_tier {
         let normalized = tier_raw.trim().to_ascii_lowercase();
@@ -583,7 +688,22 @@ fn apply_backtest_config_overrides(cfg: &mut ConfigMap, opts: &BacktestRunOption
                 "Invalid --risk-tier '{tier_raw}' (expected conservative, standard, aggressive, extreme, or custom)"
             )));
         }
+        let tier = RiskTier::parse(&normalized);
+        let custom_mult =
+            (tier == RiskTier::Custom).then(|| cfg.get_f64("target_leverage_multiplier", 1.85));
+        let mult = tier.leverage_multiplier(custom_mult);
         cfg.insert("risk_tier", normalized);
+        cfg.insert("target_leverage_multiplier", format!("{mult:.2}"));
+        if opts.risk_per_trade_pct.is_none() {
+            cfg.insert(
+                "risk_per_trade_equity_pct",
+                format!("{:.4}", tier.default_risk_per_trade_equity_pct(Some(mult))),
+            );
+        }
+        cfg.insert(
+            "max_single_asset_weight",
+            format!("{:.4}", tier.default_max_single_asset_weight(Some(mult))),
+        );
     }
     if let Some(eq) = opts.equity {
         if !eq.is_finite() || eq < 100.0 {
@@ -631,6 +751,51 @@ fn apply_backtest_config_overrides(cfg: &mut ConfigMap, opts: &BacktestRunOption
         }
         cfg.insert("risk_per_trade_equity_pct", format!("{v}"));
     }
+    if let Some(v) = opts.regime_budget_mult {
+        cfg.insert(
+            "enable_regime_budget_multipliers",
+            if v { "true" } else { "false" },
+        );
+    }
+    if let Some(v) = opts.exit_confirm_bars {
+        if !(1..=5).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --exit-confirm-bars '{v}': must be within 1..=5"
+            )));
+        }
+        cfg.insert("signal_exit_confirm_bars", v.to_string());
+    }
+    if let Some(v) = opts.suppress_flips {
+        cfg.insert("suppress_direct_flips", if v { "true" } else { "false" });
+    }
+    if let Some(v) = opts.net_exposure_cap {
+        if !v.is_finite() || !(0.10..=1.0).contains(&v) {
+            return Err(AegisError::Validation(format!(
+                "Invalid --net-exposure-cap '{v}': must be finite and within 0.10..=1.0"
+            )));
+        }
+        cfg.insert("max_net_exposure_ratio_of_gross", format!("{v}"));
+    }
+    if let Some(v) = opts.maker_first_entries {
+        cfg.insert(
+            "maker_first_low_urgency_entries",
+            if v { "true" } else { "false" },
+        );
+    }
+    if let Some(v) = opts.funding_timing {
+        cfg.insert(
+            "funding_entry_timing_enabled",
+            if v { "true" } else { "false" },
+        );
+    }
+    if let Some(v) = opts.max_entries_per_bar {
+        if v > 100 {
+            return Err(AegisError::Validation(format!(
+                "Invalid --max-entries-per-bar '{v}': must be within 0..=100"
+            )));
+        }
+        cfg.insert("max_entries_per_bar", v.to_string());
+    }
     Ok(())
 }
 
@@ -653,10 +818,82 @@ fn load_historical_dataset_json(path: &Path) -> Result<HistoricalDataset> {
     })
 }
 
-fn run_backtest_with_options(
+fn resolve_backtest_dataset(
+    db_opt: Option<&DatabaseManager>,
+    cfg: &ConfigMap,
+    bt: &BacktestEngine,
+    opts: &BacktestRunOptions,
+) -> Result<HistoricalDataset> {
+    let raw_dataset = if let Some(ref load_path) = opts.load_dataset {
+        load_historical_dataset_json(load_path)?
+    } else {
+        match opts.source {
+            BacktestSource::Synthetic => {
+                let (assets, bars_by_asset) =
+                    BacktestEngine::generate_canonical_dataset(opts.days, bt.config.warmup_bars);
+                HistoricalDataset {
+                    source: "synthetic".to_string(),
+                    timeframe: "4h".to_string(),
+                    eval_start_ms: None,
+                    eval_end_ms: None,
+                    assets,
+                    bars_by_asset,
+                }
+            }
+            BacktestSource::Db => {
+                let db = db_opt.ok_or_else(|| {
+                    AegisError::Validation(
+                        "MariaDB connection required for --source db".to_string(),
+                    )
+                })?;
+                let tf_str = opts.timeframe.as_str();
+                let bar_ms = timeframe_to_ms(tf_str).ok_or_else(|| {
+                    AegisError::Validation(format!("Unsupported timeframe '{tf_str}'"))
+                })?;
+                let until_ms = now_ms();
+                let warmup_ms = (bt.config.warmup_bars as i64 + 12).saturating_mul(bar_ms);
+                let window_ms = (opts.days.max(5) as i64).saturating_mul(86_400_000);
+                let since_ms = until_ms.saturating_sub(window_ms.saturating_add(warmup_ms));
+
+                let assets = db.list_exchange_assets()?;
+                let bars_by_asset = db.get_ohlcv_bars_window(tf_str, since_ms, until_ms)?;
+                let funding_events = db.list_funding_events_window(since_ms, until_ms)?;
+                let min_bars = bt.config.warmup_bars.saturating_add(2);
+                assemble_db_dataset(assets, bars_by_asset, funding_events, min_bars)?
+            }
+            BacktestSource::Mainnet => {
+                let http = HyperliquidHttpClient::new(12);
+                let fetch_opts = MainnetHistoryFetchOptions {
+                    days: opts.days,
+                    timeframe: opts.timeframe.as_str().to_string(),
+                    warmup_bars: opts.warmup_bars,
+                    max_assets: opts.max_assets,
+                };
+                let raw = fetch_mainnet_raw_history(&http, cfg, &fetch_opts)?;
+                let mut dataset =
+                    assemble_db_dataset(raw.assets, raw.bars_by_asset, raw.funding_events, 24)?;
+                dataset.source = "mainnet".to_string();
+                dataset.eval_start_ms = Some(raw.eval_start_ms);
+                dataset
+            }
+        }
+    };
+
+    if let Some(ref save_path) = opts.save_dataset {
+        save_historical_dataset_json(save_path, &raw_dataset)?;
+    }
+
+    if opts.eval_start_ms.is_some() || opts.eval_end_ms.is_some() {
+        slice_dataset_window(&raw_dataset, opts.eval_start_ms, opts.eval_end_ms)
+    } else {
+        Ok(raw_dataset)
+    }
+}
+
+fn run_backtest_command_with_options(
     db_opt: Option<&DatabaseManager>,
     opts: BacktestRunOptions,
-) -> Result<BacktestReport> {
+) -> Result<BacktestCommandOutcome> {
     let mut cfg = if let Some(db) = db_opt {
         if opts.source == BacktestSource::Db && opts.load_dataset.is_none() {
             db.init_schema()?;
@@ -669,58 +906,42 @@ fn run_backtest_with_options(
     apply_backtest_config_overrides(&mut cfg, &opts)?;
 
     let bt = BacktestEngine::from_config_map(&cfg, opts.days);
+    let dataset = resolve_backtest_dataset(db_opt, &cfg, &bt, &opts)?;
 
-    if let Some(ref load_path) = opts.load_dataset {
-        let dataset = load_historical_dataset_json(load_path)?;
-        if let Some(ref save_path) = opts.save_dataset {
-            save_historical_dataset_json(save_path, &dataset)?;
-        }
-        return bt.run_dataset(&dataset);
+    if opts.sensitivity_grid {
+        return Ok(BacktestCommandOutcome::SensitivityGrid(
+            bt.run_sensitivity_grid(&dataset)?,
+        ));
     }
+    if let Some(folds) = opts.walk_forward_folds {
+        return Ok(BacktestCommandOutcome::WalkForward(
+            bt.run_walk_forward_folds(&dataset, folds, opts.train_days, opts.test_days)?,
+        ));
+    }
+    if opts.load_dataset.is_none()
+        && opts.source == BacktestSource::Synthetic
+        && opts.eval_start_ms.is_none()
+        && opts.eval_end_ms.is_none()
+    {
+        return Ok(BacktestCommandOutcome::Single(Box::new(
+            bt.run_default_simulation()?,
+        )));
+    }
+    Ok(BacktestCommandOutcome::Single(Box::new(
+        bt.run_dataset(&dataset)?,
+    )))
+}
 
-    match opts.source {
-        BacktestSource::Synthetic => bt.run_default_simulation(),
-        BacktestSource::Db => {
-            let db = db_opt.ok_or_else(|| {
-                AegisError::Validation("MariaDB connection required for --source db".to_string())
-            })?;
-            let tf_str = opts.timeframe.as_str();
-            let bar_ms = timeframe_to_ms(tf_str).ok_or_else(|| {
-                AegisError::Validation(format!("Unsupported timeframe '{tf_str}'"))
-            })?;
-            let until_ms = now_ms();
-            let warmup_ms = (bt.config.warmup_bars as i64 + 12).saturating_mul(bar_ms);
-            let window_ms = (opts.days.max(5) as i64).saturating_mul(86_400_000);
-            let since_ms = until_ms.saturating_sub(window_ms.saturating_add(warmup_ms));
-
-            let assets = db.list_exchange_assets()?;
-            let bars_by_asset = db.get_ohlcv_bars_window(tf_str, since_ms, until_ms)?;
-            let funding_events = db.list_funding_events_window(since_ms, until_ms)?;
-            let min_bars = bt.config.warmup_bars.saturating_add(2);
-            let dataset = assemble_db_dataset(assets, bars_by_asset, funding_events, min_bars)?;
-            if let Some(ref save_path) = opts.save_dataset {
-                save_historical_dataset_json(save_path, &dataset)?;
-            }
-            bt.run_dataset(&dataset)
-        }
-        BacktestSource::Mainnet => {
-            let http = HyperliquidHttpClient::new(12);
-            let fetch_opts = MainnetHistoryFetchOptions {
-                days: opts.days,
-                timeframe: opts.timeframe.as_str().to_string(),
-                warmup_bars: opts.warmup_bars,
-                max_assets: opts.max_assets,
-            };
-            let raw = fetch_mainnet_raw_history(&http, &cfg, &fetch_opts)?;
-            let mut dataset =
-                assemble_db_dataset(raw.assets, raw.bars_by_asset, raw.funding_events, 24)?;
-            dataset.source = "mainnet".to_string();
-            dataset.eval_start_ms = Some(raw.eval_start_ms);
-            if let Some(ref save_path) = opts.save_dataset {
-                save_historical_dataset_json(save_path, &dataset)?;
-            }
-            bt.run_dataset(&dataset)
-        }
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_backtest_with_options(
+    db_opt: Option<&DatabaseManager>,
+    opts: BacktestRunOptions,
+) -> Result<BacktestReport> {
+    match run_backtest_command_with_options(db_opt, opts)? {
+        BacktestCommandOutcome::Single(rep) => Ok(*rep),
+        BacktestCommandOutcome::WalkForward(_) | BacktestCommandOutcome::SensitivityGrid(_) => Err(
+            AegisError::Validation("Expected single BacktestReport outcome".to_string()),
+        ),
     }
 }
 
@@ -748,6 +969,19 @@ fn run_backtest_blocking(
             risk_per_trade_pct: None,
             save_dataset: None,
             load_dataset: None,
+            eval_start_ms: None,
+            eval_end_ms: None,
+            walk_forward_folds: None,
+            train_days: 14,
+            test_days: 7,
+            sensitivity_grid: false,
+            regime_budget_mult: None,
+            exit_confirm_bars: None,
+            suppress_flips: None,
+            net_exposure_cap: None,
+            maker_first_entries: None,
+            funding_timing: None,
+            max_entries_per_bar: None,
         },
     )
 }
@@ -1255,80 +1489,224 @@ async fn main() -> anyhow::Result<()> {
         risk_per_trade_pct,
         save_dataset,
         load_dataset,
+        eval_start_ms,
+        eval_end_ms,
+        walk_forward_folds,
+        train_days,
+        test_days,
+        sensitivity_grid,
+        regime_budget_mult,
+        exit_confirm_bars,
+        suppress_flips,
+        net_exposure_cap,
+        maker_first_entries,
+        funding_timing,
+        max_entries_per_bar,
     }) = cli.command.clone()
     {
         let anchor_clone = cli.db.clone();
-        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<BacktestReport> {
-            let requires_db = source == BacktestSource::Db && load_dataset.is_none();
-            let has_db_url = std::env::var("AEGIS_DB_URL")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty());
-            let db_opt = if requires_db || has_db_url {
-                Some(DatabaseManager::connect(anchor_clone.as_deref(), None)?)
-            } else {
-                None
-            };
-            let report = run_backtest_with_options(
-                db_opt.as_ref(),
-                BacktestRunOptions {
-                    days,
-                    source,
-                    timeframe,
-                    max_assets,
-                    warmup_bars,
-                    risk_tier,
-                    equity,
-                    profit_gate,
-                    max_open_positions,
-                    min_entry_interval_sec,
-                    stagnation_hours,
-                    risk_per_trade_pct,
-                    save_dataset,
-                    load_dataset,
-                },
-            )?;
-            Ok(report)
-        })
-        .await??;
+        let outcome =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<BacktestCommandOutcome> {
+                let requires_db = source == BacktestSource::Db && load_dataset.is_none();
+                let has_db_url = std::env::var("AEGIS_DB_URL")
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty());
+                let db_opt = if requires_db || has_db_url {
+                    Some(DatabaseManager::connect(anchor_clone.as_deref(), None)?)
+                } else {
+                    None
+                };
+                let outcome = run_backtest_command_with_options(
+                    db_opt.as_ref(),
+                    BacktestRunOptions {
+                        days,
+                        source,
+                        timeframe,
+                        max_assets,
+                        warmup_bars,
+                        risk_tier,
+                        equity,
+                        profit_gate,
+                        max_open_positions,
+                        min_entry_interval_sec,
+                        stagnation_hours,
+                        risk_per_trade_pct,
+                        save_dataset,
+                        load_dataset,
+                        eval_start_ms,
+                        eval_end_ms,
+                        walk_forward_folds,
+                        train_days,
+                        test_days,
+                        sensitivity_grid,
+                        regime_budget_mult,
+                        exit_confirm_bars,
+                        suppress_flips,
+                        net_exposure_cap,
+                        maker_first_entries,
+                        funding_timing,
+                        max_entries_per_bar,
+                    },
+                )?;
+                Ok(outcome)
+            })
+            .await??;
 
-        if cli.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else {
-            println!(
-                "AEGIS QUANT v{} // MULTI-SLEEVE WALK-FORWARD BACKTEST ({} days | tf={} | src={} | Tier={} {:.2}x)",
-                PLATFORM_VERSION,
-                report.days_evaluated,
-                report.timeframe,
-                source.as_str(),
-                report.risk_tier,
-                report.leverage_multiplier
-            );
-            println!(
-                "Equity  : ${:.2} -> ${:.2} USDC ({:+.2}%)",
-                report.initial_equity_usdc, report.final_equity_usdc, report.total_return_pct
-            );
-            println!(
-                "Metrics : Sharpe {:.2} | Sortino {:.2} | MaxDD {:.2}% | WinRate {:.1}% | PF {:.2} | Trades {}",
-                report.sharpe_ratio,
-                report.sortino_ratio,
-                report.max_drawdown_pct,
-                report.win_rate_pct,
-                report.profit_factor,
-                report.total_trades
-            );
-            println!(
-                "Sleeves : S1 Carry ${:+.2} | S2 Trend ${:+.2} | S3 Event ${:+.2}",
-                report.s1_attribution_usdc, report.s2_attribution_usdc, report.s3_attribution_usdc
-            );
-            println!(
-                "Costs   : Fees ${:.2} | Funding ${:+.2} | Stops {} | Stag {} | Assets {} | Bars {}",
-                report.total_fees_usdc,
-                report.total_funding_usdc,
-                report.stop_out_count,
-                report.stagnation_stop_count,
-                report.assets_evaluated,
-                report.bars_evaluated
-            );
+        match outcome {
+            BacktestCommandOutcome::Single(report) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "AEGIS QUANT v{} // MULTI-SLEEVE WALK-FORWARD BACKTEST ({} days | tf={} | src={} | Tier={} {:.2}x)",
+                        PLATFORM_VERSION,
+                        report.days_evaluated,
+                        report.timeframe,
+                        source.as_str(),
+                        report.risk_tier,
+                        report.leverage_multiplier
+                    );
+                    println!(
+                        "Equity  : ${:.2} -> ${:.2} USDC ({:+.2}%)",
+                        report.initial_equity_usdc,
+                        report.final_equity_usdc,
+                        report.total_return_pct
+                    );
+                    println!(
+                        "Metrics : Sharpe {:.2} | Sortino {:.2} | MaxDD {:.2}% | WinRate {:.1}% | PF {:.2} | Trades {}",
+                        report.sharpe_ratio,
+                        report.sortino_ratio,
+                        report.max_drawdown_pct,
+                        report.win_rate_pct,
+                        report.profit_factor,
+                        report.total_trades
+                    );
+                    println!(
+                        "Book    : Long {} ({:.1}% WR, ${:+.2}) | Short {} ({:.1}% WR, ${:+.2})",
+                        report.long_trades,
+                        report.long_win_rate,
+                        report.long_pnl_usdc,
+                        report.short_trades,
+                        report.short_win_rate,
+                        report.short_pnl_usdc
+                    );
+                    println!(
+                        "Sleeves : S1 Carry ${:+.2} | S2 Trend ${:+.2} | S3 Event ${:+.2}",
+                        report.s1_attribution_usdc,
+                        report.s2_attribution_usdc,
+                        report.s3_attribution_usdc
+                    );
+                    println!(
+                        "Costs   : Fees ${:.2} | Funding ${:+.2} | Stops {} | Stag {} | Assets {} | Bars {}",
+                        report.total_fees_usdc,
+                        report.total_funding_usdc,
+                        report.stop_out_count,
+                        report.stagnation_stop_count,
+                        report.assets_evaluated,
+                        report.bars_evaluated
+                    );
+                    if !report.regime_breakdown.is_empty() {
+                        println!("Regimes :");
+                        for (label, attr) in &report.regime_breakdown {
+                            println!(
+                                "  {:<20} bars={:<4} trades={:<3} WR={:>5.1}% Long=${:>+8.2} Short=${:>+8.2} Total=${:>+8.2}",
+                                label,
+                                attr.bars,
+                                attr.trades,
+                                attr.win_rate_pct,
+                                attr.long_pnl_usdc,
+                                attr.short_pnl_usdc,
+                                attr.total_pnl_usdc
+                            );
+                        }
+                    }
+                    if !report.exit_reason_breakdown.is_empty() {
+                        println!("Exits   :");
+                        for (reason, summary) in &report.exit_reason_breakdown {
+                            println!(
+                                "  {:<26} count={:<4} wins={:<3} WR={:>5.1}% Net=${:>+8.2}",
+                                reason,
+                                summary.count,
+                                summary.wins,
+                                summary.win_rate_pct,
+                                summary.net_pnl_usdc
+                            );
+                        }
+                    }
+                }
+            }
+            BacktestCommandOutcome::WalkForward(wf) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&wf)?);
+                } else {
+                    println!(
+                        "AEGIS QUANT v{} // ROLLING WALK-FORWARD ({} folds | train={}d | test={}d | src={})",
+                        PLATFORM_VERSION,
+                        wf.folds_requested,
+                        wf.train_days,
+                        wf.test_days,
+                        source.as_str()
+                    );
+                    println!(
+                        "OOS Agg : CompRet {:+.2}% | MeanRet {:+.2}% | MeanSharpe {:.2} | WorstDD {:.2}% | WinRate {:.1}% | PF {:.2} | Trades {}",
+                        wf.oos_compounded_return_pct,
+                        wf.oos_mean_return_pct,
+                        wf.oos_mean_sharpe,
+                        wf.oos_worst_drawdown_pct,
+                        wf.oos_win_rate_pct,
+                        wf.oos_profit_factor,
+                        wf.oos_total_trades
+                    );
+                    println!(
+                        "OOS Book: Long ${:+.2} | Short ${:+.2}",
+                        wf.oos_long_pnl_usdc, wf.oos_short_pnl_usdc
+                    );
+                    for fold in &wf.folds {
+                        println!(
+                            "  Fold {:<2}: Train {:>+6.2}% (Sh {:>5.2}) | Test {:>+6.2}% (Sh {:>5.2}, DD {:>5.2}%, PF {:>4.2}, Trades {})",
+                            fold.fold_index,
+                            fold.train_report.total_return_pct,
+                            fold.train_report.sharpe_ratio,
+                            fold.test_report.total_return_pct,
+                            fold.test_report.sharpe_ratio,
+                            fold.test_report.max_drawdown_pct,
+                            fold.test_report.profit_factor,
+                            fold.test_report.total_trades
+                        );
+                    }
+                }
+            }
+            BacktestCommandOutcome::SensitivityGrid(grid) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&grid)?);
+                } else {
+                    println!(
+                        "AEGIS QUANT v{} // 3x3 SENSITIVITY GRID (stagnation_hours x risk_per_trade_pct | src={})",
+                        PLATFORM_VERSION,
+                        source.as_str()
+                    );
+                    println!(
+                        "  {:>7} | {:>7} | {:>8} | {:>6} | {:>7} | {:>6} | {:>5} | {:>6} | {:>5} | {:>9} | {:>9}",
+                        "Stag(h)", "Risk(%)", "Ret(%)", "Sharpe", "MaxDD%", "PF", "WR%", "Trades", "Stag#", "Long$", "Short$"
+                    );
+                    for cell in &grid.cells {
+                        println!(
+                            "  {:>7.1} | {:>6.2}% | {:>+7.2}% | {:>6.2} | {:>6.2}% | {:>6.2} | {:>4.1}% | {:>6} | {:>5} | {:>+9.2} | {:>+9.2}",
+                            cell.stagnation_hours,
+                            cell.risk_per_trade_pct * 100.0,
+                            cell.total_return_pct,
+                            cell.sharpe_ratio,
+                            cell.max_drawdown_pct,
+                            cell.profit_factor,
+                            cell.win_rate_pct,
+                            cell.total_trades,
+                            cell.stagnation_stop_count,
+                            cell.long_pnl_usdc,
+                            cell.short_pnl_usdc
+                        );
+                    }
+                }
+            }
         }
         return Ok(());
     }
@@ -1529,6 +1907,19 @@ mod tests {
                 risk_per_trade_pct: None,
                 save_dataset: None,
                 load_dataset: None,
+                eval_start_ms: None,
+                eval_end_ms: None,
+                walk_forward_folds: None,
+                train_days: 14,
+                test_days: 7,
+                sensitivity_grid: false,
+                regime_budget_mult: None,
+                exit_confirm_bars: None,
+                suppress_flips: None,
+                net_exposure_cap: None,
+                maker_first_entries: None,
+                funding_timing: None,
+                max_entries_per_bar: None,
             })
         ));
 
@@ -1582,6 +1973,28 @@ mod tests {
             "/tmp/ds.json",
             "--load-dataset",
             "/tmp/ds_in.json",
+            "--eval-start-ms",
+            "1700000000000",
+            "--eval-end-ms",
+            "1700604800000",
+            "--walk-forward-folds",
+            "3",
+            "--train-days",
+            "21",
+            "--test-days",
+            "5",
+            "--regime-budget-mult",
+            "--exit-confirm-bars",
+            "2",
+            "--suppress-flips",
+            "true",
+            "--net-exposure-cap",
+            "0.60",
+            "--maker-first-entries",
+            "true",
+            "--funding-timing",
+            "--max-entries-per-bar",
+            "4",
         ])
         .unwrap();
         match cli_bt_mainnet.command {
@@ -1600,6 +2013,19 @@ mod tests {
                 risk_per_trade_pct,
                 save_dataset,
                 load_dataset,
+                eval_start_ms,
+                eval_end_ms,
+                walk_forward_folds,
+                train_days,
+                test_days,
+                sensitivity_grid,
+                regime_budget_mult,
+                exit_confirm_bars,
+                suppress_flips,
+                net_exposure_cap,
+                maker_first_entries,
+                funding_timing,
+                max_entries_per_bar,
             }) => {
                 assert_eq!(days, 7);
                 assert_eq!(source, BacktestSource::Mainnet);
@@ -1615,9 +2041,39 @@ mod tests {
                 assert_eq!(risk_per_trade_pct, Some(0.015));
                 assert_eq!(save_dataset, Some(PathBuf::from("/tmp/ds.json")));
                 assert_eq!(load_dataset, Some(PathBuf::from("/tmp/ds_in.json")));
+                assert_eq!(eval_start_ms, Some(1_700_000_000_000));
+                assert_eq!(eval_end_ms, Some(1_700_604_800_000));
+                assert_eq!(walk_forward_folds, Some(3));
+                assert_eq!(train_days, 21);
+                assert_eq!(test_days, 5);
+                assert!(!sensitivity_grid);
+                assert_eq!(regime_budget_mult, Some(true));
+                assert_eq!(exit_confirm_bars, Some(2));
+                assert_eq!(suppress_flips, Some(true));
+                assert_eq!(net_exposure_cap, Some(0.60));
+                assert_eq!(maker_first_entries, Some(true));
+                assert_eq!(funding_timing, Some(true));
+                assert_eq!(max_entries_per_bar, Some(4));
             }
             _ => panic!("expected Backtest command"),
         }
+
+        let cli_bt_grid = Cli::try_parse_from([
+            "aegis-quant",
+            "backtest",
+            "--sensitivity-grid",
+            "--regime-budget-mult",
+            "false",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli_bt_grid.command,
+            Some(Commands::Backtest {
+                sensitivity_grid: true,
+                regime_budget_mult: Some(false),
+                ..
+            })
+        ));
 
         assert!(Cli::try_parse_from([
             "aegis-quant",
@@ -1651,6 +2107,19 @@ mod tests {
             risk_per_trade_pct: None,
             save_dataset: None,
             load_dataset: None,
+            eval_start_ms: None,
+            eval_end_ms: None,
+            walk_forward_folds: None,
+            train_days: 14,
+            test_days: 7,
+            sensitivity_grid: false,
+            regime_budget_mult: None,
+            exit_confirm_bars: None,
+            suppress_flips: None,
+            net_exposure_cap: None,
+            maker_first_entries: None,
+            funding_timing: None,
+            max_entries_per_bar: None,
         };
 
         let mut cfg = ConfigMap::from_defaults();
@@ -1660,12 +2129,26 @@ mod tests {
         valid_opts.min_entry_interval_sec = Some(0);
         valid_opts.stagnation_hours = Some(12.5);
         valid_opts.risk_per_trade_pct = Some(0.015);
+        valid_opts.regime_budget_mult = Some(true);
+        valid_opts.exit_confirm_bars = Some(3);
+        valid_opts.suppress_flips = Some(true);
+        valid_opts.net_exposure_cap = Some(0.55);
+        valid_opts.maker_first_entries = Some(true);
+        valid_opts.funding_timing = Some(true);
+        valid_opts.max_entries_per_bar = Some(2);
         apply_backtest_config_overrides(&mut cfg, &valid_opts).unwrap();
         assert_eq!(cfg.get_i64("backtest_warmup_bars", 0), 480);
         assert_eq!(cfg.get_usize("max_open_positions", 0), 10);
         assert_eq!(cfg.get_i64("min_entry_interval_sec", -1), 0);
         assert!((cfg.get_f64("stagnation_time_stop_hours", -1.0) - 12.5).abs() < 1e-9);
         assert!((cfg.get_f64("risk_per_trade_equity_pct", -1.0) - 0.015).abs() < 1e-9);
+        assert!(cfg.get_bool("enable_regime_budget_multipliers", false));
+        assert_eq!(cfg.get_i64("signal_exit_confirm_bars", 0), 3);
+        assert!(cfg.get_bool("suppress_direct_flips", false));
+        assert!((cfg.get_f64("max_net_exposure_ratio_of_gross", -1.0) - 0.55).abs() < 1e-9);
+        assert!(cfg.get_bool("maker_first_low_urgency_entries", false));
+        assert!(cfg.get_bool("funding_entry_timing_enabled", false));
+        assert_eq!(cfg.get_usize("max_entries_per_bar", 0), 2);
 
         let bt = BacktestEngine::from_config_map(&cfg, 14);
         assert_eq!(bt.config.warmup_bars, 480);
@@ -1673,6 +2156,43 @@ mod tests {
         assert_eq!(bt.config.min_entry_interval_sec, 0);
         assert!((bt.config.risk_limits.stagnation_time_stop_hours - 12.5).abs() < 1e-9);
         assert!((bt.config.risk_limits.risk_per_trade_equity_pct - 0.015).abs() < 1e-9);
+        assert!(bt.config.maker_first_low_urgency_entries);
+        assert!(bt.config.funding_entry_timing_enabled);
+        assert_eq!(bt.config.max_entries_per_bar, 2);
+
+        // Tier-sync verification: Conservative -> 0.5% risk_per_trade & 0.15 max_single_asset_weight;
+        // Standard -> 1.0% & 0.15; Aggressive -> 1.5% & 0.20; Extreme -> 2.0% & 0.25;
+        // Explicit --risk-per-trade-pct must NOT be overwritten by --risk-tier sync.
+        for (tier_name, exp_risk, exp_max_w) in [
+            ("conservative", 0.005, 0.15),
+            ("standard", 0.010, 0.15),
+            ("aggressive", 0.015, 0.20),
+            ("extreme", 0.020, 0.25),
+        ] {
+            let mut tc = ConfigMap::from_defaults();
+            let topts = BacktestRunOptions {
+                risk_tier: Some(tier_name.to_string()),
+                ..base_opts()
+            };
+            apply_backtest_config_overrides(&mut tc, &topts).unwrap();
+            assert!(
+                (tc.get_f64("risk_per_trade_equity_pct", -1.0) - exp_risk).abs() < 1e-9,
+                "tier {tier_name} risk sync mismatch"
+            );
+            assert!(
+                (tc.get_f64("max_single_asset_weight", -1.0) - exp_max_w).abs() < 1e-9,
+                "tier {tier_name} max_single_asset_weight sync mismatch"
+            );
+        }
+        let mut override_tc = ConfigMap::from_defaults();
+        let override_opts = BacktestRunOptions {
+            risk_tier: Some("conservative".to_string()),
+            risk_per_trade_pct: Some(0.018),
+            ..base_opts()
+        };
+        apply_backtest_config_overrides(&mut override_tc, &override_opts).unwrap();
+        assert!((override_tc.get_f64("risk_per_trade_equity_pct", -1.0) - 0.018).abs() < 1e-9);
+        assert!((override_tc.get_f64("max_single_asset_weight", -1.0) - 0.15).abs() < 1e-9);
 
         // Boundary valid checks
         for (opts, exp_warmup, exp_stag) in [
@@ -1683,6 +2203,9 @@ mod tests {
                     min_entry_interval_sec: Some(0),
                     stagnation_hours: Some(0.0),
                     risk_per_trade_pct: Some(0.0),
+                    exit_confirm_bars: Some(1),
+                    net_exposure_cap: Some(0.10),
+                    max_entries_per_bar: Some(0),
                     ..base_opts()
                 },
                 1,
@@ -1695,6 +2218,9 @@ mod tests {
                     min_entry_interval_sec: Some(86_400),
                     stagnation_hours: Some(168.0),
                     risk_per_trade_pct: Some(0.05),
+                    exit_confirm_bars: Some(5),
+                    net_exposure_cap: Some(1.0),
+                    max_entries_per_bar: Some(100),
                     ..base_opts()
                 },
                 500,
@@ -1710,7 +2236,7 @@ mod tests {
             );
         }
 
-        // Out-of-range / non-finite validation errors
+        // Out-of-range / non-finite / incompatible validation errors
         let invalid_cases = [
             BacktestRunOptions {
                 warmup_bars: 0,
@@ -1768,6 +2294,44 @@ mod tests {
                 risk_per_trade_pct: Some(f64::NEG_INFINITY),
                 ..base_opts()
             },
+            BacktestRunOptions {
+                exit_confirm_bars: Some(0),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                exit_confirm_bars: Some(6),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                net_exposure_cap: Some(0.09),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                net_exposure_cap: Some(1.01),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                net_exposure_cap: Some(f64::NAN),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                max_entries_per_bar: Some(101),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                eval_start_ms: Some(2_000),
+                eval_end_ms: Some(2_000),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                sensitivity_grid: true,
+                walk_forward_folds: Some(2),
+                ..base_opts()
+            },
+            BacktestRunOptions {
+                walk_forward_folds: Some(0),
+                ..base_opts()
+            },
         ];
         for opts in invalid_cases {
             let mut c = ConfigMap::from_defaults();
@@ -1776,6 +2340,39 @@ mod tests {
                 Err(AegisError::Validation(_))
             ));
         }
+
+        // End-to-end execution via CLI runner: sensitivity grid + walk-forward folds
+        let grid_out = run_backtest_command_with_options(
+            None,
+            BacktestRunOptions {
+                days: 10,
+                warmup_bars: 24,
+                sensitivity_grid: true,
+                ..base_opts()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            grid_out,
+            BacktestCommandOutcome::SensitivityGrid(ref g) if g.cells.len() == 9
+        ));
+
+        let wf_out = run_backtest_command_with_options(
+            None,
+            BacktestRunOptions {
+                days: 28,
+                warmup_bars: 24,
+                walk_forward_folds: Some(2),
+                train_days: 14,
+                test_days: 7,
+                ..base_opts()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            wf_out,
+            BacktestCommandOutcome::WalkForward(ref w) if w.folds.len() == 2
+        ));
     }
 
     #[test]
