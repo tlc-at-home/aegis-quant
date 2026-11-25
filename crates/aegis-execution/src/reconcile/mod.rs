@@ -33,7 +33,7 @@ use aegis_core::{
     extract_hl_oid, mask_identifier, now_ms, CachedHlPortfolioPnl, ConfigMap, ExchangeAsset,
     ExecutionMode, HeldAssetView, Result, VaultInfoPayload,
 };
-use aegis_db::DatabaseManager;
+use aegis_db::{BarUpsertInput, DatabaseManager};
 use aegis_risk::RiskLimitsConfig;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,56 @@ impl CutoverReconciler {
             meta_catalog = Some(fetch_meta_catalog_unlocked(&self.http, &cfg));
         }
 
+        // Pre-fetch/synthesize signal_timeframe ATR bars unlocked for exchange-adopted holdings
+        let signal_tf_raw = cfg.get_str("signal_timeframe", "4h");
+        let wall_clock_norm = cfg.get_bool("wall_clock_normalize_indicators", true);
+        let (atr_tf, atr_query_limit, _, _) =
+            crate::engine::atr_params_for_timeframe(&signal_tf_raw, wall_clock_norm);
+        let mut prefetched_bars_by_coin: HashMap<String, Vec<BarUpsertInput>> = HashMap::new();
+        let use_live_candles = crate::engine::is_live_exchange_active(&self.db, &cfg);
+        for prep in &prepared_positions {
+            if prep.closed_on_exchange {
+                continue;
+            }
+            if let Some(asset) = assets_by_symbol
+                .get(&prep.symbol.to_ascii_uppercase())
+                .or_else(|| assets_by_symbol.get(&prep.coin_upper))
+            {
+                let _ = crate::engine::resolve_signal_matched_atr_unlocked(
+                    &self.db,
+                    &self.http,
+                    Some(asset),
+                    asset.id,
+                    &cfg,
+                    prep.mark_px,
+                    limits.protective_stop_default_pct,
+                );
+            } else {
+                let meta = meta_catalog
+                    .as_ref()
+                    .and_then(|m| m.get(&prep.coin_upper).copied())
+                    .unwrap_or((0, 2, 20.0));
+                let temp_asset = positions::synthetic_asset_from_meta(
+                    &prep.coin,
+                    &prep.symbol,
+                    prep.mark_px,
+                    meta,
+                );
+                let bars = crate::market_watcher::MarketWatcher::fetch_or_synthesize_bars_for_db(
+                    &self.db,
+                    &self.http,
+                    &temp_asset,
+                    &atr_tf,
+                    atr_query_limit.max(72),
+                    use_live_candles,
+                    &cfg,
+                );
+                if !bars.is_empty() {
+                    prefetched_bars_by_coin.insert(prep.coin_upper.clone(), bars);
+                }
+            }
+        }
+
         // Phase 3: Short lock (<10ms) re-validating execution_mode and committing DB state
         let (post_cfg, tpsl_syncs) = {
             let _exec_guard = acquire_execution_lock();
@@ -532,6 +582,7 @@ impl CutoverReconciler {
                     should_run_ledger_replay,
                     meta_catalog.as_ref(),
                     &mut assets_by_symbol,
+                    &prefetched_bars_by_coin,
                     &in_flight_positions,
                     close_legacy_positions,
                     &mut report.details,

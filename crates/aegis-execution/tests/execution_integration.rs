@@ -2,14 +2,17 @@
 
 use aegis_core::{now_ms, ConfigMap, OrderSide, RiskTier};
 use aegis_db::{
-    AssetUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput, OidUpdate,
+    AssetUpsertInput, BarUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput, OidUpdate,
     SnapshotInsertInput,
 };
-use aegis_execution::{ChaseStepOutcome, ExecutionEngine, NewWorkingOrderRequest};
-use aegis_risk::{RiskEngine, RiskLimitsConfig};
+use aegis_execution::{ChaseStepOutcome, EntryUrgency, ExecutionEngine, NewWorkingOrderRequest};
+use aegis_risk::{
+    compute_initial_protective_stop, RiskEngine, RiskLimitsConfig, StopEvaluationInput,
+};
 use aegis_signals::{
     allocate_multi_sleeve_weights, AllocatorConfig, CarryMomentumMetrics, MarketBreadthSnapshot,
-    SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP, ACTION_OPEN_LONG,
+    SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_FLIP, ACTION_INCREASE,
+    ACTION_OPEN_LONG, ACTION_REDUCE,
 };
 use aegis_test_support::mock_http::MockHttpServer;
 use aegis_test_support::mock_ws::MockWsServer;
@@ -79,6 +82,8 @@ fn test_3s_market_watcher_and_order_to_open_capital_lifecycle() {
             protective_stop_px: 176.80,
             reason: "LIVE_BREAKOUT_SURGE".to_string(),
             bypass_entry_interval: false,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
     assert!(pos_id > 0);
@@ -241,6 +246,8 @@ fn test_take_profit_trigger_exit_and_live_equity_preservation() {
             protective_stop_px: 174.00,
             reason: "TP_TEST_ENTRY".to_string(),
             bypass_entry_interval: false,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
 
@@ -575,6 +582,8 @@ fn test_symbol_scoped_action_flip_cooldown_bypass() {
             protective_stop_px: arb.mark_price * 0.95,
             reason: "TEST_COOLDOWN".to_string(),
             bypass_entry_interval: false,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap_err();
     assert!(err.to_string().contains("MIN_ENTRY_INTERVAL_COOLDOWN"));
@@ -1551,6 +1560,8 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
             protective_stop_px: 176.80,
             reason: "PARTIAL_FILL_TEST_SOL".to_string(),
             bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
 
@@ -1648,6 +1659,8 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
             protective_stop_px: 33.5,
             reason: "IOC_PARTIAL_FILL_TEST".to_string(),
             bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
     positions_state
@@ -1707,6 +1720,8 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
             protective_stop_px: 17.5,
             reason: "IOC_UNFILLED_PARTIAL_PROMOTE".to_string(),
             bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
     positions_state
@@ -1763,6 +1778,8 @@ fn test_order_chaser_partial_fill_grace_chases_remaining_and_finalizes() {
             protective_stop_px: 0.80,
             reason: "EXPIRED_PARTIAL_PROMOTE".to_string(),
             bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
     positions_state
@@ -1969,6 +1986,8 @@ fn test_pump_1tick_no_self_chase_and_unchanged_price_preserves_queue() {
             protective_stop_px: 0.002606,
             reason: "LIVE_BREAKOUT_SURGE".to_string(),
             bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
         })
         .unwrap();
 
@@ -2300,6 +2319,8 @@ fn test_l2book_passive_clamp_and_bad_alo_rejection_recovery_to_fill() {
                 protective_stop_px: 2.85,
                 reason: "BBO_CLAMP_TEST".to_string(),
                 bypass_entry_interval: true,
+                entry_urgency: EntryUrgency::ChaseToIoc,
+                is_scale_in: false,
             })
             .unwrap();
 
@@ -2345,6 +2366,8 @@ fn test_l2book_passive_clamp_and_bad_alo_rejection_recovery_to_fill() {
                 protective_stop_px: 0.002606,
                 reason: "REQUOTE_RECOVERY_TEST".to_string(),
                 bypass_entry_interval: true,
+                entry_urgency: EntryUrgency::ChaseToIoc,
+                is_scale_in: false,
             })
             .unwrap();
 
@@ -2406,6 +2429,8 @@ fn test_l2book_passive_clamp_and_bad_alo_rejection_recovery_to_fill() {
                 protective_stop_px: 0.002606,
                 reason: "IOC_RECOVERY_TEST".to_string(),
                 bypass_entry_interval: true,
+                entry_urgency: EntryUrgency::ChaseToIoc,
+                is_scale_in: false,
             })
             .unwrap();
 
@@ -3181,6 +3206,8 @@ fn test_empty_private_key_in_live_testnet_fails_closed_for_alert_31() {
         protective_stop_px: 0.80,
         reason: "EMPTY_PK_BLOCK".to_string(),
         bypass_entry_interval: true,
+        entry_urgency: EntryUrgency::ChaseToIoc,
+        is_scale_in: false,
     });
     assert!(place_res.is_err());
 
@@ -6441,4 +6468,786 @@ fn test_wave3_spawn_background_runtime_ws_lifecycle_and_http_only_opt_out() {
     }
     assert!(!eng_ws.ws_cache.is_market_ws_connected());
     assert!(!eng_ws.ws_cache.is_user_ws_connected());
+}
+
+#[test]
+fn test_p0_1_4h_atr_parity_across_live_sites_and_1h_320bar_fetch() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    let db = fresh_isolated_db();
+    let now = now_ms();
+    let btc_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "BTC".to_string(),
+            asset_index: 0,
+            sz_decimals: 4,
+            tick_size: 0.01,
+            lot_step_size: 0.0001,
+            max_leverage: 40.0,
+            mark_price: 100.0,
+            mid_price: 100.0,
+            oracle_price: 100.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 50_000_000.0,
+            open_interest_usdc: 20_000_000.0,
+            prev_day_price: 99.0,
+            is_core_eligible: true,
+            is_event_eligible: false,
+            is_priority_watched: true,
+        })
+        .unwrap();
+    let btc = db.get_asset_by_id(btc_id).unwrap().unwrap();
+    let sol_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "SOL".to_string(),
+            asset_index: 2,
+            sz_decimals: 2,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+            max_leverage: 20.0,
+            mark_price: 100.0,
+            mid_price: 100.0,
+            oracle_price: 100.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 30_000_000.0,
+            open_interest_usdc: 10_000_000.0,
+            prev_day_price: 99.0,
+            is_core_eligible: false,
+            is_event_eligible: false,
+            is_priority_watched: true,
+        })
+        .unwrap();
+    let sol = db.get_asset_by_id(sol_id).unwrap().unwrap();
+
+    // Deliberately make 1h TR = 1.0 vs 4h TR = 2.0 on both BTC and SOL
+    let mut seed_bars = Vec::new();
+    for asset_id in [btc.id, sol.id] {
+        for i in (1..=64i64).rev() {
+            seed_bars.push(BarUpsertInput {
+                asset_id,
+                timeframe: "1h".to_string(),
+                timestamp_ms: now - i * 3_600_000,
+                open: 100.0,
+                high: 100.5,
+                low: 99.5,
+                close: 100.0,
+                volume: 1000.0,
+                funding_rate: 0.0,
+            });
+        }
+        for i in (1..=24i64).rev() {
+            seed_bars.push(BarUpsertInput {
+                asset_id,
+                timeframe: "4h".to_string(),
+                timestamp_ms: now - i * 14_400_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 4000.0,
+                funding_rate: 0.0,
+            });
+        }
+    }
+    db.upsert_ohlcv_bars(&seed_bars).unwrap();
+
+    let cfg = db.load_config().unwrap();
+    let limits = RiskLimitsConfig::from_config_map(&cfg);
+    let stop_4h_expected =
+        compute_initial_protective_stop(OrderSide::Long, 100.0, Some(2.0), 0.01, &limits);
+    let stop_1h_unscaled =
+        compute_initial_protective_stop(OrderSide::Long, 100.0, Some(1.0), 0.01, &limits);
+    assert!((stop_4h_expected - stop_1h_unscaled).abs() > 1.0);
+
+    let engine = ExecutionEngine::new(db.clone());
+
+    // Site 1 + Site 2: execute_signal_rebalance & place_working_order use 4h ATR (stop_4h_expected)
+    let mut sig = make_signal_input(&btc, 0.12, 0.0, ACTION_OPEN_LONG);
+    sig.mark_price = 100.0;
+    let reb = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb.working_orders_placed, 1);
+    let pid1 = reb.placed_position_ids[0];
+    let p_work = db.get_position_by_id(pid1).unwrap().unwrap();
+    assert!(
+        (p_work.protective_stop_px - stop_4h_expected).abs() < 1e-4,
+        "Site 1/2 stop {} != 4h {}",
+        p_work.protective_stop_px,
+        stop_4h_expected
+    );
+
+    // Site 3: advance_working_order fill in finalize_fill_to_open uses 4h ATR
+    let ord1 = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == pid1)
+        .unwrap();
+    db.update_asset_live_quote(btc.id, ord1.limit_price, ord1.limit_price)
+        .unwrap();
+    let fill_out = engine.chaser.advance_working_order(&ord1).unwrap();
+    let filled_px = match fill_out {
+        ChaseStepOutcome::FilledOpen { fill_price, .. } => fill_price,
+        other => panic!("expected fill, got {other:?}"),
+    };
+    let expected_fill_stop_4h =
+        compute_initial_protective_stop(OrderSide::Long, filled_px, Some(2.0), 0.01, &limits);
+    let p_open = db.get_position_by_id(pid1).unwrap().unwrap();
+    assert!(
+        (p_open.protective_stop_px - expected_fill_stop_4h).abs() < 1e-4,
+        "Site 3 stop {} != 4h {}",
+        p_open.protective_stop_px,
+        expected_fill_stop_4h
+    );
+
+    let eth_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "ETH".to_string(),
+            asset_index: 1,
+            sz_decimals: 3,
+            tick_size: 0.01,
+            lot_step_size: 0.001,
+            max_leverage: 25.0,
+            mark_price: 112.0,
+            mid_price: 112.0,
+            oracle_price: 112.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 40_000_000.0,
+            open_interest_usdc: 15_000_000.0,
+            prev_day_price: 100.0,
+            is_core_eligible: true,
+            is_event_eligible: false,
+            is_priority_watched: true,
+        })
+        .unwrap();
+    let eth = db.get_asset_by_id(eth_id).unwrap().unwrap();
+    let mut eth_bars = Vec::new();
+    for i in (1..=64i64).rev() {
+        eth_bars.push(BarUpsertInput {
+            asset_id: eth.id,
+            timeframe: "1h".to_string(),
+            timestamp_ms: now - i * 3_600_000,
+            open: 100.0,
+            high: 100.5,
+            low: 99.5,
+            close: 100.0,
+            volume: 1000.0,
+            funding_rate: 0.0,
+        });
+    }
+    for i in (1..=24i64).rev() {
+        eth_bars.push(BarUpsertInput {
+            asset_id: eth.id,
+            timeframe: "4h".to_string(),
+            timestamp_ms: now - i * 14_400_000,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 4000.0,
+            funding_rate: 0.0,
+        });
+    }
+    db.upsert_ohlcv_bars(&eth_bars).unwrap();
+
+    // Site 4: PriorityMonitor::run_1s_priority_tick uses 4h ATR & entry_r0 for Chandelier ratchet
+    db.close_position(pid1, filled_px, 0.0, "TEST_CLEANUP")
+        .unwrap();
+    let (pm_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: eth.id,
+            coin: "ETH",
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 112.0,
+            quantity: 1.0,
+            committed_notional_usdc: 112.0,
+            unrealized_pnl_usdc: 12.0,
+            portfolio_weight: 0.1,
+            protective_stop_px: p_open.protective_stop_px,
+            take_profit_px: 130.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 600_000),
+        })
+        .unwrap();
+    update_test_asset_px(&db, &eth, 112.0);
+    let held_before = db
+        .get_assets_held()
+        .unwrap()
+        .into_iter()
+        .find(|h| h.position_id == pm_pid)
+        .unwrap();
+    let risk = RiskEngine::from_config_map(&cfg);
+    let eval_4h = risk.evaluate_1s_position_lifecycle(&StopEvaluationInput {
+        side: OrderSide::Long,
+        entry_price: held_before.entry_price,
+        mark_price: 112.0,
+        quantity: held_before.quantity,
+        current_stop_px: held_before.protective_stop_px,
+        current_tp_px: held_before.take_profit_px,
+        highest_price_seen: 112.0,
+        lowest_price_seen: held_before.lowest_price_seen,
+        atr_opt: Some(2.0),
+        tick_size: 0.01,
+        check_tp: true,
+        held_duration_ms: Some(600_000),
+        entry_r0: (held_before.entry_r0 > 0.0).then_some(held_before.entry_r0),
+    });
+    let eval_1h = risk.evaluate_1s_position_lifecycle(&StopEvaluationInput {
+        atr_opt: Some(1.0),
+        side: OrderSide::Long,
+        entry_price: held_before.entry_price,
+        mark_price: 112.0,
+        quantity: held_before.quantity,
+        current_stop_px: held_before.protective_stop_px,
+        current_tp_px: held_before.take_profit_px,
+        highest_price_seen: 112.0,
+        lowest_price_seen: held_before.lowest_price_seen,
+        tick_size: 0.01,
+        check_tp: true,
+        held_duration_ms: Some(600_000),
+        entry_r0: (held_before.entry_r0 > 0.0).then_some(held_before.entry_r0),
+    });
+    engine.priority_monitor.run_1s_priority_tick().unwrap();
+    let held_after = db
+        .get_assets_held()
+        .unwrap()
+        .into_iter()
+        .find(|h| h.position_id == pm_pid)
+        .unwrap();
+    let expected_pm_stop = eval_4h.new_protective_stop_px;
+    assert!(eval_4h.stop_ratcheted);
+    assert!(
+        (held_after.protective_stop_px - expected_pm_stop).abs() < 1e-4,
+        "Site 4 ratchet {} != 4h {}",
+        held_after.protective_stop_px,
+        expected_pm_stop
+    );
+    if eval_1h.stop_ratcheted {
+        assert!((held_after.protective_stop_px - eval_1h.new_protective_stop_px).abs() > 0.5);
+    }
+    db.close_position(pm_pid, 112.0, 0.0, "TEST_CLEANUP")
+        .unwrap();
+
+    // Also verify Site 2 under signal_timeframe="1h" with wall_clock_normalize=true (56*1h * 2.0 == 4h)
+    // vs wall_clock_normalize=false (unscaled 1h ATR)
+    db.set_config_value("signal_timeframe", "1h", None).unwrap();
+    db.set_config_value("wall_clock_normalize_indicators", "true", None)
+        .unwrap();
+    let norm_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: sol.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 1.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.1,
+            s1_weight_contrib: 0.1,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.0,
+            reason: "1H_NORM_STOP".to_string(),
+            bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
+        })
+        .unwrap();
+    let p_norm = db.get_position_by_id(norm_pid).unwrap().unwrap();
+    assert!(
+        (p_norm.protective_stop_px - stop_4h_expected).abs() < 1e-4,
+        "1h wall-clock-normalized stop {} != 4h stop {}",
+        p_norm.protective_stop_px,
+        stop_4h_expected
+    );
+    db.cancel_working_order(norm_pid, "TEST_CLEANUP").unwrap();
+
+    db.set_config_value("wall_clock_normalize_indicators", "false", None)
+        .unwrap();
+    let unnorm_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: sol.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 1.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.1,
+            s1_weight_contrib: 0.1,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.0,
+            reason: "1H_UNNORM_STOP".to_string(),
+            bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
+        })
+        .unwrap();
+    let p_unnorm = db.get_position_by_id(unnorm_pid).unwrap().unwrap();
+    assert!((p_unnorm.protective_stop_px - stop_1h_unscaled).abs() < 1e-4);
+    db.cancel_working_order(unnorm_pid, "TEST_CLEANUP").unwrap();
+
+    // Site 5 (CutoverReconciler adoption) + evaluate_and_persist_signals (>=320 1h candle fetch)
+    let candle_span_hours = Arc::new(AtomicI64::new(0));
+    let span_clone = Arc::clone(&candle_span_hours);
+    let srv = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            match typ {
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "10000.0", "totalMarginUsed": "100.0", "withdrawable": "9900.0" },
+                        "assetPositions": [{
+                            "position": {
+                                "coin": "SOL",
+                                "szi": "1.0",
+                                "entryPx": "100.0",
+                                "positionValue": "100.0",
+                                "unrealizedPnl": "0.0",
+                                "cumFunding": { "sinceOpen": "0.0" }
+                            }
+                        }]
+                    }),
+                ),
+                "openOrders" | "frontendOpenOrders" | "userFillsByTime" | "userFunding" => {
+                    (200, json!([]))
+                }
+                "candleSnapshot" => {
+                    let s = body
+                        .pointer("/req/startTime")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let e = body
+                        .pointer("/req/endTime")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
+                    let hrs = (e - s) / 3_600_000;
+                    span_clone.store(hrs.max(span_clone.load(Ordering::SeqCst)), Ordering::SeqCst);
+                    (200, json!([]))
+                }
+                _ => (200, json!([])),
+            }
+        } else {
+            (
+                200,
+                json!({ "status": "ok", "response": { "type": "order", "data": { "statuses": [{ "resting": { "oid": 55501 } }] } } }),
+            )
+        }
+    });
+
+    db.set_config_value("signal_timeframe", "4h", None).unwrap();
+    configure_testnet_mock_db(&db, srv.port());
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+    let live_eng = ExecutionEngine::new(db.clone());
+    live_eng.reconciler.sync_db_with_hyperliquid().unwrap();
+    let adopted_sol = db
+        .list_active_positions_for_asset(sol.id)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.status == "OPEN")
+        .unwrap();
+    assert!(
+        (adopted_sol.protective_stop_px - stop_4h_expected).abs() < 1e-4,
+        "Site 5 adopted stop {} != 4h {}",
+        adopted_sol.protective_stop_px,
+        stop_4h_expected
+    );
+
+    // Switch to signal_timeframe="1h" with only 48 local 1h bars -> evaluate_and_persist_signals fetches >= 320 bars
+    db.set_config_value("signal_timeframe", "1h", None).unwrap();
+    let mut only_48_bars = Vec::new();
+    let arb_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "ARB".to_string(),
+            asset_index: 5,
+            sz_decimals: 1,
+            tick_size: 0.001,
+            lot_step_size: 0.1,
+            max_leverage: 10.0,
+            mark_price: 1.0,
+            mid_price: 1.0,
+            oracle_price: 1.0,
+            funding_rate_hourly: 0.0,
+            day_volume_usdc: 10_000_000.0,
+            open_interest_usdc: 2_000_000.0,
+            prev_day_price: 1.0,
+            is_core_eligible: true,
+            is_event_eligible: false,
+            is_priority_watched: true,
+        })
+        .unwrap();
+    let arb = db.get_asset_by_id(arb_id).unwrap().unwrap();
+    for i in (1..=48i64).rev() {
+        only_48_bars.push(BarUpsertInput {
+            asset_id: arb.id,
+            timeframe: "1h".to_string(),
+            timestamp_ms: now - i * 3_600_000,
+            open: 1.0,
+            high: 1.01,
+            low: 0.99,
+            close: 1.0,
+            volume: 1000.0,
+            funding_rate: 0.0,
+        });
+    }
+    db.upsert_ohlcv_bars(&only_48_bars).unwrap();
+    let _ = live_eng.evaluate_and_persist_signals(10_000.0).unwrap();
+    assert!(
+        candle_span_hours.load(Ordering::SeqCst) >= 320,
+        "evaluate_and_persist_signals must request >= 320 1h bars (got {})",
+        candle_span_hours.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn test_unbounded_sum_realized_pnl_and_scale_in_reduce_caps_bars() {
+    let db = fresh_isolated_db();
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+    let assets = db.list_exchange_assets().unwrap();
+    let sol = assets.iter().find(|a| a.coin == "SOL").unwrap().clone();
+    let eth = assets.iter().find(|a| a.coin == "ETH").unwrap().clone();
+    let avax = assets.iter().find(|a| a.coin == "AVAX").unwrap().clone();
+
+    // 1. Insert 210 closed positions ($10.00 each = $2,100.00 > 200-row cap)
+    for i in 0..210 {
+        let pid = db
+            .create_working_order(&aegis_db::WorkingOrderInput {
+                asset_id: avax.id,
+                client_order_id: format!("hist-pnl-{i}"),
+                side: OrderSide::Long,
+                limit_price: 35.0,
+                requested_quantity: 1.0,
+                reserved_margin_usdc: 20.0,
+                portfolio_weight: 0.01,
+                s1_weight_contrib: 0.01,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 30.0,
+                take_profit_px: Some(45.0),
+                exchange_order_id: None,
+                reason: "PNL_HIST".to_string(),
+            })
+            .unwrap();
+        db.promote_working_to_open(pid, 35.0, 1.0, 0.0, 30.0, Some(45.0), None, "FILL")
+            .unwrap();
+        db.close_position(pid, 45.0, 0.0, "TP").unwrap();
+    }
+    let engine = ExecutionEngine::new(db.clone());
+    let cfg0 = db.load_config().unwrap();
+    let base_eq = engine.resolve_effective_base_equity_usdc(&cfg0);
+    assert!(
+        (base_eq - 12_100.0).abs() < 1e-4,
+        "resolve_effective_base_equity_usdc must sum all 210 rows ($12,100), got {base_eq}"
+    );
+    let snap = engine.record_portfolio_snapshot(None, None).unwrap();
+    assert!(
+        (snap.total_equity_usdc - 12_100.0).abs() < 1e-4,
+        "snap={snap:?} base_eq={base_eq}"
+    );
+
+    // Clear cooldown from closes so avax can be traded later
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("risk_per_trade_equity_pct", "0.05", None)
+        .unwrap();
+
+    // 2. Test enforce_slot_spread_weight_cap (false default -> max_single_asset_weight 0.25 vs true -> capped)
+    db.set_config_value("max_open_positions", "12", None)
+        .unwrap();
+    // Target weight = 0.24 (< 0.25 max_single_asset_weight, > ((1.85/12)*1.25 = 0.1927))
+    let sig_cap_off = make_signal_input(&eth, 0.24, 0.0, ACTION_OPEN_LONG);
+    let reb_cap_off = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_cap_off]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_cap_off.working_orders_placed, 1);
+    let p_cap_off = db
+        .get_position_by_id(reb_cap_off.placed_position_ids[0])
+        .unwrap()
+        .unwrap();
+    assert!(p_cap_off.portfolio_weight > 0.20);
+    db.cancel_working_order(p_cap_off.id, "TEST_CLEANUP")
+        .unwrap();
+
+    db.set_config_value("enforce_slot_spread_weight_cap", "true", None)
+        .unwrap();
+    let sig_cap_on = make_signal_input(&eth, 0.24, 0.0, ACTION_OPEN_LONG);
+    let reb_cap_on = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_cap_on]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_cap_on.working_orders_placed, 1);
+    let p_cap_on = db
+        .get_position_by_id(reb_cap_on.placed_position_ids[0])
+        .unwrap()
+        .unwrap();
+    assert!(
+        p_cap_on.portfolio_weight <= 0.195,
+        "slot spread cap should restrict weight <= ~0.1927, got {}",
+        p_cap_on.portfolio_weight
+    );
+    db.cancel_working_order(p_cap_on.id, "TEST_CLEANUP")
+        .unwrap();
+    db.set_config_value("enforce_slot_spread_weight_cap", "false", None)
+        .unwrap();
+
+    // 3. Test ACTION_INCREASE with 1/1 max_open_positions occupied -> VWAP merge preserving entry_r0 & opened_at_ms
+    db.set_config_value("max_open_positions", "1", None)
+        .unwrap();
+    db.set_config_value("enable_scale_in_out_rebalance", "true", None)
+        .unwrap();
+    update_test_asset_px(&db, &sol, 100.0);
+    let t0 = now_ms() - 1_200_000;
+    let (base_sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: "SOL",
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 100.0,
+            quantity: 5.0,
+            committed_notional_usdc: 500.0,
+            unrealized_pnl_usdc: 0.0,
+            portfolio_weight: 0.05,
+            protective_stop_px: 95.5,
+            take_profit_px: 112.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(t0),
+        })
+        .unwrap();
+    let base_before = db.get_position_by_id(base_sol_pid).unwrap().unwrap();
+    let orig_entry_r0 = base_before.entry_r0;
+    assert!(orig_entry_r0 > 0.0);
+
+    update_test_asset_px(&db, &sol, 120.0);
+    let mut sol_fresh = sol.clone();
+    sol_fresh.mark_price = 120.0;
+    let sig_inc = make_signal_input(&sol_fresh, 0.12, 0.06, ACTION_INCREASE);
+    let reb_inc = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_inc]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_inc.working_orders_placed, 1);
+    let child_pid = reb_inc.placed_position_ids[0];
+    assert_ne!(child_pid, base_sol_pid);
+
+    // Fill the scale-in at 119.99 via OrderChaser -> merges into base_sol_pid
+    let child_ord = db
+        .get_assets_ordered()
+        .unwrap()
+        .into_iter()
+        .find(|o| o.position_id == child_pid)
+        .unwrap();
+    db.update_asset_live_quote(sol_fresh.id, child_ord.limit_price, child_ord.limit_price)
+        .unwrap();
+    let inc_fill_out = engine.chaser.advance_working_order(&child_ord).unwrap();
+    assert!(matches!(inc_fill_out, ChaseStepOutcome::FilledOpen { .. }));
+    let child_after = db.get_position_by_id(child_pid).unwrap().unwrap();
+    assert_eq!(child_after.status, "CLOSED");
+    assert_eq!(child_after.exit_reason.as_deref(), Some("SCALE_IN_MERGED"));
+
+    let parent_after = db.get_position_by_id(base_sol_pid).unwrap().unwrap();
+    assert_eq!(parent_after.status, "OPEN");
+    assert!((parent_after.filled_quantity - 10.0).abs() < 1e-6);
+    assert!((parent_after.entry_price - 109.995).abs() < 1e-3);
+    assert!((parent_after.entry_r0 - orig_entry_r0).abs() < 1e-8);
+    assert_eq!(parent_after.opened_at_ms, Some(t0));
+
+    // 4. Test ACTION_REDUCE partial exit on mature OPEN position
+    let mut sig_red = make_signal_input(&sol_fresh, 0.066, 0.11, ACTION_REDUCE);
+    sig_red.delta_weight = -0.044; // reduce 40% -> 4.0 of 10.0 -> remaining 6.0
+    let reb_red = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_red]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_red.positions_closed, 0);
+    let parent_red = db.get_position_by_id(base_sol_pid).unwrap().unwrap();
+    assert_eq!(parent_red.status, "OPEN");
+    assert!((parent_red.filled_quantity - 6.0).abs() < 1e-4);
+
+    // 5. Test max_entries_per_bar = 1 blocks additional entries within same bar window
+    let db_bar = fresh_isolated_db();
+    seed_test_assets(&db_bar);
+    db_bar
+        .set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db_bar
+        .set_config_value("max_entries_per_bar", "1", None)
+        .unwrap();
+    let bar_assets = db_bar.list_exchange_assets().unwrap();
+    let bar_eth = bar_assets.iter().find(|a| a.coin == "ETH").unwrap().clone();
+    let bar_sol = bar_assets.iter().find(|a| a.coin == "SOL").unwrap().clone();
+    let bar_eng = ExecutionEngine::new(db_bar.clone());
+    let bar_ts = now_ms();
+    let sig_eth = make_signal_input(&bar_eth, 0.10, 0.0, ACTION_OPEN_LONG);
+    let r_bar1 = bar_eng
+        .execute_signal_rebalance_at(&make_signal_output(vec![sig_eth]), 10_000.0, Some(bar_ts))
+        .unwrap();
+    assert_eq!(r_bar1.working_orders_placed, 1);
+
+    let sig_sol2 = make_signal_input(&bar_sol, 0.10, 0.0, ACTION_OPEN_LONG);
+    let r_bar2 = bar_eng
+        .execute_signal_rebalance_at(&make_signal_output(vec![sig_sol2]), 10_000.0, Some(bar_ts))
+        .unwrap();
+    assert_eq!(r_bar2.working_orders_placed, 0);
+}
+
+#[test]
+fn test_n6_funding_entry_timing_defers_adverse_pre_settlement_without_l2_fetch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let l2_calls = Arc::new(AtomicUsize::new(0));
+    let l2_clone = Arc::clone(&l2_calls);
+
+    let srv = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            match typ {
+                "l2Book" => {
+                    l2_clone.fetch_add(1, Ordering::SeqCst);
+                    (
+                        200,
+                        json!({
+                            "levels": [
+                                [{ "px": "99.99", "sz": "10000" }],
+                                [{ "px": "100.01", "sz": "10000" }]
+                            ]
+                        }),
+                    )
+                }
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "10000.0", "totalMarginUsed": "0.0", "withdrawable": "10000.0" },
+                        "assetPositions": []
+                    }),
+                ),
+                _ => (200, json!([])),
+            }
+        } else {
+            (
+                200,
+                json!({ "status": "ok", "response": { "type": "order", "data": { "statuses": [{ "resting": { "oid": 77001 } }] } } }),
+            )
+        }
+    });
+
+    let db = fresh_isolated_db();
+    configure_testnet_mock_db(&db, srv.port());
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("funding_entry_timing_enabled", "true", None)
+        .unwrap();
+    db.set_config_value("funding_entry_defer_min_rate_hourly", "0.0001", None)
+        .unwrap();
+    db.set_config_value("funding_entry_defer_window_sec", "900", None)
+        .unwrap();
+
+    let sol_id = db
+        .upsert_exchange_asset(&AssetUpsertInput {
+            raw_symbol_or_coin: "SOL".to_string(),
+            asset_index: 2,
+            sz_decimals: 2,
+            tick_size: 0.01,
+            lot_step_size: 0.01,
+            max_leverage: 20.0,
+            mark_price: 100.0,
+            mid_price: 100.0,
+            oracle_price: 100.0,
+            funding_rate_hourly: 0.0005, // adverse for LONG (+5 bps/hr >= 1 bps/hr)
+            day_volume_usdc: 20_000_000.0,
+            open_interest_usdc: 5_000_000.0,
+            prev_day_price: 99.0,
+            is_core_eligible: true,
+            is_event_eligible: false,
+            is_priority_watched: true,
+        })
+        .unwrap();
+    let sol = db.get_asset_by_id(sol_id).unwrap().unwrap();
+    let now = now_ms();
+    let bars: Vec<BarUpsertInput> = (1..=20i64)
+        .rev()
+        .map(|i| BarUpsertInput {
+            asset_id: sol.id,
+            timeframe: "4h".to_string(),
+            timestamp_ms: now - i * 14_400_000,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1000.0,
+            funding_rate: 0.0005,
+        })
+        .collect();
+    db.upsert_ohlcv_bars(&bars).unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    let base_hour_ms = (now - now.rem_euclid(3_600_000)) + 3_600_000;
+
+    // 1. At :50 (600s <= 900s before UTC :00 settlement), adverse LONG must defer with 0 L2 REST calls
+    let sig_long = make_signal_input(&sol, 0.10, 0.0, ACTION_OPEN_LONG);
+    let r_defer = engine
+        .execute_signal_rebalance_at(
+            &make_signal_output(vec![sig_long.clone()]),
+            10_000.0,
+            Some(base_hour_ms + 50 * 60_000),
+        )
+        .unwrap();
+    assert_eq!(r_defer.working_orders_placed, 0);
+    assert_eq!(
+        l2_calls.load(Ordering::SeqCst),
+        0,
+        "N6 deferral must happen BEFORE L2 liquidity REST fetch"
+    );
+
+    // 2. Confirmed ACTION_FLIP bypasses N6 deferral even at :50
+    let (short_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: "SOL",
+            side: OrderSide::Short,
+            entry_price: 100.0,
+            mark_price: 100.0,
+            quantity: 1.0,
+            committed_notional_usdc: 100.0,
+            unrealized_pnl_usdc: 0.0,
+            portfolio_weight: -0.01,
+            protective_stop_px: 105.0,
+            take_profit_px: 90.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 1_200_000),
+        })
+        .unwrap();
+    let _ = short_pid;
+    let sig_flip = make_signal_input(&sol, 0.10, -0.01, ACTION_FLIP);
+    let r_flip = engine
+        .execute_signal_rebalance_at(
+            &make_signal_output(vec![sig_flip]),
+            10_000.0,
+            Some(base_hour_ms + 50 * 60_000),
+        )
+        .unwrap();
+    assert_eq!(r_flip.positions_closed, 1);
+    assert_eq!(r_flip.working_orders_placed, 1);
+    db.cancel_working_order(r_flip.placed_position_ids[0], "TEST_CLEANUP")
+        .unwrap();
+
+    // 3. At :05 (3300s > 900s before UTC :00), regular LONG entry is admitted normally
+    let r_open = engine
+        .execute_signal_rebalance_at(
+            &make_signal_output(vec![sig_long]),
+            10_000.0,
+            Some(base_hour_ms + 5 * 60_000),
+        )
+        .unwrap();
+    assert_eq!(r_open.working_orders_placed, 1);
 }

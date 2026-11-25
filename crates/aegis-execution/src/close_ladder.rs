@@ -520,6 +520,7 @@ pub fn submit_reduce_only_close_ladder(
                 req.position_id.unwrap_or(0),
                 now_ms()
             );
+            let cloid_hex = derive_hl_cloid_hex(&coid);
             let wire = OrderWire {
                 a: req.asset.asset_index,
                 b: close_is_buy,
@@ -532,7 +533,7 @@ pub fn submit_reduce_only_close_ladder(
                     }),
                     trigger: None,
                 },
-                c: Some(derive_hl_cloid_hex(&coid)),
+                c: Some(cloid_hex.clone()),
             };
 
             mutated_open_orders = true;
@@ -566,9 +567,98 @@ pub fn submit_reduce_only_close_ladder(
                         position_id = ?req.position_id,
                         symbol = %req.asset.symbol,
                         attempt,
+                        cloid = %cloid_hex,
                         error = %e,
-                        "Hyperliquid reduceOnly IOC close submission error"
+                        "Hyperliquid reduceOnly IOC close submission error; probing cloid/state"
                     );
+                    let wallet = cfg.get_str("wallet_address", "");
+                    let trimmed_wallet = wallet.trim();
+                    if !trimmed_wallet.is_empty() {
+                        match http.fetch_order_status_by_cloid(trimmed_wallet, &cloid_hex, cfg) {
+                            Ok(Some(st)) => {
+                                if st.filled_sz > 1e-9 {
+                                    let fill_px = if st.avg_px > 0.0 {
+                                        st.avg_px
+                                    } else if st.limit_px > 0.0 {
+                                        st.limit_px
+                                    } else {
+                                        limit_px
+                                    };
+                                    let est_fee = round_dp(
+                                        fill_px * st.filled_sz * (req.taker_fee_bps / 10_000.0),
+                                        4,
+                                    );
+                                    let eoid = (st.oid > 0).then(|| format!("hl-{}", st.oid));
+                                    let ack = ExchangeOrderAck {
+                                        accepted: true,
+                                        status: "FILLED".to_string(),
+                                        exchange_order_id: eoid,
+                                        filled_quantity: st.filled_sz,
+                                        avg_fill_price: fill_px,
+                                        fee_usdc: est_fee,
+                                        raw_error: None,
+                                    };
+                                    if fills.record_fill(ack, limit_px, lot) {
+                                        fully_closed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(None) | Err(_) => {
+                                if let Ok(ch_state) =
+                                    http.fetch_clearinghouse_state(trimmed_wallet, cfg)
+                                {
+                                    let mut live_szi = 0.0_f64;
+                                    if let Some(arr) =
+                                        ch_state.get("assetPositions").and_then(Value::as_array)
+                                    {
+                                        for item in arr {
+                                            let p = item.get("position").unwrap_or(item);
+                                            let coin = p
+                                                .get("coin")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .trim();
+                                            if coin.eq_ignore_ascii_case(&req.asset.coin) {
+                                                live_szi = parse_hl_f64(p.get("szi"));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    let same_dir = live_szi.abs() > 1e-9
+                                        && (live_szi > 0.0) == (req.live_szi > 0.0);
+                                    let filled_delta = if !same_dir {
+                                        fills.rem_qty
+                                    } else if live_szi.abs() < fills.rem_qty - lot * 0.5 {
+                                        (fills.rem_qty - live_szi.abs()).max(0.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    if filled_delta > 1e-9 {
+                                        let est_fee = round_dp(
+                                            limit_px
+                                                * filled_delta
+                                                * (req.taker_fee_bps / 10_000.0),
+                                            4,
+                                        );
+                                        let ack = ExchangeOrderAck {
+                                            accepted: true,
+                                            status: "FILLED".to_string(),
+                                            exchange_order_id: None,
+                                            filled_quantity: filled_delta,
+                                            avg_fill_price: limit_px,
+                                            fee_usdc: est_fee,
+                                            raw_error: None,
+                                        };
+                                        if fills.record_fill(ack, limit_px, lot) {
+                                            fully_closed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1080,5 +1170,129 @@ mod tests {
         assert_eq!(tracker.len(), 1);
         assert!(tracker.get(10).is_some());
         assert!(tracker.get(20).is_none());
+    }
+
+    #[test]
+    fn test_ambiguous_post_ioc_rung_probes_cloid_and_credits_partial_fill() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let asset = sample_sol_asset();
+        let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let captured_cloid: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let exchange_calls = Arc::new(AtomicUsize::new(0));
+        let cloid_queries = Arc::new(AtomicUsize::new(0));
+
+        let cap_clone = Arc::clone(&captured_cloid);
+        let ex_clone = Arc::clone(&exchange_calls);
+        let cq_clone = Arc::clone(&cloid_queries);
+
+        let srv = MockHttpServer::start(move |req| {
+            if req.path == "/exchange" {
+                let n = ex_clone.fetch_add(1, Ordering::SeqCst);
+                let sz = req
+                    .json_body
+                    .pointer("/action/orders/0/s")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0")
+                    .to_string();
+                let cloid = req
+                    .json_body
+                    .pointer("/action/orders/0/c")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if n == 0 {
+                    *cap_clone.lock() = Some(cloid);
+                    return MockHttpResponse::text(500, "text/plain", "gateway timeout");
+                }
+                // Rung 1 must request ONLY the remaining 0.6 (after probing 0.4 filled on Rung 0!)
+                return MockHttpResponse::ok_json(&json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{
+                                "filled": {
+                                    "totalSz": sz,
+                                    "avgPx": "99.7",
+                                    "oid": 7002
+                                }
+                            }]
+                        }
+                    }
+                }));
+            }
+            let typ = req
+                .json_body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if typ == "orderStatus" {
+                cq_clone.fetch_add(1, Ordering::SeqCst);
+                let oid_q = req
+                    .json_body
+                    .get("oid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if cap_clone.lock().as_deref() == Some(oid_q) {
+                    return MockHttpResponse::ok_json(&json!({
+                        "status": "order",
+                        "order": {
+                            "status": "canceled",
+                            "order": {
+                                "coin": "SOL",
+                                "oid": 7001u64,
+                                "limitPx": "99.9",
+                                "avgPx": "99.9",
+                                "origSz": "1.0",
+                                "sz": "0.6",
+                                "cloid": oid_q
+                            }
+                        }
+                    }));
+                }
+            }
+            MockHttpResponse::ok_json(&json!({ "status": "unknownOid" }))
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_testnet_url", srv.base_url());
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+        cfg.insert(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        );
+
+        let http = HyperliquidHttpClient::new(5);
+        let res = submit_reduce_only_close_ladder(
+            &http,
+            None,
+            pk,
+            &cfg,
+            &ReduceOnlyCloseLadderRequest {
+                asset: &asset,
+                position_id: Some(7),
+                live_szi: 1.0,
+                reference_mark_px: 100.0,
+                l2_bbo: Some((99.95, 100.05)),
+                taker_fee_bps: 4.5,
+                cloid_prefix: "v2-close",
+                max_slippage_pct: None,
+                allow_passive_fallback: false,
+                existing_open_orders: None,
+            },
+        )
+        .unwrap();
+
+        assert!(res.fully_closed);
+        assert_eq!(cloid_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(exchange_calls.load(Ordering::SeqCst), 2);
+        assert!((res.filled_qty - 1.0).abs() < 1e-6);
+        assert!((res.remaining_qty - 0.0).abs() < 1e-6);
+        // VWAP = (0.4 * 99.9 + 0.6 * 99.7) / 1.0 = 99.78
+        assert!((res.vwap_fill_price.unwrap() - 99.78).abs() < 1e-4);
     }
 }
