@@ -275,6 +275,7 @@ pub(crate) fn prepare_exchange_positions_unlocked(
                     asset,
                     position_id: pos_id,
                     live_szi: szi,
+                    pre_close_position_abs_qty: None,
                     reference_mark_px: mark_px,
                     l2_bbo,
                     taker_fee_bps,

@@ -301,12 +301,7 @@ impl BacktestEngine {
         self.run_walk_forward_internal(assets, bars_by_asset, false)
     }
 
-    fn run_walk_forward_internal(
-        &self,
-        assets: &[ExchangeAsset],
-        bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
-        pinned_warmup: bool,
-    ) -> Result<BacktestReport> {
+    fn build_signal_engine(&self) -> SignalEngine {
         let mut effective_cfg = if self.config.raw_config.0.is_empty() {
             ConfigMap::from_defaults()
         } else {
@@ -326,6 +321,20 @@ impl BacktestEngine {
         );
         let mut signal_engine = SignalEngine::from_config_map(&effective_cfg);
         signal_engine.config = self.config.allocator.clone();
+        // Keep direct BacktestConfig struct callers aligned with CLI / from_config_map callers.
+        signal_engine.config.max_open_positions = self.config.max_open_positions.clamp(1, 100);
+        signal_engine.config.wall_clock_normalize_indicators =
+            self.config.wall_clock_normalize_indicators;
+        signal_engine
+    }
+
+    fn run_walk_forward_internal(
+        &self,
+        assets: &[ExchangeAsset],
+        bars_by_asset: &HashMap<i64, Vec<OhlcvBar>>,
+        pinned_warmup: bool,
+    ) -> Result<BacktestReport> {
+        let signal_engine = self.build_signal_engine();
         let mut risk_limits = self.config.risk_limits.clone();
         risk_limits.maker_fee_bps = self.config.maker_fee_bps;
         risk_limits.taker_fee_bps = self.config.taker_fee_bps;
@@ -2065,5 +2074,15 @@ mod tests {
         assert_eq!(grid.cells.len(), 9);
         assert_eq!(grid.stagnation_hours_axis, vec![12.0, 16.0, 24.0]);
         assert_eq!(grid.risk_per_trade_pct_axis, vec![0.015, 0.020, 0.025]);
+
+        // 3. Direct BacktestConfig struct callers must sync max_open_positions & wall_clock_normalize_indicators
+        let direct_engine = BacktestEngine::new(BacktestConfig {
+            max_open_positions: 12,
+            wall_clock_normalize_indicators: false,
+            ..BacktestConfig::default()
+        });
+        let sig_eng = direct_engine.build_signal_engine();
+        assert_eq!(sig_eng.config.max_open_positions, 12);
+        assert!(!sig_eng.config.wall_clock_normalize_indicators);
     }
 }

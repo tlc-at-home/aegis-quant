@@ -39,6 +39,9 @@ pub struct ReduceOnlyCloseLadderRequest<'a> {
     pub asset: &'a ExchangeAsset,
     pub position_id: Option<i64>,
     pub live_szi: f64,
+    /// Pre-close absolute open position quantity for partial reductions (`ACTION_REDUCE`),
+    /// so `clearinghouseState` recovery compares against the pre-reduce size rather than `live_szi`.
+    pub pre_close_position_abs_qty: Option<f64>,
     pub reference_mark_px: f64,
     pub l2_bbo: Option<(f64, f64)>,
     pub taker_fee_bps: f64,
@@ -625,12 +628,21 @@ pub fn submit_reduce_only_close_ladder(
                                             }
                                         }
                                     }
+                                    let base_pos_qty = req
+                                        .pre_close_position_abs_qty
+                                        .filter(|q| q.is_finite() && *q > 0.0)
+                                        .map(|q| q.max(initial_qty))
+                                        .unwrap_or(initial_qty);
+                                    let expected_pre_rung_pos_qty =
+                                        (base_pos_qty - fills.fill_qty_sum).max(0.0);
                                     let same_dir = live_szi.abs() > 1e-9
                                         && (live_szi > 0.0) == (req.live_szi > 0.0);
                                     let filled_delta = if !same_dir {
                                         fills.rem_qty
-                                    } else if live_szi.abs() < fills.rem_qty - lot * 0.5 {
-                                        (fills.rem_qty - live_szi.abs()).max(0.0)
+                                    } else if live_szi.abs() < expected_pre_rung_pos_qty - lot * 0.5
+                                    {
+                                        (expected_pre_rung_pos_qty - live_szi.abs())
+                                            .clamp(0.0, fills.rem_qty)
                                     } else {
                                         0.0
                                     };
@@ -1035,6 +1047,7 @@ mod tests {
                 asset: &asset,
                 position_id: Some(77),
                 live_szi: 5.0, // closing LONG -> SELL
+                pre_close_position_abs_qty: None,
                 reference_mark_px: 100.0,
                 l2_bbo: Some((95.0, 105.0)), // bid 95.0 < band_lo 96.20 (un-crossable!)
                 taker_fee_bps: 4.5,
@@ -1064,6 +1077,7 @@ mod tests {
                 asset: &asset,
                 position_id: Some(78),
                 live_szi: 5.0,
+                pre_close_position_abs_qty: None,
                 reference_mark_px: 100.0,
                 l2_bbo: Some((96.20, 100.50)),
                 taker_fee_bps: 4.5,
@@ -1106,6 +1120,7 @@ mod tests {
                 asset: &asset,
                 position_id: Some(79),
                 live_szi: 5.0,
+                pre_close_position_abs_qty: None,
                 reference_mark_px: 100.0,
                 l2_bbo: Some((95.0, 105.0)),
                 taker_fee_bps: 4.5,
@@ -1276,6 +1291,7 @@ mod tests {
                 asset: &asset,
                 position_id: Some(7),
                 live_szi: 1.0,
+                pre_close_position_abs_qty: None,
                 reference_mark_px: 100.0,
                 l2_bbo: Some((99.95, 100.05)),
                 taker_fee_bps: 4.5,
@@ -1294,5 +1310,110 @@ mod tests {
         assert!((res.remaining_qty - 0.0).abs() < 1e-6);
         // VWAP = (0.4 * 99.9 + 0.6 * 99.7) / 1.0 = 99.78
         assert!((res.vwap_fill_price.unwrap() - 99.78).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_partial_reduce_double_fault_uses_pre_close_position_abs_qty() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let asset = sample_sol_asset();
+        let pk = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let exchange_calls = Arc::new(AtomicUsize::new(0));
+        let ch_queries = Arc::new(AtomicUsize::new(0));
+        let last_sz = Arc::new(parking_lot::Mutex::new(String::new()));
+
+        let ex_clone = Arc::clone(&exchange_calls);
+        let ch_clone = Arc::clone(&ch_queries);
+        let sz_clone = Arc::clone(&last_sz);
+
+        // Pre-reduce open position is 10.0 SOL; ACTION_REDUCE targets 4.0 SOL.
+        // Rung 0 fills 1.5 SOL (exchange drops 10.0 -> 8.5) then both /exchange and orderStatus fail.
+        // clearinghouseState sees szi=8.5, so Rung 1 must submit ONLY the remaining 2.5 SOL.
+        let srv = MockHttpServer::start(move |req| {
+            if req.path == "/exchange" {
+                let n = ex_clone.fetch_add(1, Ordering::SeqCst);
+                let sz = req
+                    .json_body
+                    .pointer("/action/orders/0/s")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0")
+                    .to_string();
+                *sz_clone.lock() = sz.clone();
+                if n == 0 {
+                    return MockHttpResponse::text(500, "text/plain", "gateway timeout");
+                }
+                return MockHttpResponse::ok_json(&json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{
+                                "filled": {
+                                    "totalSz": sz,
+                                    "avgPx": "99.8",
+                                    "oid": 8002
+                                }
+                            }]
+                        }
+                    }
+                }));
+            }
+            let typ = req
+                .json_body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if typ == "clearinghouseState" {
+                ch_clone.fetch_add(1, Ordering::SeqCst);
+                return MockHttpResponse::ok_json(&json!({
+                    "assetPositions": [{
+                        "position": {
+                            "coin": "SOL",
+                            "szi": "8.5"
+                        }
+                    }]
+                }));
+            }
+            MockHttpResponse::ok_json(&json!({ "status": "unknownOid" }))
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_testnet_url", srv.base_url());
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+        cfg.insert(
+            "wallet_address",
+            "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+        );
+
+        let http = HyperliquidHttpClient::new(5);
+        let res = submit_reduce_only_close_ladder(
+            &http,
+            None,
+            pk,
+            &cfg,
+            &ReduceOnlyCloseLadderRequest {
+                asset: &asset,
+                position_id: Some(88),
+                live_szi: 4.0,
+                pre_close_position_abs_qty: Some(10.0),
+                reference_mark_px: 100.0,
+                l2_bbo: Some((99.95, 100.05)),
+                taker_fee_bps: 4.5,
+                cloid_prefix: "v2-reduce",
+                max_slippage_pct: None,
+                allow_passive_fallback: false,
+                existing_open_orders: None,
+            },
+        )
+        .unwrap();
+
+        assert!(res.fully_closed);
+        assert_eq!(ch_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(exchange_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(&*last_sz.lock(), "2.5");
+        assert!((res.filled_qty - 4.0).abs() < 1e-6);
+        assert!((res.remaining_qty - 0.0).abs() < 1e-6);
     }
 }

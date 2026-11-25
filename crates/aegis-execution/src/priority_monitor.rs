@@ -1605,6 +1605,7 @@ impl PriorityMonitor {
                             asset,
                             position_id: Some(held.position_id),
                             live_szi: effective_live_szi,
+                            pre_close_position_abs_qty: None,
                             reference_mark_px: exit_price,
                             l2_bbo,
                             taker_fee_bps,
