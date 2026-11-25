@@ -16,10 +16,17 @@ use crate::liquidity::{
     AssetLiquidityQuality, ATR_LOOKBACK_PERIOD,
 };
 use aegis_core::indicators::{
-    compute_annualized_vol_from_bars, compute_unfloored_atr, timeframe_to_ms,
+    compute_annualized_vol_from_bars, compute_unfloored_atr, infer_bar_hours, timeframe_to_ms,
 };
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use std::collections::HashMap;
+
+/// Per-asset consecutive bar confirmation state for Lever N2 signal-exit hysteresis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExitConfirmState {
+    pub count: u32,
+    pub last_bar_ts_ms: i64,
+}
 
 /// Stack-allocated causal 14-period RSI, 72-bar lookback range position, and bounce detector.
 #[inline]
@@ -47,13 +54,13 @@ pub(crate) fn compute_rsi_and_range_from_parts(
     }
 
     let rsi_14 = if bars_len >= 4 {
-        let mut closes = [0.0_f64; 16];
-        let copy_len = tail_closes.len().min(15);
+        let mut closes = [0.0_f64; 64];
+        let copy_len = tail_closes.len().min(63);
         closes[..copy_len].copy_from_slice(&tail_closes[tail_closes.len() - copy_len..]);
         let mut len = copy_len;
 
         let dup_tol = (live_px * 1e-6).max(1e-12);
-        if last_bar_close.is_none_or(|c| (live_px - c).abs() > dup_tol) {
+        if last_bar_close.is_none_or(|c| (live_px - c).abs() > dup_tol) && len < 64 {
             closes[len] = live_px;
             len += 1;
         }
@@ -97,14 +104,23 @@ pub(crate) fn compute_rsi_and_range_from_parts(
     (rsi_14, range_pos, bouncing_from_low)
 }
 
-/// Computes completed-bar 72-bar `(min_low, max_high)` and trailing 15-close chronological tail on the stack.
+/// Computes completed-bar wall-clock-normalized range bounds and trailing chronological closes on the stack.
 #[inline]
-pub(crate) fn compute_range_bounds_and_rsi_tail(bars: &[OhlcvBar]) -> (f64, f64, [f64; 15], usize) {
+pub(crate) fn compute_range_bounds_and_rsi_tail_with_mult(
+    bars: &[OhlcvBar],
+    mult: f64,
+) -> (f64, f64, [f64; 64], usize) {
     if bars.is_empty() {
-        return (f64::MAX, f64::MIN, [0.0; 15], 0);
+        return (f64::MAX, f64::MIN, [0.0; 64], 0);
     }
+    let eff_mult = if mult.is_finite() && mult > 0.0 {
+        mult.clamp(0.25, 16.0)
+    } else {
+        1.0
+    };
     let end = bars.len().saturating_sub(1).max(1);
-    let range_lookback = end.min(72);
+    let max_range_bars = (72.0 * eff_mult).round().max(1.0) as usize;
+    let range_lookback = end.min(max_range_bars);
     let range_slice = &bars[end.saturating_sub(range_lookback)..end];
     let min_low = range_slice
         .iter()
@@ -117,16 +133,25 @@ pub(crate) fn compute_range_bounds_and_rsi_tail(bars: &[OhlcvBar]) -> (f64, f64,
         .map(|b| b.high.max(b.close))
         .fold(f64::MIN, f64::max);
 
-    let start_tail = bars.len().saturating_sub(15);
-    let mut tail = [0.0_f64; 15];
+    let rsi_period = (14.0 * eff_mult).round().clamp(4.0, 62.0) as usize;
+    let tail_cap = (rsi_period + 1).min(63);
+    let start_tail = bars.len().saturating_sub(tail_cap);
+    let mut tail = [0.0_f64; 64];
     let mut tail_len = 0usize;
     for b in &bars[start_tail..] {
-        if tail_len < 15 {
+        if tail_len < tail_cap {
             tail[tail_len] = b.close.max(1e-12);
             tail_len += 1;
         }
     }
     (min_low, max_high, tail, tail_len)
+}
+
+/// Computes completed-bar range bounds and trailing closes using inferred bar duration.
+#[inline]
+pub(crate) fn compute_range_bounds_and_rsi_tail(bars: &[OhlcvBar]) -> (f64, f64, [f64; 64], usize) {
+    let mult = (4.0 / infer_bar_hours(bars)).clamp(0.25, 16.0);
+    compute_range_bounds_and_rsi_tail_with_mult(bars, mult)
 }
 
 #[inline]
@@ -141,20 +166,25 @@ pub(crate) fn ema_step(prev: f64, val: f64, span: f64) -> f64 {
     alpha * v + (1.0 - alpha) * prev
 }
 
-/// Computes completed-bar EMA endpoints `(ema8, ema21, ema55, ema12)` in a single O(1)-memory pass.
+/// Computes completed-bar EMA endpoints `(ema8, ema21, ema55, ema12)` scaled by `mult` in O(1) memory.
 #[inline]
-fn compute_bar_emas(bars: &[OhlcvBar]) -> (f64, f64, f64, f64) {
+fn compute_bar_emas(bars: &[OhlcvBar], mult: f64) -> (f64, f64, f64, f64) {
     let Some(first) = bars.first() else {
         return (0.0, 0.0, 0.0, 0.0);
+    };
+    let eff_mult = if mult.is_finite() && mult > 0.0 {
+        mult.clamp(0.25, 16.0)
+    } else {
+        1.0
     };
     let c0 = first.close.max(1e-12);
     let init = if c0.is_finite() { c0 } else { 0.0 };
     let (mut e8, mut e21, mut e55, mut e12) = (init, init, init, init);
     let (a8, a21, a55, a12) = (
-        ema_alpha(8.0),
-        ema_alpha(21.0),
-        ema_alpha(55.0),
-        ema_alpha(12.0),
+        ema_alpha(8.0 * eff_mult),
+        ema_alpha(21.0 * eff_mult),
+        ema_alpha(55.0 * eff_mult),
+        ema_alpha(12.0 * eff_mult),
     );
     for b in &bars[1..] {
         let c = b.close.max(1e-12);
@@ -172,12 +202,13 @@ fn compute_bar_emas(bars: &[OhlcvBar]) -> (f64, f64, f64, f64) {
 }
 
 #[inline]
-fn hash_bars(bars: &[OhlcvBar]) -> u64 {
+fn hash_bars(bars: &[OhlcvBar], wall_clock_normalize: bool) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mix = |acc: &mut u64, val: u64| {
         *acc ^= val;
         *acc = acc.wrapping_mul(0x100000001b3);
     };
+    mix(&mut h, wall_clock_normalize as u64);
     mix(&mut h, bars.len() as u64);
     for b in bars {
         mix(&mut h, b.timestamp_ms as u64);
@@ -195,6 +226,11 @@ fn hash_bars(bars: &[OhlcvBar]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct CachedBarIndicators {
     pub bar_fingerprint: u64,
+    pub wall_clock_normalize: bool,
+    pub bar_hours: f64,
+    pub norm_mult: f64,
+    pub atr_4h_scale: f64,
+    pub last_bar_ts_ms: i64,
     pub bars_len: usize,
     pub last_bar_open: Option<f64>,
     pub last_bar_close: Option<f64>,
@@ -206,7 +242,7 @@ pub struct CachedBarIndicators {
     pub annualized_vol_opt: Option<f64>,
     pub min_low_72: f64,
     pub max_high_72: f64,
-    pub rsi_tail_closes: [f64; 15],
+    pub rsi_tail_closes: [f64; 64],
     pub rsi_tail_len: usize,
     pub ema8_bars: f64,
     pub ema21_bars: f64,
@@ -221,12 +257,13 @@ pub struct CachedBarIndicators {
     pub market_beta_opt: Option<f64>,
 }
 
-/// Cross-tick memoizer for closed-bar technical indicators (`Sec. 8`).
+/// Cross-tick memoizer for closed-bar technical indicators (`Sec. 8`) and N2 exit confirmation state.
 #[derive(Debug, Clone, Default)]
 pub struct BarCloseCache {
     entries: HashMap<i64, CachedBarIndicators>,
     btc_fingerprint: u64,
     btc_close_by_ts: HashMap<i64, f64>,
+    pub(crate) exit_confirm_by_asset: HashMap<i64, ExitConfirmState>,
 }
 
 impl BarCloseCache {
@@ -238,6 +275,7 @@ impl BarCloseCache {
         self.entries.clear();
         self.btc_fingerprint = 0;
         self.btc_close_by_ts.clear();
+        self.exit_confirm_by_asset.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -248,8 +286,12 @@ impl BarCloseCache {
         self.entries.is_empty()
     }
 
+    pub fn exit_confirm_state(&self, asset_id: i64) -> Option<ExitConfirmState> {
+        self.exit_confirm_by_asset.get(&asset_id).copied()
+    }
+
     fn get_or_build_btc_map(&mut self, btc_bars: &[OhlcvBar]) -> (u64, &HashMap<i64, f64>) {
-        let fp = hash_bars(btc_bars);
+        let fp = hash_bars(btc_bars, false);
         if fp != self.btc_fingerprint || (btc_bars.is_empty() && !self.btc_close_by_ts.is_empty()) {
             self.btc_close_by_ts.clear();
             self.btc_close_by_ts.reserve(btc_bars.len());
@@ -269,10 +311,14 @@ impl BarCloseCache {
         bars: &[OhlcvBar],
         btc_fp: u64,
         btc_close_by_ts: &HashMap<i64, f64>,
+        wall_clock_normalize: bool,
     ) -> CachedBarIndicators {
-        let fp = hash_bars(bars);
+        let fp = hash_bars(bars, wall_clock_normalize);
         if let Some(existing) = self.entries.get(&asset.id) {
-            if existing.bar_fingerprint == fp && existing.bars_len == bars.len() {
+            if existing.bar_fingerprint == fp
+                && existing.bars_len == bars.len()
+                && existing.wall_clock_normalize == wall_clock_normalize
+            {
                 if existing.btc_fingerprint == btc_fp {
                     return existing.clone();
                 }
@@ -285,15 +331,32 @@ impl BarCloseCache {
             }
         }
 
+        let bar_hours = if wall_clock_normalize {
+            infer_bar_hours(bars)
+        } else {
+            4.0
+        };
+        let norm_mult = if wall_clock_normalize {
+            (4.0 / bar_hours).clamp(0.25, 16.0)
+        } else {
+            1.0
+        };
+        let atr_4h_scale = if wall_clock_normalize {
+            (4.0 / bar_hours).sqrt().clamp(0.5, 4.0)
+        } else {
+            1.0
+        };
+
         let raw_atr = compute_unfloored_atr(bars, ATR_LOOKBACK_PERIOD);
         let unfloored_atr_finite = compute_finite_atr_core(bars, ATR_LOOKBACK_PERIOD);
         let (active_bars, window_bars) = count_trailing_active_bars(bars);
         let annualized_vol_opt = compute_annualized_vol_from_bars(bars);
         let (min_low_72, max_high_72, rsi_tail_closes, rsi_tail_len) =
-            compute_range_bounds_and_rsi_tail(bars);
-        let (ema8_bars, ema21_bars, ema55_bars, ema12_bars) = compute_bar_emas(bars);
+            compute_range_bounds_and_rsi_tail_with_mult(bars, norm_mult);
+        let (ema8_bars, ema21_bars, ema55_bars, ema12_bars) = compute_bar_emas(bars, norm_mult);
 
-        let lookback_20 = bars.len().min(20);
+        let vol_lookback_cap = (20.0 * norm_mult).round().max(1.0) as usize;
+        let lookback_20 = bars.len().min(vol_lookback_cap);
         let recent_20 = &bars[bars.len() - lookback_20..];
         let mut avg_vol_20_sum = 0.0;
         let mut avg_vol_20_count = 0usize;
@@ -315,7 +378,8 @@ impl BarCloseCache {
             .unwrap_or(0.0);
 
         let (channel_high_18, channel_low_18) = if bars.len() >= 10 {
-            let chan_len = bars.len().saturating_sub(1).clamp(4, 18);
+            let max_chan = (18.0 * norm_mult).round().max(4.0) as usize;
+            let chan_len = bars.len().saturating_sub(1).clamp(4, max_chan);
             let prior_slice = &bars[bars.len() - 1 - chan_len..bars.len() - 1];
             let ch = prior_slice.iter().map(|b| b.high).fold(f64::MIN, f64::max);
             let cl = prior_slice.iter().map(|b| b.low).fold(f64::MAX, f64::min);
@@ -324,14 +388,22 @@ impl BarCloseCache {
             (f64::MIN, f64::MAX)
         };
 
+        let lookback_24h = (6.0 * norm_mult).round().max(1.0) as usize;
         let market_beta_opt = compute_market_beta_from_map(bars, btc_close_by_ts, asset);
 
         let entry = CachedBarIndicators {
             bar_fingerprint: fp,
+            wall_clock_normalize,
+            bar_hours,
+            norm_mult,
+            atr_4h_scale,
+            last_bar_ts_ms: bars.last().map(|b| b.timestamp_ms).unwrap_or(0),
             bars_len: bars.len(),
             last_bar_open: bars.last().map(|b| b.open),
             last_bar_close: bars.last().map(|b| b.close),
-            fourth_from_last_close: bars.get(bars.len().saturating_sub(6)).map(|b| b.close),
+            fourth_from_last_close: bars
+                .get(bars.len().saturating_sub(lookback_24h))
+                .map(|b| b.close),
             raw_atr,
             unfloored_atr_finite,
             active_bars,
@@ -359,7 +431,7 @@ impl BarCloseCache {
 }
 
 #[inline]
-fn compute_finite_atr_core(bars: &[OhlcvBar], period: usize) -> Option<f64> {
+pub(crate) fn compute_finite_atr_core(bars: &[OhlcvBar], period: usize) -> Option<f64> {
     if bars.len() < 2 || period == 0 {
         return None;
     }
@@ -467,6 +539,10 @@ pub(crate) fn fallback_annualized_vol(asset: &ExchangeAsset) -> f64 {
 pub struct PrecomputedAssetFeatures {
     pub asset_id: i64,
     pub live_px: f64,
+    pub bar_hours: f64,
+    pub norm_mult: f64,
+    pub atr_4h_scale: f64,
+    pub last_bar_ts_ms: i64,
     pub bars_len: usize,
     pub last_bar_open: Option<f64>,
     pub last_bar_close: Option<f64>,
@@ -479,7 +555,7 @@ pub struct PrecomputedAssetFeatures {
     pub bouncing_from_low: bool,
     pub min_low_72: f64,
     pub max_high_72: f64,
-    pub rsi_tail_closes: [f64; 15],
+    pub rsi_tail_closes: [f64; 64],
     pub rsi_tail_len: usize,
     pub ema8_bars: f64,
     pub ema21_bars: f64,
@@ -503,12 +579,22 @@ pub struct CycleFeatureCache {
 }
 
 impl CycleFeatureCache {
-    /// Builds all shared per-cycle features in a single universe pass, using `bar_cache` to
-    /// skip closed-bar indicator recomputation across 3-second ticks when bars have not changed.
+    /// Builds all shared per-cycle features in a single universe pass with wall-clock normalization enabled.
     pub fn build<B: AsRef<[OhlcvBar]>>(
         assets: &[ExchangeAsset],
         bars_by_asset: &HashMap<i64, B>,
         bar_cache: &mut BarCloseCache,
+    ) -> Self {
+        Self::build_with_options(assets, bars_by_asset, bar_cache, true)
+    }
+
+    /// Builds all shared per-cycle features in a single universe pass, using `bar_cache` to
+    /// skip closed-bar indicator recomputation across 3-second ticks when bars have not changed.
+    pub fn build_with_options<B: AsRef<[OhlcvBar]>>(
+        assets: &[ExchangeAsset],
+        bars_by_asset: &HashMap<i64, B>,
+        bar_cache: &mut BarCloseCache,
+        wall_clock_normalize_indicators: bool,
     ) -> Self {
         let btc_bars: &[OhlcvBar] = assets
             .iter()
@@ -534,7 +620,13 @@ impl CycleFeatureCache {
                 .map(AsRef::as_ref)
                 .unwrap_or(&[]);
 
-            let cached = bar_cache.get_or_compute_asset(asset, bars, btc_fp, &btc_close_by_ts);
+            let cached = bar_cache.get_or_compute_asset(
+                asset,
+                bars,
+                btc_fp,
+                &btc_close_by_ts,
+                wall_clock_normalize_indicators,
+            );
 
             let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
                 asset.mark_price
@@ -552,6 +644,7 @@ impl CycleFeatureCache {
                 cached.raw_atr,
                 cached.active_bars,
                 cached.window_bars,
+                cached.bar_hours,
             );
 
             let safe_ref = if live_px.is_finite() && live_px > 0.0 {
@@ -562,6 +655,7 @@ impl CycleFeatureCache {
             let atr_floor = (safe_ref * 0.012).max(1e-8);
             let floored_atr = cached
                 .unfloored_atr_finite
+                .map(|raw| raw * cached.atr_4h_scale)
                 .unwrap_or(atr_floor)
                 .max(atr_floor);
 
@@ -625,6 +719,10 @@ impl CycleFeatureCache {
                 PrecomputedAssetFeatures {
                     asset_id: asset.id,
                     live_px,
+                    bar_hours: cached.bar_hours,
+                    norm_mult: cached.norm_mult,
+                    atr_4h_scale: cached.atr_4h_scale,
+                    last_bar_ts_ms: cached.last_bar_ts_ms,
                     bars_len: cached.bars_len,
                     last_bar_open: cached.last_bar_open,
                     last_bar_close: cached.last_bar_close,

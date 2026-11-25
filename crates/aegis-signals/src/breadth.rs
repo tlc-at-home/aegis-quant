@@ -3,6 +3,7 @@
 //! Computes `market_breadth_bull`, `market_beta_exposure`, and `market_regime_label`
 //! across the active Hyperliquid perpetual universe.
 
+use aegis_core::indicators::infer_bar_hours;
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +11,34 @@ use std::collections::HashMap;
 /// Minimum eligible coin count required before breadth regime gating activates,
 /// preventing small unit/smoke fixtures from self-blocking.
 pub const MIN_REGIME_GATE_COINS: i32 = 3;
+
+/// Canonical macro market regime variants emitted by cross-sectional breadth classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum MarketRegime {
+    CapitulationShock,
+    BullExpansion,
+    BullCarry,
+    BullTrend,
+    #[default]
+    NeutralRotation,
+    DefensiveChop,
+    BearContraction,
+}
+
+impl MarketRegime {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CapitulationShock => "CAPITULATION_SHOCK",
+            Self::BullExpansion => "BULL_EXPANSION",
+            Self::BullCarry => "BULL_CARRY",
+            Self::BullTrend => "BULL_TREND",
+            Self::NeutralRotation => "NEUTRAL_ROTATION",
+            Self::DefensiveChop => "DEFENSIVE_CHOP",
+            Self::BearContraction => "BEAR_CONTRACTION",
+        }
+    }
+}
 
 /// Cross-sectional market breadth and portfolio beta exposure snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,12 +60,36 @@ impl Default for MarketBreadthSnapshot {
     }
 }
 
-/// Configuration thresholds for breadth-driven directional entry gating (`P1-Strat`).
+/// Configuration thresholds for breadth-driven directional entry gating and N1 regime budget multipliers (`P1-Strat`, `N1`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct RegimeGateConfig {
     pub enable_breadth_regime_gate: bool,
     pub bull_block_shorts_threshold: f64,
     pub bear_block_longs_threshold: f64,
+    #[serde(default)]
+    pub enable_regime_budget_multipliers: bool,
+    #[serde(default = "default_chop_long_weight_mult")]
+    pub chop_long_weight_mult: f64,
+    #[serde(default = "default_chop_short_weight_mult")]
+    pub chop_short_weight_mult: f64,
+    #[serde(default = "default_neutral_long_weight_mult")]
+    pub neutral_long_weight_mult: f64,
+}
+
+fn default_chop_long_weight_mult() -> f64 {
+    0.50
+}
+
+fn default_chop_short_weight_mult() -> f64 {
+    0.65
+}
+
+fn default_neutral_long_weight_mult() -> f64 {
+    0.65
+}
+
+fn default_one() -> f64 {
+    1.0
 }
 
 impl Default for RegimeGateConfig {
@@ -45,18 +98,43 @@ impl Default for RegimeGateConfig {
             enable_breadth_regime_gate: true,
             bull_block_shorts_threshold: 0.68,
             bear_block_longs_threshold: 0.32,
+            enable_regime_budget_multipliers: false,
+            chop_long_weight_mult: 0.50,
+            chop_short_weight_mult: 0.65,
+            neutral_long_weight_mult: 0.65,
         }
     }
 }
 
-/// Active macro regime directional entry gate computed prior to sleeve normalization (`P1-Strat`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// Active macro regime directional entry gate and directional budget multipliers computed prior to sleeve normalization (`P1-Strat`, `N1`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegimeGateState {
     pub breadth_bull: f64,
     pub eligible_coin_count: i32,
     pub regime_label: String,
+    #[serde(default)]
+    pub regime: MarketRegime,
     pub block_new_shorts: bool,
     pub block_new_longs: bool,
+    #[serde(default = "default_one")]
+    pub long_weight_mult: f64,
+    #[serde(default = "default_one")]
+    pub short_weight_mult: f64,
+}
+
+impl Default for RegimeGateState {
+    fn default() -> Self {
+        Self {
+            breadth_bull: 0.0,
+            eligible_coin_count: 0,
+            regime_label: String::new(),
+            regime: MarketRegime::NeutralRotation,
+            block_new_shorts: false,
+            block_new_longs: false,
+            long_weight_mult: 1.0,
+            short_weight_mult: 1.0,
+        }
+    }
 }
 
 /// Computes `RegimeGateState` from cross-sectional breadth, eligible count, average funding, and capitulation count.
@@ -77,7 +155,8 @@ pub fn compute_regime_gate_state(
     } else {
         0.0
     };
-    let regime_label = classify_market_regime(eff_breadth, eff_funding, capitulation_count);
+    let regime = classify_market_regime_enum(eff_breadth, eff_funding, capitulation_count);
+    let regime_label = regime.as_str().to_string();
     let gate_active =
         cfg.enable_breadth_regime_gate && eligible_coin_count >= MIN_REGIME_GATE_COINS;
     let bull_thresh = if cfg.bull_block_shorts_threshold.is_finite() {
@@ -91,20 +170,59 @@ pub fn compute_regime_gate_state(
         0.32
     };
     let block_new_shorts =
-        gate_active && (eff_breadth >= bull_thresh || regime_label == "BULL_EXPANSION");
+        gate_active && (eff_breadth >= bull_thresh || regime == MarketRegime::BullExpansion);
     let block_new_longs = gate_active
         && (eff_breadth <= bear_thresh
             || matches!(
-                regime_label.as_str(),
-                "BEAR_CONTRACTION" | "CAPITULATION_SHOCK"
+                regime,
+                MarketRegime::BearContraction | MarketRegime::CapitulationShock
             ));
+
+    let (mut long_weight_mult, mut short_weight_mult) =
+        if cfg.enable_regime_budget_multipliers && gate_active && eligible_coin_count >= 3 {
+            let neutral_long = if cfg.neutral_long_weight_mult.is_finite() {
+                cfg.neutral_long_weight_mult.clamp(0.0, 1.0)
+            } else {
+                0.65
+            };
+            let chop_long = if cfg.chop_long_weight_mult.is_finite() {
+                cfg.chop_long_weight_mult.clamp(0.0, 1.0)
+            } else {
+                0.50
+            };
+            let chop_short = if cfg.chop_short_weight_mult.is_finite() {
+                cfg.chop_short_weight_mult.clamp(0.0, 1.0)
+            } else {
+                0.65
+            };
+            match regime {
+                MarketRegime::BullExpansion => (1.0, 0.0),
+                MarketRegime::BullCarry | MarketRegime::BullTrend => (1.0, 1.0),
+                MarketRegime::NeutralRotation => (neutral_long, 1.0),
+                MarketRegime::DefensiveChop => (chop_long, chop_short),
+                MarketRegime::BearContraction | MarketRegime::CapitulationShock => (0.0, 1.0),
+            }
+        } else {
+            (1.0, 1.0)
+        };
+    if cfg.enable_regime_budget_multipliers {
+        if block_new_longs {
+            long_weight_mult = 0.0;
+        }
+        if block_new_shorts {
+            short_weight_mult = 0.0;
+        }
+    }
 
     RegimeGateState {
         breadth_bull: eff_breadth,
         eligible_coin_count,
         regime_label,
+        regime,
         block_new_shorts,
         block_new_longs,
+        long_weight_mult,
+        short_weight_mult,
     }
 }
 
@@ -128,7 +246,12 @@ pub fn compute_preliminary_bull_breadth<B: AsRef<[OhlcvBar]>>(
         if let Some(bars_entry) = bars_by_asset.get(&asset.id) {
             let bars = bars_entry.as_ref();
             if bars.len() >= 4 {
-                let first = bars[bars.len().saturating_sub(6)].close.max(1e-12);
+                let bar_hours = infer_bar_hours(bars);
+                let mult = (4.0 / bar_hours).clamp(0.25, 16.0);
+                let lookback_24h = (6.0 * mult).round().max(1.0) as usize;
+                let first = bars[bars.len().saturating_sub(lookback_24h)]
+                    .close
+                    .max(1e-12);
                 let last = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
                     asset.mark_price
                 } else {
@@ -168,29 +291,40 @@ pub fn compute_preliminary_bull_breadth<B: AsRef<[OhlcvBar]>>(
     (breadth, eligible_count)
 }
 
+/// Classifies the macro market regime variant from cross-sectional breadth, average funding, and event triggers.
+pub fn classify_market_regime_enum(
+    market_breadth_bull: f64,
+    avg_funding_hourly: f64,
+    capitulation_count: usize,
+) -> MarketRegime {
+    if capitulation_count >= 2 && market_breadth_bull < 0.30 {
+        MarketRegime::CapitulationShock
+    } else if market_breadth_bull >= 0.68 {
+        MarketRegime::BullExpansion
+    } else if market_breadth_bull >= 0.55 {
+        if avg_funding_hourly > 0.00004 {
+            MarketRegime::BullCarry
+        } else {
+            MarketRegime::BullTrend
+        }
+    } else if market_breadth_bull <= 0.32 {
+        MarketRegime::BearContraction
+    } else if market_breadth_bull <= 0.45 {
+        MarketRegime::DefensiveChop
+    } else {
+        MarketRegime::NeutralRotation
+    }
+}
+
 /// Classifies the macro market regime label from cross-sectional breadth, average funding, and event triggers.
 pub fn classify_market_regime(
     market_breadth_bull: f64,
     avg_funding_hourly: f64,
     capitulation_count: usize,
 ) -> String {
-    if capitulation_count >= 2 && market_breadth_bull < 0.30 {
-        "CAPITULATION_SHOCK".to_string()
-    } else if market_breadth_bull >= 0.68 {
-        "BULL_EXPANSION".to_string()
-    } else if market_breadth_bull >= 0.55 {
-        if avg_funding_hourly > 0.00004 {
-            "BULL_CARRY".to_string()
-        } else {
-            "BULL_TREND".to_string()
-        }
-    } else if market_breadth_bull <= 0.32 {
-        "BEAR_CONTRACTION".to_string()
-    } else if market_breadth_bull <= 0.45 {
-        "DEFENSIVE_CHOP".to_string()
-    } else {
-        "NEUTRAL_ROTATION".to_string()
-    }
+    classify_market_regime_enum(market_breadth_bull, avg_funding_hourly, capitulation_count)
+        .as_str()
+        .to_string()
 }
 
 /// Finalizes the `MarketBreadthSnapshot` including portfolio-weighted beta exposure (`sum(w_i * beta_i)`).
@@ -418,5 +552,105 @@ mod tests {
         );
         assert!(!disabled.block_new_shorts);
         assert!(!disabled.block_new_longs);
+        assert!((disabled.long_weight_mult - 1.0).abs() < 1e-9);
+        assert!((disabled.short_weight_mult - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_n1_regime_budget_multipliers_and_1h_preliminary_breadth() {
+        let mut n1_cfg = RegimeGateConfig {
+            enable_regime_budget_multipliers: true,
+            ..RegimeGateConfig::default()
+        };
+
+        // Small universe (< 3) keeps (1.0, 1.0)
+        let small = compute_regime_gate_state(0.40, 2, 0.0, 0, &n1_cfg);
+        assert_eq!(small.long_weight_mult, 1.0);
+        assert_eq!(small.short_weight_mult, 1.0);
+
+        // All 7 regimes when N1 enabled and gate active
+        let bull_exp = compute_regime_gate_state(0.75, 5, 0.0, 0, &n1_cfg);
+        assert_eq!(bull_exp.regime, MarketRegime::BullExpansion);
+        assert_eq!(
+            (bull_exp.long_weight_mult, bull_exp.short_weight_mult),
+            (1.0, 0.0)
+        );
+
+        let bull_carry = compute_regime_gate_state(0.60, 5, 0.0001, 0, &n1_cfg);
+        assert_eq!(bull_carry.regime, MarketRegime::BullCarry);
+        assert_eq!(
+            (bull_carry.long_weight_mult, bull_carry.short_weight_mult),
+            (1.0, 1.0)
+        );
+
+        let bull_trend = compute_regime_gate_state(0.60, 5, 0.0, 0, &n1_cfg);
+        assert_eq!(bull_trend.regime, MarketRegime::BullTrend);
+        assert_eq!(
+            (bull_trend.long_weight_mult, bull_trend.short_weight_mult),
+            (1.0, 1.0)
+        );
+
+        let neutral = compute_regime_gate_state(0.50, 5, 0.0, 0, &n1_cfg);
+        assert_eq!(neutral.regime, MarketRegime::NeutralRotation);
+        assert_eq!(
+            (neutral.long_weight_mult, neutral.short_weight_mult),
+            (0.65, 1.0)
+        );
+
+        let chop = compute_regime_gate_state(0.40, 5, 0.0, 0, &n1_cfg);
+        assert_eq!(chop.regime, MarketRegime::DefensiveChop);
+        assert_eq!(
+            (chop.long_weight_mult, chop.short_weight_mult),
+            (0.50, 0.65)
+        );
+
+        let bear = compute_regime_gate_state(0.25, 5, 0.0, 0, &n1_cfg);
+        assert_eq!(bear.regime, MarketRegime::BearContraction);
+        assert_eq!((bear.long_weight_mult, bear.short_weight_mult), (0.0, 1.0));
+
+        let shock = compute_regime_gate_state(0.20, 5, 0.0, 3, &n1_cfg);
+        assert_eq!(shock.regime, MarketRegime::CapitulationShock);
+        assert_eq!(
+            (shock.long_weight_mult, shock.short_weight_mult),
+            (0.0, 1.0)
+        );
+
+        // Gate disabled -> (1.0, 1.0)
+        n1_cfg.enable_breadth_regime_gate = false;
+        let off = compute_regime_gate_state(0.40, 5, 0.0, 0, &n1_cfg);
+        assert_eq!((off.long_weight_mult, off.short_weight_mult), (1.0, 1.0));
+
+        // 1h 24h return lookback scales from 6 bars to 24 bars
+        let mut closes_1h = vec![100.0; 26];
+        // Bars 0..20 flat at 100, bar 2 (index len-24 = 2) is 100.0, bars 21..25 dip then recover to 105.0
+        for (i, c) in closes_1h.iter_mut().enumerate().skip(20) {
+            *c = if i == 20 { 110.0 } else { 105.0 };
+        }
+        let bars_1h: Vec<OhlcvBar> = closes_1h
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 100,
+                timeframe: "1h".to_string(),
+                timestamp_ms: 1_700_000_000_000 + (i as i64) * 3_600_000,
+                open: c,
+                high: c,
+                low: c,
+                close: c,
+                volume: 10_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            })
+            .collect();
+        let a = mk_asset(100, "BULL24H", 105.0, 100.0, 0.0, 5_000_000.0, true);
+        let mut map = HashMap::new();
+        map.insert(100, bars_1h);
+        // 24 bars back (index 2) is 100.0 -> 105.0 > 100.0 * 1.002 => bullish (1.0)!
+        // (Old 6 bars back index 20 was 110.0, which would falsely mark it bearish 0.0!)
+        let (b_1h, cnt) = compute_preliminary_bull_breadth(&[a], &map);
+        assert_eq!(cnt, 1);
+        assert!((b_1h - 1.0).abs() < 1e-9);
     }
 }

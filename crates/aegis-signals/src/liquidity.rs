@@ -8,7 +8,7 @@
 //!   (`kSHIB` `3/12`, `EIGEN` `0/12`), and produces a smooth `[0.0, 1.0]` `activity_scale` attenuation.
 
 use aegis_core::indicators::{
-    compute_one_tick_bps_opt, compute_unfloored_atr as core_compute_unfloored_atr,
+    compute_one_tick_bps_opt, compute_unfloored_atr as core_compute_unfloored_atr, infer_bar_hours,
 };
 use aegis_core::{ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
@@ -75,7 +75,7 @@ pub(crate) fn count_trailing_active_bars(bars: &[OhlcvBar]) -> (usize, usize) {
 }
 
 /// Evaluates bar-liveness, tick granularity, unfloored ATR vs friction, and smooth activity scaling
-/// from precomputed bar indicators (`raw_atr`, `active_bars`, `window_bars`).
+/// from precomputed bar indicators (`raw_atr`, `active_bars`, `window_bars`, `bar_hours`).
 pub(crate) fn evaluate_asset_liquidity_quality_with_bar_stats(
     asset: &ExchangeAsset,
     bars_len: usize,
@@ -83,6 +83,7 @@ pub(crate) fn evaluate_asset_liquidity_quality_with_bar_stats(
     raw_atr: f64,
     active_bars: usize,
     window_bars: usize,
+    bar_hours: f64,
 ) -> AssetLiquidityQuality {
     let live_px = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
         asset.mark_price
@@ -106,8 +107,14 @@ pub(crate) fn evaluate_asset_liquidity_quality_with_bar_stats(
         0.0
     };
 
+    let eff_bar_hours = if bar_hours.is_finite() && bar_hours > 0.0 {
+        bar_hours
+    } else {
+        4.0
+    };
+    let eff_min_raw_atr_bps = MIN_RAW_ATR_BPS * (eff_bar_hours / 4.0).sqrt().clamp(0.25, 2.0);
     let tick_ok = one_tick_bps_opt.is_some_and(|bps| bps <= MAX_ONE_TICK_BPS);
-    let min_atr_bps = (one_tick_bps * MIN_RAW_ATR_TICK_MULT).max(MIN_RAW_ATR_BPS);
+    let min_atr_bps = (one_tick_bps * MIN_RAW_ATR_TICK_MULT).max(eff_min_raw_atr_bps);
     let passes_quality = if live_px <= 0.0 || !tick_ok {
         false
     } else if bars_len >= MIN_BARS_FOR_LIVENESS_GATE {
@@ -154,6 +161,7 @@ pub fn evaluate_asset_liquidity_quality(
 ) -> AssetLiquidityQuality {
     let raw_atr = compute_unfloored_atr(bars, ATR_LOOKBACK_PERIOD);
     let (active_bars, window_bars) = count_trailing_active_bars(bars);
+    let bar_hours = infer_bar_hours(bars);
     evaluate_asset_liquidity_quality_with_bar_stats(
         asset,
         bars.len(),
@@ -161,6 +169,7 @@ pub fn evaluate_asset_liquidity_quality(
         raw_atr,
         active_bars,
         window_bars,
+        bar_hours,
     )
 }
 
@@ -365,5 +374,36 @@ mod tests {
             assert!(!q.passes_quality, "mark={bad_px} must fail quality");
             assert_eq!(q.activity_scale, 0.0);
         }
+    }
+
+    #[test]
+    fn test_1h_min_raw_atr_bps_scales_to_17_5_while_4h_keeps_35_and_tick_unscaled() {
+        let btc = mk_asset("BTC", 92_000.0, 1.0, 65_000_000.0);
+        // 22 bps 1h ATR clears 17.5 bps on 1h, but fails 35.0 bps on 4h
+        let bars_1h_pass = mk_bars(20, 12, 92_000.0, 22.0, 25_000.0);
+        assert!(evaluate_asset_liquidity_quality(&btc, &bars_1h_pass).passes_quality);
+
+        let bars_4h_fail: Vec<OhlcvBar> = bars_1h_pass
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let mut c = b.clone();
+                c.timeframe = "4h".to_string();
+                c.timestamp_ms = 1_700_000_000_000 + (i as i64) * 14_400_000;
+                c
+            })
+            .collect();
+        assert!(!evaluate_asset_liquidity_quality(&btc, &bars_4h_fail).passes_quality);
+
+        // 15 bps fails even on 1h (< 17.5 bps)
+        let bars_1h_fail = mk_bars(20, 12, 92_000.0, 15.0, 25_000.0);
+        assert!(!evaluate_asset_liquidity_quality(&btc, &bars_1h_fail).passes_quality);
+
+        // Microstructure 2.5 * one_tick_bps stays unscaled on 1h (12 bps tick -> 30 bps min ATR > 17.5 bps)
+        let coarse_tick = mk_asset("COARSE", 10.0, 0.012, 500_000.0);
+        let bars_25bps = mk_bars(20, 12, 10.0, 25.0, 25_000.0);
+        let bars_32bps = mk_bars(20, 12, 10.0, 32.0, 25_000.0);
+        assert!(!evaluate_asset_liquidity_quality(&coarse_tick, &bars_25bps).passes_quality);
+        assert!(evaluate_asset_liquidity_quality(&coarse_tick, &bars_32bps).passes_quality);
     }
 }

@@ -9,7 +9,7 @@ use crate::features::{
 };
 use crate::liquidity::{default_passes_quality, evaluate_asset_liquidity_quality};
 use crate::trend_breakout::compute_rsi_and_range_position;
-use aegis_core::indicators::{compute_annualized_vol_from_bars, top_k_normalized};
+use aegis_core::indicators::{compute_annualized_vol_from_bars, infer_bar_hours, top_k_normalized};
 use aegis_core::{round_dp, ExchangeAsset, OhlcvBar};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ pub fn compute_s1_momentum_score(
     asset: &ExchangeAsset,
     annualized_vol: f64,
 ) -> f64 {
-    compute_s1_momentum_score_with_rsi(bars, asset, annualized_vol, None)
+    compute_s1_momentum_score_with_rsi(bars, asset, annualized_vol, None, None)
 }
 
 #[inline]
@@ -72,6 +72,7 @@ fn compute_s1_momentum_score_with_rsi(
     asset: &ExchangeAsset,
     annualized_vol: f64,
     precomputed_rsi_range: Option<(f64, f64, bool)>,
+    norm_mult_opt: Option<f64>,
 ) -> f64 {
     let vol_norm = annualized_vol.max(0.20);
     if bars.len() >= 8 {
@@ -81,9 +82,13 @@ fn compute_s1_momentum_score_with_rsi(
         } else {
             bars[n - 1].close.max(1e-12)
         };
-        let fast_idx = n.saturating_sub(6);
-        let mid_idx = n.saturating_sub(18);
-        let slow_idx = n.saturating_sub(42);
+        let mult = norm_mult_opt.unwrap_or_else(|| (4.0 / infer_bar_hours(bars)).clamp(0.25, 16.0));
+        let fast_lookback = (6.0 * mult).round().max(1.0) as usize;
+        let mid_lookback = (18.0 * mult).round().max(1.0) as usize;
+        let slow_lookback = (42.0 * mult).round().max(1.0) as usize;
+        let fast_idx = n.saturating_sub(fast_lookback);
+        let mid_idx = n.saturating_sub(mid_lookback);
+        let slow_idx = n.saturating_sub(slow_lookback);
 
         let r_fast = (last_px / bars[fast_idx].close.max(1e-12)).ln();
         let r_mid = (last_px / bars[mid_idx].close.max(1e-12)).ln();
@@ -132,6 +137,7 @@ pub(crate) fn evaluate_sleeve_s1_with_features<B: AsRef<[OhlcvBar]>>(
     features: &CycleFeatureCache,
     regime_gate: &RegimeGateState,
     s1_budget: f64,
+    top_k: usize,
 ) -> HashMap<i64, CarryMomentumMetrics> {
     evaluate_sleeve_s1_inner(
         assets,
@@ -140,6 +146,7 @@ pub(crate) fn evaluate_sleeve_s1_with_features<B: AsRef<[OhlcvBar]>>(
         Some(features),
         regime_gate,
         s1_budget,
+        top_k,
     )
 }
 
@@ -157,6 +164,7 @@ pub fn evaluate_sleeve_s1<B: AsRef<[OhlcvBar]>>(
         None,
         &RegimeGateState::default(),
         s1_budget,
+        8,
     )
 }
 
@@ -167,6 +175,7 @@ fn evaluate_sleeve_s1_inner<B: AsRef<[OhlcvBar]>>(
     features_opt: Option<&CycleFeatureCache>,
     regime_gate: &RegimeGateState,
     s1_budget: f64,
+    top_k: usize,
 ) -> HashMap<i64, CarryMomentumMetrics> {
     struct RawS1Metric {
         asset_id: i64,
@@ -221,8 +230,14 @@ fn evaluate_sleeve_s1_inner<B: AsRef<[OhlcvBar]>>(
         };
 
         let rsi_range_opt = feat_opt.map(|f| (f.rsi_14, f.range_pos, f.bouncing_from_low));
-        let s1_mom_score =
-            compute_s1_momentum_score_with_rsi(bars, asset, annualized_vol, rsi_range_opt);
+        let norm_mult_opt = feat_opt.map(|f| f.norm_mult);
+        let s1_mom_score = compute_s1_momentum_score_with_rsi(
+            bars,
+            asset,
+            annualized_vol,
+            rsi_range_opt,
+            norm_mult_opt,
+        );
         let s1_carry_score = compute_s1_carry_score(asset.funding_rate_hourly, s1_mom_score);
 
         let last_px = feat_opt.map(|f| f.live_px).unwrap_or_else(|| {
@@ -310,7 +325,7 @@ fn evaluate_sleeve_s1_inner<B: AsRef<[OhlcvBar]>>(
         adjusted_scores.push((m.asset_id, adj, m.day_volume_usdc));
     }
 
-    let weights = top_k_normalized(&adjusted_scores, 8, budget);
+    let weights = top_k_normalized(&adjusted_scores, top_k.max(1), budget);
 
     let mut out = HashMap::with_capacity(raw_metrics.len());
     for m in raw_metrics {
@@ -838,5 +853,65 @@ mod tests {
         fallback_asset.prev_day_price = 104.0;
         let vol_fb = compute_annualized_vol(&bad_ts_bars, &fallback_asset);
         assert!((vol_fb - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_s1_1h_vs_4h_wall_clock_momentum_invariance() {
+        let base_ts = 1_700_000_000_000i64;
+        let step_4h = 14_400_000i64;
+        let step_1h = 3_600_000i64;
+        let r_4h = 1.008_f64;
+        let r_1h = r_4h.powf(0.25);
+
+        let mut bars_4h = Vec::with_capacity(50);
+        let mut px4 = 100.0;
+        for i in 0..50 {
+            let open = px4;
+            px4 *= r_4h;
+            bars_4h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "4h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * step_4h,
+                open,
+                high: px4 * 1.003,
+                low: open * 0.997,
+                close: px4,
+                volume: 50_000.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+
+        let mut bars_1h = Vec::with_capacity(200);
+        let mut px1 = 100.0;
+        for i in 0..200 {
+            let open = px1;
+            px1 *= r_1h;
+            bars_1h.push(OhlcvBar {
+                id: (i + 1) as i64,
+                asset_id: 1,
+                timeframe: "1h".to_string(),
+                timestamp_ms: base_ts + (i as i64) * step_1h,
+                open,
+                high: px1 * 1.0015,
+                low: open * 0.9985,
+                close: px1,
+                volume: 12_500.0,
+                funding_rate: 0.0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        }
+
+        let a4 = test_asset(1, "SOL", bars_4h.last().unwrap().close, 0.0);
+        let a1 = test_asset(1, "SOL", bars_1h.last().unwrap().close, 0.0);
+        let mom_4h = compute_s1_momentum_score(&bars_4h, &a4, 0.50);
+        let mom_1h = compute_s1_momentum_score(&bars_1h, &a1, 0.50);
+        assert!(
+            (mom_4h - mom_1h).abs() < 0.02,
+            "1h ({mom_1h}) and 4h ({mom_4h}) wall-clock S1 momentum must match"
+        );
     }
 }

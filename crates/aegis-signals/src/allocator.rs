@@ -8,6 +8,7 @@
 use crate::breadth::{RegimeGateConfig, RegimeGateState};
 use crate::carry_momentum::CarryMomentumMetrics;
 use crate::event_reversion::EventReversionMetrics;
+use crate::features::ExitConfirmState;
 use crate::liquidity::{compute_one_tick_bps, MAX_ONE_TICK_BPS, MIN_FALLBACK_DAY_VOLUME_USDC};
 use crate::trend_breakout::TrendBreakoutMetrics;
 use aegis_core::{round_dp, ConfigMap, CooldownAssetView, ExchangeAsset, RiskTier, SleeveSignal};
@@ -90,6 +91,8 @@ pub struct AllocatorConfig {
     pub max_gross_leverage_x: f64,
     pub max_single_asset_weight: f64,
     pub min_rebalance_delta_weight: f64,
+    #[serde(default = "default_max_open_positions")]
+    pub max_open_positions: usize,
     pub s1_carry_mom_budget: f64,
     pub s2_trend_breakout_budget: f64,
     pub s3_event_reversion_budget: f64,
@@ -99,12 +102,34 @@ pub struct AllocatorConfig {
     pub breadth_bull_block_shorts_threshold: f64,
     #[serde(default = "default_bear_block_longs")]
     pub breadth_bear_block_longs_threshold: f64,
+    #[serde(default = "default_true")]
+    pub wall_clock_normalize_indicators: bool,
+    #[serde(default = "default_true")]
+    pub s3_strict_admission_enabled: bool,
+    #[serde(default)]
+    pub enable_regime_budget_multipliers: bool,
+    #[serde(default = "default_chop_long_weight_mult")]
+    pub chop_long_weight_mult: f64,
+    #[serde(default = "default_chop_short_weight_mult")]
+    pub chop_short_weight_mult: f64,
+    #[serde(default = "default_neutral_long_weight_mult")]
+    pub neutral_long_weight_mult: f64,
+    #[serde(default = "default_signal_exit_confirm_bars")]
+    pub signal_exit_confirm_bars: u32,
+    #[serde(default)]
+    pub suppress_direct_flips: bool,
+    #[serde(default = "default_one")]
+    pub max_net_exposure_ratio_of_gross: f64,
     #[serde(default)]
     pub hysteresis: HysteresisConfig,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_open_positions() -> usize {
+    6
 }
 
 fn default_bull_block_shorts() -> f64 {
@@ -115,20 +140,50 @@ fn default_bear_block_longs() -> f64 {
     0.32
 }
 
+fn default_chop_long_weight_mult() -> f64 {
+    0.50
+}
+
+fn default_chop_short_weight_mult() -> f64 {
+    0.65
+}
+
+fn default_neutral_long_weight_mult() -> f64 {
+    0.65
+}
+
+fn default_signal_exit_confirm_bars() -> u32 {
+    1
+}
+
+fn default_one() -> f64 {
+    1.0
+}
+
 impl Default for AllocatorConfig {
     fn default() -> Self {
         Self {
             risk_tier: RiskTier::Extreme,
             custom_leverage_override: None,
             max_gross_leverage_x: 2.50,
-            max_single_asset_weight: 0.15,
+            max_single_asset_weight: RiskTier::Extreme.default_max_single_asset_weight(None),
             min_rebalance_delta_weight: 0.025,
+            max_open_positions: 6,
             s1_carry_mom_budget: 0.45,
             s2_trend_breakout_budget: 0.40,
             s3_event_reversion_budget: 0.10,
             enable_breadth_regime_gate: true,
             breadth_bull_block_shorts_threshold: 0.68,
             breadth_bear_block_longs_threshold: 0.32,
+            wall_clock_normalize_indicators: true,
+            s3_strict_admission_enabled: true,
+            enable_regime_budget_multipliers: false,
+            chop_long_weight_mult: 0.50,
+            chop_short_weight_mult: 0.65,
+            neutral_long_weight_mult: 0.65,
+            signal_exit_confirm_bars: 1,
+            suppress_direct_flips: false,
+            max_net_exposure_ratio_of_gross: 1.0,
             hysteresis: HysteresisConfig::default(),
         }
     }
@@ -138,6 +193,7 @@ impl AllocatorConfig {
     pub fn from_config_map(cfg: &ConfigMap) -> Self {
         let tier = cfg.risk_tier();
         let mult = cfg.target_leverage_multiplier();
+        let default_max_single = tier.default_max_single_asset_weight(Some(mult));
         let min_rebalance_delta_weight = cfg
             .get_f64("min_rebalance_delta_weight", 0.025)
             .clamp(0.005, 0.25);
@@ -146,9 +202,10 @@ impl AllocatorConfig {
             custom_leverage_override: (tier == RiskTier::Custom).then_some(mult),
             max_gross_leverage_x: cfg.get_f64("max_gross_leverage_x", 2.50).clamp(0.20, 5.00),
             max_single_asset_weight: cfg
-                .get_f64("max_single_asset_weight", 0.15)
+                .get_f64("max_single_asset_weight", default_max_single)
                 .clamp(0.01, 1.00),
             min_rebalance_delta_weight,
+            max_open_positions: cfg.get_usize("max_open_positions", 6).clamp(1, 100),
             s1_carry_mom_budget: cfg.get_f64("s1_carry_mom_budget", 0.45).clamp(0.0, 1.50),
             s2_trend_breakout_budget: cfg
                 .get_f64("s2_trend_breakout_budget", 0.40)
@@ -163,6 +220,20 @@ impl AllocatorConfig {
             breadth_bear_block_longs_threshold: cfg
                 .get_f64("breadth_bear_block_longs_threshold", 0.32)
                 .clamp(0.05, 0.45),
+            wall_clock_normalize_indicators: cfg.get_bool("wall_clock_normalize_indicators", true),
+            s3_strict_admission_enabled: cfg.get_bool("s3_strict_admission_enabled", true),
+            enable_regime_budget_multipliers: cfg
+                .get_bool("enable_regime_budget_multipliers", false),
+            chop_long_weight_mult: cfg.get_f64("chop_long_weight_mult", 0.50).clamp(0.0, 1.0),
+            chop_short_weight_mult: cfg.get_f64("chop_short_weight_mult", 0.65).clamp(0.0, 1.0),
+            neutral_long_weight_mult: cfg
+                .get_f64("neutral_long_weight_mult", 0.65)
+                .clamp(0.0, 1.0),
+            signal_exit_confirm_bars: cfg.get_i64("signal_exit_confirm_bars", 1).clamp(1, 5) as u32,
+            suppress_direct_flips: cfg.get_bool("suppress_direct_flips", false),
+            max_net_exposure_ratio_of_gross: cfg
+                .get_f64("max_net_exposure_ratio_of_gross", 1.0)
+                .clamp(0.10, 1.0),
             hysteresis: HysteresisConfig {
                 min_rebalance_delta_weight,
                 early_loser_invalidation_enabled: cfg
@@ -191,6 +262,10 @@ impl AllocatorConfig {
             enable_breadth_regime_gate: self.enable_breadth_regime_gate,
             bull_block_shorts_threshold: self.breadth_bull_block_shorts_threshold,
             bear_block_longs_threshold: self.breadth_bear_block_longs_threshold,
+            enable_regime_budget_multipliers: self.enable_regime_budget_multipliers,
+            chop_long_weight_mult: self.chop_long_weight_mult,
+            chop_short_weight_mult: self.chop_short_weight_mult,
+            neutral_long_weight_mult: self.neutral_long_weight_mult,
         }
     }
 }
@@ -349,11 +424,24 @@ pub fn classify_rebalance_action_with_gates(
 /// - Winners (`unrealized_pnl_pct >= +0.005`) require stronger reversal (`s2` opposing, `s1 +-0.12`, or opposing `w_s3`)
 ///   to signal-close, letting stepped Chandelier/TP harvest right-tail runners.
 ///
-/// Returns `(effective_desired_weight, hysteresis_held)`.
-fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfig) -> (f64, bool) {
-    if input.cur_w.abs() < 1e-4 || !input.is_eligible || !input.has_signal_eval {
-        return (input.unblocked_scaled_weight, false);
+/// Returns `(effective_desired_weight, hysteresis_held, emergency_exit_bypass)`.
+fn apply_held_exit_hysteresis(
+    input: &HeldHysteresisInput,
+    cfg: &HysteresisConfig,
+) -> (f64, bool, bool) {
+    if input.cur_w.abs() < 1e-4 {
+        return (input.unblocked_scaled_weight, false, false);
     }
+    if !input.is_eligible {
+        return (input.unblocked_scaled_weight, false, true);
+    }
+    if !input.has_signal_eval {
+        return (input.unblocked_scaled_weight, false, false);
+    }
+
+    let short_flush_emergency =
+        (input.cur_w < 0.0 && input.is_downward_flush) || input.s3_flush_atr_mult <= -3.5;
+    let base_emergency = input.counter_regime_held || short_flush_emergency;
 
     let min_delta = cfg.min_rebalance_delta_weight.max(1e-4);
     let min_hold_band = (min_delta * 0.5).max(1e-3);
@@ -362,7 +450,7 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
     if input.unblocked_scaled_weight * input.cur_w > 0.0
         && input.unblocked_scaled_weight.abs() >= min_hold_band
     {
-        return (input.unblocked_scaled_weight, false);
+        return (input.unblocked_scaled_weight, false, base_emergency);
     }
 
     let s1_composite = 0.65 * input.s1_mom_score + 0.35 * input.s1_carry_score;
@@ -398,7 +486,7 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
                 } else {
                     input.unblocked_scaled_weight
                 };
-                return (exit_w, false);
+                return (exit_w, false, true);
             }
         }
 
@@ -408,9 +496,9 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
                 || input.s2_trend_alignment < 0
                 || input.s1_mom_score <= -winner_rev_thresh;
             return if strong_reversal {
-                (input.unblocked_scaled_weight, false)
+                (input.unblocked_scaled_weight, false, base_emergency)
             } else {
-                (input.cur_w, true)
+                (input.cur_w, true, base_emergency)
             };
         }
 
@@ -420,7 +508,7 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
             || input.s2_trend_alignment < 0
             || input.s1_mom_score <= -rev_thresh
         {
-            return (input.unblocked_scaled_weight, false);
+            return (input.unblocked_scaled_weight, false, base_emergency);
         }
 
         let has_mild_long_support = input.raw_combined_weight > 0.0
@@ -431,9 +519,9 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
             || input.s3_funding_zscore <= -0.8;
 
         if has_mild_long_support {
-            (input.cur_w, true)
+            (input.cur_w, true, base_emergency)
         } else {
-            (input.unblocked_scaled_weight, false)
+            (input.unblocked_scaled_weight, false, base_emergency)
         }
     } else {
         if is_loser {
@@ -447,7 +535,7 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
                 } else {
                     input.unblocked_scaled_weight
                 };
-                return (exit_w, false);
+                return (exit_w, false, true);
             }
         }
 
@@ -458,9 +546,9 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
                 || input.s2_trend_alignment > 0
                 || input.s1_mom_score >= winner_rev_thresh;
             return if strong_reversal {
-                (input.unblocked_scaled_weight, false)
+                (input.unblocked_scaled_weight, false, base_emergency)
             } else {
-                (input.cur_w, true)
+                (input.cur_w, true, base_emergency)
             };
         }
 
@@ -471,7 +559,7 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
             || input.s2_trend_alignment > 0
             || input.s1_mom_score >= rev_thresh
         {
-            return (input.unblocked_scaled_weight, false);
+            return (input.unblocked_scaled_weight, false, base_emergency);
         }
 
         let has_mild_short_support = input.raw_combined_weight < 0.0
@@ -486,9 +574,9 @@ fn apply_held_exit_hysteresis(input: &HeldHysteresisInput, cfg: &HysteresisConfi
                 && input.s2_trend_alignment <= 0);
 
         if has_mild_short_support {
-            (input.cur_w, true)
+            (input.cur_w, true, base_emergency)
         } else {
-            (input.unblocked_scaled_weight, false)
+            (input.unblocked_scaled_weight, false, base_emergency)
         }
     }
 }
@@ -541,12 +629,44 @@ pub fn allocate_multi_sleeve_weights_with_context(
     regime_gate: &RegimeGateState,
     cfg: &AllocatorConfig,
 ) -> Vec<SleeveSignalInput> {
+    let mut empty_confirm = HashMap::new();
+    let empty_ts = HashMap::new();
+    allocate_multi_sleeve_weights_with_exit_confirm(
+        assets,
+        s1_map,
+        s2_map,
+        s3_map,
+        held_contexts,
+        active_cooldowns,
+        regime_gate,
+        cfg,
+        &empty_ts,
+        &mut empty_confirm,
+    )
+}
+
+/// Internal allocator entrypoint supporting persistent `BarCloseCache` N2 exit confirmation state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn allocate_multi_sleeve_weights_with_exit_confirm(
+    assets: &[ExchangeAsset],
+    s1_map: &HashMap<i64, CarryMomentumMetrics>,
+    s2_map: &HashMap<i64, TrendBreakoutMetrics>,
+    s3_map: &HashMap<i64, EventReversionMetrics>,
+    held_contexts: &HashMap<i64, HeldPositionContext>,
+    active_cooldowns: &[CooldownAssetView],
+    regime_gate: &RegimeGateState,
+    cfg: &AllocatorConfig,
+    bar_ts_by_asset: &HashMap<i64, i64>,
+    exit_confirm_by_asset: &mut HashMap<i64, ExitConfirmState>,
+) -> Vec<SleeveSignalInput> {
     let lev_mult = cfg.effective_leverage_multiplier();
     let max_single = cfg.max_single_asset_weight.max(0.01);
     let max_gross = cfg.max_gross_leverage_x.max(0.10);
-    let min_delta = cfg.min_rebalance_delta_weight.max(1e-4);
+    let eff_min_delta = (cfg.min_rebalance_delta_weight * lev_mult)
+        .max(1e-4)
+        .min(cfg.max_single_asset_weight.max(1e-4));
     let mut hyst_cfg = cfg.hysteresis;
-    hyst_cfg.min_rebalance_delta_weight = cfg.min_rebalance_delta_weight;
+    hyst_cfg.min_rebalance_delta_weight = eff_min_delta;
 
     let cooldown_ids: HashSet<i64> = active_cooldowns.iter().map(|c| c.asset_id).collect();
     let cooldown_symbols: HashSet<String> = active_cooldowns
@@ -570,6 +690,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
         raw_combined_weight: f64,
         unblocked_scaled_weight: f64,
         effective_desired_weight: f64,
+        post_cooldown_weight: f64,
         hysteresis_held: bool,
         capped_single_weight: f64,
         current_weight: f64,
@@ -635,11 +756,45 @@ pub fn allocate_multi_sleeve_weights_with_context(
             None
         };
 
+        let ctx = held_contexts.get(&asset.id).copied().unwrap_or_default();
+        let cur_w = round_dp(ctx.current_weight, 4);
+        let is_loser = cfg.hysteresis.early_loser_invalidation_enabled
+            && ctx.unrealized_pnl_pct.is_finite()
+            && ctx.unrealized_pnl_pct <= -0.003;
+
+        // Lever N1: apply unified directional regime multiplier ONCE across sleeves,
+        // protecting already-held non-loser winners from spurious partial-reduce churn.
+        let raw_sum = w_s1 + w_s2 + w_s3;
+        let side_mult = if !cfg.enable_regime_budget_multipliers {
+            1.0
+        } else if raw_sum > 0.0 {
+            regime_gate.long_weight_mult.clamp(0.0, 1.0)
+        } else if raw_sum < 0.0 {
+            regime_gate.short_weight_mult.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let eff_side_mult =
+            if cur_w * raw_sum > 0.0 && !is_loser && side_mult > 0.0 && side_mult < 1.0 {
+                let min_hold_raw = cur_w.abs() / lev_mult.max(1e-6);
+                let desired_raw_mag = (raw_sum * side_mult).abs();
+                if desired_raw_mag < min_hold_raw {
+                    (raw_sum.abs().min(min_hold_raw) / raw_sum.abs().max(1e-12))
+                        .clamp(side_mult, 1.0)
+                } else {
+                    side_mult
+                }
+            } else {
+                side_mult
+            };
+
+        let w_s1 = w_s1 * eff_side_mult;
+        let w_s2 = w_s2 * eff_side_mult;
+        let w_s3 = w_s3 * eff_side_mult;
+
         let raw_combined_weight = round_dp(w_s1 + w_s2 + w_s3, 4);
         let unblocked_scaled_weight = round_dp(raw_combined_weight * lev_mult, 4);
 
-        let ctx = held_contexts.get(&asset.id).copied().unwrap_or_default();
-        let cur_w = round_dp(ctx.current_weight, 4);
         let in_cooldown = cooldown_ids.contains(&asset.id)
             || cooldown_symbols.contains(&asset.symbol.to_ascii_uppercase());
 
@@ -670,14 +825,14 @@ pub fn allocate_multi_sleeve_weights_with_context(
             s3_funding_zscore,
             s3_flush_atr_mult,
         };
-        let (effective_desired_weight, hysteresis_held) =
+        let (mut effective_desired_weight, mut hysteresis_held, emergency_exit_bypass) =
             apply_held_exit_hysteresis(&hyst_input, &hyst_cfg);
 
         // Defense-in-depth Breadth Regime Gate (`P1-Strat`): NEVER blocks CLOSE or REDUCE!
         let mut regime_blocked = false;
         let post_regime_weight = if regime_gate.block_new_shorts {
             if cur_w.abs() < 1e-4 && effective_desired_weight < 0.0 {
-                if effective_desired_weight.abs() >= min_delta {
+                if effective_desired_weight.abs() >= eff_min_delta {
                     regime_blocked = true;
                 }
                 0.0
@@ -685,7 +840,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
                 // Held LONG flipping into blocked SHORT -> CLOSE instead of FLIP
                 0.0
             } else if cur_w < 0.0 && effective_desired_weight < cur_w {
-                if (effective_desired_weight - cur_w).abs() >= min_delta {
+                if (effective_desired_weight - cur_w).abs() >= eff_min_delta {
                     regime_blocked = true;
                 }
                 cur_w
@@ -694,7 +849,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
             }
         } else if regime_gate.block_new_longs {
             if cur_w.abs() < 1e-4 && effective_desired_weight > 0.0 {
-                if effective_desired_weight.abs() >= min_delta {
+                if effective_desired_weight.abs() >= eff_min_delta {
                     regime_blocked = true;
                 }
                 0.0
@@ -702,7 +857,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
                 // Held SHORT flipping into blocked LONG -> CLOSE instead of FLIP
                 0.0
             } else if cur_w > 0.0 && effective_desired_weight > cur_w {
-                if (effective_desired_weight - cur_w).abs() >= min_delta {
+                if (effective_desired_weight - cur_w).abs() >= eff_min_delta {
                     regime_blocked = true;
                 }
                 cur_w
@@ -728,7 +883,59 @@ pub fn allocate_multi_sleeve_weights_with_context(
             post_regime_weight
         };
 
-        let capped_single = post_cooldown_weight.clamp(-max_single, max_single);
+        // Lever N3: optional suppression of direct opposite-side flips -> exit-to-flat ACTION_CLOSE.
+        let post_cooldown_weight = if cfg.suppress_direct_flips
+            && cur_w.abs() >= 1e-4
+            && post_cooldown_weight * cur_w < 0.0
+        {
+            0.0
+        } else {
+            post_cooldown_weight
+        };
+
+        let mut capped_single = post_cooldown_weight.clamp(-max_single, max_single);
+
+        // Lever N2: multi-bar confirmation for non-emergency ACTION_CLOSE (with mandatory R13-S1 bypass).
+        let confirm_bars = cfg.signal_exit_confirm_bars.clamp(1, 5);
+        if cur_w.abs() < 1e-4 || confirm_bars <= 1 {
+            exit_confirm_by_asset.remove(&asset.id);
+        } else {
+            let tentative_action = classify_rebalance_action_with_gates(
+                cur_w,
+                round_dp(capped_single, 4),
+                effective_desired_weight,
+                in_cooldown,
+                regime_blocked,
+                eff_min_delta,
+            );
+            if tentative_action == ACTION_CLOSE && !emergency_exit_bypass {
+                let bar_ts = bar_ts_by_asset.get(&asset.id).copied().unwrap_or(0);
+                let next_state = match exit_confirm_by_asset.get(&asset.id).copied() {
+                    None => ExitConfirmState {
+                        count: 1,
+                        last_bar_ts_ms: bar_ts,
+                    },
+                    Some(prev) => {
+                        if bar_ts > prev.last_bar_ts_ms {
+                            ExitConfirmState {
+                                count: prev.count.saturating_add(1),
+                                last_bar_ts_ms: bar_ts,
+                            }
+                        } else {
+                            prev
+                        }
+                    }
+                };
+                exit_confirm_by_asset.insert(asset.id, next_state);
+                if next_state.count < confirm_bars {
+                    effective_desired_weight = cur_w;
+                    capped_single = cur_w;
+                    hysteresis_held = true;
+                }
+            } else {
+                exit_confirm_by_asset.remove(&asset.id);
+            }
+        }
 
         drafts.push(DraftAlloc {
             asset: asset.clone(),
@@ -746,6 +953,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
             raw_combined_weight,
             unblocked_scaled_weight,
             effective_desired_weight,
+            post_cooldown_weight,
             hysteresis_held,
             capped_single_weight: capped_single,
             current_weight: cur_w,
@@ -755,31 +963,37 @@ pub fn allocate_multi_sleeve_weights_with_context(
         });
     }
 
-    if drafts.len() > 12 {
+    let prune_cap = cfg.max_open_positions.saturating_add(6).max(12);
+    if drafts.len() > prune_cap {
         let mut keep_ids: HashSet<i64> = HashSet::new();
         for d in &drafts {
-            if d.current_weight.abs() >= 1e-4 {
+            if d.current_weight.abs() >= 1e-4 && d.capped_single_weight.abs() >= 1e-4 {
                 keep_ids.insert(d.asset.id);
             }
         }
-        let mut ranked: Vec<(i64, f64, f64)> = drafts
+        let mut ranked: Vec<(i64, f64, f64, f64)> = drafts
             .iter()
+            .filter(|d| !keep_ids.contains(&d.asset.id) && d.capped_single_weight.abs() > 1e-6)
             .map(|d| {
                 (
                     d.asset.id,
                     d.capped_single_weight.abs(),
+                    d.post_cooldown_weight.abs(),
                     d.asset.day_volume_usdc,
                 )
             })
             .collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.2.total_cmp(&a.2)));
-        for (id, weight_abs, _) in ranked {
-            if keep_ids.len() >= 12 {
+        ranked.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| b.2.total_cmp(&a.2))
+                .then_with(|| b.3.total_cmp(&a.3))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (id, _, _, _) in ranked {
+            if keep_ids.len() >= prune_cap {
                 break;
             }
-            if weight_abs > 1e-6 {
-                keep_ids.insert(id);
-            }
+            keep_ids.insert(id);
         }
         for d in &mut drafts {
             if !keep_ids.contains(&d.asset.id) {
@@ -799,9 +1013,48 @@ pub fn allocate_multi_sleeve_weights_with_context(
         1.0
     };
 
+    // Lever N5: portfolio net-direction exposure cap relative to pre-net-cap gross G_0.
+    let net_ratio_cap = cfg.max_net_exposure_ratio_of_gross.clamp(0.10, 1.0);
+    let (long_net_scale, short_net_scale) = if net_ratio_cap < 0.9999 {
+        let mut sum_long = 0.0_f64;
+        let mut sum_short = 0.0_f64;
+        for d in &drafts {
+            let w = d.capped_single_weight * gross_scale;
+            if w > 0.0 {
+                sum_long += w;
+            } else if w < 0.0 {
+                sum_short += w.abs();
+            }
+        }
+        let g0 = sum_long + sum_short;
+        if g0 > 1e-8 {
+            let cap = net_ratio_cap * g0;
+            let net = sum_long - sum_short;
+            if net > cap && sum_long > 1e-8 {
+                (((cap + sum_short) / sum_long).clamp(0.0, 1.0), 1.0)
+            } else if -net > cap && sum_short > 1e-8 {
+                (1.0, ((cap + sum_long) / sum_short).clamp(0.0, 1.0))
+            } else {
+                (1.0, 1.0)
+            }
+        } else {
+            (1.0, 1.0)
+        }
+    } else {
+        (1.0, 1.0)
+    };
+
     let mut results = Vec::with_capacity(drafts.len());
     for d in drafts {
-        let mut target_weight = round_dp(d.capped_single_weight * gross_scale, 4);
+        let raw_scaled = d.capped_single_weight * gross_scale;
+        let net_scale = if raw_scaled > 0.0 {
+            long_net_scale
+        } else if raw_scaled < 0.0 {
+            short_net_scale
+        } else {
+            1.0
+        };
+        let mut target_weight = round_dp(raw_scaled * net_scale, 4);
         if d.hysteresis_held && target_weight.abs() < 1e-4 {
             target_weight = d.current_weight.signum() * 1e-4;
         }
@@ -823,7 +1076,7 @@ pub fn allocate_multi_sleeve_weights_with_context(
             d.effective_desired_weight,
             d.in_cooldown,
             d.regime_blocked,
-            cfg.min_rebalance_delta_weight,
+            eff_min_delta,
         );
 
         results.push(SleeveSignalInput {
@@ -1538,6 +1791,7 @@ mod tests {
             regime_label: "BULL_EXPANSION".to_string(),
             block_new_shorts: true,
             block_new_longs: false,
+            ..RegimeGateState::default()
         };
 
         let mut s1 = HashMap::new();
@@ -1633,5 +1887,420 @@ mod tests {
         );
         assert_eq!(flip_to_close[0].rebalance_action, ACTION_CLOSE);
         assert_eq!(flip_to_close[0].target_weight, 0.0);
+    }
+
+    #[test]
+    fn test_leak_l4_eff_min_delta_and_tier_max_single_weight_defaults() {
+        use aegis_core::ConfigMap;
+
+        // 1. Default and tier-scaled max_single_asset_weight fallbacks
+        assert!((AllocatorConfig::default().max_single_asset_weight - 0.25).abs() < 1e-9);
+        for (tier_str, expected_max) in [
+            ("conservative", 0.15),
+            ("standard", 0.15),
+            ("aggressive", 0.20),
+            ("extreme", 0.25),
+        ] {
+            let mut cm = ConfigMap::new();
+            cm.insert("risk_tier", tier_str);
+            let cfg = AllocatorConfig::from_config_map(&cm);
+            assert!(
+                (cfg.max_single_asset_weight - expected_max).abs() < 1e-9,
+                "tier={tier_str}: expected {expected_max}, got {}",
+                cfg.max_single_asset_weight
+            );
+        }
+        let mut explicit_cm = ConfigMap::new();
+        explicit_cm.insert("risk_tier", "extreme");
+        explicit_cm.insert("max_single_asset_weight", "0.01");
+        assert!(
+            (AllocatorConfig::from_config_map(&explicit_cm).max_single_asset_weight - 0.01).abs()
+                < 1e-9
+        );
+
+        // 2. Extreme (1.85x): eff_min_delta = 0.025 * 1.85 = 0.04625 -> 0.015 unlevered (0.0278 levered) is HOLD, not OPEN
+        let a = test_asset(1, 10_000_000.0);
+        let mut s1 = HashMap::new();
+        s1.insert(
+            a.id,
+            CarryMomentumMetrics {
+                asset_id: a.id,
+                symbol: a.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: 0.3,
+                s1_carry_score: 0.1,
+                w_s1_carry_mom: 0.015,
+                passes_quality: true,
+            },
+        );
+        let ext_cfg = AllocatorConfig::default();
+        let ext_small = allocate_multi_sleeve_weights(
+            std::slice::from_ref(&a),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &ext_cfg,
+        );
+        assert_eq!(ext_small[0].rebalance_action, ACTION_HOLD);
+
+        // 0.030 unlevered (0.0555 >= 0.04625) opens cleanly
+        s1.get_mut(&a.id).unwrap().w_s1_carry_mom = 0.030;
+        let ext_open = allocate_multi_sleeve_weights(
+            std::slice::from_ref(&a),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &ext_cfg,
+        );
+        assert_eq!(ext_open[0].rebalance_action, ACTION_OPEN_LONG);
+
+        // 3. Conservative (0.65x): eff_min_delta = 0.025 * 0.65 = 0.01625 -> 0.035 unlevered (0.0228 levered) opens cleanly!
+        let cons_cfg = AllocatorConfig {
+            risk_tier: RiskTier::Conservative,
+            ..AllocatorConfig::default()
+        };
+        s1.get_mut(&a.id).unwrap().w_s1_carry_mom = 0.035;
+        let cons_open = allocate_multi_sleeve_weights(
+            &[a],
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &cons_cfg,
+        );
+        assert_eq!(cons_open[0].rebalance_action, ACTION_OPEN_LONG);
+        assert!((cons_open[0].target_weight - 0.0228).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_p1_1_prune_cap_scales_with_mp_excludes_closing_and_tiebreaks_pre_clamp() {
+        let cfg = AllocatorConfig {
+            max_open_positions: 10, // prune_cap = 10 + 6 = 16
+            max_single_asset_weight: 0.25,
+            max_gross_leverage_x: 4.50,
+            ..AllocatorConfig::default()
+        };
+        let mut assets = Vec::new();
+        let mut s1 = HashMap::new();
+        let mut held = HashMap::new();
+
+        // 6 held active (ids 1..=6), 4 held closing (ids 7..=10, zero sleeve signal),
+        // and 11 flat challengers (ids 11..=21). Total 21 assets; 17 non-zero candidates > 16 cap!
+        for i in 1..=21i64 {
+            let vol = if i == 11 {
+                1_000_000.0 // lower volume challenger, high pre-clamp weight
+            } else if i == 12 {
+                50_000_000.0 // higher volume challenger, lower pre-clamp weight
+            } else {
+                (i as f64) * 1_000_000.0
+            };
+            let a = test_asset(i, vol);
+            assets.push(a.clone());
+
+            let w_s1 = if (1..=6).contains(&i) {
+                0.12
+            } else if (7..=10).contains(&i) {
+                0.0 // closing!
+            } else if i == 11 {
+                0.40 // clamped 0.25, pre_clamp 0.74
+            } else if i == 12 {
+                0.16 // clamped 0.25, pre_clamp 0.296
+            } else {
+                0.30 // clamped 0.25, pre_clamp 0.555
+            };
+            s1.insert(
+                i,
+                CarryMomentumMetrics {
+                    asset_id: i,
+                    symbol: a.symbol.clone(),
+                    annualized_vol: 0.5,
+                    market_beta: 1.0,
+                    s1_mom_score: if w_s1 > 0.0 { 0.5 } else { 0.0 },
+                    s1_carry_score: 0.0,
+                    w_s1_carry_mom: w_s1,
+                    passes_quality: true,
+                },
+            );
+            if i <= 10 {
+                held.insert(
+                    i,
+                    HeldPositionContext {
+                        current_weight: 0.12,
+                        unrealized_pnl_pct: 0.0,
+                    },
+                );
+            }
+        }
+
+        let signals = allocate_multi_sleeve_weights_with_context(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        let non_zero: Vec<i64> = signals
+            .iter()
+            .filter(|s| s.target_weight.abs() > 1e-6)
+            .map(|s| s.asset_id)
+            .collect();
+        assert_eq!(non_zero.len(), 16, "mp10 must keep 16 active positions");
+
+        // All 4 closing positions emit ACTION_CLOSE without consuming any of the 16 candidate slots
+        for id in 7..=10i64 {
+            let sig = signals.iter().find(|s| s.asset_id == id).unwrap();
+            assert_eq!(sig.rebalance_action, ACTION_CLOSE);
+            assert_eq!(sig.target_weight, 0.0);
+        }
+
+        // Asset 11 (pre-clamp 0.74, lower vol) must beat Asset 12 (pre-clamp 0.296, higher vol) for the last slot
+        assert!(
+            non_zero.contains(&11),
+            "Higher pre-clamp weight asset 11 must win slot"
+        );
+        assert!(
+            !non_zero.contains(&12),
+            "Lower pre-clamp weight asset 12 must be pruned"
+        );
+    }
+
+    #[test]
+    fn test_n1_regime_throttle_and_non_loser_winner_protection() {
+        use crate::breadth::{compute_regime_gate_state, RegimeGateConfig};
+
+        let cfg = AllocatorConfig {
+            enable_regime_budget_multipliers: true,
+            chop_long_weight_mult: 0.50,
+            chop_short_weight_mult: 0.65,
+            neutral_long_weight_mult: 0.65,
+            ..AllocatorConfig::default()
+        };
+        let chop_gate = compute_regime_gate_state(0.40, 10, 0.0, 0, &cfg.regime_gate_config());
+        assert_eq!(chop_gate.long_weight_mult, 0.50);
+        assert_eq!(chop_gate.short_weight_mult, 0.65);
+
+        let a_flat_long = test_asset(1, 10_000_000.0);
+        let a_flat_short = test_asset(2, 10_000_000.0);
+        let a_winner_long = test_asset(3, 10_000_000.0);
+        let a_loser_long = test_asset(4, 10_000_000.0);
+        let assets = vec![
+            a_flat_long.clone(),
+            a_flat_short.clone(),
+            a_winner_long.clone(),
+            a_loser_long.clone(),
+        ];
+
+        let mut s1 = HashMap::new();
+        for (id, w) in [(1, 0.10), (2, -0.10), (3, 0.14), (4, 0.14)] {
+            s1.insert(
+                id,
+                CarryMomentumMetrics {
+                    asset_id: id,
+                    symbol: format!("A{id}-USDC"),
+                    annualized_vol: 0.5,
+                    market_beta: 1.0,
+                    s1_mom_score: if w > 0.0 { 0.5 } else { -0.5 },
+                    s1_carry_score: 0.0,
+                    w_s1_carry_mom: w,
+                    passes_quality: true,
+                },
+            );
+        }
+        let mut held = HashMap::new();
+        held.insert(
+            3,
+            HeldPositionContext {
+                current_weight: 0.20,
+                unrealized_pnl_pct: 0.015, // winner: unthrottled = 0.259, throttled = 0.1295 < 0.20 -> HOLD at ~0.20!
+            },
+        );
+        held.insert(
+            4,
+            HeldPositionContext {
+                current_weight: 0.20,
+                unrealized_pnl_pct: -0.010, // loser: throttled down to 0.1295 -> ACTION_REDUCE!
+            },
+        );
+
+        let out = allocate_multi_sleeve_weights_with_context(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &chop_gate,
+            &cfg,
+        );
+        let s_long = out.iter().find(|s| s.asset_id == 1).unwrap();
+        assert!((s_long.target_weight - 0.0925).abs() < 1e-4);
+        assert!((s_long.w_s1_carry_mom * 1.85 - s_long.target_weight).abs() < 1e-3);
+
+        let s_short = out.iter().find(|s| s.asset_id == 2).unwrap();
+        assert!((s_short.target_weight + 0.1202).abs() < 2e-4);
+
+        let s_win = out.iter().find(|s| s.asset_id == 3).unwrap();
+        assert_eq!(s_win.rebalance_action, ACTION_HOLD);
+        assert!((s_win.target_weight - 0.20).abs() < 5e-4);
+
+        let s_lose = out.iter().find(|s| s.asset_id == 4).unwrap();
+        assert_eq!(s_lose.rebalance_action, ACTION_REDUCE);
+        assert!((s_lose.target_weight - 0.1295).abs() < 1e-4);
+        let _ = RegimeGateConfig::default();
+    }
+
+    #[test]
+    fn test_n3_suppress_direct_flips_converts_flip_to_close() {
+        let a = test_asset(1, 10_000_000.0);
+        let mut s1 = HashMap::new();
+        s1.insert(
+            1,
+            CarryMomentumMetrics {
+                asset_id: 1,
+                symbol: a.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: -0.6,
+                s1_carry_score: -0.2,
+                w_s1_carry_mom: -0.10,
+                passes_quality: true,
+            },
+        );
+        let mut held = HashMap::new();
+        held.insert(
+            1,
+            HeldPositionContext {
+                current_weight: 0.15,
+                unrealized_pnl_pct: 0.0,
+            },
+        );
+
+        let off_cfg = AllocatorConfig {
+            suppress_direct_flips: false,
+            ..AllocatorConfig::default()
+        };
+        let flip_out = allocate_multi_sleeve_weights_with_context(
+            std::slice::from_ref(&a),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &RegimeGateState::default(),
+            &off_cfg,
+        );
+        assert_eq!(flip_out[0].rebalance_action, ACTION_FLIP);
+
+        let on_cfg = AllocatorConfig {
+            suppress_direct_flips: true,
+            ..AllocatorConfig::default()
+        };
+        let close_out = allocate_multi_sleeve_weights_with_context(
+            &[a],
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &RegimeGateState::default(),
+            &on_cfg,
+        );
+        assert_eq!(close_out[0].rebalance_action, ACTION_CLOSE);
+        assert_eq!(close_out[0].target_weight, 0.0);
+        assert_eq!(close_out[0].w_s1_carry_mom, 0.0);
+    }
+
+    #[test]
+    fn test_n5_net_exposure_cap_two_sided_and_one_sided_bull_expansion() {
+        let mut assets = Vec::new();
+        let mut s1 = HashMap::new();
+        // 8 long assets at w_s1 = 0.10 (levered = 0.185 each => L = 1.48) + 2 short assets (levered = -0.185 each => S = 0.37)
+        for i in 1..=10i64 {
+            let a = test_asset(i, 10_000_000.0);
+            assets.push(a.clone());
+            let is_long = i <= 8;
+            s1.insert(
+                i,
+                CarryMomentumMetrics {
+                    asset_id: i,
+                    symbol: a.symbol.clone(),
+                    annualized_vol: 0.5,
+                    market_beta: 1.0,
+                    s1_mom_score: if is_long { 0.5 } else { -0.5 },
+                    s1_carry_score: 0.0,
+                    w_s1_carry_mom: if is_long { 0.10 } else { -0.10 },
+                    passes_quality: true,
+                },
+            );
+        }
+
+        let cfg = AllocatorConfig {
+            max_net_exposure_ratio_of_gross: 0.50,
+            ..AllocatorConfig::default()
+        };
+        let out = allocate_multi_sleeve_weights_with_context(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        let l_sum: f64 = out
+            .iter()
+            .filter(|s| s.target_weight > 0.0)
+            .map(|s| s.target_weight)
+            .sum();
+        let s_sum: f64 = out
+            .iter()
+            .filter(|s| s.target_weight < 0.0)
+            .map(|s| s.target_weight.abs())
+            .sum();
+        // G_0 = 1.48 + 0.37 = 1.85, cap = 0.50 * 1.85 = 0.925, S = 0.37 -> L' = 0.925 + 0.37 = 1.295
+        assert!((s_sum - 0.37).abs() < 1e-3);
+        assert!((l_sum - 1.295).abs() < 2e-3);
+        assert!((l_sum - s_sum) <= 0.50 * 1.85 + 2e-3);
+
+        // One-sided BULL_EXPANSION (S = 0.0): must NOT collapse portfolio to zero!
+        let bull_assets = assets[..8].to_vec();
+        let bull_gate = RegimeGateState {
+            breadth_bull: 0.85,
+            eligible_coin_count: 8,
+            regime_label: "BULL_EXPANSION".to_string(),
+            block_new_shorts: true,
+            block_new_longs: false,
+            ..RegimeGateState::default()
+        };
+        let cfg_bull = AllocatorConfig {
+            max_net_exposure_ratio_of_gross: 0.60,
+            ..AllocatorConfig::default()
+        };
+        let bull_out = allocate_multi_sleeve_weights_with_context(
+            &bull_assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &bull_gate,
+            &cfg_bull,
+        );
+        let bull_gross: f64 = bull_out.iter().map(|s| s.target_weight.abs()).sum();
+        // L_0 = 1.48, S = 0 -> L' = 0.60 * 1.48 = 0.888 (not 0.0!)
+        assert!(
+            (bull_gross - 0.888).abs() < 2e-3,
+            "One-sided BULL_EXPANSION must retain 0.60 * G_0 = 0.888 without singularity collapse, got {bull_gross}"
+        );
     }
 }
