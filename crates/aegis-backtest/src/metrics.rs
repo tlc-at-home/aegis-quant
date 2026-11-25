@@ -1,8 +1,38 @@
 //! Walk-Forward Backtest Performance Metrics & Tear Sheet Computation (`aegis-backtest::metrics`).
 
-use crate::config::{BacktestConfig, BacktestReport};
+use crate::config::{BacktestConfig, BacktestReport, ExitReasonSummary, RegimeAttribution};
 use crate::settlement::SimulationState;
-use aegis_core::round_dp;
+use aegis_core::{round_dp, PortfolioSnapshot, PositionRecord};
+use std::collections::BTreeMap;
+
+fn resolve_trade_regime_label(
+    pos: &PositionRecord,
+    state: &SimulationState,
+    equity_curve: &[PortfolioSnapshot],
+) -> String {
+    if let Some(label) = state.entry_regime_by_pid.get(&pos.id) {
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let lookup_ts = pos.opened_at_ms.or(pos.closed_at_ms);
+    if let Some(ts) = lookup_ts {
+        if !equity_curve.is_empty() {
+            let idx = equity_curve.partition_point(|s| s.created_at_ms <= ts);
+            let snap = if idx > 0 {
+                &equity_curve[idx - 1]
+            } else {
+                &equity_curve[0]
+            };
+            let trimmed = snap.market_regime_label.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "UNKNOWN".to_string()
+}
 
 /// Computes the final [`BacktestReport`] tear sheet from accumulated walk-forward simulation state.
 ///
@@ -119,6 +149,103 @@ pub fn compute_backtest_report(
         _ => 0,
     };
 
+    let mut long_trades = 0usize;
+    let mut long_wins = 0usize;
+    let mut long_pnl_usdc = 0.0_f64;
+    let mut short_trades = 0usize;
+    let mut short_wins = 0usize;
+    let mut short_pnl_usdc = 0.0_f64;
+
+    let mut regime_breakdown: BTreeMap<String, RegimeAttribution> = BTreeMap::new();
+    for snap in &state.equity_curve {
+        let label = {
+            let trimmed = snap.market_regime_label.trim();
+            if trimmed.is_empty() {
+                "UNKNOWN".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        regime_breakdown.entry(label).or_default().bars += 1;
+    }
+
+    let mut exit_reason_breakdown: BTreeMap<String, ExitReasonSummary> = BTreeMap::new();
+    for pos in &state.closed_positions {
+        let is_win = pos.realized_pnl_usdc > 0.0;
+        let is_long = pos.side.trim().eq_ignore_ascii_case("LONG");
+        if is_long {
+            long_trades += 1;
+            if is_win {
+                long_wins += 1;
+            }
+            long_pnl_usdc += pos.realized_pnl_usdc;
+        } else {
+            short_trades += 1;
+            if is_win {
+                short_wins += 1;
+            }
+            short_pnl_usdc += pos.realized_pnl_usdc;
+        }
+
+        let regime = resolve_trade_regime_label(pos, &state, &state.equity_curve);
+        let r_entry = regime_breakdown.entry(regime).or_default();
+        r_entry.trades += 1;
+        if is_win {
+            r_entry.winning_trades += 1;
+        }
+        if is_long {
+            r_entry.long_trades += 1;
+            r_entry.long_pnl_usdc += pos.realized_pnl_usdc;
+        } else {
+            r_entry.short_trades += 1;
+            r_entry.short_pnl_usdc += pos.realized_pnl_usdc;
+        }
+        r_entry.total_pnl_usdc += pos.realized_pnl_usdc;
+
+        let exit_reason = pos
+            .exit_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        let e_entry = exit_reason_breakdown.entry(exit_reason).or_default();
+        e_entry.count += 1;
+        if is_win {
+            e_entry.wins += 1;
+        }
+        e_entry.net_pnl_usdc += pos.realized_pnl_usdc;
+    }
+
+    let long_win_rate = if long_trades > 0 {
+        round_dp((long_wins as f64 / long_trades as f64) * 100.0, 2)
+    } else {
+        0.0
+    };
+    let short_win_rate = if short_trades > 0 {
+        round_dp((short_wins as f64 / short_trades as f64) * 100.0, 2)
+    } else {
+        0.0
+    };
+    for attr in regime_breakdown.values_mut() {
+        attr.win_rate_pct = if attr.trades > 0 {
+            round_dp((attr.winning_trades as f64 / attr.trades as f64) * 100.0, 2)
+        } else {
+            0.0
+        };
+        attr.long_pnl_usdc = round_dp(attr.long_pnl_usdc, 2);
+        attr.short_pnl_usdc = round_dp(attr.short_pnl_usdc, 2);
+        attr.total_pnl_usdc = round_dp(attr.total_pnl_usdc, 2);
+    }
+    for summary in exit_reason_breakdown.values_mut() {
+        summary.win_rate_pct = if summary.count > 0 {
+            round_dp((summary.wins as f64 / summary.count as f64) * 100.0, 2)
+        } else {
+            0.0
+        };
+        summary.net_pnl_usdc = round_dp(summary.net_pnl_usdc, 2);
+    }
+
     BacktestReport {
         platform_version: "2.0.0".to_string(),
         risk_tier: config.risk_tier.as_str().to_string(),
@@ -134,6 +261,12 @@ pub fn compute_backtest_report(
         total_trades,
         winning_trades,
         losing_trades,
+        long_trades,
+        long_win_rate,
+        long_pnl_usdc: round_dp(long_pnl_usdc, 2),
+        short_trades,
+        short_win_rate,
+        short_pnl_usdc: round_dp(short_pnl_usdc, 2),
         stop_out_count: state.stop_out_count,
         cooldown_blocks: state.cooldown_blocks,
         s1_attribution_usdc: round_dp(state.s1_attribution_usdc, 2),
@@ -153,6 +286,8 @@ pub fn compute_backtest_report(
         ioc_escalations: state.ioc_escalations,
         max_positions_blocks: state.max_positions_blocks,
         entry_interval_blocks: state.entry_interval_blocks,
+        regime_breakdown,
+        exit_reason_breakdown,
         equity_curve: state.equity_curve,
         closed_positions: state.closed_positions,
     }

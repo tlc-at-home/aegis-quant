@@ -1,6 +1,7 @@
 //! Walk-Forward Simulation State, Fill/Stop/Funding Settlement & Live-Gate Parity (`aegis-backtest::settlement`).
 
 use crate::config::BacktestConfig;
+use aegis_core::indicators::{compute_atr as core_compute_atr, timeframe_to_ms};
 use aegis_core::{
     round_dp, CooldownAssetView, ExchangeAsset, OhlcvBar, OrderSide, PortfolioSnapshot,
     PositionRecord, PositionStatus, Result,
@@ -10,8 +11,8 @@ use aegis_risk::{
     StopEvaluationInput,
 };
 use aegis_signals::{
-    SignalCycleOutput, ACTION_CLOSE, ACTION_COOLDOWN_BLOCKED, ACTION_FLIP, ACTION_INCREASE,
-    ACTION_OPEN_LONG, ACTION_OPEN_SHORT, ACTION_REDUCE, ACTION_REGIME_BLOCKED,
+    SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_COOLDOWN_BLOCKED, ACTION_FLIP,
+    ACTION_INCREASE, ACTION_OPEN_LONG, ACTION_OPEN_SHORT, ACTION_REDUCE, ACTION_REGIME_BLOCKED,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -22,6 +23,8 @@ pub struct SimulationState {
     pub active_positions: HashMap<i64, PositionRecord>,
     pub pending_increases: HashMap<i64, PositionRecord>,
     pub initial_limit_price_by_pid: HashMap<i64, f64>,
+    pub maker_only_pids: HashSet<i64>,
+    pub entry_regime_by_pid: HashMap<i64, String>,
     pub closed_positions: Vec<PositionRecord>,
     pub cooldown_until_ms: HashMap<i64, (i64, String, String)>,
     pub rolling_24h_equity: VecDeque<(i64, f64)>,
@@ -42,6 +45,8 @@ pub struct SimulationState {
     pub ioc_escalations: usize,
     pub max_positions_blocks: usize,
     pub entry_interval_blocks: usize,
+    pub max_entries_per_bar_blocks: usize,
+    pub funding_defer_blocks: usize,
     pub total_fees_usdc: f64,
     pub total_funding_usdc: f64,
     pub s1_attribution_usdc: f64,
@@ -60,6 +65,8 @@ impl SimulationState {
             active_positions: HashMap::new(),
             pending_increases: HashMap::new(),
             initial_limit_price_by_pid: HashMap::new(),
+            maker_only_pids: HashSet::new(),
+            entry_regime_by_pid: HashMap::new(),
             closed_positions: Vec::new(),
             cooldown_until_ms: HashMap::new(),
             rolling_24h_equity: VecDeque::new(),
@@ -80,6 +87,8 @@ impl SimulationState {
             ioc_escalations: 0,
             max_positions_blocks: 0,
             entry_interval_blocks: 0,
+            max_entries_per_bar_blocks: 0,
+            funding_defer_blocks: 0,
             total_fees_usdc: 0.0,
             total_funding_usdc: 0.0,
             s1_attribution_usdc: 0.0,
@@ -97,6 +106,74 @@ impl SimulationState {
         out.extend(self.pending_increases.values().cloned());
         out
     }
+}
+
+/// Resolves canonical bar duration in milliseconds from `point_bars`, falling back to `config.timeframe`.
+pub(crate) fn resolve_bar_duration_ms(
+    point_bars: &HashMap<i64, &[OhlcvBar]>,
+    config: &BacktestConfig,
+) -> i64 {
+    let mut best_asset_id: Option<i64> = None;
+    for (&aid, bars) in point_bars {
+        if !bars.is_empty() && best_asset_id.is_none_or(|cur| aid < cur) {
+            best_asset_id = Some(aid);
+        }
+    }
+    if let Some(aid) = best_asset_id {
+        if let Some(bars) = point_bars.get(&aid) {
+            if let Some(tf_ms) = bars.last().and_then(|b| timeframe_to_ms(&b.timeframe)) {
+                return tf_ms.max(60_000);
+            }
+            if bars.len() >= 2 {
+                let mut dts: Vec<i64> = bars
+                    .windows(2)
+                    .map(|w| w[1].timestamp_ms.saturating_sub(w[0].timestamp_ms))
+                    .filter(|&dt| dt >= 60_000)
+                    .collect();
+                if !dts.is_empty() {
+                    dts.sort_unstable();
+                    return dts[dts.len() / 2].max(60_000);
+                }
+            }
+        }
+    }
+    timeframe_to_ms(&config.timeframe)
+        .unwrap_or(14_400_000)
+        .max(60_000)
+}
+
+/// Computes wall-clock normalized ATR (scaled to the canonical 4h stop horizon when enabled).
+pub(crate) fn resolve_bar_atr(
+    bars: &[OhlcvBar],
+    mark_price: f64,
+    default_pct: f64,
+    config: &BacktestConfig,
+    bar_duration_ms: i64,
+) -> f64 {
+    if !config.wall_clock_normalize_indicators {
+        return compute_atr_from_bars(bars, 14, mark_price, default_pct);
+    }
+    let bar_ms = bars
+        .last()
+        .and_then(|b| timeframe_to_ms(&b.timeframe))
+        .unwrap_or(bar_duration_ms)
+        .max(60_000);
+    let bar_hours = (bar_ms as f64) / 3_600_000.0;
+    if (bar_hours - 4.0).abs() < 0.05 {
+        return compute_atr_from_bars(bars, 14, mark_price, default_pct);
+    }
+    let mult = (4.0 / bar_hours).clamp(0.25, 16.0);
+    let period = (14.0 * mult).round().clamp(2.0, 224.0) as usize;
+    let scale = mult.sqrt();
+    let floor_pct = 0.004 / scale;
+    let fallback_pct = default_pct.max(0.005) / (2.2 * scale);
+    core_compute_atr(
+        bars,
+        period,
+        mark_price,
+        Some(floor_pct),
+        Some(fallback_pct),
+    ) * scale
 }
 
 /// Attributes realized or open position net PnL across Sleeves S1/S2/S3 in proportion to aligned contributions.
@@ -229,6 +306,9 @@ pub fn settle_partial_reduce(
     let mut partial_closed = pos.clone();
     partial_closed.id = state.next_pos_id;
     state.next_pos_id += 1;
+    if let Some(regime) = state.entry_regime_by_pid.get(&pos.id).cloned() {
+        state.entry_regime_by_pid.insert(partial_closed.id, regime);
+    }
     partial_closed.client_order_id = format!("{}-trim-{}", pos.client_order_id, partial_closed.id);
     partial_closed.status = "CLOSED".to_string();
     partial_closed.fsm_state = "CLOSED".to_string();
@@ -275,6 +355,34 @@ pub fn fill_working_orders(
     risk_engine: &RiskEngine,
     state: &mut SimulationState,
 ) -> Result<HashSet<i64>> {
+    let default_cfg = BacktestConfig::default();
+    let bar_duration_ms = resolve_bar_duration_ms(point_bars, &default_cfg);
+    fill_working_orders_with_config(
+        point_assets,
+        point_bars,
+        cur_bars_by_asset,
+        bar_open_ts_ms,
+        bar_duration_ms,
+        maker_fee_bps,
+        &default_cfg,
+        risk_engine,
+        state,
+    )
+}
+
+/// Config-aware variant of [`fill_working_orders`] supporting wall-clock normalized ATR stops and `entry_r0` pinning.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_working_orders_with_config(
+    point_assets: &[ExchangeAsset],
+    point_bars: &HashMap<i64, &[OhlcvBar]>,
+    cur_bars_by_asset: &HashMap<i64, &OhlcvBar>,
+    bar_open_ts_ms: i64,
+    bar_duration_ms: i64,
+    maker_fee_bps: f64,
+    config: &BacktestConfig,
+    risk_engine: &RiskEngine,
+    state: &mut SimulationState,
+) -> Result<HashSet<i64>> {
     let active_list = state.active_positions_snapshot();
     let pre_ledger = risk_engine.evaluate_ledger(state.realized_cash_equity, &active_list);
     let mut just_opened_assets = HashSet::new();
@@ -290,11 +398,12 @@ pub fn fill_working_orders(
             {
                 let side = OrderSide::parse(&pos.side)?;
                 let bars = point_bars.get(&asset.id).copied().unwrap_or(&[]);
-                let atr = compute_atr_from_bars(
+                let atr = resolve_bar_atr(
                     bars,
-                    14,
                     asset.mark_price,
                     risk_engine.limits.protective_stop_default_pct,
+                    config,
+                    bar_duration_ms,
                 );
                 let commit = risk_engine.confirm_order_fill_to_open(
                     side,
@@ -313,11 +422,17 @@ pub fn fill_working_orders(
                 pos.reserved_margin_usdc = 0.0;
                 pos.committed_notional_usdc = commit.committed_notional_usdc;
                 pos.protective_stop_px = commit.protective_stop_px;
+                pos.entry_r0 = if commit.protective_stop_px > 0.0 {
+                    (pos.entry_price - commit.protective_stop_px).abs()
+                } else {
+                    0.0
+                };
                 pos.take_profit_px = commit.take_profit_px;
                 pos.fees_paid_usdc += commit.fees_paid_usdc;
                 pos.opened_at_ms = Some(fill_ts);
                 pos.updated_at_ms = fill_ts;
                 state.initial_limit_price_by_pid.remove(&pos.id);
+                state.maker_only_pids.remove(&pos.id);
                 state.realized_cash_equity -= commit.fees_paid_usdc;
                 state.total_fees_usdc += commit.fees_paid_usdc;
                 just_opened_assets.insert(asset.id);
@@ -331,6 +446,7 @@ pub fn fill_working_orders(
         if inc_fills {
             if let Some(inc) = state.pending_increases.remove(&asset.id) {
                 state.initial_limit_price_by_pid.remove(&inc.id);
+                state.maker_only_pids.remove(&inc.id);
                 if let Some(pos) = state.active_positions.get_mut(&asset.id) {
                     if PositionStatus::parse(&pos.status) == PositionStatus::Open {
                         let old_qty = pos.filled_quantity.max(0.0);
@@ -342,6 +458,9 @@ pub fn fill_working_orders(
                             let tot_notional = (old_notional + add_notional).max(1e-8);
                             let add_fee = round_dp(add_notional * (maker_fee_bps / 10_000.0), 4);
                             pos.entry_price = round_dp(tot_notional / new_qty, 8);
+                            if pos.entry_r0 <= 0.0 && pos.protective_stop_px > 0.0 {
+                                pos.entry_r0 = (pos.entry_price - pos.protective_stop_px).abs();
+                            }
                             pos.filled_quantity = new_qty;
                             pos.requested_quantity = new_qty;
                             pos.committed_notional_usdc = round_dp(tot_notional, 4);
@@ -410,11 +529,12 @@ pub fn process_intrabar_stops_and_funding(
         };
         let side = OrderSide::parse(&pos.side)?;
         let bars = point_bars.get(&asset.id).copied().unwrap_or(&[]);
-        let atr = compute_atr_from_bars(
+        let atr = resolve_bar_atr(
             bars,
-            14,
             asset.mark_price,
             risk_engine.limits.protective_stop_default_pct,
+            config,
+            bar_duration_ms,
         );
 
         // R14-L22: Charge/credit funding on live mark notional `(mark * qty).abs()`, not initial entry notional.
@@ -514,11 +634,18 @@ pub fn process_intrabar_stops_and_funding(
         let held_duration_ms = pos
             .opened_at_ms
             .map(|opened| bar_close_ts_ms.saturating_sub(opened));
+        let entry_r0 = (pos.entry_r0 > 0.0).then_some(pos.entry_r0);
 
-        let stop_eval = risk_engine.evaluate_1s_position_lifecycle(&StopEvaluationInput {
+        // ME-2 Step 1: Evaluate lifecycle at the bar's favorable extremum (`high` for LONG, `low` for SHORT)
+        // so Chandelier / breakeven ratcheting captures intra-bar MFE before pullback to close.
+        let fav_extremum = match side {
+            OrderSide::Long => cur_bar.high,
+            OrderSide::Short => cur_bar.low,
+        };
+        let step1_eval = risk_engine.evaluate_1s_position_lifecycle(&StopEvaluationInput {
             side,
             entry_price: pos.entry_price,
-            mark_price: asset.mark_price,
+            mark_price: fav_extremum,
             quantity: pos.filled_quantity,
             current_stop_px: pos.protective_stop_px,
             current_tp_px: pos.take_profit_px,
@@ -526,9 +653,30 @@ pub fn process_intrabar_stops_and_funding(
             lowest_price_seen: bar_low,
             atr_opt: Some(atr),
             tick_size: asset.tick_size,
+            check_tp: false,
+            held_duration_ms: None,
+            entry_r0,
+        });
+
+        // ME-2 Step 2: Check whether bar close breached the newly ratcheted stop (or stagnation/close TP).
+        let stop_eval = risk_engine.evaluate_1s_position_lifecycle(&StopEvaluationInput {
+            side,
+            entry_price: pos.entry_price,
+            mark_price: asset.mark_price,
+            quantity: pos.filled_quantity,
+            current_stop_px: step1_eval.new_protective_stop_px,
+            current_tp_px: step1_eval.take_profit_px,
+            highest_price_seen: bar_high.max(step1_eval.highest_price_seen),
+            lowest_price_seen: if bar_low > 0.0 {
+                bar_low.min(step1_eval.lowest_price_seen)
+            } else {
+                step1_eval.lowest_price_seen
+            },
+            atr_opt: Some(atr),
+            tick_size: asset.tick_size,
             check_tp: true,
             held_duration_ms,
-            entry_r0: None,
+            entry_r0,
         });
 
         pos.current_price = asset.mark_price;
@@ -540,18 +688,21 @@ pub fn process_intrabar_stops_and_funding(
         pos.updated_at_ms = bar_close_ts_ms;
 
         if stop_eval.triggered {
-            let fill_px = round_dp(
-                (asset.mark_price * (1.0 - side.sign() * slip)).max(tick_floor),
-                8,
-            );
+            let reason = stop_eval
+                .exit_reason
+                .unwrap_or_else(|| "PROTECTIVE_STOP".to_string());
+            let raw_px = if reason.starts_with("PROTECTIVE_STOP") {
+                step1_eval.new_protective_stop_px
+            } else {
+                asset.mark_price
+            };
+            let fill_px = round_dp((raw_px * (1.0 - side.sign() * slip)).max(tick_floor), 8);
             stopped_assets.push((
                 asset.id,
                 asset.symbol.clone(),
-                asset.mark_price,
+                raw_px,
                 fill_px,
-                stop_eval
-                    .exit_reason
-                    .unwrap_or_else(|| "PROTECTIVE_STOP".to_string()),
+                reason,
                 stop_eval.cooldown_duration_ms,
             ));
         }
@@ -560,9 +711,11 @@ pub fn process_intrabar_stops_and_funding(
     for (aid, sym, raw_px, exit_px, reason, eval_cd_ms) in stopped_assets {
         if let Some(inc) = state.pending_increases.remove(&aid) {
             state.initial_limit_price_by_pid.remove(&inc.id);
+            state.maker_only_pids.remove(&inc.id);
         }
         if let Some(pos) = state.active_positions.remove(&aid) {
             state.initial_limit_price_by_pid.remove(&pos.id);
+            state.maker_only_pids.remove(&pos.id);
             let closed = settle_full_close(
                 pos,
                 raw_px,
@@ -627,10 +780,12 @@ pub fn build_active_cooldown_views(
         .collect()
 }
 
-/// Step 5: Executes rebalance actions enforcing all live execution gates (`max_open_positions`,
-/// `min_position_hold_sec` w/ loser invalidation bypass, `min_entry_interval_sec`,
-/// `profit_gate_signal_exits` w/ `FLIP` exemption & `mark*qty` fee, 24h rolling DD breaker,
-/// `min_equity_halt_usdc`, and chase drift cap / IOC escalation).
+/// Step 5: Executes rebalance actions in strict 2-phase parity (`Phase 1` exits/reduces/working
+/// updates before `Phase 2` sorted entry/increase candidates) enforcing live gates (`max_open_positions`,
+/// `max_entries_per_bar`, Leak L2 intra-bar `sim_entry_ts` pacing, `min_position_hold_sec` w/ loser bypass,
+/// `profit_gate_signal_exits` w/ `FLIP` exemption, `300s` `ACTION_CLOSE` cooldown, 24h rolling DD breaker,
+/// `min_equity_halt_usdc`, `enforce_slot_spread_weight_cap`, N4 passive maker rest, N6 funding timing,
+/// and chase drift cap / IOC escalation).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_rebalance_actions(
     point_assets: &[ExchangeAsset],
@@ -642,11 +797,43 @@ pub fn execute_rebalance_actions(
     risk_engine: &RiskEngine,
     state: &mut SimulationState,
 ) -> Result<()> {
+    let bar_duration_ms = resolve_bar_duration_ms(point_bars, config);
+    execute_rebalance_actions_with_duration(
+        point_assets,
+        point_bars,
+        cycle_out,
+        mid_ledger,
+        bar_close_ts_ms,
+        bar_duration_ms,
+        config,
+        risk_engine,
+        state,
+    )
+}
+
+/// Duration-aware variant of [`execute_rebalance_actions`] receiving exact `bar_duration_ms` from `run_walk_forward`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_rebalance_actions_with_duration(
+    point_assets: &[ExchangeAsset],
+    point_bars: &HashMap<i64, &[OhlcvBar]>,
+    cycle_out: &SignalCycleOutput,
+    mid_ledger: &CapitalLedgerState,
+    bar_close_ts_ms: i64,
+    bar_duration_ms: i64,
+    config: &BacktestConfig,
+    risk_engine: &RiskEngine,
+    state: &mut SimulationState,
+) -> Result<()> {
     let slip = (config.slippage_bps.max(0.0)) / 10_000.0;
     let lev_mult = config.allocator.effective_leverage_multiplier();
-    let min_delta = config.allocator.min_rebalance_delta_weight.max(1e-4);
+    let base_min_delta = config.allocator.min_rebalance_delta_weight.max(1e-4);
+    let eff_min_delta = (base_min_delta * lev_mult)
+        .max(1e-4)
+        .min(config.allocator.max_single_asset_weight.max(1e-4));
     let min_hold_ms = config.min_position_hold_sec.max(0) * 1000;
     let early_loser_enabled = config.allocator.hysteresis.early_loser_invalidation_enabled;
+    let eff_bar_duration_ms = bar_duration_ms.max(60_000);
+    let bar_open_ts_ms = bar_close_ts_ms - eff_bar_duration_ms;
 
     let asset_by_id: HashMap<i64, &ExchangeAsset> =
         point_assets.iter().map(|a| (a.id, a)).collect();
@@ -680,9 +867,11 @@ pub fn execute_rebalance_actions(
     }
     let entries_halted = drawdown_halted || ruin_halted;
 
+    // ── Phase 1: Exits (CLOSE / FLIP / REDUCE), stale pending_increases cleanup & WORKING updates ──
+    let mut flipped_assets: HashSet<i64> = HashSet::new();
     for sig in &cycle_out.signals {
         if sig.rebalance_action == ACTION_COOLDOWN_BLOCKED {
-            if sig.raw_combined_weight.abs() * lev_mult >= min_delta {
+            if sig.raw_combined_weight.abs() * lev_mult >= eff_min_delta {
                 state.cooldown_blocks += 1;
             }
             continue;
@@ -696,13 +885,27 @@ pub fn execute_rebalance_actions(
         };
         let tick_floor = asset.tick_size.max(1e-8);
 
-        if sig.rebalance_action != ACTION_INCREASE {
+        if sig.rebalance_action != ACTION_INCREASE || !config.enable_scale_in_out_rebalance {
             if let Some(inc) = state.pending_increases.remove(&sig.asset_id) {
                 state.initial_limit_price_by_pid.remove(&inc.id);
+                state.maker_only_pids.remove(&inc.id);
+            }
+        } else if config.maker_first_low_urgency_entries {
+            let expire_inc = state
+                .pending_increases
+                .get(&sig.asset_id)
+                .is_some_and(|inc| {
+                    state.maker_only_pids.contains(&inc.id)
+                        && bar_close_ts_ms.saturating_sub(inc.created_at_ms)
+                            >= config.maker_only_rest_ttl_ms
+                });
+            if expire_inc {
+                if let Some(inc) = state.pending_increases.remove(&sig.asset_id) {
+                    state.initial_limit_price_by_pid.remove(&inc.id);
+                    state.maker_only_pids.remove(&inc.id);
+                }
             }
         }
-
-        let mut is_flipped_entry = false;
 
         if matches!(sig.rebalance_action.as_str(), ACTION_CLOSE | ACTION_FLIP) {
             let can_exit = if let Some(pos) = state.active_positions.get(&sig.asset_id) {
@@ -748,6 +951,7 @@ pub fn execute_rebalance_actions(
             if can_exit {
                 if let Some(pos) = state.active_positions.remove(&sig.asset_id) {
                     state.initial_limit_price_by_pid.remove(&pos.id);
+                    state.maker_only_pids.remove(&pos.id);
                     if PositionStatus::parse(&pos.status) == PositionStatus::Open {
                         let side = OrderSide::parse(&pos.side)?;
                         let raw_px = asset.mark_price;
@@ -764,12 +968,24 @@ pub fn execute_rebalance_actions(
                         )?;
                         state.closed_positions.push(closed);
                         if sig.rebalance_action == ACTION_FLIP {
-                            is_flipped_entry = true;
+                            flipped_assets.insert(sig.asset_id);
+                        } else {
+                            // Live engine.rs:1280-1284 parity: 300s cooldown on CLOSE, 0s on FLIP
+                            state.cooldown_until_ms.insert(
+                                asset.id,
+                                (
+                                    bar_close_ts_ms + 300_000,
+                                    asset.symbol.clone(),
+                                    "SIGNAL_CLOSE".to_string(),
+                                ),
+                            );
                         }
+                    } else if sig.rebalance_action == ACTION_FLIP {
+                        flipped_assets.insert(sig.asset_id);
                     }
                 }
             }
-        } else if sig.rebalance_action == ACTION_REDUCE {
+        } else if sig.rebalance_action == ACTION_REDUCE && config.enable_scale_in_out_rebalance {
             let existing_status = state
                 .active_positions
                 .get(&sig.asset_id)
@@ -777,6 +993,7 @@ pub fn execute_rebalance_actions(
             if existing_status == Some(PositionStatus::Working) {
                 if let Some(pos) = state.active_positions.remove(&sig.asset_id) {
                     state.initial_limit_price_by_pid.remove(&pos.id);
+                    state.maker_only_pids.remove(&pos.id);
                 }
             } else if existing_status == Some(PositionStatus::Open) {
                 if let Some(mut pos) = state.active_positions.remove(&sig.asset_id) {
@@ -832,6 +1049,7 @@ pub fn execute_rebalance_actions(
                     }
                     if full_close {
                         state.initial_limit_price_by_pid.remove(&pos.id);
+                        state.maker_only_pids.remove(&pos.id);
                         let raw_px = asset.mark_price;
                         let exit_px =
                             round_dp((raw_px * (1.0 - side.sign() * slip)).max(tick_floor), 8);
@@ -850,73 +1068,10 @@ pub fn execute_rebalance_actions(
                     }
                 }
             }
-        } else if sig.rebalance_action == ACTION_INCREASE && !entries_halted {
-            let total_active = state.active_positions.len() + state.pending_increases.len();
-            let interval_ok = config.min_entry_interval_sec <= 0
-                || state.last_entry_ts_ms.is_none_or(|last| {
-                    bar_close_ts_ms.saturating_sub(last) >= config.min_entry_interval_sec * 1000
-                });
-            if total_active >= config.max_open_positions.max(1) {
-                state.max_positions_blocks += 1;
-            } else if !interval_ok {
-                state.entry_interval_blocks += 1;
-            } else {
-                if let Some(pos) = state.active_positions.get(&sig.asset_id) {
-                    if PositionStatus::parse(&pos.status) == PositionStatus::Open
-                        && !state.pending_increases.contains_key(&sig.asset_id)
-                    {
-                        let cur_vec = state.active_positions_snapshot();
-                        let cur_ledger =
-                            risk_engine.evaluate_ledger(state.realized_cash_equity, &cur_vec);
-                        let side = OrderSide::parse(&pos.side)?;
-                        let live_current_w = if cur_ledger.total_equity_usdc > 1e-6 {
-                            (pos.current_price.max(pos.entry_price) * pos.filled_quantity
-                                / cur_ledger.total_equity_usdc)
-                                * side.sign()
-                        } else {
-                            pos.portfolio_weight.abs() * side.sign()
-                        };
-                        let bars = point_bars.get(&asset.id).copied().unwrap_or(&[]);
-                        let atr = compute_atr_from_bars(
-                            bars,
-                            14,
-                            asset.mark_price,
-                            risk_engine.limits.protective_stop_default_pct,
-                        );
-                        let plan = risk_engine.size_working_order_from_weights(
-                            asset,
-                            sig.target_weight,
-                            live_current_w,
-                            sig.w_s1_carry_mom,
-                            sig.w_s2_trend_breakout,
-                            sig.w_s3_event_reversion,
-                            &cur_ledger,
-                            Some(atr),
-                        );
-                        if plan.approved && plan.side == side {
-                            let pid = state.next_pos_id;
-                            state.next_pos_id += 1;
-                            state
-                                .initial_limit_price_by_pid
-                                .insert(pid, plan.limit_price);
-                            state.last_entry_ts_ms = Some(bar_close_ts_ms);
-                            state.pending_increases.insert(
-                                asset.id,
-                                build_working_position(
-                                    pid,
-                                    asset.id,
-                                    format!("bt-inc-{pid}"),
-                                    &plan,
-                                    bar_close_ts_ms,
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
         }
 
-        // Re-anchor unfilled WORKING orders: enforce drift cap (60 bps) and IOC escalation after max_alo_chase_ticks (3)
+        // Re-anchor unfilled WORKING orders: enforce drift cap (60 bps), N4 passive maker rest,
+        // and IOC escalation after max_alo_chase_ticks (3) for urgent orders.
         let mut abort_chase = false;
         let mut cancel_working = false;
         let mut escalate_ioc = false;
@@ -935,8 +1090,24 @@ pub fn execute_rebalance_actions(
                         .copied()
                         .unwrap_or(pos.entry_price);
                     let drift_bps = ((new_px - init_px).abs() / init_px.max(1e-12)) * 10_000.0;
+                    let is_maker_only = config.maker_first_low_urgency_entries
+                        && state.maker_only_pids.contains(&pos.id);
                     if drift_bps > config.max_alo_chase_drift_bps {
                         abort_chase = true;
+                    } else if is_maker_only {
+                        if bar_close_ts_ms.saturating_sub(pos.created_at_ms)
+                            >= config.maker_only_rest_ttl_ms
+                        {
+                            cancel_working = true;
+                        } else if new_px > 0.0 {
+                            pos.entry_price = new_px;
+                            pos.current_price = new_px;
+                            pos.fsm_state = "MAKER_RESTING".to_string();
+                            pos.highest_price_seen = new_px;
+                            pos.lowest_price_seen = new_px;
+                            pos.chase_count += 1;
+                            pos.updated_at_ms = bar_close_ts_ms;
+                        }
                     } else if pos.chase_count >= config.max_alo_chase_ticks && !entries_halted {
                         escalate_ioc = true;
                     } else if new_px > 0.0 {
@@ -955,10 +1126,12 @@ pub fn execute_rebalance_actions(
         if cancel_working {
             if let Some(pos) = state.active_positions.remove(&sig.asset_id) {
                 state.initial_limit_price_by_pid.remove(&pos.id);
+                state.maker_only_pids.remove(&pos.id);
             }
         } else if abort_chase {
             if let Some(pos) = state.active_positions.remove(&sig.asset_id) {
                 state.initial_limit_price_by_pid.remove(&pos.id);
+                state.maker_only_pids.remove(&pos.id);
                 state.chase_abort_count += 1;
                 let cd_ms = config.chase_reject_cooldown_sec.max(1) * 1000;
                 state.cooldown_until_ms.insert(
@@ -975,11 +1148,12 @@ pub fn execute_rebalance_actions(
                 let cur_vec = state.active_positions_snapshot();
                 let cur_ledger = risk_engine.evaluate_ledger(state.realized_cash_equity, &cur_vec);
                 let bars = point_bars.get(&asset.id).copied().unwrap_or(&[]);
-                let atr = compute_atr_from_bars(
+                let atr = resolve_bar_atr(
                     bars,
-                    14,
                     asset.mark_price,
                     risk_engine.limits.protective_stop_default_pct,
+                    config,
+                    eff_bar_duration_ms,
                 );
                 let ioc_slip_frac = config
                     .slippage_bps
@@ -1013,6 +1187,11 @@ pub fn execute_rebalance_actions(
                     pos.reserved_margin_usdc = 0.0;
                     pos.committed_notional_usdc = commit.committed_notional_usdc;
                     pos.protective_stop_px = commit.protective_stop_px;
+                    pos.entry_r0 = if commit.protective_stop_px > 0.0 {
+                        (ioc_fill_px - commit.protective_stop_px).abs()
+                    } else {
+                        0.0
+                    };
                     pos.take_profit_px = commit.take_profit_px;
                     pos.highest_price_seen = ioc_fill_px.max(asset.mark_price);
                     pos.lowest_price_seen = ioc_fill_px.min(asset.mark_price);
@@ -1025,63 +1204,210 @@ pub fn execute_rebalance_actions(
                     pos.opened_at_ms = Some(bar_close_ts_ms);
                     pos.updated_at_ms = bar_close_ts_ms;
                     state.initial_limit_price_by_pid.remove(&pos.id);
+                    state.maker_only_pids.remove(&pos.id);
                     state.realized_cash_equity -= commit.fees_paid_usdc;
                     state.total_fees_usdc += commit.fees_paid_usdc;
                     state.ioc_escalations += 1;
                 }
             }
         }
+    }
 
-        if matches!(
-            sig.rebalance_action.as_str(),
-            ACTION_OPEN_LONG | ACTION_OPEN_SHORT | ACTION_FLIP
-        ) && !state.active_positions.contains_key(&sig.asset_id)
-            && !entries_halted
-        {
+    // ── Phase 2: Sorted entry & scale-in candidates after Phase 1 freed slots/equity ──
+    if !entries_halted {
+        let mut candidates: Vec<&SleeveSignalInput> = cycle_out
+            .signals
+            .iter()
+            .filter(|sig| {
+                let is_open_cand = matches!(
+                    sig.rebalance_action.as_str(),
+                    ACTION_OPEN_LONG | ACTION_OPEN_SHORT | ACTION_FLIP
+                ) && !state.active_positions.contains_key(&sig.asset_id);
+                let is_inc_cand = config.enable_scale_in_out_rebalance
+                    && sig.rebalance_action == ACTION_INCREASE
+                    && !state.pending_increases.contains_key(&sig.asset_id)
+                    && state
+                        .active_positions
+                        .get(&sig.asset_id)
+                        .is_some_and(|p| PositionStatus::parse(&p.status) == PositionStatus::Open);
+                (is_open_cand || is_inc_cand) && asset_by_id.contains_key(&sig.asset_id)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            let a_prio = ((a.rebalance_action == ACTION_FLIP
+                && flipped_assets.contains(&a.asset_id)) as i32)
+                * 2
+                + ((a.event_trigger.as_deref() == Some("CAPITULATION_FLUSH")) as i32);
+            let b_prio = ((b.rebalance_action == ACTION_FLIP
+                && flipped_assets.contains(&b.asset_id)) as i32)
+                * 2
+                + ((b.event_trigger.as_deref() == Some("CAPITULATION_FLUSH")) as i32);
+            b_prio
+                .cmp(&a_prio)
+                .then_with(|| b.target_weight.abs().total_cmp(&a.target_weight.abs()))
+                .then_with(|| b.day_volume_usdc.total_cmp(&a.day_volume_usdc))
+                .then_with(|| a.asset_id.cmp(&b.asset_id))
+        });
+
+        let eff_lev_cap = lev_mult.min(risk_engine.limits.max_gross_leverage_x);
+        let max_per_pos_weight = if config.enforce_slot_spread_weight_cap {
+            ((eff_lev_cap / (config.max_open_positions.max(1) as f64)) * 1.25)
+                .min(risk_engine.limits.max_single_asset_weight)
+        } else {
+            risk_engine.limits.max_single_asset_weight
+        };
+        let interval_ms = config.min_entry_interval_sec.max(0) * 1000;
+        let mut entries_this_bar: usize = 0;
+
+        for sig in candidates {
+            let Some(&asset) = asset_by_id.get(&sig.asset_id) else {
+                continue;
+            };
+            let is_flipped_entry =
+                sig.rebalance_action == ACTION_FLIP && flipped_assets.contains(&sig.asset_id);
+
+            if !is_flipped_entry
+                && state
+                    .cooldown_until_ms
+                    .get(&sig.asset_id)
+                    .is_some_and(|(exp, _, _)| *exp > bar_close_ts_ms)
+            {
+                continue;
+            }
+
             if state.active_positions.len() + state.pending_increases.len()
                 >= config.max_open_positions.max(1)
             {
                 state.max_positions_blocks += 1;
                 continue;
             }
-            if !is_flipped_entry
-                && config.min_entry_interval_sec > 0
-                && state.last_entry_ts_ms.is_some_and(|last| {
-                    bar_close_ts_ms.saturating_sub(last) < config.min_entry_interval_sec * 1000
-                })
-            {
-                state.entry_interval_blocks += 1;
+
+            if config.max_entries_per_bar > 0 && entries_this_bar >= config.max_entries_per_bar {
+                state.max_entries_per_bar_blocks += 1;
                 continue;
             }
 
+            // Leak L2: Track intra-bar entry cursor within [bar_open_ts_ms, bar_close_ts_ms].
+            // When bar_duration_ms < interval_ms (e.g. 1m bars with 150s cooldown), consecutive
+            // bars remain blocked; when bar_duration_ms >= interval_ms (e.g. 4h), spaced entries fit.
+            let sim_entry_ts = if is_flipped_entry || interval_ms <= 0 {
+                state
+                    .last_entry_ts_ms
+                    .map(|last| last.max(bar_open_ts_ms))
+                    .unwrap_or(bar_open_ts_ms)
+            } else {
+                let candidate_ts = state
+                    .last_entry_ts_ms
+                    .map(|last| (last + interval_ms).max(bar_open_ts_ms))
+                    .unwrap_or(bar_open_ts_ms);
+                if candidate_ts > bar_close_ts_ms {
+                    state.entry_interval_blocks += 1;
+                    continue;
+                }
+                candidate_ts
+            };
+
+            let capped_target_weight = sig
+                .target_weight
+                .clamp(-max_per_pos_weight, max_per_pos_weight);
             let cur_vec = state.active_positions_snapshot();
             let cur_ledger = risk_engine.evaluate_ledger(state.realized_cash_equity, &cur_vec);
             let bars = point_bars.get(&asset.id).copied().unwrap_or(&[]);
-            let atr = compute_atr_from_bars(
+            let atr = resolve_bar_atr(
                 bars,
-                14,
                 asset.mark_price,
                 risk_engine.limits.protective_stop_default_pct,
+                config,
+                eff_bar_duration_ms,
             );
+
+            let is_increase = sig.rebalance_action == ACTION_INCREASE;
+            let (effective_current_w, existing_side_opt) = if is_increase {
+                let Some(pos) = state.active_positions.get(&sig.asset_id) else {
+                    continue;
+                };
+                if PositionStatus::parse(&pos.status) != PositionStatus::Open
+                    || state.pending_increases.contains_key(&sig.asset_id)
+                {
+                    continue;
+                }
+                let side = OrderSide::parse(&pos.side)?;
+                let live_current_w = if cur_ledger.total_equity_usdc > 1e-6 {
+                    (pos.current_price.max(pos.entry_price) * pos.filled_quantity
+                        / cur_ledger.total_equity_usdc)
+                        * side.sign()
+                } else {
+                    pos.portfolio_weight.abs() * side.sign()
+                };
+                (live_current_w, Some(side))
+            } else {
+                (0.0, None)
+            };
 
             let plan = risk_engine.size_working_order_from_weights(
                 asset,
-                sig.target_weight,
-                0.0,
+                capped_target_weight,
+                effective_current_w,
                 sig.w_s1_carry_mom,
                 sig.w_s2_trend_breakout,
                 sig.w_s3_event_reversion,
                 &cur_ledger,
                 Some(atr),
             );
+            if !plan.approved {
+                continue;
+            }
+            if let Some(existing_side) = existing_side_opt {
+                if plan.side != existing_side {
+                    continue;
+                }
+            }
 
-            if plan.approved {
-                let pid = state.next_pos_id;
-                state.next_pos_id += 1;
-                state
-                    .initial_limit_price_by_pid
-                    .insert(pid, plan.limit_price);
-                state.last_entry_ts_ms = Some(bar_close_ts_ms);
+            // Lever N6: Defer adverse-funding non-flip entries right before UTC hourly settlement.
+            if config.funding_entry_timing_enabled && !is_flipped_entry {
+                let adverse_funding = plan.side.sign() * asset.funding_rate_hourly;
+                let defer_window_ms = config.funding_entry_defer_window_sec.clamp(0, 3_600) * 1000;
+                let ms_to_hour = 3_600_000 - bar_close_ts_ms.rem_euclid(3_600_000);
+                if adverse_funding >= config.funding_entry_defer_min_rate_hourly
+                    && ms_to_hour <= defer_window_ms
+                {
+                    state.funding_defer_blocks += 1;
+                    continue;
+                }
+            }
+
+            let pid = state.next_pos_id;
+            state.next_pos_id += 1;
+            state
+                .initial_limit_price_by_pid
+                .insert(pid, plan.limit_price);
+            state
+                .entry_regime_by_pid
+                .insert(pid, cycle_out.breadth.market_regime_label.clone());
+            let is_high_urgency = is_flipped_entry
+                || matches!(
+                    sig.event_trigger.as_deref(),
+                    Some("CAPITULATION_FLUSH" | "LIVE_BREAKOUT_SURGE")
+                );
+            if config.maker_first_low_urgency_entries && !is_high_urgency {
+                state.maker_only_pids.insert(pid);
+            }
+            state.last_entry_ts_ms = Some(sim_entry_ts);
+            entries_this_bar += 1;
+
+            if is_increase {
+                state.pending_increases.insert(
+                    asset.id,
+                    build_working_position(
+                        pid,
+                        asset.id,
+                        format!("bt-inc-{pid}"),
+                        &plan,
+                        bar_close_ts_ms,
+                    ),
+                );
+            } else {
                 state.active_positions.insert(
                     asset.id,
                     build_working_position(
@@ -1106,6 +1432,11 @@ fn build_working_position(
     plan: &aegis_risk::WorkingOrderSizingPlan,
     ts_ms: i64,
 ) -> PositionRecord {
+    let entry_r0 = if plan.protective_stop_px > 0.0 {
+        (plan.limit_price - plan.protective_stop_px).abs()
+    } else {
+        0.0
+    };
     PositionRecord {
         id: pid,
         asset_id,
@@ -1125,7 +1456,7 @@ fn build_working_position(
         s2_weight_contrib: plan.s2_weight_contrib,
         s3_weight_contrib: plan.s3_weight_contrib,
         protective_stop_px: plan.protective_stop_px,
-        entry_r0: 0.0,
+        entry_r0,
         protective_stop_oid: None,
         take_profit_px: plan.take_profit_px,
         take_profit_oid: None,
