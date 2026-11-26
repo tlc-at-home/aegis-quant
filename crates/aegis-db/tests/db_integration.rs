@@ -4078,3 +4078,536 @@ fn test_wave4_proportional_portfolio_weight_scaling_across_partial_lifecycle() {
     assert!((reduced.s1_weight_contrib - 0.026).abs() < 1e-4);
     assert!((reduced.s2_weight_contrib - 0.0173).abs() < 1e-4);
 }
+
+#[test]
+fn test_r14_w1_sync_open_preserves_working_scale_in_audits_dedup_and_relinks() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let doge_id = seed_test_asset(&db, "DOGE", 12, 0.2000);
+    let now = now_ms();
+
+    // 1. Seed OPEN LONG parent (5,000 DOGE) + same-side WORKING INCREASE scale-in (+1,006 DOGE)
+    let open_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: doge_id,
+            client_order_id: "v2-doge-long-open-parent".to_string(),
+            side: OrderSide::Long,
+            limit_price: 0.2000,
+            requested_quantity: 5_000.0,
+            reserved_margin_usdc: 500.0,
+            portfolio_weight: 0.20,
+            s1_weight_contrib: 0.20,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.1900,
+            take_profit_px: Some(0.2200),
+            exchange_order_id: Some("hl-90001".to_string()),
+            reason: "OPEN_LONG".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        open_pid,
+        0.2000,
+        5_000.0,
+        0.15,
+        0.1900,
+        Some(0.2200),
+        Some("hl-90001"),
+        "FILLED",
+    )
+    .unwrap();
+
+    let inc_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: doge_id,
+            client_order_id: "v2-doge-long-scalein-174773".to_string(),
+            side: OrderSide::Long,
+            limit_price: 0.1999,
+            requested_quantity: 1_006.0,
+            reserved_margin_usdc: 100.55,
+            portfolio_weight: 0.04,
+            s1_weight_contrib: 0.04,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.1900,
+            take_profit_px: Some(0.2200),
+            exchange_order_id: None,
+            reason: "INCREASE".to_string(),
+        })
+        .unwrap();
+
+    // 2. Repeated 15s sync_open_position_from_exchange_v2 MUST preserve same-side WORKING scale-in
+    for _ in 0..3 {
+        let (synced_pid, newly_adopted) = db
+            .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+                asset_id: doge_id,
+                coin: "DOGE",
+                side: OrderSide::Long,
+                entry_price: 0.2000,
+                mark_price: 0.2010,
+                quantity: 5_000.0,
+                committed_notional_usdc: 1_005.0,
+                unrealized_pnl_usdc: 5.0,
+                portfolio_weight: 0.20,
+                protective_stop_px: 0.1900,
+                take_profit_px: 0.2200,
+                funding_accrued_usdc: 0.0,
+                opened_at_ms: Some(now - 60_000),
+            })
+            .unwrap();
+        assert_eq!(synced_pid, open_pid);
+        assert!(!newly_adopted);
+    }
+
+    let inc_row = db.get_position_by_id(inc_pid).unwrap().unwrap();
+    assert_eq!(
+        inc_row.status, "WORKING",
+        "Same-side WORKING scale-in must NEVER be cancelled by DEDUP_EXCHANGE_RECONCILE"
+    );
+    let ordered = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].position_id, inc_pid);
+    assert!((ordered[0].requested_quantity - 1_006.0).abs() < 1e-6);
+    assert!((ordered[0].reserved_margin_usdc - 100.55).abs() < 1e-4);
+
+    // 3. Upsert missing exchange_order_id onto WORKING row and verify idempotency
+    assert!(db
+        .set_working_order_exchange_id(inc_pid, "hl-91001")
+        .unwrap());
+    assert!(!db
+        .set_working_order_exchange_id(inc_pid, "hl-91001")
+        .unwrap());
+    assert_eq!(
+        db.get_position_by_id(inc_pid)
+            .unwrap()
+            .unwrap()
+            .exchange_order_id
+            .as_deref(),
+        Some("hl-91001")
+    );
+
+    // 4. Duplicate OPEN row + opposite-side WORKING row ARE deduplicated WITH explicit order_audit entries
+    let dup_open_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: doge_id,
+            client_order_id: "v2-doge-long-dup-open".to_string(),
+            side: OrderSide::Long,
+            limit_price: 0.2000,
+            requested_quantity: 1_000.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.04,
+            s1_weight_contrib: 0.04,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.1900,
+            take_profit_px: None,
+            exchange_order_id: None,
+            reason: "DUP_OPEN".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        dup_open_pid,
+        0.2000,
+        1_000.0,
+        0.0,
+        0.1900,
+        None,
+        None,
+        "DUP",
+    )
+    .unwrap();
+    let opp_short_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: doge_id,
+            client_order_id: "v2-doge-short-stale".to_string(),
+            side: OrderSide::Short,
+            limit_price: 0.2020,
+            requested_quantity: 500.0,
+            reserved_margin_usdc: 50.0,
+            portfolio_weight: -0.02,
+            s1_weight_contrib: -0.02,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 0.2120,
+            take_profit_px: None,
+            exchange_order_id: None,
+            reason: "OPP_SHORT".to_string(),
+        })
+        .unwrap();
+
+    db.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+        asset_id: doge_id,
+        coin: "DOGE",
+        side: OrderSide::Long,
+        entry_price: 0.2000,
+        mark_price: 0.2010,
+        quantity: 5_000.0,
+        committed_notional_usdc: 1_005.0,
+        unrealized_pnl_usdc: 5.0,
+        portfolio_weight: 0.20,
+        protective_stop_px: 0.1900,
+        take_profit_px: 0.2200,
+        funding_accrued_usdc: 0.0,
+        opened_at_ms: Some(now - 60_000),
+    })
+    .unwrap();
+
+    assert_eq!(
+        db.get_position_by_id(inc_pid).unwrap().unwrap().status,
+        "WORKING"
+    );
+    assert_eq!(
+        db.get_position_by_id(dup_open_pid).unwrap().unwrap().status,
+        "CANCELLED"
+    );
+    assert_eq!(
+        db.get_position_by_id(opp_short_pid)
+            .unwrap()
+            .unwrap()
+            .status,
+        "CANCELLED"
+    );
+    let audits = db.list_recent_order_audits(30).unwrap();
+    assert!(audits.iter().any(|a| {
+        a.position_id == dup_open_pid
+            && a.to_state == "CANCELLED"
+            && a.reason == "DEDUP_EXCHANGE_RECONCILE"
+    }));
+    assert!(audits.iter().any(|a| {
+        a.position_id == opp_short_pid
+            && a.to_state == "CANCELLED"
+            && a.reason == "REPLACED_BY_EXCHANGE_OPEN"
+    }));
+    assert!(!audits
+        .iter()
+        .any(|a| a.position_id == inc_pid && a.to_state == "CANCELLED"));
+
+    // 5. Prematurely cancelled WORKING row is cleanly re-linked back to WORKING with reserved_margin_usdc
+    db.cancel_working_order(inc_pid, "SIMULATED_PREMATURE_CANCEL")
+        .unwrap();
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+    let (relinked_id, changed) = db
+        .adopt_or_relink_resting_working_order(
+            &WorkingOrderInput {
+                asset_id: doge_id,
+                client_order_id: "hl-working-doge-91001".to_string(),
+                side: OrderSide::Long,
+                limit_price: 0.1999,
+                requested_quantity: 1_006.0,
+                reserved_margin_usdc: 100.55,
+                portfolio_weight: 0.04,
+                s1_weight_contrib: 0.04,
+                s2_weight_contrib: 0.0,
+                s3_weight_contrib: 0.0,
+                protective_stop_px: 0.1900,
+                take_profit_px: Some(0.2200),
+                exchange_order_id: Some("hl-91001".to_string()),
+                reason: "HL_RECONCILE_RELINKED_RESTING_ORDER".to_string(),
+            },
+            Some(inc_pid),
+        )
+        .unwrap();
+    assert_eq!(relinked_id, inc_pid);
+    assert!(changed);
+    let ordered_relinked = db.get_assets_ordered().unwrap();
+    assert_eq!(ordered_relinked.len(), 1);
+    assert_eq!(ordered_relinked[0].position_id, inc_pid);
+    assert!((ordered_relinked[0].reserved_margin_usdc - 100.55).abs() < 1e-4);
+}
+
+#[test]
+fn test_r14_w3_partial_reduce_single_booking_scale_in_zero_and_close_parity() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = seed_test_asset(&db, "SOL", 5, 100.0);
+    let t_open = now_ms() - 3_600_000;
+
+    // 1. Open 2.48 SOL @ $100.00 (fee $0.0868) + merge 1.00 SOL scale-in @ $100.00 (fee $0.0350) => 3.48 SOL @ $100.00, fee $0.1218
+    let open_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "v2-sol-long-w3-parent".to_string(),
+            side: OrderSide::Long,
+            limit_price: 100.0,
+            requested_quantity: 2.48,
+            reserved_margin_usdc: 124.0,
+            portfolio_weight: 0.124,
+            s1_weight_contrib: 0.124,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 94.0,
+            take_profit_px: Some(115.0),
+            exchange_order_id: Some("hl-7001".to_string()),
+            reason: "OPEN_LONG".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        open_pid,
+        100.0,
+        2.48,
+        0.0868,
+        94.0,
+        Some(115.0),
+        Some("hl-7001"),
+        "FILLED",
+    )
+    .unwrap();
+    {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            "UPDATE positions SET created_at_ms = :t, opened_at_ms = :t, funding_accrued_usdc = -0.1220 WHERE id = :pid",
+            params! { "t" => t_open, "pid" => open_pid },
+        )
+        .unwrap();
+    }
+
+    let scale_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "v2-sol-long-w3-scalein".to_string(),
+            side: OrderSide::Long,
+            limit_price: 100.0,
+            requested_quantity: 1.00,
+            reserved_margin_usdc: 50.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 94.0,
+            take_profit_px: Some(115.0),
+            exchange_order_id: Some("hl-7001b".to_string()),
+            reason: "INCREASE".to_string(),
+        })
+        .unwrap();
+    db.merge_working_scale_in_into_open(
+        scale_pid,
+        open_pid,
+        100.0,
+        1.00,
+        0.0350,
+        Some("hl-7001b"),
+        "INCREASE_FILLED",
+    )
+    .unwrap();
+
+    // Pollute SCALE_IN_MERGED child row (reproducing #174553) and seed pre-existing phantom hl-closed-sol-7002 (#174737)
+    let phantom_id: i64 = {
+        let mut conn = db.get_conn().unwrap();
+        conn.exec_drop(
+            "UPDATE positions SET realized_pnl_usdc = 1.2500, fees_paid_usdc = 0.0900, funding_accrued_usdc = -0.0400 WHERE id = :id",
+            params! { "id" => scale_pid },
+        )
+        .unwrap();
+        conn.exec_drop(
+            r#"INSERT INTO positions (
+                   asset_id, client_order_id, side, status, fsm_state, entry_price, current_price, exit_price,
+                   requested_quantity, filled_quantity, protective_stop_px, entry_r0, realized_pnl_usdc,
+                   fees_paid_usdc, funding_accrued_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                   closed_at_ms, updated_at_ms, exit_reason
+               ) VALUES (
+                   :aid, 'hl-closed-sol-7002', 'LONG', 'CLOSED', 'CLOSED', 100.0, 102.5, 102.5,
+                   1.04, 1.04, 0.0, 0.0, 0.8332,
+                   0.0373, 0.0, 'hl-7002', :t_open, :t_open,
+                   :t_close, :t_close, 'HL_USER_FILL_RECONCILED'
+               )"#,
+            params! { "aid" => sol_id, "t_open" => t_open, "t_close" => t_open + 600_000 },
+        )
+        .unwrap();
+        let pid = conn.last_insert_id() as i64;
+        conn.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :pid, :aid, 'hl-closed-sol-7002', 'LONG', 'OPEN', 'CLOSED',
+                   1.04, 1.04, 102.5, 102.5, 0, 0, 0.0373, 'LEGACY_SPLIT_AUDIT', :ts, :ts
+               )"#,
+            params! { "pid" => pid, "aid" => sol_id, "ts" => t_open + 600_000 },
+        )
+        .unwrap();
+        pid
+    };
+
+    // 2. Record 3 partial REDUCE exits leaving 1.49 SOL OPEN:
+    // -1.04 @ 102.50 (fee 0.0373 => +2.5627), -0.72 @ 103.00 (fee 0.0260 => +2.1340), -0.23 @ 101.80 (fee 0.0082 => +0.4058)
+    db.record_partial_position_exit(open_pid, 1.04, 2.44, 102.50, 0.0373, "ACTION_REDUCE")
+        .unwrap();
+    db.record_partial_position_exit(open_pid, 0.72, 1.72, 103.00, 0.0260, "ACTION_REDUCE")
+        .unwrap();
+    db.record_partial_position_exit(open_pid, 0.23, 1.49, 101.80, 0.0082, "ACTION_REDUCE")
+        .unwrap();
+
+    // 3. Reconcile closed trades while SOL is still OPEN -> skips active open-epoch `hl-closed-*` rows,
+    // self-heals/deletes phantom_id (repointing its audit FK to open_pid), and zeroes SCALE_IN_MERGED child!
+    let active_trim_inputs = vec![
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7002".to_string(),
+            exchange_order_id: "hl-7002".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 102.50,
+            filled_quantity: 1.04,
+            realized_pnl_usdc: 2.5254,
+            fees_paid_usdc: 0.0746,
+            funding_accrued_usdc: -0.05,
+            created_at_ms: t_open,
+            closed_at_ms: t_open + 600_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7003".to_string(),
+            exchange_order_id: "hl-7003".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 103.00,
+            filled_quantity: 0.72,
+            realized_pnl_usdc: 2.1340,
+            fees_paid_usdc: 0.0260,
+            funding_accrued_usdc: 0.0,
+            created_at_ms: t_open,
+            closed_at_ms: t_open + 1_200_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+    ];
+    for _ in 0..3 {
+        let processed = db
+            .reconcile_closed_positions_from_exchange_fills(&active_trim_inputs)
+            .unwrap();
+        assert_eq!(processed, 0);
+    }
+
+    assert!(
+        db.get_position_by_id(phantom_id).unwrap().is_none(),
+        "Pre-existing phantom hl-closed-* row in active open epoch must be deleted"
+    );
+    let audits = db.list_recent_order_audits(30).unwrap();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.position_id == open_pid && a.reason == "LEGACY_SPLIT_AUDIT"),
+        "Audit FK from healed phantom row must be repointed to OPEN survivor"
+    );
+    let healed_scale_child = db.get_position_by_id(scale_pid).unwrap().unwrap();
+    assert_eq!(
+        healed_scale_child.exit_reason.as_deref(),
+        Some("SCALE_IN_MERGED")
+    );
+    assert!((healed_scale_child.realized_pnl_usdc - 0.0).abs() < 1e-9);
+    assert!((healed_scale_child.fees_paid_usdc - 0.0).abs() < 1e-9);
+    assert!((healed_scale_child.funding_accrued_usdc - 0.0).abs() < 1e-9);
+
+    let open_after_trims = db.get_position_by_id(open_pid).unwrap().unwrap();
+    let expected_partial_rpnl = (2.60 - 0.0373) + (2.16 - 0.0260) + (0.414 - 0.0082); // 5.1025
+    assert!((open_after_trims.realized_pnl_usdc - expected_partial_rpnl).abs() < 1e-4);
+    assert!((db.sum_realized_pnl_usdc().unwrap() - expected_partial_rpnl).abs() < 1e-4);
+    let pnl_while_open = db
+        .compute_pnl_summary_uncached(0.0, -0.1220, 10_000.0)
+        .unwrap();
+    assert!((pnl_while_open.daily.realized_pnl_usdc - 0.0).abs() < 1e-6);
+
+    // 4. Close final 1.49 SOL @ $104.20 (fee $0.0543) -> full lifecycle net PnL == +$11.0624 to < 1e-4
+    let expected_full_net =
+        (2.60 + 2.16 + 0.414 + 6.258) - (0.1218 + 0.0373 + 0.0260 + 0.0082 + 0.0543) - 0.1220;
+    let final_rpnl = db
+        .close_position(open_pid, 104.20, 0.0543, "FINAL_EXIT")
+        .unwrap();
+    assert!(
+        (final_rpnl - expected_full_net).abs() < 1e-4,
+        "close_position final_rpnl={final_rpnl} expected={expected_full_net}"
+    );
+
+    // 5. Repeated reconcile_closed_positions_from_exchange_fills after flat matches open_pid 1:1 (never SCALE_IN_MERGED!)
+    let t_close_final = now_ms() - 45_000; // >30s gap proves opened_at_ms Pass-2 matching works cleanly too!
+    let full_epoch_inputs = vec![
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7002".to_string(),
+            exchange_order_id: "hl-7002".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 102.50,
+            filled_quantity: 1.04,
+            realized_pnl_usdc: 2.60 - 0.0373 - (0.1218 * (1.04 / 3.48)) - 0.05,
+            fees_paid_usdc: 0.0373 + (0.1218 * (1.04 / 3.48)),
+            funding_accrued_usdc: -0.05,
+            created_at_ms: t_open,
+            closed_at_ms: t_open + 600_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7003".to_string(),
+            exchange_order_id: "hl-7003".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 103.00,
+            filled_quantity: 0.72,
+            realized_pnl_usdc: 2.16 - 0.0260 - (0.1218 * (0.72 / 3.48)) - 0.04,
+            fees_paid_usdc: 0.0260 + (0.1218 * (0.72 / 3.48)),
+            funding_accrued_usdc: -0.04,
+            created_at_ms: t_open,
+            closed_at_ms: t_open + 1_200_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7004".to_string(),
+            exchange_order_id: "hl-7004".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 101.80,
+            filled_quantity: 0.23,
+            realized_pnl_usdc: 0.414 - 0.0082 - (0.1218 * (0.23 / 3.48)) - 0.01,
+            fees_paid_usdc: 0.0082 + (0.1218 * (0.23 / 3.48)),
+            funding_accrued_usdc: -0.01,
+            created_at_ms: t_open,
+            closed_at_ms: t_open + 1_800_000,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-7005".to_string(),
+            exchange_order_id: "hl-7005".to_string(),
+            close_epoch_id: Some("SOL:1".to_string()),
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            exit_price: 104.20,
+            filled_quantity: 1.49,
+            realized_pnl_usdc: 6.258 - 0.0543 - (0.1218 * (1.49 / 3.48)) - 0.0220,
+            fees_paid_usdc: 0.0543 + (0.1218 * (1.49 / 3.48)),
+            funding_accrued_usdc: -0.0220,
+            created_at_ms: t_open,
+            closed_at_ms: t_close_final,
+            exit_reason: "HL_USER_FILL_RECONCILED".to_string(),
+        },
+    ];
+    for _ in 0..3 {
+        let processed = db
+            .reconcile_closed_positions_from_exchange_fills(&full_epoch_inputs)
+            .unwrap();
+        assert_eq!(processed, 1);
+    }
+
+    let non_merged_closed: Vec<_> = db
+        .list_closed_positions(20)
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.exit_reason.as_deref() != Some("SCALE_IN_MERGED"))
+        .collect();
+    assert_eq!(non_merged_closed.len(), 1);
+    assert_eq!(non_merged_closed[0].id, open_pid);
+    assert!((non_merged_closed[0].realized_pnl_usdc - expected_full_net).abs() < 1e-4);
+    assert!((non_merged_closed[0].fees_paid_usdc - 0.2476).abs() < 1e-4);
+    assert!((non_merged_closed[0].funding_accrued_usdc - (-0.1220)).abs() < 1e-4);
+    assert!((non_merged_closed[0].filled_quantity - 3.48).abs() < 1e-6);
+
+    let scale_child_after = db.get_position_by_id(scale_pid).unwrap().unwrap();
+    assert!((scale_child_after.realized_pnl_usdc - 0.0).abs() < 1e-9);
+    assert!((scale_child_after.fees_paid_usdc - 0.0).abs() < 1e-9);
+}
