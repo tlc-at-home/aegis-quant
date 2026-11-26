@@ -37,7 +37,7 @@ impl RiskTierLeverageExt for RiskTier {
     }
 }
 
-/// Asymmetric exit hysteresis configuration for held positions (`R14-L21`, `P1-Strat`).
+/// Asymmetric exit hysteresis configuration for held positions (`R14-L21`, `P1-Strat`, `R14-W2`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct HysteresisConfig {
     pub min_rebalance_delta_weight: f64,
@@ -48,6 +48,12 @@ pub struct HysteresisConfig {
     pub early_loser_max_loss_pct: f64,
     pub s1_reversal_mom_threshold: f64,
     pub s1_support_composite_threshold: f64,
+    #[serde(default = "default_maker_fee_bps")]
+    pub maker_fee_bps: f64,
+    #[serde(default = "default_taker_fee_bps")]
+    pub taker_fee_bps: f64,
+    #[serde(default = "default_reduce_min_net_edge_bps")]
+    pub reduce_min_net_edge_bps: f64,
 }
 
 fn default_early_loser_r0_mult() -> f64 {
@@ -56,6 +62,18 @@ fn default_early_loser_r0_mult() -> f64 {
 
 fn default_early_loser_max_loss_pct() -> f64 {
     0.009
+}
+
+fn default_maker_fee_bps() -> f64 {
+    1.5
+}
+
+fn default_taker_fee_bps() -> f64 {
+    4.5
+}
+
+fn default_reduce_min_net_edge_bps() -> f64 {
+    8.0
 }
 
 impl Default for HysteresisConfig {
@@ -67,8 +85,37 @@ impl Default for HysteresisConfig {
             early_loser_max_loss_pct: 0.009,
             s1_reversal_mom_threshold: 0.08,
             s1_support_composite_threshold: 0.025,
+            maker_fee_bps: 1.5,
+            taker_fee_bps: 4.5,
+            reduce_min_net_edge_bps: 8.0,
         }
     }
+}
+
+/// Computes the fractional breakeven-plus-edge hurdle (`round_trip_cost + reduce_min_net_edge`,
+/// e.g. `(1.5 + 4.5 + 8.0) / 10_000 = 0.0014` = `14.0 bps`) required before a non-emergency
+/// `ACTION_REDUCE` trim is emitted (`R14-W2`).
+pub fn min_reduce_breakeven_edge_pct(
+    maker_fee_bps: f64,
+    taker_fee_bps: f64,
+    reduce_min_net_edge_bps: f64,
+) -> f64 {
+    let maker = if maker_fee_bps.is_finite() {
+        maker_fee_bps.clamp(0.0, 100.0)
+    } else {
+        1.5
+    };
+    let taker = if taker_fee_bps.is_finite() {
+        taker_fee_bps.clamp(0.0, 100.0)
+    } else {
+        4.5
+    };
+    let edge = if reduce_min_net_edge_bps.is_finite() {
+        reduce_min_net_edge_bps.clamp(0.0, 500.0)
+    } else {
+        8.0
+    };
+    (maker + taker + edge) / 10_000.0
 }
 
 /// Computes the fractional unrealized PnL hurdle (negative, e.g. `-0.009`) below which
@@ -286,6 +333,11 @@ impl AllocatorConfig {
                 s1_support_composite_threshold: cfg
                     .get_f64("hysteresis_s1_support_composite_threshold", 0.025)
                     .clamp(0.005, 0.25),
+                maker_fee_bps: cfg.get_f64("maker_fee_bps", 1.5).clamp(0.0, 100.0),
+                taker_fee_bps: cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0),
+                reduce_min_net_edge_bps: cfg
+                    .get_f64("reduce_min_net_edge_bps", 8.0)
+                    .clamp(0.0, 500.0),
             },
         }
     }
@@ -957,6 +1009,31 @@ pub(crate) fn allocate_multi_sleeve_weights_with_exit_confirm(
 
         let mut capped_single = post_cooldown_weight.clamp(-max_single, max_single);
 
+        // R14-W2: Breakeven-plus hysteresis on non-emergency signal ACTION_REDUCE trims.
+        // Suppress calm partial trims until unrealized PnL clears round-trip cost + reduce_min_net_edge_bps,
+        // while allowing underwater early-loser invalidations and single-asset/gross cap trims unconditionally.
+        if cur_w.abs() >= 1e-4
+            && !is_loser
+            && !emergency_exit_bypass
+            && !in_cooldown
+            && hysteresis_eligible
+            && cur_w.abs() <= max_single + 1e-9
+            && capped_single * cur_w > 0.0
+            && capped_single.abs() < cur_w.abs()
+            && (capped_single - cur_w).abs() >= eff_min_delta
+        {
+            let min_reduce_edge = min_reduce_breakeven_edge_pct(
+                hyst_cfg.maker_fee_bps,
+                hyst_cfg.taker_fee_bps,
+                hyst_cfg.reduce_min_net_edge_bps,
+            );
+            if !ctx.unrealized_pnl_pct.is_finite() || ctx.unrealized_pnl_pct < min_reduce_edge {
+                effective_desired_weight = cur_w;
+                capped_single = cur_w;
+                hysteresis_held = true;
+            }
+        }
+
         // Lever N2: multi-bar confirmation for non-emergency ACTION_CLOSE (with mandatory R13-S1 bypass).
         let confirm_bars = cfg.signal_exit_confirm_bars.clamp(1, 5);
         if cur_w.abs() < 1e-4 || confirm_bars <= 1 {
@@ -1067,10 +1144,24 @@ pub(crate) fn allocate_multi_sleeve_weights_with_exit_confirm(
         }
     }
 
+    let draft_asset_ids: HashSet<i64> = drafts.iter().map(|d| d.asset.id).collect();
+    let unlisted_active_gross: f64 = held_contexts
+        .iter()
+        .filter(|(id, _)| !draft_asset_ids.contains(id))
+        .map(|(_, c)| {
+            if c.current_weight.is_finite() {
+                c.current_weight.abs()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    let eff_max_gross = (max_gross - unlisted_active_gross).max(0.0);
+
     let total_gross_before_cap: f64 = drafts.iter().map(|d| d.capped_single_weight.abs()).sum();
 
-    let gross_scale = if total_gross_before_cap > max_gross && total_gross_before_cap > 1e-8 {
-        max_gross / total_gross_before_cap
+    let gross_scale = if total_gross_before_cap > eff_max_gross && total_gross_before_cap > 1e-8 {
+        eff_max_gross / total_gross_before_cap
     } else {
         1.0
     };
@@ -2623,6 +2714,108 @@ mod tests {
                 .rebalance_action,
             ACTION_CLOSE,
             "Extreme <= 0.20 counter-regime held LONG must still bypass confirm_bars on bar 1"
+        );
+    }
+
+    #[test]
+    fn test_w2_breakeven_plus_reduce_hysteresis_and_unlisted_working_exposure_cap() {
+        let doge = test_asset(1, 10_000_000.0);
+        let cfg = AllocatorConfig::default(); // 1.5 + 4.5 + 8.0 = 14.0 bps = 0.0014 required edge
+        assert!(
+            (min_reduce_breakeven_edge_pct(1.5, 4.5, 8.0) - 0.0014).abs() < 1e-9,
+            "Default reduce breakeven+edge must equal 14 bps"
+        );
+
+        let mut s1 = HashMap::new();
+        // Desired scaled weight = 0.05 * 1.85 = 0.0925 (< current_weight 0.20 by > min_delta)
+        s1.insert(
+            1,
+            CarryMomentumMetrics {
+                asset_id: 1,
+                symbol: doge.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: 0.25,
+                s1_carry_score: 0.05,
+                w_s1_carry_mom: 0.05,
+                passes_quality: true,
+            },
+        );
+
+        // 1. Sub-breakeven trim (-2.65 bps, DOGE 0.056656 -> 0.056641) is suppressed -> ACTION_HOLD
+        let mut held_sub = HashMap::new();
+        held_sub.insert(
+            1,
+            HeldPositionContext {
+                current_weight: 0.20,
+                unrealized_pnl_pct: -0.000265,
+                entry_r0_pct: 0.04,
+            },
+        );
+        let out_sub = allocate_multi_sleeve_weights_with_context(
+            std::slice::from_ref(&doge),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held_sub,
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        assert_eq!(out_sub[0].rebalance_action, ACTION_HOLD);
+        assert!((out_sub[0].target_weight - 0.20).abs() < 1e-4);
+
+        // 2. Profitable trim (+20 bps >= 14 bps) executes ACTION_REDUCE cleanly
+        let mut held_prof = HashMap::new();
+        held_prof.insert(
+            1,
+            HeldPositionContext {
+                current_weight: 0.20,
+                unrealized_pnl_pct: 0.0020,
+                entry_r0_pct: 0.04,
+            },
+        );
+        let out_prof = allocate_multi_sleeve_weights_with_context(
+            std::slice::from_ref(&doge),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held_prof,
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        assert_eq!(out_prof[0].rebalance_action, ACTION_REDUCE);
+        assert!((out_prof[0].target_weight - 0.0925).abs() < 1e-4);
+
+        // 3. Unlisted resting WORKING / OPEN exposure in held_contexts reduces remaining max_gross
+        let cfg_tight_gross = AllocatorConfig {
+            max_gross_leverage_x: 0.30,
+            ..AllocatorConfig::default()
+        };
+        let mut held_working = HashMap::new();
+        held_working.insert(
+            999, // resting WORKING order on unlisted asset taking 0.22 weight
+            HeldPositionContext {
+                current_weight: 0.22,
+                unrealized_pnl_pct: 0.0,
+                entry_r0_pct: 0.04,
+            },
+        );
+        let out_capped = allocate_multi_sleeve_weights_with_context(
+            std::slice::from_ref(&doge),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held_working,
+            &[],
+            &RegimeGateState::default(),
+            &cfg_tight_gross,
+        );
+        assert!(
+            out_capped[0].target_weight <= 0.0801,
+            "Remaining gross headroom must deduct unlisted WORKING exposure (0.30 - 0.22 = 0.08), got {}",
+            out_capped[0].target_weight
         );
     }
 }

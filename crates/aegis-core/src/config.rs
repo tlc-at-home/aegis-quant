@@ -431,6 +431,10 @@ pub fn default_v2_system_config_seeds(
         ("wall_clock_normalize_indicators", "true", "bool", "Normalize indicator lookbacks by bar duration wall-clock time across timeframes"),
         ("s3_strict_admission_enabled", "true", "bool", "Enforce strict Sleeve 3 capitulation flush and funding dislocation admission filters"),
         ("enable_scale_in_out_rebalance", "true", "bool", "Allow incremental scale-in and scale-out rebalance orders on existing open positions"),
+        ("scale_in_min_atr_mult", "0.25", "float", "Minimum ATR multiple spacing required between same-side scale-in entries (0.25 ATR default)"),
+        ("scale_in_min_spacing_bps", "15.0", "float", "Minimum price spacing floor in basis points between same-side scale-in entries (15.0 bps default)"),
+        ("scale_in_reduce_cooldown_sec", "900", "int", "Minimum cooldown in seconds after a scale-in fill before a non-emergency ACTION_REDUCE trim (900s default)"),
+        ("reduce_min_net_edge_bps", "8.0", "float", "Minimum net profit edge in basis points above round-trip fees required for non-emergency ACTION_REDUCE trims (8.0 bps default)"),
         ("enforce_slot_spread_weight_cap", "false", "bool", "Cap per-position weight by slot-spread leverage quota when enabled"),
         ("max_entries_per_bar", "0", "int", "Maximum new entries permitted per signal bar (0 disables bar-level cap)"),
         ("enable_regime_budget_multipliers", "false", "bool", "Apply directional regime multipliers in chop and neutral breadth regimes"),
@@ -886,8 +890,14 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
         "max_open_positions" => {
             parse_i64_bounded(clean_key, clean_val, 1, 50)?;
         }
-        "min_entry_interval_sec" | "min_position_hold_sec" => {
+        "min_entry_interval_sec" | "min_position_hold_sec" | "scale_in_reduce_cooldown_sec" => {
             parse_i64_bounded(clean_key, clean_val, 0, 86_400)?;
+        }
+        "scale_in_min_atr_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 5.0)?;
+        }
+        "scale_in_min_spacing_bps" | "reduce_min_net_edge_bps" => {
+            parse_f64_bounded(clean_key, clean_val, 0.0, 500.0)?;
         }
         "scanner_interval_ms" => {
             parse_i64_bounded(clean_key, clean_val, 500, 60_000)?;
@@ -1195,6 +1205,22 @@ mod tests {
         assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.10").is_ok());
         assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.0029").is_err());
         assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.101").is_err());
+        assert!(validate_core_config_key_value("scale_in_min_atr_mult", "0.25").is_ok());
+        assert!(validate_core_config_key_value("scale_in_min_atr_mult", "5.0").is_ok());
+        assert!(validate_core_config_key_value("scale_in_min_atr_mult", "-0.01").is_err());
+        assert!(validate_core_config_key_value("scale_in_min_atr_mult", "5.01").is_err());
+        assert!(validate_core_config_key_value("scale_in_min_spacing_bps", "15.0").is_ok());
+        assert!(validate_core_config_key_value("scale_in_min_spacing_bps", "500.0").is_ok());
+        assert!(validate_core_config_key_value("scale_in_min_spacing_bps", "-1.0").is_err());
+        assert!(validate_core_config_key_value("scale_in_min_spacing_bps", "500.1").is_err());
+        assert!(validate_core_config_key_value("scale_in_reduce_cooldown_sec", "900").is_ok());
+        assert!(validate_core_config_key_value("scale_in_reduce_cooldown_sec", "86400").is_ok());
+        assert!(validate_core_config_key_value("scale_in_reduce_cooldown_sec", "-1").is_err());
+        assert!(validate_core_config_key_value("scale_in_reduce_cooldown_sec", "86401").is_err());
+        assert!(validate_core_config_key_value("reduce_min_net_edge_bps", "8.0").is_ok());
+        assert!(validate_core_config_key_value("reduce_min_net_edge_bps", "500.0").is_ok());
+        assert!(validate_core_config_key_value("reduce_min_net_edge_bps", "-0.1").is_err());
+        assert!(validate_core_config_key_value("reduce_min_net_edge_bps", "500.1").is_err());
     }
 
     #[test]

@@ -749,7 +749,7 @@ pub fn submit_reduce_only_close_ladder(
     })
 }
 
-/// Active non-blocking maker-first reduce-only close tracked across 1s `PriorityMonitor` ticks (`P1-Strat`).
+/// Active non-blocking maker-first reduce-only close or partial trim tracked across 1s `PriorityMonitor` ticks (`P1-Strat`, `R14-W2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPassiveClose {
     pub position_id: i64,
@@ -758,13 +758,27 @@ pub struct PendingPassiveClose {
     pub eoid: Option<String>,
     pub cloid: String,
     pub limit_px: f64,
+    #[serde(default)]
+    pub initial_limit_px: f64,
+    /// Remaining reduce-only quantity still targeted by this passive order.
     pub initial_qty: f64,
+    /// Live open `szi.abs()` observed when placed or at latest partial-fill checkpoint.
+    #[serde(default)]
+    pub last_open_abs_qty: f64,
     pub placed_at_ms: i64,
     pub exit_reason: String,
     pub is_tp: bool,
+    #[serde(default)]
+    pub is_partial_reduce: bool,
+    #[serde(default)]
+    pub min_limit_px_floor_or_cap: Option<f64>,
+    #[serde(default)]
+    pub cooldown_sec_override: Option<i64>,
+    #[serde(default)]
+    pub reprice_count: u32,
 }
 
-/// Shared thread-safe tracker for non-blocking `PassiveFirst` reduce-only closes (`P1-Strat`, `R14-L6`).
+/// Shared thread-safe tracker for non-blocking `PassiveFirst` reduce-only closes & partial trims (`P1-Strat`, `R14-L6`, `R14-W2`).
 #[derive(Debug, Clone, Default)]
 pub struct PassiveCloseTracker {
     entries: Arc<Mutex<HashMap<i64, PendingPassiveClose>>>,
@@ -790,6 +804,36 @@ impl PassiveCloseTracker {
     pub fn update_initial_qty(&self, position_id: i64, new_qty: f64) {
         if let Some(entry) = self.entries.lock().get_mut(&position_id) {
             entry.initial_qty = new_qty;
+            entry.last_open_abs_qty = new_qty;
+        }
+    }
+
+    pub fn record_partial_fill(
+        &self,
+        position_id: i64,
+        new_rem_reduce_qty: f64,
+        new_open_abs_qty: f64,
+    ) {
+        if let Some(entry) = self.entries.lock().get_mut(&position_id) {
+            entry.initial_qty = new_rem_reduce_qty;
+            entry.last_open_abs_qty = new_open_abs_qty;
+        }
+    }
+
+    pub fn update_reprice(
+        &self,
+        position_id: i64,
+        oid: Option<u64>,
+        eoid: Option<String>,
+        cloid: String,
+        new_limit_px: f64,
+    ) {
+        if let Some(entry) = self.entries.lock().get_mut(&position_id) {
+            entry.oid = oid;
+            entry.eoid = eoid;
+            entry.cloid = cloid;
+            entry.limit_px = new_limit_px;
+            entry.reprice_count = entry.reprice_count.saturating_add(1);
         }
     }
 
@@ -826,8 +870,8 @@ pub enum PassiveClosePlacement {
     Rejected(String),
 }
 
-/// Places ONE strictly passive reduce-only `Alo` close order (1-tick passive fallback on crossing reject,
-/// then passive `Gtc` inside oracle band), never sleeping inside the 1s loop (`P1-Strat`).
+/// Places ONE strictly passive reduce-only `Alo` close/reduce order (with 1-tick passive `Alo` fallback
+/// on post-only crossing reject), never sleeping inside the 1s/3s loops (`P1-Strat`, `R14-W2`).
 #[allow(clippy::too_many_arguments)]
 pub fn place_passive_reduce_only_close_order(
     http: &HyperliquidHttpClient,
@@ -861,10 +905,10 @@ pub fn place_passive_reduce_only_close_order(
         compute_passive_close_px(asset, close_is_buy, l2_bbo, oracle_anchor, band_lo, band_hi);
     if let Some(tp_target) = tp_floor_or_cap_px.filter(|v| v.is_finite() && *v > 0.0) {
         if close_is_buy {
-            // Closing SHORT TP: never buy back worse (higher) than tp_target
+            // Closing SHORT TP / breakeven cap: never buy back worse (higher) than tp_target
             passive_px = passive_px.min(tp_target).clamp(band_lo, band_hi);
         } else {
-            // Closing LONG TP: never sell worse (lower) than tp_target
+            // Closing LONG TP / breakeven floor: never sell worse (lower) than tp_target
             passive_px = passive_px.max(tp_target).clamp(band_lo, band_hi);
         }
     }
@@ -917,13 +961,20 @@ pub fn place_passive_reduce_only_close_order(
             })
         }
         Ok(ack) if is_post_only_crossing_rejection(ack.raw_error.as_deref()) => {
-            let fallback_px = if close_is_buy {
+            let mut fallback_px = if close_is_buy {
                 (passive_px - eff_tick)
                     .max(eff_tick)
                     .clamp(band_lo, band_hi)
             } else {
                 (passive_px + eff_tick).clamp(band_lo, band_hi)
             };
+            if let Some(tp_target) = tp_floor_or_cap_px.filter(|v| v.is_finite() && *v > 0.0) {
+                if close_is_buy {
+                    fallback_px = fallback_px.min(tp_target).clamp(band_lo, band_hi);
+                } else {
+                    fallback_px = fallback_px.max(tp_target).clamp(band_lo, band_hi);
+                }
+            }
             let fb_coid = format!("{cloid_prefix}-p1-{position_id}-{}", now_ms());
             let fb_cloid = derive_hl_cloid_hex(&fb_coid);
             let fb_wire = build_limit_order_wire(
@@ -935,7 +986,7 @@ pub fn place_passive_reduce_only_close_order(
                 asset.lot_step_size,
                 asset.sz_decimals,
                 true,
-                "Gtc",
+                "Alo",
                 Some(&fb_coid),
             );
             match http.submit_order_wire(fb_wire, qty, fallback_px, maker_fee_bps, pk, db, cfg) {
@@ -967,6 +1018,123 @@ pub fn place_passive_reduce_only_close_order(
         )),
         Err(e) => Err(e),
     }
+}
+
+/// Reprices a resting passive reduce-only `Alo` order when live BBO drifts by `>= 2` ticks within
+/// `max_alo_chase_drift_bps` during the `passive_close_rest_sec` maker window (`R14-W2`).
+/// Returns `Ok(None)` when current resting price is already optimal or cancel could not confirm un-filled.
+#[allow(clippy::too_many_arguments)]
+pub fn reprice_passive_reduce_only_close_order(
+    http: &HyperliquidHttpClient,
+    db: Option<&DatabaseManager>,
+    pk: &str,
+    cfg: &ConfigMap,
+    asset: &ExchangeAsset,
+    pending: &PendingPassiveClose,
+    close_is_buy: bool,
+    reference_mark_px: f64,
+    l2_bbo: Option<(f64, f64)>,
+    maker_fee_bps: f64,
+    max_drift_bps: f64,
+) -> Result<Option<PassiveClosePlacement>> {
+    let valid_bbo = l2_bbo.filter(|(b, a)| b.is_finite() && a.is_finite() && *b > 0.0 && *a >= *b);
+    let Some((bid, ask)) = valid_bbo else {
+        return Ok(None);
+    };
+    let oracle_anchor = if asset.oracle_price.is_finite() && asset.oracle_price > 0.0 {
+        asset.oracle_price
+    } else if reference_mark_px.is_finite() && reference_mark_px > 0.0 {
+        reference_mark_px
+    } else {
+        asset.mark_price.max(1e-8)
+    };
+    let eff_tick = effective_hl_tick_size(oracle_anchor, asset.tick_size, asset.sz_decimals)
+        .unwrap_or_else(|| asset.tick_size.max(1e-8));
+    let band_lo = (oracle_anchor * (1.0 - HL_ORACLE_BAND_PCT)).max(eff_tick);
+    let band_hi = (oracle_anchor * (1.0 + HL_ORACLE_BAND_PCT)).max(band_lo);
+
+    let (mut candidate_px, _) = compute_passive_close_px(
+        asset,
+        close_is_buy,
+        Some((bid, ask)),
+        oracle_anchor,
+        band_lo,
+        band_hi,
+    );
+    if let Some(floor_or_cap) = pending
+        .min_limit_px_floor_or_cap
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        if close_is_buy {
+            candidate_px = candidate_px.min(floor_or_cap).clamp(band_lo, band_hi);
+            if candidate_px >= ask - eff_tick * 1e-6 {
+                return Ok(None);
+            }
+        } else {
+            candidate_px = candidate_px.max(floor_or_cap).clamp(band_lo, band_hi);
+            if candidate_px <= bid + eff_tick * 1e-6 {
+                return Ok(None);
+            }
+        }
+    }
+    if (candidate_px - pending.limit_px).abs() < eff_tick * 1.5 {
+        return Ok(None);
+    }
+    let anchor_px = if pending.initial_limit_px > 0.0 {
+        pending.initial_limit_px
+    } else {
+        pending.limit_px
+    };
+    if anchor_px > 0.0 {
+        let drift_bps = ((candidate_px - anchor_px).abs() / anchor_px) * 10_000.0;
+        if drift_bps > max_drift_bps.max(5.0) {
+            return Ok(None);
+        }
+    }
+
+    if let Some(oid) = pending.oid {
+        match http.cancel_orders_batch(
+            vec![CancelWire {
+                a: asset.asset_index,
+                o: oid,
+            }],
+            pk,
+            db,
+            cfg,
+        ) {
+            Ok(resp) => {
+                if cancel_batch_response_ok(&resp).is_err() {
+                    return Ok(None);
+                }
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+
+    let signed_qty = if close_is_buy {
+        -pending.initial_qty.abs()
+    } else {
+        pending.initial_qty.abs()
+    };
+    let prefix = format!(
+        "v2-preprice-{}",
+        pending.reprice_count.saturating_add(1).min(99)
+    );
+    place_passive_reduce_only_close_order(
+        http,
+        db,
+        pk,
+        cfg,
+        asset,
+        pending.position_id,
+        signed_qty,
+        reference_mark_px,
+        Some((bid, ask)),
+        maker_fee_bps,
+        pending.min_limit_px_floor_or_cap,
+        &prefix,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -1162,10 +1330,16 @@ mod tests {
             eoid: Some("hl-111".to_string()),
             cloid: "0x111".to_string(),
             limit_px: 100.0,
+            initial_limit_px: 100.0,
             initial_qty: 2.0,
+            last_open_abs_qty: 2.0,
             placed_at_ms: 1000,
             exit_reason: "TAKE_PROFIT_LONG".to_string(),
             is_tp: true,
+            is_partial_reduce: false,
+            min_limit_px_floor_or_cap: None,
+            cooldown_sec_override: None,
+            reprice_count: 0,
         });
         tracker.insert(PendingPassiveClose {
             position_id: 20,
@@ -1174,10 +1348,16 @@ mod tests {
             eoid: Some("hl-222".to_string()),
             cloid: "0x222".to_string(),
             limit_px: 99.0,
+            initial_limit_px: 99.0,
             initial_qty: 2.0,
+            last_open_abs_qty: 2.0,
             placed_at_ms: 1000,
             exit_reason: "STAGNATION_TIME_STOP_LONG".to_string(),
             is_tp: false,
+            is_partial_reduce: false,
+            min_limit_px_floor_or_cap: None,
+            cooldown_sec_override: None,
+            reprice_count: 0,
         });
         let mut active = HashSet::new();
         active.insert(10);
