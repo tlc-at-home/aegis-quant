@@ -293,10 +293,20 @@ pub(crate) struct ParsedHlFunding {
     pub dedup_key: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OpenEpochRealizedSummary {
+    pub partial_closed_qty: f64,
+    pub gross_closed_pnl: f64,
+    pub close_fees_usdc: f64,
+    pub open_fills_fees_usdc: f64,
+    pub has_complete_open_fills: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct FifoFundingReplayOutput {
     pub closed_orders: Vec<(u64, AggClosingOrder)>,
     pub open_epoch_booked_funding_by_coin: HashMap<String, f64>,
+    pub open_epoch_realized_by_coin: HashMap<String, OpenEpochRealizedSummary>,
     pub funding_events_with_remaining: Vec<(ParsedHlFunding, f64)>,
 }
 
@@ -327,6 +337,8 @@ struct CoinReplayState {
     rem_usdc: Vec<f64>,
     active_epoch_ev_indices: Vec<usize>,
     open_epoch_booked_funding: f64,
+    active_epoch_open_fees_usdc: f64,
+    active_epoch_has_initial_open_fill: bool,
 }
 
 impl CoinReplayState {
@@ -339,6 +351,8 @@ impl CoinReplayState {
             rem_usdc: vec![0.0; funding_len],
             active_epoch_ev_indices: Vec::new(),
             open_epoch_booked_funding: 0.0,
+            active_epoch_open_fees_usdc: 0.0,
+            active_epoch_has_initial_open_fill: false,
         }
     }
 
@@ -369,6 +383,10 @@ impl CoinReplayState {
         let is_closing_dir = fill_is_closing_dir(fill);
 
         if is_open_or_add_fill(fill, self.prev_szi) {
+            if self.prev_szi == 0.0 {
+                self.active_epoch_has_initial_open_fill = true;
+            }
+            self.active_epoch_open_fees_usdc += fill.fee.max(0.0);
             self.open_lots.push_back(OpenLot {
                 rem_sz: fill.sz,
                 orig_sz: fill.sz,
@@ -479,12 +497,16 @@ impl CoinReplayState {
             }
             self.active_epoch_ev_indices.clear();
             self.open_epoch_booked_funding = 0.0;
+            self.active_epoch_open_fees_usdc = 0.0;
+            self.active_epoch_has_initial_open_fill = false;
             self.epoch_seq = self.epoch_seq.saturating_add(1);
         } else {
             self.open_epoch_booked_funding += matched_funding;
         }
 
         if flipped_open_sz > 1e-9 {
+            self.active_epoch_has_initial_open_fill = true;
+            self.active_epoch_open_fees_usdc += open_fee;
             self.open_lots.push_back(OpenLot {
                 rem_sz: flipped_open_sz,
                 orig_sz: flipped_open_sz,
@@ -521,7 +543,8 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
     all_coins.extend(funding_by_coin.keys().cloned());
 
     let mut agg_by_key: BTreeMap<(String, u64, u64), AggClosingOrder> = BTreeMap::new();
-    let mut open_epoch_booked_funding_by_coin: HashMap<String, f64> = HashMap::new();
+    let open_epoch_booked_funding_by_coin: HashMap<String, f64> = HashMap::new();
+    let mut open_epoch_realized_by_coin: HashMap<String, OpenEpochRealizedSummary> = HashMap::new();
     let mut funding_events_with_remaining: Vec<(ParsedHlFunding, f64)> = Vec::new();
 
     for coin_upper in all_coins {
@@ -533,6 +556,8 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
             .get(&coin_upper)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let live_open_szi = open_szi_by_coin.get(&coin_upper).copied().unwrap_or(0.0);
+        let is_coin_currently_open = live_open_szi.abs() > 1e-9;
 
         let mut fund_indices: Vec<usize> = (0..funding_raw.len()).collect();
         fund_indices.sort_by_key(|&idx| (funding_raw[idx].time_ms, idx));
@@ -541,7 +566,16 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
         let earliest_funding_ts = fund_indices.first().map(|&idx| funding_raw[idx].time_ms);
 
         if let Some(first_fill) = fills.first() {
-            if let Some(sp) = first_fill.start_position {
+            let inferred_sp = first_fill.start_position.or_else(|| {
+                if is_coin_currently_open {
+                    let net_fills: f64 = fills.iter().map(fill_signed_sz).sum();
+                    let sp = live_open_szi - net_fills;
+                    (sp.abs() > 1e-9).then_some(sp)
+                } else {
+                    None
+                }
+            });
+            if let Some(sp) = inferred_sp {
                 if sp.abs() > 1e-9 {
                     let earliest_ts = earliest_funding_ts
                         .map_or(first_fill.time_ms, |ft| first_fill.time_ms.min(ft));
@@ -556,21 +590,17 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
                     state.prev_szi = sp;
                 }
             }
-        } else if !fund_indices.is_empty() {
-            if let Some(&szi) = open_szi_by_coin.get(&coin_upper) {
-                if szi.abs() > 1e-9 {
-                    let earliest_ts = earliest_funding_ts.unwrap_or(0);
-                    state.open_lots.push_back(OpenLot {
-                        rem_sz: szi.abs(),
-                        orig_sz: szi.abs(),
-                        fee: 0.0,
-                        funding_accrued: 0.0,
-                        funding_by_ev: Vec::new(),
-                        time_ms: earliest_ts.saturating_sub(1),
-                    });
-                    state.prev_szi = szi;
-                }
-            }
+        } else if !fund_indices.is_empty() && is_coin_currently_open {
+            let earliest_ts = earliest_funding_ts.unwrap_or(0);
+            state.open_lots.push_back(OpenLot {
+                rem_sz: live_open_szi.abs(),
+                orig_sz: live_open_szi.abs(),
+                fee: 0.0,
+                funding_accrued: 0.0,
+                funding_by_ev: Vec::new(),
+                time_ms: earliest_ts.saturating_sub(1),
+            });
+            state.prev_szi = live_open_szi;
         }
 
         let mut f_idx = 0usize;
@@ -600,11 +630,41 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
             }
         }
 
-        let remaining_open_sz: f64 = state.open_lots.iter().map(|l| l.rem_sz).sum();
-        if remaining_open_sz > 1e-9 && state.open_epoch_booked_funding.abs() > 1e-12 {
-            open_epoch_booked_funding_by_coin
-                .insert(coin_upper.clone(), state.open_epoch_booked_funding);
+        if is_coin_currently_open {
+            // W3 Single Booking Rule: Do NOT emit `CLOSED` `hl-closed-*` rows for partial trims
+            // belonging to the still-open position epoch (`epoch == state.epoch_seq`), and keep
+            // 100% of active open-epoch funding on the OPEN row + `funding_events.remaining_usdc`.
+            let active_epoch = state.epoch_seq;
+            let mut active_keys = Vec::new();
+            let mut summary = OpenEpochRealizedSummary {
+                open_fills_fees_usdc: state.active_epoch_open_fees_usdc,
+                has_complete_open_fills: state.active_epoch_has_initial_open_fill,
+                ..Default::default()
+            };
+            for (k, agg) in &agg_by_key {
+                if k.0.eq_ignore_ascii_case(&coin_upper) && k.2 == active_epoch {
+                    summary.partial_closed_qty += agg.total_sz;
+                    summary.gross_closed_pnl += agg.gross_closed_pnl;
+                    summary.close_fees_usdc += agg.close_fees_usdc;
+                    active_keys.push(k.clone());
+                }
+            }
+            for k in active_keys {
+                agg_by_key.remove(&k);
+            }
+            if summary.partial_closed_qty > 1e-9 || summary.open_fills_fees_usdc > 1e-9 {
+                open_epoch_realized_by_coin.insert(coin_upper.clone(), summary);
+            }
+            for &ev_i in &state.active_epoch_ev_indices {
+                state.rem_usdc[ev_i] = funding_raw[ev_i].usdc;
+            }
+        } else {
+            // Coin is confirmed flat on Hyperliquid; settle any residual open-lot funding to 0.
+            for &ev_i in &state.active_epoch_ev_indices {
+                state.rem_usdc[ev_i] = 0.0;
+            }
         }
+
         for &ev_i in &fund_indices {
             funding_events_with_remaining.push((funding_raw[ev_i].clone(), state.rem_usdc[ev_i]));
         }
@@ -619,6 +679,7 @@ pub(crate) fn compute_fifo_closed_orders_and_funding(
     FifoFundingReplayOutput {
         closed_orders,
         open_epoch_booked_funding_by_coin,
+        open_epoch_realized_by_coin,
         funding_events_with_remaining,
     }
 }
@@ -1184,5 +1245,150 @@ mod tests {
         let (px, fee) = resolve_flat_exit_fill_stats(&held, Some(&fills));
         assert!((px - 88_080.0).abs() < 1e-6);
         assert!((fee - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_w3_single_booking_rule_suppresses_open_epoch_closed_orders_until_flat() {
+        let mut fills_by_coin: BTreeMap<String, Vec<ParsedHlFill>> = BTreeMap::new();
+        fills_by_coin.insert(
+            "SOL".to_string(),
+            vec![
+                make_fill(
+                    "SOL",
+                    "B",
+                    100.00,
+                    3.48,
+                    0.1218,
+                    0.0,
+                    "Open Long",
+                    1_000,
+                    7001,
+                    1,
+                    Some(0.0),
+                ),
+                make_fill(
+                    "SOL",
+                    "A",
+                    102.50,
+                    1.04,
+                    0.0373,
+                    2.60,
+                    "Close Long",
+                    2_000,
+                    7002,
+                    2,
+                    Some(3.48),
+                ),
+                make_fill(
+                    "SOL",
+                    "A",
+                    103.00,
+                    0.72,
+                    0.0260,
+                    2.16,
+                    "Close Long",
+                    3_000,
+                    7003,
+                    3,
+                    Some(2.44),
+                ),
+                make_fill(
+                    "SOL",
+                    "A",
+                    101.80,
+                    0.23,
+                    0.0082,
+                    0.414,
+                    "Close Long",
+                    4_000,
+                    7004,
+                    4,
+                    Some(1.72),
+                ),
+            ],
+        );
+        let mut funding_by_coin: HashMap<String, Vec<ParsedHlFunding>> = HashMap::new();
+        funding_by_coin.insert(
+            "SOL".to_string(),
+            vec![
+                ParsedHlFunding {
+                    coin: "SOL".to_string(),
+                    time_ms: 1_500,
+                    usdc: -0.1840,
+                    szi: 3.48,
+                    funding_rate: 0.0005,
+                    dedup_key: "f1".to_string(),
+                },
+                ParsedHlFunding {
+                    coin: "SOL".to_string(),
+                    time_ms: 3_500,
+                    usdc: 0.0620,
+                    szi: 1.72,
+                    funding_rate: -0.0003,
+                    dedup_key: "f2".to_string(),
+                },
+            ],
+        );
+
+        // 1. While 1.49 SOL remains OPEN: 0 closed_orders emitted; open_epoch_realized_by_coin holds exact trims
+        let open_szi: HashMap<String, f64> = [("SOL".to_string(), 1.49)].into_iter().collect();
+        let out_open =
+            compute_fifo_closed_orders_and_funding(&fills_by_coin, &funding_by_coin, &open_szi);
+        assert!(
+            out_open.closed_orders.is_empty(),
+            "Active OPEN epoch must emit 0 closed_orders"
+        );
+        assert!(out_open.open_epoch_booked_funding_by_coin.is_empty());
+        let summary = out_open.open_epoch_realized_by_coin.get("SOL").unwrap();
+        assert!((summary.partial_closed_qty - 1.99).abs() < 1e-9);
+        assert!((summary.gross_closed_pnl - 5.174).abs() < 1e-9);
+        assert!((summary.close_fees_usdc - 0.0715).abs() < 1e-9);
+        assert!((summary.open_fills_fees_usdc - 0.1218).abs() < 1e-9);
+        assert!(summary.has_complete_open_fills);
+        let rem_funding_sum: f64 = out_open
+            .funding_events_with_remaining
+            .iter()
+            .map(|(_, rem)| *rem)
+            .sum();
+        assert!((rem_funding_sum - (-0.1220)).abs() < 1e-9);
+
+        // 2. Final 1.49 SOL closes to 0.0: all 4 slices emit under SOL:1 with exact lifecycle conservation
+        fills_by_coin.get_mut("SOL").unwrap().push(make_fill(
+            "SOL",
+            "A",
+            104.20,
+            1.49,
+            0.0543,
+            6.258,
+            "Close Long",
+            5_000,
+            7005,
+            5,
+            Some(1.49),
+        ));
+        let out_flat = compute_fifo_closed_orders_and_funding(
+            &fills_by_coin,
+            &funding_by_coin,
+            &HashMap::new(),
+        );
+        assert_eq!(out_flat.closed_orders.len(), 4);
+        assert!(out_flat
+            .closed_orders
+            .iter()
+            .all(|(_, a)| a.close_epoch_id == "SOL:1"));
+        let net_sum: f64 = out_flat
+            .closed_orders
+            .iter()
+            .map(|(_, a)| {
+                a.gross_closed_pnl - a.open_fees_usdc - a.close_fees_usdc + a.funding_accrued_usdc
+            })
+            .sum();
+        let expected_net =
+            (2.60 + 2.16 + 0.414 + 6.258) - (0.1218 + 0.0373 + 0.0260 + 0.0082 + 0.0543) - 0.1220;
+        assert!((net_sum - expected_net).abs() < 1e-9);
+        assert!(out_flat
+            .funding_events_with_remaining
+            .iter()
+            .all(|(_, rem)| rem.abs() < 1e-12));
     }
 }

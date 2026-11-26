@@ -110,8 +110,10 @@ pub struct MergedClosedTrade {
 #[derive(Debug, Clone)]
 struct ActiveSyncRow {
     id: i64,
+    asset_id: i64,
     status: String,
     side: String,
+    entry_price: f64,
     protective_stop_px: f64,
     entry_r0: f64,
     protective_stop_oid: Option<String>,
@@ -1470,17 +1472,30 @@ impl DatabaseManager {
         let qty = filled_quantity.max(0.0);
         let gross_remaining = (exit_price - entry_price) * qty * side.sign();
         let total_fees = existing_fees_paid + fees_paid_usdc;
-        // Note: existing_realized_pnl already includes any prior partial-exit net PnL (net of partial fees),
-        // while existing_fees_paid also includes prior partial fees -> subtract only incremental fees_paid_usdc
-        // when partial exits have already accrued, or preserve exact formula when existing_realized_pnl == 0.
-        let net_realized_pnl = if existing_realized_pnl.abs() > 1e-12 {
-            round_dp(
-                existing_realized_pnl + gross_remaining - fees_paid_usdc + funding_accrued_usdc,
-                4,
+        // `record_partial_position_exit` adds `gross_partial - partial_fees` to `realized_pnl_usdc`
+        // and `partial_fees` to `fees_paid_usdc` while logging `to_state = 'PARTIAL_CLOSE'`.
+        // Query already-deducted partial fees so prior unallocated open/scale-in fees are always
+        // subtracted once and partial fees are never double-counted (`W3`).
+        let partial_fees_row: Option<mysql::Row> = tx
+            .exec_first(
+                r#"SELECT COALESCE(SUM(fees_usdc), 0)
+                   FROM order_audit
+                   WHERE position_id = :pid AND to_state = 'PARTIAL_CLOSE'"#,
+                params! { "pid" => position_id },
             )
-        } else {
-            round_dp(gross_remaining - total_fees + funding_accrued_usdc, 4)
-        };
+            .map_err(|e| {
+                AegisError::Database(format!("close_position partial fees lookup failed: {e}"))
+            })?;
+        let partial_fees_in_rpnl = partial_fees_row
+            .map(|r| row_get_f64(&r, 0, 0.0))
+            .unwrap_or(0.0)
+            .max(0.0);
+        let unallocated_open_fees = (existing_fees_paid - partial_fees_in_rpnl).max(0.0);
+        let net_realized_pnl = round_dp(
+            existing_realized_pnl + gross_remaining - unallocated_open_fees - fees_paid_usdc
+                + funding_accrued_usdc,
+            4,
+        );
 
         let safe_exit_reason = truncate_exit_reason(exit_reason);
         let safe_audit_reason = truncate_audit_reason(exit_reason);
@@ -1841,22 +1856,56 @@ impl DatabaseManager {
 
         let result = if let Some(open_row) = active_rows
             .iter()
-            .find(|r| r.status.eq_ignore_ascii_case("OPEN"))
-        {
+            .filter(|r| r.status.eq_ignore_ascii_case("OPEN"))
+            .min_by_key(|r| {
+                let side_mismatch = !r.side.eq_ignore_ascii_case(input.side.as_str());
+                let missing_tpsl = r.protective_stop_oid.is_none() && r.take_profit_oid.is_none();
+                (side_mismatch, missing_tpsl, r.id)
+            }) {
+            // W1: Preserve same-side WORKING scale-in (`INCREASE`) rows! Only deduplicate duplicate OPEN rows
+            // (and opposite-side stale WORKING rows if the open position side flipped externally).
             cancel_duplicate_active_rows(
                 &mut tx,
                 &active_rows,
                 Some(open_row.id),
-                "status IN ('OPEN', 'WORKING')",
+                "status = 'OPEN'",
                 "DEDUP_EXCHANGE_RECONCILE",
                 ts,
             )?;
+            let opposite_working: Vec<ActiveSyncRow> = active_rows
+                .iter()
+                .filter(|r| {
+                    r.status.eq_ignore_ascii_case("WORKING")
+                        && !r.side.eq_ignore_ascii_case(input.side.as_str())
+                })
+                .cloned()
+                .collect();
+            if !opposite_working.is_empty() {
+                cancel_duplicate_active_rows(
+                    &mut tx,
+                    &opposite_working,
+                    None,
+                    "status = 'WORKING'",
+                    "REPLACED_BY_EXCHANGE_OPEN",
+                    ts,
+                )?;
+            }
             let pid = update_existing_open_row_on_sync(&mut tx, open_row, input, high, low, ts)?;
             (pid, false)
-        } else if let Some(working_row) = active_rows.iter().find(|r| {
-            r.status.eq_ignore_ascii_case("WORKING")
-                && r.side.eq_ignore_ascii_case(input.side.as_str())
-        }) {
+        } else if let Some(working_row) = active_rows
+            .iter()
+            .filter(|r| {
+                r.status.eq_ignore_ascii_case("WORKING")
+                    && r.side.eq_ignore_ascii_case(input.side.as_str())
+                    && (r.requested_quantity <= 0.0
+                        || input.quantity <= r.requested_quantity * 1.05 + 1e-6)
+            })
+            .min_by(|a, b| {
+                let da = (a.requested_quantity - input.quantity).abs();
+                let db_diff = (b.requested_quantity - input.quantity).abs();
+                da.total_cmp(&db_diff).then_with(|| a.id.cmp(&b.id))
+            })
+        {
             cancel_duplicate_active_rows(
                 &mut tx,
                 &active_rows,
@@ -1869,14 +1918,25 @@ impl DatabaseManager {
                 promote_same_side_working_row_on_sync(&mut tx, working_row, input, high, low, ts)?;
             (pid, true)
         } else {
-            cancel_duplicate_active_rows(
-                &mut tx,
-                &active_rows,
-                None,
-                "status = 'WORKING'",
-                "REPLACED_BY_EXCHANGE_OPEN",
-                ts,
-            )?;
+            // Adopt new OPEN row while preserving any same-side WORKING scale-in rows (only cancel opposite-side WORKING rows)
+            let opposite_working: Vec<ActiveSyncRow> = active_rows
+                .iter()
+                .filter(|r| {
+                    r.status.eq_ignore_ascii_case("WORKING")
+                        && !r.side.eq_ignore_ascii_case(input.side.as_str())
+                })
+                .cloned()
+                .collect();
+            if !opposite_working.is_empty() {
+                cancel_duplicate_active_rows(
+                    &mut tx,
+                    &opposite_working,
+                    None,
+                    "status = 'WORKING'",
+                    "REPLACED_BY_EXCHANGE_OPEN",
+                    ts,
+                )?;
+            }
             let pid = adopt_new_open_row_on_sync(&mut tx, input, high, low, ts)?;
             (pid, true)
         };
@@ -1922,13 +1982,65 @@ impl DatabaseManager {
                 ))
             })?;
 
+        // W3: Ensure SCALE_IN_MERGED child rows NEVER retain non-zero PnL, fees, or funding.
+        tx.exec_drop(
+            r#"UPDATE positions
+               SET realized_pnl_usdc = 0.00000000,
+                   fees_paid_usdc = 0.00000000,
+                   funding_accrued_usdc = 0.00000000
+               WHERE status = 'CLOSED'
+                 AND exit_reason = 'SCALE_IN_MERGED'
+                 AND (realized_pnl_usdc != 0 OR fees_paid_usdc != 0 OR funding_accrued_usdc != 0)"#,
+            (),
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("reconcile_closed zero SCALE_IN_MERGED failed: {e}"))
+        })?;
+
         let mut matched_ids: HashSet<i64> = HashSet::with_capacity(merged_trades.len());
         let mut resolved_match: Vec<Option<i64>> = vec![None; merged_trades.len()];
         let mut skipped_active: Vec<bool> = vec![false; merged_trades.len()];
 
+        // W3 Defense-in-depth: Never insert or keep a CLOSED `hl-closed-*` (`HL_USER_FILL_RECONCILED`)
+        // row whose close timestamp falls inside a currently OPEN same-side position epoch!
+        let mut batch_asset_ids: Vec<i64> = merged_trades.iter().map(|m| m.asset_id).collect();
+        batch_asset_ids.sort_unstable();
+        batch_asset_ids.dedup();
+        let active_open_by_asset_side = lock_open_epoch_origins(&mut tx, &batch_asset_ids)?;
+        let mut healed_open_epochs: HashSet<(i64, String)> = HashSet::new();
+        for (idx, m) in merged_trades.iter().enumerate() {
+            if !m.client_order_id.starts_with("hl-closed-")
+                || !m
+                    .exit_reason
+                    .eq_ignore_ascii_case("HL_USER_FILL_RECONCILED")
+            {
+                continue;
+            }
+            let side_key = m.side.as_str().to_string();
+            if let Some(&(open_id, open_origin_ms)) =
+                active_open_by_asset_side.get(&(m.asset_id, side_key.clone()))
+            {
+                if m.closed_at_ms >= open_origin_ms.saturating_sub(1_000) {
+                    if healed_open_epochs.insert((m.asset_id, side_key)) {
+                        heal_open_epoch_phantom_rows_in_tx(
+                            &mut tx,
+                            m.asset_id,
+                            open_id,
+                            m.side,
+                            open_origin_ms,
+                        )?;
+                    }
+                    skipped_active[idx] = true;
+                }
+            }
+        }
+
         // Pass 1: Exact client_order_id / exchange_order_id matching (`!matched_ids.contains(&pid)` enforced!)
         // + self-healing of split historical `hl-closed-%` fragments.
         for (idx, m) in merged_trades.iter().enumerate() {
+            if skipped_active[idx] {
+                continue;
+            }
             let candidates =
                 lock_exact_closed_candidates(&mut tx, &m.merged_coids, &m.merged_eoids)?;
             if candidates.iter().any(|c| {
@@ -1985,7 +2097,7 @@ impl DatabaseManager {
         }
 
         // Pass 2: 30s close-window fallback for unmatched epochs, skipping rows reserved by another
-        // trade's exact coid/eoid in this batch.
+        // trade's exact coid/eoid in this batch and excluding SCALE_IN_MERGED child rows.
         for (idx, m) in merged_trades.iter().enumerate() {
             if skipped_active[idx] || resolved_match[idx].is_some() {
                 continue;
@@ -1995,9 +2107,13 @@ impl DatabaseManager {
                     r#"SELECT id, client_order_id, exchange_order_id
                        FROM positions
                        WHERE status = 'CLOSED'
+                         AND COALESCE(exit_reason, '') != 'SCALE_IN_MERGED'
                          AND asset_id = :aid
                          AND side = :side
-                         AND ABS(COALESCE(closed_at_ms, updated_at_ms) - :clts) <= 30000
+                         AND (
+                             ABS(COALESCE(closed_at_ms, updated_at_ms) - :clts) <= 30000
+                             OR (:cts > 0 AND opened_at_ms IS NOT NULL AND ABS(opened_at_ms - :cts) <= 5000)
+                         )
                        ORDER BY CASE WHEN client_order_id NOT LIKE 'hl-closed-%' THEN 0 ELSE 1 END,
                                 ABS(COALESCE(closed_at_ms, updated_at_ms) - :clts) ASC,
                                 id DESC
@@ -2007,6 +2123,7 @@ impl DatabaseManager {
                         "aid" => m.asset_id,
                         "side" => m.side.as_str(),
                         "clts" => m.closed_at_ms,
+                        "cts" => m.created_at_ms,
                     },
                 )
                 .map_err(|e| {
@@ -2394,7 +2511,7 @@ impl DatabaseManager {
                           requested_quantity, filled_quantity, committed_notional_usdc,
                           portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
                           protective_stop_px, entry_r0, highest_price_seen, lowest_price_seen,
-                          fees_paid_usdc, opened_at_ms
+                          fees_paid_usdc, opened_at_ms, funding_accrued_usdc
                    FROM positions
                    WHERE id IN (:wid, :oid)
                    ORDER BY id ASC
@@ -2432,6 +2549,7 @@ impl DatabaseManager {
         let w_s1 = row_get_f64(w, 11, 0.0);
         let w_s2 = row_get_f64(w, 12, 0.0);
         let w_s3 = row_get_f64(w, 13, 0.0);
+        let w_funding = row_get_f64(w, 20, 0.0);
 
         let o_asset_id = row_get_i64(o, 1, 0);
         let o_coid = row_get_string(o, 2, "");
@@ -2449,6 +2567,7 @@ impl DatabaseManager {
         let o_entry_r0 = row_get_f64(o, 15, 0.0);
         let o_fees = row_get_f64(o, 18, 0.0);
         let o_opened_at_ms = row_get_opt_i64(o, 19);
+        let o_funding = row_get_f64(o, 20, 0.0);
 
         if !w_status.eq_ignore_ascii_case("WORKING") {
             return Err(AegisError::Database(format!(
@@ -2481,6 +2600,7 @@ impl DatabaseManager {
         let new_committed = round_dp(total_notional, 4);
         let new_req_qty = round_dp(o_req_qty.max(old_qty) + add_qty, 8);
         let new_fees = round_dp(o_fees + fees_rounded, 4);
+        let new_funding = round_dp(o_funding + w_funding, 4);
         let w_fill_ratio = if w_req_qty > 1e-12 {
             (add_qty / w_req_qty).clamp(0.0, 1.0)
         } else {
@@ -2506,6 +2626,7 @@ impl DatabaseManager {
         let new_comm_dec = decimal_param(new_committed, 8, DEC_20_8_MAX_ABS)?;
         let add_comm_dec = decimal_param(round_dp(add_notional, 4), 8, DEC_20_8_MAX_ABS)?;
         let new_fees_dec = decimal_param(new_fees, 8, DEC_20_8_MAX_ABS)?;
+        let new_funding_dec = decimal_param(new_funding, 8, DEC_20_8_MAX_ABS)?;
         let add_fees_dec = decimal_param(fees_rounded, 8, DEC_20_8_MAX_ABS)?;
         let new_pw_dec = decimal_param(new_pw, 8, DEC_20_8_MAX_ABS)?;
         let new_s1_dec = decimal_param(new_s1, 8, DEC_20_8_MAX_ABS)?;
@@ -2534,6 +2655,7 @@ impl DatabaseManager {
                        ELSE CAST(:fill_px AS DECIMAL(20,8))
                    END,
                    fees_paid_usdc = :new_fees,
+                   funding_accrued_usdc = :new_funding,
                    opened_at_ms = COALESCE(opened_at_ms, :opened_at),
                    updated_at_ms = :ts
                WHERE id = :oid AND status = 'OPEN'"#,
@@ -2549,6 +2671,7 @@ impl DatabaseManager {
                 "new_s3" => &new_s3_dec,
                 "entry_r0" => &r0_dec,
                 "new_fees" => &new_fees_dec,
+                "new_funding" => &new_funding_dec,
                 "opened_at" => preserved_opened_at,
                 "ts" => ts,
                 "oid" => open_position_id,
@@ -2563,8 +2686,8 @@ impl DatabaseManager {
             )));
         }
 
-        // Fees and notional are moved onto the parent OPEN row; keep 0.00 fees/realized_pnl on the
-        // SCALE_IN_MERGED child row so compute_pnl_summary does not double-count closed fees.
+        // Fees, funding, and notional are moved onto the parent OPEN row; keep 0.00 PnL/fees/funding on
+        // the SCALE_IN_MERGED child row so neither sum_realized_pnl_usdc nor compute_pnl_summary double-counts.
         tx.exec_drop(
             r#"UPDATE positions
                SET status = 'CLOSED',
@@ -2577,6 +2700,7 @@ impl DatabaseManager {
                    realized_pnl_usdc = 0.00000000,
                    unrealized_pnl_usdc = 0.00000000,
                    fees_paid_usdc = 0.00000000,
+                   funding_accrued_usdc = 0.00000000,
                    exchange_order_id = COALESCE(:eoid, exchange_order_id),
                    opened_at_ms = COALESCE(opened_at_ms, :ts),
                    closed_at_ms = :ts,
@@ -2776,6 +2900,743 @@ impl DatabaseManager {
         }
         Ok(inserted)
     }
+
+    /// Upserts `exchange_order_id` onto an active `WORKING` row when reconciler resolves the live
+    /// exchange OID via `cloid` (`W1`), recording an `order_audit` entry only when changed.
+    pub fn set_working_order_exchange_id(
+        &self,
+        position_id: i64,
+        exchange_order_id: &str,
+    ) -> Result<bool> {
+        let trimmed = exchange_order_id.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("set_working_order_exchange_id tx failed: {e}"))
+            })?;
+
+        let row: Option<mysql::Row> = tx
+            .exec_first(
+                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          requested_quantity, filled_quantity, reserved_margin_usdc, exchange_order_id
+                   FROM positions
+                   WHERE id = :pid
+                   FOR UPDATE"#,
+                params! { "pid" => position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("set_working_order_exchange_id lock failed: {e}"))
+            })?;
+
+        let Some(locked) = row else {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!("set_working_order_exchange_id commit failed: {e}"))
+            })?;
+            return Ok(false);
+        };
+        let status = row_get_string(&locked, 3, "");
+        let cur_eoid = row_get_opt_string(&locked, 9);
+        if !status.eq_ignore_ascii_case("WORKING") || cur_eoid.as_deref() == Some(trimmed) {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!("set_working_order_exchange_id commit failed: {e}"))
+            })?;
+            return Ok(false);
+        }
+
+        let asset_id = row_get_i64(&locked, 0, 0);
+        let client_order_id = row_get_string(&locked, 1, "");
+        let side_str = row_get_string(&locked, 2, "LONG");
+        let fsm_state = row_get_string(&locked, 4, "WORKING_ALO");
+        let entry_price = row_get_f64(&locked, 5, 0.0);
+        let req_qty = row_get_f64(&locked, 6, 0.0);
+        let fill_qty = row_get_f64(&locked, 7, 0.0);
+        let res_usdc = row_get_f64(&locked, 8, 0.0);
+
+        tx.exec_drop(
+            r#"UPDATE positions
+               SET exchange_order_id = :eoid,
+                   updated_at_ms = :ts
+               WHERE id = :pid AND status = 'WORKING'"#,
+            params! { "eoid" => trimmed, "ts" => ts, "pid" => position_id },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("set_working_order_exchange_id update failed: {e}"))
+        })?;
+
+        let reason =
+            truncate_audit_reason(&format!("HL_RECONCILE_LINKED_EXCHANGE_OID ({trimmed})"));
+        tx.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :pid, :aid, :coid, :side, :fsm, :fsm,
+                   :req_qty, :fill_qty, :lim_px, 0.00000000,
+                   :res_usdc, 0.00000000, 0.00000000, :reason, :ts, :ts
+               )"#,
+            params! {
+                "pid" => position_id,
+                "aid" => asset_id,
+                "coid" => &client_order_id,
+                "side" => &side_str,
+                "fsm" => if fsm_state.is_empty() { "WORKING_ALO".to_string() } else { fsm_state },
+                "req_qty" => decimal_param(req_qty.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                "fill_qty" => decimal_param(fill_qty.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                "lim_px" => decimal_param(entry_price.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                "res_usdc" => decimal_param(res_usdc.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                "reason" => &reason,
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("set_working_order_exchange_id audit failed: {e}"))
+        })?;
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!("set_working_order_exchange_id commit failed: {e}"))
+        })?;
+        Ok(true)
+    }
+
+    /// Lists recent `CANCELLED` positions for `asset_id` (`id DESC`) so reconciler can match and
+    /// re-link prematurely cancelled rows whose orders are still resting on Hyperliquid (`W1`).
+    pub fn list_recent_cancelled_positions_for_asset(
+        &self,
+        asset_id: i64,
+        limit: usize,
+    ) -> Result<Vec<PositionRecord>> {
+        let mut conn = self.get_conn()?;
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                r#"SELECT id, asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          current_price, exit_price, requested_quantity, filled_quantity,
+                          reserved_margin_usdc, committed_notional_usdc, portfolio_weight,
+                          s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                          protective_stop_px, entry_r0, protective_stop_oid, take_profit_px, take_profit_oid,
+                          highest_price_seen, lowest_price_seen, chase_count, realized_pnl_usdc,
+                          unrealized_pnl_usdc, fees_paid_usdc, funding_accrued_usdc,
+                          slippage_paid_usdc, exchange_order_id, created_at_ms, opened_at_ms,
+                          closed_at_ms, updated_at_ms, exit_reason
+                   FROM positions
+                   WHERE asset_id = :aid AND status = 'CANCELLED'
+                   ORDER BY id DESC
+                   LIMIT :lim"#,
+                params! { "aid" => asset_id, "lim" => limit.max(1) as u64 },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "list_recent_cancelled_positions_for_asset failed: {e}"
+                ))
+            })?;
+        Ok(rows.iter().map(row_to_position_record).collect())
+    }
+
+    /// Adopts an unknown live non-trigger resting entry order on Hyperliquid into `status = 'WORKING'`
+    /// or re-links a matching `CANCELLED` DB row (`relink_cancelled_id` or `exchange_order_id` match)
+    /// back to `status = 'WORKING'` so exposure & heat checks count it (`W1`).
+    pub fn adopt_or_relink_resting_working_order(
+        &self,
+        input: &WorkingOrderInput,
+        relink_cancelled_id: Option<i64>,
+    ) -> Result<(i64, bool)> {
+        let ts = now_ms();
+        let take_profit_px = input
+            .take_profit_px
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| {
+                derive_take_profit_px(input.side, input.limit_price, input.protective_stop_px)
+            });
+
+        let px_dec = decimal_param(input.limit_price.max(1e-8), 8, DEC_20_8_MAX_ABS)?;
+        let qty_dec = decimal_param(input.requested_quantity.max(0.0), 8, DEC_20_8_MAX_ABS)?;
+        let res_dec = decimal_param(
+            round_dp(input.reserved_margin_usdc.max(0.0), 4),
+            8,
+            DEC_20_8_MAX_ABS,
+        )?;
+        let pw_dec = decimal_param(input.portfolio_weight, 8, DEC_20_8_MAX_ABS)?;
+        let s1_dec = decimal_param(input.s1_weight_contrib, 8, DEC_20_8_MAX_ABS)?;
+        let s2_dec = decimal_param(input.s2_weight_contrib, 8, DEC_20_8_MAX_ABS)?;
+        let s3_dec = decimal_param(input.s3_weight_contrib, 8, DEC_20_8_MAX_ABS)?;
+        let stop_dec = decimal_param(input.protective_stop_px.max(0.0), 8, DEC_20_8_MAX_ABS)?;
+        let entry_r0 = derive_entry_r0_from_stop(input.limit_price, input.protective_stop_px);
+        let entry_r0_dec = decimal_param(entry_r0, 8, DEC_20_8_MAX_ABS)?;
+        let tp_dec = decimal_param(take_profit_px.max(0.0), 8, DEC_20_8_MAX_ABS)?;
+
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "adopt_or_relink_resting_working_order tx failed: {e}"
+                ))
+            })?;
+
+        // 1. Idempotency: if a WORKING row already matches exchange_order_id or client_order_id, keep it.
+        if let Some(ref eoid) = input.exchange_order_id {
+            let existing_working: Option<i64> = tx
+                .exec_first(
+                    r#"SELECT id FROM positions
+                       WHERE asset_id = :aid AND status = 'WORKING'
+                         AND (exchange_order_id = :eoid OR client_order_id = :coid)
+                       LIMIT 1
+                       FOR UPDATE"#,
+                    params! { "aid" => input.asset_id, "eoid" => eoid, "coid" => &input.client_order_id },
+                )
+                .map_err(|e| {
+                    AegisError::Database(format!(
+                        "adopt_or_relink_resting_working_order check failed: {e}"
+                    ))
+                })?;
+            if let Some(wid) = existing_working {
+                tx.commit().map_err(|e| {
+                    AegisError::Database(format!(
+                        "adopt_or_relink_resting_working_order commit failed: {e}"
+                    ))
+                })?;
+                return Ok((wid, false));
+            }
+        }
+
+        // 2. Re-link a matching CANCELLED row if found by caller cloid match or exchange_order_id.
+        let target_cancelled_id: Option<(i64, String)> = if let Some(cid) = relink_cancelled_id {
+            tx.exec_first::<mysql::Row, _, _>(
+                r#"SELECT id, client_order_id FROM positions
+                   WHERE id = :cid AND asset_id = :aid AND side = :side AND status = 'CANCELLED'
+                   FOR UPDATE"#,
+                params! { "cid" => cid, "aid" => input.asset_id, "side" => input.side.as_str() },
+            )
+            .map_err(|e| AegisError::Database(format!("relink cancelled lock failed: {e}")))?
+            .map(|r| (row_get_i64(&r, 0, 0), row_get_string(&r, 1, "")))
+        } else if let Some(ref eoid) = input.exchange_order_id {
+            tx.exec_first::<mysql::Row, _, _>(
+                r#"SELECT id, client_order_id FROM positions
+                   WHERE asset_id = :aid AND side = :side AND status = 'CANCELLED'
+                     AND exchange_order_id = :eoid
+                   ORDER BY id DESC
+                   LIMIT 1
+                   FOR UPDATE"#,
+                params! { "aid" => input.asset_id, "side" => input.side.as_str(), "eoid" => eoid },
+            )
+            .map_err(|e| AegisError::Database(format!("relink cancelled eoid lock failed: {e}")))?
+            .map(|r| (row_get_i64(&r, 0, 0), row_get_string(&r, 1, "")))
+        } else {
+            None
+        };
+
+        if let Some((cid, orig_coid)) = target_cancelled_id {
+            tx.exec_drop(
+                r#"UPDATE positions
+                   SET status = 'WORKING',
+                       fsm_state = 'WORKING_ALO',
+                       entry_price = :px,
+                       current_price = :px,
+                       requested_quantity = :qty,
+                       reserved_margin_usdc = :res_usdc,
+                       committed_notional_usdc = 0.00000000,
+                       exchange_order_id = COALESCE(:eoid, exchange_order_id),
+                       closed_at_ms = NULL,
+                       exit_reason = NULL,
+                       updated_at_ms = :ts
+                   WHERE id = :cid AND status = 'CANCELLED'"#,
+                params! {
+                    "px" => &px_dec,
+                    "qty" => &qty_dec,
+                    "res_usdc" => &res_dec,
+                    "eoid" => &input.exchange_order_id,
+                    "ts" => ts,
+                    "cid" => cid,
+                },
+            )
+            .map_err(|e| AegisError::Database(format!("relink cancelled update failed: {e}")))?;
+
+            let safe_reason = truncate_audit_reason(&input.reason);
+            tx.exec_drop(
+                r#"INSERT INTO order_audit (
+                       position_id, asset_id, client_order_id, side, from_state, to_state,
+                       requested_qty, filled_qty, limit_price, avg_fill_price,
+                       reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :pid, :aid, :coid, :side, 'CANCELLED', 'WORKING_ALO',
+                       :qty, 0.00000000, :px, 0.00000000,
+                       :res_usdc, 0.00000000, 0.00000000, :reason, :ts, :ts
+                   )"#,
+                params! {
+                    "pid" => cid,
+                    "aid" => input.asset_id,
+                    "coid" => &orig_coid,
+                    "side" => input.side.as_str(),
+                    "qty" => &qty_dec,
+                    "px" => &px_dec,
+                    "res_usdc" => &res_dec,
+                    "reason" => &safe_reason,
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("relink cancelled audit failed: {e}"))
+            })?;
+
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "adopt_or_relink_resting_working_order commit failed: {e}"
+                ))
+            })?;
+            return Ok((cid, true));
+        }
+
+        // 3. Adopt as a fresh WORKING row in MariaDB (or skip if client_order_id already exists closed).
+        let existing_coid: Option<i64> = tx
+            .exec_first(
+                "SELECT id FROM positions WHERE client_order_id = :coid LIMIT 1 FOR UPDATE",
+                params! { "coid" => &input.client_order_id },
+            )
+            .map_err(|e| AegisError::Database(format!("adopt working coid check failed: {e}")))?;
+        if let Some(existing_id) = existing_coid {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "adopt_or_relink_resting_working_order commit failed: {e}"
+                ))
+            })?;
+            return Ok((existing_id, false));
+        }
+
+        tx.exec_drop(
+            r#"INSERT INTO positions (
+                   asset_id, client_order_id, side, status, fsm_state, entry_price, current_price,
+                   requested_quantity, filled_quantity, reserved_margin_usdc, committed_notional_usdc,
+                   portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib,
+                   protective_stop_px, entry_r0, take_profit_px, highest_price_seen, lowest_price_seen, chase_count,
+                   exchange_order_id, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :aid, :coid, :side, 'WORKING', 'WORKING_ALO', :px, :px,
+                   :qty, 0.00000000, :res_usdc, 0.00000000,
+                   :pw, :s1, :s2, :s3,
+                   :stop_px, :entry_r0, :tp_px, :px, :px, 0,
+                   :eoid, :ts, :ts
+               )"#,
+            params! {
+                "aid" => input.asset_id,
+                "coid" => &input.client_order_id,
+                "side" => input.side.as_str(),
+                "px" => &px_dec,
+                "qty" => &qty_dec,
+                "res_usdc" => &res_dec,
+                "pw" => &pw_dec,
+                "s1" => &s1_dec,
+                "s2" => &s2_dec,
+                "s3" => &s3_dec,
+                "stop_px" => &stop_dec,
+                "entry_r0" => &entry_r0_dec,
+                "tp_px" => &tp_dec,
+                "eoid" => &input.exchange_order_id,
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("adopt resting working order insert failed: {e}"))
+        })?;
+        let new_id = tx.last_insert_id().unwrap_or(0) as i64;
+        let safe_reason = truncate_audit_reason(&input.reason);
+        tx.exec_drop(
+            r#"INSERT INTO order_audit (
+                   position_id, asset_id, client_order_id, side, from_state, to_state,
+                   requested_qty, filled_qty, limit_price, avg_fill_price,
+                   reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+               ) VALUES (
+                   :pid, :aid, :coid, :side, 'RECONCILED', 'WORKING_ALO',
+                   :qty, 0.00000000, :px, 0.00000000,
+                   :res_usdc, 0.00000000, 0.00000000, :reason, :ts, :ts
+               )"#,
+            params! {
+                "pid" => new_id,
+                "aid" => input.asset_id,
+                "coid" => &input.client_order_id,
+                "side" => input.side.as_str(),
+                "qty" => &qty_dec,
+                "px" => &px_dec,
+                "res_usdc" => &res_dec,
+                "reason" => &safe_reason,
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("adopt resting working order audit failed: {e}"))
+        })?;
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "adopt_or_relink_resting_working_order commit failed: {e}"
+            ))
+        })?;
+        Ok((new_id, true))
+    }
+
+    /// Idempotently synchronizes active open-epoch partial-trim `realized_pnl_usdc` and `fees_paid_usdc`
+    /// onto an `OPEN` position (`W3` Single Booking Rule), recording any unlogged partial-close fee delta
+    /// in `order_audit` (`to_state = 'PARTIAL_CLOSE'`) so `close_position` conserves entry fees cleanly.
+    pub fn sync_open_epoch_partial_realized(
+        &self,
+        position_id: i64,
+        partial_closed_qty: f64,
+        gross_closed_pnl: f64,
+        partial_close_fees_usdc: f64,
+        open_fills_fees_usdc: f64,
+        has_complete_open_fills: bool,
+    ) -> Result<bool> {
+        let safe_partial_fees = if partial_close_fees_usdc.is_finite() {
+            partial_close_fees_usdc.max(0.0)
+        } else {
+            0.0
+        };
+        let safe_open_fees = if open_fills_fees_usdc.is_finite() {
+            open_fills_fees_usdc.max(0.0)
+        } else {
+            0.0
+        };
+        let safe_gross = if gross_closed_pnl.is_finite() {
+            gross_closed_pnl
+        } else {
+            0.0
+        };
+        if partial_closed_qty <= 1e-9 && safe_open_fees <= 1e-9 {
+            return Ok(false);
+        }
+
+        let ts = now_ms();
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!("sync_open_epoch_partial_realized tx failed: {e}"))
+            })?;
+
+        let row: Option<mysql::Row> = tx
+            .exec_first(
+                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          committed_notional_usdc, realized_pnl_usdc, fees_paid_usdc
+                   FROM positions
+                   WHERE id = :pid
+                   FOR UPDATE"#,
+                params! { "pid" => position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!("sync_open_epoch_partial_realized lock failed: {e}"))
+            })?;
+        let Some(locked) = row else {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized commit failed: {e}"
+                ))
+            })?;
+            return Ok(false);
+        };
+        let status = row_get_string(&locked, 3, "");
+        if !status.eq_ignore_ascii_case("OPEN") {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized commit failed: {e}"
+                ))
+            })?;
+            return Ok(false);
+        }
+
+        let asset_id = row_get_i64(&locked, 0, 0);
+        let client_order_id = row_get_string(&locked, 1, "");
+        let side_str = row_get_string(&locked, 2, "LONG");
+        let fsm_state = row_get_string(&locked, 4, "FILLED_OPEN");
+        let entry_price = row_get_f64(&locked, 5, 0.0);
+        let comm_usdc = row_get_f64(&locked, 6, 0.0);
+        let cur_rpnl = row_get_f64(&locked, 7, 0.0);
+        let cur_fees = row_get_f64(&locked, 8, 0.0);
+
+        let partial_audit_row: Option<mysql::Row> = tx
+            .exec_first(
+                r#"SELECT COALESCE(SUM(fees_usdc), 0)
+                   FROM order_audit
+                   WHERE position_id = :pid AND to_state = 'PARTIAL_CLOSE'"#,
+                params! { "pid" => position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized audit sum failed: {e}"
+                ))
+            })?;
+        let cur_partial_audit_fees = partial_audit_row
+            .map(|r| row_get_f64(&r, 0, 0.0))
+            .unwrap_or(0.0)
+            .max(0.0);
+        let cur_open_fees = (cur_fees - cur_partial_audit_fees).max(0.0);
+
+        let target_open_fees = if has_complete_open_fills {
+            round_dp(safe_open_fees, 4)
+        } else {
+            round_dp(cur_open_fees.max(safe_open_fees), 4)
+        };
+        let target_rpnl = if partial_closed_qty > 1e-9 {
+            round_dp(safe_gross - safe_partial_fees, 4)
+        } else {
+            cur_rpnl
+        };
+        let eff_partial_fees = if partial_closed_qty > 1e-9 {
+            round_dp(safe_partial_fees, 4)
+        } else {
+            round_dp(cur_partial_audit_fees, 4)
+        };
+        let target_total_fees = round_dp(target_open_fees + eff_partial_fees, 4);
+
+        let rpnl_changed = (cur_rpnl - target_rpnl).abs() > 1e-6;
+        let fees_changed = (cur_fees - target_total_fees).abs() > 1e-6;
+        let delta_partial_fee = round_dp(eff_partial_fees - cur_partial_audit_fees, 4);
+
+        if !rpnl_changed && !fees_changed && delta_partial_fee <= 1e-6 {
+            tx.commit().map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized commit failed: {e}"
+                ))
+            })?;
+            return Ok(false);
+        }
+
+        if rpnl_changed || fees_changed {
+            tx.exec_drop(
+                r#"UPDATE positions
+                   SET realized_pnl_usdc = :rpnl,
+                       fees_paid_usdc = :fees,
+                       updated_at_ms = :ts
+                   WHERE id = :pid AND status = 'OPEN'"#,
+                params! {
+                    "rpnl" => decimal_param(target_rpnl, 8, DEC_20_8_MAX_ABS)?,
+                    "fees" => decimal_param(target_total_fees, 8, DEC_20_8_MAX_ABS)?,
+                    "ts" => ts,
+                    "pid" => position_id,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized update failed: {e}"
+                ))
+            })?;
+        }
+
+        if delta_partial_fee > 1e-6 {
+            let reason = truncate_audit_reason("HL_OPEN_EPOCH_PARTIAL_RECONCILED");
+            tx.exec_drop(
+                r#"INSERT INTO order_audit (
+                       position_id, asset_id, client_order_id, side, from_state, to_state,
+                       requested_qty, filled_qty, limit_price, avg_fill_price,
+                       reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :pid, :aid, :coid, :side, :from_st, 'PARTIAL_CLOSE',
+                       :qty, :qty, :px, :px,
+                       0.00000000, :comm_usdc, :fees, :reason, :ts, :ts
+                   )"#,
+                params! {
+                    "pid" => position_id,
+                    "aid" => asset_id,
+                    "coid" => &client_order_id,
+                    "side" => &side_str,
+                    "from_st" => if fsm_state.is_empty() { "FILLED_OPEN".to_string() } else { fsm_state },
+                    "qty" => decimal_param(partial_closed_qty.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                    "px" => decimal_param(entry_price.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                    "comm_usdc" => decimal_param(comm_usdc.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                    "fees" => decimal_param(delta_partial_fee, 8, DEC_20_8_MAX_ABS)?,
+                    "reason" => &reason,
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "sync_open_epoch_partial_realized audit failed: {e}"
+                ))
+            })?;
+        }
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "sync_open_epoch_partial_realized commit failed: {e}"
+            ))
+        })?;
+        self.invalidate_pnl_cache();
+        Ok(true)
+    }
+
+    /// Self-heals pre-existing `hl-closed-%` `HL_USER_FILL_RECONCILED` `CLOSED` rows belonging to
+    /// the currently `OPEN` position `open_position_id` (repointing `order_audit` FKs first) and
+    /// zeroes any polluted `SCALE_IN_MERGED` child rows (`W3`).
+    pub fn heal_open_epoch_phantom_closed_rows(
+        &self,
+        asset_id: i64,
+        open_position_id: i64,
+        side: OrderSide,
+    ) -> Result<usize> {
+        let mut conn = self.get_conn()?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "heal_open_epoch_phantom_closed_rows tx failed: {e}"
+                ))
+            })?;
+
+        tx.exec_drop(
+            r#"UPDATE positions
+               SET realized_pnl_usdc = 0.00000000,
+                   fees_paid_usdc = 0.00000000,
+                   funding_accrued_usdc = 0.00000000
+               WHERE asset_id = :aid
+                 AND status = 'CLOSED'
+                 AND exit_reason = 'SCALE_IN_MERGED'
+                 AND (realized_pnl_usdc != 0 OR fees_paid_usdc != 0 OR funding_accrued_usdc != 0)"#,
+            params! { "aid" => asset_id },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "heal_open_epoch_phantom_closed_rows zero scale_in failed: {e}"
+            ))
+        })?;
+
+        let open_row: Option<mysql::Row> = tx
+            .exec_first(
+                r#"SELECT COALESCE(opened_at_ms, created_at_ms)
+                   FROM positions
+                   WHERE id = :pid AND status = 'OPEN'
+                   FOR UPDATE"#,
+                params! { "pid" => open_position_id },
+            )
+            .map_err(|e| {
+                AegisError::Database(format!(
+                    "heal_open_epoch_phantom_closed_rows open lock failed: {e}"
+                ))
+            })?;
+        let deleted = if let Some(r) = open_row {
+            let open_origin_ms = row_get_i64(&r, 0, 0);
+            heal_open_epoch_phantom_rows_in_tx(
+                &mut tx,
+                asset_id,
+                open_position_id,
+                side,
+                open_origin_ms,
+            )?
+        } else {
+            0
+        };
+
+        tx.commit().map_err(|e| {
+            AegisError::Database(format!(
+                "heal_open_epoch_phantom_closed_rows commit failed: {e}"
+            ))
+        })?;
+        if deleted > 0 {
+            self.invalidate_pnl_cache();
+        }
+        Ok(deleted)
+    }
+}
+
+fn lock_open_epoch_origins(
+    tx: &mut Transaction<'_>,
+    asset_ids: &[i64],
+) -> Result<std::collections::HashMap<(i64, String), (i64, i64)>> {
+    let mut out = std::collections::HashMap::new();
+    if asset_ids.is_empty() {
+        return Ok(out);
+    }
+    let mut ph = Vec::with_capacity(asset_ids.len());
+    let mut bind_params: Vec<(String, Value)> = Vec::with_capacity(asset_ids.len());
+    for (i, &aid) in asset_ids.iter().enumerate() {
+        let name = format!("oa{i}");
+        ph.push(format!(":{name}"));
+        bind_params.push((name, Value::from(aid)));
+    }
+    let sql = format!(
+        r#"SELECT id, asset_id, side, COALESCE(opened_at_ms, created_at_ms)
+           FROM positions
+           WHERE status = 'OPEN' AND asset_id IN ({})
+           ORDER BY id ASC
+           FOR UPDATE"#,
+        ph.join(", ")
+    );
+    let rows: Vec<mysql::Row> = tx
+        .exec(sql, mysql::Params::from(bind_params))
+        .map_err(|e| AegisError::Database(format!("lock_open_epoch_origins failed: {e}")))?;
+    for r in &rows {
+        let id = row_get_i64(r, 0, 0);
+        let aid = row_get_i64(r, 1, 0);
+        let side = row_get_string(r, 2, "LONG").to_ascii_uppercase();
+        let origin_ms = row_get_i64(r, 3, 0);
+        out.entry((aid, side))
+            .and_modify(|cur: &mut (i64, i64)| {
+                if origin_ms < cur.1 {
+                    *cur = (id, origin_ms);
+                }
+            })
+            .or_insert((id, origin_ms));
+    }
+    Ok(out)
+}
+
+fn heal_open_epoch_phantom_rows_in_tx(
+    tx: &mut Transaction<'_>,
+    asset_id: i64,
+    open_position_id: i64,
+    side: OrderSide,
+    open_origin_ms: i64,
+) -> Result<usize> {
+    let min_close_ms = open_origin_ms.saturating_sub(1_000);
+    let dup_rows: Vec<mysql::Row> = tx
+        .exec(
+            r#"SELECT id
+               FROM positions
+               WHERE asset_id = :aid
+                 AND side = :side
+                 AND status = 'CLOSED'
+                 AND client_order_id LIKE 'hl-closed-%'
+                 AND COALESCE(exit_reason, '') = 'HL_USER_FILL_RECONCILED'
+                 AND COALESCE(closed_at_ms, updated_at_ms) >= :min_clts
+               FOR UPDATE"#,
+            params! {
+                "aid" => asset_id,
+                "side" => side.as_str(),
+                "min_clts" => min_close_ms,
+            },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!("heal_open_epoch_phantom_rows select failed: {e}"))
+        })?;
+    let mut deleted = 0usize;
+    for r in &dup_rows {
+        let dup_id = row_get_i64(r, 0, 0);
+        if dup_id <= 0 || dup_id == open_position_id {
+            continue;
+        }
+        tx.exec_drop(
+            "UPDATE order_audit SET position_id = :survivor WHERE position_id = :dup",
+            params! { "survivor" => open_position_id, "dup" => dup_id },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "heal_open_epoch_phantom_rows audit reassign {dup_id} -> {open_position_id} failed: {e}"
+            ))
+        })?;
+        tx.exec_drop(
+            "DELETE FROM positions WHERE id = :dup AND status = 'CLOSED'",
+            params! { "dup" => dup_id },
+        )
+        .map_err(|e| {
+            AegisError::Database(format!(
+                "heal_open_epoch_phantom_rows delete {dup_id} failed: {e}"
+            ))
+        })?;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 struct ExactClosedCandidate {
@@ -2817,7 +3678,8 @@ fn lock_exact_closed_candidates(
         r#"SELECT p.id, p.status, p.client_order_id,
                   EXISTS (SELECT 1 FROM order_audit oa WHERE oa.position_id = p.id) AS has_audit
            FROM positions p
-           WHERE {}
+           WHERE ({})
+             AND COALESCE(p.exit_reason, '') != 'SCALE_IN_MERGED'
            ORDER BY p.id DESC
            FOR UPDATE"#,
         clauses.join(" OR ")
@@ -2843,9 +3705,9 @@ fn lock_active_rows_for_asset(
 ) -> Result<Vec<ActiveSyncRow>> {
     let raw_active: Vec<mysql::Row> = tx
         .exec(
-            r#"SELECT id, status, side, protective_stop_px, entry_r0, protective_stop_oid,
-                      take_profit_px, take_profit_oid, client_order_id, fsm_state,
-                      requested_quantity
+            r#"SELECT id, asset_id, status, side, entry_price, protective_stop_px, entry_r0,
+                      protective_stop_oid, take_profit_px, take_profit_oid, client_order_id,
+                      fsm_state, requested_quantity
                FROM positions
                WHERE asset_id = :aid AND status IN ('OPEN', 'WORKING')
                ORDER BY FIELD(status, 'OPEN', 'WORKING'), id DESC
@@ -2862,16 +3724,18 @@ fn lock_active_rows_for_asset(
         .iter()
         .map(|r| ActiveSyncRow {
             id: row_get_i64(r, 0, 0),
-            status: row_get_string(r, 1, ""),
-            side: row_get_string(r, 2, "LONG"),
-            protective_stop_px: row_get_f64(r, 3, 0.0),
-            entry_r0: row_get_f64(r, 4, 0.0),
-            protective_stop_oid: row_get_opt_string(r, 5),
-            take_profit_px: row_get_f64(r, 6, 0.0),
-            take_profit_oid: row_get_opt_string(r, 7),
-            client_order_id: row_get_string(r, 8, ""),
-            fsm_state: row_get_string(r, 9, ""),
-            requested_quantity: row_get_f64(r, 10, 0.0),
+            asset_id: row_get_i64(r, 1, asset_id),
+            status: row_get_string(r, 2, ""),
+            side: row_get_string(r, 3, "LONG"),
+            entry_price: row_get_f64(r, 4, 0.0),
+            protective_stop_px: row_get_f64(r, 5, 0.0),
+            entry_r0: row_get_f64(r, 6, 0.0),
+            protective_stop_oid: row_get_opt_string(r, 7),
+            take_profit_px: row_get_f64(r, 8, 0.0),
+            take_profit_oid: row_get_opt_string(r, 9),
+            client_order_id: row_get_string(r, 10, ""),
+            fsm_state: row_get_string(r, 11, ""),
+            requested_quantity: row_get_f64(r, 12, 0.0),
         })
         .collect())
 }
@@ -2884,6 +3748,8 @@ fn cancel_duplicate_active_rows(
     exit_reason: &str,
     ts: i64,
 ) -> Result<()> {
+    let safe_exit_reason = truncate_exit_reason(exit_reason);
+    let safe_audit_reason = truncate_audit_reason(exit_reason);
     let sql = format!(
         r#"UPDATE positions
            SET status = 'CANCELLED',
@@ -2901,9 +3767,41 @@ fn cancel_duplicate_active_rows(
         }
         tx.exec_drop(
             &sql,
-            params! { "ts" => ts, "reason" => exit_reason, "pid" => other.id },
+            params! { "ts" => ts, "reason" => &safe_exit_reason, "pid" => other.id },
         )
         .map_err(|e| AegisError::Database(format!("dedup cancel position failed: {e}")))?;
+        if tx.affected_rows() > 0 {
+            let from_state = if !other.fsm_state.trim().is_empty() {
+                other.fsm_state.clone()
+            } else if other.status.eq_ignore_ascii_case("OPEN") {
+                "FILLED_OPEN".to_string()
+            } else {
+                "WORKING_ALO".to_string()
+            };
+            tx.exec_drop(
+                r#"INSERT INTO order_audit (
+                       position_id, asset_id, client_order_id, side, from_state, to_state,
+                       requested_qty, filled_qty, limit_price, avg_fill_price,
+                       reserved_usdc, committed_usdc, fees_usdc, reason, created_at_ms, updated_at_ms
+                   ) VALUES (
+                       :pid, :aid, :coid, :side, :from_st, 'CANCELLED',
+                       :req_qty, 0.00000000, :lim_px, 0.00000000,
+                       0.00000000, 0.00000000, 0.00000000, :reason, :ts, :ts
+                   )"#,
+                params! {
+                    "pid" => other.id,
+                    "aid" => other.asset_id,
+                    "coid" => &other.client_order_id,
+                    "side" => &other.side,
+                    "from_st" => &from_state,
+                    "req_qty" => decimal_param(other.requested_quantity.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                    "lim_px" => decimal_param(other.entry_price.max(0.0), 8, DEC_20_8_MAX_ABS)?,
+                    "reason" => &safe_audit_reason,
+                    "ts" => ts,
+                },
+            )
+            .map_err(|e| AegisError::Database(format!("dedup cancel audit failed: {e}")))?;
+        }
     }
     Ok(())
 }

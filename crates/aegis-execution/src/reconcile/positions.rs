@@ -8,16 +8,19 @@ use crate::reconcile::ledger::{
     derive_open_position_opened_at_ms, fill_is_closing_dir, resolve_flat_exit_fill_stats,
     FifoFundingReplayOutput, ParsedHlFill,
 };
-use crate::reconcile::orders::resolve_working_entry_oid;
+use crate::reconcile::orders::{
+    candidate_hl_cloids_for_coid, lookup_resting_entry_order_by_oid,
+    resolve_working_entry_oid_with_resting,
+};
 use crate::signing::infer_tick_size;
 use crate::tpsl_sync::{sync_tpsl_batch_for_positions, TpslSyncRequest};
 use aegis_core::{
     normalize_hyperliquid_symbol, parse_hl_f64, round_dp, ConfigMap, ExchangeAsset, HeldAssetView,
-    OrderSide, Result, ENTRY_PARTIAL_GRACE_MS,
+    OrderSide, OrderedAssetView, PositionStatus, Result, ENTRY_PARTIAL_GRACE_MS,
 };
 use aegis_db::{
     AssetUpsertInput, BarUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput,
-    FundingEventUpsertInput, ReconciledClosedTradeInput,
+    FundingEventUpsertInput, ReconciledClosedTradeInput, WorkingOrderInput,
 };
 use aegis_risk::{compute_initial_protective_stop, compute_initial_take_profit, RiskLimitsConfig};
 use serde_json::Value;
@@ -324,6 +327,72 @@ pub(crate) fn prepare_exchange_positions_unlocked(
     out
 }
 
+fn match_working_order_fills(
+    ordered: &OrderedAssetView,
+    resolved_oid: Option<u64>,
+    fills_for_coin: Option<&Vec<ParsedHlFill>>,
+    claimed_fill_oids: &HashSet<u64>,
+) -> Option<(f64, f64, f64, u64)> {
+    let fills = fills_for_coin?;
+    let expected_side = if ordered.side.eq_ignore_ascii_case("LONG") {
+        "B"
+    } else if ordered.side.eq_ignore_ascii_case("SHORT") {
+        "A"
+    } else {
+        return None;
+    };
+
+    if let Some(oid) = resolved_oid {
+        if !claimed_fill_oids.contains(&oid) {
+            let mut notional_sum = 0.0_f64;
+            let mut qty_sum = 0.0_f64;
+            let mut fee_sum = 0.0_f64;
+            for f in fills {
+                if f.oid == oid
+                    && f.side_str.eq_ignore_ascii_case(expected_side)
+                    && !fill_is_closing_dir(f)
+                {
+                    notional_sum += f.px * f.sz;
+                    qty_sum += f.sz;
+                    fee_sum += f.fee.max(0.0);
+                }
+            }
+            if qty_sum > 1e-9 && notional_sum > 0.0 {
+                return Some((notional_sum / qty_sum, qty_sum, fee_sum, oid));
+            }
+        }
+    }
+
+    if resolved_oid.is_none() && ordered.requested_quantity > 1e-9 {
+        let min_ts = ordered.created_at_ms.saturating_sub(2_000);
+        let mut by_oid: BTreeMap<u64, (f64, f64, f64)> = BTreeMap::new();
+        for f in fills {
+            if f.time_ms < min_ts
+                || claimed_fill_oids.contains(&f.oid)
+                || !f.side_str.eq_ignore_ascii_case(expected_side)
+                || fill_is_closing_dir(f)
+            {
+                continue;
+            }
+            let e = by_oid.entry(f.oid).or_insert((0.0, 0.0, 0.0));
+            e.0 += f.px * f.sz;
+            e.1 += f.sz;
+            e.2 += f.fee.max(0.0);
+        }
+        for (oid, (notional_sum, qty_sum, fee_sum)) in by_oid {
+            if qty_sum > 1e-9
+                && notional_sum > 0.0
+                && (qty_sum - ordered.requested_quantity).abs()
+                    <= ordered.requested_quantity * 0.05 + 1e-6
+            {
+                return Some((notional_sum / qty_sum, qty_sum, fee_sum, oid));
+            }
+        }
+    }
+
+    None
+}
+
 /// Phase 3 locked DB commit for working clearances, open position 1:1 sync, `EXCHANGE_RECONCILED_FLAT`
 /// fill-resolved cooldowns, closed trade replay, and `funding_events` remaining balances.
 #[allow(clippy::too_many_arguments)]
@@ -356,31 +425,112 @@ pub(crate) fn commit_positions_and_ledger_locked(
     let mut legacy_positions_adopted = 0usize;
     let mut local_orphans_closed = 0usize;
     let mut tpsl_syncs = Vec::new();
+    let limits = RiskLimitsConfig::from_config_map(fresh_cfg);
+    let eff_basis_eq = if eff_cap_eq >= 10.0 {
+        exchange_equity_usdc.min(eff_cap_eq)
+    } else {
+        exchange_equity_usdc
+    };
 
-    // Cancel stale WORKING rows created <= snapshot_ts_ms (never cancelling in-flight or post-snapshot rows)
+    // W1: Reconcile WORKING rows (`v_assets_ordered`):
+    // - Match by `exchange_order_id` (`hl-<oid>`) OR Keccak256 `cloid`, upserting `exchange_order_id` if missing.
+    // - Merge filled scale-ins (`SCALE_IN_MERGED`) into their OPEN parent if fills already landed in `userFills`.
+    // - Never locally cancel unless confirmed absent from live `openOrders` after `ENTRY_PARTIAL_GRACE_MS` (or explicit legacy flatten).
+    let mut handled_resting_oids: HashSet<u64> = HashSet::new();
+    let mut claimed_fill_oids: HashSet<u64> = HashSet::new();
     if let Ok(local_ordered) = db.get_assets_ordered() {
         for o in local_ordered {
-            if in_flight_positions.contains(&o.position_id) {
+            let coin_upper = o.coin.to_ascii_uppercase();
+            let resolved_oid =
+                resolve_working_entry_oid_with_resting(&o, resting_exchange_oids, cloid_to_oid);
+            let is_resting = !close_legacy_positions
+                && resolved_oid.is_some_and(|oid| resting_exchange_oids.contains(&oid));
+            if is_resting {
+                let oid = resolved_oid.unwrap();
+                handled_resting_oids.insert(oid);
+                let canonical_eoid = format!("hl-{oid}");
+                if o.exchange_order_id.as_deref() != Some(canonical_eoid.as_str()) {
+                    let _ = db.set_working_order_exchange_id(o.position_id, &canonical_eoid);
+                }
                 continue;
             }
-            if o.created_at_ms > snapshot_ts_ms {
+
+            if in_flight_positions.contains(&o.position_id) || o.created_at_ms > snapshot_ts_ms {
                 continue;
             }
-            let is_open_on_exch = open_coins.contains(&o.coin.to_ascii_uppercase());
+
+            if let Some((vwap_px, total_qty, total_fee, fill_oid)) = match_working_order_fills(
+                &o,
+                resolved_oid,
+                parsed_fills_by_coin.get(&coin_upper),
+                &claimed_fill_oids,
+            ) {
+                let open_parent_opt = OrderSide::parse(&o.side).ok().and_then(|w_side| {
+                    db.list_active_positions_for_asset(o.asset_id)
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter().find(|p| {
+                                p.id != o.position_id
+                                    && PositionStatus::parse(&p.status) == PositionStatus::Open
+                                    && OrderSide::parse(&p.side).ok() == Some(w_side)
+                            })
+                        })
+                });
+                if let Some(open_parent) = open_parent_opt {
+                    let fill_eoid = format!("hl-{fill_oid}");
+                    if db
+                        .merge_working_scale_in_into_open(
+                            o.position_id,
+                            open_parent.id,
+                            vwap_px,
+                            total_qty,
+                            total_fee,
+                            Some(&fill_eoid),
+                            "HL_RECONCILE_SCALE_IN_MERGED",
+                        )
+                        .is_ok()
+                    {
+                        claimed_fill_oids.insert(fill_oid);
+                        details.push(format!(
+                            "Merged filled WORKING scale-in #{} on {} (+{:.4} @ ${:.4}) into OPEN #{}",
+                            o.position_id, o.symbol, total_qty, vwap_px, open_parent.id
+                        ));
+                        continue;
+                    }
+                } else if !open_coins.contains(&coin_upper) {
+                    let fill_eoid = format!("hl-{fill_oid}");
+                    let tp_opt = (o.take_profit_px > 0.0).then_some(o.take_profit_px);
+                    if db
+                        .promote_working_to_open(
+                            o.position_id,
+                            vwap_px,
+                            total_qty,
+                            total_fee,
+                            o.protective_stop_px,
+                            tp_opt,
+                            Some(&fill_eoid),
+                            "HL_RECONCILE_WORKING_FILLED",
+                        )
+                        .is_ok()
+                    {
+                        claimed_fill_oids.insert(fill_oid);
+                        continue;
+                    }
+                } else {
+                    // Open on exchange with no OPEN parent row yet -> let sync_open_position_from_exchange_v2 promote in-place.
+                    continue;
+                }
+            }
+
             let is_expired =
                 snapshot_ts_ms.saturating_sub(o.created_at_ms) >= ENTRY_PARTIAL_GRACE_MS;
-            let is_resting = resolve_working_entry_oid(&o, cloid_to_oid)
-                .is_some_and(|oid| resting_exchange_oids.contains(&oid));
-            if close_legacy_positions
-                || (!is_open_on_exch && (is_expired || (open_orders_fetch_ok && !is_resting)))
-            {
+            if close_legacy_positions || (open_orders_fetch_ok && !is_resting && is_expired) {
                 let _ =
                     db.cancel_working_order(o.position_id, "EXCHANGE_RECONCILED_WORKING_CLEARED");
             }
         }
     }
 
-    let limits = RiskLimitsConfig::from_config_map(fresh_cfg);
     let mut exchange_open_asset_ids: HashSet<i64> = HashSet::new();
     let mut coin_asset_id_cache: HashMap<String, i64> = HashMap::new();
 
@@ -508,11 +658,6 @@ pub(crate) fn commit_positions_and_ledger_locked(
         } else {
             round_dp(prep.mark_px * prep.remaining_qty, 4)
         };
-        let eff_basis_eq = if eff_cap_eq >= 10.0 {
-            exchange_equity_usdc.min(eff_cap_eq)
-        } else {
-            exchange_equity_usdc
-        };
         let weight = round_dp(
             (committed_usdc / eff_basis_eq.max(1.0)) * prep.side.sign(),
             4,
@@ -537,6 +682,23 @@ pub(crate) fn commit_positions_and_ledger_locked(
                 funding_accrued_usdc,
                 opened_at_ms: opened_at_ms_opt,
             })?;
+        // W3: Self-heal any pre-existing phantom `hl-closed-%` rows in the active open epoch
+        // and idempotently synchronize active open-epoch partial-trim realized PnL & fees.
+        let _ = db.heal_open_epoch_phantom_closed_rows(asset.id, pid, prep.side);
+        if ledger_sync_ok {
+            if let Some(open_realized) =
+                replay_out.open_epoch_realized_by_coin.get(&prep.coin_upper)
+            {
+                let _ = db.sync_open_epoch_partial_realized(
+                    pid,
+                    open_realized.partial_closed_qty,
+                    open_realized.gross_closed_pnl,
+                    open_realized.close_fees_usdc,
+                    open_realized.open_fills_fees_usdc,
+                    open_realized.has_complete_open_fills,
+                );
+            }
+        }
         if let Ok(Some(synced_pos)) = db.get_position_by_id(pid) {
             tpsl_syncs.push(PendingTpslSync {
                 position_id: pid,
@@ -563,6 +725,133 @@ pub(crate) fn commit_positions_and_ledger_locked(
             committed_usdc,
             prep.upnl
         ));
+    }
+
+    // W1: Adopt or re-link any live non-trigger resting entry orders carrying our `cloid` that
+    // had no active `WORKING` DB row so exposure & heat caps never miss live resting orders.
+    if !close_legacy_positions && open_orders_fetch_ok {
+        let mut unmatched_oids: Vec<u64> = resting_exchange_oids
+            .iter()
+            .copied()
+            .filter(|oid| !handled_resting_oids.contains(oid))
+            .collect();
+        unmatched_oids.sort_unstable();
+        for oid in unmatched_oids {
+            let Some(entry_ord) = lookup_resting_entry_order_by_oid(oid) else {
+                continue;
+            };
+            let Some(ref raw_cloid) = entry_ord.cloid else {
+                continue;
+            };
+            let sym = format!("{}-USDC", entry_ord.coin_upper);
+            let Some(asset) = assets_by_symbol
+                .get(&sym)
+                .or_else(|| assets_by_symbol.get(&entry_ord.coin_upper))
+                .cloned()
+            else {
+                continue;
+            };
+            let same_or_flat = prepared_positions
+                .iter()
+                .filter(|p| !p.closed_on_exchange && p.coin_upper == entry_ord.coin_upper)
+                .all(|p| p.side == entry_ord.side);
+            if !same_or_flat {
+                continue;
+            }
+
+            let eoid_str = format!("hl-{oid}");
+            let relink_id = db
+                .list_recent_cancelled_positions_for_asset(asset.id, 20)
+                .ok()
+                .and_then(|cands| {
+                    cands
+                        .into_iter()
+                        .find(|c| {
+                            c.side.eq_ignore_ascii_case(entry_ord.side.as_str())
+                                && (c.exchange_order_id.as_deref() == Some(eoid_str.as_str())
+                                    || candidate_hl_cloids_for_coid(
+                                        &c.client_order_id,
+                                        c.chase_count,
+                                    )
+                                    .iter()
+                                    .any(|cand| cand.eq_ignore_ascii_case(raw_cloid)))
+                        })
+                        .map(|c| c.id)
+                });
+
+            let tick = asset.tick_size.max(1e-8);
+            let ref_px = if asset.mark_price > 0.0 {
+                asset.mark_price
+            } else {
+                entry_ord.limit_price
+            };
+            let atr_opt = crate::engine::resolve_signal_matched_atr_from_db(
+                db,
+                asset.id,
+                fresh_cfg,
+                ref_px,
+                limits.protective_stop_default_pct,
+            );
+            let stop_px = compute_initial_protective_stop(
+                entry_ord.side,
+                entry_ord.limit_price,
+                atr_opt,
+                tick,
+                &limits,
+            );
+            let tp_px = compute_initial_take_profit(
+                entry_ord.side,
+                entry_ord.limit_price,
+                atr_opt,
+                tick,
+                &limits,
+            );
+            let reserved_usdc = round_dp(entry_ord.limit_price * entry_ord.quantity, 4);
+            let pw = round_dp(
+                (reserved_usdc / eff_basis_eq.max(1.0)) * entry_ord.side.sign(),
+                4,
+            );
+            let reason = if relink_id.is_some() {
+                "HL_RECONCILE_RELINKED_RESTING_ORDER"
+            } else {
+                "HL_RECONCILE_ADOPTED_RESTING_ORDER"
+            };
+            if let Ok((wid, changed)) = db.adopt_or_relink_resting_working_order(
+                &WorkingOrderInput {
+                    asset_id: asset.id,
+                    client_order_id: format!(
+                        "hl-working-{}-{oid}",
+                        asset.coin.to_ascii_lowercase()
+                    ),
+                    side: entry_ord.side,
+                    limit_price: entry_ord.limit_price,
+                    requested_quantity: entry_ord.quantity,
+                    reserved_margin_usdc: reserved_usdc,
+                    portfolio_weight: pw,
+                    s1_weight_contrib: pw,
+                    s2_weight_contrib: 0.0,
+                    s3_weight_contrib: 0.0,
+                    protective_stop_px: stop_px,
+                    take_profit_px: Some(tp_px),
+                    exchange_order_id: Some(eoid_str.clone()),
+                    reason: reason.to_string(),
+                },
+                relink_id,
+            ) {
+                let _ = db.set_asset_priority_watch(asset.id, true);
+                if changed {
+                    details.push(format!(
+                        "Adopted/re-linked resting WORKING order #{} on {} ({} {:.4} @ ${:.4}, oid={})",
+                        wid,
+                        asset.symbol,
+                        entry_ord.side.as_str(),
+                        entry_ord.quantity,
+                        entry_ord.limit_price,
+                        eoid_str
+                    ));
+                }
+            }
+        }
     }
 
     // Close local `OPEN` rows flat on Hyperliquid (guarded by snapshot_ts_ms + in_flight_positions + P1-Acct cooldowns)
@@ -643,10 +932,7 @@ pub(crate) fn commit_positions_and_ledger_locked(
                     OrderSide::Short => (exit_px + (agg.gross_closed_pnl / agg.total_sz)).max(1e-8),
                 };
                 let total_fees = agg.close_fees_usdc + agg.open_fees_usdc;
-                let net_rpnl = round_dp(
-                    agg.gross_closed_pnl - total_fees + agg.funding_accrued_usdc,
-                    4,
-                );
+                let net_rpnl = agg.gross_closed_pnl - total_fees + agg.funding_accrued_usdc;
                 let symbol = format!("{}-USDC", agg.coin);
                 let Some(asset) = resolve_or_upsert_asset_locked(
                     db,
@@ -676,8 +962,8 @@ pub(crate) fn commit_positions_and_ledger_locked(
                     exit_price: exit_px,
                     filled_quantity: agg.total_sz,
                     realized_pnl_usdc: net_rpnl,
-                    fees_paid_usdc: round_dp(total_fees, 4),
-                    funding_accrued_usdc: round_dp(agg.funding_accrued_usdc, 4),
+                    fees_paid_usdc: total_fees,
+                    funding_accrued_usdc: agg.funding_accrued_usdc,
                     created_at_ms: window_start,
                     closed_at_ms: agg.max_time_ms,
                     exit_reason: "HL_USER_FILL_RECONCILED".to_string(),

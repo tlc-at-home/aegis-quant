@@ -3780,16 +3780,18 @@ fn test_reconcile_met_partial_close_pro_rata_funding_and_daily_pnl_window() {
     let met_open = &held[0];
     assert_eq!(met_open.symbol, "MET-USDC");
     assert_eq!(met_open.opened_at_ms, Some(open_ts));
-    assert!((met_open.funding_accrued_usdc - 664.19).abs() < 1e-2);
+    // W3 Single Booking Rule: 100% of open-epoch funding (+665.57), partial realized PnL (-0.87),
+    // and partial close fees (0.02) remain on the OPEN row until szi reaches 0; zero CLOSED rows exist.
+    assert!((met_open.funding_accrued_usdc - 665.57).abs() < 1e-2);
+    assert!((met_open.realized_pnl_usdc - (-0.87)).abs() < 1e-4);
+    assert!((met_open.fees_paid_usdc - 0.02).abs() < 1e-4);
 
     let closed = db.list_closed_positions(10).unwrap();
-    let met_closed = closed
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-met-9002")
-        .expect("MET partial close trade");
-    assert!((met_closed.funding_accrued_usdc - 1.38).abs() < 1e-2);
     assert!(
-        ((met_closed.funding_accrued_usdc + met_open.funding_accrued_usdc) - 665.57).abs() < 1e-2
+        closed
+            .iter()
+            .all(|p| p.client_order_id != "hl-closed-met-9002"),
+        "W3: partial close on active OPEN epoch must NOT insert a CLOSED hl-closed-* row"
     );
 
     let evs = db.list_funding_events_for_asset(met_id).unwrap();
@@ -3797,12 +3799,9 @@ fn test_reconcile_met_partial_close_pro_rata_funding_and_daily_pnl_window() {
     let rem_sum: f64 = evs.iter().map(|e| e.remaining_usdc).sum();
     assert!((rem_sum - met_open.funding_accrued_usdc).abs() < 1e-2);
 
-    // Daily (24H) reflects ONLY the in-window open funding (165.57 * 9634/9654 ≈ 165.23) + closed (1.38 - 0.02) ≈ 166.59,
-    // NEVER leaking the pre-24h 500.00 tick and NEVER double-counting closed 1.38.
+    // Daily (24H) reflects ONLY the in-window open funding (165.57), NEVER leaking the pre-24h 500.00 tick.
     let pnl = db.compute_pnl_summary(0.0, 0.0, 5000.0).unwrap();
-    let expected_daily_open_rem = 165.57 * (9634.0 / 9654.0);
-    let expected_daily_fees_funding =
-        expected_daily_open_rem + met_closed.funding_accrued_usdc - 0.02;
+    let expected_daily_fees_funding = 165.57;
     assert!(
         (pnl.daily.fees_funding_usdc - expected_daily_fees_funding).abs() < 0.05,
         "daily.fees_funding_usdc={} expected={}",
@@ -3888,33 +3887,26 @@ fn test_reconcile_multi_partial_close_funding_conservation() {
     engine.aux_sync.sync_startup_before_reconcile();
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
 
-    // P1-Acct: partial IOC slices within the same position lifetime share close_epoch_id = "ETH:1"
-    // and aggregate cleanly into one closed trade row (c1 20.0 + c2 45.0 = 65.0 funding, 50.0 qty).
+    // W3 Single Booking Rule: while ETH remains OPEN (szi=50.0), zero CLOSED `hl-closed-*` rows
+    // are inserted and 100% of open-epoch funding (+140.0) stays on OPEN + funding_events.
     let closed = db.list_closed_positions(10).unwrap();
-    let c_merged = closed
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-eth-102")
-        .expect("merged close_epoch_id closed trade");
     assert!(
         closed
             .iter()
-            .all(|p| p.client_order_id != "hl-closed-eth-101"),
-        "partial IOC slice hl-closed-eth-101 must aggregate into hl-closed-eth-102 via close_epoch_id"
+            .all(|p| !p.client_order_id.starts_with("hl-closed-eth-")),
+        "W3: partial IOC slices on still-open position must NOT create CLOSED rows"
     );
-    assert!((c_merged.filled_quantity - 50.0).abs() < 1e-6);
-    assert!((c_merged.funding_accrued_usdc - 65.0).abs() < 1e-4);
 
     let held = db.get_assets_held().unwrap();
     assert_eq!(held.len(), 1);
     let open = &held[0];
-    assert!((open.funding_accrued_usdc - 75.0).abs() < 1e-4);
-    assert!(((c_merged.funding_accrued_usdc + open.funding_accrued_usdc) - 140.0).abs() < 1e-4);
+    assert!((open.funding_accrued_usdc - 140.0).abs() < 1e-4);
 
     let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
     let evs = db.list_funding_events_for_asset(eth_id).unwrap();
     assert_eq!(evs.len(), 2);
-    assert!((evs[0].remaining_usdc - 50.0).abs() < 1e-6);
-    assert!((evs[1].remaining_usdc - 25.0).abs() < 1e-6);
+    assert!((evs[0].remaining_usdc - 100.0).abs() < 1e-6);
+    assert!((evs[1].remaining_usdc - 40.0).abs() < 1e-6);
 }
 
 #[test]
@@ -3995,31 +3987,37 @@ fn test_reconcile_prehistory_start_position_partial_close() {
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
 
     let closed = db.list_closed_positions(10).unwrap();
-    let sol_closed = closed
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-sol-3001")
-        .expect("SOL pre-history partial close");
-    assert!((sol_closed.funding_accrued_usdc - 0.20).abs() < 1e-4);
+    assert!(
+        closed
+            .iter()
+            .all(|p| p.client_order_id != "hl-closed-sol-3001"),
+        "W3: pre-history partial close on still-OPEN SOL must stay on OPEN row"
+    );
 
     let held = db.get_assets_held().unwrap();
     assert_eq!(held.len(), 1);
-    assert!((held[0].funding_accrued_usdc - 96.34).abs() < 1e-4);
+    assert!((held[0].funding_accrued_usdc - 96.54).abs() < 1e-4);
+    assert!((held[0].fees_paid_usdc - 0.02).abs() < 1e-4);
+    assert!((held[0].realized_pnl_usdc - (-0.02)).abs() < 1e-4);
 
     // Second reconcile must remain idempotent even when DB stored opened_at_ms >= first_fill.time_ms
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
     let closed_2 = db.list_closed_positions(10).unwrap();
-    let sol_closed_2 = closed_2
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-sol-3001")
-        .expect("SOL pre-history partial close on second reconcile");
-    assert!((sol_closed_2.funding_accrued_usdc - 0.20).abs() < 1e-4);
+    assert!(
+        closed_2
+            .iter()
+            .all(|p| p.client_order_id != "hl-closed-sol-3001"),
+        "W3: second reconcile must still keep 0 phantom CLOSED rows while SOL is OPEN"
+    );
     let held_2 = db.get_assets_held().unwrap();
     assert_eq!(held_2.len(), 1);
-    assert!((held_2[0].funding_accrued_usdc - 96.34).abs() < 1e-4);
+    assert!((held_2[0].funding_accrued_usdc - 96.54).abs() < 1e-4);
+    assert!((held_2[0].fees_paid_usdc - 0.02).abs() < 1e-4);
+    assert!((held_2[0].realized_pnl_usdc - (-0.02)).abs() < 1e-4);
     let sol_id = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap().id;
     let sol_evs = db.list_funding_events_for_asset(sol_id).unwrap();
     assert_eq!(sol_evs.len(), 1);
-    assert!((sol_evs[0].remaining_usdc - 96.34).abs() < 1e-4);
+    assert!((sol_evs[0].remaining_usdc - 96.54).abs() < 1e-4);
 }
 
 #[test]
@@ -4091,40 +4089,36 @@ fn test_reconcile_user_funding_429_does_not_clobber_reconciled_funding() {
     seed_test_assets(&db);
     configure_testnet_mock_db(&db, server.port());
 
-    // 1. Initial aux funding backfill + reconcile succeeds and books +20.0 closed + +80.0 open
+    // 1. Initial aux funding backfill + reconcile succeeds and keeps full +100.0 on OPEN ETH (W3 Single Booking Rule)
     engine.aux_sync.sync_startup_before_reconcile();
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
     let closed1 = db.list_closed_positions(10).unwrap();
-    let eth_c1 = closed1
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-eth-5002")
-        .unwrap();
-    assert!((eth_c1.funding_accrued_usdc - 20.0).abs() < 1e-4);
-    assert!((db.get_assets_held().unwrap()[0].funding_accrued_usdc - 80.0).abs() < 1e-4);
+    assert!(
+        closed1
+            .iter()
+            .all(|p| p.client_order_id != "hl-closed-eth-5002"),
+        "W3: partial close on active OPEN ETH must NOT emit a CLOSED row"
+    );
+    assert!((db.get_assets_held().unwrap()[0].funding_accrued_usdc - 100.0).abs() < 1e-4);
     let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
     assert_eq!(db.list_funding_events_for_asset(eth_id).unwrap().len(), 1);
 
-    // 2. Subsequent aux sync + reconcile hits HTTP 429 on userFunding -> must NOT zero closed trade or double-count open position
+    // 2. Subsequent aux sync + reconcile hits HTTP 429 on userFunding -> must preserve +100.0 on OPEN ETH & funding_events
     fail_funding.store(true, Ordering::SeqCst);
     engine.aux_sync.run_once(false);
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
 
     let closed2 = db.list_closed_positions(10).unwrap();
-    let eth_c2 = closed2
+    assert!(closed2
         .iter()
-        .find(|p| p.client_order_id == "hl-closed-eth-5002")
-        .unwrap();
+        .all(|p| p.client_order_id != "hl-closed-eth-5002"));
     assert!(
-        (eth_c2.funding_accrued_usdc - 20.0).abs() < 1e-4,
-        "429 must not clobber closed trade funding to 0.0"
-    );
-    assert!(
-        (db.get_assets_held().unwrap()[0].funding_accrued_usdc - 80.0).abs() < 1e-4,
-        "429 must not overwrite open position funding to 100.0"
+        (db.get_assets_held().unwrap()[0].funding_accrued_usdc - 100.0).abs() < 1e-4,
+        "429 must preserve full +100.0 open-epoch funding on OPEN ETH"
     );
     let evs_after = db.list_funding_events_for_asset(eth_id).unwrap();
     assert_eq!(evs_after.len(), 1);
-    assert!((evs_after[0].remaining_usdc - 80.0).abs() < 1e-6);
+    assert!((evs_after[0].remaining_usdc - 100.0).abs() < 1e-6);
 }
 
 #[test]
@@ -4417,32 +4411,34 @@ fn test_reconcile_multi_lot_dca_partial_close_funding_conservation_and_pnl() {
     engine.aux_sync.sync_startup_before_reconcile();
     engine.reconciler.run_cutover_reconciliation(false).unwrap();
 
-    // Lot 1 (100) accrued E1 = +100.0, Lot 2 (300) accrued 0.0.
-    // Partial close 100 closes all of Lot 1 -> closed books +100.0, open has 0.0, E1 remaining_usdc == 0.0.
+    // W3 Single Booking Rule: while ETH remains OPEN (300.0 left), Lot 1's +100.0 funding stays
+    // on the active OPEN row and in funding_events.remaining_usdc, with 0 phantom CLOSED rows.
     let closed = db.list_closed_positions(10).unwrap();
-    let eth_c = closed
-        .iter()
-        .find(|p| p.client_order_id == "hl-closed-eth-6003")
-        .expect("DCA Lot 1 close trade");
-    assert!((eth_c.funding_accrued_usdc - 100.0).abs() < 1e-4);
+    assert!(
+        closed
+            .iter()
+            .all(|p| p.client_order_id != "hl-closed-eth-6003"),
+        "W3: partial close on active DCA position must NOT insert a CLOSED row"
+    );
 
     let held = db.get_assets_held().unwrap();
     assert_eq!(held.len(), 1);
-    assert!((held[0].funding_accrued_usdc - 0.0).abs() < 1e-4);
+    assert!((held[0].funding_accrued_usdc - 100.0).abs() < 1e-4);
 
     let eth_id = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap().id;
     let evs = db.list_funding_events_for_asset(eth_id).unwrap();
     assert_eq!(evs.len(), 1);
-    assert!((evs[0].remaining_usdc - 0.0).abs() < 1e-6);
+    assert!((evs[0].remaining_usdc - 100.0).abs() < 1e-6);
 
-    // Weekly (7D) must report exactly +100.00 (no +75.00 double-count from uniform keep_ratio).
+    // Weekly (7D) must report +100.00 (`t_fund_e1` = 48h ago), while Daily (24H) is 0.00
+    // because no phantom CLOSED row at `t_close_1` (12h ago) drags 48h-old funding into 24H.
     let pnl = db.compute_pnl_summary(0.0, 0.0, 5000.0).unwrap();
     assert!(
         (pnl.weekly.fees_funding_usdc - 100.0).abs() < 1e-2,
         "weekly.fees_funding_usdc={} expected=100.0",
         pnl.weekly.fees_funding_usdc
     );
-    assert!((pnl.daily.fees_funding_usdc - 100.0).abs() < 1e-2);
+    assert!((pnl.daily.fees_funding_usdc - 0.0).abs() < 1e-2);
 }
 
 #[test]
