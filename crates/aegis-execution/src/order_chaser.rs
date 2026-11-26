@@ -379,6 +379,7 @@ pub struct OrderChaser {
     working_initial_limits: Arc<Mutex<HashMap<i64, f64>>>,
     working_entry_urgencies: Arc<Mutex<HashMap<i64, EntryUrgency>>>,
     asset_failure_counters: Arc<Mutex<HashMap<i64, AssetFailureCounters>>>,
+    scale_in_anchors: Arc<Mutex<HashMap<i64, (f64, i64)>>>,
     alert_wakeup_tx: Option<SyncSender<usize>>,
     ws_cache: Option<Arc<WsStateCache>>,
 }
@@ -392,9 +393,31 @@ impl OrderChaser {
             working_initial_limits: Arc::new(Mutex::new(HashMap::new())),
             working_entry_urgencies: Arc::new(Mutex::new(HashMap::new())),
             asset_failure_counters: Arc::new(Mutex::new(HashMap::new())),
+            scale_in_anchors: Arc::new(Mutex::new(HashMap::new())),
             alert_wakeup_tx: None,
             ws_cache: None,
         }
+    }
+
+    /// Returns the latest in-memory `(fill_price, ts_ms)` recorded when a `WORKING` scale-in merged into `open_position_id` (`R14-W2`).
+    pub fn latest_scale_in_anchor(&self, open_position_id: i64) -> Option<(f64, i64)> {
+        self.scale_in_anchors.lock().get(&open_position_id).copied()
+    }
+
+    /// Records a merged scale-in fill anchor `(fill_price, ts_ms)` for `open_position_id` (`R14-W2`).
+    pub fn record_scale_in_anchor(&self, open_position_id: i64, fill_px: f64, ts_ms: i64) {
+        if fill_px.is_finite() && fill_px > 0.0 {
+            self.scale_in_anchors
+                .lock()
+                .insert(open_position_id, (fill_px, ts_ms));
+        }
+    }
+
+    /// Prunes cached `scale_in_anchors` to currently `OPEN` position IDs (`R14-W2`).
+    pub fn prune_scale_in_anchors(&self, active_open_ids: &HashSet<i64>) {
+        self.scale_in_anchors
+            .lock()
+            .retain(|pid, _| active_open_ids.contains(pid));
     }
 
     /// Attaches an optional bounded wakeup sender for non-blocking background alert dispatch (`R14-L5`).
@@ -512,9 +535,10 @@ impl OrderChaser {
     ) -> Result<()> {
         let risk = RiskEngine::from_config_map(cfg);
         let eff_equity = crate::engine::resolve_effective_base_equity_usdc_for_db(&self.db, cfg);
-        let (held, stored_stop) = {
+        let (held, ordered_all, stored_stop) = {
             let _guard = acquire_execution_lock();
             let h = self.db.get_assets_held()?;
+            let o = self.db.get_assets_ordered().unwrap_or_default();
             let s = self
                 .db
                 .get_position_by_id(ordered.position_id)
@@ -522,25 +546,16 @@ impl OrderChaser {
                 .flatten()
                 .map(|p| p.protective_stop_px)
                 .unwrap_or(0.0);
-            (h, s)
+            (h, o, s)
         };
-        let mut open_notional: f64 = 0.0;
-        let mut open_stop_risk: f64 = 0.0;
-        for h in &held {
-            let notional =
-                if h.committed_notional_usdc.is_finite() && h.committed_notional_usdc > 0.0 {
-                    h.committed_notional_usdc
-                } else {
-                    (h.entry_price * h.quantity).abs()
-                };
-            open_notional += notional;
-            let risk_per_unit = if h.protective_stop_px > 0.0 {
-                (h.entry_price - h.protective_stop_px).abs()
-            } else {
-                h.entry_price * risk.limits.protective_stop_default_pct
-            };
-            open_stop_risk += risk_per_unit * h.quantity;
-        }
+        let exp = crate::engine::compute_active_exposure_and_heat_with_db(
+            Some(&self.db),
+            &held,
+            &ordered_all,
+            cfg.target_leverage_multiplier(),
+            risk.limits.protective_stop_default_pct,
+            Some(ordered.position_id),
+        );
         let est_fill_px = if live_mid.is_finite() && live_mid > 0.0 {
             live_mid
         } else {
@@ -568,8 +583,8 @@ impl OrderChaser {
         let prosp_stop_risk = (est_fill_px - prosp_stop_px).abs() * prosp_qty;
         risk.check_portfolio_heat_and_gross_at_fill(
             eff_equity,
-            open_notional + prosp_notional,
-            open_stop_risk + prosp_stop_risk,
+            exp.total_gross_notional_usdc + prosp_notional,
+            exp.total_stop_risk_usdc + prosp_stop_risk,
         )
     }
 
@@ -716,7 +731,7 @@ impl OrderChaser {
     /// Places a new `WORKING` (`WORKING_ALO`) order, reserving `reserved_margin_usdc`
     /// without deducting `committed_notional_usdc` yet, and enqueues a non-blocking HTML alert.
     pub fn place_working_order(&self, req: &NewWorkingOrderRequest) -> Result<i64> {
-        let (cfg, ccfg, is_live_exchange, ref_mid, tick, qty, limits) = {
+        let (cfg, ccfg, is_live_exchange, ref_mid, tick, qty, limits, scale_in_open_pos) = {
             let _guard = acquire_execution_lock();
             if self.db.is_asset_in_cooldown(req.asset.id)? {
                 return Err(AegisError::Validation(format!(
@@ -725,7 +740,7 @@ impl OrderChaser {
                 )));
             }
             let active_rows = self.db.list_active_positions_for_asset(req.asset.id)?;
-            if req.is_scale_in {
+            let scale_in_open_pos = if req.is_scale_in {
                 let valid_open = active_rows.len() == 1
                     && PositionStatus::parse(&active_rows[0].status) == PositionStatus::Open
                     && OrderSide::parse(&active_rows[0].side).ok() == Some(req.side);
@@ -735,12 +750,16 @@ impl OrderChaser {
                         req.asset.symbol
                     )));
                 }
-            } else if let Some(existing) = active_rows.first() {
-                return Err(AegisError::Validation(format!(
-                    "Asset '{}' already has active position #{} (status={})",
-                    req.asset.symbol, existing.id, existing.status
-                )));
-            }
+                Some(active_rows[0].clone())
+            } else {
+                if let Some(existing) = active_rows.first() {
+                    return Err(AegisError::Validation(format!(
+                        "Asset '{}' already has active position #{} (status={})",
+                        req.asset.symbol, existing.id, existing.status
+                    )));
+                }
+                None
+            };
 
             let cfg = self.db.load_config()?;
             let ccfg = ChaserConfig::from_config(&cfg);
@@ -806,7 +825,16 @@ impl OrderChaser {
 
             let limits = RiskLimitsConfig::from_config_map(&cfg);
             let is_live_exchange = crate::engine::is_live_exchange_active(&self.db, &cfg);
-            (cfg, ccfg, is_live_exchange, ref_mid, tick, qty, limits)
+            (
+                cfg,
+                ccfg,
+                is_live_exchange,
+                ref_mid,
+                tick,
+                qty,
+                limits,
+                scale_in_open_pos,
+            )
         };
 
         let atr_opt = crate::engine::resolve_signal_matched_atr_unlocked(
@@ -818,6 +846,11 @@ impl OrderChaser {
             ref_mid,
             limits.protective_stop_default_pct,
         );
+        if let Some(ref open_pos) = scale_in_open_pos {
+            crate::engine::check_scale_in_spacing_for_open_position(
+                &self.db, self, open_pos, ref_mid, atr_opt, &cfg,
+            )?;
+        }
         let stop_px = if req.protective_stop_px.is_finite() && req.protective_stop_px > 0.0 {
             snap_to_tick(req.protective_stop_px, tick)
         } else {
@@ -3104,6 +3137,7 @@ impl OrderChaser {
                     exchange_order_id,
                     reason,
                 )?;
+                self.record_scale_in_anchor(open_pos.id, fill_price, now_ms());
                 self.working_initial_limits.lock().remove(&position_id);
                 self.working_entry_urgencies.lock().remove(&position_id);
                 let merged = self.db.get_position_by_id(open_pos.id)?.ok_or_else(|| {
@@ -3189,23 +3223,17 @@ impl OrderChaser {
         let eff_equity = crate::engine::resolve_effective_base_equity_usdc_for_db(&self.db, cfg);
         let _guard = acquire_execution_lock();
         if let Ok(held_after) = self.db.get_assets_held() {
-            let mut open_notional = 0.0;
-            let mut open_stop_risk = 0.0;
-            for h in &held_after {
-                let notional =
-                    if h.committed_notional_usdc.is_finite() && h.committed_notional_usdc > 0.0 {
-                        h.committed_notional_usdc
-                    } else {
-                        (h.entry_price * h.quantity).abs()
-                    };
-                open_notional += notional;
-                let risk_per_unit = if h.protective_stop_px > 0.0 {
-                    (h.entry_price - h.protective_stop_px).abs()
-                } else {
-                    h.entry_price * limits.protective_stop_default_pct
-                };
-                open_stop_risk += risk_per_unit * h.quantity;
-            }
+            let ordered_after = self.db.get_assets_ordered().unwrap_or_default();
+            let exp = crate::engine::compute_active_exposure_and_heat_with_db(
+                Some(&self.db),
+                &held_after,
+                &ordered_after,
+                cfg.target_leverage_multiplier(),
+                limits.protective_stop_default_pct,
+                None,
+            );
+            let open_notional = exp.total_gross_notional_usdc;
+            let open_stop_risk = exp.total_stop_risk_usdc;
             let risk = RiskEngine::from_config_map(cfg);
             if let Err(breach_err) = risk.check_portfolio_heat_and_gross_at_fill(
                 eff_equity,

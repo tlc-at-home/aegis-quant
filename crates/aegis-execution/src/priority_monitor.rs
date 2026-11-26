@@ -9,14 +9,14 @@
 //!    widened `userFillsByTime` lookup (`R14-M4`), and batched 39-action TP/SL synchronization (`Sec. 11`).
 
 use crate::close_ladder::{
-    place_passive_reduce_only_close_order, submit_reduce_only_close_ladder, CloseUrgency,
-    PassiveClosePlacement, PassiveCloseTracker, PendingPassiveClose, ReduceOnlyCloseLadderRequest,
-    DEFAULT_PASSIVE_CLOSE_REST_SEC,
+    place_passive_reduce_only_close_order, reprice_passive_reduce_only_close_order,
+    submit_reduce_only_close_ladder, CloseUrgency, PassiveClosePlacement, PassiveCloseTracker,
+    PendingPassiveClose, ReduceOnlyCloseLadderRequest, DEFAULT_PASSIVE_CLOSE_REST_SEC,
 };
 use crate::http_client::HyperliquidHttpClient;
 use crate::lock_guard::acquire_execution_lock;
 use crate::order_chaser::{parse_hl_oid, ChaseStepOutcome, OrderChaser};
-use crate::signing::CancelWire;
+use crate::signing::{snap_to_lot, CancelWire};
 use crate::tpsl_sync::{sync_tpsl_batch_for_positions, TpslSyncRequest};
 use crate::ws_client::WsStateCache;
 use aegis_alerts::{format_position_closed_html, AlertEngine, PositionClosedAlert};
@@ -689,13 +689,8 @@ impl PriorityMonitor {
                         .clone()
                         .unwrap_or_else(|| "PROTECTIVE_STOP_BREACH".to_string());
                     let is_stop_breach = exit_reason.starts_with("PROTECTIVE_STOP");
-                    let emergency_gap = is_stop_breach
-                        && h.protective_stop_px > 0.0
-                        && (((h.protective_stop_px - surveillance_ref_px) * side.sign())
-                            / h.protective_stop_px)
-                            > emergency_ioc_breach_pct;
                     let urgency =
-                        if !is_live_exchange || passive_close_rest_sec == 0 || emergency_gap {
+                        if !is_live_exchange || passive_close_rest_sec == 0 || is_stop_breach {
                             CloseUrgency::ImmediateIoc
                         } else {
                             CloseUrgency::PassiveFirst
@@ -904,6 +899,7 @@ impl PriorityMonitor {
             .lock()
             .retain(|pid, _| active_open_ids.contains(pid));
         self.passive_closes.prune_to_active(&active_open_ids);
+        self.chaser.prune_scale_in_anchors(&active_open_ids);
         self.chaser.prune_tracking_maps(&active_working_ids);
 
         self.update_surveillance_health_and_persist(
@@ -1102,6 +1098,33 @@ impl PriorityMonitor {
         }
     }
 
+    fn cancel_holding_tpsl_triggers(
+        &self,
+        held: &HeldAssetView,
+        asset: &ExchangeAsset,
+        pk: &str,
+        cfg: &ConfigMap,
+    ) {
+        let mut cancels = Vec::new();
+        if let Some(oid) = parse_hl_oid(held.protective_stop_oid.as_deref()) {
+            cancels.push(CancelWire {
+                a: asset.asset_index,
+                o: oid,
+            });
+        }
+        if let Some(oid) = parse_hl_oid(held.take_profit_oid.as_deref()) {
+            cancels.push(CancelWire {
+                a: asset.asset_index,
+                o: oid,
+            });
+        }
+        if !cancels.is_empty() {
+            let _ = self
+                .http
+                .cancel_orders_batch(cancels, pk, Some(&self.db), cfg);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_pending_passive_close(
         &self,
@@ -1135,69 +1158,150 @@ impl PriorityMonitor {
 
         let live_szi = Self::extract_coin_szi(&ch_state, &held.coin);
         let lot = asset_opt.map(|a| a.lot_step_size).unwrap_or(0.01).max(1e-8);
+        let sz_dec = asset_opt.map(|a| a.sz_decimals).unwrap_or(2);
+        let maker_fee_bps = risk.limits.maker_fee_bps;
 
-        // 1. Resting passive maker order completely filled!
+        // 1. Resting passive maker order completely flattened exchange position!
         if live_szi.abs() <= 1e-9 || live_szi.abs() <= lot * 0.5 {
             self.passive_closes.remove(held.position_id);
-            let (eff_exit_price, fees_paid_usdc, live_close_oid) =
-                self.resolve_exchange_flat_fill_details(held, side, pending.limit_px, risk, cfg);
+            if let Some(asset) = asset_opt {
+                self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
+            }
+            let (eff_exit_price, fees_paid_usdc, live_close_oid) = self
+                .resolve_exchange_flat_fill_details(
+                    held,
+                    side,
+                    pending.limit_px,
+                    maker_fee_bps,
+                    cfg,
+                );
             return self
-                .commit_closed_position(
+                .commit_closed_position_with_cooldown(
                     held,
                     side,
                     eff_exit_price,
                     fees_paid_usdc,
                     &pending.exit_reason,
                     live_close_oid.as_deref(),
+                    pending.cooldown_sec_override,
                     risk,
                 )
                 .map(|opt| opt.is_some());
         }
 
-        // 2. Partial maker fill -> immediately persist remainder (`R14-M3`)
+        // 2. Partial (or full-slice of partial_reduce) maker fill -> persist immediately & re-sync SL/TP (`R14-M3`, `R14-W2`)
         let live_abs = live_szi.abs();
-        if live_abs + lot * 0.5 < pending.initial_qty {
-            let closed_qty = (pending.initial_qty - live_abs).max(0.0);
+        let base_open_qty = if pending.last_open_abs_qty > 1e-9 {
+            pending.last_open_abs_qty
+        } else if !pending.is_partial_reduce {
+            pending.initial_qty
+        } else {
+            held.quantity
+        };
+        if live_abs + lot * 0.5 < base_open_qty {
+            let raw_delta = (base_open_qty - live_abs).max(0.0);
+            let closed_qty = if pending.is_partial_reduce {
+                raw_delta.min(pending.initial_qty)
+            } else {
+                raw_delta
+            };
             if closed_qty > 1e-9 {
-                let partial_fee = round_dp(
-                    pending.limit_px * closed_qty * (risk.limits.maker_fee_bps / 10_000.0),
-                    4,
+                let (fill_px, partial_fee, _eoid) = self.resolve_recent_closing_fill_slice(
+                    &held.coin,
+                    side,
+                    pending.placed_at_ms.saturating_sub(5_000),
+                    closed_qty,
+                    pending.limit_px,
+                    maker_fee_bps,
+                    cfg,
                 );
-                let _guard = acquire_execution_lock();
-                if self
-                    .db
-                    .get_position_by_id(held.position_id)?
-                    .is_some_and(|p| p.status.eq_ignore_ascii_case("OPEN"))
+                let rem_target = (pending.initial_qty - closed_qty).max(0.0);
+                let target_done =
+                    pending.is_partial_reduce && (rem_target <= lot * 0.5 || rem_target <= 1e-9);
                 {
-                    let _ = self.db.record_partial_position_exit(
+                    let _guard = acquire_execution_lock();
+                    if self
+                        .db
+                        .get_position_by_id(held.position_id)?
+                        .is_some_and(|p| p.status.eq_ignore_ascii_case("OPEN"))
+                    {
+                        let _ = self.db.record_partial_position_exit(
+                            held.position_id,
+                            closed_qty,
+                            live_abs,
+                            fill_px,
+                            partial_fee,
+                            &pending.exit_reason,
+                        );
+                    }
+                    if target_done {
+                        let cd_sec = pending.cooldown_sec_override.unwrap_or(120);
+                        if cd_sec > 0 {
+                            let _ = self.db.insert_asset_cooldown(
+                                held.asset_id,
+                                "PARTIAL_REDUCE_GUARD",
+                                &format!(
+                                    "Passive maker partial reduce cooldown guard for position #{}",
+                                    held.position_id
+                                ),
+                                cd_sec,
+                            );
+                        }
+                    }
+                }
+                if let Some(asset) = asset_opt {
+                    let _ = self.chaser.ensure_exchange_tpsl_orders(
                         held.position_id,
-                        closed_qty,
+                        asset,
+                        side,
                         live_abs,
-                        pending.limit_px,
-                        partial_fee,
-                        &pending.exit_reason,
+                        fill_px,
+                        held.protective_stop_px,
+                        held.take_profit_px,
+                        held.protective_stop_oid.as_deref(),
+                        held.take_profit_oid.as_deref(),
+                        true,
+                        true,
+                        None,
+                        cfg,
                     );
                 }
+                if target_done {
+                    if let (Some(asset), Some(oid)) = (asset_opt, pending.oid) {
+                        let _ = self.http.cancel_orders_batch(
+                            vec![CancelWire {
+                                a: asset.asset_index,
+                                o: oid,
+                            }],
+                            &pk,
+                            Some(&self.db),
+                            cfg,
+                        );
+                    }
+                    self.passive_closes.remove(held.position_id);
+                    return Ok(false);
+                }
                 self.passive_closes
-                    .update_initial_qty(held.position_id, live_abs);
+                    .record_partial_fill(held.position_id, rem_target, live_abs);
             }
         }
 
-        // 3. Check expiry or emergency stop gap escalation
+        // 3. Urgent protective-stop breach override: immediately cancel resting passive order & IOC flatten!
         let elapsed_ms = now_ms().saturating_sub(pending.placed_at_ms);
+        let stop_breached = held.protective_stop_px > 0.0
+            && ((held.protective_stop_px - surveillance_ref_px) * side.sign()) >= 0.0;
         let emergency_gap = !pending.is_tp
             && held.protective_stop_px > 0.0
             && (((held.protective_stop_px - surveillance_ref_px) * side.sign())
                 / held.protective_stop_px)
                 > emergency_ioc_breach_pct;
 
-        if elapsed_ms < passive_close_rest_sec * 1000 && !emergency_gap {
-            return Ok(false);
-        }
-
-        // Escalate: cancel resting passive order, re-verify live_szi, then run ImmediateIoc close ladder!
-        if let Some(asset) = asset_opt {
-            if let Some(oid) = pending.oid {
+        if stop_breached || emergency_gap {
+            let pending_cur = self
+                .passive_closes
+                .remove(held.position_id)
+                .unwrap_or_else(|| pending.clone());
+            if let (Some(asset), Some(oid)) = (asset_opt, pending_cur.oid) {
                 let _ = self.http.cancel_orders_batch(
                     vec![CancelWire {
                         a: asset.asset_index,
@@ -1208,8 +1312,191 @@ impl PriorityMonitor {
                     cfg,
                 );
             }
+            let fresh_ch = self
+                .ws_cache
+                .as_ref()
+                .and_then(|c| c.get_fresh_clearinghouse_state())
+                .or_else(|| self.http.fetch_clearinghouse_state(&wallet, cfg).ok())
+                .unwrap_or(ch_state);
+            let stop_reason = if side == OrderSide::Long {
+                "PROTECTIVE_STOP_LONG"
+            } else {
+                "PROTECTIVE_STOP_SHORT"
+            };
+            return self
+                .execute_exit_with_urgency_and_cooldown(
+                    held,
+                    asset_opt,
+                    side,
+                    surveillance_ref_px,
+                    stop_reason,
+                    CloseUrgency::ImmediateIoc,
+                    Some(&fresh_ch),
+                    None,
+                    risk,
+                    cfg,
+                )
+                .map(|opt| opt.is_some());
         }
-        self.passive_closes.remove(held.position_id);
+
+        // 4. Within rest window -> reprice passive ALO order if BBO drifted moderately (`R14-W2`)
+        if elapsed_ms < passive_close_rest_sec * 1000 {
+            if let Some(asset) = asset_opt {
+                let pending_cur = self
+                    .passive_closes
+                    .get(held.position_id)
+                    .unwrap_or_else(|| pending.clone());
+                let l2_bbo = self
+                    .ws_cache
+                    .as_ref()
+                    .and_then(|c| c.get_fresh_l2_bbo(&asset.coin))
+                    .or_else(|| self.http.fetch_l2_book(&asset.coin, cfg).ok().flatten());
+                let max_drift_bps = cfg
+                    .get_f64("max_alo_chase_drift_bps", 35.0)
+                    .clamp(1.0, 500.0);
+                if let Ok(Some(reprice_res)) = reprice_passive_reduce_only_close_order(
+                    &self.http,
+                    Some(&self.db),
+                    &pk,
+                    cfg,
+                    asset,
+                    &pending_cur,
+                    side == OrderSide::Short,
+                    surveillance_ref_px,
+                    l2_bbo,
+                    maker_fee_bps,
+                    max_drift_bps,
+                ) {
+                    match reprice_res {
+                        PassiveClosePlacement::Resting {
+                            oid,
+                            eoid,
+                            cloid,
+                            limit_px,
+                        } => {
+                            self.passive_closes.update_reprice(
+                                held.position_id,
+                                oid,
+                                eoid,
+                                cloid,
+                                limit_px,
+                            );
+                        }
+                        PassiveClosePlacement::Filled {
+                            fill_px,
+                            filled_qty,
+                            fee_usdc,
+                            eoid,
+                        } => {
+                            let cur_open_abs = if pending_cur.last_open_abs_qty > 1e-9 {
+                                pending_cur.last_open_abs_qty
+                            } else {
+                                live_abs
+                            };
+                            let new_open_abs = snap_to_lot(
+                                (cur_open_abs - filled_qty).max(0.0),
+                                lot,
+                                sz_dec,
+                                true,
+                            );
+                            if new_open_abs <= lot * 0.5 || new_open_abs <= 1e-9 {
+                                self.passive_closes.remove(held.position_id);
+                                self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
+                                return self
+                                    .commit_closed_position_with_cooldown(
+                                        held,
+                                        side,
+                                        fill_px,
+                                        round_dp(fee_usdc, 4),
+                                        &pending_cur.exit_reason,
+                                        eoid.as_deref(),
+                                        pending_cur.cooldown_sec_override,
+                                        risk,
+                                    )
+                                    .map(|opt| opt.is_some());
+                            }
+                            let rem_target = (pending_cur.initial_qty - filled_qty).max(0.0);
+                            let target_done = pending_cur.is_partial_reduce
+                                && (rem_target <= lot * 0.5 || rem_target <= 1e-9);
+                            {
+                                let _guard = acquire_execution_lock();
+                                if self
+                                    .db
+                                    .get_position_by_id(held.position_id)?
+                                    .is_some_and(|p| p.status.eq_ignore_ascii_case("OPEN"))
+                                {
+                                    let _ = self.db.record_partial_position_exit(
+                                        held.position_id,
+                                        filled_qty,
+                                        new_open_abs,
+                                        fill_px,
+                                        round_dp(fee_usdc, 4),
+                                        &pending_cur.exit_reason,
+                                    );
+                                }
+                                if target_done {
+                                    let cd_sec = pending_cur.cooldown_sec_override.unwrap_or(120);
+                                    if cd_sec > 0 {
+                                        let _ = self.db.insert_asset_cooldown(
+                                            held.asset_id,
+                                            "PARTIAL_REDUCE_GUARD",
+                                            &format!(
+                                                "Passive maker partial reduce cooldown guard for position #{}",
+                                                held.position_id
+                                            ),
+                                            cd_sec,
+                                        );
+                                    }
+                                }
+                            }
+                            let _ = self.chaser.ensure_exchange_tpsl_orders(
+                                held.position_id,
+                                asset,
+                                side,
+                                new_open_abs,
+                                fill_px,
+                                held.protective_stop_px,
+                                held.take_profit_px,
+                                held.protective_stop_oid.as_deref(),
+                                held.take_profit_oid.as_deref(),
+                                true,
+                                true,
+                                None,
+                                cfg,
+                            );
+                            if target_done {
+                                self.passive_closes.remove(held.position_id);
+                            } else {
+                                self.passive_closes.record_partial_fill(
+                                    held.position_id,
+                                    rem_target,
+                                    new_open_abs,
+                                );
+                            }
+                        }
+                        PassiveClosePlacement::Rejected(_) => {}
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        // 5. Timeout reached (`elapsed_ms >= passive_close_rest_sec * 1000`): cancel passive ALO & escalate to IOC!
+        let pending_cur = self
+            .passive_closes
+            .remove(held.position_id)
+            .unwrap_or_else(|| pending.clone());
+        if let (Some(asset), Some(oid)) = (asset_opt, pending_cur.oid) {
+            let _ = self.http.cancel_orders_batch(
+                vec![CancelWire {
+                    a: asset.asset_index,
+                    o: oid,
+                }],
+                &pk,
+                Some(&self.db),
+                cfg,
+            );
+        }
 
         let fresh_ch = self
             .ws_cache
@@ -1217,14 +1504,232 @@ impl PriorityMonitor {
             .and_then(|c| c.get_fresh_clearinghouse_state())
             .or_else(|| self.http.fetch_clearinghouse_state(&wallet, cfg).ok())
             .unwrap_or(ch_state);
-        self.execute_exit_with_urgency(
+        let fresh_szi = Self::extract_coin_szi(&fresh_ch, &held.coin);
+        let fresh_abs = fresh_szi.abs();
+
+        if fresh_abs <= 1e-9 || fresh_abs <= lot * 0.5 {
+            if let Some(asset) = asset_opt {
+                self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
+            }
+            let (eff_exit_price, fees_paid_usdc, live_close_oid) = self
+                .resolve_exchange_flat_fill_details(
+                    held,
+                    side,
+                    pending_cur.limit_px,
+                    maker_fee_bps,
+                    cfg,
+                );
+            return self
+                .commit_closed_position_with_cooldown(
+                    held,
+                    side,
+                    eff_exit_price,
+                    fees_paid_usdc,
+                    &pending_cur.exit_reason,
+                    live_close_oid.as_deref(),
+                    pending_cur.cooldown_sec_override,
+                    risk,
+                )
+                .map(|opt| opt.is_some());
+        }
+
+        if pending_cur.is_partial_reduce {
+            let base_open = if pending_cur.last_open_abs_qty > 1e-9 {
+                pending_cur.last_open_abs_qty
+            } else {
+                held.quantity
+            };
+            let maker_delta = (base_open - fresh_abs)
+                .max(0.0)
+                .min(pending_cur.initial_qty);
+            if maker_delta > lot * 0.5 {
+                let (m_px, m_fee, _) = self.resolve_recent_closing_fill_slice(
+                    &held.coin,
+                    side,
+                    pending_cur.placed_at_ms.saturating_sub(5_000),
+                    maker_delta,
+                    pending_cur.limit_px,
+                    maker_fee_bps,
+                    cfg,
+                );
+                let _guard = acquire_execution_lock();
+                if self
+                    .db
+                    .get_position_by_id(held.position_id)?
+                    .is_some_and(|p| p.status.eq_ignore_ascii_case("OPEN"))
+                {
+                    let _ = self.db.record_partial_position_exit(
+                        held.position_id,
+                        maker_delta,
+                        fresh_abs,
+                        m_px,
+                        m_fee,
+                        &pending_cur.exit_reason,
+                    );
+                }
+            }
+            let rem_reduce = snap_to_lot(
+                (pending_cur.initial_qty - maker_delta).max(0.0),
+                lot,
+                sz_dec,
+                true,
+            );
+            if rem_reduce <= lot * 0.5 || rem_reduce <= 1e-9 {
+                let cd_sec = pending_cur.cooldown_sec_override.unwrap_or(120);
+                if cd_sec > 0 {
+                    let _guard = acquire_execution_lock();
+                    let _ = self.db.insert_asset_cooldown(
+                        held.asset_id,
+                        "PARTIAL_REDUCE_GUARD",
+                        &format!(
+                            "Passive maker partial reduce cooldown guard for position #{}",
+                            held.position_id
+                        ),
+                        cd_sec,
+                    );
+                }
+                if let Some(asset) = asset_opt {
+                    let _ = self.chaser.ensure_exchange_tpsl_orders(
+                        held.position_id,
+                        asset,
+                        side,
+                        fresh_abs,
+                        pending_cur.limit_px,
+                        held.protective_stop_px,
+                        held.take_profit_px,
+                        held.protective_stop_oid.as_deref(),
+                        held.take_profit_oid.as_deref(),
+                        true,
+                        true,
+                        None,
+                        cfg,
+                    );
+                }
+                return Ok(false);
+            }
+
+            if let Some(asset) = asset_opt {
+                let l2_bbo = self
+                    .ws_cache
+                    .as_ref()
+                    .and_then(|c| c.get_fresh_l2_bbo(&asset.coin))
+                    .or_else(|| self.http.fetch_l2_book(&asset.coin, cfg).ok().flatten());
+                let open_orders_snap = self
+                    .ws_cache
+                    .as_ref()
+                    .and_then(|c| c.get_fresh_open_orders())
+                    .filter(|s| s.metadata_complete)
+                    .or_else(|| self.http.fetch_open_orders_with_metadata(&wallet, cfg).ok());
+                let cloid_prefix = format!("v2-reduce-ioc-{}", held.position_id);
+                let live_reduce_szi = if side == OrderSide::Long {
+                    rem_reduce.min(fresh_abs)
+                } else {
+                    -rem_reduce.min(fresh_abs)
+                };
+                if let Ok(res) = submit_reduce_only_close_ladder(
+                    &self.http,
+                    Some(&self.db),
+                    &pk,
+                    cfg,
+                    &ReduceOnlyCloseLadderRequest {
+                        asset,
+                        position_id: Some(held.position_id),
+                        live_szi: live_reduce_szi,
+                        pre_close_position_abs_qty: Some(fresh_abs),
+                        reference_mark_px: surveillance_ref_px,
+                        l2_bbo,
+                        taker_fee_bps: risk.limits.taker_fee_bps,
+                        cloid_prefix: &cloid_prefix,
+                        max_slippage_pct: None,
+                        allow_passive_fallback: false,
+                        existing_open_orders: open_orders_snap.as_ref(),
+                    },
+                ) {
+                    if res.filled_qty > 1e-9 {
+                        let exit_px = res
+                            .vwap_fill_price
+                            .filter(|&p| p.is_finite() && p > 0.0)
+                            .unwrap_or(surveillance_ref_px);
+                        let post_abs = snap_to_lot(
+                            (fresh_abs - res.filled_qty).max(0.0),
+                            asset.lot_step_size,
+                            asset.sz_decimals,
+                            true,
+                        );
+                        if post_abs <= 1e-9 {
+                            self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
+                            return self
+                                .commit_closed_position_with_cooldown(
+                                    held,
+                                    side,
+                                    round_dp(exit_px, 6),
+                                    round_dp(res.total_fee_usdc, 4),
+                                    &pending_cur.exit_reason,
+                                    res.last_fill_eoid.as_deref(),
+                                    pending_cur.cooldown_sec_override,
+                                    risk,
+                                )
+                                .map(|opt| opt.is_some());
+                        }
+                        {
+                            let _guard = acquire_execution_lock();
+                            if self
+                                .db
+                                .get_position_by_id(held.position_id)?
+                                .is_some_and(|p| p.status.eq_ignore_ascii_case("OPEN"))
+                            {
+                                let _ = self.db.record_partial_position_exit(
+                                    held.position_id,
+                                    res.filled_qty.min(fresh_abs),
+                                    post_abs,
+                                    round_dp(exit_px, 6),
+                                    round_dp(res.total_fee_usdc, 4),
+                                    &pending_cur.exit_reason,
+                                );
+                            }
+                            let cd_sec = pending_cur.cooldown_sec_override.unwrap_or(120);
+                            if cd_sec > 0 {
+                                let _ = self.db.insert_asset_cooldown(
+                                    held.asset_id,
+                                    "PARTIAL_REDUCE_GUARD",
+                                    &format!(
+                                        "Timeout IOC partial reduce cooldown guard for position #{}",
+                                        held.position_id
+                                    ),
+                                    cd_sec,
+                                );
+                            }
+                        }
+                        let _ = self.chaser.ensure_exchange_tpsl_orders_with_snapshot(
+                            held.position_id,
+                            asset,
+                            side,
+                            post_abs,
+                            round_dp(exit_px, 6),
+                            held.protective_stop_px,
+                            held.take_profit_px,
+                            held.protective_stop_oid.as_deref(),
+                            held.take_profit_oid.as_deref(),
+                            true,
+                            true,
+                            None,
+                            cfg,
+                        );
+                    }
+                }
+            }
+            return Ok(false);
+        }
+
+        self.execute_exit_with_urgency_and_cooldown(
             held,
             asset_opt,
             side,
             surveillance_ref_px,
-            &pending.exit_reason,
+            &pending_cur.exit_reason,
             CloseUrgency::ImmediateIoc,
             Some(&fresh_ch),
+            pending_cur.cooldown_sec_override,
             risk,
             cfg,
         )
@@ -1245,6 +1750,117 @@ impl PriorityMonitor {
         0.0
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_recent_closing_fill_slice(
+        &self,
+        coin: &str,
+        side: OrderSide,
+        lookup_start_ms: i64,
+        expected_qty: f64,
+        fallback_exit_px: f64,
+        fallback_fee_bps: f64,
+        cfg: &ConfigMap,
+    ) -> (f64, f64, Option<String>) {
+        let wallet = cfg.get_str("wallet_address", "");
+        if !wallet.trim().is_empty() {
+            let fills_res = self
+                .http
+                .fetch_user_fills_by_time(&wallet, lookup_start_ms.max(0), None, true, cfg)
+                .or_else(|_| self.http.fetch_user_fills(&wallet, cfg));
+            if let Ok(fills) = fills_res {
+                let mut matching: Vec<(i64, f64, f64, f64, Option<u64>)> = Vec::new();
+                for f in &fills {
+                    let fc = f.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                    if !fc.eq_ignore_ascii_case(coin) {
+                        continue;
+                    }
+                    let ft = parse_hl_i64_opt(f.get("time")).unwrap_or(0);
+                    if ft < lookup_start_ms {
+                        continue;
+                    }
+                    let dir = f.get("dir").and_then(Value::as_str).unwrap_or("").trim();
+                    let f_side = f
+                        .get("side")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_uppercase();
+                    let cpnl = parse_hl_f64(f.get("closedPnl"));
+                    let dir_matches = match side {
+                        OrderSide::Long => {
+                            dir.starts_with("Close Long")
+                                || dir.starts_with("Long >")
+                                || ((f_side == "A" || f_side == "SELL") && cpnl.abs() > 1e-9)
+                                || (f_side.is_empty()
+                                    && (cpnl.abs() > 1e-9
+                                        || dir.starts_with("Close")
+                                        || dir.contains('>')))
+                        }
+                        OrderSide::Short => {
+                            dir.starts_with("Close Short")
+                                || dir.starts_with("Short >")
+                                || ((f_side == "B" || f_side == "BUY") && cpnl.abs() > 1e-9)
+                                || (f_side.is_empty()
+                                    && (cpnl.abs() > 1e-9
+                                        || dir.starts_with("Close")
+                                        || dir.contains('>')))
+                        }
+                    };
+                    if !dir_matches {
+                        continue;
+                    }
+                    let px = parse_hl_f64(f.get("px"));
+                    let sz = parse_hl_f64(f.get("sz"));
+                    let fee = parse_hl_f64(f.get("fee"));
+                    if px > 0.0 && sz > 0.0 {
+                        let oid = parse_hl_u64_opt(f.get("oid"));
+                        matching.push((ft, px, sz, fee, oid));
+                    }
+                }
+                matching.sort_by_key(|a| std::cmp::Reverse(a.0));
+                let mut sz_sum = 0.0_f64;
+                let mut ntl_sum = 0.0_f64;
+                let mut fee_sum = 0.0_f64;
+                let mut last_oid: Option<u64> = None;
+                let mut prev_ts: Option<i64> = None;
+                for (ft, px, sz, fee, oid) in matching {
+                    if let Some(pts) = prev_ts {
+                        if pts.saturating_sub(ft) > EXCHANGE_FLAT_SLICE_MAX_GAP_MS {
+                            break;
+                        }
+                    }
+                    prev_ts = Some(ft);
+                    sz_sum += sz;
+                    ntl_sum += px * sz;
+                    fee_sum += fee;
+                    if last_oid.is_none() {
+                        last_oid = oid;
+                    }
+                    if sz_sum >= expected_qty * 0.99 {
+                        break;
+                    }
+                }
+                if sz_sum > 0.0 {
+                    let scale = if sz_sum > expected_qty * 1.05 && expected_qty > 0.0 {
+                        expected_qty / sz_sum
+                    } else {
+                        1.0
+                    };
+                    return (
+                        round_dp(ntl_sum / sz_sum, 6),
+                        round_dp(fee_sum * scale, 4),
+                        last_oid.map(|id| format!("hl-{id}")),
+                    );
+                }
+            }
+        }
+        let est_fee = round_dp(
+            fallback_exit_px * expected_qty * (fallback_fee_bps / 10_000.0),
+            4,
+        );
+        (fallback_exit_px, est_fee, None)
+    }
+
     /// Queries Hyperliquid `userFillsByTime` (falling back to `userFills`) using `last_confirmed_open_ms`
     /// or `opened_at_ms` (`R14-M4`), walking newest-to-oldest contiguous closing slices.
     fn resolve_exchange_flat_fill_details(
@@ -1252,11 +1868,10 @@ impl PriorityMonitor {
         held: &HeldAssetView,
         side: OrderSide,
         fallback_exit_px: f64,
-        risk: &RiskEngine,
+        fallback_fee_bps: f64,
         cfg: &ConfigMap,
     ) -> (f64, f64, Option<String>) {
         let now = now_ms();
-        let wallet = cfg.get_str("wallet_address", "");
         let confirmed_ts = self
             .last_confirmed_open_ms
             .lock()
@@ -1268,110 +1883,15 @@ impl PriorityMonitor {
             .unwrap_or_else(|| now.saturating_sub(EXCHANGE_FLAT_FILL_FALLBACK_LOOKBACK_MS));
         let min_bound = now.saturating_sub(EXCHANGE_FLAT_MAX_LOOKBACK_MS).max(0);
         let lookup_start_ms = raw_start.max(min_bound);
-
-        let fills_res = self
-            .http
-            .fetch_user_fills_by_time(&wallet, lookup_start_ms, None, true, cfg)
-            .or_else(|_| self.http.fetch_user_fills(&wallet, cfg));
-
-        if let Ok(fills) = fills_res {
-            let mut matching: Vec<(i64, f64, f64, f64, Option<u64>)> = Vec::new();
-            for f in &fills {
-                let fc = f.get("coin").and_then(Value::as_str).unwrap_or("").trim();
-                if !fc.eq_ignore_ascii_case(&held.coin) {
-                    continue;
-                }
-                let ft = parse_hl_i64_opt(f.get("time")).unwrap_or(0);
-                if ft < lookup_start_ms {
-                    continue;
-                }
-                let dir = f.get("dir").and_then(Value::as_str).unwrap_or("").trim();
-                let f_side = f
-                    .get("side")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_uppercase();
-                let cpnl = parse_hl_f64(f.get("closedPnl"));
-
-                let dir_matches = match side {
-                    OrderSide::Long => {
-                        dir.starts_with("Close Long")
-                            || dir.starts_with("Long >")
-                            || ((f_side == "A" || f_side == "SELL") && cpnl.abs() > 1e-9)
-                            || (f_side.is_empty()
-                                && (cpnl.abs() > 1e-9
-                                    || dir.starts_with("Close")
-                                    || dir.contains('>')))
-                    }
-                    OrderSide::Short => {
-                        dir.starts_with("Close Short")
-                            || dir.starts_with("Short >")
-                            || ((f_side == "B" || f_side == "BUY") && cpnl.abs() > 1e-9)
-                            || (f_side.is_empty()
-                                && (cpnl.abs() > 1e-9
-                                    || dir.starts_with("Close")
-                                    || dir.contains('>')))
-                    }
-                };
-                if !dir_matches {
-                    continue;
-                }
-                let px = parse_hl_f64(f.get("px"));
-                let sz = parse_hl_f64(f.get("sz"));
-                let fee = parse_hl_f64(f.get("fee"));
-                if px > 0.0 && sz > 0.0 {
-                    let oid = parse_hl_u64_opt(f.get("oid"));
-                    matching.push((ft, px, sz, fee, oid));
-                }
-            }
-
-            // Sort newest-to-oldest and accumulate only contiguous slices (gap <= 60s)
-            matching.sort_by_key(|a| std::cmp::Reverse(a.0));
-            let mut sz_sum = 0.0_f64;
-            let mut ntl_sum = 0.0_f64;
-            let mut fee_sum = 0.0_f64;
-            let mut last_oid: Option<u64> = None;
-            let mut prev_ts: Option<i64> = None;
-
-            for (ft, px, sz, fee, oid) in matching {
-                if let Some(pts) = prev_ts {
-                    if pts.saturating_sub(ft) > EXCHANGE_FLAT_SLICE_MAX_GAP_MS {
-                        break;
-                    }
-                }
-                prev_ts = Some(ft);
-                sz_sum += sz;
-                ntl_sum += px * sz;
-                fee_sum += fee;
-                if last_oid.is_none() {
-                    last_oid = oid;
-                }
-                if sz_sum >= held.quantity * 0.99 {
-                    break;
-                }
-            }
-
-            if sz_sum > 0.0 {
-                return (
-                    round_dp(ntl_sum / sz_sum, 6),
-                    round_dp(fee_sum, 4),
-                    last_oid.map(|id| format!("hl-{id}")),
-                );
-            }
-        }
-
-        tracing::warn!(
-            position_id = held.position_id,
-            symbol = %held.symbol,
+        self.resolve_recent_closing_fill_slice(
+            &held.coin,
+            side,
             lookup_start_ms,
-            "userFillsByTime returned no matching closing slice for exchange-flat position; estimating taker fee fallback"
-        );
-        let est_fee = round_dp(
-            fallback_exit_px * held.quantity * (risk.limits.taker_fee_bps / 10_000.0),
-            4,
-        );
-        (fallback_exit_px, est_fee, None)
+            held.quantity,
+            fallback_exit_px,
+            fallback_fee_bps,
+            cfg,
+        )
     }
 
     /// Executes an immediate protective stop or take-profit exit (`ImmediateIoc`), preserving
@@ -1413,6 +1933,34 @@ impl PriorityMonitor {
         exit_reason: &str,
         urgency: CloseUrgency,
         pre_fetched_ch_state: Option<&Value>,
+        risk: &RiskEngine,
+        cfg: &ConfigMap,
+    ) -> Result<Option<f64>> {
+        self.execute_exit_with_urgency_and_cooldown(
+            held,
+            asset_opt,
+            side,
+            exit_price,
+            exit_reason,
+            urgency,
+            pre_fetched_ch_state,
+            None,
+            risk,
+            cfg,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_exit_with_urgency_and_cooldown(
+        &self,
+        held: &HeldAssetView,
+        asset_opt: Option<&ExchangeAsset>,
+        side: OrderSide,
+        exit_price: f64,
+        exit_reason: &str,
+        urgency: CloseUrgency,
+        pre_fetched_ch_state: Option<&Value>,
+        cooldown_sec_override: Option<i64>,
         risk: &RiskEngine,
         cfg: &ConfigMap,
     ) -> Result<Option<f64>> {
@@ -1466,8 +2014,13 @@ impl PriorityMonitor {
             let live_szi = Self::extract_coin_szi(&ch_state, &held.coin);
 
             if live_szi.abs() <= 1e-9 {
-                let (fx, fee, oid) =
-                    self.resolve_exchange_flat_fill_details(held, side, exit_price, risk, cfg);
+                let (fx, fee, oid) = self.resolve_exchange_flat_fill_details(
+                    held,
+                    side,
+                    exit_price,
+                    taker_fee_bps,
+                    cfg,
+                );
                 eff_exit_price = fx;
                 fees_paid_usdc = fee;
                 live_close_oid = oid;
@@ -1539,6 +2092,7 @@ impl PriorityMonitor {
                                 fees_paid_usdc = round_dp(fee_usdc, 4);
                                 live_close_oid = eoid;
                                 already_filled_passively = true;
+                                self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
                             } else {
                                 let _guard = acquire_execution_lock();
                                 if self
@@ -1571,10 +2125,16 @@ impl PriorityMonitor {
                                 eoid,
                                 cloid,
                                 limit_px,
+                                initial_limit_px: limit_px,
                                 initial_qty: live_szi.abs(),
+                                last_open_abs_qty: live_szi.abs(),
                                 placed_at_ms: now,
                                 exit_reason: exit_reason.to_string(),
                                 is_tp: is_tp_exit,
+                                is_partial_reduce: false,
+                                min_limit_px_floor_or_cap: tp_cap,
+                                cooldown_sec_override,
+                                reprice_count: 0,
                             });
                             return Ok(None);
                         }
@@ -1622,25 +2182,7 @@ impl PriorityMonitor {
                             fees_paid_usdc = ladder_res.total_fee_usdc;
                         }
                         live_close_oid = ladder_res.last_fill_eoid;
-
-                        let mut cancels = Vec::new();
-                        if let Some(oid) = parse_hl_oid(held.protective_stop_oid.as_deref()) {
-                            cancels.push(CancelWire {
-                                a: asset.asset_index,
-                                o: oid,
-                            });
-                        }
-                        if let Some(oid) = parse_hl_oid(held.take_profit_oid.as_deref()) {
-                            cancels.push(CancelWire {
-                                a: asset.asset_index,
-                                o: oid,
-                            });
-                        }
-                        if !cancels.is_empty() {
-                            let _ =
-                                self.http
-                                    .cancel_orders_batch(cancels, &pk, Some(&self.db), cfg);
-                        }
+                        self.cancel_holding_tpsl_triggers(held, asset, &pk, cfg);
                     } else {
                         // R14-M3: Immediately persist any partial stop-exit fill!
                         if ladder_res.filled_qty > 1e-9 && ladder_res.remaining_qty > 1e-9 {
@@ -1678,13 +2220,14 @@ impl PriorityMonitor {
             }
         }
 
-        self.commit_closed_position(
+        self.commit_closed_position_with_cooldown(
             held,
             side,
             eff_exit_price,
             fees_paid_usdc,
             exit_reason,
             live_close_oid.as_deref(),
+            cooldown_sec_override,
             risk,
         )
     }
@@ -1821,7 +2364,7 @@ impl PriorityMonitor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_closed_position(
+    fn commit_closed_position_with_cooldown(
         &self,
         held: &HeldAssetView,
         side: OrderSide,
@@ -1829,6 +2372,7 @@ impl PriorityMonitor {
         fees_paid_usdc: f64,
         exit_reason: &str,
         live_close_oid: Option<&str>,
+        cooldown_sec_override: Option<i64>,
         risk: &RiskEngine,
     ) -> Result<Option<f64>> {
         let is_tp_exit = exit_reason.starts_with("TAKE_PROFIT");
@@ -1842,13 +2386,6 @@ impl PriorityMonitor {
             {
                 return Ok(None);
             }
-            let realized_pnl = self.db.close_position(
-                held.position_id,
-                eff_exit_price,
-                fees_paid_usdc,
-                exit_reason,
-            )?;
-
             if let Some(eoid) = live_close_oid {
                 let oid_num = eoid.strip_prefix("hl-").unwrap_or(eoid);
                 let coid = format!("hl-closed-{}-{oid_num}", held.coin.to_ascii_lowercase());
@@ -1856,41 +2393,57 @@ impl PriorityMonitor {
                     .db
                     .set_position_closed_exchange_ids(held.position_id, &coid, eoid);
             }
+            let realized_pnl = self.db.close_position(
+                held.position_id,
+                eff_exit_price,
+                fees_paid_usdc,
+                exit_reason,
+            )?;
 
-            let (cooldown_type, cooldown_sec, cd_reason) = if is_tp_exit {
-                (
-                    "CHURN_GUARD",
-                    300,
-                    format!(
+            let (cooldown_type_opt, cooldown_sec, cd_reason) =
+                if let Some(cd_override) = cooldown_sec_override {
+                    let cd_clamped = cd_override.max(0);
+                    (
+                        (cd_clamped > 0).then_some("MANUAL"),
+                        cd_clamped,
+                        format!("Signal close cooldown: {exit_reason}"),
+                    )
+                } else if is_tp_exit {
+                    (
+                        Some("CHURN_GUARD"),
+                        300,
+                        format!(
                         "Take-profit target triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
                         held.symbol, eff_exit_price, held.entry_price, realized_pnl
                     ),
-                )
-            } else if is_stagnation_exit {
-                (
-                    "CHURN_GUARD",
-                    600,
-                    format!(
-                        "Stagnation time-stop closed {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
-                        held.symbol, eff_exit_price, held.entry_price, realized_pnl
-                    ),
-                )
-            } else {
-                (
-                    "STOP_OUT",
-                    risk.limits.stop_out_cooldown_sec.max(60),
-                    format!(
-                        "Protective stop triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
-                        held.symbol, eff_exit_price, held.entry_price, realized_pnl
-                    ),
-                )
-            };
-            self.db.insert_asset_cooldown(
-                held.asset_id,
-                cooldown_type,
-                &cd_reason,
-                cooldown_sec,
-            )?;
+                    )
+                } else if is_stagnation_exit {
+                    (
+                        Some("CHURN_GUARD"),
+                        600,
+                        format!(
+                            "Stagnation time-stop closed {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
+                            held.symbol, eff_exit_price, held.entry_price, realized_pnl
+                        ),
+                    )
+                } else {
+                    (
+                        Some("STOP_OUT"),
+                        risk.limits.stop_out_cooldown_sec.max(60),
+                        format!(
+                            "Protective stop triggered on {} at ${:.4} (entry=${:.4}, PnL=${:+.2})",
+                            held.symbol, eff_exit_price, held.entry_price, realized_pnl
+                        ),
+                    )
+                };
+            if let Some(cooldown_type) = cooldown_type_opt {
+                self.db.insert_asset_cooldown(
+                    held.asset_id,
+                    cooldown_type,
+                    &cd_reason,
+                    cooldown_sec,
+                )?;
+            }
 
             let _ = self.db.log_telemetry(
                 "WARN",
@@ -1925,7 +2478,7 @@ impl PriorityMonitor {
                 filled_qty: held.quantity,
                 realized_pnl_usdc: realized_pnl,
                 available_cash_usdc: avail_cash,
-                cooldown_type: Some(cooldown_type.to_string()),
+                cooldown_type: cooldown_type_opt.map(str::to_string),
                 cooldown_seconds: cooldown_sec,
                 timestamp_ms: now_ms(),
             };
