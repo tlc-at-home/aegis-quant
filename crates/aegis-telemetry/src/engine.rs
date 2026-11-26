@@ -4,6 +4,7 @@ use aegis_core::{now_ms, ConfigMap, Result, TelemetryLogRecord};
 use aegis_db::{DatabaseManager, TelemetryInsertInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Condvar, Mutex,
@@ -14,6 +15,162 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 /// Maximum number of queued telemetry events persisted per single MariaDB transaction.
 const MAX_TELEMETRY_BATCH_SIZE: usize = 32;
+
+/// Default 5-minute (`300_000 ms`) summary window for repeated identical `WARN` deduplication (`R14-W4`).
+pub const DEFAULT_WARN_DEDUP_WINDOW_MS: i64 = 300_000;
+
+/// Default maximum tracked keys in [`RepeatedWarnDeduplicator`] (`R14-W4`).
+pub const DEFAULT_WARN_DEDUP_MAX_KEYS: usize = 256;
+
+/// Outcome of recording an occurrence in [`RepeatedWarnDeduplicator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarnDedupDecision {
+    /// First occurrence for this key (or first occurrence after a clear / signature transition).
+    EmitFirst,
+    /// Identical repeat within the active suppression window; suppress duplicate `WARN` emission.
+    Suppress { suppressed_repeats: u64 },
+    /// Summary window elapsed while condition remains active; emit summary with `(suppressed_repeats = N)`.
+    EmitSummary { suppressed_repeats: u64 },
+}
+
+impl WarnDedupDecision {
+    /// Returns `true` when the caller should emit a `WARN` log (`EmitFirst` or `EmitSummary`).
+    pub fn should_emit(self) -> bool {
+        matches!(self, Self::EmitFirst | Self::EmitSummary { .. })
+    }
+
+    /// Returns the repeat counter associated with this decision (`0` on `EmitFirst`).
+    pub fn suppressed_repeats(self) -> u64 {
+        match self {
+            Self::EmitFirst => 0,
+            Self::Suppress { suppressed_repeats } | Self::EmitSummary { suppressed_repeats } => {
+                suppressed_repeats
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WarnDedupEntry {
+    signature: String,
+    window_start_ms: i64,
+    last_seen_ms: i64,
+    suppressed_repeats: u64,
+}
+
+/// Bounded per-key repeated-`WARN` deduplicator (`R14-W4`).
+///
+/// Emits on the first occurrence of a key, suppresses identical repeats within `window_ms`
+/// (`300_000 ms` / 5 minutes by default) while incrementing a counter, and emits
+/// `(suppressed_repeats = N)` when the summary interval elapses or when the condition clears.
+pub struct RepeatedWarnDeduplicator {
+    window_ms: i64,
+    max_keys: usize,
+    entries: Mutex<HashMap<String, WarnDedupEntry>>,
+}
+
+impl Default for RepeatedWarnDeduplicator {
+    fn default() -> Self {
+        Self::new(DEFAULT_WARN_DEDUP_WINDOW_MS, DEFAULT_WARN_DEDUP_MAX_KEYS)
+    }
+}
+
+impl RepeatedWarnDeduplicator {
+    pub fn new(window_ms: i64, max_keys: usize) -> Self {
+        Self {
+            window_ms: window_ms.max(1),
+            max_keys: max_keys.max(1),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Observes an occurrence of `key` at `now_ms_val`.
+    pub fn observe(&self, key: &str, now_ms_val: i64) -> WarnDedupDecision {
+        self.observe_with_signature(key, "", now_ms_val).0
+    }
+
+    /// Observes an occurrence of `key` with sub-fingerprint `signature` at `now_ms_val`.
+    /// If `key` was active under a different `signature` with suppressed repeats, returns the
+    /// flushed repeat count from the prior signature as the second tuple element.
+    pub fn observe_with_signature(
+        &self,
+        key: &str,
+        signature: &str,
+        now_ms_val: i64,
+    ) -> (WarnDedupDecision, Option<u64>) {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(key) {
+            if entry.signature != signature {
+                let flushed = (entry.suppressed_repeats > 0).then_some(entry.suppressed_repeats);
+                entry.signature = signature.to_string();
+                entry.window_start_ms = now_ms_val;
+                entry.last_seen_ms = now_ms_val;
+                entry.suppressed_repeats = 0;
+                return (WarnDedupDecision::EmitFirst, flushed);
+            }
+            entry.last_seen_ms = now_ms_val;
+            if now_ms_val < entry.window_start_ms {
+                entry.window_start_ms = now_ms_val;
+            }
+            if now_ms_val.saturating_sub(entry.window_start_ms) >= self.window_ms {
+                let suppressed = entry.suppressed_repeats;
+                entry.window_start_ms = now_ms_val;
+                entry.suppressed_repeats = 0;
+                return (
+                    WarnDedupDecision::EmitSummary {
+                        suppressed_repeats: suppressed,
+                    },
+                    None,
+                );
+            }
+            entry.suppressed_repeats = entry.suppressed_repeats.saturating_add(1);
+            return (
+                WarnDedupDecision::Suppress {
+                    suppressed_repeats: entry.suppressed_repeats,
+                },
+                None,
+            );
+        }
+
+        if guard.len() >= self.max_keys {
+            if let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, v)| v.last_seen_ms)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest_key);
+            }
+        }
+        guard.insert(
+            key.to_string(),
+            WarnDedupEntry {
+                signature: signature.to_string(),
+                window_start_ms: now_ms_val,
+                last_seen_ms: now_ms_val,
+                suppressed_repeats: 0,
+            },
+        );
+        (WarnDedupDecision::EmitFirst, None)
+    }
+
+    /// Clears `key` when the underlying condition resolves. Returns `Some(suppressed_repeats)` if
+    /// one or more identical repeats had been suppressed since the last emission.
+    pub fn clear(&self, key: &str) -> Option<u64> {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard.remove(key)?;
+        (removed.suppressed_repeats > 0).then_some(removed.suppressed_repeats)
+    }
+
+    /// Returns the current number of tracked deduplication keys (`<= max_keys`).
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Returns `true` when no active deduplication keys are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Structured telemetry event sent over `tokio::sync::mpsc` to the MariaDB `telemetry_logs` writer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +446,48 @@ impl TelemetryBus {
     pub fn list_recent_logs(&self, limit: usize) -> Result<Vec<TelemetryLogRecord>> {
         self.db.list_recent_telemetry(limit)
     }
+
+    /// Publishes a deduplicated `WARN` event via `dedup` (`R14-W4`).
+    /// Emits immediately on the first occurrence, suppresses identical repeats within the window,
+    /// and appends `(suppressed_repeats = N)` when the summary window elapses.
+    pub fn publish_warn_dedup(
+        &self,
+        dedup: &RepeatedWarnDeduplicator,
+        dedup_key: &str,
+        component: &str,
+        message: &str,
+        details: Option<Value>,
+        now_ms_val: i64,
+    ) -> WarnDedupDecision {
+        let decision = dedup.observe(dedup_key, now_ms_val);
+        match decision {
+            WarnDedupDecision::EmitFirst => {
+                self.publish_event("WARN", component, message, details);
+            }
+            WarnDedupDecision::Suppress { .. } => {}
+            WarnDedupDecision::EmitSummary { suppressed_repeats } => {
+                let summary_msg = format!("{message} (suppressed_repeats = {suppressed_repeats})");
+                self.publish_event("WARN", component, &summary_msg, details);
+            }
+        }
+        decision
+    }
+
+    /// Clears `dedup_key` in `dedup` and, if any repeats had been suppressed, emits a summary
+    /// `INFO` clearance event including `(suppressed_repeats = N)` (`R14-W4`).
+    pub fn clear_warn_dedup(
+        &self,
+        dedup: &RepeatedWarnDeduplicator,
+        dedup_key: &str,
+        component: &str,
+        clear_message: &str,
+        details: Option<Value>,
+    ) -> Option<u64> {
+        let suppressed = dedup.clear(dedup_key)?;
+        let msg = format!("{clear_message} (suppressed_repeats = {suppressed})");
+        self.publish_event("INFO", component, &msg, details);
+        Some(suppressed)
+    }
 }
 
 /// Initializes the global `tracing_subscriber` with `RUST_LOG` environment filter (default `"info"`).
@@ -455,5 +654,126 @@ mod tests {
 
         assert_eq!(bus.dropped_events(), 2);
         assert_eq!(db.list_recent_telemetry(10).unwrap().len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_repeated_warn_deduplicator_window_summary_clear_and_bounded_keys() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let bus = TelemetryBus::new(db.clone());
+        let dedup = RepeatedWarnDeduplicator::new(DEFAULT_WARN_DEDUP_WINDOW_MS, 4);
+
+        let t0 = 1_700_000_000_000_i64;
+        // 1. First occurrence emits immediately with 0 suppressed repeats
+        let d0 = bus.publish_warn_dedup(
+            &dedup,
+            "equity_cliff:wallet1",
+            "execution.reconcile.equity",
+            "Equity cliff active",
+            None,
+            t0,
+        );
+        assert_eq!(d0, WarnDedupDecision::EmitFirst);
+        assert!(d0.should_emit());
+        assert_eq!(d0.suppressed_repeats(), 0);
+
+        // 2. 19 repeats across 15s..285s inside 300_000 ms window are suppressed
+        for step in 1..=19_i64 {
+            let d = bus.publish_warn_dedup(
+                &dedup,
+                "equity_cliff:wallet1",
+                "execution.reconcile.equity",
+                "Equity cliff active",
+                None,
+                t0 + step * 15_000,
+            );
+            assert_eq!(
+                d,
+                WarnDedupDecision::Suppress {
+                    suppressed_repeats: step as u64
+                }
+            );
+            assert!(!d.should_emit());
+        }
+
+        // 3. At t0 + 300_000 ms, summary emits with (suppressed_repeats = 19)
+        let d_sum = bus.publish_warn_dedup(
+            &dedup,
+            "equity_cliff:wallet1",
+            "execution.reconcile.equity",
+            "Equity cliff active",
+            None,
+            t0 + 300_000,
+        );
+        assert_eq!(
+            d_sum,
+            WarnDedupDecision::EmitSummary {
+                suppressed_repeats: 19
+            }
+        );
+        assert!(d_sum.should_emit());
+
+        // 4. Two more repeats at +315s, +330s, then clear emits (suppressed_repeats = 2)
+        assert_eq!(
+            bus.publish_warn_dedup(
+                &dedup,
+                "equity_cliff:wallet1",
+                "execution.reconcile.equity",
+                "Equity cliff active",
+                None,
+                t0 + 315_000,
+            ),
+            WarnDedupDecision::Suppress {
+                suppressed_repeats: 1
+            }
+        );
+        assert_eq!(
+            bus.publish_warn_dedup(
+                &dedup,
+                "equity_cliff:wallet1",
+                "execution.reconcile.equity",
+                "Equity cliff active",
+                None,
+                t0 + 330_000,
+            ),
+            WarnDedupDecision::Suppress {
+                suppressed_repeats: 2
+            }
+        );
+        let cleared = bus.clear_warn_dedup(
+            &dedup,
+            "equity_cliff:wallet1",
+            "execution.reconcile.equity",
+            "Equity cliff cleared",
+            None,
+        );
+        assert_eq!(cleared, Some(2));
+        // Clearing again when absent is a no-op
+        assert_eq!(dedup.clear("equity_cliff:wallet1"), None);
+
+        // 5. Verify max_keys = 4 eviction bound
+        for idx in 0..10_i64 {
+            let _ = dedup.observe(&format!("k-{idx}"), t0 + idx * 1_000);
+            assert!(dedup.len() <= 4);
+        }
+        assert_eq!(dedup.len(), 4);
+
+        let bus_flush = bus.clone();
+        tokio::task::spawn_blocking(move || bus_flush.shutdown_and_flush(Duration::from_secs(10)))
+            .await
+            .unwrap();
+
+        let logs = db.list_recent_telemetry(20).unwrap();
+        assert_eq!(logs.len(), 3);
+        assert!(logs
+            .iter()
+            .any(|l| l.level == "WARN" && l.message == "Equity cliff active"));
+        assert!(logs
+            .iter()
+            .any(|l| l.level == "WARN"
+                && l.message == "Equity cliff active (suppressed_repeats = 19)"));
+        assert!(logs
+            .iter()
+            .any(|l| l.level == "INFO"
+                && l.message == "Equity cliff cleared (suppressed_repeats = 2)"));
     }
 }
