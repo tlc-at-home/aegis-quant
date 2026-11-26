@@ -111,18 +111,18 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
 
     let state = Arc::new(Mutex::new(MockDogeState {
         szi: 5_000.0,
-        entry_px: 0.20000,
+        entry_px: 0.19600,
         resting_orders: vec![
             json!({
                 "coin": "DOGE",
                 "oid": 90_010u64,
                 "side": "A",
-                "limitPx": "0.18950",
+                "limitPx": "0.18350",
                 "sz": "5000.0",
                 "reduceOnly": true,
                 "isTrigger": true,
                 "orderType": "Stop Limit",
-                "triggerPx": "0.19000",
+                "triggerPx": "0.18400",
                 "timestamp": (now - 290_000) as u64
             }),
             json!({
@@ -141,9 +141,9 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
         fills: vec![json!({
             "coin": "DOGE",
             "side": "B",
-            "px": "0.20000",
+            "px": "0.19600",
             "sz": "5000.0",
-            "fee": "0.1500",
+            "fee": "0.1470",
             "closedPnl": "0.0",
             "dir": "Open Long",
             "time": t_open,
@@ -274,20 +274,20 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
     configure_testnet_mock_db(&db, server.port());
     let doge = seed_asset(&db, "DOGE", 12, 0, 0.00001, 1.0, 0.20000);
 
-    // 1. Seed canonical OPEN LONG 5,000 DOGE parent with SL/TP OIDs
+    // 1. Seed canonical OPEN LONG 5,000 DOGE parent (@ $0.19600 => +204 bps spacing to $0.20000) with SL/TP OIDs
     let open_pid = db
         .create_working_order(&WorkingOrderInput {
             asset_id: doge.id,
             client_order_id: "v2-doge-long-parent".to_string(),
             side: OrderSide::Long,
-            limit_price: 0.20000,
+            limit_price: 0.19600,
             requested_quantity: 5_000.0,
-            reserved_margin_usdc: 500.0,
+            reserved_margin_usdc: 490.0,
             portfolio_weight: 0.40,
             s1_weight_contrib: 0.40,
             s2_weight_contrib: 0.0,
             s3_weight_contrib: 0.0,
-            protective_stop_px: 0.19000,
+            protective_stop_px: 0.18400,
             take_profit_px: Some(0.22000),
             exchange_order_id: Some("hl-90001".to_string()),
             reason: "OPEN_LONG".to_string(),
@@ -295,10 +295,10 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
         .unwrap();
     db.promote_working_to_open(
         open_pid,
-        0.20000,
+        0.19600,
         5_000.0,
-        0.1500,
-        0.19000,
+        0.1470,
+        0.18400,
         Some(0.22000),
         Some("hl-90001"),
         "FILLED",
@@ -306,7 +306,7 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
     .unwrap();
     db.update_position_tpsl_orders(
         open_pid,
-        0.19000,
+        0.18400,
         OidUpdate::Set("hl-90010"),
         0.22000,
         OidUpdate::Set("hl-90011"),
@@ -325,7 +325,7 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
             s1_weight_contrib: 0.08,
             s2_weight_contrib: 0.0,
             s3_weight_contrib: 0.0,
-            protective_stop_px: 0.19000,
+            protective_stop_px: 0.18400,
             reason: "INCREASE".to_string(),
             bypass_entry_interval: true,
             entry_urgency: EntryUrgency::MakerOnly,
@@ -349,7 +349,7 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
             s1_weight_contrib: 0.04,
             s2_weight_contrib: 0.0,
             s3_weight_contrib: 0.0,
-            protective_stop_px: 0.19000,
+            protective_stop_px: 0.18400,
             take_profit_px: Some(0.22000),
             exchange_order_id: None,
             reason: "INCREASE".to_string(),
@@ -416,7 +416,7 @@ fn test_r14_w1_doge_174773_scale_in_reconcile_preserve_cloid_link_and_fill_merge
     std::thread::sleep(Duration::from_millis(3));
     {
         let mut st = state.lock();
-        let total_notional = 5_000.0 * 0.20000 + 500.0 * 0.19998;
+        let total_notional = 5_000.0 * 0.19600 + 500.0 * 0.19998;
         st.szi = 5_500.0;
         st.entry_px = total_notional / 5_500.0;
         st.resting_orders
