@@ -79,6 +79,7 @@ impl SignalEngine {
                     HeldPositionContext {
                         current_weight: w,
                         unrealized_pnl_pct: 0.0,
+                        ..Default::default()
                     },
                 )
             })
@@ -240,6 +241,7 @@ impl SignalEngine {
         let eq_valid = total_equity_usdc.is_finite() && total_equity_usdc > 1e-6;
         let mut weight_by_asset: HashMap<i64, f64> = HashMap::new();
         let mut open_pnl_acc: HashMap<i64, (f64, f64)> = HashMap::new();
+        let mut open_r0_acc: HashMap<i64, (f64, f64)> = HashMap::new();
 
         for pos in active_positions {
             let status = PositionStatus::parse(&pos.status);
@@ -306,6 +308,17 @@ impl SignalEngine {
                     let entry = open_pnl_acc.entry(pos.asset_id).or_insert((0.0, 0.0));
                     entry.0 += upnl;
                     entry.1 += entry_notional;
+
+                    if pos.entry_r0.is_finite()
+                        && pos.entry_r0 > 0.0
+                        && pos.entry_price.is_finite()
+                        && pos.entry_price > 0.0
+                    {
+                        let r0_pct = pos.entry_r0 / pos.entry_price;
+                        let r0_entry = open_r0_acc.entry(pos.asset_id).or_insert((0.0, 0.0));
+                        r0_entry.0 += r0_pct * entry_notional;
+                        r0_entry.1 += entry_notional;
+                    }
                 }
             }
         }
@@ -317,11 +330,17 @@ impl SignalEngine {
                 .filter(|(_, denom)| *denom > 1e-6)
                 .map(|(upnl, denom)| upnl / denom)
                 .unwrap_or(0.0);
+            let entry_r0_pct = open_r0_acc
+                .get(&asset_id)
+                .filter(|(_, denom)| *denom > 1e-6)
+                .map(|(num, denom)| num / denom)
+                .unwrap_or(0.0);
             held_contexts.insert(
                 asset_id,
                 HeldPositionContext {
                     current_weight,
                     unrealized_pnl_pct,
+                    entry_r0_pct,
                 },
             );
         }
@@ -1294,6 +1313,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: 0.0,
+                ..Default::default()
             },
         );
         let mut map = HashMap::new();
@@ -1415,6 +1435,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: 0.01,
+                ..Default::default()
             },
         );
         let r5a = strict_engine.evaluate_universe_with_cache(
@@ -1465,6 +1486,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: 0.0,
+                ..Default::default()
             },
         );
         let r5b = strict_engine.evaluate_universe_with_cache(
@@ -1503,6 +1525,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: -0.12,
                 unrealized_pnl_pct: 0.02,
+                ..Default::default()
             },
         );
         let r5c = strict_engine.evaluate_universe_with_cache(
@@ -1560,6 +1583,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: -0.006, // <= -0.003 loser!
+                ..Default::default()
             },
         );
         let r5d = strict_engine.evaluate_universe_with_cache(

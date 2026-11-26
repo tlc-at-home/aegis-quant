@@ -7251,3 +7251,168 @@ fn test_n6_funding_entry_timing_defers_adverse_pre_settlement_without_l2_fetch()
         .unwrap();
     assert_eq!(r_open.working_orders_placed, 1);
 }
+
+#[test]
+fn test_wave4_partial_reduce_weight_sync_cooldown_guard_and_r_scaled_hold_floor() {
+    let db = fresh_isolated_db();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+
+    db.set_config_value("min_position_hold_sec", "900", None)
+        .unwrap();
+    db.set_config_value("early_loser_invalidation_enabled", "true", None)
+        .unwrap();
+    db.set_config_value("early_loser_r0_mult", "0.25", None)
+        .unwrap();
+    db.set_config_value("early_loser_max_loss_pct", "0.009", None)
+        .unwrap();
+    db.set_config_value("enable_scale_in_out_rebalance", "true", None)
+        .unwrap();
+    db.set_config_value("profit_gate_signal_exits", "false", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let now = now_ms();
+
+    // 1. SOL held > 900s: initial qty = 10.0 @ 100.0 ($1000 notional = 0.10 weight of $10k equity).
+    //    ACTION_REDUCE target_weight = 0.06 -> reduces to 6.0, updates positions.portfolio_weight to 0.06,
+    //    and inserts a 120s PARTIAL_REDUCE_GUARD cooldown blocking immediate ACTION_INCREASE bounce-back.
+    db.upsert_exchange_asset(&AssetUpsertInput {
+        raw_symbol_or_coin: sol.coin.clone(),
+        asset_index: sol.asset_index,
+        sz_decimals: 2,
+        tick_size: 0.01,
+        lot_step_size: 0.01,
+        max_leverage: sol.max_leverage,
+        mark_price: 100.0,
+        mid_price: 100.0,
+        oracle_price: 100.0,
+        funding_rate_hourly: 0.0,
+        day_volume_usdc: 20_000_000.0,
+        open_interest_usdc: 5_000_000.0,
+        prev_day_price: 100.0,
+        is_core_eligible: true,
+        is_event_eligible: true,
+        is_priority_watched: true,
+    })
+    .unwrap();
+    let sol_fresh = db.get_asset_by_id(sol.id).unwrap().unwrap();
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: &sol.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 100.0,
+            quantity: 10.0,
+            committed_notional_usdc: 1000.0,
+            unrealized_pnl_usdc: 0.0,
+            portfolio_weight: 0.10,
+            protective_stop_px: 93.0,
+            take_profit_px: 114.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 1_200_000),
+        })
+        .unwrap();
+
+    let sig_reduce = make_signal_input(&sol_fresh, 0.06, 0.10, ACTION_REDUCE);
+    engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_reduce]), 10_000.0)
+        .unwrap();
+
+    let sol_after = db.get_position_by_id(sol_pid).unwrap().unwrap();
+    assert_eq!(sol_after.status, "OPEN");
+    assert!((sol_after.filled_quantity - 6.0).abs() < 1e-6);
+    assert!(
+        (sol_after.portfolio_weight - 0.06).abs() < 1e-4,
+        "ACTION_REDUCE must scale positions.portfolio_weight proportionally, got {}",
+        sol_after.portfolio_weight
+    );
+    let cds = db.get_assets_in_cooldown().unwrap();
+    assert!(
+        cds.iter()
+            .any(|c| c.asset_id == sol.id && c.cooldown_type == "PARTIAL_REDUCE_GUARD"),
+        "ACTION_REDUCE must insert PARTIAL_REDUCE_GUARD cooldown"
+    );
+
+    // Immediate bounce-back ACTION_INCREASE must be blocked by PARTIAL_REDUCE_GUARD
+    let sig_bounce = make_signal_input(&sol_fresh, 0.10, 0.06, ACTION_INCREASE);
+    let bounce_rep = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_bounce]), 10_000.0)
+        .unwrap();
+    assert_eq!(bounce_rep.working_orders_placed, 0);
+    assert_eq!(bounce_rep.cooldown_blocked_count, 1);
+
+    // 2. R-scaled hold floor on 4h entry_r0 = 7% position held 200s (< 900s):
+    //    -0.55% unrealized loss is noise vs -0.90% cap -> MUST hold!
+    //    -1.00% unrealized loss clears -0.90% hurdle -> bypasses 900s floor and closes!
+    db.upsert_exchange_asset(&AssetUpsertInput {
+        raw_symbol_or_coin: eth.coin.clone(),
+        asset_index: eth.asset_index,
+        sz_decimals: 2,
+        tick_size: 0.01,
+        lot_step_size: 0.01,
+        max_leverage: eth.max_leverage,
+        mark_price: 99.45,
+        mid_price: 99.45,
+        oracle_price: 99.45,
+        funding_rate_hourly: 0.0,
+        day_volume_usdc: 20_000_000.0,
+        open_interest_usdc: 5_000_000.0,
+        prev_day_price: 100.0,
+        is_core_eligible: true,
+        is_event_eligible: true,
+        is_priority_watched: true,
+    })
+    .unwrap();
+    let eth_noise = db.get_asset_by_id(eth.id).unwrap().unwrap();
+    let (eth_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: eth.id,
+            coin: &eth.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 99.45,
+            quantity: 5.0,
+            committed_notional_usdc: 500.0,
+            unrealized_pnl_usdc: -2.75,
+            portfolio_weight: 0.05,
+            protective_stop_px: 93.0, // entry_r0 = 7.0 (7% of entry_price)
+            take_profit_px: 112.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 200_000),
+        })
+        .unwrap();
+
+    let sig_eth_close = make_signal_input(&eth_noise, 0.0, 0.05, ACTION_CLOSE);
+    let reb_noise = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_eth_close]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_noise.positions_closed, 0);
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "OPEN",
+        "-0.55% noise on 7% entry_r0 position must hold within min_position_hold_sec"
+    );
+
+    // Move mark down to 99.0 (-1.00% <= -0.90% cap) -> bypasses hold floor and closes!
+    update_test_asset_px(&db, &eth_noise, 99.0);
+    db.update_open_position_mark_and_stop(eth_pid, 99.0, 93.0)
+        .unwrap();
+    let eth_loss = db.get_asset_by_id(eth.id).unwrap().unwrap();
+    let sig_eth_loss_close = make_signal_input(&eth_loss, 0.0, 0.05, ACTION_CLOSE);
+    let reb_loss = engine
+        .execute_signal_rebalance(&make_signal_output(vec![sig_eth_loss_close]), 10_000.0)
+        .unwrap();
+    assert_eq!(reb_loss.positions_closed, 1);
+    assert_eq!(
+        db.get_position_by_id(eth_pid).unwrap().unwrap().status,
+        "CLOSED",
+        "-1.0% loss clearing -0.9% R-scaled hurdle must bypass min_position_hold_sec"
+    );
+}

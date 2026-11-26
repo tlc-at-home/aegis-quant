@@ -581,7 +581,8 @@ impl DatabaseManager {
         let row: Option<mysql::Row> = tx
             .exec_first(
                 r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price,
-                          requested_quantity, protective_stop_px, take_profit_px
+                          requested_quantity, protective_stop_px, take_profit_px,
+                          portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib
                    FROM positions
                    WHERE id = :pid
                    FOR UPDATE"#,
@@ -602,6 +603,10 @@ impl DatabaseManager {
         let requested_qty = row_get_f64(&locked, 6, 0.0);
         let existing_stop_px = row_get_f64(&locked, 7, 0.0);
         let existing_tp_px = row_get_f64(&locked, 8, 0.0);
+        let old_pw = row_get_f64(&locked, 9, 0.0);
+        let old_s1 = row_get_f64(&locked, 10, 0.0);
+        let old_s2 = row_get_f64(&locked, 11, 0.0);
+        let old_s3 = row_get_f64(&locked, 12, 0.0);
 
         if !status.eq_ignore_ascii_case("WORKING") {
             return Err(AegisError::Database(format!(
@@ -633,6 +638,22 @@ impl DatabaseManager {
         let tp_dec = decimal_param(eff_tp, 8, DEC_20_8_MAX_ABS)?;
         let req_qty_dec = decimal_param(requested_qty, 8, DEC_20_8_MAX_ABS)?;
         let lim_px_dec = decimal_param(limit_px, 8, DEC_20_8_MAX_ABS)?;
+        let (new_pw, new_s1, new_s2, new_s3) =
+            if requested_qty > 1e-12 && filled_quantity < requested_qty {
+                let fill_ratio = (filled_quantity / requested_qty).clamp(0.0, 1.0);
+                (
+                    round_dp(old_pw * fill_ratio, 4),
+                    round_dp(old_s1 * fill_ratio, 4),
+                    round_dp(old_s2 * fill_ratio, 4),
+                    round_dp(old_s3 * fill_ratio, 4),
+                )
+            } else {
+                (old_pw, old_s1, old_s2, old_s3)
+            };
+        let pw_dec = decimal_param(new_pw, 8, DEC_20_8_MAX_ABS)?;
+        let s1_dec = decimal_param(new_s1, 8, DEC_20_8_MAX_ABS)?;
+        let s2_dec = decimal_param(new_s2, 8, DEC_20_8_MAX_ABS)?;
+        let s3_dec = decimal_param(new_s3, 8, DEC_20_8_MAX_ABS)?;
 
         tx.exec_drop(
             r#"UPDATE positions
@@ -643,6 +664,10 @@ impl DatabaseManager {
                    filled_quantity = :qty,
                    reserved_margin_usdc = 0.00000000,
                    committed_notional_usdc = :comm_usdc,
+                   portfolio_weight = :pw,
+                   s1_weight_contrib = :s1,
+                   s2_weight_contrib = :s2,
+                   s3_weight_contrib = :s3,
                    protective_stop_px = :stop_px,
                    entry_r0 = :entry_r0,
                    take_profit_px = :tp_px,
@@ -657,6 +682,10 @@ impl DatabaseManager {
                 "px" => &px_dec,
                 "qty" => &qty_dec,
                 "comm_usdc" => &comm_dec,
+                "pw" => &pw_dec,
+                "s1" => &s1_dec,
+                "s2" => &s2_dec,
+                "s3" => &s3_dec,
                 "stop_px" => &stop_dec,
                 "entry_r0" => &entry_r0_dec,
                 "tp_px" => &tp_dec,
@@ -1253,7 +1282,8 @@ impl DatabaseManager {
 
         let row: Option<mysql::Row> = tx
             .exec_first(
-                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price
+                r#"SELECT asset_id, client_order_id, side, status, fsm_state, entry_price,
+                          filled_quantity, portfolio_weight, s1_weight_contrib, s2_weight_contrib, s3_weight_contrib
                    FROM positions
                    WHERE id = :pid
                    FOR UPDATE"#,
@@ -1271,6 +1301,11 @@ impl DatabaseManager {
         let status = row_get_string(&locked, 3, "");
         let fsm_state = row_get_string(&locked, 4, "FILLED_OPEN");
         let entry_price = row_get_f64(&locked, 5, 0.0);
+        let old_filled_qty = row_get_f64(&locked, 6, 0.0);
+        let old_pw = row_get_f64(&locked, 7, 0.0);
+        let old_s1 = row_get_f64(&locked, 8, 0.0);
+        let old_s2 = row_get_f64(&locked, 9, 0.0);
+        let old_s3 = row_get_f64(&locked, 10, 0.0);
 
         if !status.eq_ignore_ascii_case("OPEN") {
             return Err(AegisError::Database(format!(
@@ -1283,11 +1318,24 @@ impl DatabaseManager {
         let partial_fees_rounded = round_dp(partial_fees_usdc, 4);
         let net_partial_pnl = round_dp(gross_partial - partial_fees_rounded, 4);
         let new_committed = round_dp(entry_price * remaining_qty, 4);
+        let scale_ratio = if old_filled_qty > 1e-12 {
+            (remaining_qty / old_filled_qty).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let new_pw = round_dp(old_pw * scale_ratio, 4);
+        let new_s1 = round_dp(old_s1 * scale_ratio, 4);
+        let new_s2 = round_dp(old_s2 * scale_ratio, 4);
+        let new_s3 = round_dp(old_s3 * scale_ratio, 4);
 
         let rem_qty_dec = decimal_param(remaining_qty, 8, DEC_20_8_MAX_ABS)?;
         let closed_qty_dec = decimal_param(closed_qty, 8, DEC_20_8_MAX_ABS)?;
         let exit_px_dec = decimal_param(partial_exit_price, 8, DEC_20_8_MAX_ABS)?;
         let comm_dec = decimal_param(new_committed, 8, DEC_20_8_MAX_ABS)?;
+        let new_pw_dec = decimal_param(new_pw, 8, DEC_20_8_MAX_ABS)?;
+        let new_s1_dec = decimal_param(new_s1, 8, DEC_20_8_MAX_ABS)?;
+        let new_s2_dec = decimal_param(new_s2, 8, DEC_20_8_MAX_ABS)?;
+        let new_s3_dec = decimal_param(new_s3, 8, DEC_20_8_MAX_ABS)?;
         let partial_pnl_dec = decimal_param(net_partial_pnl, 8, DEC_20_8_MAX_ABS)?;
         let partial_fees_dec = decimal_param(partial_fees_rounded, 8, DEC_20_8_MAX_ABS)?;
 
@@ -1295,6 +1343,10 @@ impl DatabaseManager {
             r#"UPDATE positions
                SET filled_quantity = :rem_qty,
                    committed_notional_usdc = :comm_usdc,
+                   portfolio_weight = :new_pw,
+                   s1_weight_contrib = :new_s1,
+                   s2_weight_contrib = :new_s2,
+                   s3_weight_contrib = :new_s3,
                    realized_pnl_usdc = realized_pnl_usdc + CAST(:partial_pnl AS DECIMAL(20,8)),
                    fees_paid_usdc = fees_paid_usdc + CAST(:partial_fees AS DECIMAL(20,8)),
                    updated_at_ms = :ts
@@ -1302,6 +1354,10 @@ impl DatabaseManager {
             params! {
                 "rem_qty" => &rem_qty_dec,
                 "comm_usdc" => &comm_dec,
+                "new_pw" => &new_pw_dec,
+                "new_s1" => &new_s1_dec,
+                "new_s2" => &new_s2_dec,
+                "new_s3" => &new_s3_dec,
                 "partial_pnl" => &partial_pnl_dec,
                 "partial_fees" => &partial_fees_dec,
                 "ts" => ts,
@@ -2425,10 +2481,15 @@ impl DatabaseManager {
         let new_committed = round_dp(total_notional, 4);
         let new_req_qty = round_dp(o_req_qty.max(old_qty) + add_qty, 8);
         let new_fees = round_dp(o_fees + fees_rounded, 4);
-        let new_pw = round_dp(o_pw + w_pw, 4);
-        let new_s1 = round_dp(o_s1 + w_s1, 4);
-        let new_s2 = round_dp(o_s2 + w_s2, 4);
-        let new_s3 = round_dp(o_s3 + w_s3, 4);
+        let w_fill_ratio = if w_req_qty > 1e-12 {
+            (add_qty / w_req_qty).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let new_pw = round_dp(o_pw + w_pw * w_fill_ratio, 4);
+        let new_s1 = round_dp(o_s1 + w_s1 * w_fill_ratio, 4);
+        let new_s2 = round_dp(o_s2 + w_s2 * w_fill_ratio, 4);
+        let new_s3 = round_dp(o_s3 + w_s3 * w_fill_ratio, 4);
         let preserved_r0 = if o_entry_r0.is_finite() && o_entry_r0 > 0.0 {
             o_entry_r0
         } else {

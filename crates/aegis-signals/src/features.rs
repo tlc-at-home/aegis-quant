@@ -8,8 +8,8 @@
 //!   across 3-second ticks via [`BarCloseCache`] so live mark updates run in O(1) with zero Vec allocations.
 
 use crate::breadth::{
-    classify_market_regime, compute_regime_gate_state, MarketBreadthSnapshot, RegimeGateConfig,
-    RegimeGateState,
+    classify_market_regime, compute_regime_gate_state, effective_breadth_anchor_price,
+    MarketBreadthSnapshot, RegimeGateConfig, RegimeGateState,
 };
 use crate::liquidity::{
     count_trailing_active_bars, evaluate_asset_liquidity_quality_with_bar_stats,
@@ -687,11 +687,8 @@ impl CycleFeatureCache {
                 }
                 if cached.bars_len >= 4 {
                     let first = cached.fourth_from_last_close.unwrap_or(0.0).max(1e-12);
-                    let last = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
-                        asset.mark_price
-                    } else {
-                        cached.last_bar_close.unwrap_or(0.0)
-                    };
+                    let last =
+                        effective_breadth_anchor_price(asset.mark_price, cached.last_bar_close);
                     if last > first * 1.002 {
                         bull_count += 1.0;
                     } else if (last - first).abs() / first <= 0.002 {

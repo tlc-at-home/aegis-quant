@@ -65,7 +65,7 @@ export function classifyConfigKeyCategory(key) {
     k === 'min_position_hold_sec' ||
     k === 'profit_gate_signal_exits' ||
     k === 'signal_exit_min_net_profit_pct' ||
-    k === 'early_loser_invalidation_enabled' ||
+    k.startsWith('early_loser_') ||
     k === 'min_equity_halt_usdc' ||
     k === 'risk_per_trade_equity_pct' ||
     k.startsWith('take_profit_') ||

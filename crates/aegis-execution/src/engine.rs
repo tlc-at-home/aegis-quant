@@ -39,9 +39,9 @@ use aegis_core::{
 use aegis_db::{DatabaseManager, SignalUpsertInput, SnapshotInsertInput};
 use aegis_risk::RiskEngine;
 use aegis_signals::{
-    BarCloseCache, HeldPositionContext, SignalCycleOutput, SignalEngine, SleeveSignalInput,
-    ACTION_CLOSE, ACTION_COOLDOWN_BLOCKED, ACTION_FLIP, ACTION_INCREASE, ACTION_OPEN_LONG,
-    ACTION_OPEN_SHORT, ACTION_REDUCE,
+    effective_early_loser_threshold, BarCloseCache, HeldPositionContext, SignalCycleOutput,
+    SignalEngine, SleeveSignalInput, ACTION_CLOSE, ACTION_COOLDOWN_BLOCKED, ACTION_FLIP,
+    ACTION_INCREASE, ACTION_OPEN_LONG, ACTION_OPEN_SHORT, ACTION_REDUCE,
 };
 use parking_lot::{Mutex, ReentrantMutex};
 use serde::{Deserialize, Serialize};
@@ -209,7 +209,6 @@ pub const CAP_ENFORCEMENT_TOLERANCE_MULT: f64 = 1.03;
 const AUTO_DELEVERAGE_CONFIRM_WINDOW_MS: i64 = 30_000;
 const AUTO_DELEVERAGE_EQUITY_FRESH_MS: i64 = 20_000;
 const EARLY_LOSER_MIN_HOLD_MS: i64 = 120_000;
-const EARLY_LOSER_PNL_THRESHOLD_FRAC: f64 = -0.003;
 const DEFAULT_MIN_L2_DEPTH_MULT: f64 = 1.5;
 const DEFAULT_MIN_L2_DEPTH_USDC: f64 = 150.0;
 
@@ -1571,6 +1570,12 @@ impl ExecutionEngine {
                 partial_fee,
                 ACTION_REDUCE,
             )?;
+            let _ = self.db.insert_asset_cooldown(
+                asset.id,
+                "PARTIAL_REDUCE_GUARD",
+                &format!("Partial reduce cooldown guard for position #{position_id}"),
+                120,
+            );
             let _ = self.db.log_telemetry(
                 "INFO",
                 "execution.engine",
@@ -1611,6 +1616,10 @@ impl ExecutionEngine {
         let rebalance_now = now_ms();
         let min_hold_ms = cfg.get_i64("min_position_hold_sec", 300).max(0) * 1000;
         let early_loser_enabled = cfg.get_bool("early_loser_invalidation_enabled", true);
+        let early_loser_r0_mult = cfg.get_f64("early_loser_r0_mult", 0.25).clamp(0.05, 1.0);
+        let early_loser_max_loss_pct = cfg
+            .get_f64("early_loser_max_loss_pct", 0.009)
+            .clamp(0.003, 0.10);
         let profit_gate_signal_exits = cfg.get_bool("profit_gate_signal_exits", false);
         let enable_scale_in_out_rebalance = cfg.get_bool("enable_scale_in_out_rebalance", true);
         let signal_exit_min_net_profit_pct = cfg
@@ -1632,8 +1641,22 @@ impl ExecutionEngine {
             };
             let held_ms = rebalance_now.saturating_sub(h.opened_at_ms.unwrap_or(h.created_at_ms));
             let frac_upnl = held_position_fractional_pnl(h);
+            let entry_r0_pct = if h.entry_r0.is_finite()
+                && h.entry_r0 > 0.0
+                && h.entry_price.is_finite()
+                && h.entry_price > 0.0
+            {
+                h.entry_r0 / h.entry_price
+            } else {
+                0.0
+            };
+            let loser_thresh = effective_early_loser_threshold(
+                entry_r0_pct,
+                early_loser_r0_mult,
+                early_loser_max_loss_pct,
+            );
             let bypass_for_loser = early_loser_enabled
-                && frac_upnl <= EARLY_LOSER_PNL_THRESHOLD_FRAC
+                && frac_upnl <= loser_thresh
                 && held_ms >= EARLY_LOSER_MIN_HOLD_MS;
             if min_hold_ms > 0 && held_ms < min_hold_ms && !bypass_for_loser {
                 continue;
@@ -3144,15 +3167,27 @@ fn build_held_position_contexts(
 ) -> Result<HashMap<i64, HeldPositionContext>> {
     let mut weight_by_asset: HashMap<i64, f64> = HashMap::new();
     let mut pnl_acc: HashMap<i64, (f64, f64)> = HashMap::new();
+    let mut r0_acc: HashMap<i64, (f64, f64)> = HashMap::new();
+    let eq_valid = eq.is_finite() && eq > 1e-6;
 
     for h in held {
         let side = OrderSide::parse(&h.side)?;
-        let w = if h.portfolio_weight.abs() > 1e-6 {
-            h.portfolio_weight.abs() * side.sign()
+        let abs_w = if eq_valid
+            && h.committed_notional_usdc.is_finite()
+            && h.committed_notional_usdc > 1e-6
+        {
+            h.committed_notional_usdc / eq
+        } else if eq_valid
+            && h.entry_price.is_finite()
+            && h.entry_price > 0.0
+            && h.quantity.is_finite()
+            && h.quantity > 0.0
+        {
+            (h.entry_price * h.quantity).abs() / eq
         } else {
-            (h.committed_notional_usdc / eq) * side.sign()
+            h.portfolio_weight.abs()
         };
-        *weight_by_asset.entry(h.asset_id).or_insert(0.0) += w;
+        *weight_by_asset.entry(h.asset_id).or_insert(0.0) += abs_w * side.sign();
 
         let notional = if h.committed_notional_usdc.is_finite() && h.committed_notional_usdc > 0.0 {
             h.committed_notional_usdc
@@ -3169,6 +3204,17 @@ fn build_held_position_contexts(
         let entry = pnl_acc.entry(h.asset_id).or_insert((0.0, 0.0));
         entry.0 += frac * notional;
         entry.1 += notional;
+
+        if h.entry_r0.is_finite()
+            && h.entry_r0 > 0.0
+            && h.entry_price.is_finite()
+            && h.entry_price > 0.0
+        {
+            let r0_pct = h.entry_r0 / h.entry_price;
+            let r0_entry = r0_acc.entry(h.asset_id).or_insert((0.0, 0.0));
+            r0_entry.0 += r0_pct * notional;
+            r0_entry.1 += notional;
+        }
     }
 
     for o in ordered {
@@ -3185,11 +3231,17 @@ fn build_held_position_contexts(
             .filter(|(_, denom)| *denom > 1e-9)
             .map(|(num, denom)| num / denom)
             .unwrap_or(0.0);
+        let entry_r0_pct = r0_acc
+            .get(&asset_id)
+            .filter(|(_, denom)| *denom > 1e-9)
+            .map(|(num, denom)| num / denom)
+            .unwrap_or(0.0);
         held_contexts.insert(
             asset_id,
             HeldPositionContext {
                 current_weight,
                 unrealized_pnl_pct,
+                entry_r0_pct,
             },
         );
     }
@@ -3816,5 +3868,77 @@ mod tests {
         assert!(passes_entry_oracle_deviation_gate(&met, 0.015).is_ok());
         met.oracle_price = 0.0;
         assert!(passes_entry_oracle_deviation_gate(&met, 0.015).is_err());
+    }
+
+    #[test]
+    fn test_wave4_build_held_position_contexts_uses_committed_notional_and_r0_pct() {
+        let base = HeldAssetView {
+            position_id: 1,
+            asset_id: 10,
+            symbol: "SOL-USDC".to_string(),
+            coin: "SOL".to_string(),
+            client_order_id: "coid-1".to_string(),
+            side: "SHORT".to_string(),
+            quantity: 2.0,
+            committed_notional_usdc: 150.0,
+            portfolio_weight: -0.25, // stale DB weight must be ignored when committed_notional > 0
+            entry_price: 100.0,
+            mark_price: 99.45,
+            protective_stop_px: 107.0,
+            entry_r0: 7.0,
+            protective_stop_oid: None,
+            stop_distance_pct: Some(7.0),
+            take_profit_px: 85.0,
+            take_profit_oid: None,
+            tp_distance_pct: Some(15.0),
+            highest_price_seen: 100.0,
+            lowest_price_seen: 99.45,
+            unrealized_pnl_usdc: 1.1,
+            unrealized_pnl_pct: 0.55,
+            realized_pnl_usdc: 0.0,
+            funding_accrued_usdc: 0.0,
+            fees_paid_usdc: 0.0,
+            s1_weight_contrib: -0.25,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            latest_target_weight: -0.15,
+            latest_delta_weight: 0.10,
+            created_at_ms: 1_700_000_000_000,
+            opened_at_ms: Some(1_700_000_000_000),
+            updated_at_ms: 1_700_000_000_000,
+        };
+        let mut fallback_qty = base.clone();
+        fallback_qty.position_id = 2;
+        fallback_qty.asset_id = 11;
+        fallback_qty.side = "LONG".to_string();
+        fallback_qty.committed_notional_usdc = 0.0;
+        fallback_qty.entry_price = 50.0;
+        fallback_qty.mark_price = 50.0;
+        fallback_qty.quantity = 4.0; // 200 / 1000 = 0.20
+        fallback_qty.portfolio_weight = 0.40;
+        fallback_qty.entry_r0 = 2.5; // 2.5 / 50 = 0.05
+
+        let mut fallback_pw = base.clone();
+        fallback_pw.position_id = 3;
+        fallback_pw.asset_id = 12;
+        fallback_pw.committed_notional_usdc = 0.0;
+        fallback_pw.quantity = 0.0;
+        fallback_pw.portfolio_weight = -0.12;
+        fallback_pw.entry_r0 = 0.0;
+
+        let ctxs = build_held_position_contexts(&[base, fallback_qty, fallback_pw], &[], 1000.0)
+            .expect("contexts");
+
+        let c10 = ctxs.get(&10).unwrap();
+        assert!((c10.current_weight - (-0.15)).abs() < 1e-9);
+        assert!((c10.entry_r0_pct - 0.07).abs() < 1e-9);
+
+        let c11 = ctxs.get(&11).unwrap();
+        assert!((c11.current_weight - 0.20).abs() < 1e-9);
+        assert!((c11.entry_r0_pct - 0.05).abs() < 1e-9);
+
+        let c12 = ctxs.get(&12).unwrap();
+        assert!((c12.current_weight - (-0.12)).abs() < 1e-9);
+        assert!((c12.entry_r0_pct - 0.0).abs() < 1e-9);
     }
 }

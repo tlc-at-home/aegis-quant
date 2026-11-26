@@ -5,7 +5,7 @@
 //! applies asymmetric exit hysteresis for held winners vs underwater losers,
 //! enforces single-asset (`0.15`) and gross leverage caps, and classifies `rebalance_action`.
 
-use crate::breadth::{RegimeGateConfig, RegimeGateState};
+use crate::breadth::{MarketRegime, RegimeGateConfig, RegimeGateState};
 use crate::carry_momentum::CarryMomentumMetrics;
 use crate::event_reversion::EventReversionMetrics;
 use crate::features::ExitConfirmState;
@@ -42,8 +42,20 @@ impl RiskTierLeverageExt for RiskTier {
 pub struct HysteresisConfig {
     pub min_rebalance_delta_weight: f64,
     pub early_loser_invalidation_enabled: bool,
+    #[serde(default = "default_early_loser_r0_mult")]
+    pub early_loser_r0_mult: f64,
+    #[serde(default = "default_early_loser_max_loss_pct")]
+    pub early_loser_max_loss_pct: f64,
     pub s1_reversal_mom_threshold: f64,
     pub s1_support_composite_threshold: f64,
+}
+
+fn default_early_loser_r0_mult() -> f64 {
+    0.25
+}
+
+fn default_early_loser_max_loss_pct() -> f64 {
+    0.009
 }
 
 impl Default for HysteresisConfig {
@@ -51,9 +63,31 @@ impl Default for HysteresisConfig {
         Self {
             min_rebalance_delta_weight: 0.025,
             early_loser_invalidation_enabled: true,
+            early_loser_r0_mult: 0.25,
+            early_loser_max_loss_pct: 0.009,
             s1_reversal_mom_threshold: 0.08,
             s1_support_composite_threshold: 0.025,
         }
+    }
+}
+
+/// Computes the fractional unrealized PnL hurdle (negative, e.g. `-0.009`) below which
+/// an underwater position qualifies for early-loser invalidation / hold-floor bypass.
+pub fn effective_early_loser_threshold(entry_r0_pct: f64, r0_mult: f64, max_loss_pct: f64) -> f64 {
+    let mult = if r0_mult.is_finite() {
+        r0_mult.clamp(0.05, 1.0)
+    } else {
+        0.25
+    };
+    let max_cap = if max_loss_pct.is_finite() {
+        max_loss_pct.clamp(0.003, 0.10)
+    } else {
+        0.009
+    };
+    if entry_r0_pct.is_finite() && entry_r0_pct > 1e-6 {
+        -((entry_r0_pct * mult).clamp(0.003, max_cap))
+    } else {
+        -0.003
     }
 }
 
@@ -63,6 +97,9 @@ pub struct HeldPositionContext {
     pub current_weight: f64,
     /// Fractional unrealized PnL (`(mark - entry) / entry * side.sign()`, e.g. `-0.003` = `-0.3%`, `+0.005` = `+0.5%`).
     pub unrealized_pnl_pct: f64,
+    /// Initial stop-loss distance as a fraction of entry price (`entry_r0 / entry_price`), 0.0 when unknown.
+    #[serde(default)]
+    pub entry_r0_pct: f64,
 }
 
 /// Parameter bundle for 2-arg [`apply_held_exit_hysteresis`] (`R14-L21`).
@@ -71,6 +108,7 @@ struct HeldHysteresisInput {
     unblocked_scaled_weight: f64,
     raw_combined_weight: f64,
     unrealized_pnl_pct: f64,
+    entry_r0_pct: f64,
     is_eligible: bool,
     has_signal_eval: bool,
     is_downward_flush: bool,
@@ -238,6 +276,10 @@ impl AllocatorConfig {
                 min_rebalance_delta_weight,
                 early_loser_invalidation_enabled: cfg
                     .get_bool("early_loser_invalidation_enabled", true),
+                early_loser_r0_mult: cfg.get_f64("early_loser_r0_mult", 0.25).clamp(0.05, 1.0),
+                early_loser_max_loss_pct: cfg
+                    .get_f64("early_loser_max_loss_pct", 0.009)
+                    .clamp(0.003, 0.10),
                 s1_reversal_mom_threshold: cfg
                     .get_f64("hysteresis_s1_reversal_mom_threshold", 0.08)
                     .clamp(0.01, 0.50),
@@ -454,9 +496,14 @@ fn apply_held_exit_hysteresis(
     }
 
     let s1_composite = 0.65 * input.s1_mom_score + 0.35 * input.s1_carry_score;
+    let loser_thresh = effective_early_loser_threshold(
+        input.entry_r0_pct,
+        cfg.early_loser_r0_mult,
+        cfg.early_loser_max_loss_pct,
+    );
     let is_loser = cfg.early_loser_invalidation_enabled
         && input.unrealized_pnl_pct.is_finite()
-        && input.unrealized_pnl_pct <= -0.003;
+        && input.unrealized_pnl_pct <= loser_thresh;
     let is_winner = cfg.early_loser_invalidation_enabled
         && input.unrealized_pnl_pct.is_finite()
         && input.unrealized_pnl_pct >= 0.005;
@@ -600,6 +647,7 @@ pub fn allocate_multi_sleeve_weights(
                 HeldPositionContext {
                     current_weight: w,
                     unrealized_pnl_pct: 0.0,
+                    ..Default::default()
                 },
             )
         })
@@ -758,9 +806,14 @@ pub(crate) fn allocate_multi_sleeve_weights_with_exit_confirm(
 
         let ctx = held_contexts.get(&asset.id).copied().unwrap_or_default();
         let cur_w = round_dp(ctx.current_weight, 4);
+        let loser_thresh = effective_early_loser_threshold(
+            ctx.entry_r0_pct,
+            cfg.hysteresis.early_loser_r0_mult,
+            cfg.hysteresis.early_loser_max_loss_pct,
+        );
         let is_loser = cfg.hysteresis.early_loser_invalidation_enabled
             && ctx.unrealized_pnl_pct.is_finite()
-            && ctx.unrealized_pnl_pct <= -0.003;
+            && ctx.unrealized_pnl_pct <= loser_thresh;
 
         // Lever N1: apply unified directional regime multiplier ONCE across sleeves,
         // protecting already-held non-loser winners from spurious partial-reduce churn.
@@ -806,14 +859,23 @@ pub(crate) fn allocate_multi_sleeve_weights_with_exit_confirm(
                 || asset.day_volume_usdc < MIN_FALLBACK_DAY_VOLUME_USDC);
         let hysteresis_eligible = asset_eligible && quality_ok && !ghost_zero_alpha;
 
-        let counter_regime_held = (cur_w > 0.0 && regime_gate.block_new_longs)
-            || (cur_w < 0.0 && regime_gate.block_new_shorts);
+        let sparse_universe_confirm = cfg.signal_exit_confirm_bars > 1
+            && regime_gate.eligible_coin_count > 0
+            && regime_gate.eligible_coin_count < 10;
+        let allow_counter_regime_emergency = !sparse_universe_confirm
+            || regime_gate.regime == MarketRegime::CapitulationShock
+            || regime_gate.breadth_bull >= 0.80
+            || regime_gate.breadth_bull <= 0.20;
+        let counter_regime_held = ((cur_w > 0.0 && regime_gate.block_new_longs)
+            || (cur_w < 0.0 && regime_gate.block_new_shorts))
+            && allow_counter_regime_emergency;
 
         let hyst_input = HeldHysteresisInput {
             cur_w,
             unblocked_scaled_weight,
             raw_combined_weight,
             unrealized_pnl_pct: ctx.unrealized_pnl_pct,
+            entry_r0_pct: ctx.entry_r0_pct,
             is_eligible: hysteresis_eligible,
             has_signal_eval: s1.is_some() || s2.is_some() || s3.is_some(),
             is_downward_flush,
@@ -1689,6 +1751,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: -0.005,
+                ..Default::default()
             },
         );
         let loser_out = allocate_multi_sleeve_weights_with_context(
@@ -1712,6 +1775,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.12,
                 unrealized_pnl_pct: 0.012,
+                ..Default::default()
             },
         );
         let winner_hold = allocate_multi_sleeve_weights_with_context(
@@ -1749,6 +1813,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: -0.12,
                 unrealized_pnl_pct: -0.005,
+                ..Default::default()
             },
         );
         s1.get_mut(&a.id).unwrap().s1_mom_score = 0.05;
@@ -1832,6 +1897,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: -0.06,
                 unrealized_pnl_pct: 0.0,
+                ..Default::default()
             },
         );
         let blocked_inc = allocate_multi_sleeve_weights_with_context(
@@ -1873,6 +1939,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.10,
                 unrealized_pnl_pct: 0.0,
+                ..Default::default()
             },
         );
         let flip_to_close = allocate_multi_sleeve_weights_with_context(
@@ -2033,6 +2100,7 @@ mod tests {
                     HeldPositionContext {
                         current_weight: 0.12,
                         unrealized_pnl_pct: 0.0,
+                        ..Default::default()
                     },
                 );
             }
@@ -2121,6 +2189,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.20,
                 unrealized_pnl_pct: 0.015, // winner: unthrottled = 0.259, throttled = 0.1295 < 0.20 -> HOLD at ~0.20!
+                ..Default::default()
             },
         );
         held.insert(
@@ -2128,6 +2197,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.20,
                 unrealized_pnl_pct: -0.010, // loser: throttled down to 0.1295 -> ACTION_REDUCE!
+                ..Default::default()
             },
         );
 
@@ -2181,6 +2251,7 @@ mod tests {
             HeldPositionContext {
                 current_weight: 0.15,
                 unrealized_pnl_pct: 0.0,
+                ..Default::default()
             },
         );
 
@@ -2301,6 +2372,257 @@ mod tests {
         assert!(
             (bull_gross - 0.888).abs() < 2e-3,
             "One-sided BULL_EXPANSION must retain 0.60 * G_0 = 0.888 without singularity collapse, got {bull_gross}"
+        );
+    }
+
+    #[test]
+    fn test_wave4_effective_early_loser_threshold_and_hysteresis_scaling() {
+        // 1. Unknown/zero entry_r0_pct falls back to -0.003
+        assert!((effective_early_loser_threshold(0.0, 0.25, 0.009) - (-0.003)).abs() < 1e-12);
+        assert!((effective_early_loser_threshold(f64::NAN, 0.25, 0.009) - (-0.003)).abs() < 1e-12);
+
+        // 2. Tight stop (1.0% * 0.25 = 0.25%) floors at -0.003
+        assert!((effective_early_loser_threshold(0.01, 0.25, 0.009) - (-0.003)).abs() < 1e-12);
+
+        // 3. Moderate stop (2.4% * 0.25 = 0.6%) scales linearly
+        assert!((effective_early_loser_threshold(0.024, 0.25, 0.009) - (-0.006)).abs() < 1e-12);
+
+        // 4. Wide 4h stop (7.0% * 0.25 = 1.75%) caps at -0.009 (or -0.018 when max_loss_pct = 0.018)
+        assert!((effective_early_loser_threshold(0.07, 0.25, 0.009) - (-0.009)).abs() < 1e-12);
+        assert!((effective_early_loser_threshold(0.07, 0.25, 0.018) - (-0.0175)).abs() < 1e-12);
+
+        // 5. Allocator respects R-scaled threshold: -0.55% noise on a 7% entry_r0 position
+        //    with mild support holds (not treated as invalidated early loser), whereas -1.0% closes.
+        let cfg = AllocatorConfig::default();
+        let a = test_asset(77, 10_000_000.0);
+        let mut s1 = HashMap::new();
+        s1.insert(
+            a.id,
+            CarryMomentumMetrics {
+                asset_id: a.id,
+                symbol: a.symbol.clone(),
+                annualized_vol: 0.65,
+                market_beta: 1.0,
+                s1_mom_score: -0.03,
+                s1_carry_score: 0.15, // composite = 0.65*(-0.03)+0.35*0.15 = +0.033 > 0.025 mild support!
+                w_s1_carry_mom: 0.0,
+                passes_quality: true,
+            },
+        );
+        let mut noise_held = HashMap::new();
+        noise_held.insert(
+            a.id,
+            HeldPositionContext {
+                current_weight: 0.15,
+                unrealized_pnl_pct: -0.0055,
+                entry_r0_pct: 0.07,
+            },
+        );
+        let out_noise = allocate_multi_sleeve_weights_with_context(
+            std::slice::from_ref(&a),
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &noise_held,
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        assert_eq!(out_noise[0].rebalance_action, ACTION_HOLD);
+
+        let mut deep_loss_held = HashMap::new();
+        deep_loss_held.insert(
+            a.id,
+            HeldPositionContext {
+                current_weight: 0.15,
+                unrealized_pnl_pct: -0.010, // <= -0.009 cap -> invalidated early loser!
+                entry_r0_pct: 0.07,
+            },
+        );
+        let out_loss = allocate_multi_sleeve_weights_with_context(
+            &[a],
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &deep_loss_held,
+            &[],
+            &RegimeGateState::default(),
+            &cfg,
+        );
+        assert_eq!(out_loss[0].rebalance_action, ACTION_CLOSE);
+    }
+
+    #[test]
+    fn test_wave4_sparse_universe_counter_regime_confirmation() {
+        let cfg = AllocatorConfig {
+            signal_exit_confirm_bars: 2,
+            ..AllocatorConfig::default()
+        };
+        let a_held_short = test_asset(1, 10_000_000.0);
+        let a_flat_short = test_asset(2, 10_000_000.0);
+        let a_held_long = test_asset(3, 10_000_000.0);
+        let assets = vec![
+            a_held_short.clone(),
+            a_flat_short.clone(),
+            a_held_long.clone(),
+        ];
+
+        let mut s1 = HashMap::new();
+        // Neutral signals on held assets (1 & 3) -> candidate ACTION_CLOSE; flat asset (2) wants SHORT -> BLOCKED
+        s1.insert(
+            1,
+            CarryMomentumMetrics {
+                asset_id: 1,
+                symbol: a_held_short.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: 0.0,
+                s1_carry_score: 0.0,
+                w_s1_carry_mom: 0.0,
+                passes_quality: true,
+            },
+        );
+        s1.insert(
+            2,
+            CarryMomentumMetrics {
+                asset_id: 2,
+                symbol: a_flat_short.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: -0.5,
+                s1_carry_score: -0.2,
+                w_s1_carry_mom: -0.08,
+                passes_quality: true,
+            },
+        );
+        s1.insert(
+            3,
+            CarryMomentumMetrics {
+                asset_id: 3,
+                symbol: a_held_long.symbol.clone(),
+                annualized_vol: 0.5,
+                market_beta: 1.0,
+                s1_mom_score: 0.0,
+                s1_carry_score: 0.0,
+                w_s1_carry_mom: 0.0,
+                passes_quality: true,
+            },
+        );
+
+        let mut held = HashMap::new();
+        held.insert(
+            1,
+            HeldPositionContext {
+                current_weight: -0.12,
+                unrealized_pnl_pct: 0.0,
+                ..Default::default()
+            },
+        );
+        held.insert(
+            3,
+            HeldPositionContext {
+                current_weight: 0.12,
+                unrealized_pnl_pct: 0.0,
+                ..Default::default()
+            },
+        );
+
+        // 1. Marginal 5/7 = 0.7143 (< 10 coins, < 0.80) bull breadth:
+        //    Blocks new counter-regime SHORT (asset 2 -> ACTION_REGIME_BLOCKED),
+        //    while held counter-regime SHORT (asset 1) waits for confirm_bars = 2!
+        let gate_5_of_7 = RegimeGateState {
+            breadth_bull: 5.0 / 7.0,
+            eligible_coin_count: 7,
+            regime_label: "BULL_EXPANSION".to_string(),
+            regime: MarketRegime::BullExpansion,
+            block_new_shorts: true,
+            block_new_longs: false,
+            ..RegimeGateState::default()
+        };
+        let mut confirm_map = HashMap::new();
+        let mut bar_ts = HashMap::from([(1, 1000), (2, 1000), (3, 1000)]);
+        let bar1 = allocate_multi_sleeve_weights_with_exit_confirm(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &gate_5_of_7,
+            &cfg,
+            &bar_ts,
+            &mut confirm_map,
+        );
+        assert_eq!(
+            bar1.iter()
+                .find(|s| s.asset_id == 2)
+                .unwrap()
+                .rebalance_action,
+            ACTION_REGIME_BLOCKED
+        );
+        assert_eq!(
+            bar1.iter()
+                .find(|s| s.asset_id == 1)
+                .unwrap()
+                .rebalance_action,
+            ACTION_HOLD,
+            "Marginal 5/7=0.7143 counter-regime close must wait for bar 2 confirmation"
+        );
+
+        // Bar 2 at newer timestamp confirms exit -> ACTION_CLOSE!
+        bar_ts.insert(1, 2000);
+        bar_ts.insert(3, 2000);
+        let bar2 = allocate_multi_sleeve_weights_with_exit_confirm(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &gate_5_of_7,
+            &cfg,
+            &bar_ts,
+            &mut confirm_map,
+        );
+        assert_eq!(
+            bar2.iter()
+                .find(|s| s.asset_id == 1)
+                .unwrap()
+                .rebalance_action,
+            ACTION_CLOSE
+        );
+
+        // 2. Extreme breadth <= 0.20 (e.g. 1/7 = 0.1429) on < 10 coins STILL bypasses bar 1 immediately!
+        let gate_bear_extreme = RegimeGateState {
+            breadth_bull: 1.0 / 7.0,
+            eligible_coin_count: 7,
+            regime_label: "BEAR_CONTRACTION".to_string(),
+            regime: MarketRegime::BearContraction,
+            block_new_shorts: false,
+            block_new_longs: true,
+            ..RegimeGateState::default()
+        };
+        let mut confirm_extreme = HashMap::new();
+        let bar1_extreme = allocate_multi_sleeve_weights_with_exit_confirm(
+            &assets,
+            &s1,
+            &HashMap::new(),
+            &HashMap::new(),
+            &held,
+            &[],
+            &gate_bear_extreme,
+            &cfg,
+            &bar_ts,
+            &mut confirm_extreme,
+        );
+        assert_eq!(
+            bar1_extreme
+                .iter()
+                .find(|s| s.asset_id == 3)
+                .unwrap()
+                .rebalance_action,
+            ACTION_CLOSE,
+            "Extreme <= 0.20 counter-regime held LONG must still bypass confirm_bars on bar 1"
         );
     }
 }

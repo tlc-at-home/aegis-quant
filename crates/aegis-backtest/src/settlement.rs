@@ -11,8 +11,9 @@ use aegis_risk::{
     StopEvaluationInput,
 };
 use aegis_signals::{
-    SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE, ACTION_COOLDOWN_BLOCKED, ACTION_FLIP,
-    ACTION_INCREASE, ACTION_OPEN_LONG, ACTION_OPEN_SHORT, ACTION_REDUCE, ACTION_REGIME_BLOCKED,
+    effective_early_loser_threshold, SignalCycleOutput, SleeveSignalInput, ACTION_CLOSE,
+    ACTION_COOLDOWN_BLOCKED, ACTION_FLIP, ACTION_INCREASE, ACTION_OPEN_LONG, ACTION_OPEN_SHORT,
+    ACTION_REDUCE, ACTION_REGIME_BLOCKED,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -811,6 +812,21 @@ pub fn execute_rebalance_actions(
     )
 }
 
+/// Computes the R-scaled fractional loss hurdle for early-loser hold bypass in walk-forward settlement.
+#[inline]
+fn position_early_loser_threshold(pos: &PositionRecord, r0_mult: f64, max_loss_pct: f64) -> f64 {
+    let entry_r0_pct = if pos.entry_r0.is_finite()
+        && pos.entry_r0 > 0.0
+        && pos.entry_price.is_finite()
+        && pos.entry_price > 0.0
+    {
+        pos.entry_r0 / pos.entry_price
+    } else {
+        0.0
+    };
+    effective_early_loser_threshold(entry_r0_pct, r0_mult, max_loss_pct)
+}
+
 /// Duration-aware variant of [`execute_rebalance_actions`] receiving exact `bar_duration_ms` from `run_walk_forward`.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_rebalance_actions_with_duration(
@@ -832,6 +848,8 @@ pub fn execute_rebalance_actions_with_duration(
         .min(config.allocator.max_single_asset_weight.max(1e-4));
     let min_hold_ms = config.min_position_hold_sec.max(0) * 1000;
     let early_loser_enabled = config.allocator.hysteresis.early_loser_invalidation_enabled;
+    let early_loser_r0_mult = config.allocator.hysteresis.early_loser_r0_mult;
+    let early_loser_max_loss_pct = config.allocator.hysteresis.early_loser_max_loss_pct;
     let eff_bar_duration_ms = bar_duration_ms.max(60_000);
     let bar_open_ts_ms = bar_close_ts_ms - eff_bar_duration_ms;
 
@@ -916,8 +934,13 @@ pub fn execute_rebalance_actions_with_duration(
                     let upnl_frac = ((asset.mark_price - pos.entry_price)
                         / pos.entry_price.max(1e-12))
                         * side.sign();
+                    let loser_thresh = position_early_loser_threshold(
+                        pos,
+                        early_loser_r0_mult,
+                        early_loser_max_loss_pct,
+                    );
                     let bypass_hold =
-                        early_loser_enabled && upnl_frac <= -0.003 && held_ms >= 120_000;
+                        early_loser_enabled && upnl_frac <= loser_thresh && held_ms >= 120_000;
                     if min_hold_ms > 0 && held_ms < min_hold_ms && !bypass_hold {
                         false
                     } else if config.profit_gate_signal_exits
@@ -1010,8 +1033,13 @@ pub fn execute_rebalance_actions_with_duration(
                     let upnl_frac = ((asset.mark_price - pos.entry_price)
                         / pos.entry_price.max(1e-12))
                         * side.sign();
+                    let loser_thresh = position_early_loser_threshold(
+                        &pos,
+                        early_loser_r0_mult,
+                        early_loser_max_loss_pct,
+                    );
                     let bypass_hold =
-                        early_loser_enabled && upnl_frac <= -0.003 && held_ms >= 120_000;
+                        early_loser_enabled && upnl_frac <= loser_thresh && held_ms >= 120_000;
                     if !(min_hold_ms > 0 && held_ms < min_hold_ms && !bypass_hold) {
                         let target_qty = if mid_ledger.total_equity_usdc > 1e-6 {
                             round_to_lot(

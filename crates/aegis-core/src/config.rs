@@ -398,6 +398,8 @@ pub fn default_v2_system_config_seeds(
         ("breadth_bull_block_shorts_threshold", "0.68", "float", "Bullish breadth threshold above which counter-regime short entries are blocked"),
         ("breadth_bear_block_longs_threshold", "0.32", "float", "Bearish breadth threshold below which counter-regime long entries are blocked"),
         ("early_loser_invalidation_enabled", "true", "bool", "Allow immediate exit of underwater losers on trend/momentum invalidation without holding full 900s floor"),
+        ("early_loser_r0_mult", "0.25", "float", "Fraction of initial entry_r0 stop distance required before early_loser_invalidation bypasses min_position_hold_sec (0.05-1.0)"),
+        ("early_loser_max_loss_pct", "0.009", "float", "Maximum fractional loss hurdle cap for early_loser_invalidation bypass (0.003-0.10)"),
         ("hysteresis_s1_reversal_mom_threshold", "0.08", "float", "Held-position S1 momentum reversal magnitude threshold"),
         ("hysteresis_s1_support_composite_threshold", "0.025", "float", "Held-position S1 composite support threshold"),
         ("protective_stop_atr_mult", "2.2", "float", "Protective trailing stop distance multiplier in ATR units"),
@@ -820,6 +822,12 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
         "hysteresis_s1_support_composite_threshold" => {
             parse_f64_bounded(clean_key, clean_val, 0.005, 0.25)?;
         }
+        "early_loser_r0_mult" => {
+            parse_f64_bounded(clean_key, clean_val, 0.05, 1.0)?;
+        }
+        "early_loser_max_loss_pct" => {
+            parse_f64_bounded(clean_key, clean_val, 0.003, 0.10)?;
+        }
         "risk_per_trade_equity_pct" => {
             parse_f64_bounded(clean_key, clean_val, 0.0, 0.05)?;
         }
@@ -1043,6 +1051,8 @@ mod tests {
         assert_eq!(find("stagnation_time_stop_hours"), Some("12.0"));
         assert_eq!(find("stagnation_min_mfe_r"), Some("0.35"));
         assert_eq!(find("early_loser_invalidation_enabled"), Some("true"));
+        assert_eq!(find("early_loser_r0_mult"), Some("0.25"));
+        assert_eq!(find("early_loser_max_loss_pct"), Some("0.009"));
         assert_eq!(find("hysteresis_s1_reversal_mom_threshold"), Some("0.08"));
         assert_eq!(
             find("hysteresis_s1_support_composite_threshold"),
@@ -1177,6 +1187,14 @@ mod tests {
         );
         assert!(validate_core_config_key_value("funding_entry_defer_window_sec", "3600").is_ok());
         assert!(validate_core_config_key_value("funding_entry_defer_window_sec", "3601").is_err());
+        assert!(validate_core_config_key_value("early_loser_r0_mult", "0.05").is_ok());
+        assert!(validate_core_config_key_value("early_loser_r0_mult", "1.0").is_ok());
+        assert!(validate_core_config_key_value("early_loser_r0_mult", "0.049").is_err());
+        assert!(validate_core_config_key_value("early_loser_r0_mult", "1.01").is_err());
+        assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.003").is_ok());
+        assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.10").is_ok());
+        assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.0029").is_err());
+        assert!(validate_core_config_key_value("early_loser_max_loss_pct", "0.101").is_err());
     }
 
     #[test]

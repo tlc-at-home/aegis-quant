@@ -3992,3 +3992,89 @@ fn test_merge_working_scale_in_into_open_and_paper_funding_idempotency() {
     let after_f2 = db.get_position_by_id(open_pid).unwrap().unwrap();
     assert!((after_f2.funding_accrued_usdc - (-1.56)).abs() < 1e-4);
 }
+
+#[test]
+fn test_wave4_proportional_portfolio_weight_scaling_across_partial_lifecycle() {
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = seed_test_asset(&db, "SOL", 5, 100.0);
+
+    // 1. Partial ALO fill promotion (requested 10.0, filled 4.0 => 40% weight scaling)
+    let pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "w4-partial-promote".to_string(),
+            side: OrderSide::Long,
+            limit_price: 100.0,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 500.0,
+            portfolio_weight: 0.20,
+            s1_weight_contrib: 0.12,
+            s2_weight_contrib: 0.08,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 92.0,
+            take_profit_px: Some(120.0),
+            exchange_order_id: Some("hl-w4-1".to_string()),
+            reason: "OPEN_LONG".to_string(),
+        })
+        .unwrap();
+    db.promote_working_to_open(
+        pid,
+        100.0,
+        4.0,
+        0.2,
+        92.0,
+        Some(120.0),
+        None,
+        "partial_fill",
+    )
+    .unwrap();
+    let promoted = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((promoted.portfolio_weight - 0.08).abs() < 1e-6);
+    assert!((promoted.s1_weight_contrib - 0.048).abs() < 1e-6);
+    assert!((promoted.s2_weight_contrib - 0.032).abs() < 1e-6);
+
+    // 2. Partial scale-in merge (requested 10.0, filled 5.0 => adds 50% of working weights)
+    let inc_pid = db
+        .create_working_order(&WorkingOrderInput {
+            asset_id: sol_id,
+            client_order_id: "w4-partial-scalein".to_string(),
+            side: OrderSide::Long,
+            limit_price: 102.0,
+            requested_quantity: 10.0,
+            reserved_margin_usdc: 500.0,
+            portfolio_weight: 0.10,
+            s1_weight_contrib: 0.06,
+            s2_weight_contrib: 0.04,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 92.0,
+            take_profit_px: None,
+            exchange_order_id: Some("hl-w4-2".to_string()),
+            reason: "INCREASE".to_string(),
+        })
+        .unwrap();
+    db.merge_working_scale_in_into_open(
+        inc_pid,
+        pid,
+        102.0,
+        5.0,
+        0.2,
+        Some("hl-w4-2"),
+        "INCREASE_PARTIAL",
+    )
+    .unwrap();
+    let merged = db.get_position_by_id(pid).unwrap().unwrap();
+    // 0.08 + 0.10*0.5 = 0.13; s1: 0.048 + 0.03 = 0.078; s2: 0.032 + 0.02 = 0.052; qty = 9.0
+    assert!((merged.filled_quantity - 9.0).abs() < 1e-6);
+    assert!((merged.portfolio_weight - 0.13).abs() < 1e-6);
+    assert!((merged.s1_weight_contrib - 0.078).abs() < 1e-6);
+    assert!((merged.s2_weight_contrib - 0.052).abs() < 1e-6);
+
+    // 3. Partial position exit (9.0 -> 3.0 remaining => 1/3 scaling)
+    db.record_partial_position_exit(pid, 6.0, 3.0, 105.0, 0.3, "REDUCE")
+        .unwrap();
+    let reduced = db.get_position_by_id(pid).unwrap().unwrap();
+    assert!((reduced.filled_quantity - 3.0).abs() < 1e-6);
+    assert!((reduced.portfolio_weight - 0.0433).abs() < 1e-4);
+    assert!((reduced.s1_weight_contrib - 0.026).abs() < 1e-4);
+    assert!((reduced.s2_weight_contrib - 0.0173).abs() < 1e-4);
+}

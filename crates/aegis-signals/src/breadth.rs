@@ -226,6 +226,23 @@ pub fn compute_regime_gate_state(
     }
 }
 
+/// Anchors 24h breadth on closed-bar price unless live `mark_price` diverged `>= 3.5%` intra-bar.
+#[inline]
+pub(crate) fn effective_breadth_anchor_price(mark_price: f64, last_bar_close: Option<f64>) -> f64 {
+    if let Some(close) = last_bar_close.filter(|c| c.is_finite() && *c > 0.0) {
+        if mark_price.is_finite() && mark_price > 0.0 && (mark_price - close).abs() / close >= 0.035
+        {
+            mark_price
+        } else {
+            close
+        }
+    } else if mark_price.is_finite() && mark_price > 0.0 {
+        mark_price
+    } else {
+        0.0
+    }
+}
+
 /// Computes preliminary cross-sectional bullish breadth fraction in `[0.0, 1.0]` before Sleeve 2 runs.
 pub fn compute_preliminary_bull_breadth<B: AsRef<[OhlcvBar]>>(
     assets: &[ExchangeAsset],
@@ -252,11 +269,10 @@ pub fn compute_preliminary_bull_breadth<B: AsRef<[OhlcvBar]>>(
                 let first = bars[bars.len().saturating_sub(lookback_24h)]
                     .close
                     .max(1e-12);
-                let last = if asset.mark_price.is_finite() && asset.mark_price > 0.0 {
-                    asset.mark_price
-                } else {
-                    bars[bars.len() - 1].close
-                };
+                let last = effective_breadth_anchor_price(
+                    asset.mark_price,
+                    Some(bars[bars.len() - 1].close),
+                );
                 if last > first * 1.002 {
                     bull_count += 1.0;
                 } else if (last - first).abs() / first <= 0.002 {
@@ -652,5 +668,54 @@ mod tests {
         let (b_1h, cnt) = compute_preliminary_bull_breadth(&[a], &map);
         assert_eq!(cnt, 1);
         assert!((b_1h - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_wave4_closed_bar_breadth_anchors_on_close_below_3_5pct_and_tracks_spike() {
+        use crate::features::{BarCloseCache, CycleFeatureCache};
+
+        // Closed bars end at 100.1 (+0.1% vs first=100.0 => flat 0.50 breadth).
+        // Live mark at 103.0 (+2.897% vs close=100.1, < 3.5%) must stay anchored to 100.1 -> 0.50!
+        let mut a_mild = mk_asset(201, "MILD", 103.0, 100.0, 0.0, 5_000_000.0, true);
+        let mut map = HashMap::new();
+        map.insert(201, mk_bars(201, &[100.0, 100.0, 100.0, 100.0, 100.1]));
+
+        let (b_mild, cnt_mild) =
+            compute_preliminary_bull_breadth(std::slice::from_ref(&a_mild), &map);
+        assert_eq!(cnt_mild, 1);
+        assert!(
+            (b_mild - 0.50).abs() < 1e-9,
+            "Intra-bar move < 3.5% must keep closed-bar breadth anchored at 0.50, got {b_mild}"
+        );
+        let mut bar_cache = BarCloseCache::new();
+        let feat_mild = CycleFeatureCache::build_with_options(
+            std::slice::from_ref(&a_mild),
+            &map,
+            &mut bar_cache,
+            true,
+        );
+        assert!((feat_mild.prelim_breadth_bull - b_mild).abs() < 1e-9);
+
+        // Live mark at 103.7 (+3.596% vs close=100.1, >= 3.5%) must switch to mark_price -> 1.0!
+        a_mild.mark_price = 103.7;
+        let (b_spike, _) = compute_preliminary_bull_breadth(std::slice::from_ref(&a_mild), &map);
+        assert!(
+            (b_spike - 1.0).abs() < 1e-9,
+            "Intra-bar spike >= 3.5% must switch breadth anchor to live mark -> 1.0, got {b_spike}"
+        );
+        let feat_spike =
+            CycleFeatureCache::build_with_options(&[a_mild], &map, &mut bar_cache, true);
+        assert!((feat_spike.prelim_breadth_bull - b_spike).abs() < 1e-9);
+
+        // Downward flash crash >= 3.5% (-3.6% below close=100.1 -> 96.4) must flip bearish -> 0.0!
+        let a_crash = mk_asset(202, "CRASH", 96.4, 100.0, 0.0, 5_000_000.0, true);
+        let mut map_crash = HashMap::new();
+        map_crash.insert(202, mk_bars(202, &[100.0, 100.0, 100.0, 100.0, 100.1]));
+        let (b_crash, _) =
+            compute_preliminary_bull_breadth(std::slice::from_ref(&a_crash), &map_crash);
+        assert!((b_crash - 0.0).abs() < 1e-9);
+        let feat_crash =
+            CycleFeatureCache::build_with_options(&[a_crash], &map_crash, &mut bar_cache, true);
+        assert!((feat_crash.prelim_breadth_bull - b_crash).abs() < 1e-9);
     }
 }

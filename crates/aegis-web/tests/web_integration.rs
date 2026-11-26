@@ -4552,7 +4552,7 @@ async fn test_web_risk_tier_switch_and_config_sync_with_override_preservation() 
                 .uri("/api/v1/config")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"updates":{"signal_timeframe":"1h","max_portfolio_heat_pct":"0.18","wall_clock_normalize_indicators":false,"max_entries_per_bar":4,"maker_only_rest_ttl_ms":30000}}"#,
+                    r#"{"updates":{"signal_timeframe":"1h","max_portfolio_heat_pct":"0.18","wall_clock_normalize_indicators":false,"max_entries_per_bar":4,"maker_only_rest_ttl_ms":30000,"early_loser_r0_mult":"0.30","early_loser_max_loss_pct":"0.018"}}"#,
                 ))
                 .unwrap(),
         )
@@ -4565,11 +4565,15 @@ async fn test_web_risk_tier_switch_and_config_sync_with_override_preservation() 
     assert!(!cfg_new.get_bool("wall_clock_normalize_indicators", true));
     assert_eq!(cfg_new.get_i64("max_entries_per_bar", 0), 4);
     assert_eq!(cfg_new.get_i64("maker_only_rest_ttl_ms", 0), 30_000);
+    assert!((cfg_new.get_f64("early_loser_r0_mult", 0.0) - 0.30).abs() < 1e-6);
+    assert!((cfg_new.get_f64("early_loser_max_loss_pct", 0.0) - 0.018).abs() < 1e-6);
 
     for bad_payload in [
         r#"{"config_key":"signal_timeframe","config_value":"30m"}"#,
         r#"{"config_key":"max_portfolio_heat_pct","config_value":"1.5"}"#,
         r#"{"config_key":"signal_exit_confirm_bars","config_value":"9"}"#,
+        r#"{"config_key":"early_loser_r0_mult","config_value":"0.01"}"#,
+        r#"{"config_key":"early_loser_max_loss_pct","config_value":"0.20"}"#,
     ] {
         let bad_res = app
             .clone()
