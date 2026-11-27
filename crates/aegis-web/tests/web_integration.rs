@@ -2734,6 +2734,7 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
                 ],
                 vlm: 83291.08,
             },
+            ..Default::default()
         };
         mgr.set_config_value(
             "live_exchange_portfolio_pnl_json",
@@ -2785,9 +2786,17 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
         (body["pnl_summary"]["daily"]["net_pnl_usdc"]
             .as_f64()
             .unwrap()
-            - 242.70)
+            - 232.99)
             .abs()
-            < 1e-6
+            < 0.05
+    );
+    assert!(
+        (body["pnl_summary"]["daily"]["unrealized_pnl_usdc"]
+            .as_f64()
+            .unwrap()
+            - 0.0)
+            .abs()
+            < 1e-9
     );
     assert_eq!(body["pnl_summary"]["daily"]["is_cap_clamped"], false);
     assert_eq!(body["pnl_summary"]["weekly"]["pnl_source"], "HL_PORTFOLIO");
@@ -2799,6 +2808,14 @@ async fn test_web_unified_account_equity_basis_and_hl_portfolio_pnl() {
             - 562.52)
             .abs()
             < 1e-4
+    );
+    assert!(
+        (body["pnl_summary"]["weekly"]["unrealized_pnl_usdc"]
+            .as_f64()
+            .unwrap()
+            - 0.0)
+            .abs()
+            < 1e-9
     );
 }
 

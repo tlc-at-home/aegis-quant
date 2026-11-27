@@ -196,7 +196,9 @@ function renderHealthAndTopBar(health, dash) {
 
 function renderPnlHorizonRibbon(dash, force = false) {
   const summary = (dash && dash.pnl_summary) || {};
-  const fallbackUpnl = ((dash && dash.v_assets_held) || []).reduce(
+  const heldAssets = Array.isArray(dash?.v_assets_held) ? dash.v_assets_held : [];
+  const hasOpenHoldings = heldAssets.length > 0;
+  const fallbackUpnl = heldAssets.reduce(
     (acc, heldItem) => acc + (toFiniteNumber(heldItem.unrealized_pnl_usdc) ?? 0),
     0
   );
@@ -206,7 +208,13 @@ function renderPnlHorizonRibbon(dash, force = false) {
     0;
   const capEpochMs = Number(dash?.risk_capital_cap_updated_at_ms ?? 0);
 
-  const fp = computeFingerprint([summary, fallbackUpnl.toFixed(2), totalEq.toFixed(2), capEpochMs]);
+  const fp = computeFingerprint([
+    summary,
+    hasOpenHoldings,
+    fallbackUpnl.toFixed(2),
+    totalEq.toFixed(2),
+    capEpochMs,
+  ]);
   if (!force && !isSectionDirty('pnl-ribbon', fp)) return;
 
   const paintHorizon = (key, defaultObj) => {
@@ -215,7 +223,8 @@ function renderPnlHorizonRibbon(dash, force = false) {
     const retPct =
       toFiniteNumber(hz.return_pct) ?? (totalEq > 0 ? (netPnl / totalEq) * 100.0 : 0.0);
     const rpnl = toFiniteNumber(hz.realized_pnl_usdc) ?? 0;
-    const upnl = toFiniteNumber(hz.unrealized_pnl_usdc) ?? fallbackUpnl;
+    const upnl = hasOpenHoldings ? (toFiniteNumber(hz.unrealized_pnl_usdc) ?? fallbackUpnl) : 0;
+    const m2mCarry = toFiniteNumber(hz.m2m_carry_usdc) ?? netPnl - rpnl - upnl;
     const trades = Number(hz.trade_count ?? 0);
     const wins = Number(hz.win_count ?? 0);
     const winStartMs = Number(hz.window_start_ms ?? 0);
@@ -240,11 +249,9 @@ function renderPnlHorizonRibbon(dash, force = false) {
     if (sourceEl) {
       if (String(hz.pnl_source || '').toUpperCase() === 'HL_PORTFOLIO') {
         sourceEl.textContent = 'HL Perps';
-        sourceEl.setAttribute('aria-label', 'Hyperliquid Perps exchange-reconciled PnL');
         sourceEl.hidden = false;
       } else {
         sourceEl.textContent = '';
-        sourceEl.removeAttribute('aria-label');
         sourceEl.hidden = true;
       }
     }
@@ -271,21 +278,29 @@ function renderPnlHorizonRibbon(dash, force = false) {
     if (subEl) {
       const tradeStr =
         trades > 0 ? `${trades} Trades (${wins}W)` : '0 Closed · Live Mark';
-      subEl.replaceChildren(
-        h(
-          'span',
-          null,
-          'Realized: ',
+      const breakdownParts = [
+        'Realized: ',
+        h('span', {
+          className: `pnl-inline-val ${pnlToneClass(rpnl)}`,
+          text: fmtSignedUsd(rpnl),
+        }),
+        ' · Unrealized: ',
+        h('span', {
+          className: `pnl-inline-val ${pnlToneClass(upnl)}`,
+          text: fmtSignedUsd(upnl),
+        }),
+      ];
+      if (Math.abs(m2mCarry) >= 0.01) {
+        breakdownParts.push(
+          ' · Prior M2M: ',
           h('span', {
-            className: `pnl-inline-val ${pnlToneClass(rpnl)}`,
-            text: fmtSignedUsd(rpnl),
-          }),
-          ' · Unrealized: ',
-          h('span', {
-            className: `pnl-inline-val ${pnlToneClass(upnl)}`,
-            text: fmtSignedUsd(upnl),
+            className: `pnl-inline-val ${pnlToneClass(m2mCarry)}`,
+            text: fmtSignedUsd(m2mCarry),
           })
-        ),
+        );
+      }
+      subEl.replaceChildren(
+        h('span', null, ...breakdownParts),
         h('span', { text: tradeStr })
       );
     }
@@ -295,6 +310,7 @@ function renderPnlHorizonRibbon(dash, force = false) {
     net_pnl_usdc: fallbackUpnl,
     realized_pnl_usdc: 0,
     unrealized_pnl_usdc: fallbackUpnl,
+    m2m_carry_usdc: 0,
     trade_count: 0,
     win_count: 0,
   };

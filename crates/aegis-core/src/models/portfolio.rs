@@ -16,6 +16,8 @@ pub struct PnlHorizonMetrics {
     pub return_pct: f64,
     pub realized_pnl_usdc: f64,
     pub unrealized_pnl_usdc: f64,
+    #[serde(default)]
+    pub m2m_carry_usdc: f64,
     pub fees_funding_usdc: f64,
     pub trade_count: usize,
     pub win_count: usize,
@@ -43,7 +45,7 @@ pub struct HlPortfolioWindowCache {
     pub vlm: f64,
 }
 
-/// Cached Hyperliquid `portfolio` perp PnL histories persisted by reconciler (`live_exchange_portfolio_pnl_json`).
+/// Cached Hyperliquid `portfolio` perp and unified-account PnL histories persisted by reconciler (`live_exchange_portfolio_pnl_json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CachedHlPortfolioPnl {
     #[serde(default)]
@@ -56,6 +58,14 @@ pub struct CachedHlPortfolioPnl {
     pub perp_month: HlPortfolioWindowCache,
     #[serde(default)]
     pub perp_all_time: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub account_day: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub account_week: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub account_month: HlPortfolioWindowCache,
+    #[serde(default)]
+    pub account_all_time: HlPortfolioWindowCache,
 }
 
 impl CachedHlPortfolioPnl {
@@ -93,24 +103,23 @@ impl CachedHlPortfolioPnl {
         None
     }
 
-    /// Resolves `(net_pnl_usdc, window_start_ms, is_cap_clamped)` for `"daily"`, `"weekly"`, `"monthly"`, or `"ytd"`.
-    pub fn horizon_net_pnl(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_series_horizon_pnl(
+        synced_at_ms: i64,
+        day: &HlPortfolioWindowCache,
+        week: &HlPortfolioWindowCache,
+        month: &HlPortfolioWindowCache,
+        all_time: &HlPortfolioWindowCache,
         horizon: &str,
         raw_start_ms: i64,
         cap_updated_at_ms: i64,
     ) -> Option<(f64, i64, bool)> {
         let is_cap_clamped = cap_updated_at_ms > 0 && cap_updated_at_ms > raw_start_ms;
         if is_cap_clamped {
-            if self.synced_at_ms < cap_updated_at_ms {
+            if synced_at_ms < cap_updated_at_ms {
                 return None;
             }
-            let candidates = [
-                &self.perp_day,
-                &self.perp_week,
-                &self.perp_month,
-                &self.perp_all_time,
-            ];
+            let candidates = [day, week, month, all_time];
             let series = candidates
                 .iter()
                 .copied()
@@ -119,9 +128,7 @@ impl CachedHlPortfolioPnl {
                         .first()
                         .is_some_and(|&(first_ts, _)| first_ts <= cap_updated_at_ms)
                 })
-                .or_else(|| {
-                    (!self.perp_all_time.pnl_history.is_empty()).then_some(&self.perp_all_time)
-                })?;
+                .or_else(|| (!all_time.pnl_history.is_empty()).then_some(all_time))?;
             let (_, last_pnl) = *series.pnl_history.last()?;
             let cap_pnl = Self::interpolate_series_pnl(&series.pnl_history, cap_updated_at_ms)?;
             let net = last_pnl - cap_pnl;
@@ -129,10 +136,10 @@ impl CachedHlPortfolioPnl {
         }
 
         let series = match horizon {
-            "daily" => &self.perp_day,
-            "weekly" => &self.perp_week,
-            "monthly" => &self.perp_month,
-            "ytd" => &self.perp_all_time,
+            "daily" => day,
+            "weekly" => week,
+            "monthly" => month,
+            "ytd" => all_time,
             _ => return None,
         };
         let &(first_ts, first_pnl) = series.pnl_history.first()?;
@@ -140,13 +147,66 @@ impl CachedHlPortfolioPnl {
         if !first_pnl.is_finite() || !last_pnl.is_finite() {
             return None;
         }
-        if horizon == "ytd" && first_ts < raw_start_ms {
+        if first_ts < raw_start_ms {
             let start_pnl = Self::interpolate_series_pnl(&series.pnl_history, raw_start_ms)?;
             let net = last_pnl - start_pnl;
             return net.is_finite().then_some((net, raw_start_ms, false));
         }
         let net = last_pnl - first_pnl;
         net.is_finite().then_some((net, first_ts, false))
+    }
+
+    /// Resolves `(net_pnl_usdc, window_start_ms, is_cap_clamped)` for `"daily"`, `"weekly"`, `"monthly"`, or `"ytd"` from perp series.
+    pub fn horizon_net_pnl(
+        &self,
+        horizon: &str,
+        raw_start_ms: i64,
+        cap_updated_at_ms: i64,
+    ) -> Option<(f64, i64, bool)> {
+        Self::resolve_series_horizon_pnl(
+            self.synced_at_ms,
+            &self.perp_day,
+            &self.perp_week,
+            &self.perp_month,
+            &self.perp_all_time,
+            horizon,
+            raw_start_ms,
+            cap_updated_at_ms,
+        )
+    }
+
+    /// Resolves `(net_pnl_usdc, window_start_ms, is_cap_clamped)` choosing unified-account series (minus `vault_window_pnl_usdc`) when `prefer_unified_account` is set and populated, otherwise falling back to `perp_*` without vault subtraction.
+    pub fn horizon_net_pnl_for_mode(
+        &self,
+        horizon: &str,
+        raw_start_ms: i64,
+        cap_updated_at_ms: i64,
+        prefer_unified_account: bool,
+        vault_window_pnl_usdc: f64,
+    ) -> Option<(f64, i64, bool)> {
+        if prefer_unified_account {
+            if let Some((raw_net, win_ts, clamped)) = Self::resolve_series_horizon_pnl(
+                self.synced_at_ms,
+                &self.account_day,
+                &self.account_week,
+                &self.account_month,
+                &self.account_all_time,
+                horizon,
+                raw_start_ms,
+                cap_updated_at_ms,
+            ) {
+                let vault_adj = if vault_window_pnl_usdc.is_finite() {
+                    vault_window_pnl_usdc
+                } else {
+                    0.0
+                };
+                let net = raw_net - vault_adj;
+                if net.is_finite() {
+                    return Some((net, win_ts, clamped));
+                }
+            }
+        }
+        self.horizon_net_pnl(horizon, raw_start_ms, cap_updated_at_ms)
     }
 }
 
@@ -694,6 +754,7 @@ mod tests {
                 pnl_history: all_pts,
                 vlm: 83291.0,
             },
+            ..Default::default()
         };
 
         assert!(cache.is_fresh(1_100_000, 600_000));
@@ -704,6 +765,13 @@ mod tests {
         assert!(!daily_clamped);
         assert_eq!(daily_ts, 1_000_000);
         assert!((daily_net - 242.70).abs() < 1e-6);
+
+        // When perpDay starts earlier than raw_start_ms, daily interpolates at raw_start_ms.
+        let (interp_day_net, interp_day_ts, interp_day_clamped) =
+            cache.horizon_net_pnl("daily", 1_043_200, 750_000).unwrap();
+        assert!(!interp_day_clamped);
+        assert_eq!(interp_day_ts, 1_043_200);
+        assert!((interp_day_net - 121.35).abs() < 1e-6);
 
         let (wk_net, wk_ts, wk_clamped) =
             cache.horizon_net_pnl("weekly", 400_000, 750_000).unwrap();
@@ -721,6 +789,34 @@ mod tests {
         assert!((ytd_net - 387.50).abs() < 1e-6);
 
         assert!(cache.horizon_net_pnl("monthly", 400_000, 0).is_none());
+
+        // Falling back to perp_* when account_* is empty does NOT subtract vault_window_pnl_usdc.
+        let (fb_net, _, _) = cache
+            .horizon_net_pnl_for_mode("daily", 1_000_000, 0, true, 12.50)
+            .unwrap();
+        assert!((fb_net - 242.70).abs() < 1e-6);
+
+        // With account_* populated in unifiedAccount mode, vault PnL is subtracted cleanly.
+        let mut unified_cache = cache.clone();
+        unified_cache.account_day = HlPortfolioWindowCache {
+            pnl_history: vec![(900_000, 0.0), (1_000_000, 10.0), (1_086_400, 260.0)],
+            vlm: 1412.91,
+        };
+        unified_cache.account_all_time = HlPortfolioWindowCache {
+            pnl_history: vec![(100_000, 0.0), (1_086_400, 480.0)],
+            vlm: 83291.0,
+        };
+        let (uni_day_net, uni_day_ts, _) = unified_cache
+            .horizon_net_pnl_for_mode("daily", 1_000_000, 0, true, 5.0)
+            .unwrap();
+        assert_eq!(uni_day_ts, 1_000_000);
+        assert!((uni_day_net - 245.0).abs() < 1e-6);
+
+        // In default perp mode (prefer_unified_account = false), perp_* is used unchanged.
+        let (def_day_net, _, _) = unified_cache
+            .horizon_net_pnl_for_mode("daily", 1_000_000, 0, false, 5.0)
+            .unwrap();
+        assert!((def_day_net - 242.70).abs() < 1e-6);
     }
 
     #[test]

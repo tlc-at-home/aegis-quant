@@ -4572,16 +4572,19 @@ fn test_unified_account_equity_no_double_count_and_hl_portfolio_pnl_sync() {
     assert!((snap.total_equity_usdc - 1000.0).abs() < 1e-6);
     assert!((snap.available_cash_usdc - 1000.0).abs() < 1e-6);
 
-    // Hybrid HL portfolio PnL: daily = 242.70 (HL_PORTFOLIO), weekly clamped = 562.52
+    // Hybrid HL portfolio PnL: daily interpolated to exact 24h window (HL_PORTFOLIO), weekly clamped = 562.52,
+    // and with 0 OPEN positions, unrealized_pnl_usdc == 0.0 on all horizons.
     let pnl = db
         .compute_pnl_summary(0.0, 0.0, snap.total_equity_usdc)
         .unwrap();
     assert_eq!(pnl.daily.pnl_source, "HL_PORTFOLIO");
-    assert!((pnl.daily.net_pnl_usdc - 242.70).abs() < 1e-6);
+    assert!((pnl.daily.net_pnl_usdc - 232.99).abs() < 0.05);
+    assert!((pnl.daily.unrealized_pnl_usdc - 0.0).abs() < 1e-9);
     assert!(!pnl.daily.is_cap_clamped);
     assert_eq!(pnl.weekly.pnl_source, "HL_PORTFOLIO");
     assert!(pnl.weekly.is_cap_clamped);
     assert!((pnl.weekly.net_pnl_usdc - 562.52).abs() < 1e-4);
+    assert!((pnl.weekly.unrealized_pnl_usdc - 0.0).abs() < 1e-9);
 }
 
 #[test]

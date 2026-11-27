@@ -2194,6 +2194,11 @@ impl DatabaseManager {
                            funding_accrued_usdc = :funding,
                            exchange_order_id = COALESCE(NULLIF(TRIM(exchange_order_id), ''), :eoid),
                            opened_at_ms = CASE
+                               WHEN opened_at_ms IS NOT NULL
+                                    AND created_at_ms > 0
+                                    AND ABS(opened_at_ms - created_at_ms) <= 3600000
+                                    AND :cts < created_at_ms - 60000
+                               THEN opened_at_ms
                                WHEN :cts > 0 THEN LEAST(COALESCE(opened_at_ms, :cts), :cts)
                                ELSE opened_at_ms
                            END,

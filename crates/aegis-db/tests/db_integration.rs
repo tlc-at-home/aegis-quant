@@ -2103,6 +2103,7 @@ fn test_pnl_summary_ignores_zero_volume_stale_candles_and_applies_hl_portfolio_c
             ],
             vlm: 83291.0,
         },
+        ..Default::default()
     };
     db.set_config_value(
         "live_exchange_portfolio_pnl_json",
@@ -2111,7 +2112,7 @@ fn test_pnl_summary_ignores_zero_volume_stale_candles_and_applies_hl_portfolio_c
     )
     .unwrap();
 
-    // Closed trade 2h ago (+12.00 realized) verifies unrealized = net - realized identity
+    // Closed trade 2h ago (+12.00 realized) verifies exact 24h interpolation + live unrealized + Prior M2M additive identity
     db.reconcile_closed_positions_from_exchange_fills(&[ReconciledClosedTradeInput {
         asset_id: met_id,
         client_order_id: "hl-closed-met-2h".to_string(),
@@ -2133,9 +2134,19 @@ fn test_pnl_summary_ignores_zero_volume_stale_candles_and_applies_hl_portfolio_c
     let hl_summary = db.compute_pnl_summary(-418.69, 698.08, 679.15).unwrap();
     assert_eq!(hl_summary.daily.pnl_source, "HL_PORTFOLIO");
     assert!(!hl_summary.daily.is_cap_clamped);
-    assert!((hl_summary.daily.net_pnl_usdc - 242.70).abs() < 1e-6);
+    // perp_day starts 30m before now - 24h, so exact 24h interpolation yields 242.70 * 86_400_000 / 88_200_000 ≈ 237.75
+    assert!((hl_summary.daily.net_pnl_usdc - 237.75).abs() < 0.05);
     assert!((hl_summary.daily.realized_pnl_usdc - 12.0).abs() < 1e-6);
-    assert!((hl_summary.daily.unrealized_pnl_usdc - 230.70).abs() < 1e-6);
+    assert!((hl_summary.daily.unrealized_pnl_usdc - 279.39).abs() < 1e-6);
+    assert!(
+        (hl_summary.daily.realized_pnl_usdc
+            + hl_summary.daily.unrealized_pnl_usdc
+            + hl_summary.daily.m2m_carry_usdc
+            - hl_summary.daily.net_pnl_usdc)
+            .abs()
+            < 1e-6
+    );
+    assert!((hl_summary.daily.m2m_carry_usdc - (-53.64)).abs() < 0.05);
 
     // Weekly clamped at three_days_ago sits halfway between (-100) and (-300) => -200 => delta = 362.52 - (-200) = 562.52
     assert_eq!(hl_summary.weekly.pnl_source, "HL_PORTFOLIO");
@@ -4610,4 +4621,189 @@ fn test_r14_w3_partial_reduce_single_booking_scale_in_zero_and_close_parity() {
     let scale_child_after = db.get_position_by_id(scale_pid).unwrap().unwrap();
     assert!((scale_child_after.realized_pnl_usdc - 0.0).abs() < 1e-9);
     assert!((scale_child_after.fees_paid_usdc - 0.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_pnl_summary_flat_account_zero_unrealized_and_unified_vault_exclusion() {
+    use aegis_core::{
+        CachedHlPortfolioPnl, HlPortfolioWindowCache, VaultInfoPayload, VaultPositionInfo,
+    };
+
+    let db = DatabaseManager::new_isolated_test(None).expect("isolated test DB");
+    let sol_id = seed_test_asset(&db, "SOL", 1, 70.0);
+    let eth_id = seed_test_asset(&db, "ETH", 2, 1700.0);
+    let now = now_ms();
+    let day_ms = 86_400_000i64;
+
+    db.set_config_value("execution_mode", "TESTNET", None)
+        .unwrap();
+    db.set_config_value("live_exchange_account_mode", "unifiedAccount", None)
+        .unwrap();
+    db.set_config_value("risk_capital_cap_updated_at_ms", "0", None)
+        .unwrap();
+
+    // Closed trades:
+    // 1) Boundary-crossing trade opened 36h ago and closed 2h ago (+10.00): crosses 24h start,
+    //    so daily has boundary_crossing_cnt = 1 (flat now, but carried prior-window M2M),
+    //    whereas weekly/monthly/ytd are strictly flat-to-flat (boundary_crossing_cnt = 0).
+    // 2) Intra-day trade opened 4h ago and closed 1h ago (-2.50).
+    db.reconcile_closed_positions_from_exchange_fills(&[
+        ReconciledClosedTradeInput {
+            asset_id: sol_id,
+            client_order_id: "hl-closed-sol-cross24h".to_string(),
+            exchange_order_id: "hl-sol-cross".to_string(),
+            close_epoch_id: None,
+            side: OrderSide::Long,
+            entry_price: 68.0,
+            exit_price: 70.0,
+            filled_quantity: 5.0,
+            realized_pnl_usdc: 10.0,
+            fees_paid_usdc: 0.10,
+            funding_accrued_usdc: 0.20,
+            created_at_ms: now - 36 * 3_600_000,
+            closed_at_ms: now - 2 * 3_600_000,
+            exit_reason: "CLOSE".to_string(),
+        },
+        ReconciledClosedTradeInput {
+            asset_id: eth_id,
+            client_order_id: "hl-closed-eth-intraday".to_string(),
+            exchange_order_id: "hl-eth-intra".to_string(),
+            close_epoch_id: None,
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            exit_price: 1702.5,
+            filled_quantity: 1.0,
+            realized_pnl_usdc: -2.50,
+            fees_paid_usdc: 0.05,
+            funding_accrued_usdc: 0.0,
+            created_at_ms: now - 4 * 3_600_000,
+            closed_at_ms: now - 3_600_000,
+            exit_reason: "CLOSE".to_string(),
+        },
+    ])
+    .unwrap();
+
+    // Verify opened_at_ms guard against synthetic paginated pre-history timestamps:
+    // re-reconciling SOL with created_at_ms far earlier (< created_at_ms - 60s) must keep opened_at_ms intact.
+    db.reconcile_closed_positions_from_exchange_fills(&[ReconciledClosedTradeInput {
+        asset_id: sol_id,
+        client_order_id: "hl-closed-sol-cross24h".to_string(),
+        exchange_order_id: "hl-sol-cross".to_string(),
+        close_epoch_id: None,
+        side: OrderSide::Long,
+        entry_price: 68.0,
+        exit_price: 70.0,
+        filled_quantity: 5.0,
+        realized_pnl_usdc: 10.0,
+        fees_paid_usdc: 0.10,
+        funding_accrued_usdc: 0.20,
+        created_at_ms: now - 10 * day_ms,
+        closed_at_ms: now - 2 * 3_600_000,
+        exit_reason: "CLOSE".to_string(),
+    }])
+    .unwrap();
+    let sol_closed = db
+        .list_closed_positions(10)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.client_order_id == "hl-closed-sol-cross24h")
+        .unwrap();
+    assert!(sol_closed.opened_at_ms.unwrap() >= now - 36 * 3_600_000 - 1_000);
+
+    // Vault earned +$0.50 all-time over 4 days => ~+$0.125 in 24h and +$0.50 in 7d/30d/YTD.
+    let vault_payload = VaultInfoPayload {
+        configured_vault_address: "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0".to_string(),
+        total_vault_equity_usdc: 100.50,
+        combined_portfolio_equity_usdc: 1979.50,
+        vault_count: 1,
+        synced_at_ms: now,
+        vaults: vec![VaultPositionInfo {
+            vault_address: "0xa15099a30bbf2e68942d6f4c43d70d04faeab0a0".to_string(),
+            name: "HLP".to_string(),
+            equity_usdc: 100.50,
+            pnl_usdc: 0.50,
+            all_time_pnl_usdc: 0.50,
+            days_following: 4,
+            ..Default::default()
+        }],
+    };
+    db.set_config_value(
+        "live_vault_info_json",
+        &serde_json::to_string(&vault_payload).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    // Account unified series has +$5.125 over exact 24h (so after subtracting ~$0.125 vault => +$5.00),
+    // while perp_* carries an intentional -$2.00 offset to prove unifiedAccount selects account_*.
+    let hl_cache = CachedHlPortfolioPnl {
+        synced_at_ms: now,
+        perp_day: HlPortfolioWindowCache {
+            pnl_history: vec![(now - day_ms, 0.0), (now, 3.00)],
+            vlm: 1000.0,
+        },
+        perp_week: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 7 * day_ms, 0.0), (now, 5.50)],
+            vlm: 1000.0,
+        },
+        perp_month: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 30 * day_ms, 0.0), (now, 5.50)],
+            vlm: 1000.0,
+        },
+        perp_all_time: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 3 * day_ms, 0.0), (now, 5.50)],
+            vlm: 1000.0,
+        },
+        account_day: HlPortfolioWindowCache {
+            pnl_history: vec![(now - day_ms, 0.0), (now, 5.125)],
+            vlm: 1000.0,
+        },
+        account_week: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 7 * day_ms, 0.0), (now, 8.10)],
+            vlm: 1000.0,
+        },
+        account_month: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 30 * day_ms, 0.0), (now, 8.10)],
+            vlm: 1000.0,
+        },
+        account_all_time: HlPortfolioWindowCache {
+            pnl_history: vec![(now - 3 * day_ms, 0.0), (now, 8.10)],
+            vlm: 1000.0,
+        },
+    };
+    db.set_config_value(
+        "live_exchange_portfolio_pnl_json",
+        &serde_json::to_string(&hl_cache).unwrap(),
+        None,
+    )
+    .unwrap();
+
+    // Even if caller passes stale nonzero uPnL args, DB has 0 OPEN positions => unrealized must be 0.00!
+    let summary = db.compute_pnl_summary(0.0, 0.0, 1000.0).unwrap();
+
+    // 1. Daily has boundary_crossing_cnt = 1: account_day (+5.125) - vault 24h (+0.125) = +5.00 net
+    //    Realized = +7.50, Unrealized = 0.00, Prior M2M = -2.50 => 7.50 + 0.00 - 2.50 == 5.00.
+    assert_eq!(summary.daily.pnl_source, "HL_PORTFOLIO");
+    assert!((summary.daily.unrealized_pnl_usdc - 0.0).abs() < 1e-9);
+    assert!((summary.daily.realized_pnl_usdc - 7.50).abs() < 1e-6);
+    assert!((summary.daily.net_pnl_usdc - 5.00).abs() < 0.02);
+    assert!(
+        (summary.daily.realized_pnl_usdc
+            + summary.daily.unrealized_pnl_usdc
+            + summary.daily.m2m_carry_usdc
+            - summary.daily.net_pnl_usdc)
+            .abs()
+            < 1e-6
+    );
+    assert!((summary.daily.m2m_carry_usdc - (-2.50)).abs() < 0.02);
+
+    // 2. Weekly / Monthly / YTD are strictly flat-to-flat with all opens inside window:
+    //    exact zero unrealized and zero Prior M2M despite HL account_week/month noise (+8.10 - 0.50 = +7.60 != +7.50).
+    for h in [&summary.weekly, &summary.monthly, &summary.ytd] {
+        assert_eq!(h.pnl_source, "HL_PORTFOLIO");
+        assert!((h.unrealized_pnl_usdc - 0.0).abs() < 1e-9);
+        assert!((h.m2m_carry_usdc - 0.0).abs() < 1e-9);
+        assert!((h.realized_pnl_usdc - 7.50).abs() < 1e-6);
+        assert!((h.net_pnl_usdc - 7.50).abs() < 1e-6);
+    }
 }
