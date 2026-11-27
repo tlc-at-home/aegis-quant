@@ -100,6 +100,9 @@ export async function submitAuthLogin(evt) {
   }
 }
 
+const heldFirstObservedAtMs = new Map();
+let hasObservedInitialHeldSnapshot = false;
+
 export function renderOutageAndSurveillanceBanners(dash, health) {
   const dbBanner = getEl('db-outage-banner');
   const survBanner = getEl('surveillance-alert-banner');
@@ -163,15 +166,39 @@ export function renderOutageAndSurveillanceBanners(dash, health) {
     const execMode = String(activeDash?.execution_mode || '').toUpperCase();
     const isLiveOrTestnet = execMode === 'LIVE' || execMode === 'TESTNET';
     const nowTsMs = toFiniteNumber(activeDash?.timestamp_ms) ?? Date.now();
+    const heldList = Array.isArray(activeDash?.v_assets_held) ? activeDash.v_assets_held : [];
+    const currentHeldKeys = new Set();
+    for (const heldItem of heldList) {
+      const posKey = String(heldItem?.position_id ?? heldItem?.symbol ?? '');
+      if (!posKey) continue;
+      currentHeldKeys.add(posKey);
+      if (!heldFirstObservedAtMs.has(posKey)) {
+        const originTs =
+          toFiniteNumber(heldItem?.opened_at_ms ?? heldItem?.created_at_ms) ?? 0;
+        heldFirstObservedAtMs.set(
+          posKey,
+          hasObservedInitialHeldSnapshot ? Math.max(originTs, nowTsMs) : originTs
+        );
+      }
+    }
+    for (const oldKey of heldFirstObservedAtMs.keys()) {
+      if (!currentHeldKeys.has(oldKey)) heldFirstObservedAtMs.delete(oldKey);
+    }
+    if (Array.isArray(activeDash?.v_assets_held)) {
+      hasObservedInitialHeldSnapshot = true;
+    }
+
     const missingSlSyms = isLiveOrTestnet
-      ? (activeDash?.v_assets_held || [])
+      ? heldList
           .filter((heldItem) => {
             const slOid = heldItem?.protective_stop_oid
               ? String(heldItem.protective_stop_oid).trim()
               : '';
             const originTs =
               toFiniteNumber(heldItem?.opened_at_ms ?? heldItem?.created_at_ms) ?? 0;
-            return !slOid && originTs > 0 && nowTsMs - originTs > 15_000;
+            const posKey = String(heldItem?.position_id ?? heldItem?.symbol ?? '');
+            const graceStartTs = heldFirstObservedAtMs.get(posKey) ?? originTs;
+            return !slOid && graceStartTs > 0 && nowTsMs - graceStartTs > 15_000;
           })
           .map((heldItem) => String(heldItem.symbol || heldItem.coin || ''))
       : [];

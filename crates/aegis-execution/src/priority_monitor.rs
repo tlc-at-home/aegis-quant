@@ -44,7 +44,8 @@ pub const EXCHANGE_FLAT_FILL_FALLBACK_LOOKBACK_MS: i64 = 86_400_000;
 
 const EXCHANGE_FLAT_MAX_LOOKBACK_MS: i64 = 7 * 86_400_000;
 const EXCHANGE_FLAT_SLICE_MAX_GAP_MS: i64 = 60_000;
-const HEALTH_PERSIST_HEARTBEAT_MS: i64 = 30_000;
+/// Healthy MariaDB heartbeat persistence cadence (`10_000 ms`) for `priority_monitor_health_json`.
+pub const HEALTH_PERSIST_HEARTBEAT_MS: i64 = 10_000;
 const UNFILLED_BREACH_ALERT_THROTTLE_MS: i64 = 300_000;
 const MAX_TICK_ERROR_ITEMS: usize = 20;
 
@@ -1095,6 +1096,10 @@ impl PriorityMonitor {
                     Some("Cached 1s PriorityMonitor surveillance health snapshot JSON"),
                 );
             }
+        }
+
+        if !report.degraded && !active_unmonitored {
+            self.db.record_live_priority_tick_ms(ts);
         }
     }
 

@@ -657,8 +657,19 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .get("priority_monitor_health_json")
         .and_then(|raw| serde_json::from_str::<PriorityMonitorHealth>(raw.trim()).ok())
         .unwrap_or_default();
+    let live_tick_ms = db.live_priority_tick_ms();
+    if live_tick_ms > priority_monitor_health.last_tick_at_ms
+        && (priority_monitor_health.status == "HEALTHY"
+            || priority_monitor_health.status == "IDLE")
+    {
+        priority_monitor_health.last_tick_at_ms = live_tick_ms;
+        if priority_monitor_health.status == "IDLE" {
+            priority_monitor_health.status = "HEALTHY".to_string();
+        }
+    }
     let prio_interval_ms = cfg.get_i64("priority_monitor_interval_ms", 1000).max(250);
-    let stale_threshold_ms = (prio_interval_ms * 15).max(30_000);
+    let stale_threshold_ms = (prio_interval_ms * 15)
+        .max(aegis_execution::HEALTH_PERSIST_HEARTBEAT_MS * 3 + 15_000);
     if priority_monitor_health.last_tick_at_ms > 0
         && ts.saturating_sub(priority_monitor_health.last_tick_at_ms) > stale_threshold_ms
         && (!v_assets_held.is_empty() || !v_assets_ordered.is_empty())

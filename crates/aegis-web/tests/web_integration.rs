@@ -4607,3 +4607,128 @@ async fn test_web_risk_tier_switch_and_config_sync_with_override_preservation() 
         assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn test_priority_monitor_heartbeat_no_30s_boundary_false_unmonitored_flash() {
+    let now = now_ms();
+    let db = tokio::task::spawn_blocking(move || {
+        let mgr = new_test_db_noauth();
+        mgr.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        let btc_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "BTC".to_string(),
+                asset_index: 0,
+                sz_decimals: 4,
+                tick_size: 0.1,
+                lot_step_size: 0.001,
+                max_leverage: 40.0,
+                mark_price: 94250.0,
+                mid_price: 94250.0,
+                oracle_price: 94248.0,
+                funding_rate_hourly: 0.000015,
+                day_volume_usdc: 85_000_000.0,
+                open_interest_usdc: 25_000_000.0,
+                prev_day_price: 92100.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+        mgr.create_working_order(&WorkingOrderInput {
+            asset_id: btc_id,
+            client_order_id: "test-pm-heartbeat-1".to_string(),
+            side: OrderSide::Long,
+            limit_price: 94200.0,
+            requested_quantity: 0.05,
+            reserved_margin_usdc: 4710.0,
+            portfolio_weight: 0.471,
+            s1_weight_contrib: 0.20,
+            s2_weight_contrib: 0.271,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 90432.0,
+            take_profit_px: None,
+            exchange_order_id: Some("hl-oid-pm-1".to_string()),
+            reason: "S1_S2_CONFLUENCE".to_string(),
+        })
+        .unwrap();
+
+        // 1. Persisted DB heartbeat 30.5s old must NOT trigger false UNMONITORED flash.
+        mgr.set_config_value(
+            "priority_monitor_health_json",
+            &serde_json::json!({
+                "last_tick_at_ms": now - 30_500,
+                "consecutive_error_ticks": 0,
+                "last_tick_error_count": 0,
+                "failed_symbols": [],
+                "unfilled_stop_breach_symbols": [],
+                "unmonitored_alert_active": false,
+                "is_stale": false,
+                "status": "HEALTHY"
+            })
+            .to_string(),
+            None,
+        )
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    let fetch_dash = || async {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice::<Value>(
+            &axum::body::to_bytes(res.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    let d1 = fetch_dash().await;
+    assert_eq!(d1["priority_monitor_health"]["is_stale"], false);
+    assert_eq!(d1["priority_monitor_health"]["status"], "HEALTHY");
+
+    // 2. Recording an in-process live 1s tick promotes last_tick_at_ms without a DB write.
+    let tick_ts = now_ms();
+    db.record_live_priority_tick_ms(tick_ts);
+    let d2 = fetch_dash().await;
+    assert_eq!(d2["priority_monitor_health"]["is_stale"], false);
+    assert_eq!(d2["priority_monitor_health"]["status"], "HEALTHY");
+    assert_eq!(d2["priority_monitor_health"]["last_tick_at_ms"], tick_ts);
+
+    // 3. Explicit set_config_value on priority_monitor_health_json resets live_priority_tick_ms
+    // so a genuinely dead (>45s) snapshot is flagged UNMONITORED + is_stale=true.
+    let stale_ts = now_ms() - 60_000;
+    db.set_config_value(
+        "priority_monitor_health_json",
+        &serde_json::json!({
+            "last_tick_at_ms": stale_ts,
+            "consecutive_error_ticks": 0,
+            "last_tick_error_count": 0,
+            "failed_symbols": [],
+            "unfilled_stop_breach_symbols": [],
+            "unmonitored_alert_active": false,
+            "is_stale": false,
+            "status": "HEALTHY"
+        })
+        .to_string(),
+        None,
+    )
+    .unwrap();
+    let d3 = fetch_dash().await;
+    assert_eq!(d3["priority_monitor_health"]["is_stale"], true);
+    assert_eq!(d3["priority_monitor_health"]["status"], "UNMONITORED");
+}
