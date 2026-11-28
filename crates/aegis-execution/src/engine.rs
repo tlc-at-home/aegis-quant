@@ -9,8 +9,9 @@
 //! - Unlocked 60-Second Auxiliary Ledger Sync (`AuxiliarySyncWorker`) & Bounded Alert Dispatch (`AlertDispatchWorker`)
 
 use crate::close_ladder::{
-    cancel_batch_response_ok, collect_coin_non_trigger_cancels, submit_reduce_only_close_ladder,
-    ReduceOnlyCloseLadderRequest,
+    cancel_batch_response_ok, collect_coin_non_trigger_cancels,
+    place_passive_reduce_only_close_order, submit_reduce_only_close_ladder, PassiveClosePlacement,
+    PendingPassiveClose, ReduceOnlyCloseLadderRequest, DEFAULT_PASSIVE_CLOSE_REST_SEC,
 };
 use crate::http_client::{
     endpoints_are_loopback, HyperliquidHttpClient, L2BookDepthSnapshot, OpenOrdersSnapshot,
@@ -608,6 +609,386 @@ pub fn signal_exit_passes_profit_gate(
     (allowed, net_exit_pnl_usdc, min_required_profit_usdc)
 }
 
+/// Computes effective gross notional committed/pending for a resting `WORKING` order (`v_assets_ordered`),
+/// accounting for both `limit_price * requested_quantity` and `reserved_margin_usdc * target_leverage_mult` (`R14-W2`).
+pub fn working_order_notional_usdc(o: &OrderedAssetView, target_leverage_mult: f64) -> f64 {
+    let lev = if target_leverage_mult.is_finite() && target_leverage_mult > 0.0 {
+        target_leverage_mult
+    } else {
+        1.0
+    };
+    let px_qty = if o.limit_price.is_finite()
+        && o.limit_price > 0.0
+        && o.requested_quantity.is_finite()
+        && o.requested_quantity > 0.0
+    {
+        o.limit_price * o.requested_quantity
+    } else {
+        0.0
+    };
+    let margin_notional = if o.reserved_margin_usdc.is_finite() && o.reserved_margin_usdc > 0.0 {
+        o.reserved_margin_usdc * lev
+    } else {
+        0.0
+    };
+    px_qty.max(margin_notional).max(0.0)
+}
+
+/// Unified active exposure and stop-risk heat summary across both `OPEN` positions (`v_assets_held`)
+/// and live resting `WORKING` orders (`v_assets_ordered`, including `INCREASE` scale-ins) (`R14-W2`).
+#[derive(Debug, Clone, Default)]
+pub struct ActiveExposureAndHeat {
+    pub open_notional_usdc: f64,
+    pub working_notional_usdc: f64,
+    pub total_gross_notional_usdc: f64,
+    pub open_stop_risk_usdc: f64,
+    pub working_stop_risk_usdc: f64,
+    pub total_stop_risk_usdc: f64,
+    pub gross_by_asset_usdc: HashMap<i64, f64>,
+    pub signed_notional_by_asset_usdc: HashMap<i64, f64>,
+}
+
+/// Computes active gross exposure, per-asset exposure, and portfolio stop-risk heat counting both
+/// `OPEN` positions and live resting `WORKING` orders (`R14-W2`).
+pub fn compute_active_exposure_and_heat(
+    held: &[HeldAssetView],
+    ordered: &[OrderedAssetView],
+    target_leverage_mult: f64,
+    default_stop_pct: f64,
+    exclude_working_position_id: Option<i64>,
+) -> ActiveExposureAndHeat {
+    compute_active_exposure_and_heat_with_db(
+        None,
+        held,
+        ordered,
+        target_leverage_mult,
+        default_stop_pct,
+        exclude_working_position_id,
+    )
+}
+
+/// DB-enriched variant of [`compute_active_exposure_and_heat`] that also reads exact stored
+/// `protective_stop_px` on resting `WORKING` rows when `db_opt` is provided (`R14-W2`).
+pub fn compute_active_exposure_and_heat_with_db(
+    db_opt: Option<&DatabaseManager>,
+    held: &[HeldAssetView],
+    ordered: &[OrderedAssetView],
+    target_leverage_mult: f64,
+    default_stop_pct: f64,
+    exclude_working_position_id: Option<i64>,
+) -> ActiveExposureAndHeat {
+    let eff_default_stop = if default_stop_pct.is_finite() {
+        default_stop_pct.max(0.005)
+    } else {
+        0.025
+    };
+    let mut out = ActiveExposureAndHeat::default();
+    let mut open_stop_pct_by_asset: HashMap<i64, f64> = HashMap::new();
+
+    for h in held {
+        let notional = if h.committed_notional_usdc.is_finite() && h.committed_notional_usdc > 0.0 {
+            h.committed_notional_usdc
+        } else if h.entry_price.is_finite()
+            && h.entry_price > 0.0
+            && h.quantity.is_finite()
+            && h.quantity > 0.0
+        {
+            (h.entry_price * h.quantity).abs()
+        } else {
+            0.0
+        };
+        out.open_notional_usdc += notional;
+        *out.gross_by_asset_usdc.entry(h.asset_id).or_insert(0.0) += notional;
+        if let Ok(side) = OrderSide::parse(&h.side) {
+            *out.signed_notional_by_asset_usdc
+                .entry(h.asset_id)
+                .or_insert(0.0) += notional * side.sign();
+        }
+        let risk_per_unit = if h.protective_stop_px.is_finite()
+            && h.protective_stop_px > 0.0
+            && h.entry_price.is_finite()
+            && h.entry_price > 0.0
+        {
+            let dist = (h.entry_price - h.protective_stop_px).abs();
+            open_stop_pct_by_asset.insert(h.asset_id, (dist / h.entry_price).max(0.005));
+            dist
+        } else {
+            h.entry_price.max(0.0) * eff_default_stop
+        };
+        out.open_stop_risk_usdc += (risk_per_unit * h.quantity.max(0.0)).max(0.0);
+    }
+
+    for o in ordered {
+        if exclude_working_position_id == Some(o.position_id) {
+            continue;
+        }
+        let notional = working_order_notional_usdc(o, target_leverage_mult);
+        out.working_notional_usdc += notional;
+        *out.gross_by_asset_usdc.entry(o.asset_id).or_insert(0.0) += notional;
+        if let Ok(side) = OrderSide::parse(&o.side) {
+            *out.signed_notional_by_asset_usdc
+                .entry(o.asset_id)
+                .or_insert(0.0) += notional * side.sign();
+        }
+        let stored_stop_pct = db_opt
+            .and_then(|db| db.get_position_by_id(o.position_id).ok().flatten())
+            .filter(|p| p.protective_stop_px.is_finite() && p.protective_stop_px > 0.0)
+            .and_then(|p| {
+                let ref_px = if o.limit_price.is_finite() && o.limit_price > 0.0 {
+                    o.limit_price
+                } else {
+                    p.entry_price
+                };
+                (ref_px > 0.0).then(|| ((ref_px - p.protective_stop_px).abs() / ref_px).max(0.005))
+            });
+        let stop_pct = stored_stop_pct
+            .or_else(|| open_stop_pct_by_asset.get(&o.asset_id).copied())
+            .unwrap_or(eff_default_stop);
+        out.working_stop_risk_usdc += (notional * stop_pct).max(0.0);
+    }
+
+    out.total_gross_notional_usdc = out.open_notional_usdc + out.working_notional_usdc;
+    out.total_stop_risk_usdc = out.open_stop_risk_usdc + out.working_stop_risk_usdc;
+    out
+}
+
+/// Anchor prices & timestamps extracted from `order_audit` and `OrderChaser` for an active `OPEN` epoch (`R14-W2`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PositionScaleAnchors {
+    pub latest_scale_in_price: Option<f64>,
+    pub latest_scale_in_at_ms: Option<i64>,
+    pub latest_scale_or_trim_price: Option<f64>,
+    pub latest_scale_or_trim_at_ms: Option<i64>,
+}
+
+/// Resolves the latest `SCALE_IN` and `PARTIAL_CLOSE` fill anchors for `open_position_id` since `open_epoch_start_ms` (`R14-W2`).
+pub fn resolve_position_scale_anchors(
+    db: &DatabaseManager,
+    chaser: Option<&OrderChaser>,
+    open_position_id: i64,
+    open_epoch_start_ms: i64,
+) -> PositionScaleAnchors {
+    let mut out = PositionScaleAnchors::default();
+    let min_ts = open_epoch_start_ms.saturating_sub(1_000);
+    let parent_tag_colon = format!("into #{open_position_id}:");
+    let parent_tag_end = format!("into #{open_position_id}");
+
+    if let Ok(audits) = db.list_recent_order_audits(500) {
+        for a in audits {
+            if a.created_at_ms < min_ts {
+                continue;
+            }
+            let reason_str = a.reason.as_str();
+            let is_parent_scale_in =
+                a.position_id == open_position_id && reason_str.contains("SCALE_IN_MERGED");
+            let is_child_scale_in = a.to_state.eq_ignore_ascii_case("SCALE_IN_MERGED")
+                && (reason_str.contains(&parent_tag_colon)
+                    || reason_str.ends_with(&parent_tag_end));
+            let is_scale_in = is_parent_scale_in || is_child_scale_in;
+            let is_partial_close = a.position_id == open_position_id
+                && a.to_state.eq_ignore_ascii_case("PARTIAL_CLOSE");
+            if !is_scale_in && !is_partial_close {
+                continue;
+            }
+            let px = if a.avg_fill_price.is_finite() && a.avg_fill_price > 0.0 {
+                a.avg_fill_price
+            } else if a.limit_price.is_finite() && a.limit_price > 0.0 {
+                a.limit_price
+            } else {
+                continue;
+            };
+            if is_scale_in
+                && out
+                    .latest_scale_in_at_ms
+                    .is_none_or(|ts| a.created_at_ms > ts)
+            {
+                out.latest_scale_in_price = Some(px);
+                out.latest_scale_in_at_ms = Some(a.created_at_ms);
+            }
+            if out
+                .latest_scale_or_trim_at_ms
+                .is_none_or(|ts| a.created_at_ms > ts)
+            {
+                out.latest_scale_or_trim_price = Some(px);
+                out.latest_scale_or_trim_at_ms = Some(a.created_at_ms);
+            }
+        }
+    }
+
+    if let Some((mem_px, mem_ts)) = chaser.and_then(|c| c.latest_scale_in_anchor(open_position_id))
+    {
+        if mem_ts >= min_ts && mem_px.is_finite() && mem_px > 0.0 {
+            if out.latest_scale_in_at_ms.is_none_or(|ts| mem_ts >= ts) {
+                out.latest_scale_in_price = Some(mem_px);
+                out.latest_scale_in_at_ms = Some(mem_ts);
+            }
+            if out.latest_scale_or_trim_at_ms.is_none_or(|ts| mem_ts >= ts) {
+                out.latest_scale_or_trim_price = Some(mem_px);
+                out.latest_scale_or_trim_at_ms = Some(mem_ts);
+            }
+        }
+    }
+
+    out
+}
+
+/// Computes minimum fractional price spacing required between same-side `INCREASE` scale-ins (`R14-W2`):
+/// `max(2.0 * round_trip_cost_pct, scale_in_min_atr_mult * atr_pct, scale_in_min_spacing_bps / 10_000.0)`.
+pub fn compute_min_scale_in_spacing_pct(
+    cfg: &ConfigMap,
+    ref_price: f64,
+    atr_opt: Option<f64>,
+) -> f64 {
+    let maker_bps = cfg.get_f64("maker_fee_bps", 1.5).clamp(0.0, 100.0);
+    let taker_bps = cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
+    let round_trip_cost_pct = (maker_bps + taker_bps) / 10_000.0;
+    let atr_mult = cfg.get_f64("scale_in_min_atr_mult", 0.25).clamp(0.0, 5.0);
+    let floor_pct = cfg
+        .get_f64("scale_in_min_spacing_bps", 15.0)
+        .clamp(0.0, 500.0)
+        / 10_000.0;
+    let atr_pct = match atr_opt {
+        Some(atr) if atr.is_finite() && atr > 0.0 && ref_price.is_finite() && ref_price > 0.0 => {
+            atr / ref_price
+        }
+        _ => 0.0,
+    };
+    (2.0 * round_trip_cost_pct)
+        .max(atr_mult * atr_pct)
+        .max(floor_pct)
+}
+
+/// Evaluates whether `candidate_price` clears the minimum scale-in spacing from both `entry_price`
+/// and the most recent `SCALE_IN` / `PARTIAL_CLOSE` fill price (`R14-W2`).
+pub fn evaluate_scale_in_spacing_gate(
+    entry_price: f64,
+    anchors: &PositionScaleAnchors,
+    candidate_price: f64,
+    min_spacing_pct: f64,
+) -> std::result::Result<(), String> {
+    if !candidate_price.is_finite() || candidate_price <= 0.0 {
+        return Err("SCALE_IN_INVALID_CANDIDATE_PRICE".to_string());
+    }
+    let req_pct = if min_spacing_pct.is_finite() {
+        min_spacing_pct.max(0.0)
+    } else {
+        0.0015
+    };
+    if entry_price.is_finite() && entry_price > 0.0 {
+        let dist = (candidate_price - entry_price).abs() / entry_price;
+        if dist + 1e-12 < req_pct {
+            return Err(format!(
+                "SCALE_IN_SPACING_TOO_CLOSE_TO_ENTRY: dist={:.2}bps < min={:.2}bps (px={candidate_price:.6}, entry={entry_price:.6})",
+                dist * 10_000.0,
+                req_pct * 10_000.0
+            ));
+        }
+    }
+    if let Some(last_px) = anchors
+        .latest_scale_or_trim_price
+        .filter(|p| p.is_finite() && *p > 0.0)
+    {
+        let dist = (candidate_price - last_px).abs() / last_px;
+        if dist + 1e-12 < req_pct {
+            return Err(format!(
+                "SCALE_IN_SPACING_TOO_CLOSE_TO_LAST_FILL: dist={:.2}bps < min={:.2}bps (px={candidate_price:.6}, last_fill={last_px:.6})",
+                dist * 10_000.0,
+                req_pct * 10_000.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// DB + `OrderChaser` guard preventing `INCREASE` scale-in submission when `candidate_price`
+/// falls within `compute_min_scale_in_spacing_pct` of `open_pos.entry_price` or latest `SCALE_IN` / `PARTIAL_CLOSE` (`R14-W2`).
+pub fn check_scale_in_spacing_for_open_position(
+    db: &DatabaseManager,
+    chaser: &OrderChaser,
+    open_pos: &PositionRecord,
+    candidate_price: f64,
+    atr_opt: Option<f64>,
+    cfg: &ConfigMap,
+) -> Result<()> {
+    let epoch_ms = open_pos.opened_at_ms.unwrap_or(open_pos.created_at_ms);
+    let anchors = resolve_position_scale_anchors(db, Some(chaser), open_pos.id, epoch_ms);
+    let min_spacing_pct = compute_min_scale_in_spacing_pct(cfg, candidate_price, atr_opt);
+    evaluate_scale_in_spacing_gate(
+        open_pos.entry_price,
+        &anchors,
+        candidate_price,
+        min_spacing_pct,
+    )
+    .map_err(AegisError::Validation)
+}
+
+/// Evaluates breakeven-plus hysteresis & `scale_in_reduce_cooldown_sec` flip cooldown on non-emergency `ACTION_REDUCE` trims (`R14-W2`).
+/// Urgent risk/cap/deleverage/early-loser reductions pass `urgent_bypass = true` and are permitted unconditionally.
+pub fn evaluate_reduce_hysteresis_gate(
+    side: OrderSide,
+    entry_price: f64,
+    trim_price: f64,
+    anchors: &PositionScaleAnchors,
+    now_ts_ms: i64,
+    cfg: &ConfigMap,
+    urgent_bypass: bool,
+) -> std::result::Result<(), String> {
+    if urgent_bypass {
+        return Ok(());
+    }
+    if !entry_price.is_finite()
+        || entry_price <= 0.0
+        || !trim_price.is_finite()
+        || trim_price <= 0.0
+    {
+        return Err("REDUCE_HYSTERESIS_INVALID_PRICE".to_string());
+    }
+    let cooldown_sec = cfg
+        .get_i64("scale_in_reduce_cooldown_sec", 900)
+        .clamp(0, 86_400);
+    if cooldown_sec > 0 {
+        if let Some(last_scale_ms) = anchors.latest_scale_in_at_ms {
+            let elapsed_ms = now_ts_ms.saturating_sub(last_scale_ms);
+            if elapsed_ms < cooldown_sec * 1000 {
+                return Err(format!(
+                    "REDUCE_SCALE_IN_COOLDOWN: elapsed={}s < min={}s",
+                    elapsed_ms / 1000,
+                    cooldown_sec
+                ));
+            }
+        }
+    }
+    let maker_bps = cfg.get_f64("maker_fee_bps", 1.5).clamp(0.0, 100.0);
+    let taker_bps = cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
+    let net_edge_bps = cfg
+        .get_f64("reduce_min_net_edge_bps", 8.0)
+        .clamp(0.0, 500.0);
+    let min_edge_pct = (maker_bps + taker_bps + net_edge_bps) / 10_000.0;
+
+    let entry_edge = ((trim_price - entry_price) / entry_price) * side.sign();
+    if entry_edge + 1e-12 < min_edge_pct {
+        return Err(format!(
+            "REDUCE_BELOW_AVG_ENTRY_HYSTERESIS: edge={:.2}bps < min={:.2}bps",
+            entry_edge * 10_000.0,
+            min_edge_pct * 10_000.0
+        ));
+    }
+    if let Some(scale_px) = anchors
+        .latest_scale_in_price
+        .filter(|p| p.is_finite() && *p > 0.0)
+    {
+        let scale_edge = ((trim_price - scale_px) / scale_px) * side.sign();
+        if scale_edge + 1e-12 < min_edge_pct {
+            return Err(format!(
+                "REDUCE_BELOW_LAST_SCALE_IN_HYSTERESIS: edge={:.2}bps < min={:.2}bps",
+                scale_edge * 10_000.0,
+                min_edge_pct * 10_000.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Report returned by [`ExecutionEngine::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutoverFullReport {
@@ -948,7 +1329,8 @@ impl ExecutionEngine {
         };
 
         let eq = base_equity_usdc.max(100.0);
-        let held_contexts = build_held_position_contexts(&held, &ordered, eq)?;
+        let held_contexts =
+            build_held_position_contexts(&held, &ordered, eq, cfg.target_leverage_multiplier())?;
 
         let signal_tf = normalize_signal_timeframe(&cfg.get_str("signal_timeframe", "4h"));
         let is_1h_tf = signal_tf == "1h";
@@ -1178,10 +1560,11 @@ impl ExecutionEngine {
             .clamp(1, 5);
 
         let mut closed_reports = Vec::new();
+        let target_lev_mult = cfg.target_leverage_multiplier();
         let mut current_committed: f64 = all_held.iter().map(|h| h.committed_notional_usdc).sum();
         let mut current_reserved: f64 = all_ordered
             .iter()
-            .map(|o| (o.limit_price * o.requested_quantity).max(0.0))
+            .map(|o| working_order_notional_usdc(o, target_lev_mult))
             .sum();
         let mut cancelled_order_ids: HashSet<i64> = HashSet::new();
         let count_active_assets = |held_slice: &[HeldAssetView],
@@ -1220,7 +1603,7 @@ impl ExecutionEngine {
                 ) {
                     if rep.final_status != "OPEN" && rep.final_status != "WORKING" {
                         current_reserved = (current_reserved
-                            - (o.limit_price * o.requested_quantity).max(0.0))
+                            - working_order_notional_usdc(o, target_lev_mult))
                         .max(0.0);
                         cancelled_order_ids.insert(o.position_id);
                         total_active =
@@ -1238,10 +1621,11 @@ impl ExecutionEngine {
             (cfg, all_ordered, all_held)
         };
         all_held = held_after;
+        let post_lev_mult = cfg.target_leverage_multiplier();
         current_committed = all_held.iter().map(|h| h.committed_notional_usdc).sum();
         current_reserved = all_ordered_after
             .iter()
-            .map(|o| (o.limit_price * o.requested_quantity).max(0.0))
+            .map(|o| working_order_notional_usdc(o, post_lev_mult))
             .sum();
         let mut open_count = all_held.len();
         let live_active = is_live_exchange_active(&self.db, &cfg);
@@ -1298,10 +1682,11 @@ impl ExecutionEngine {
                 }
                 cfg = fresh_cfg;
                 all_held = fresh_held;
+                let fresh_lev_mult = cfg.target_leverage_multiplier();
                 current_committed = all_held.iter().map(|h| h.committed_notional_usdc).sum();
                 current_reserved = fresh_ordered
                     .iter()
-                    .map(|o| (o.limit_price * o.requested_quantity).max(0.0))
+                    .map(|o| working_order_notional_usdc(o, fresh_lev_mult))
                     .sum();
                 open_count = all_held.len();
                 max_gross_notional = self.resolve_effective_base_equity_usdc(&cfg)
@@ -1396,12 +1781,269 @@ impl ExecutionEngine {
         Ok(closed_reports)
     }
 
+    fn close_open_position_passive_first(
+        &self,
+        position_id: i64,
+        reason: &str,
+        cooldown_seconds: Option<i64>,
+        min_limit_px_floor_or_cap: Option<f64>,
+    ) -> Result<Option<ManualCloseReport>> {
+        if self
+            .priority_monitor
+            .passive_closes
+            .get(position_id)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let in_flight_guard =
+            match InFlightIdGuard::try_acquire(&self.in_flight_position_ops, position_id) {
+                Some(g) => g,
+                None => return Ok(None),
+            };
+        let (pos, asset, fresh_cfg) = {
+            let _exec_guard = acquire_execution_lock();
+            let Some(pos) = self.db.get_position_by_id(position_id)? else {
+                return Ok(None);
+            };
+            if PositionStatus::parse(&pos.status) != PositionStatus::Open {
+                return Ok(None);
+            }
+            let asset = self.db.get_asset_by_id(pos.asset_id)?.ok_or_else(|| {
+                AegisError::Database(format!("Asset #{} not found", pos.asset_id))
+            })?;
+            let cfg = self.db.load_config()?;
+            (pos, asset, cfg)
+        };
+
+        let passive_rest_sec = fresh_cfg
+            .get_i64("passive_close_rest_sec", DEFAULT_PASSIVE_CLOSE_REST_SEC)
+            .clamp(0, 120);
+        let is_live_exchange = is_live_exchange_active(&self.db, &fresh_cfg);
+        if passive_rest_sec <= 0 {
+            drop(in_flight_guard);
+            return self
+                .close_or_cancel_position(position_id, reason, cooldown_seconds)
+                .map(Some);
+        }
+
+        let _side = OrderSide::parse(&pos.side)?;
+        let mark_px = if asset.mark_price > 0.0 {
+            asset.mark_price
+        } else {
+            pos.current_price.max(pos.entry_price)
+        };
+        let maker_fee_bps = fresh_cfg.get_f64("maker_fee_bps", 1.5).clamp(0.0, 100.0);
+        let cd_sec = cooldown_seconds.unwrap_or(300).max(0);
+
+        if !is_live_exchange {
+            let fee = round_dp(
+                mark_px * pos.filled_quantity * (maker_fee_bps / 10_000.0),
+                4,
+            );
+            let realized = {
+                let _exec_guard = acquire_execution_lock();
+                let r = self.db.close_position(position_id, mark_px, fee, reason)?;
+                if cd_sec > 0 {
+                    let _ = self.db.insert_asset_cooldown(
+                        asset.id,
+                        "MANUAL",
+                        &format!("Passive signal close cooldown: {reason}"),
+                        cd_sec,
+                    );
+                }
+                r
+            };
+            let _ = self.record_portfolio_snapshot(None, None);
+            return Ok(Some(ManualCloseReport {
+                position_id,
+                asset_id: asset.id,
+                symbol: asset.symbol,
+                previous_status: pos.status,
+                final_status: "CLOSED".to_string(),
+                exit_price: Some(mark_px),
+                realized_pnl_usdc: realized,
+                released_reserved_usdc: 0.0,
+                cooldown_inserted_sec: cd_sec,
+                reason: reason.to_string(),
+            }));
+        }
+
+        let pk = fresh_cfg.get_str("private_key", "");
+        let wallet = fresh_cfg.get_str("wallet_address", "");
+        if pk.trim().is_empty() || wallet.trim().is_empty() {
+            return Ok(None);
+        }
+        let ch_state = if let Some(ws_ch) = self.ws_cache.get_fresh_clearinghouse_state() {
+            ws_ch
+        } else {
+            match self.http.fetch_clearinghouse_state(&wallet, &fresh_cfg) {
+                Ok(st) => st,
+                Err(_) => return Ok(None),
+            }
+        };
+        let mut live_szi = 0.0;
+        if let Some(arr) = ch_state.get("assetPositions").and_then(Value::as_array) {
+            for item in arr {
+                let p = item.get("position").unwrap_or(item);
+                let c = p.get("coin").and_then(Value::as_str).unwrap_or("").trim();
+                if c.eq_ignore_ascii_case(&asset.coin) {
+                    live_szi = parse_hl_f64(p.get("szi"));
+                    break;
+                }
+            }
+        }
+        if live_szi.abs() <= 1e-9 {
+            drop(in_flight_guard);
+            return self
+                .close_or_cancel_position(position_id, reason, cooldown_seconds)
+                .map(Some);
+        }
+
+        let l2_bbo = self.ws_cache.get_fresh_l2_bbo(&asset.coin).or_else(|| {
+            self.http
+                .fetch_l2_book(&asset.coin, &fresh_cfg)
+                .ok()
+                .flatten()
+        });
+        let cloid_prefix = format!("v2-sigclose-alo-{}", pos.id);
+        match place_passive_reduce_only_close_order(
+            &self.http,
+            Some(&self.db),
+            &pk,
+            &fresh_cfg,
+            &asset,
+            pos.id,
+            live_szi,
+            mark_px,
+            l2_bbo,
+            maker_fee_bps,
+            min_limit_px_floor_or_cap,
+            &cloid_prefix,
+        ) {
+            Ok(PassiveClosePlacement::Filled {
+                fill_px,
+                filled_qty,
+                fee_usdc,
+                eoid,
+            }) => {
+                let lot = asset.lot_step_size.max(1e-8);
+                let rem = snap_to_lot(
+                    (live_szi.abs() - filled_qty).max(0.0),
+                    asset.lot_step_size,
+                    asset.sz_decimals,
+                    true,
+                );
+                if rem <= lot * 0.5 || rem <= 1e-9 {
+                    self.cancel_coin_exchange_orders(&asset, &wallet, &pk, &fresh_cfg, true);
+                    let realized = {
+                        let _exec_guard = acquire_execution_lock();
+                        if let Some(ref e) = eoid {
+                            let oid_num = e.strip_prefix("hl-").unwrap_or(e.as_str());
+                            let coid =
+                                format!("hl-closed-{}-{oid_num}", asset.coin.to_ascii_lowercase());
+                            let _ = self
+                                .db
+                                .set_position_closed_exchange_ids(position_id, &coid, e);
+                        }
+                        let r = self.db.close_position(
+                            position_id,
+                            round_dp(fill_px, 6),
+                            round_dp(fee_usdc, 4),
+                            reason,
+                        )?;
+                        if cd_sec > 0 {
+                            let _ = self.db.insert_asset_cooldown(
+                                asset.id,
+                                "MANUAL",
+                                &format!("Passive signal close cooldown: {reason}"),
+                                cd_sec,
+                            );
+                        }
+                        r
+                    };
+                    let _ = self.record_portfolio_snapshot(None, None);
+                    return Ok(Some(ManualCloseReport {
+                        position_id,
+                        asset_id: asset.id,
+                        symbol: asset.symbol,
+                        previous_status: pos.status,
+                        final_status: "CLOSED".to_string(),
+                        exit_price: Some(round_dp(fill_px, 6)),
+                        realized_pnl_usdc: realized,
+                        released_reserved_usdc: 0.0,
+                        cooldown_inserted_sec: cd_sec,
+                        reason: reason.to_string(),
+                    }));
+                }
+                {
+                    let _exec_guard = acquire_execution_lock();
+                    let _ = self.db.record_partial_position_exit(
+                        position_id,
+                        filled_qty,
+                        rem,
+                        round_dp(fill_px, 6),
+                        round_dp(fee_usdc, 4),
+                        reason,
+                    );
+                }
+                drop(in_flight_guard);
+                self.close_or_cancel_position(position_id, reason, cooldown_seconds)
+                    .map(Some)
+            }
+            Ok(PassiveClosePlacement::Resting {
+                oid,
+                eoid,
+                cloid,
+                limit_px,
+            }) => {
+                self.priority_monitor
+                    .passive_closes
+                    .insert(PendingPassiveClose {
+                        position_id: pos.id,
+                        asset_id: asset.id,
+                        oid,
+                        eoid,
+                        cloid,
+                        limit_px,
+                        initial_limit_px: limit_px,
+                        initial_qty: live_szi.abs(),
+                        last_open_abs_qty: live_szi.abs(),
+                        placed_at_ms: now_ms(),
+                        exit_reason: reason.to_string(),
+                        is_tp: false,
+                        is_partial_reduce: false,
+                        min_limit_px_floor_or_cap,
+                        cooldown_sec_override: Some(cd_sec),
+                        reprice_count: 0,
+                    });
+                Ok(None)
+            }
+            Ok(PassiveClosePlacement::Rejected(_)) | Err(_) => {
+                drop(in_flight_guard);
+                self.close_or_cancel_position(position_id, reason, cooldown_seconds)
+                    .map(Some)
+            }
+        }
+    }
+
     fn reduce_open_position_partial(
         &self,
         position_id: i64,
         sig: &SleeveSignalInput,
         base_equity_usdc: f64,
+        is_urgent_reduce: bool,
+        anchors: &PositionScaleAnchors,
     ) -> Result<Option<ManualCloseReport>> {
+        if !is_urgent_reduce
+            && self
+                .priority_monitor
+                .passive_closes
+                .get(position_id)
+                .is_some()
+        {
+            return Ok(None);
+        }
         let in_flight_guard =
             match InFlightIdGuard::try_acquire(&self.in_flight_position_ops, position_id) {
                 Some(g) => g,
@@ -1467,6 +2109,36 @@ impl ExecutionEngine {
         {
             return Ok(None);
         }
+        let maker_fee_bps = fresh_cfg.get_f64("maker_fee_bps", 1.5).clamp(0.0, 100.0);
+        let taker_fee_bps = fresh_cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
+        let passive_rest_sec = fresh_cfg
+            .get_i64("passive_close_rest_sec", DEFAULT_PASSIVE_CLOSE_REST_SEC)
+            .clamp(0, 120);
+        let enforce_strict_hysteresis = fresh_cfg.execution_mode().is_live_or_testnet()
+            || fresh_cfg.get_bool("profit_gate_signal_exits", false);
+        let min_hysteresis_px = (!is_urgent_reduce && enforce_strict_hysteresis).then(|| {
+            let net_edge_bps = fresh_cfg
+                .get_f64("reduce_min_net_edge_bps", 8.0)
+                .clamp(0.0, 500.0);
+            let min_edge_pct = (maker_fee_bps + taker_fee_bps + net_edge_bps) / 10_000.0;
+            match side {
+                OrderSide::Long => {
+                    let base_px = anchors
+                        .latest_scale_in_price
+                        .filter(|p| p.is_finite() && *p > 0.0)
+                        .map_or(pos.entry_price, |s| pos.entry_price.max(s));
+                    base_px * (1.0 + min_edge_pct)
+                }
+                OrderSide::Short => {
+                    let base_px = anchors
+                        .latest_scale_in_price
+                        .filter(|p| p.is_finite() && *p > 0.0)
+                        .map_or(pos.entry_price, |s| pos.entry_price.min(s));
+                    (base_px * (1.0 - min_edge_pct)).max(asset.tick_size.max(1e-8))
+                }
+            }
+        });
+
         let remaining_qty = snap_to_lot(
             (pos.filled_quantity - snapped_reduce).max(0.0),
             asset.lot_step_size,
@@ -1475,11 +2147,18 @@ impl ExecutionEngine {
         );
         if remaining_qty <= 1e-9 || remaining_qty * mark_px < min_notional {
             drop(in_flight_guard);
+            if !is_urgent_reduce && passive_rest_sec > 0 {
+                return self.close_open_position_passive_first(
+                    position_id,
+                    ACTION_REDUCE,
+                    Some(0),
+                    min_hysteresis_px,
+                );
+            }
             let full_rep = self.close_or_cancel_position(position_id, ACTION_REDUCE, Some(0))?;
             return Ok(Some(full_rep));
         }
 
-        let taker_fee_bps = fresh_cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
         let is_live_exchange = is_live_exchange_active(&self.db, &fresh_cfg);
         let (closed_qty, partial_exit_px, partial_fee, last_eoid) = if is_live_exchange {
             let pk = fresh_cfg.get_str("private_key", "");
@@ -1498,61 +2177,136 @@ impl ExecutionEngine {
                     .ok()
                     .flatten()
             });
-            let open_orders_snap = self
-                .ws_cache
-                .get_fresh_open_orders()
-                .filter(|s| s.metadata_complete)
-                .or_else(|| {
-                    self.http
-                        .fetch_open_orders_with_metadata(&wallet, &fresh_cfg)
-                        .ok()
-                });
-            let cloid_prefix = format!("v2-reduce-{}", pos.id);
-            let ladder_req = ReduceOnlyCloseLadderRequest {
-                asset: &asset,
-                position_id: Some(pos.id),
-                live_szi,
-                pre_close_position_abs_qty: Some(pos.filled_quantity),
-                reference_mark_px: mark_px,
-                l2_bbo,
-                taker_fee_bps,
-                cloid_prefix: &cloid_prefix,
-                max_slippage_pct: None,
-                allow_passive_fallback: false,
-                existing_open_orders: open_orders_snap.as_ref(),
-            };
-            match submit_reduce_only_close_ladder(
-                &self.http,
-                Some(&self.db),
-                &pk,
-                &fresh_cfg,
-                &ladder_req,
-            ) {
-                Ok(res) if res.filled_qty > 1e-9 => {
-                    let exit_px = res
-                        .vwap_fill_price
-                        .filter(|&p| p.is_finite() && p > 0.0)
-                        .unwrap_or(mark_px);
-                    (
-                        res.filled_qty.min(pos.filled_quantity),
-                        round_dp(exit_px, 6),
-                        round_dp(res.total_fee_usdc, 4),
-                        res.last_fill_eoid,
-                    )
+
+            // R14-W2: Non-emergency ACTION_REDUCE posts strictly passive ALO maker order first!
+            let mut passive_immediate_fill: Option<(f64, f64, f64, Option<String>)> = None;
+            if !is_urgent_reduce && passive_rest_sec > 0 {
+                let alo_prefix = format!("v2-reduce-alo-{}", pos.id);
+                match place_passive_reduce_only_close_order(
+                    &self.http,
+                    Some(&self.db),
+                    &pk,
+                    &fresh_cfg,
+                    &asset,
+                    pos.id,
+                    live_szi,
+                    mark_px,
+                    l2_bbo,
+                    maker_fee_bps,
+                    min_hysteresis_px,
+                    &alo_prefix,
+                ) {
+                    Ok(PassiveClosePlacement::Filled {
+                        fill_px,
+                        filled_qty,
+                        fee_usdc,
+                        eoid,
+                    }) => {
+                        passive_immediate_fill = Some((
+                            filled_qty.min(pos.filled_quantity),
+                            round_dp(fill_px, 6),
+                            round_dp(fee_usdc, 4),
+                            eoid,
+                        ));
+                    }
+                    Ok(PassiveClosePlacement::Resting {
+                        oid,
+                        eoid,
+                        cloid,
+                        limit_px,
+                    }) => {
+                        self.priority_monitor
+                            .passive_closes
+                            .insert(PendingPassiveClose {
+                                position_id: pos.id,
+                                asset_id: asset.id,
+                                oid,
+                                eoid,
+                                cloid,
+                                limit_px,
+                                initial_limit_px: limit_px,
+                                initial_qty: snapped_reduce,
+                                last_open_abs_qty: pos.filled_quantity,
+                                placed_at_ms: now_ms(),
+                                exit_reason: ACTION_REDUCE.to_string(),
+                                is_tp: false,
+                                is_partial_reduce: true,
+                                min_limit_px_floor_or_cap: min_hysteresis_px,
+                                cooldown_sec_override: Some(120),
+                                reprice_count: 0,
+                            });
+                        return Ok(None);
+                    }
+                    Ok(PassiveClosePlacement::Rejected(_)) | Err(_) => {
+                        // Fall through to IOC ladder only when exchange rejected both passive ALO quotes
+                    }
                 }
-                Ok(_) => return Ok(None),
-                Err(err) => {
-                    tracing::warn!(
-                        position_id = pos.id,
-                        symbol = %asset.symbol,
-                        error = %err,
-                        "ACTION_REDUCE close ladder failed; keeping existing position size"
-                    );
-                    return Ok(None);
+            }
+
+            if let Some(filled_tuple) = passive_immediate_fill {
+                filled_tuple
+            } else {
+                let open_orders_snap = self
+                    .ws_cache
+                    .get_fresh_open_orders()
+                    .filter(|s| s.metadata_complete)
+                    .or_else(|| {
+                        self.http
+                            .fetch_open_orders_with_metadata(&wallet, &fresh_cfg)
+                            .ok()
+                    });
+                let cloid_prefix = format!("v2-reduce-{}", pos.id);
+                let ladder_req = ReduceOnlyCloseLadderRequest {
+                    asset: &asset,
+                    position_id: Some(pos.id),
+                    live_szi,
+                    pre_close_position_abs_qty: Some(pos.filled_quantity),
+                    reference_mark_px: mark_px,
+                    l2_bbo,
+                    taker_fee_bps,
+                    cloid_prefix: &cloid_prefix,
+                    max_slippage_pct: None,
+                    allow_passive_fallback: false,
+                    existing_open_orders: open_orders_snap.as_ref(),
+                };
+                match submit_reduce_only_close_ladder(
+                    &self.http,
+                    Some(&self.db),
+                    &pk,
+                    &fresh_cfg,
+                    &ladder_req,
+                ) {
+                    Ok(res) if res.filled_qty > 1e-9 => {
+                        let exit_px = res
+                            .vwap_fill_price
+                            .filter(|&p| p.is_finite() && p > 0.0)
+                            .unwrap_or(mark_px);
+                        (
+                            res.filled_qty.min(pos.filled_quantity),
+                            round_dp(exit_px, 6),
+                            round_dp(res.total_fee_usdc, 4),
+                            res.last_fill_eoid,
+                        )
+                    }
+                    Ok(_) => return Ok(None),
+                    Err(err) => {
+                        tracing::warn!(
+                            position_id = pos.id,
+                            symbol = %asset.symbol,
+                            error = %err,
+                            "ACTION_REDUCE close ladder failed; keeping existing position size"
+                        );
+                        return Ok(None);
+                    }
                 }
             }
         } else {
-            let fee = round_dp(mark_px * snapped_reduce * (taker_fee_bps / 10_000.0), 4);
+            let eff_fee_bps = if !is_urgent_reduce && passive_rest_sec > 0 {
+                maker_fee_bps
+            } else {
+                taker_fee_bps
+            };
+            let fee = round_dp(mark_px * snapped_reduce * (eff_fee_bps / 10_000.0), 4);
             (snapped_reduce, round_dp(mark_px, 6), fee, None)
         };
 
@@ -1634,12 +2388,15 @@ impl ExecutionEngine {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_signal_exits_unlocked(
         &self,
         signal_out: &SignalCycleOutput,
         cfg: &ConfigMap,
         held: &[HeldAssetView],
         base_equity_usdc: f64,
+        rebalance_now: i64,
+        urgent_portfolio_reduce: bool,
         report: &mut RebalanceExecutionReport,
     ) -> Result<HashSet<i64>> {
         let run_mode = cfg.trading_run_mode();
@@ -1647,7 +2404,6 @@ impl ExecutionEngine {
             return Ok(HashSet::new());
         }
         let is_drain_mode = !run_mode.allows_new_entries();
-        let rebalance_now = now_ms();
         let min_hold_ms = cfg.get_i64("min_position_hold_sec", 300).max(0) * 1000;
         let early_loser_enabled = cfg.get_bool("early_loser_invalidation_enabled", true);
         let early_loser_r0_mult = cfg.get_f64("early_loser_r0_mult", 0.25).clamp(0.05, 1.0);
@@ -1660,6 +2416,14 @@ impl ExecutionEngine {
             .get_f64("signal_exit_min_net_profit_pct", 0.0025)
             .clamp(0.0, 0.50);
         let taker_fee_bps = cfg.get_f64("taker_fee_bps", 4.5).clamp(0.0, 100.0);
+        let passive_rest_sec = cfg
+            .get_i64("passive_close_rest_sec", DEFAULT_PASSIVE_CLOSE_REST_SEC)
+            .clamp(0, 120);
+        let max_single_w = cfg
+            .get_f64("max_single_asset_weight", 0.35)
+            .clamp(0.05, 2.0);
+        let enforce_strict_reduce_hysteresis =
+            cfg.execution_mode().is_live_or_testnet() || profit_gate_signal_exits;
         let mut flipped_symbols: HashSet<i64> = HashSet::new();
 
         for sig in &signal_out.signals {
@@ -1673,7 +2437,8 @@ impl ExecutionEngine {
             let Some(h) = held.iter().find(|x| x.asset_id == sig.asset_id) else {
                 continue;
             };
-            let held_ms = rebalance_now.saturating_sub(h.opened_at_ms.unwrap_or(h.created_at_ms));
+            let epoch_ms = h.opened_at_ms.unwrap_or(h.created_at_ms);
+            let held_ms = rebalance_now.saturating_sub(epoch_ms);
             let frac_upnl = held_position_fractional_pnl(h);
             let entry_r0_pct = if h.entry_r0.is_finite()
                 && h.entry_r0 > 0.0
@@ -1701,10 +2466,86 @@ impl ExecutionEngine {
             {
                 continue;
             }
+
+            let is_event_urgent = sig.event_trigger.as_deref().is_some_and(|e| {
+                e.contains("INELIGIBLE")
+                    || e.contains("DELEVERAGE")
+                    || e.contains("SHOCK")
+                    || e.contains("BREAKER")
+            });
+            let is_over_single_cap =
+                sig.current_weight.abs() > max_single_w * CAP_ENFORCEMENT_TOLERANCE_MULT;
+            let is_urgent_exit = sig.rebalance_action == ACTION_FLIP
+                || bypass_for_loser
+                || urgent_portfolio_reduce
+                || is_event_urgent
+                || is_over_single_cap;
+
+            if !is_urgent_exit
+                && self
+                    .priority_monitor
+                    .passive_closes
+                    .get(h.position_id)
+                    .is_some()
+            {
+                continue;
+            }
+
             if is_reduce {
-                if let Some(full_rep) =
-                    self.reduce_open_position_partial(h.position_id, sig, base_equity_usdc)?
-                {
+                let Ok(side) = OrderSide::parse(&h.side) else {
+                    continue;
+                };
+                let trim_px = if sig.mark_price > 0.0 {
+                    sig.mark_price
+                } else {
+                    h.mark_price
+                };
+                let anchors = resolve_position_scale_anchors(
+                    &self.db,
+                    Some(&self.chaser),
+                    h.position_id,
+                    epoch_ms,
+                );
+                if enforce_strict_reduce_hysteresis {
+                    if let Err(reason) = evaluate_reduce_hysteresis_gate(
+                        side,
+                        h.entry_price,
+                        trim_px,
+                        &anchors,
+                        rebalance_now,
+                        cfg,
+                        is_urgent_exit,
+                    ) {
+                        tracing::debug!(
+                            position_id = h.position_id,
+                            symbol = %h.symbol,
+                            reason = %reason,
+                            "Holding open position: non-emergency ACTION_REDUCE suppressed by W2 hysteresis/cooldown"
+                        );
+                        continue;
+                    }
+                } else if !is_urgent_exit {
+                    let entry_edge = if h.entry_price > 0.0 {
+                        ((trim_px - h.entry_price) / h.entry_price) * side.sign()
+                    } else {
+                        0.0
+                    };
+                    let scale_underwater = anchors
+                        .latest_scale_in_price
+                        .filter(|p| p.is_finite() && *p > 0.0)
+                        .is_some_and(|spx| (((trim_px - spx) / spx) * side.sign()) < -1e-9);
+                    if entry_edge < -1e-9 || scale_underwater {
+                        continue;
+                    }
+                }
+
+                if let Some(full_rep) = self.reduce_open_position_partial(
+                    h.position_id,
+                    sig,
+                    base_equity_usdc,
+                    is_urgent_exit,
+                    &anchors,
+                )? {
                     if full_rep.final_status != "OPEN" {
                         report.positions_closed += 1;
                         report.closed_position_ids.push(full_rep.position_id);
@@ -1712,6 +2553,7 @@ impl ExecutionEngine {
                 }
                 continue;
             }
+
             // R14-M10: PROFIT_GATE only applies to CLOSE when explicitly enabled; FLIP is exempt.
             if profit_gate_signal_exits && sig.rebalance_action == ACTION_CLOSE {
                 let (passes_profit_gate, net_exit_pnl_usdc, min_required_profit_usdc) =
@@ -1737,6 +2579,20 @@ impl ExecutionEngine {
             } else {
                 Some(300)
             };
+            if sig.rebalance_action == ACTION_CLOSE && !is_urgent_exit && passive_rest_sec > 0 {
+                if let Some(close_res) = self.close_open_position_passive_first(
+                    h.position_id,
+                    &sig.rebalance_action,
+                    close_cd,
+                    None,
+                )? {
+                    if close_res.final_status != "OPEN" {
+                        report.positions_closed += 1;
+                        report.closed_position_ids.push(close_res.position_id);
+                    }
+                }
+                continue;
+            }
             let close_res =
                 self.close_or_cancel_position(h.position_id, &sig.rebalance_action, close_cd)?;
             if close_res.final_status != "OPEN" {
@@ -1879,16 +2735,68 @@ impl ExecutionEngine {
             }
         }
 
+        let rebalance_now = now_override_ms.unwrap_or_else(now_ms);
+
         // 1. Handle CLOSE, REDUCE, or FLIP on currently OPEN holdings (always allowed even under Ruin Halt / DD)
-        let (cfg_exit, held_for_exits) = {
+        let (cfg_exit, held_for_exits, ordered_for_exits, peak_latest_exit) = {
             let _exec_guard = acquire_execution_lock();
-            (self.db.load_config()?, self.db.get_assets_held()?)
+            let dd_window_start = rebalance_now - 86_400_000;
+            (
+                self.db.load_config()?,
+                self.db.get_assets_held()?,
+                self.db.get_assets_ordered()?,
+                self.db
+                    .get_peak_and_latest_uncapped_equity_since(dd_window_start)?,
+            )
         };
+        let eff_eq_exit = if cfg_exit.execution_mode().is_live_or_testnet() {
+            self.resolve_effective_base_equity_usdc(&cfg_exit)
+        } else {
+            base_equity_usdc.max(100.0)
+        };
+        let min_eq_halt_exit = cfg_exit
+            .get_f64("min_equity_halt_usdc", 50.0)
+            .clamp(0.0, 1_000_000.0);
+        let ruin_halted_pre = min_eq_halt_exit > 0.0
+            && self
+                .compute_ruin_halt_uncapped_equity(&cfg_exit, &held_for_exits)
+                .is_some_and(|eq| !eq.is_finite() || eq < min_eq_halt_exit);
+        let max_dd_exit = cfg_exit
+            .get_f64("max_daily_drawdown_pct", 0.15)
+            .clamp(0.01, 0.90);
+        let dd_tripped_pre = peak_latest_exit.is_some_and(|(pk, lat)| {
+            pk.is_finite()
+                && lat.is_finite()
+                && pk > 0.0
+                && lat > 0.0
+                && ((pk - lat) / pk) >= max_dd_exit
+        });
+        let max_gross_lev_exit = cfg_exit
+            .get_f64("max_gross_leverage_x", 2.50)
+            .clamp(0.20, 5.00);
+        let eff_lev_exit = cfg_exit
+            .target_leverage_multiplier()
+            .min(max_gross_lev_exit);
+        let exp_exit = compute_active_exposure_and_heat(
+            &held_for_exits,
+            &ordered_for_exits,
+            cfg_exit.target_leverage_multiplier(),
+            cfg_exit
+                .get_f64("protective_stop_default_pct", 0.025)
+                .max(0.005),
+            None,
+        );
+        let over_gross_cap_pre = exp_exit.total_gross_notional_usdc
+            > eff_eq_exit * eff_lev_exit * CAP_ENFORCEMENT_TOLERANCE_MULT;
+        let urgent_portfolio_reduce = ruin_halted_pre || dd_tripped_pre || over_gross_cap_pre;
+
         let flipped_symbols = self.process_signal_exits_unlocked(
             signal_out,
             &cfg_exit,
             &held_for_exits,
             base_equity_usdc,
+            rebalance_now,
+            urgent_portfolio_reduce,
             &mut report,
         )?;
 
@@ -1900,7 +2808,7 @@ impl ExecutionEngine {
             let o = self.db.get_assets_ordered()?;
             let a = self.db.list_exchange_assets()?;
             let last_entry = self.db.last_position_entry_timestamp_ms().ok().flatten();
-            let dd_window_start = now_override_ms.unwrap_or_else(now_ms) - 86_400_000;
+            let dd_window_start = rebalance_now - 86_400_000;
             let dd_stats = self
                 .db
                 .get_peak_and_latest_uncapped_equity_since(dd_window_start)?;
@@ -1916,7 +2824,6 @@ impl ExecutionEngine {
         } else {
             base_equity_usdc.max(100.0)
         };
-        let rebalance_now = now_override_ms.unwrap_or_else(now_ms);
 
         if all_held
             .iter()
@@ -2021,12 +2928,15 @@ impl ExecutionEngine {
         let target_mult = cfg.target_leverage_multiplier();
         let eff_lev_cap = target_mult.min(risk.limits.max_gross_leverage_x);
         let max_allowed_gross_notional = eff_equity * eff_lev_cap;
-        let current_reserved_notional: f64 = all_ordered
-            .iter()
-            .map(|o| (o.limit_price * o.requested_quantity).max(0.0))
-            .sum();
-        if ledger.committed_notional_usdc + current_reserved_notional >= max_allowed_gross_notional
-        {
+        let active_exp = compute_active_exposure_and_heat_with_db(
+            Some(&self.db),
+            &all_held,
+            &all_ordered,
+            target_mult,
+            risk.limits.protective_stop_default_pct,
+            None,
+        );
+        if active_exp.total_gross_notional_usdc >= max_allowed_gross_notional {
             return Ok(report);
         }
         let enforce_slot_spread_weight_cap = cfg.get_bool("enforce_slot_spread_weight_cap", false);
@@ -2084,7 +2994,7 @@ impl ExecutionEngine {
             .clamp(0, 3600);
         let mut l2_depth_checks: usize = 0;
 
-        // 3. Place at most 1 new WORKING order per cycle under per-asset in-flight guard (`R14-H2`, `R14-L12`)
+        // 3. Place at most 1 new WORKING order per cycle under per-asset in-flight guard (`R14-H2`, `R14-L12`, `R14-W2`)
         for sig in &candidate_signals {
             if report.working_orders_placed >= 1 {
                 break;
@@ -2115,6 +3025,9 @@ impl ExecutionEngine {
             if entry_interval_blocked && !is_confirmed_flip {
                 continue;
             }
+            if is_scale_in_action && all_ordered.iter().any(|o| o.asset_id == asset.id) {
+                continue;
+            }
 
             // R14-L12: Fail closed on DB errors when checking cooldown or active position
             match self.db.is_asset_in_cooldown(asset.id) {
@@ -2133,48 +3046,65 @@ impl ExecutionEngine {
                     continue;
                 }
             }
-            let existing_open_weight_opt: Option<f64> =
-                match self.db.list_active_positions_for_asset(asset.id) {
-                    Ok(active_rows) => {
-                        if is_scale_in_action {
-                            if active_rows.len() != 1 {
-                                continue;
-                            }
-                            let open_row = &active_rows[0];
-                            if PositionStatus::parse(&open_row.status) != PositionStatus::Open {
-                                continue;
-                            }
-                            let Ok(open_side) = OrderSide::parse(&open_row.side) else {
-                                continue;
-                            };
-                            if open_side.sign() * sig.target_weight <= 0.0 {
-                                continue;
-                            }
-                            if sig.current_weight.abs() > 1e-9 {
-                                Some(sig.current_weight)
-                            } else {
-                                Some(
-                                    ((open_row.filled_quantity * asset.mark_price)
-                                        / eff_equity.max(100.0))
-                                        * open_side.sign(),
-                                )
-                            }
-                        } else if !active_rows.is_empty() {
+            let (existing_open_weight_opt, scale_in_open_pos_opt): (
+                Option<f64>,
+                Option<PositionRecord>,
+            ) = match self.db.list_active_positions_for_asset(asset.id) {
+                Ok(active_rows) => {
+                    if is_scale_in_action {
+                        if active_rows.len() != 1 {
                             continue;
-                        } else {
-                            None
                         }
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            asset_id = asset.id,
-                            symbol = %asset.symbol,
-                            error = %err,
-                            "list_active_positions_for_asset DB check failed; failing closed"
-                        );
+                        let open_row = &active_rows[0];
+                        if PositionStatus::parse(&open_row.status) != PositionStatus::Open {
+                            continue;
+                        }
+                        if self
+                            .priority_monitor
+                            .passive_closes
+                            .get(open_row.id)
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        let Ok(open_side) = OrderSide::parse(&open_row.side) else {
+                            continue;
+                        };
+                        if open_side.sign() * sig.target_weight <= 0.0 {
+                            continue;
+                        }
+                        let asset_signed_notional = active_exp
+                            .signed_notional_by_asset_usdc
+                            .get(&asset.id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                open_row.filled_quantity * asset.mark_price * open_side.sign()
+                            });
+                        let computed_w = asset_signed_notional / eff_equity.max(100.0);
+                        let eff_cur_w = if computed_w.abs() > sig.current_weight.abs() {
+                            computed_w
+                        } else if sig.current_weight.abs() > 1e-9 {
+                            sig.current_weight
+                        } else {
+                            computed_w
+                        };
+                        (Some(eff_cur_w), Some(open_row.clone()))
+                    } else if !active_rows.is_empty() {
                         continue;
+                    } else {
+                        (None, None)
                     }
-                };
+                }
+                Err(err) => {
+                    tracing::error!(
+                        asset_id = asset.id,
+                        symbol = %asset.symbol,
+                        error = %err,
+                        "list_active_positions_for_asset DB check failed; failing closed"
+                    );
+                    continue;
+                }
+            };
 
             let Some(_entry_guard) =
                 InFlightIdGuard::try_acquire(&self.in_flight_entry_assets, asset.id)
@@ -2191,6 +3121,32 @@ impl ExecutionEngine {
                 asset.mark_price,
                 risk.limits.protective_stop_default_pct,
             );
+
+            if let Some(ref open_row) = scale_in_open_pos_opt {
+                let candidate_px = if asset.mid_price > 0.0 {
+                    asset.mid_price
+                } else if asset.mark_price > 0.0 {
+                    asset.mark_price
+                } else {
+                    sig.mark_price
+                };
+                if let Err(err) = check_scale_in_spacing_for_open_position(
+                    &self.db,
+                    &self.chaser,
+                    open_row,
+                    candidate_px,
+                    atr_opt,
+                    &cfg,
+                ) {
+                    tracing::debug!(
+                        position_id = open_row.id,
+                        symbol = %asset.symbol,
+                        error = %err,
+                        "Skipping ACTION_INCREASE scale-in due to minimum price spacing guard"
+                    );
+                    continue;
+                }
+            }
 
             let capped_target_weight = sig
                 .target_weight
@@ -2216,10 +3172,45 @@ impl ExecutionEngine {
                 continue;
             }
 
-            if ledger.committed_notional_usdc
-                + current_reserved_notional
-                + plan.target_notional_usdc
+            let existing_asset_gross = if is_confirmed_flip {
+                0.0
+            } else {
+                active_exp
+                    .gross_by_asset_usdc
+                    .get(&asset.id)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            let sizing_equity = ledger.total_equity_usdc.max(eff_equity);
+            if existing_asset_gross + plan.target_notional_usdc
+                > sizing_equity * max_per_pos_weight + 1e-2
+            {
+                continue;
+            }
+
+            if active_exp.total_gross_notional_usdc + plan.target_notional_usdc
                 > max_allowed_gross_notional + 1e-2
+            {
+                continue;
+            }
+
+            let ref_entry_px = if asset.mid_price > 0.0 {
+                asset.mid_price
+            } else {
+                asset.mark_price
+            };
+            let prosp_stop_risk = if plan.protective_stop_px > 0.0 && ref_entry_px > 0.0 {
+                (ref_entry_px - plan.protective_stop_px).abs() * plan.requested_quantity
+            } else {
+                plan.target_notional_usdc * risk.limits.protective_stop_default_pct
+            };
+            if risk
+                .check_portfolio_heat_and_gross_at_fill(
+                    sizing_equity,
+                    active_exp.total_gross_notional_usdc + plan.target_notional_usdc,
+                    active_exp.total_stop_risk_usdc + prosp_stop_risk,
+                )
+                .is_err()
             {
                 continue;
             }
@@ -3447,6 +4438,7 @@ impl ExecutionEngine {
         let rec_engine = self.clone();
         let rec_rx = rx.clone();
         std::thread::spawn(move || {
+            let mut gap_fill_retry_streak: u32 = 0;
             while !*rec_rx.borrow() {
                 let tick_start = Instant::now();
                 let cfg = match rec_engine.db.load_config() {
@@ -3469,12 +4461,20 @@ impl ExecutionEngine {
                     } else {
                         let _ = rec_engine.record_portfolio_snapshot(None, None);
                     }
+                    if rec_engine.ws_cache.needs_rest_gap_reconcile() {
+                        gap_fill_retry_streak = gap_fill_retry_streak.saturating_add(1);
+                    } else {
+                        gap_fill_retry_streak = 0;
+                    }
+                } else {
+                    gap_fill_retry_streak = 0;
                 }
+                let gap_wake_ms = compute_gap_fill_wake_ms(gap_fill_retry_streak, reconcile_ms);
                 let elapsed_ms = tick_start.elapsed().as_millis() as u64;
                 let rem_ms = reconcile_ms.saturating_sub(elapsed_ms).max(250);
                 let mut slept = 0u64;
                 while slept < rem_ms && !*rec_rx.borrow() {
-                    if rec_engine.ws_cache.needs_rest_gap_reconcile() && slept >= 1000 {
+                    if rec_engine.ws_cache.needs_rest_gap_reconcile() && slept >= gap_wake_ms {
                         break;
                     }
                     let chunk = (rem_ms - slept).min(250);
@@ -3512,10 +4512,21 @@ impl ExecutionEngine {
     }
 }
 
+/// Computes the early-wake backoff (`1s -> 2s -> 4s -> 8s -> reconcile_ms`) for the 15s sync
+/// loop when REST gap-fill fails repeatedly after WebSocket reconnects.
+fn compute_gap_fill_wake_ms(gap_fill_retry_streak: u32, reconcile_ms: u64) -> u64 {
+    if gap_fill_retry_streak == 0 {
+        1000
+    } else {
+        (1000u64.saturating_mul(1u64 << gap_fill_retry_streak.min(4))).min(reconcile_ms)
+    }
+}
+
 fn build_held_position_contexts(
     held: &[HeldAssetView],
     ordered: &[OrderedAssetView],
     eq: f64,
+    target_leverage_mult: f64,
 ) -> Result<HashMap<i64, HeldPositionContext>> {
     let mut weight_by_asset: HashMap<i64, f64> = HashMap::new();
     let mut pnl_acc: HashMap<i64, (f64, f64)> = HashMap::new();
@@ -3571,7 +4582,7 @@ fn build_held_position_contexts(
 
     for o in ordered {
         let side = OrderSide::parse(&o.side)?;
-        let notional = o.limit_price * o.requested_quantity;
+        let notional = working_order_notional_usdc(o, target_leverage_mult);
         let w = (notional / eq) * side.sign();
         *weight_by_asset.entry(o.asset_id).or_insert(0.0) += w;
     }
@@ -4278,8 +5289,9 @@ mod tests {
         fallback_pw.portfolio_weight = -0.12;
         fallback_pw.entry_r0 = 0.0;
 
-        let ctxs = build_held_position_contexts(&[base, fallback_qty, fallback_pw], &[], 1000.0)
-            .expect("contexts");
+        let ctxs =
+            build_held_position_contexts(&[base, fallback_qty, fallback_pw], &[], 1000.0, 1.0)
+                .expect("contexts");
 
         let c10 = ctxs.get(&10).unwrap();
         assert!((c10.current_weight - (-0.15)).abs() < 1e-9);
@@ -4292,5 +5304,15 @@ mod tests {
         let c12 = ctxs.get(&12).unwrap();
         assert!((c12.current_weight - (-0.12)).abs() < 1e-9);
         assert!((c12.entry_r0_pct - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_gap_fill_wake_ms_exponential_backoff() {
+        assert_eq!(compute_gap_fill_wake_ms(0, 15_000), 1_000);
+        assert_eq!(compute_gap_fill_wake_ms(1, 15_000), 2_000);
+        assert_eq!(compute_gap_fill_wake_ms(2, 15_000), 4_000);
+        assert_eq!(compute_gap_fill_wake_ms(3, 15_000), 8_000);
+        assert_eq!(compute_gap_fill_wake_ms(4, 15_000), 15_000);
+        assert_eq!(compute_gap_fill_wake_ms(10, 15_000), 15_000);
     }
 }

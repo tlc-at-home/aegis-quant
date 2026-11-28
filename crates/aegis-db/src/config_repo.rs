@@ -432,6 +432,9 @@ impl DatabaseManager {
         drop(conn);
         drop(cipher);
         self.invalidate_pnl_cache();
+        if clean_key == "priority_monitor_health_json" {
+            self.reset_live_priority_tick_ms();
+        }
         Ok(())
     }
 

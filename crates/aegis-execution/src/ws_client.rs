@@ -35,8 +35,8 @@ pub const HYPERLIQUID_TESTNET_WS_URL: &str = "wss://api.hyperliquid-testnet.xyz/
 
 pub const WS_MIDS_FRESH_MS: i64 = 5_000;
 pub const WS_L2_BOOK_FRESH_MS: i64 = 3_000;
-pub const WS_CLEARINGHOUSE_FRESH_MS: i64 = 5_000;
-pub const WS_OPEN_ORDERS_FRESH_MS: i64 = 5_000;
+pub const WS_CLEARINGHOUSE_FRESH_MS: i64 = 15_000;
+pub const WS_OPEN_ORDERS_FRESH_MS: i64 = 15_000;
 pub const WS_ORDER_SUBMIT_BYPASS_MS: i64 = 1_500;
 pub const WS_ACTIVE_CTX_FRESH_MS: i64 = 15_000;
 pub const WS_CANDLE_FRESH_MS: i64 = 90_000;
@@ -1062,8 +1062,12 @@ impl WsStateCache {
             "webData3" | "webData2" => self.ingest_web_data(data, ts_ms),
             "clearinghouseState" => {
                 if data.is_object() {
+                    let ch_obj = data
+                        .get("clearinghouseState")
+                        .filter(|v| v.is_object())
+                        .unwrap_or(data);
                     *self.clearinghouse_state.write() = Some(Stamped {
-                        value: data.clone(),
+                        value: ch_obj.clone(),
                         updated_at_ms: ts_ms,
                     });
                 }
@@ -1300,9 +1304,8 @@ impl WsStateCache {
             return;
         };
         let explicit_meta = data.get("metadataComplete").and_then(Value::as_bool);
-        let metadata_complete = explicit_meta.unwrap_or_else(|| {
-            !orders.is_empty() && orders.iter().all(order_has_frontend_metadata)
-        });
+        let metadata_complete = explicit_meta
+            .unwrap_or_else(|| orders.is_empty() || orders.iter().all(order_has_frontend_metadata));
         *self.open_orders.write() = Some(Stamped {
             value: OpenOrdersSnapshot {
                 orders: orders.clone(),
@@ -2165,6 +2168,8 @@ async fn drive_user_session(
         "userFills",
         "userFundings",
         "userEvents",
+        "clearinghouseState",
+        "openOrders",
         "webData3",
     ];
     let mut pending_subs: VecDeque<String> = user_channels
@@ -2574,7 +2579,7 @@ mod tests {
         assert!(cache
             .get_fresh_open_orders_at(t0 + 2_000, WS_OPEN_ORDERS_FRESH_MS)
             .is_none());
-        // Restores once 1_500 ms passes (within 5_000 ms frame window)
+        // Restores once 1_500 ms passes (within 15_000 ms frame window)
         assert!(cache
             .get_fresh_clearinghouse_state_at(t0 + 2_600, WS_CLEARINGHOUSE_FRESH_MS)
             .is_some());
@@ -2632,8 +2637,8 @@ mod tests {
             "expected 2 WS connections (Market + User)"
         );
         assert!(
-            server.wait_for_received(8, Duration::from_secs(3)),
-            "expected market + user subscription messages"
+            server.wait_for_received(12, Duration::from_secs(3)),
+            "expected market (5) + user (7) subscription messages"
         );
         assert!(cache.is_market_ws_connected());
         assert!(cache.is_user_ws_connected());
@@ -2909,5 +2914,123 @@ mod tests {
         assert!(cache.market_reconnect_count() >= 1);
         assert!(cache.needs_rest_gap_reconcile());
         mgr.shutdown();
+    }
+
+    #[test]
+    fn test_ws_clearinghouse_envelope_unwrap_open_orders_empty_and_15s_freshness() {
+        let cache = WsStateCache::new();
+        cache.set_user_connected(true);
+        let t0 = 1_750_000_000_000i64;
+
+        // 1. Live wrapped clearinghouseState envelope: { dex, user, clearinghouseState: { ... } }
+        cache.ingest_frame_value_at(
+            &json!({
+                "channel": "clearinghouseState",
+                "data": {
+                    "dex": "",
+                    "user": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                    "clearinghouseState": {
+                        "marginSummary": { "accountValue": "1987.65", "totalMarginUsed": "123.45" },
+                        "assetPositions": []
+                    }
+                }
+            }),
+            true,
+            t0,
+        );
+        let unwrapped = cache
+            .get_fresh_clearinghouse_state_at(t0 + 14_999, WS_CLEARINGHOUSE_FRESH_MS)
+            .expect("wrapped clearinghouseState must remain fresh up to 15_000 ms");
+        assert_eq!(
+            unwrapped
+                .pointer("/marginSummary/accountValue")
+                .and_then(Value::as_str),
+            Some("1987.65")
+        );
+        assert!(
+            unwrapped.get("dex").is_none(),
+            "outer wrapper fields must be unwrapped"
+        );
+        assert!(
+            cache
+                .get_fresh_clearinghouse_state_at(t0 + 15_001, WS_CLEARINGHOUSE_FRESH_MS)
+                .is_none(),
+            "clearinghouseState must expire after 15_000 ms"
+        );
+
+        // 2. Flat clearinghouseState test objects remain supported
+        let t1 = t0 + 20_000;
+        cache.ingest_frame_value_at(
+            &json!({
+                "channel": "clearinghouseState",
+                "data": {
+                    "marginSummary": { "accountValue": "2468.10" },
+                    "assetPositions": []
+                }
+            }),
+            true,
+            t1,
+        );
+        let flat = cache
+            .get_fresh_clearinghouse_state_at(t1 + 1_000, WS_CLEARINGHOUSE_FRESH_MS)
+            .expect("flat clearinghouseState must remain supported");
+        assert_eq!(
+            flat.pointer("/marginSummary/accountValue")
+                .and_then(Value::as_str),
+            Some("2468.10")
+        );
+
+        // 3. Dedicated openOrders channel with empty snapshot orders: [] -> metadata_complete == true
+        cache.ingest_frame_value_at(
+            &json!({
+                "channel": "openOrders",
+                "data": {
+                    "dex": "",
+                    "user": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                    "orders": []
+                }
+            }),
+            true,
+            t0,
+        );
+        let empty_snap = cache
+            .get_fresh_open_orders_at(t0 + 14_999, WS_OPEN_ORDERS_FRESH_MS)
+            .expect("empty openOrders snapshot must remain fresh up to 15_000 ms");
+        assert!(empty_snap.orders.is_empty());
+        assert!(
+            empty_snap.metadata_complete,
+            "empty openOrders snapshot has no missing frontend trigger metadata"
+        );
+        assert!(
+            cache
+                .get_fresh_open_orders_at(t0 + 15_001, WS_OPEN_ORDERS_FRESH_MS)
+                .is_none(),
+            "openOrders must expire after 15_000 ms"
+        );
+
+        // 4. Non-empty trigger-stripped orders on openOrders -> metadata_complete == false
+        let t2 = t0 + 30_000;
+        cache.ingest_frame_value_at(
+            &json!({
+                "channel": "openOrders",
+                "data": {
+                    "dex": "",
+                    "user": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+                    "orders": [
+                        { "coin": "SOL", "oid": 2001u64, "limitPx": "188.0", "sz": "1.0" }
+                    ]
+                }
+            }),
+            true,
+            t2,
+        );
+        let stripped_snap = cache
+            .get_fresh_open_orders_at(t2 + 100, WS_OPEN_ORDERS_FRESH_MS)
+            .expect("non-empty openOrders snapshot present");
+        assert_eq!(stripped_snap.orders.len(), 1);
+        assert!(
+            !stripped_snap.metadata_complete,
+            "non-empty openOrders lacking frontend trigger metadata must mark metadata_complete = false"
+        );
     }
 }

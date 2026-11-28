@@ -321,7 +321,10 @@ pub fn json_value_to_config_string(val: &Value) -> String {
 }
 
 /// Validates a configuration update before persisting to MariaDB `system_config`.
-/// Delegates canonical rules to [`aegis_core::validate_core_config_key_value`] and enforces SSRF checks on `discord_webhook_url`.
+/// Delegates canonical rules to [`aegis_core::validate_core_config_key_value`] (including W2
+/// scale-in spacing & reduce breakeven hysteresis keys: `scale_in_min_atr_mult`,
+/// `scale_in_min_spacing_bps`, `scale_in_reduce_cooldown_sec`, `reduce_min_net_edge_bps`)
+/// and enforces SSRF checks on `discord_webhook_url`.
 pub fn validate_config_key_value(key: &str, value_str: &str) -> Result<()> {
     validate_core_config_key_value(key, value_str)?;
     if key.trim().eq_ignore_ascii_case("discord_webhook_url") {
@@ -709,8 +712,18 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .get("priority_monitor_health_json")
         .and_then(|raw| serde_json::from_str::<PriorityMonitorHealth>(raw.trim()).ok())
         .unwrap_or_default();
+    let live_tick_ms = db.live_priority_tick_ms();
+    if live_tick_ms > priority_monitor_health.last_tick_at_ms
+        && (priority_monitor_health.status == "HEALTHY" || priority_monitor_health.status == "IDLE")
+    {
+        priority_monitor_health.last_tick_at_ms = live_tick_ms;
+        if priority_monitor_health.status == "IDLE" {
+            priority_monitor_health.status = "HEALTHY".to_string();
+        }
+    }
     let prio_interval_ms = cfg.get_i64("priority_monitor_interval_ms", 1000).max(250);
-    let stale_threshold_ms = (prio_interval_ms * 15).max(30_000);
+    let stale_threshold_ms =
+        (prio_interval_ms * 15).max(aegis_execution::HEALTH_PERSIST_HEARTBEAT_MS * 3 + 15_000);
     if run_mode.suspends_background_loops()
         && v_assets_held.is_empty()
         && v_assets_ordered.is_empty()
@@ -1191,5 +1204,22 @@ pub fn map_aegis_error_response(err: AegisError) -> Response {
             };
             (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_w2_scale_in_and_reduce_hysteresis_config_keys() {
+        assert!(validate_config_key_value("scale_in_min_atr_mult", "0.25").is_ok());
+        assert!(validate_config_key_value("scale_in_min_atr_mult", "5.5").is_err());
+        assert!(validate_config_key_value("scale_in_min_spacing_bps", "15.0").is_ok());
+        assert!(validate_config_key_value("scale_in_min_spacing_bps", "-5.0").is_err());
+        assert!(validate_config_key_value("scale_in_reduce_cooldown_sec", "900").is_ok());
+        assert!(validate_config_key_value("scale_in_reduce_cooldown_sec", "90000").is_err());
+        assert!(validate_config_key_value("reduce_min_net_edge_bps", "8.0").is_ok());
+        assert!(validate_config_key_value("reduce_min_net_edge_bps", "600.0").is_err());
     }
 }

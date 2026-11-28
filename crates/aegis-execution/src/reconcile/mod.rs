@@ -57,6 +57,12 @@ use positions::{
     prepare_exchange_positions_unlocked, sync_tpsl_unlocked,
 };
 
+const RECONCILE_WARN_DEDUP_WINDOW_MS: i64 = 60_000;
+const RECONCILE_INFO_HEARTBEAT_INTERVAL_MS: i64 = 60_000;
+
+type ReconcileWarnDedupMap = HashMap<(String, String), (i64, u32)>;
+type ReconcileInfoHeartbeatMap = HashMap<(String, String), (i64, usize, String)>;
+
 /// Structured report produced by [`CutoverReconciler::run_cutover_reconciliation`].
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CutoverReconcileReport {
@@ -83,6 +89,8 @@ pub struct CutoverReconciler {
     in_flight_position_ops: Arc<Mutex<HashSet<i64>>>,
     ledger_cache: Arc<Mutex<HashMap<(String, String), ReconcileLedgerCache>>>,
     ws_cache: Option<Arc<WsStateCache>>,
+    warn_dedup: Arc<Mutex<ReconcileWarnDedupMap>>,
+    info_heartbeat: Arc<Mutex<ReconcileInfoHeartbeatMap>>,
 }
 
 impl CutoverReconciler {
@@ -93,6 +101,8 @@ impl CutoverReconciler {
             in_flight_position_ops: Arc::new(Mutex::new(HashSet::new())),
             ledger_cache: Arc::new(Mutex::new(HashMap::new())),
             ws_cache: None,
+            warn_dedup: Arc::new(Mutex::new(HashMap::new())),
+            info_heartbeat: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -134,6 +144,80 @@ impl CutoverReconciler {
     /// `spotClearinghouseState`) strictly without holding `execution_lock()` over network IO (`P0-Risk`).
     pub fn refresh_equity_snapshot(&self, cfg: &ConfigMap) -> Result<f64> {
         refresh_equity_snapshot_unlocked(&self.db, &self.http, cfg)
+    }
+
+    /// Evaluates whether a `clearinghouseState` unavailable `WARN` telemetry row should be
+    /// emitted at `ts_ms`, throttling repeated background failures within a 60s window while
+    /// always logging immediately when `force_log == true` or on first failure in 60s.
+    fn evaluate_warn_dedup(
+        &self,
+        cache_key: &(String, String),
+        ts_ms: i64,
+        force_log: bool,
+    ) -> Option<u32> {
+        let mut guard = self.warn_dedup.lock();
+        if !guard.contains_key(cache_key) && guard.len() >= 256 {
+            guard.clear();
+        }
+        match guard.get_mut(cache_key) {
+            Some((last_logged_ms, suppressed_repeats)) => {
+                if force_log
+                    || ts_ms.saturating_sub(*last_logged_ms) >= RECONCILE_WARN_DEDUP_WINDOW_MS
+                {
+                    let prior_suppressed = *suppressed_repeats;
+                    *last_logged_ms = ts_ms;
+                    *suppressed_repeats = 0;
+                    Some(prior_suppressed)
+                } else {
+                    *suppressed_repeats = suppressed_repeats.saturating_add(1);
+                    None
+                }
+            }
+            None => {
+                guard.insert(cache_key.clone(), (ts_ms, 0));
+                Some(0)
+            }
+        }
+    }
+
+    /// Evaluates whether the `Hyperliquid 1:1 reconciliation complete` `INFO` telemetry row
+    /// should be emitted at `snapshot_ts_ms`, suppressing idle background repeats within 60s.
+    fn evaluate_info_heartbeat(
+        &self,
+        cache_key: &(String, String),
+        snapshot_ts_ms: i64,
+        report: &CutoverReconcileReport,
+        force_ledger_replay: bool,
+    ) -> bool {
+        let mut guard = self.info_heartbeat.lock();
+        if !guard.contains_key(cache_key) && guard.len() >= 256 {
+            guard.clear();
+        }
+        let has_mutation = report.stale_orders_cancelled > 0
+            || report.legacy_positions_closed > 0
+            || report.local_orphans_closed > 0;
+        let should_log = match guard.get(cache_key) {
+            None => true,
+            Some((last_logged_ms, prev_open_synced, prev_mode)) => {
+                force_ledger_replay
+                    || has_mutation
+                    || *prev_open_synced != report.legacy_positions_adopted
+                    || *prev_mode != report.execution_mode
+                    || snapshot_ts_ms.saturating_sub(*last_logged_ms)
+                        >= RECONCILE_INFO_HEARTBEAT_INTERVAL_MS
+            }
+        };
+        if should_log {
+            guard.insert(
+                cache_key.clone(),
+                (
+                    snapshot_ts_ms,
+                    report.legacy_positions_adopted,
+                    report.execution_mode.clone(),
+                ),
+            );
+        }
+        should_log
     }
 
     fn run_reconciliation_internal(
@@ -220,19 +304,27 @@ impl CutoverReconciler {
             )
         };
 
+        let cached_live_eq = cfg.get_f64("live_exchange_equity_usdc", 0.0);
+        let initial_report_eq = if cached_live_eq.is_finite() && cached_live_eq > 0.0 {
+            cached_live_eq
+        } else {
+            fallback_eq
+        };
         let mut report = CutoverReconcileReport {
             reconciled_at_ms: snapshot_ts_ms,
             execution_mode: mode.as_str().to_string(),
             is_testnet,
             wallet_address: mask_identifier(&wallet),
             exchange_reachable: false,
-            exchange_equity_usdc: fallback_eq,
+            exchange_equity_usdc: initial_report_eq,
             ..Default::default()
         };
 
         // Phase 2: Unlocked HTTP IO (ZERO execution_lock()), consuming fresh User WS when connected & gap-filled
-        let bg_opts =
-            RequestOptions::background_sync().with_timeout_sec(self.http.timeout_sec.min(8));
+        let cache_key = (
+            self.db.db_name().to_string(),
+            wallet.trim().to_ascii_lowercase(),
+        );
         let user_reconnect_seq = self
             .ws_cache
             .as_ref()
@@ -242,6 +334,9 @@ impl CutoverReconciler {
             .ws_cache
             .as_ref()
             .is_some_and(|c| c.needs_rest_gap_reconcile());
+        let bg_opts = RequestOptions::background_sync()
+            .with_timeout_sec(self.http.timeout_sec.min(8))
+            .with_blocking_pace(needs_gap_fill || force_ledger_replay);
         let ws_disconnected_since = self
             .ws_cache
             .as_ref()
@@ -277,12 +372,33 @@ impl CutoverReconciler {
                     report
                         .details
                         .push(format!("Clearinghouse state unreachable: {e}"));
-                    let _ = self.db.log_telemetry(
-                        "WARN",
-                        "execution.reconcile",
-                        &format!("Hyperliquid clearinghouseState unreachable during cutover: {e}"),
-                        Some(serde_json::to_value(&report).unwrap_or_default()),
-                    );
+                    let phase_label = if force_ledger_replay {
+                        "cutover"
+                    } else {
+                        "background 15s sync"
+                    };
+                    if let Some(suppressed_repeats) =
+                        self.evaluate_warn_dedup(&cache_key, snapshot_ts_ms, force_ledger_replay)
+                    {
+                        let mut details_json =
+                            serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+                        if suppressed_repeats > 0 {
+                            if let Some(obj) = details_json.as_object_mut() {
+                                obj.insert(
+                                    "suppressed_repeats".to_string(),
+                                    json!(suppressed_repeats),
+                                );
+                            }
+                        }
+                        let _ = self.db.log_telemetry(
+                            "WARN",
+                            "execution.reconcile",
+                            &format!(
+                                "Hyperliquid clearinghouseState unavailable during {phase_label}: {e}"
+                            ),
+                            Some(details_json),
+                        );
+                    }
                     return Ok(report);
                 }
             }
@@ -390,10 +506,6 @@ impl CutoverReconciler {
             .filter_map(|h| h.opened_at_ms.filter(|&t| t > 0))
             .min();
 
-        let cache_key = (
-            self.db.db_name().to_string(),
-            wallet.trim().to_ascii_lowercase(),
-        );
         let (parsed_fills_by_coin, user_fills_fetch_ok, should_run_ledger_replay) = {
             let mut cache_map = self.ledger_cache.lock();
             if cache_map.len() > 32 {
@@ -410,6 +522,7 @@ impl CutoverReconciler {
                 earliest_local_open_ms,
                 snapshot_ts_ms,
                 &cfg,
+                bg_opts,
             );
             let pos_delta_or_flat = cache_entry.prev_open_szi_by_coin != open_szi_by_coin
                 || local_held_before
@@ -615,20 +728,22 @@ impl CutoverReconciler {
             &post_cfg,
         );
 
-        let _ = self.db.log_telemetry(
-            "INFO",
-            "execution.reconcile",
-            &format!(
-                "Hyperliquid 1:1 reconciliation complete: mode={}, equity=${:.2}, orders_cancelled={}/{}, open_positions_synced={}, local_flat_closed={}",
-                report.execution_mode,
-                report.exchange_equity_usdc,
-                report.stale_orders_cancelled,
-                report.stale_orders_found,
-                report.legacy_positions_adopted,
-                report.local_orphans_closed
-            ),
-            Some(json!(report)),
-        );
+        if self.evaluate_info_heartbeat(&cache_key, snapshot_ts_ms, &report, force_ledger_replay) {
+            let _ = self.db.log_telemetry(
+                "INFO",
+                "execution.reconcile",
+                &format!(
+                    "Hyperliquid 1:1 reconciliation complete: mode={}, equity=${:.2}, orders_cancelled={}/{}, open_positions_synced={}, local_flat_closed={}",
+                    report.execution_mode,
+                    report.exchange_equity_usdc,
+                    report.stale_orders_cancelled,
+                    report.stale_orders_found,
+                    report.legacy_positions_adopted,
+                    report.local_orphans_closed
+                ),
+                Some(json!(report)),
+            );
+        }
 
         Ok(report)
     }
@@ -753,5 +868,202 @@ impl CutoverReconciler {
             min_interval_ms,
             perp_equity_override,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_test_support::mock_http::{MockHttpResponse, MockHttpServer};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn test_reconcile_warn_dedup_and_info_heartbeat_state_machine() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        let reconciler = CutoverReconciler::new(db, HyperliquidHttpClient::new(2));
+        let key = ("test_db".to_string(), "0xabc".to_string());
+        let t0 = 1_760_000_000_000_i64;
+
+        // WARN dedup: first background failure logs immediately, repeats within 60s are suppressed,
+        // 60_000 ms boundary emits with suppressed_repeats, and force_log (cutover) always emits.
+        assert_eq!(reconciler.evaluate_warn_dedup(&key, t0, false), Some(0));
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 15_000, false),
+            None
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 30_000, false),
+            None
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 59_999, false),
+            None
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 60_000, false),
+            Some(3)
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 75_000, false),
+            None
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 80_000, true),
+            Some(1)
+        );
+        assert_eq!(
+            reconciler.evaluate_warn_dedup(&key, t0 + 81_000, true),
+            Some(0)
+        );
+
+        // INFO heartbeat: first pass logs; identical idle passes within 60s are suppressed;
+        // mutations, position count change, mode change, force_ledger_replay, and >= 60s emit.
+        let mut rep = CutoverReconcileReport {
+            execution_mode: "TESTNET".to_string(),
+            legacy_positions_adopted: 2,
+            ..Default::default()
+        };
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0, &rep, false));
+        assert!(!reconciler.evaluate_info_heartbeat(&key, t0 + 15_000, &rep, false));
+        assert!(!reconciler.evaluate_info_heartbeat(&key, t0 + 30_000, &rep, false));
+
+        rep.stale_orders_cancelled = 1;
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 40_000, &rep, false));
+        rep.stale_orders_cancelled = 0;
+        assert!(!reconciler.evaluate_info_heartbeat(&key, t0 + 55_000, &rep, false));
+
+        rep.legacy_positions_closed = 1;
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 60_000, &rep, false));
+        rep.legacy_positions_closed = 0;
+
+        rep.local_orphans_closed = 1;
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 65_000, &rep, false));
+        rep.local_orphans_closed = 0;
+
+        rep.legacy_positions_adopted = 3;
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 70_000, &rep, false));
+
+        rep.execution_mode = "LIVE".to_string();
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 75_000, &rep, false));
+
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 80_000, &rep, true));
+        assert!(!reconciler.evaluate_info_heartbeat(&key, t0 + 139_999, &rep, false));
+        assert!(reconciler.evaluate_info_heartbeat(&key, t0 + 140_000, &rep, false));
+    }
+
+    #[test]
+    fn test_reconcile_warn_dedup_and_info_heartbeat_with_db_and_mock_http() {
+        let db = DatabaseManager::new_isolated_test(None).unwrap();
+        db.init_schema().unwrap();
+
+        let fail_ch = Arc::new(AtomicBool::new(true));
+        let fail_ch_srv = fail_ch.clone();
+        let server = MockHttpServer::start(move |req| {
+            let typ = req
+                .json_body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match typ {
+                "clearinghouseState" => {
+                    if fail_ch_srv.load(Ordering::SeqCst) {
+                        MockHttpResponse::json(400, &json!({ "error": "unavailable" }))
+                    } else {
+                        MockHttpResponse::ok_json(&json!({
+                            "marginSummary": { "accountValue": "1969.92", "totalMarginUsed": "0.0" },
+                            "withdrawable": "1969.92",
+                            "assetPositions": []
+                        }))
+                    }
+                }
+                "userAbstraction" => MockHttpResponse::ok_json(&json!("default")),
+                "spotClearinghouseState" => MockHttpResponse::ok_json(&json!({ "balances": [] })),
+                "meta" => MockHttpResponse::ok_json(&json!({ "universe": [] })),
+                _ => MockHttpResponse::ok_json(&json!([])),
+            }
+        });
+
+        db.set_config_value("execution_mode", "TESTNET", None)
+            .unwrap();
+        db.set_config_value("hyperliquid_testnet_url", &server.base_url(), None)
+            .unwrap();
+        db.set_config_value("hyperliquid_allowed_hosts", "127.0.0.1", None)
+            .unwrap();
+        db.set_config_value(
+            "wallet_address",
+            "0x1111111111111111111111111111111111111111",
+            None,
+        )
+        .unwrap();
+        db.set_config_value("initial_paper_equity_usdc", "5000.0", None)
+            .unwrap();
+        db.set_config_value("live_exchange_equity_usdc", "1969.92", None)
+            .unwrap();
+
+        let reconciler = CutoverReconciler::new(db.clone(), HyperliquidHttpClient::new(2));
+
+        // 1. Repeated background failures within 60s: only 1 WARN logged, using live_exchange_equity_usdc
+        let err_rep1 = reconciler.sync_db_with_hyperliquid().unwrap();
+        assert!(!err_rep1.exchange_reachable);
+        assert!((err_rep1.exchange_equity_usdc - 1969.92).abs() < 1e-6);
+
+        let err_rep2 = reconciler.sync_db_with_hyperliquid().unwrap();
+        assert!(!err_rep2.exchange_reachable);
+        assert!((err_rep2.exchange_equity_usdc - 1969.92).abs() < 1e-6);
+
+        let warn_rows_after_bg: Vec<_> = db
+            .list_recent_telemetry(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.level == "WARN" && r.component == "execution.reconcile")
+            .collect();
+        assert_eq!(warn_rows_after_bg.len(), 1);
+        assert!(warn_rows_after_bg[0]
+            .message
+            .contains("Hyperliquid clearinghouseState unavailable during background 15s sync:"));
+        let det0 = warn_rows_after_bg[0].details_json.as_ref().unwrap();
+        assert!((det0["exchange_equity_usdc"].as_f64().unwrap() - 1969.92).abs() < 1e-6);
+        assert!(det0.get("suppressed_repeats").is_none());
+
+        // 2. Cutover failure immediately logs WARN and carries suppressed_repeats = 1
+        let _ = reconciler.run_cutover_reconciliation(false).unwrap();
+        let warn_rows_after_cutover: Vec<_> = db
+            .list_recent_telemetry(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.level == "WARN" && r.component == "execution.reconcile")
+            .collect();
+        assert_eq!(warn_rows_after_cutover.len(), 2);
+        assert!(warn_rows_after_cutover[0]
+            .message
+            .contains("Hyperliquid clearinghouseState unavailable during cutover:"));
+        assert_eq!(
+            warn_rows_after_cutover[0].details_json.as_ref().unwrap()["suppressed_repeats"]
+                .as_u64(),
+            Some(1)
+        );
+
+        // 3. Exchange recovers: 3 rapid background syncs emit only 1 INFO row; cutover emits a 2nd
+        fail_ch.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            let ok_rep = reconciler.sync_db_with_hyperliquid().unwrap();
+            assert!(ok_rep.exchange_reachable);
+        }
+        let info_rows_after_bg: Vec<_> = db
+            .list_recent_telemetry(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.level == "INFO" && r.component == "execution.reconcile")
+            .collect();
+        assert_eq!(info_rows_after_bg.len(), 1);
+
+        let _ = reconciler.run_cutover_reconciliation(false).unwrap();
+        let info_rows_after_cutover: Vec<_> = db
+            .list_recent_telemetry(50)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.level == "INFO" && r.component == "execution.reconcile")
+            .collect();
+        assert_eq!(info_rows_after_cutover.len(), 2);
     }
 }

@@ -182,6 +182,11 @@ impl RequestOptions {
         self.max_retries = max_retries;
         self
     }
+
+    pub const fn with_blocking_pace(mut self, blocking_pace: bool) -> Self {
+        self.blocking_pace = blocking_pace;
+        self
+    }
 }
 
 impl Default for RequestOptions {
@@ -729,10 +734,14 @@ fn compute_info_retry_backoff_ms(attempt: usize, retry_after_header: Option<&str
     .0
 }
 
-/// Shared blocking JSON POST helper with endpoint validation, lock-discipline assertion (`R14-H2`),
-/// host-keyed REST weight governor (`R14-H4`), and bounded `/info` jittered backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpPostFailure {
+    GovernorShed,
+    RequestFailed,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn http_post_json_with_options(
+fn http_post_json_detailed(
     http_client: &Client,
     client_timeout_sec: u64,
     url: &str,
@@ -740,7 +749,7 @@ pub fn http_post_json_with_options(
     cfg: &ConfigMap,
     opts: RequestOptions,
     governor_override: Option<&RestWeightGovernor>,
-) -> Option<Value> {
+) -> std::result::Result<Value, HttpPostFailure> {
     if crate::lock_guard::is_execution_lock_held_on_current_thread() {
         tracing::error!(
             url = url,
@@ -753,7 +762,7 @@ pub fn http_post_json_with_options(
     }
 
     if !validate_hyperliquid_endpoint_url(url, cfg) {
-        return None;
+        return Err(HttpPostFailure::RequestFailed);
     }
 
     let eff_timeout_sec = opts.timeout_sec.max(1);
@@ -795,7 +804,12 @@ pub fn http_post_json_with_options(
     for attempt in 0..max_attempts {
         if let Some(gov) = active_governor {
             let acquired = if opts.blocking_pace {
-                gov.acquire_for_request_blocking(opts.priority, base_weight, 30_000)
+                let max_pace_ms = if opts.timeout_sec >= 12 {
+                    30_000
+                } else {
+                    5_000
+                };
+                gov.acquire_for_request_blocking(opts.priority, base_weight, max_pace_ms)
             } else {
                 gov.acquire_for_request(opts.priority, base_weight)
             };
@@ -806,7 +820,7 @@ pub fn http_post_json_with_options(
                     base_weight,
                     "Hyperliquid REST request shed by RestWeightGovernor"
                 );
-                return None;
+                return Err(HttpPostFailure::GovernorShed);
             }
         }
 
@@ -814,7 +828,7 @@ pub fn http_post_json_with_options(
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(url = url, error = %e, "Hyperliquid HTTP POST request failed");
-                return None;
+                return Err(HttpPostFailure::RequestFailed);
             }
         };
         let status = resp.status();
@@ -825,11 +839,11 @@ pub fn http_post_json_with_options(
                         let extra = RestWeightGovernor::variable_item_debit(payload, &val);
                         gov.record_post_response_debit(extra);
                     }
-                    Some(val)
+                    Ok(val)
                 }
                 Err(e) => {
                     tracing::warn!(url = url, error = %e, "Failed to parse JSON from Hyperliquid endpoint");
-                    None
+                    Err(HttpPostFailure::RequestFailed)
                 }
             };
         }
@@ -876,10 +890,34 @@ pub fn http_post_json_with_options(
             attempts = attempt + 1,
             "Hyperliquid endpoint returned non-2xx HTTP status"
         );
-        return None;
+        return Err(HttpPostFailure::RequestFailed);
     }
 
-    None
+    Err(HttpPostFailure::RequestFailed)
+}
+
+/// Shared blocking JSON POST helper with endpoint validation, lock-discipline assertion (`R14-H2`),
+/// host-keyed REST weight governor (`R14-H4`), and bounded `/info` jittered backoff.
+#[allow(clippy::too_many_arguments)]
+pub fn http_post_json_with_options(
+    http_client: &Client,
+    client_timeout_sec: u64,
+    url: &str,
+    payload: &Value,
+    cfg: &ConfigMap,
+    opts: RequestOptions,
+    governor_override: Option<&RestWeightGovernor>,
+) -> Option<Value> {
+    http_post_json_detailed(
+        http_client,
+        client_timeout_sec,
+        url,
+        payload,
+        cfg,
+        opts,
+        governor_override,
+    )
+    .ok()
 }
 
 /// Compatible default wrapper around [`http_post_json_with_options`].
@@ -1275,6 +1313,13 @@ pub fn parse_l2_book_depth(raw: &Value) -> Option<L2BookDepthSnapshot> {
     })
 }
 
+/// Returns `true` when `err` indicates the request was locally shed by [`RestWeightGovernor`]
+/// before reaching Hyperliquid rather than failing over HTTP/network.
+pub fn is_governor_shed_error(err: &AegisError) -> bool {
+    err.to_string()
+        .contains("locally shed by RestWeightGovernor")
+}
+
 /// High-level Hyperliquid `/info` and `/exchange` client for Aegis Quant v2.0.
 #[derive(Clone)]
 pub struct HyperliquidHttpClient {
@@ -1316,7 +1361,7 @@ impl HyperliquidHttpClient {
         opts: RequestOptions,
     ) -> Result<Value> {
         let url = resolve_info_url_for_network(cfg, is_testnet);
-        http_post_json_with_options(
+        http_post_json_detailed(
             &self.client,
             self.timeout_sec,
             &url,
@@ -1325,8 +1370,13 @@ impl HyperliquidHttpClient {
             opts,
             self.custom_governor.as_deref(),
         )
-        .ok_or_else(|| {
-            AegisError::Execution(format!("Hyperliquid /info request failed at '{url}'"))
+        .map_err(|failure| match failure {
+            HttpPostFailure::GovernorShed => AegisError::Execution(format!(
+                "Hyperliquid /info request locally shed by RestWeightGovernor at '{url}'"
+            )),
+            HttpPostFailure::RequestFailed => {
+                AegisError::Execution(format!("Hyperliquid /info request failed at '{url}'"))
+            }
         })
     }
 
@@ -1740,6 +1790,9 @@ impl HyperliquidHttpClient {
                 metadata_complete: true,
             }),
             Err(front_err) => {
+                if is_governor_shed_error(&front_err) {
+                    return Err(front_err);
+                }
                 tracing::warn!(
                     error = %front_err,
                     "frontendOpenOrders failed; falling back to openOrders with metadata_complete=false"
@@ -1861,6 +1914,27 @@ impl HyperliquidHttpClient {
         aggregate_by_time: bool,
         cfg: &ConfigMap,
     ) -> Result<Vec<Value>> {
+        let opts = RequestOptions::background_sync().with_timeout_sec(self.timeout_sec.min(8));
+        self.fetch_user_fills_by_time_with_options(
+            user_wallet,
+            start_time_ms,
+            end_time_ms,
+            aggregate_by_time,
+            cfg,
+            opts,
+        )
+    }
+
+    /// Polls `userFillsByTime` for `user_wallet` starting at `start_time_ms` with explicit [`RequestOptions`].
+    pub fn fetch_user_fills_by_time_with_options(
+        &self,
+        user_wallet: &str,
+        start_time_ms: i64,
+        end_time_ms: Option<i64>,
+        aggregate_by_time: bool,
+        cfg: &ConfigMap,
+        opts: RequestOptions,
+    ) -> Result<Vec<Value>> {
         let mut payload = json!({
             "type": "userFillsByTime",
             "user": user_wallet.trim(),
@@ -1870,7 +1944,6 @@ impl HyperliquidHttpClient {
         if let Some(end_ms) = end_time_ms {
             payload["endTime"] = json!(end_ms.max(0));
         }
-        let opts = RequestOptions::background_sync().with_timeout_sec(self.timeout_sec.min(8));
         let raw = self.post_info_with_options(&payload, cfg, opts)?;
         Ok(raw.as_array().cloned().unwrap_or_default())
     }
@@ -3131,5 +3204,118 @@ mod tests {
             .expect("paginated fundingHistory succeeds with blocking pace");
         assert_eq!(history.len(), 502);
         assert_eq!(srv.request_count(), 2);
+    }
+
+    #[test]
+    fn test_governor_shed_error_skips_open_orders_fallback_while_http_500_falls_back() {
+        let srv = MockHttpServer::start(move |req| {
+            let typ = req
+                .json_body
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match typ {
+                "frontendOpenOrders" => {
+                    if req.json_body.get("user").and_then(Value::as_str) == Some("0xfailfront") {
+                        MockHttpResponse::json(500, &json!({ "error": "boom" }))
+                    } else {
+                        MockHttpResponse::ok_json(&json!([{ "coin": "ETH", "oid": 11 }]))
+                    }
+                }
+                "openOrders" => MockHttpResponse::ok_json(&json!([{ "coin": "ETH", "oid": 22 }])),
+                _ => MockHttpResponse::ok_json(&json!([])),
+            }
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_testnet_url", srv.base_url());
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        // Drain High lane (floor 150) down to 160 tokens so weight-20 frontendOpenOrders sheds (> 150ms wait).
+        let gov = Arc::new(RestWeightGovernor::new_enforced(900));
+        for _ in 0..22 {
+            assert!(gov.try_acquire(RequestPriority::High, 20).is_ok());
+        }
+        assert!(gov.try_acquire(RequestPriority::High, 20).is_err());
+
+        let shed_client = HyperliquidHttpClient::new(5).with_governor(Arc::clone(&gov));
+        let shed_err = shed_client
+            .fetch_open_orders_with_metadata("0xfailfront", &cfg)
+            .expect_err("governor-shed frontendOpenOrders must fail without fallback");
+        assert!(
+            is_governor_shed_error(&shed_err),
+            "expected governor shed error, got: {shed_err}"
+        );
+        assert_eq!(
+            srv.request_count(),
+            0,
+            "neither frontendOpenOrders nor fallback openOrders should hit HTTP when locally shed"
+        );
+
+        // HTTP 500 is NOT a governor shed error and must still fall back to openOrders.
+        let fresh_client = HyperliquidHttpClient::new(5);
+        let http_err = fresh_client
+            .fetch_frontend_open_orders("0xfailfront", &cfg)
+            .expect_err("HTTP 500 must error on frontendOpenOrders");
+        assert!(
+            !is_governor_shed_error(&http_err),
+            "HTTP 500 must not be classified as governor shed: {http_err}"
+        );
+        srv.clear_requests();
+
+        let fallback = fresh_client
+            .fetch_open_orders_with_metadata("0xfailfront", &cfg)
+            .expect("HTTP 500 on frontendOpenOrders must fall back to openOrders");
+        assert!(!fallback.metadata_complete);
+        assert_eq!(fallback.orders.len(), 1);
+        assert_eq!(
+            fallback.orders[0].get("oid").and_then(Value::as_u64),
+            Some(22)
+        );
+        assert_eq!(srv.request_count(), 2);
+    }
+
+    #[test]
+    fn test_with_blocking_pace_paces_across_token_refill_cleanly() {
+        let srv = MockHttpServer::start_json(|_path, body| {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            if typ == "userFillsByTime" {
+                (200, json!([{ "coin": "SOL", "px": "70.0" }]))
+            } else {
+                (404, json!({}))
+            }
+        });
+
+        let mut cfg = ConfigMap::new();
+        cfg.insert("execution_mode", "TESTNET");
+        cfg.insert("hyperliquid_testnet_url", srv.base_url());
+        cfg.insert("hyperliquid_allowed_hosts", "127.0.0.1");
+
+        let non_blocking = RequestOptions::background_sync().with_timeout_sec(5);
+        assert!(!non_blocking.blocking_pace);
+        let blocking = non_blocking.with_blocking_pace(true);
+        assert!(blocking.blocking_pace);
+        assert_eq!(blocking.timeout_sec, 5);
+
+        // Drain Normal lane (floor 300) down to 300 tokens -> deficit 20 tokens (~1.34s refill at 900/min).
+        let gov = Arc::new(RestWeightGovernor::new_enforced(900));
+        for _ in 0..15 {
+            assert!(gov.try_acquire(RequestPriority::Normal, 20).is_ok());
+        }
+        assert!(gov.try_acquire(RequestPriority::Normal, 20).is_err());
+
+        let client = HyperliquidHttpClient::new(5).with_governor(Arc::clone(&gov));
+        let shed_err = client
+            .fetch_user_fills_by_time_with_options("0xok", 1_000, None, false, &cfg, non_blocking)
+            .expect_err("non-blocking Normal request should shed immediately above 300ms wait");
+        assert!(is_governor_shed_error(&shed_err));
+        assert_eq!(srv.request_count(), 0);
+
+        let fills = client
+            .fetch_user_fills_by_time_with_options("0xok", 1_000, None, false, &cfg, blocking)
+            .expect("with_blocking_pace(true) should pace cleanly across token refill (<5s cap)");
+        assert_eq!(fills.len(), 1);
+        assert_eq!(srv.request_count(), 1);
     }
 }

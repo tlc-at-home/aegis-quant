@@ -7,9 +7,10 @@ use crate::row_decode::{
     row_get_opt_string, row_get_string, DEC_20_10_MAX_ABS, DEC_20_8_MAX_ABS,
 };
 use aegis_core::{
-    is_sensitive_config_key, mask_identifier, now_ms, round_dp, sanitize_telemetry_message,
-    ytd_start_ms, AegisError, AlertQueueRecord, CachedHlPortfolioPnl, ConfigMap, OrderSide,
-    PnlHorizonMetrics, PnlSummary, PortfolioSnapshot, Result, TelemetryLogRecord,
+    is_sensitive_config_key, is_unified_account_mode, mask_identifier, now_ms, round_dp,
+    sanitize_telemetry_message, ytd_start_ms, AegisError, AlertQueueRecord, CachedHlPortfolioPnl,
+    ConfigMap, OrderSide, PnlHorizonMetrics, PnlSummary, PortfolioSnapshot, Result,
+    TelemetryLogRecord, VaultInfoPayload,
 };
 use mysql::prelude::*;
 use mysql::{params, PooledConn, Value};
@@ -1121,6 +1122,15 @@ impl DatabaseManager {
         } else {
             None
         };
+        let is_unified = is_unified_account_mode(&cfg.get_str("live_exchange_account_mode", ""));
+        let vault_payload_opt: Option<VaultInfoPayload> = if is_live_or_testnet {
+            let raw_vault = cfg.get_str("live_vault_info_json", "");
+            (!raw_vault.is_empty())
+                .then(|| serde_json::from_str::<VaultInfoPayload>(&raw_vault).ok())
+                .flatten()
+        } else {
+            None
+        };
 
         let day_ms = 86_400_000i64;
         let specs = [
@@ -1141,9 +1151,19 @@ impl DatabaseManager {
             } else {
                 raw_start
             };
+            let vault_win_pnl =
+                estimate_vault_window_pnl_usdc(vault_payload_opt.as_ref(), eff_starts[i], now);
             hl_matches[i] = hl_portfolio_opt
                 .as_ref()
-                .and_then(|hl| hl.horizon_net_pnl(key, raw_start, cap_updated_at_ms))
+                .and_then(|hl| {
+                    hl.horizon_net_pnl_for_mode(
+                        key,
+                        raw_start,
+                        cap_updated_at_ms,
+                        is_unified,
+                        vault_win_pnl,
+                    )
+                })
                 .filter(|(net, _, _)| net.is_finite());
         }
         let min_start = eff_starts.iter().copied().min().unwrap_or(now - day_ms);
@@ -1158,18 +1178,22 @@ impl DatabaseManager {
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :d_s THEN funding_accrued_usdc - fees_paid_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :d_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :d_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN closed_at_ms >= :d_s AND COALESCE(opened_at_ms, created_at_ms) < :d_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :w_s THEN realized_pnl_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :w_s THEN funding_accrued_usdc - fees_paid_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :w_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :w_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN closed_at_ms >= :w_s AND COALESCE(opened_at_ms, created_at_ms) < :w_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :m_s THEN realized_pnl_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :m_s THEN funding_accrued_usdc - fees_paid_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :m_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :m_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN closed_at_ms >= :m_s AND COALESCE(opened_at_ms, created_at_ms) < :m_s THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s THEN realized_pnl_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s THEN funding_accrued_usdc - fees_paid_usdc ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s THEN 1 ELSE 0 END), 0),
-                       COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0)
+                       COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s AND realized_pnl_usdc > 0 THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN closed_at_ms >= :y_s AND COALESCE(opened_at_ms, created_at_ms) < :y_s THEN 1 ELSE 0 END), 0)
                    FROM positions
                    WHERE status = 'CLOSED'
                      AND closed_at_ms >= :min_s
@@ -1190,13 +1214,15 @@ impl DatabaseManager {
         let mut closed_ff = [0.0_f64; 4];
         let mut trade_cnt = [0_i64; 4];
         let mut win_cnt = [0_i64; 4];
+        let mut boundary_crossing_cnt = [0_i64; 4];
         if let Some(ref r) = closed_row {
             for i in 0..4 {
-                let base = i * 4;
+                let base = i * 5;
                 closed_rpnl[i] = row_get_f64(r, base, 0.0);
                 closed_ff[i] = row_get_f64(r, base + 1, 0.0);
                 trade_cnt[i] = row_get_i64(r, base + 2, 0);
                 win_cnt[i] = row_get_i64(r, base + 3, 0);
+                boundary_crossing_cnt[i] = row_get_i64(r, base + 4, 0);
             }
         }
 
@@ -1462,12 +1488,11 @@ impl DatabaseManager {
             let (
                 net_pnl_usdc,
                 unrealized_pnl_usdc,
+                m2m_carry_usdc,
                 final_window_start_ms,
                 final_is_cap_clamped,
                 pnl_source,
             ) = if let Some((hl_net_pnl, hl_win_start, hl_clamped)) = hl_matches[i] {
-                let net = round_dp(hl_net_pnl, 2);
-                let unrl = round_dp(net - realized_pnl_usdc, 2);
                 let win_ms = if hl_clamped {
                     eff_start_ms
                 } else if hl_win_start > 0 {
@@ -1475,7 +1500,38 @@ impl DatabaseManager {
                 } else {
                     eff_start_ms
                 };
-                (net, unrl, win_ms, hl_clamped, "HL_PORTFOLIO".to_string())
+                let is_flat_to_flat_with_trades =
+                    open_positions.is_empty() && boundary_crossing_cnt[i] == 0 && trade_cnt[i] > 0;
+                if is_flat_to_flat_with_trades {
+                    (
+                        realized_pnl_usdc,
+                        0.0,
+                        0.0,
+                        win_ms,
+                        hl_clamped,
+                        "HL_PORTFOLIO".to_string(),
+                    )
+                } else {
+                    let net = round_dp(hl_net_pnl, 2);
+                    let unrl = if open_positions.is_empty() {
+                        0.0
+                    } else {
+                        round_dp(
+                            finite_or_zero(current_unrealized_pnl)
+                                + finite_or_zero(open_fees_funding),
+                            2,
+                        )
+                    };
+                    let carry = round_dp(net - realized_pnl_usdc - unrl, 2);
+                    (
+                        net,
+                        unrl,
+                        carry,
+                        win_ms,
+                        hl_clamped,
+                        "HL_PORTFOLIO".to_string(),
+                    )
+                }
             } else {
                 let unrl = round_dp(horizon_upnl_delta + horizon_open_fees_funding, 2);
                 let net = round_dp(
@@ -1485,6 +1541,7 @@ impl DatabaseManager {
                 (
                     net,
                     unrl,
+                    0.0,
                     eff_start_ms,
                     is_cap_clamped[i],
                     "LOCAL_LEDGER".to_string(),
@@ -1505,6 +1562,7 @@ impl DatabaseManager {
                 return_pct,
                 realized_pnl_usdc,
                 unrealized_pnl_usdc,
+                m2m_carry_usdc,
                 fees_funding_usdc,
                 trade_count: trade_cnt[i].max(0) as usize,
                 win_count: win_cnt[i].max(0) as usize,
@@ -1525,6 +1583,40 @@ impl DatabaseManager {
             monthly,
             ytd,
         })
+    }
+}
+
+fn estimate_vault_window_pnl_usdc(
+    vault_payload: Option<&VaultInfoPayload>,
+    eff_start_ms: i64,
+    now_ms_val: i64,
+) -> f64 {
+    let Some(vp) = vault_payload else {
+        return 0.0;
+    };
+    let mut sum = 0.0_f64;
+    for v in &vp.vaults {
+        if v.is_closed || !v.all_time_pnl_usdc.is_finite() {
+            continue;
+        }
+        if v.days_following == 0 && v.equity_usdc <= 0.0 {
+            continue;
+        }
+        let ref_now = vp.synced_at_ms.max(now_ms_val);
+        let follow_span_ms = (v.days_following.max(1) as i64) * 86_400_000;
+        let est_entry_ms = ref_now.saturating_sub(follow_span_ms);
+        if eff_start_ms <= est_entry_ms {
+            sum += v.all_time_pnl_usdc;
+        } else {
+            let win_ms = ref_now.saturating_sub(eff_start_ms) as f64;
+            let frac = (win_ms / (follow_span_ms as f64)).clamp(0.0, 1.0);
+            sum += v.all_time_pnl_usdc * frac;
+        }
+    }
+    if sum.is_finite() {
+        sum
+    } else {
+        0.0
     }
 }
 

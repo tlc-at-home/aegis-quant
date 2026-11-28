@@ -14,7 +14,7 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use zeroize::Zeroize;
 
@@ -168,6 +168,7 @@ pub struct DatabaseManager {
     has_external_master_key: bool,
     ephemeral_drop_guard: Option<Arc<EphemeralDbDropGuard>>,
     pub(crate) pnl_cache: Arc<Mutex<Option<PnlSummaryCacheEntry>>>,
+    pub(crate) live_priority_tick_ms: Arc<AtomicI64>,
 }
 
 impl DatabaseManager {
@@ -232,6 +233,7 @@ impl DatabaseManager {
             has_external_master_key: has_ext,
             ephemeral_drop_guard: None,
             pnl_cache: Arc::new(Mutex::new(None)),
+            live_priority_tick_ms: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -301,6 +303,7 @@ impl DatabaseManager {
             has_external_master_key: has_ext,
             ephemeral_drop_guard: Some(guard),
             pnl_cache: Arc::new(Mutex::new(None)),
+            live_priority_tick_ms: Arc::new(AtomicI64::new(0)),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -361,6 +364,22 @@ impl DatabaseManager {
     /// Invalidates the in-memory `compute_pnl_summary` TTL cache.
     pub fn invalidate_pnl_cache(&self) {
         *self.pnl_cache.lock() = None;
+    }
+
+    /// Records the latest in-process healthy 1s `PriorityMonitor` tick timestamp (`ms`).
+    pub fn record_live_priority_tick_ms(&self, ts_ms: i64) {
+        self.live_priority_tick_ms.store(ts_ms, Ordering::Relaxed);
+    }
+
+    /// Resets the in-process 1s `PriorityMonitor` tick timestamp (`0`) on schema resets
+    /// or explicit `priority_monitor_health_json` writes (degraded/error persistence or test overrides).
+    pub fn reset_live_priority_tick_ms(&self) {
+        self.live_priority_tick_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Returns the latest in-process healthy 1s `PriorityMonitor` tick timestamp (`ms`), or `0` if unset.
+    pub fn live_priority_tick_ms(&self) -> i64 {
+        self.live_priority_tick_ms.load(Ordering::Relaxed)
     }
 
     /// Queries MariaDB server version string (e.g. `"13.0.2-MariaDB"`).
@@ -448,6 +467,7 @@ impl DatabaseManager {
         }
         drop(conn);
 
+        self.reset_live_priority_tick_ms();
         self.init_schema()
     }
 

@@ -359,13 +359,21 @@ pub fn parse_hl_portfolio_pnl(raw: &Value, synced_at_ms: i64) -> Option<CachedHl
             "perpWeek" => out.perp_week = parse_window(obj),
             "perpMonth" => out.perp_month = parse_window(obj),
             "perpAllTime" => out.perp_all_time = parse_window(obj),
+            "day" => out.account_day = parse_window(obj),
+            "week" => out.account_week = parse_window(obj),
+            "month" => out.account_month = parse_window(obj),
+            "allTime" => out.account_all_time = parse_window(obj),
             _ => {}
         }
     }
     let any_non_empty = !out.perp_day.pnl_history.is_empty()
         || !out.perp_week.pnl_history.is_empty()
         || !out.perp_month.pnl_history.is_empty()
-        || !out.perp_all_time.pnl_history.is_empty();
+        || !out.perp_all_time.pnl_history.is_empty()
+        || !out.account_day.pnl_history.is_empty()
+        || !out.account_week.pnl_history.is_empty()
+        || !out.account_month.pnl_history.is_empty()
+        || !out.account_all_time.pnl_history.is_empty();
     any_non_empty.then_some(out)
 }
 
