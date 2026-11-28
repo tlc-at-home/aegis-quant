@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const PLATFORM_NAME: &str = "Aegis Quant";
-pub const PLATFORM_VERSION: &str = "2.0.0";
+pub const PLATFORM_VERSION: &str = "2.1.0";
 
 /// Selectable portfolio leverage / risk appetite tier (`Conservative`, `Standard`, `Aggressive`, `Extreme`, `Custom`).
 /// Seeded by default at `Extreme (1.85x)` per Rev 3.1 architecture spec.
@@ -127,6 +127,73 @@ impl ExecutionMode {
 
     pub fn is_live_or_testnet(&self) -> bool {
         matches!(self, Self::Testnet | Self::Live)
+    }
+}
+
+/// Operator-controlled graduated runtime mode (`ACTIVE`, `DRAIN`, `PAUSED`, `HALTED`, `STANDBY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TradingRunMode {
+    Active,
+    Drain,
+    Paused,
+    Halted,
+    Standby,
+}
+
+impl TradingRunMode {
+    /// Strict parser rejecting unknown mode strings with [`AegisError::Validation`].
+    pub fn parse_strict(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "ACTIVE" => Ok(Self::Active),
+            "DRAIN" => Ok(Self::Drain),
+            "PAUSED" => Ok(Self::Paused),
+            "HALTED" => Ok(Self::Halted),
+            "STANDBY" => Ok(Self::Standby),
+            other => Err(AegisError::Validation(format!(
+                "Invalid trading_run_mode '{other}': expected ACTIVE, DRAIN, PAUSED, HALTED, or STANDBY"
+            ))),
+        }
+    }
+
+    /// Fault-tolerant parser defaulting unrecognized values safely to `Active`.
+    pub fn parse(raw: &str) -> Self {
+        Self::parse_strict(raw).unwrap_or(Self::Active)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "ACTIVE",
+            Self::Drain => "DRAIN",
+            Self::Paused => "PAUSED",
+            Self::Halted => "HALTED",
+            Self::Standby => "STANDBY",
+        }
+    }
+
+    pub fn display_badge(&self) -> &'static str {
+        match self {
+            Self::Active => "🟢 ACTIVE",
+            Self::Drain => "🟡 DRAIN (CLOSE-ONLY)",
+            Self::Paused => "🟠 PAUSED (HOLD)",
+            Self::Halted => "🔴 HALTED (KILL-SWITCH)",
+            Self::Standby => "⚪ STANDBY (LOOPS PAUSED)",
+        }
+    }
+
+    /// Returns `true` only when new entries, scale-ins, and flip re-entries are permitted.
+    pub fn allows_new_entries(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Returns `true` when automated signal exits (`CLOSE`, `REDUCE`, and close-part of `FLIP`) are permitted.
+    pub fn allows_signal_exits(&self) -> bool {
+        matches!(self, Self::Active | Self::Drain)
+    }
+
+    /// Returns `true` when background trading/polling loops may suspend (`STANDBY` requires flat book).
+    pub fn suspends_background_loops(&self) -> bool {
+        matches!(self, Self::Standby)
     }
 }
 
@@ -295,6 +362,10 @@ impl ConfigMap {
         ExecutionMode::parse(&self.get_str("execution_mode", "TESTNET"))
     }
 
+    pub fn trading_run_mode(&self) -> TradingRunMode {
+        TradingRunMode::parse(&self.get_str("trading_run_mode", "ACTIVE"))
+    }
+
     pub fn alert_provider(&self) -> AlertProvider {
         AlertProvider::parse(&self.get_str("alert_provider", "telegram"))
     }
@@ -332,8 +403,11 @@ pub fn is_unified_account_mode(mode: &str) -> bool {
 pub fn default_v2_system_config_seeds(
 ) -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
-        ("platform_version", "2.0.0", "string", "Aegis Quant v2.0 Modular Multi-Sleeve Engine"),
+        ("platform_version", "2.1.0", "string", "Aegis Quant v2.1 Modular Multi-Sleeve Engine"),
         ("execution_mode", "TESTNET", "string", "Execution routing mode: PAPER, TESTNET, or LIVE"),
+        ("trading_run_mode", "ACTIVE", "string", "Operator runtime control mode: ACTIVE, DRAIN (close-only), PAUSED (hold, SL/TP active), HALTED (flattened kill-switch), or STANDBY (flat + background loops suspended)"),
+        ("trading_run_mode_reason", "", "string", "Operator reason or audit note for the latest trading_run_mode transition"),
+        ("trading_run_mode_updated_at_ms", "0", "int", "Timestamp (ms) of the latest trading_run_mode transition (read-only)"),
         ("hyperliquid_testnet", "true", "bool", "Route orders and info queries to Hyperliquid Testnet when true"),
         ("hyperliquid_mainnet_url", "https://api.hyperliquid.xyz", "string", "Hyperliquid Mainnet API base URL"),
         ("hyperliquid_testnet_url", "https://api.hyperliquid-testnet.xyz", "string", "Hyperliquid Testnet API base URL"),
@@ -554,6 +628,21 @@ pub fn validate_core_config_key_value(key: &str, value_str: &str) -> Result<()> 
                 return Err(AegisError::Validation(format!(
                     "Invalid execution_mode '{clean_val}': expected PAPER, TESTNET, or LIVE"
                 )));
+            }
+        }
+        "trading_run_mode" => {
+            let _ = TradingRunMode::parse_strict(clean_val)?;
+        }
+        "trading_run_mode_reason" => {
+            if clean_val.chars().count() > 240 {
+                return Err(AegisError::Validation(
+                    "trading_run_mode_reason must be at most 240 characters".to_string(),
+                ));
+            }
+            if value_str.chars().any(|c| c.is_ascii_control()) {
+                return Err(AegisError::Validation(
+                    "trading_run_mode_reason must not contain ASCII control characters".to_string(),
+                ));
             }
         }
         "risk_tier" => {
@@ -1270,6 +1359,72 @@ mod tests {
     fn test_config_map_from_defaults() {
         let cfg = ConfigMap::from_defaults();
         assert_eq!(cfg.risk_tier(), RiskTier::Extreme);
+        assert_eq!(cfg.trading_run_mode(), TradingRunMode::Active);
+        assert_eq!(cfg.get_str("platform_version", ""), "2.1.0");
         assert!((cfg.get_f64("core_min_day_volume_usdc", 0.0) - 2_000_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_trading_run_mode_parse_gates_and_validation() {
+        assert_eq!(
+            TradingRunMode::parse_strict("active").unwrap(),
+            TradingRunMode::Active
+        );
+        assert_eq!(
+            TradingRunMode::parse_strict(" DRAIN ").unwrap(),
+            TradingRunMode::Drain
+        );
+        assert_eq!(
+            TradingRunMode::parse_strict("paused").unwrap(),
+            TradingRunMode::Paused
+        );
+        assert_eq!(
+            TradingRunMode::parse_strict("HALTED").unwrap(),
+            TradingRunMode::Halted
+        );
+        assert_eq!(
+            TradingRunMode::parse_strict("Standby").unwrap(),
+            TradingRunMode::Standby
+        );
+        assert!(TradingRunMode::parse_strict("STOPPED").is_err());
+        assert_eq!(TradingRunMode::parse("garbage"), TradingRunMode::Active);
+
+        assert!(TradingRunMode::Active.allows_new_entries());
+        assert!(TradingRunMode::Active.allows_signal_exits());
+        assert!(!TradingRunMode::Active.suspends_background_loops());
+
+        assert!(!TradingRunMode::Drain.allows_new_entries());
+        assert!(TradingRunMode::Drain.allows_signal_exits());
+        assert!(!TradingRunMode::Drain.suspends_background_loops());
+
+        assert!(!TradingRunMode::Paused.allows_new_entries());
+        assert!(!TradingRunMode::Paused.allows_signal_exits());
+        assert!(!TradingRunMode::Paused.suspends_background_loops());
+
+        assert!(!TradingRunMode::Halted.allows_new_entries());
+        assert!(!TradingRunMode::Halted.allows_signal_exits());
+        assert!(!TradingRunMode::Halted.suspends_background_loops());
+
+        assert!(!TradingRunMode::Standby.allows_new_entries());
+        assert!(!TradingRunMode::Standby.allows_signal_exits());
+        assert!(TradingRunMode::Standby.suspends_background_loops());
+
+        for mode in ["ACTIVE", "drain", "Paused", "HALTED", "standby"] {
+            assert!(validate_core_config_key_value("trading_run_mode", mode).is_ok());
+        }
+        assert!(validate_core_config_key_value("trading_run_mode", "UNKNOWN").is_err());
+        assert!(validate_core_config_key_value("trading_run_mode_reason", "").is_ok());
+        assert!(
+            validate_core_config_key_value("trading_run_mode_reason", "Scheduled maintenance")
+                .is_ok()
+        );
+        assert!(
+            validate_core_config_key_value("trading_run_mode_reason", &"x".repeat(241)).is_err()
+        );
+        assert!(validate_core_config_key_value("trading_run_mode_reason", "bad\ncontrol").is_err());
+        assert!(matches!(
+            validate_core_config_key_value("trading_run_mode_updated_at_ms", "12345"),
+            Err(AegisError::SecurityViolation(_))
+        ));
     }
 }

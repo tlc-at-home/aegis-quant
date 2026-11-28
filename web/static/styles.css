@@ -430,6 +430,53 @@ html, body {
   transform: translateY(-1px);
 }
 
+/* Operator Run-Mode & Kill-Switch Button */
+.action-btn.run-mode-btn {
+  font-weight: 800;
+  letter-spacing: 0.4px;
+}
+
+.action-btn.run-mode-btn.is-active {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(0, 242, 254, 0.12));
+  border-color: var(--border-glow-emerald);
+  color: #34d399;
+}
+
+.action-btn.run-mode-btn.is-drain {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.24), rgba(251, 191, 36, 0.14));
+  border-color: var(--border-glow-amber);
+  color: #fbbf24;
+}
+
+.action-btn.run-mode-btn.is-paused {
+  background: linear-gradient(135deg, rgba(249, 115, 22, 0.26), rgba(139, 92, 246, 0.16));
+  border-color: rgba(249, 115, 22, 0.58);
+  color: #fdba74;
+}
+
+.action-btn.run-mode-btn.is-halted {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.32), rgba(225, 29, 72, 0.2));
+  border-color: var(--border-glow-rose);
+  color: #fecdd3;
+  box-shadow: 0 0 18px rgba(244, 63, 94, 0.32);
+}
+
+.action-btn.run-mode-btn.is-standby {
+  background: rgba(100, 116, 139, 0.18);
+  border-color: rgba(148, 163, 184, 0.45);
+  color: #cbd5e1;
+}
+
+.action-btn.run-mode-btn:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.12);
+}
+
+.pulse-dot.muted {
+  background: #94a3b8;
+  box-shadow: none;
+}
+
 /* ============================================================================
    MAIN TERMINAL CONTAINER & LAYOUT
    ============================================================================ */
@@ -2816,6 +2863,216 @@ dialog.aegis-native-dialog[open] {
 .alert-banner-meta {
   font-size: 10.5px;
   opacity: 0.9;
+}
+
+/* Operator Run-Mode Status Banner & Modal Dialog */
+.run-mode-banner.mode-drain {
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.55);
+  color: #fde68a;
+}
+
+.run-mode-banner.mode-paused {
+  background: rgba(249, 115, 22, 0.14);
+  border: 1px solid rgba(249, 115, 22, 0.58);
+  color: #fed7aa;
+}
+
+.run-mode-banner.mode-halted {
+  background: rgba(244, 63, 94, 0.18);
+  border: 1px solid rgba(244, 63, 94, 0.68);
+  color: #fecdd3;
+}
+
+.run-mode-banner.mode-standby {
+  background: rgba(100, 116, 139, 0.16);
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  color: #e2e8f0;
+}
+
+.run-mode-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+dialog.aegis-native-dialog.run-mode-modal {
+  width: min(760px, calc(100vw - 28px));
+  max-width: 760px;
+}
+
+.run-mode-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+#run-mode-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.run-mode-exposure-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 680px) {
+  .run-mode-exposure-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.run-mode-stat-box {
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: rgba(6, 9, 17, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.run-mode-stat-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 0.4px;
+}
+
+.run-mode-stat-val {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.run-mode-radio-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-mode-option.is-drain:has(input:checked) {
+  border-color: var(--border-glow-amber);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.run-mode-option.is-paused:has(input:checked) {
+  border-color: rgba(249, 115, 22, 0.65);
+  background: rgba(249, 115, 22, 0.1);
+}
+
+.run-mode-option.is-halted:has(input:checked) {
+  border-color: var(--border-glow-rose);
+  background: rgba(244, 63, 94, 0.13);
+}
+
+.run-mode-option.is-standby:has(input:checked) {
+  border-color: rgba(148, 163, 184, 0.6);
+  background: rgba(100, 116, 139, 0.14);
+}
+
+.run-mode-check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(14, 21, 38, 0.58);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.run-mode-check-row input[type="checkbox"] {
+  accent-color: var(--neon-rose);
+  inline-size: 18px;
+  block-size: 18px;
+  margin-block-start: 2px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.run-mode-check-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  cursor: pointer;
+}
+
+.run-mode-options-split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 680px) {
+  .run-mode-options-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.run-mode-impact-warning {
+  min-block-size: 22px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.4;
+  border: 1px solid rgba(244, 63, 94, 0.45);
+  background: rgba(244, 63, 94, 0.12);
+  color: #fecdd3;
+}
+
+.run-mode-impact-warning.is-hidden {
+  visibility: hidden;
+  border-color: transparent;
+  background: transparent;
+}
+
+.run-mode-modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.run-mode-cancel-btn {
+  min-height: 44px;
+  padding: 9px 16px;
+  font-size: 12px;
+  background: rgba(148, 163, 184, 0.12);
+  border-color: rgba(148, 163, 184, 0.35);
+  color: var(--text-secondary);
+}
+
+.run-mode-cancel-btn:hover {
+  background: rgba(148, 163, 184, 0.24);
+  color: #ffffff;
+}
+
+.run-mode-modal-actions .action-btn {
+  min-height: 44px;
+  padding: 9px 18px;
+  font-size: 12px;
+}
+
+.action-btn.btn-apply-halt-danger {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.36), rgba(225, 29, 72, 0.28));
+  border-color: var(--border-glow-rose);
+  color: #ffe4e6;
+}
+
+.action-btn.btn-apply-halt-danger:hover {
+  background: linear-gradient(135deg, rgba(244, 63, 94, 0.52), rgba(225, 29, 72, 0.42));
+  box-shadow: 0 0 18px rgba(244, 63, 94, 0.4);
+  color: #ffffff;
 }
 
 .cfg-cat-btn[hidden] {

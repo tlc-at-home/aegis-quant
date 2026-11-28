@@ -4,8 +4,9 @@ use crate::auth::security_and_auth_middleware;
 use crate::handlers::{
     get_dashboard_handler, get_health_handler, post_alerts_test_handler, post_auth_login_handler,
     post_auth_logout_handler, post_config_handler, post_positions_close_handler,
-    post_reconcile_handler, post_risk_tier_handler, post_vault_inspect_handler,
-    post_vault_sync_handler, serve_app_js, serve_index, serve_js_module, serve_styles_css,
+    post_reconcile_handler, post_risk_tier_handler, post_run_mode_handler,
+    post_vault_inspect_handler, post_vault_sync_handler, serve_app_js, serve_index,
+    serve_js_module, serve_styles_css,
 };
 use crate::server::AppState;
 use crate::stream::sse_stream_handler;
@@ -32,6 +33,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/state", get(get_dashboard_handler))
         .route("/api/v1/stream", get(sse_stream_handler))
         .route("/api/v1/risk-tier", post(post_risk_tier_handler))
+        .route("/api/v1/run-mode", post(post_run_mode_handler))
         .route("/api/v1/config", post(post_config_handler))
         .route("/api/v1/alerts/test", post(post_alerts_test_handler))
         .route(

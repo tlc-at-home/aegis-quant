@@ -1202,6 +1202,29 @@ impl OrderChaser {
             });
         }
 
+        if !cfg.trading_run_mode().allows_new_entries() {
+            if is_live_exchange {
+                let ccfg_ro = ChaserConfig::from_config(&cfg);
+                let side_ro = OrderSide::parse(&ordered.side)?;
+                if let Some(outcome) = self.try_finalize_existing_exchange_fill(
+                    ordered,
+                    &asset,
+                    side_ro,
+                    &ccfg_ro,
+                    pre_fetched_ch_state,
+                    &cfg,
+                )? {
+                    return Ok(outcome);
+                }
+            }
+            return Ok(ChaseStepOutcome::Resting {
+                position_id: ordered.position_id,
+                symbol: ordered.symbol.clone(),
+                limit_price: ordered.limit_price,
+                distance_from_mid_bps: ordered.distance_from_mid_bps,
+            });
+        }
+
         let side = OrderSide::parse(&ordered.side)?;
         let live_mid = if asset.mid_price > 0.0 {
             asset.mid_price

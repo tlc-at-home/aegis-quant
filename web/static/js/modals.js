@@ -2,7 +2,7 @@
    AEGIS QUANT v2.0 — MODALS (AUTH, VAULT <dialog>, TOAST, ALERT BANNERS)
    ============================================================================ */
 
-import { state, getEl } from '/js/state.js';
+import { state, getEl, SUPPORTS_INVOKER_COMMANDS } from '/js/state.js';
 import {
   OFFICIAL_HLP_MAINNET,
   OFFICIAL_HLP_TESTNET,
@@ -23,7 +23,12 @@ import {
   createAddressChip,
   createStatusPillEl,
 } from '/js/format.js';
-import { apiFetch, refreshAll, connectSSE } from '/js/api.js';
+import {
+  apiFetch,
+  refreshAll,
+  connectSSE,
+  switchTradingRunMode,
+} from '/js/api.js';
 
 export function showToast(msg, isError = false) {
   const el = getEl('toast-banner');
@@ -176,14 +181,17 @@ export function renderOutageAndSurveillanceBanners(dash, health) {
           .map((heldItem) => String(heldItem.symbol || heldItem.coin || ''))
       : [];
 
+    const isStandbyPm = pmStatus === 'STANDBY';
     const isCritical =
-      pmStatus === 'CRITICAL' ||
-      pmStatus === 'UNMONITORED' ||
-      Boolean(pm.unmonitored_alert_active) ||
-      breaches.length > 0 ||
-      missingSlSyms.length > 0;
+      !isStandbyPm &&
+      (pmStatus === 'CRITICAL' ||
+        pmStatus === 'UNMONITORED' ||
+        Boolean(pm.unmonitored_alert_active) ||
+        breaches.length > 0 ||
+        missingSlSyms.length > 0);
     const isDegraded =
-      pmStatus === 'DEGRADED' || Boolean(pm.is_stale) || failedSyms.length > 0;
+      !isStandbyPm &&
+      (pmStatus === 'DEGRADED' || Boolean(pm.is_stale) || failedSyms.length > 0);
 
     if (isCritical || isDegraded) {
       const reasons = [];
@@ -1627,4 +1635,356 @@ async function submitVaultManagerForm(evt) {
       submitBtn.textContent = 'Save & Sync Vault';
     }
   }
+}
+
+/* ============================================================================
+   OPERATOR TRADING RUN-MODE & KILL-SWITCH CONTROLLER (<dialog> + BANNER)
+   ============================================================================ */
+
+const RUN_MODE_DESCRIPTIONS = {
+  DRAIN: {
+    title: '🟡 DRAIN MODE ACTIVE — GRACEFUL WIND-DOWN (CLOSE-ONLY)',
+    summary:
+      'Resting WORKING entry orders cancelled and new entries blocked. Existing OPEN holdings remain guarded by 1s SL/TP and close normally on S1/S2/S3 exit signals.',
+  },
+  PAUSED: {
+    title: '🟠 STRATEGY PAUSED — HOLD & GUARD MODE',
+    summary:
+      'Resting WORKING entry orders cancelled and signal rebalances suspended. Existing OPEN holdings stay untouched under 1s hard SL/TP and trailing stops.',
+  },
+  HALTED: {
+    title: '🔴 EMERGENCY KILL-SWITCH LATCHED (HALTED)',
+    summary:
+      'All entries and strategy rebalances are blocked across daemon restarts. Residual positions (if any) remain guarded by 1s SL/TP until manually resumed.',
+  },
+  STANDBY: {
+    title: '⚪ QUIET STANDBY — BACKGROUND LOOPS PAUSED',
+    summary:
+      '1s Priority, 3s Scanner, 15s Reconciler, and 60s Aux loops are suspended with zero Hyperliquid REST polling. Web UI remains online for 1-click resume.',
+  },
+};
+
+function setRunModeFormStatus(message, tone = 'info') {
+  const el = getEl('run-mode-form-status');
+  if (!el) return;
+  if (!message) {
+    el.textContent = '';
+    el.className = 'vault-form-status';
+    el.hidden = true;
+    return;
+  }
+  el.className = `vault-form-status status-${tone}`;
+  el.textContent = message;
+  el.hidden = false;
+}
+
+function getRunModeSnapshotCounts(dash = state.dashboard) {
+  const activeDash = dash || state.dashboard || {};
+  const held = Array.isArray(activeDash.v_assets_held) ? activeDash.v_assets_held : [];
+  const ordered = Array.isArray(activeDash.v_assets_ordered)
+    ? activeDash.v_assets_ordered
+    : [];
+  const openNotional = held.reduce(
+    (acc, item) => acc + Math.abs(toFiniteNumber(item?.committed_notional_usdc) ?? 0),
+    0
+  );
+  const reservedMargin = ordered.reduce(
+    (acc, item) => acc + Math.abs(toFiniteNumber(item?.reserved_margin_usdc) ?? 0),
+    0
+  );
+  return {
+    runMode: String(
+      activeDash.trading_run_mode || state.health?.trading_run_mode || 'ACTIVE'
+    ).toUpperCase(),
+    execMode: String(
+      activeDash.execution_mode || state.health?.execution_mode || 'TESTNET'
+    ).toUpperCase(),
+    openCount: held.length,
+    workingCount: ordered.length,
+    openNotional,
+    reservedMargin,
+  };
+}
+
+function renderRunModeExposureStrip(dash = state.dashboard) {
+  const strip = getEl('run-mode-exposure-strip');
+  if (!strip) return;
+  const info = getRunModeSnapshotCounts(dash);
+  const pill = getEl('run-mode-modal-current-pill');
+  if (pill) {
+    pill.textContent = info.runMode;
+    pill.className =
+      info.runMode === 'ACTIVE'
+        ? 'status-pill open'
+        : info.runMode === 'HALTED'
+        ? 'status-pill closed'
+        : 'status-pill working';
+  }
+
+  const statBox = (label, val) =>
+    h(
+      'div',
+      { className: 'run-mode-stat-box' },
+      h('span', { className: 'run-mode-stat-label', text: label }),
+      h('span', { className: 'run-mode-stat-val', text: val })
+    );
+
+  strip.replaceChildren(
+    statBox('Current Run Mode', info.runMode),
+    statBox('Execution Mode', info.execMode),
+    statBox('OPEN Holdings', `${info.openCount} (${fmtUsd(info.openNotional)})`),
+    statBox('WORKING Orders', `${info.workingCount} (${fmtUsd(info.reservedMargin)})`)
+  );
+}
+
+function syncRunModeFormControls(dash = state.dashboard) {
+  const form = getEl('run-mode-form');
+  if (!form) return;
+  const selectedMode = String(
+    form.querySelector('input[name="run_mode"]:checked')?.value || 'ACTIVE'
+  ).toUpperCase();
+  const flattenBox = getEl('run-mode-flatten-checkbox');
+  const applyBtn = getEl('btn-apply-run-mode');
+  const warnBox = getEl('run-mode-impact-warning');
+  const info = getRunModeSnapshotCounts(dash);
+
+  if (flattenBox) {
+    if (selectedMode === 'HALTED') {
+      flattenBox.checked = true;
+      flattenBox.disabled = true;
+    } else if (selectedMode === 'ACTIVE') {
+      flattenBox.checked = false;
+      flattenBox.disabled = true;
+    } else {
+      flattenBox.disabled = false;
+    }
+  }
+
+  const willFlatten =
+    selectedMode === 'HALTED' || (flattenBox ? flattenBox.checked : false);
+  const willCancelWorking = selectedMode !== 'ACTIVE';
+
+  if (warnBox) {
+    let warnText = '';
+    if (selectedMode === 'HALTED' && (info.openCount > 0 || info.workingCount > 0)) {
+      warnText = `KILL-SWITCH IMPACT: Will cancel ${info.workingCount} WORKING order(s) and immediately market-close ${info.openCount} OPEN position(s) (${fmtUsd(info.openNotional)} notional).`;
+    } else if (
+      selectedMode === 'STANDBY' &&
+      !willFlatten &&
+      (info.openCount > 0 || info.workingCount > 0)
+    ) {
+      warnText = `STANDBY REQUIRES FLAT BOOK: ${info.openCount} OPEN / ${info.workingCount} WORKING active. Check "Flatten all OPEN positions" above or use DRAIN/PAUSED instead.`;
+    } else if (willFlatten && info.openCount > 0) {
+      warnText = `FLATTEN IMPACT: Will market-close ${info.openCount} OPEN position(s) and cancel ${info.workingCount} WORKING order(s) before entering ${selectedMode}.`;
+    } else if (willCancelWorking && info.workingCount > 0) {
+      warnText = `TRANSITION IMPACT: Will cancel ${info.workingCount} resting WORKING order(s) and preserve ${info.openCount} OPEN holding(s) with 1s SL/TP armed.`;
+    }
+    warnBox.textContent = warnText || ' ';
+    warnBox.classList.toggle('is-hidden', !warnText);
+  }
+
+  if (applyBtn) {
+    const isDanger = selectedMode === 'HALTED' || (willFlatten && info.openCount > 0);
+    applyBtn.className = isDanger
+      ? 'action-btn btn-apply-halt-danger'
+      : 'action-btn cycle-btn';
+    if (!state.runModeModal.inFlight) {
+      const labelMap = {
+        ACTIVE: '▶ Resume ACTIVE Trading',
+        DRAIN: '⏸ Enter DRAIN (Close-Only)',
+        PAUSED: '⏸ Freeze Strategy (PAUSED)',
+        HALTED: '🚨 Flatten All & HALT Engine',
+        STANDBY: '💤 Enter Quiet STANDBY',
+      };
+      applyBtn.textContent = labelMap[selectedMode] || `Apply ${selectedMode}`;
+    }
+  }
+}
+
+async function submitRunModeForm(evt) {
+  evt.preventDefault();
+  const dialog = getEl('run-mode-modal');
+  const form = evt.currentTarget;
+  if (!form || state.runModeModal.inFlight) return;
+
+  const selectedMode = String(
+    form.querySelector('input[name="run_mode"]:checked')?.value || 'ACTIVE'
+  ).toUpperCase();
+  const flattenBox = getEl('run-mode-flatten-checkbox');
+  const cooldownSel = getEl('run-mode-cooldown-select');
+  const reasonInp = getEl('run-mode-reason-input');
+  const applyBtn = getEl('btn-apply-run-mode');
+
+  const flattenChecked =
+    selectedMode === 'HALTED' || Boolean(flattenBox && flattenBox.checked);
+  const cooldownSec = Number(cooldownSel?.value ?? 0) || 0;
+  const reasonText = String(reasonInp?.value || '').trim();
+
+  state.runModeModal.inFlight = true;
+  if (applyBtn) {
+    applyBtn.disabled = true;
+    applyBtn.textContent = `Applying ${selectedMode}...`;
+  }
+  setRunModeFormStatus(`Transitioning trading run mode to ${selectedMode}...`, 'info');
+
+  try {
+    const res = await switchTradingRunMode({
+      run_mode: selectedMode,
+      reason: reasonText,
+      flatten_open_positions: flattenChecked,
+      cooldown_sec: cooldownSec,
+    });
+    if (!res.ok) {
+      setRunModeFormStatus(res.error || 'Run-mode transition failed', 'error');
+      return;
+    }
+    setRunModeFormStatus('');
+    if (dialog && dialog.open) {
+      dialog.close('applied');
+    }
+  } finally {
+    state.runModeModal.inFlight = false;
+    if (applyBtn) applyBtn.disabled = false;
+    syncRunModeFormControls(state.dashboard);
+  }
+}
+
+export function initRunModeModal() {
+  const dialog = getEl('run-mode-modal');
+  const form = getEl('run-mode-form');
+  if (!dialog) return;
+
+  if (dialog.dataset.dialogWired !== 'true') {
+    dialog.dataset.dialogWired = 'true';
+    dialog.addEventListener('close', () => {
+      dialog.returnValue = '';
+      state.runModeModal.inFlight = false;
+    });
+
+    if (!('closedBy' in HTMLDialogElement.prototype)) {
+      const isOutsideDialog = (e, dlg) => {
+        const r = dlg.getBoundingClientRect();
+        return (
+          e.clientX < r.left ||
+          e.clientX > r.right ||
+          e.clientY < r.top ||
+          e.clientY > r.bottom
+        );
+      };
+      let pressedOutside = false;
+      dialog.addEventListener('pointerdown', (e) => {
+        pressedOutside = dialog.open && isOutsideDialog(e, dialog);
+      });
+      dialog.addEventListener('pointerup', (e) => {
+        if (pressedOutside && dialog.open && isOutsideDialog(e, dialog)) {
+          dialog.close();
+        }
+        pressedOutside = false;
+      });
+      dialog.addEventListener('pointercancel', () => {
+        pressedOutside = false;
+      });
+    }
+  }
+
+  if (form && form.dataset.runModeWired !== 'true') {
+    form.dataset.runModeWired = 'true';
+    form.addEventListener('change', () => syncRunModeFormControls(state.dashboard));
+    form.addEventListener('submit', submitRunModeForm);
+  }
+}
+
+export function openRunModeModal(preselectMode = null, openProgrammatically = false) {
+  const dialog = getEl('run-mode-modal');
+  const form = getEl('run-mode-form');
+  if (!dialog) return;
+  initRunModeModal();
+
+  const dash = state.dashboard || {};
+  const info = getRunModeSnapshotCounts(dash);
+  const targetMode = String(preselectMode || info.runMode || 'ACTIVE').toUpperCase();
+
+  if (form) {
+    const radio = form.querySelector(`input[name="run_mode"][value="${targetMode}"]`);
+    if (radio) radio.checked = true;
+    const flattenBox = getEl('run-mode-flatten-checkbox');
+    if (flattenBox) flattenBox.checked = targetMode === 'HALTED';
+    const cooldownSel = getEl('run-mode-cooldown-select');
+    if (cooldownSel) cooldownSel.value = '0';
+    const reasonInp = getEl('run-mode-reason-input');
+    if (reasonInp) reasonInp.value = String(dash.trading_run_mode_reason || '');
+  }
+
+  setRunModeFormStatus('');
+  renderRunModeExposureStrip(dash);
+  syncRunModeFormControls(dash);
+
+  if ((openProgrammatically || !SUPPORTS_INVOKER_COMMANDS) && !dialog.open) {
+    dialog.showModal();
+  }
+}
+
+export function refreshOpenRunModeModalFromDashboard(dash) {
+  const dialog = getEl('run-mode-modal');
+  if (!dialog || !dialog.open || !dash) return;
+  renderRunModeExposureStrip(dash);
+  syncRunModeFormControls(dash);
+}
+
+export function renderRunModeBanner(dash, health) {
+  const banner = getEl('run-mode-banner');
+  if (!banner) return;
+  const activeDash = dash || state.dashboard || {};
+  const mode = String(
+    activeDash.trading_run_mode || health?.trading_run_mode || 'ACTIVE'
+  ).toUpperCase();
+
+  if (mode === 'ACTIVE') {
+    banner.replaceChildren();
+    banner.hidden = true;
+    return;
+  }
+
+  const meta = RUN_MODE_DESCRIPTIONS[mode] || {
+    title: `OPERATOR RUN MODE: ${mode}`,
+    summary: 'Automated new order entries are currently gated.',
+  };
+  const info = getRunModeSnapshotCounts(activeDash);
+  const reason = String(activeDash.trading_run_mode_reason || '').trim();
+  const updatedMs = toFiniteNumber(activeDash.trading_run_mode_updated_at_ms) ?? 0;
+  const updatedStr = updatedMs > 0 ? fmtLocalTime(updatedMs, '') : '';
+
+  const detailParts = [meta.summary];
+  if (info.openCount > 0 || info.workingCount > 0) {
+    detailParts.push(`Book: ${info.openCount} OPEN · ${info.workingCount} WORKING`);
+  }
+  if (reason) detailParts.push(`Reason: ${reason}`);
+  if (updatedStr) detailParts.push(`Updated ${updatedStr}`);
+
+  banner.className = `alert-banner run-mode-banner mode-${mode.toLowerCase()}`;
+  banner.replaceChildren(
+    h(
+      'div',
+      null,
+      h('div', { className: 'alert-banner-title', text: meta.title }),
+      h('div', { className: 'alert-banner-meta', text: detailParts.join(' · ') })
+    ),
+    h(
+      'div',
+      { className: 'run-mode-banner-actions' },
+      h('button', {
+        type: 'button',
+        className: 'action-btn cycle-btn',
+        attrs: { 'data-action': 'quick-resume-active' },
+        text: '▶ Resume ACTIVE',
+      }),
+      h('button', {
+        type: 'button',
+        className: 'action-btn config-btn',
+        attrs: { 'data-action': 'open-run-mode' },
+        text: '⚙ Change Mode',
+      })
+    )
+  );
+  banner.hidden = false;
 }

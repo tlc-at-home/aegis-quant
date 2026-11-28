@@ -1,6 +1,6 @@
-# Aegis Quant (`v2.0.0`) — Hyperliquid L1 Multi-Sleeve Quantitative Trading Platform
+# Aegis Quant (`v2.1.0`) — Hyperliquid L1 Multi-Sleeve Quantitative Trading Platform
 
-**Aegis Quant v2.0** is an autonomous, self-custodial quantitative perpetuals trading platform written in Rust (`2021` edition, Tokio async runtime, Axum REST/SSE web server, and MariaDB 13.0 Rolling / 12.3 LTS InnoDB) for **Hyperliquid L1**.
+**Aegis Quant v2.1** is an autonomous, self-custodial quantitative perpetuals trading platform written in Rust (`2021` edition, Tokio async runtime, Axum REST/SSE web server, and MariaDB 13.0 Rolling / 12.3 LTS InnoDB) for **Hyperliquid L1**.
 
 ---
 
@@ -126,7 +126,7 @@ Subcommands:
 - **Unauthenticated Probe**: `GET /api/v1/health` (returns HTTP `503 Service Unavailable` with sanitized correlation ID if MariaDB ping/query fails).
 - **Authentication (Loopback Auth-by-Default)**: `POST /api/v1/auth/login` (exchanges `web_api_token` for `HttpOnly; SameSite=Strict` `aegis_session` cookie) and `POST /api/v1/auth/logout`. Authentication is required on **all** `/api/v1/*` routes (`GET` and `POST`, except `/api/v1/health` and `/api/v1/auth/login`) **including on `127.0.0.1` loopback**, unless explicitly disabled via DB-immutable `web_auth_enabled=false`. `aegis-quant db --init` auto-provisions a random 32-byte Fernet-encrypted `web_api_token` if unset/empty and displays it once during provisioning (never logged in steady-state daemon runs). Forwarded proxy headers (`X-Forwarded-For`, `X-Forwarded-Proto`) are accepted right-to-left only from `web_trusted_proxies` CIDRs.
 - **Read & Stream Endpoints**: `GET /api/v1/dashboard`, `GET /api/v1/state`, `GET /api/v1/stream` (shared 1.5s `watch` SSE broadcaster with continuous session re-validation).
-- **Mutating Endpoints (CSRF `Origin`/`Referer` vs `Host` enforced)**: `POST /api/v1/risk-tier`, `POST /api/v1/config` (typed bounds & key validation), `POST /api/v1/alerts/test`, `POST /api/v1/positions/close`, `POST /api/v1/reconcile`.
+- **Mutating Endpoints (CSRF `Origin`/`Referer` vs `Host` enforced)**: `POST /api/v1/run-mode` (5-state Operator Run-Mode & Kill-Switch: `ACTIVE`, `DRAIN`, `PAUSED`, `HALTED`, `STANDBY`), `POST /api/v1/risk-tier`, `POST /api/v1/config` (typed bounds & key validation), `POST /api/v1/alerts/test`, `POST /api/v1/positions/close`, `POST /api/v1/reconcile`, `POST /api/v1/vault/inspect`, `POST /api/v1/vault/sync`.
 
 ---
 

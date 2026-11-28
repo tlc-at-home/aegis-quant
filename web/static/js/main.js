@@ -32,6 +32,7 @@ import {
   refreshAll,
   connectSSE,
   switchRiskTier,
+  switchTradingRunMode,
   triggerTelegramTestAlert,
   triggerHyperliquidReconcile,
   closePositionOrOrder,
@@ -62,6 +63,10 @@ import {
   openAuthModal,
   submitAuthLogin,
   renderOutageAndSurveillanceBanners,
+  renderRunModeBanner,
+  initRunModeModal,
+  openRunModeModal,
+  refreshOpenRunModeModalFromDashboard,
   initVaultModalDialogAndForm,
   openVaultModal,
   refreshOpenVaultModalFromDashboard,
@@ -85,6 +90,45 @@ function renderHealthAndTopBar(health, dash) {
   const outage = state.degradedError || (dash?.degraded || dash?.database_reachable === false ? dash : null);
   const dbOffline = outage?.database_reachable === false || health?.status === 'unavailable';
   const dbDegraded = Boolean(outage?.degraded) && !dbOffline;
+
+  const platformVer =
+    (health && health.platform_version) ||
+    (activeDash && activeDash.platform_version) ||
+    '2.1.0';
+  const verPill = getEl('platform-version-pill');
+  if (verPill) verPill.textContent = `v${platformVer}`;
+
+  const runMode = String(
+    (activeDash && activeDash.trading_run_mode) ||
+      (health && health.trading_run_mode) ||
+      'ACTIVE'
+  ).toUpperCase();
+  const runModeBtn = getEl('btn-open-run-mode-modal');
+  const runModeDot = getEl('run-mode-btn-dot');
+  const runModeLabel = getEl('run-mode-btn-label');
+  if (runModeBtn) {
+    runModeBtn.classList.remove(
+      'is-active',
+      'is-drain',
+      'is-paused',
+      'is-halted',
+      'is-standby'
+    );
+    runModeBtn.classList.add(`is-${runMode.toLowerCase()}`);
+  }
+  if (runModeDot) {
+    runModeDot.className =
+      runMode === 'ACTIVE'
+        ? 'pulse-dot emerald'
+        : runMode === 'HALTED'
+        ? 'pulse-dot rose'
+        : runMode === 'STANDBY'
+        ? 'pulse-dot muted'
+        : 'pulse-dot amber';
+  }
+  if (runModeLabel) {
+    runModeLabel.textContent = `Engine: ${runMode}`;
+  }
 
   const dbVer =
     (health && health.mariadb_version) ||
@@ -136,20 +180,32 @@ function renderHealthAndTopBar(health, dash) {
   const prioBadge = getEl('badge-prio-pulse');
   const prioDot = getEl('prio-pulse-dot');
   const prioLabel = getEl('prio-watch-label');
+  const isStandbyPm =
+    pmStatus === 'STANDBY' ||
+    (runMode === 'STANDBY' &&
+      !Boolean(pm.unmonitored_alert_active) &&
+      (!Array.isArray(pm.unfilled_stop_breach_symbols) ||
+        pm.unfilled_stop_breach_symbols.length === 0));
   const isCritPrio =
-    pmStatus === 'CRITICAL' ||
-    pmStatus === 'UNMONITORED' ||
-    Boolean(pm.unmonitored_alert_active) ||
-    (Array.isArray(pm.unfilled_stop_breach_symbols) &&
-      pm.unfilled_stop_breach_symbols.length > 0);
-  const isDegPrio = !isCritPrio && (pmStatus === 'DEGRADED' || Boolean(pm.is_stale));
+    !isStandbyPm &&
+    (pmStatus === 'CRITICAL' ||
+      pmStatus === 'UNMONITORED' ||
+      Boolean(pm.unmonitored_alert_active) ||
+      (Array.isArray(pm.unfilled_stop_breach_symbols) &&
+        pm.unfilled_stop_breach_symbols.length > 0));
+  const isDegPrio =
+    !isStandbyPm &&
+    !isCritPrio &&
+    (pmStatus === 'DEGRADED' || Boolean(pm.is_stale));
 
   if (prioBadge) {
     prioBadge.classList.toggle('is-critical', isCritPrio);
     prioBadge.classList.toggle('is-degraded', isDegPrio);
   }
   if (prioDot) {
-    prioDot.className = isCritPrio
+    prioDot.className = isStandbyPm
+      ? 'pulse-dot muted'
+      : isCritPrio
       ? 'pulse-dot rose'
       : isDegPrio
       ? 'pulse-dot amber'
@@ -157,7 +213,9 @@ function renderHealthAndTopBar(health, dash) {
   }
   if (prioLabel) {
     const countNode = prioEl || h('strong', { id: 'prio-watch-count', text: String(prioWatch.length) });
-    if (isCritPrio) {
+    if (isStandbyPm) {
+      prioLabel.replaceChildren(document.createTextNode('1s WATCH: STANDBY · '), countNode);
+    } else if (isCritPrio) {
       prioLabel.replaceChildren(document.createTextNode('SURVEILLANCE STALLED · '), countNode);
     } else if (isDegPrio) {
       const errCnt = Number(pm.consecutive_error_ticks || pm.last_tick_error_count || 0);
@@ -606,6 +664,7 @@ function applyDashboardPayload(dash, forceConfig = false) {
 
   renderHealthAndTopBar(state.health, dash);
   renderOutageAndSurveillanceBanners(dash, state.health);
+  renderRunModeBanner(dash, state.health);
   renderPnlHorizonRibbon(dash, forceConfig);
   renderKpiCards(dash, forceConfig);
   renderVaultPanel(dash, forceConfig);
@@ -620,6 +679,10 @@ function applyDashboardPayload(dash, forceConfig = false) {
   drawEquityCurveCanvas(dash, forceConfig);
   drawSleeveAttributionCanvas(dash, forceConfig);
 
+  const runModeDialog = getEl('run-mode-modal');
+  if (runModeDialog && runModeDialog.open) {
+    refreshOpenRunModeModalFromDashboard(dash);
+  }
   const vaultDialog = getEl('vault-manager-modal');
   if (vaultDialog && vaultDialog.open) {
     refreshOpenVaultModalFromDashboard(dash);
@@ -770,11 +833,13 @@ configureApiHooks({
   onHealthUpdate: (health) => {
     renderHealthAndTopBar(health, state.dashboard);
     renderOutageAndSurveillanceBanners(state.degradedError || state.dashboard, health);
+    renderRunModeBanner(state.dashboard, health);
   },
   onOutageState: (outagePayload) => {
     state.degradedError = outagePayload;
     renderHealthAndTopBar(state.health, outagePayload);
     renderOutageAndSurveillanceBanners(outagePayload, state.health);
+    renderRunModeBanner(state.dashboard, state.health);
     renderPriorityAndWorkingTable(outagePayload, true);
     renderOpenHoldingsTable(outagePayload, true);
   },
@@ -822,6 +887,37 @@ document.addEventListener('click', (evt) => {
   const tierBtn = target.closest('.tier-btn[data-tier]');
   if (tierBtn) {
     switchRiskTier(tierBtn.getAttribute('data-tier'));
+    return;
+  }
+
+  if (target.closest('#btn-open-run-mode-modal')) {
+    openRunModeModal(null, false);
+    return;
+  }
+  if (target.closest('#btn-close-run-mode-modal') || target.closest('#btn-cancel-run-mode')) {
+    if (!SUPPORTS_INVOKER_COMMANDS) {
+      const dlg = getEl('run-mode-modal');
+      if (dlg && dlg.open) dlg.close('cancel');
+    }
+    return;
+  }
+  if (target.closest('[data-action="open-run-mode"]')) {
+    openRunModeModal(null, true);
+    return;
+  }
+  const quickResumeBtn = target.closest('[data-action="quick-resume-active"]');
+  if (quickResumeBtn) {
+    quickResumeBtn.disabled = true;
+    quickResumeBtn.textContent = 'Resuming...';
+    switchTradingRunMode({
+      run_mode: 'ACTIVE',
+      reason: 'WEB_UI_BANNER_RESUME',
+    }).finally(() => {
+      if (quickResumeBtn.isConnected) {
+        quickResumeBtn.disabled = false;
+        quickResumeBtn.textContent = '▶ Resume ACTIVE';
+      }
+    });
     return;
   }
 
@@ -951,6 +1047,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initDomRegistry();
   initSortableTables();
   initVaultModalDialogAndForm();
+  initRunModeModal();
 
   const scannerSearch = getEl('scanner-search-input');
   if (scannerSearch) {

@@ -28,13 +28,13 @@ use crate::ws_client::{
     HyperliquidWsManager, WsStateCache, WsSubscriptionSet, WsTimingConfig,
 };
 use aegis_alerts::{
-    format_cutover_reconcile_html, format_position_closed_html, AlertEngine, CutoverReconcileAlert,
-    PositionClosedAlert,
+    escape_html, format_cutover_reconcile_html, format_position_closed_html, AlertEngine,
+    CutoverReconcileAlert, PositionClosedAlert,
 };
 use aegis_core::{
     compute_atr, extract_hl_oid, normalize_hyperliquid_symbol, now_ms, parse_hl_f64, round_dp,
     timeframe_to_ms, AegisError, ConfigMap, ExchangeAsset, HeldAssetView, OhlcvBar, OrderSide,
-    OrderedAssetView, PortfolioSnapshot, PositionRecord, PositionStatus, Result,
+    OrderedAssetView, PortfolioSnapshot, PositionRecord, PositionStatus, Result, TradingRunMode,
 };
 use aegis_db::{DatabaseManager, SignalUpsertInput, SnapshotInsertInput};
 use aegis_risk::RiskEngine;
@@ -653,6 +653,35 @@ pub struct ManualCloseReport {
     pub released_reserved_usdc: f64,
     pub cooldown_inserted_sec: i64,
     pub reason: String,
+}
+
+/// Request to transition the platform between graduated `TradingRunMode` states.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunModeTransitionRequest {
+    pub mode: TradingRunMode,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub flatten_open_positions: bool,
+    #[serde(default)]
+    pub cooldown_seconds: Option<i64>,
+}
+
+/// Result returned after persisting and enforcing a `TradingRunMode` transition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunModeTransitionReport {
+    pub previous_mode: String,
+    pub effective_mode: String,
+    pub requested_mode: String,
+    pub fallback_to_halted: bool,
+    pub working_orders_cancelled: usize,
+    pub open_positions_closed: usize,
+    pub remaining_open_positions: usize,
+    pub remaining_working_orders: usize,
+    pub realized_pnl_usdc: f64,
+    pub cooldown_applied_sec: i64,
+    pub reason: String,
+    pub updated_at_ms: i64,
 }
 
 struct OpenPositionCloseOutcome {
@@ -1613,6 +1642,11 @@ impl ExecutionEngine {
         base_equity_usdc: f64,
         report: &mut RebalanceExecutionReport,
     ) -> Result<HashSet<i64>> {
+        let run_mode = cfg.trading_run_mode();
+        if !run_mode.allows_signal_exits() {
+            return Ok(HashSet::new());
+        }
+        let is_drain_mode = !run_mode.allows_new_entries();
         let rebalance_now = now_ms();
         let min_hold_ms = cfg.get_i64("min_position_hold_sec", 300).max(0) * 1000;
         let early_loser_enabled = cfg.get_bool("early_loser_invalidation_enabled", true);
@@ -1698,7 +1732,7 @@ impl ExecutionEngine {
                     continue;
                 }
             }
-            let close_cd = if sig.rebalance_action == ACTION_FLIP {
+            let close_cd = if sig.rebalance_action == ACTION_FLIP && !is_drain_mode {
                 Some(0)
             } else {
                 Some(300)
@@ -1708,7 +1742,10 @@ impl ExecutionEngine {
             if close_res.final_status != "OPEN" {
                 report.positions_closed += 1;
                 report.closed_position_ids.push(close_res.position_id);
-                if sig.rebalance_action == ACTION_FLIP && close_res.final_status == "CLOSED" {
+                if sig.rebalance_action == ACTION_FLIP
+                    && !is_drain_mode
+                    && close_res.final_status == "CLOSED"
+                {
                     flipped_symbols.insert(sig.asset_id);
                 }
             }
@@ -1827,6 +1864,11 @@ impl ExecutionEngine {
     ) -> Result<RebalanceExecutionReport> {
         let mut report = RebalanceExecutionReport::default();
 
+        let init_mode = self.db.load_config()?.trading_run_mode();
+        if !init_mode.allows_signal_exits() {
+            return Ok(report);
+        }
+
         // 0. Enforce leverage & max_open_positions caps first (unlocked; 2-tick confirm on OPEN)
         if let Ok(deleveraged) = self.enforce_leverage_and_position_caps() {
             for r in deleveraged {
@@ -1864,6 +1906,10 @@ impl ExecutionEngine {
                 .get_peak_and_latest_uncapped_equity_since(dd_window_start)?;
             (c, h, o, a, last_entry, dd_stats)
         };
+
+        if !cfg.trading_run_mode().allows_new_entries() {
+            return Ok(report);
+        }
 
         let eff_equity = if cfg.execution_mode().is_live_or_testnet() {
             self.resolve_effective_base_equity_usdc(&cfg)
@@ -2392,10 +2438,19 @@ impl ExecutionEngine {
         let cfg = self.db.load_config()?;
         let market_scan = self.watcher.run_3s_exchange_scan()?;
         let priority_tick = self.priority_monitor.run_1s_priority_tick()?;
+        if cfg.trading_run_mode().suspends_background_loops()
+            && self.db.get_assets_held()?.is_empty()
+            && self.db.get_assets_ordered()?.is_empty()
+        {
+            self.priority_monitor.record_standby_status();
+        }
 
         let base_equity = self.resolve_effective_base_equity_usdc(&cfg);
         let signal_out = self.evaluate_and_persist_signals(base_equity)?;
-        let rebalance = if execute_orders {
+        let eff_execute = execute_orders
+            && cfg.get_bool("auto_rebalance_enabled", true)
+            && cfg.trading_run_mode().allows_signal_exits();
+        let rebalance = if eff_execute {
             self.execute_signal_rebalance(&signal_out, base_equity)?
         } else {
             RebalanceExecutionReport::default()
@@ -2940,6 +2995,24 @@ impl ExecutionEngine {
         })
     }
 
+    /// Cancels all currently resting `WORKING` orders (`v_assets_ordered`).
+    pub fn cancel_all_working_orders(
+        &self,
+        reason: &str,
+        cooldown_seconds: Option<i64>,
+    ) -> Result<Vec<ManualCloseReport>> {
+        let mut reports = Vec::new();
+        let ordered = self.db.get_assets_ordered()?;
+        for o in ordered {
+            if let Ok(rep) = self.close_or_cancel_position(o.position_id, reason, cooldown_seconds)
+            {
+                reports.push(rep);
+            }
+        }
+        let _ = self.record_portfolio_snapshot(None, None);
+        Ok(reports)
+    }
+
     /// Closes all currently `OPEN` holdings (`v_assets_held`) and cancels all `WORKING` orders (`v_assets_ordered`).
     pub fn close_all_active_positions(
         &self,
@@ -2963,6 +3036,222 @@ impl ExecutionEngine {
         }
         let _ = self.record_portfolio_snapshot(None, None);
         Ok(reports)
+    }
+
+    /// Transitions the platform `TradingRunMode` (`ACTIVE`, `DRAIN`, `PAUSED`, `HALTED`, `STANDBY`)
+    /// strictly unlocked across exchange HTTP IO (`R14-H2`) while enforcing flat-book invariants for `STANDBY`.
+    pub fn set_trading_run_mode(
+        &self,
+        req: &RunModeTransitionRequest,
+    ) -> Result<RunModeTransitionReport> {
+        let raw_reason = req.reason.as_deref().unwrap_or("").trim();
+        let sanitized_reason: String = raw_reason
+            .chars()
+            .filter(|c| !c.is_ascii_control())
+            .take(240)
+            .collect();
+        let clean_reason = if sanitized_reason.trim().is_empty() {
+            format!("OPERATOR_SWITCH_{}", req.mode.as_str())
+        } else {
+            sanitized_reason.trim().to_string()
+        };
+        let cd_sec = req.cooldown_seconds.unwrap_or(0).clamp(0, 86_400);
+        let stage_ts = now_ms();
+
+        // Phase 1: Short locked pre-check and immediate gate staging to prevent concurrent 3s entries.
+        let (previous_mode, had_active_exposure) = {
+            let _exec_guard = acquire_execution_lock();
+            let cfg = self.db.load_config()?;
+            let prev = cfg.trading_run_mode();
+            let held = self.db.get_assets_held()?;
+            let ordered = self.db.get_assets_ordered()?;
+            let has_exposure = !held.is_empty() || !ordered.is_empty();
+
+            if req.mode == TradingRunMode::Standby && !req.flatten_open_positions && has_exposure {
+                return Err(AegisError::Validation(format!(
+                    "Cannot enter STANDBY while {} OPEN position(s) or {} WORKING order(s) exist. Flatten positions first or set flatten_open_positions=true.",
+                    held.len(),
+                    ordered.len()
+                )));
+            }
+
+            let staged_mode = if req.mode == TradingRunMode::Standby && has_exposure {
+                TradingRunMode::Halted
+            } else {
+                req.mode
+            };
+            self.db.set_config_value(
+                "trading_run_mode",
+                staged_mode.as_str(),
+                Some("Operator runtime control mode"),
+            )?;
+            self.db.set_config_value(
+                "trading_run_mode_reason",
+                &clean_reason,
+                Some("Operator reason or audit note for the latest trading_run_mode transition"),
+            )?;
+            self.db.set_config_value(
+                "trading_run_mode_updated_at_ms",
+                &stage_ts.to_string(),
+                Some("Timestamp (ms) of the latest trading_run_mode transition (read-only)"),
+            )?;
+            (prev, has_exposure)
+        };
+
+        // Phase 2: Unlocked exchange cancellations and optional position flattening.
+        let should_cancel_working = req.mode != TradingRunMode::Active;
+        let should_flatten = req.mode == TradingRunMode::Halted || req.flatten_open_positions;
+        let mut working_orders_cancelled = 0usize;
+        let mut open_positions_closed = 0usize;
+        let mut realized_pnl_usdc = 0.0f64;
+
+        if should_cancel_working {
+            let ordered = self.db.get_assets_ordered()?;
+            for o in ordered {
+                if let Ok(rep) =
+                    self.close_or_cancel_position(o.position_id, &clean_reason, Some(cd_sec))
+                {
+                    if rep.final_status == "CANCELLED" {
+                        working_orders_cancelled += 1;
+                    } else if rep.final_status == "CLOSED" {
+                        open_positions_closed += 1;
+                        realized_pnl_usdc += rep.realized_pnl_usdc;
+                    }
+                }
+            }
+        }
+
+        if should_flatten || (req.mode == TradingRunMode::Standby && had_active_exposure) {
+            let held = self.db.get_assets_held()?;
+            for h in held {
+                if let Ok(rep) =
+                    self.close_or_cancel_position(h.position_id, &clean_reason, Some(cd_sec))
+                {
+                    if rep.final_status == "CLOSED" {
+                        open_positions_closed += 1;
+                        realized_pnl_usdc += rep.realized_pnl_usdc;
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Short locked verification & final mode commit (`STANDBY` fallback to `HALTED` if unflat).
+        let final_ts = now_ms();
+        let (effective_mode, fallback_to_halted, rem_open, rem_working) = {
+            let _exec_guard = acquire_execution_lock();
+            let rem_open = self.db.get_assets_held()?.len();
+            let rem_working = self.db.get_assets_ordered()?.len();
+            let (eff_mode, fallback) =
+                if req.mode == TradingRunMode::Standby && (rem_open > 0 || rem_working > 0) {
+                    (TradingRunMode::Halted, true)
+                } else {
+                    (req.mode, false)
+                };
+            let persisted_reason = if fallback {
+                format!(
+                    "{clean_reason} [STANDBY BLOCKED: {rem_open} OPEN / {rem_working} WORKING remaining -> latched HALTED]"
+                )
+                .chars()
+                .take(240)
+                .collect::<String>()
+            } else {
+                clean_reason.clone()
+            };
+            self.db.set_config_value(
+                "trading_run_mode",
+                eff_mode.as_str(),
+                Some("Operator runtime control mode"),
+            )?;
+            self.db.set_config_value(
+                "trading_run_mode_reason",
+                &persisted_reason,
+                Some("Operator reason or audit note for the latest trading_run_mode transition"),
+            )?;
+            self.db.set_config_value(
+                "trading_run_mode_updated_at_ms",
+                &final_ts.to_string(),
+                Some("Timestamp (ms) of the latest trading_run_mode transition (read-only)"),
+            )?;
+            (eff_mode, fallback, rem_open, rem_working)
+        };
+
+        if effective_mode == TradingRunMode::Standby {
+            self.priority_monitor.record_standby_status();
+            self.ws_sub_tx.send_replace(WsSubscriptionSet::default());
+        } else if previous_mode == TradingRunMode::Standby {
+            if let Ok(cfg_now) = self.db.load_config() {
+                self.ws_sub_tx
+                    .send_replace(build_ws_subscription_set_from_db(&self.db, &cfg_now));
+            }
+        }
+        let _ = self.record_portfolio_snapshot(None, None);
+
+        let report = RunModeTransitionReport {
+            previous_mode: previous_mode.as_str().to_string(),
+            effective_mode: effective_mode.as_str().to_string(),
+            requested_mode: req.mode.as_str().to_string(),
+            fallback_to_halted,
+            working_orders_cancelled,
+            open_positions_closed,
+            remaining_open_positions: rem_open,
+            remaining_working_orders: rem_working,
+            realized_pnl_usdc: round_dp(realized_pnl_usdc, 4),
+            cooldown_applied_sec: cd_sec,
+            reason: clean_reason.clone(),
+            updated_at_ms: final_ts,
+        };
+
+        let tel_level = if effective_mode == TradingRunMode::Halted || fallback_to_halted {
+            "WARN"
+        } else {
+            "INFO"
+        };
+        let _ = self.db.log_telemetry(
+            tel_level,
+            "execution.run_mode",
+            &format!(
+                "TradingRunMode transitioned {} -> {} (cancelled={}, closed={}, rem_open={}, rem_working={}, reason='{}')",
+                report.previous_mode,
+                report.effective_mode,
+                working_orders_cancelled,
+                open_positions_closed,
+                rem_open,
+                rem_working,
+                clean_reason
+            ),
+            serde_json::to_value(&report).ok(),
+        );
+
+        let event_type = if effective_mode == TradingRunMode::Halted {
+            "EMERGENCY_HALT"
+        } else {
+            "RUN_MODE_CHANGED"
+        };
+        let severity = if effective_mode == TradingRunMode::Halted {
+            "CRITICAL"
+        } else {
+            "INFO"
+        };
+        let safe_prev = escape_html(&report.previous_mode);
+        let safe_eff = escape_html(&report.effective_mode);
+        let safe_reason = escape_html(&clean_reason);
+        let html = format!(
+            "{} <b>AEGIS v2.1 // RUN MODE: {safe_eff}</b>\n\
+            Transition: <code>{safe_prev}</code> → <code>{safe_eff}</code>\n\
+            Working Cancelled: <code>{working_orders_cancelled}</code> · Open Closed: <code>{open_positions_closed}</code>\n\
+            Remaining: <code>{rem_open}</code> OPEN · <code>{rem_working}</code> WORKING · PnL: <code>${:.2}</code>\n\
+            Reason: <i>{safe_reason}</i>",
+            if effective_mode == TradingRunMode::Halted { "🔴" } else { "🎛️" },
+            report.realized_pnl_usdc
+        );
+        self.enqueue_non_blocking_alert(
+            event_type,
+            severity,
+            &html,
+            serde_json::to_value(&report).ok().as_ref(),
+        );
+
+        Ok(report)
     }
 
     /// Closes an `OPEN` position or cancels a `WORKING` order by canonical or raw symbol (`"SOL-USDC"`, `"SOL"`).
@@ -2998,8 +3287,12 @@ impl ExecutionEngine {
 
         let startup_cfg = self.db.load_config_or_default();
         if should_enable_ws_manager(&self.db, &startup_cfg) {
-            let init_subs = build_ws_subscription_set_from_db(&self.db, &startup_cfg);
-            let _ = self.ws_sub_tx.send(init_subs);
+            let init_subs = if startup_cfg.trading_run_mode().suspends_background_loops() {
+                WsSubscriptionSet::default()
+            } else {
+                build_ws_subscription_set_from_db(&self.db, &startup_cfg)
+            };
+            self.ws_sub_tx.send_replace(init_subs);
             if let Err(err) = HyperliquidWsManager::spawn_background(
                 self.db.clone(),
                 Arc::clone(&self.ws_cache),
@@ -3041,6 +3334,25 @@ impl ExecutionEngine {
                 let prio_ms = cfg
                     .get_i64("priority_monitor_interval_ms", 1000)
                     .clamp(250, 5000) as u64;
+                if cfg.trading_run_mode().suspends_background_loops() {
+                    let has_active = !prio_engine
+                        .db
+                        .get_assets_held()
+                        .unwrap_or_default()
+                        .is_empty()
+                        || !prio_engine
+                            .db
+                            .get_assets_ordered()
+                            .unwrap_or_default()
+                            .is_empty();
+                    if !has_active {
+                        prio_engine.priority_monitor.record_standby_status();
+                        let elapsed_ms = tick_start.elapsed().as_millis() as u64;
+                        let rem_ms = prio_ms.saturating_sub(elapsed_ms).max(50);
+                        sleep_interruptible(&prio_rx, rem_ms);
+                        continue;
+                    }
+                }
                 if let Err(e) = prio_engine.priority_monitor.run_1s_priority_tick() {
                     tracing::warn!(error = %e, "1s priority watchlist tick error");
                     prio_engine.priority_monitor.record_tick_failure(&e);
@@ -3054,7 +3366,9 @@ impl ExecutionEngine {
         // 2. 3s Market Scanner, Candle Refresh, Signal Evaluation & Unlocked Rebalance loop
         let scan_engine = self.clone();
         let scan_rx = rx.clone();
+        let initial_standby_ws = startup_cfg.trading_run_mode().suspends_background_loops();
         std::thread::spawn(move || {
+            let mut ws_subs_cleared = initial_standby_ws;
             while !*scan_rx.borrow() {
                 let tick_start = Instant::now();
                 let cfg = match scan_engine.db.load_config() {
@@ -3066,7 +3380,32 @@ impl ExecutionEngine {
                     }
                 };
                 let scan_ms = cfg.get_i64("scanner_interval_ms", 3000).max(1000) as u64;
-                let execute_orders = cfg.get_bool("auto_rebalance_enabled", true);
+                let run_mode = cfg.trading_run_mode();
+                if run_mode.suspends_background_loops() {
+                    if !ws_subs_cleared {
+                        scan_engine
+                            .ws_sub_tx
+                            .send_replace(WsSubscriptionSet::default());
+                        ws_subs_cleared = true;
+                    }
+                    if scan_engine.alert_wakeup_tx.is_some() {
+                        scan_engine.wake_alert_worker(8);
+                    } else {
+                        let _ = scan_engine.alerts.poll_pending_queue(8);
+                    }
+                    let elapsed_ms = tick_start.elapsed().as_millis() as u64;
+                    let rem_ms = scan_ms.saturating_sub(elapsed_ms).max(100);
+                    sleep_interruptible(&scan_rx, rem_ms);
+                    continue;
+                }
+                if ws_subs_cleared {
+                    scan_engine
+                        .ws_sub_tx
+                        .send_replace(build_ws_subscription_set_from_db(&scan_engine.db, &cfg));
+                    ws_subs_cleared = false;
+                }
+                let execute_orders =
+                    cfg.get_bool("auto_rebalance_enabled", true) && run_mode.allows_signal_exits();
                 let eff_eq = scan_engine.resolve_effective_base_equity_usdc(&cfg);
 
                 if let Err(e) = scan_engine.watcher.run_3s_exchange_scan() {
@@ -3120,6 +3459,10 @@ impl ExecutionEngine {
                 };
                 let scan_ms = cfg.get_i64("scanner_interval_ms", 3000).max(1000) as u64;
                 let reconcile_ms = (scan_ms * 5).max(5000);
+                if cfg.trading_run_mode().suspends_background_loops() {
+                    sleep_interruptible(&rec_rx, reconcile_ms.min(2000));
+                    continue;
+                }
                 if cfg.execution_mode().is_live_or_testnet() {
                     if let Err(e) = rec_engine.reconciler.sync_db_with_hyperliquid() {
                         tracing::warn!(error = %e, "15s Hyperliquid 1:1 synchronization error");
@@ -3147,6 +3490,15 @@ impl ExecutionEngine {
         std::thread::spawn(move || {
             while !*aux_rx.borrow() {
                 let tick_start = Instant::now();
+                if aux_engine
+                    .db
+                    .load_config_or_default()
+                    .trading_run_mode()
+                    .suspends_background_loops()
+                {
+                    sleep_interruptible(&aux_rx, 2000);
+                    continue;
+                }
                 let _ = aux_engine.aux_sync.run_once(false);
                 let elapsed_ms = tick_start.elapsed().as_millis() as u64;
                 let rem_ms = (AUX_SYNC_INTERVAL_MS as u64)

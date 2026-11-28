@@ -47,6 +47,7 @@ const PRIORITY_CONFIG_KEYS = [
   'min_entry_interval_sec',
   'max_gross_leverage_x',
   'execution_mode',
+  'trading_run_mode',
 ];
 
 export function classifyConfigKeyCategory(key) {
@@ -86,6 +87,7 @@ export function classifyConfigKeyCategory(key) {
     return 'risk';
   }
   if (
+    k.startsWith('trading_run_mode') ||
     k.startsWith('max_alo_') ||
     k.startsWith('alo_') ||
     k.startsWith('entry_ioc_') ||
@@ -207,6 +209,8 @@ function buildInlineConfigControlNode(row, idPrefix, rowIdx = 0) {
   let enumOptions = null;
   if (key === 'execution_mode') {
     enumOptions = ['TESTNET', 'LIVE', 'PAPER'];
+  } else if (key === 'trading_run_mode') {
+    enumOptions = ['ACTIVE', 'DRAIN', 'PAUSED', 'HALTED', 'STANDBY'];
   } else if (key === 'risk_tier') {
     enumOptions = ['extreme', 'aggressive', 'standard', 'conservative', 'custom'];
   } else if (key === 'alert_provider') {

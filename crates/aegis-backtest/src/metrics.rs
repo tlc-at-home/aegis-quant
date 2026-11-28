@@ -247,7 +247,7 @@ pub fn compute_backtest_report(
     }
 
     BacktestReport {
-        platform_version: "2.0.0".to_string(),
+        platform_version: aegis_core::PLATFORM_VERSION.to_string(),
         risk_tier: config.risk_tier.as_str().to_string(),
         leverage_multiplier: config.allocator.effective_leverage_multiplier(),
         initial_equity_usdc: config.initial_equity_usdc,

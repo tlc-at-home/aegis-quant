@@ -1,11 +1,14 @@
 //! End-to-End Integration Tests for Aegis Quant v2.0 Execution Engine (`aegis-execution`).
 
-use aegis_core::{now_ms, ConfigMap, OrderSide, RiskTier};
+use aegis_core::{now_ms, ConfigMap, OrderSide, RiskTier, TradingRunMode};
 use aegis_db::{
     AssetUpsertInput, BarUpsertInput, DatabaseManager, ExchangeOpenPositionSyncInput, OidUpdate,
     SnapshotInsertInput,
 };
-use aegis_execution::{ChaseStepOutcome, EntryUrgency, ExecutionEngine, NewWorkingOrderRequest};
+use aegis_execution::{
+    ChaseStepOutcome, EntryUrgency, ExecutionEngine, NewWorkingOrderRequest,
+    RunModeTransitionRequest,
+};
 use aegis_risk::{
     compute_initial_protective_stop, RiskEngine, RiskLimitsConfig, StopEvaluationInput,
 };
@@ -7415,4 +7418,692 @@ fn test_wave4_partial_reduce_weight_sync_cooldown_guard_and_r_scaled_hold_floor(
         "CLOSED",
         "-1.0% loss clearing -0.9% R-scaled hurdle must bypass min_position_hold_sec"
     );
+}
+
+#[test]
+fn test_v2_1_trading_run_mode_five_state_controller_and_invariants() {
+    let db = fresh_isolated_db();
+    let engine = ExecutionEngine::new(db.clone());
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    seed_test_assets(&db);
+    db.set_config_value("min_position_hold_sec", "0", None)
+        .unwrap();
+    db.set_config_value("min_entry_interval_sec", "0", None)
+        .unwrap();
+    db.set_config_value("profit_gate_signal_exits", "false", None)
+        .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    let btc = db.get_asset_by_symbol("BTC-USDC").unwrap().unwrap();
+    update_test_asset_px(&db, &sol, 100.0);
+    update_test_asset_px(&db, &eth, 200.0);
+    update_test_asset_px(&db, &btc, 50_000.0);
+    let sol = db.get_asset_by_id(sol.id).unwrap().unwrap();
+    let eth = db.get_asset_by_id(eth.id).unwrap().unwrap();
+    let btc = db.get_asset_by_id(btc.id).unwrap().unwrap();
+
+    let now = now_ms();
+    // Create 1 OPEN position (SOL) and 1 WORKING order (ETH)
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: &sol.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 101.0,
+            quantity: 5.0,
+            committed_notional_usdc: 500.0,
+            unrealized_pnl_usdc: 5.0,
+            portfolio_weight: 0.05,
+            protective_stop_px: 95.0,
+            take_profit_px: 120.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 2_000_000),
+        })
+        .unwrap();
+    let eth_work_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: eth.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 2.0,
+            reserved_margin_usdc: 200.0,
+            portfolio_weight: 0.04,
+            s1_weight_contrib: 0.04,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 185.0,
+            reason: "TEST_WORKING".to_string(),
+            bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
+        })
+        .unwrap();
+    assert_eq!(db.get_assets_ordered().unwrap().len(), 1);
+
+    // 1. STANDBY without flatten_open_positions MUST be rejected while OPEN or WORKING exists
+    let standby_err = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Standby,
+            reason: Some("Attempt unflat standby".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap_err();
+    assert!(standby_err.to_string().contains("Cannot enter STANDBY"));
+    assert_eq!(
+        db.load_config().unwrap().trading_run_mode(),
+        TradingRunMode::Active
+    );
+
+    // 2. DRAIN cancels WORKING order, keeps OPEN position, allows ACTION_CLOSE/FLIP-close without new entry
+    let drain_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Drain,
+            reason: Some("Graceful pre-maintenance pause".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(drain_rep.effective_mode, "DRAIN");
+    assert_eq!(drain_rep.working_orders_cancelled, 1);
+    assert_eq!(drain_rep.open_positions_closed, 0);
+    assert_eq!(drain_rep.remaining_open_positions, 1);
+    assert_eq!(drain_rep.remaining_working_orders, 0);
+    assert_eq!(
+        db.get_position_by_id(eth_work_pid).unwrap().unwrap().status,
+        "CANCELLED"
+    );
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+
+    // In DRAIN: new OPEN_LONG on BTC and ACTION_INCREASE on SOL are blocked, while ACTION_FLIP on SOL closes-to-flat without re-entry!
+    let drain_reb = engine
+        .execute_signal_rebalance(
+            &make_signal_output(vec![
+                make_signal_input(&btc, 0.10, 0.0, ACTION_OPEN_LONG),
+                make_signal_input(&sol, -0.05, 0.05, ACTION_FLIP),
+            ]),
+            10_000.0,
+        )
+        .unwrap();
+    assert_eq!(drain_reb.working_orders_placed, 0);
+    assert_eq!(drain_reb.positions_closed, 1);
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert!(db.get_assets_ordered().unwrap().is_empty());
+
+    // 3. Re-open SOL & switch to PAUSED -> cancels WORKING, suppresses signal ACTION_CLOSE, keeps 1s hard SL active!
+    engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Active,
+            reason: Some("Resume for PAUSED test".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    let (sol_pid2, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: &sol.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 100.0,
+            quantity: 5.0,
+            committed_notional_usdc: 500.0,
+            unrealized_pnl_usdc: 0.0,
+            portfolio_weight: 0.05,
+            protective_stop_px: 95.0,
+            take_profit_px: 120.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 2_000_000),
+        })
+        .unwrap();
+    let _btc_work_pid = engine
+        .chaser
+        .place_working_order(&NewWorkingOrderRequest {
+            asset: btc.clone(),
+            side: OrderSide::Long,
+            requested_quantity: 0.01,
+            reserved_margin_usdc: 250.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 47_500.0,
+            reason: "BTC_WORK".to_string(),
+            bypass_entry_interval: true,
+            entry_urgency: EntryUrgency::ChaseToIoc,
+            is_scale_in: false,
+        })
+        .unwrap();
+
+    let paused_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Paused,
+            reason: Some("Freeze strategy only".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(paused_rep.effective_mode, "PAUSED");
+    assert_eq!(paused_rep.working_orders_cancelled, 1);
+    assert_eq!(paused_rep.remaining_open_positions, 1);
+
+    let paused_reb = engine
+        .execute_signal_rebalance(
+            &make_signal_output(vec![
+                make_signal_input(&sol, 0.0, 0.05, ACTION_CLOSE),
+                make_signal_input(&eth, 0.08, 0.0, ACTION_OPEN_LONG),
+            ]),
+            10_000.0,
+        )
+        .unwrap();
+    assert_eq!(paused_reb.positions_closed, 0);
+    assert_eq!(paused_reb.working_orders_placed, 0);
+    assert_eq!(
+        db.get_position_by_id(sol_pid2).unwrap().unwrap().status,
+        "OPEN"
+    );
+
+    // Trigger hard protective stop at 94.0 (< 95.0 SL) -> 1s PriorityMonitor MUST close even while PAUSED!
+    update_test_asset_px(&db, &sol, 94.0);
+    let tick = engine.priority_monitor.run_1s_priority_tick().unwrap();
+    assert_eq!(tick.stops_triggered_closed, 1);
+    assert_eq!(
+        db.get_position_by_id(sol_pid2).unwrap().unwrap().status,
+        "CLOSED"
+    );
+
+    // 4. HALTED (Kill-Switch) flattens OPEN holdings with 0s default cooldown and latches HALTED
+    update_test_asset_px(&db, &eth, 200.0);
+    let (eth_pid_open, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: eth.id,
+            coin: &eth.coin,
+            side: OrderSide::Long,
+            entry_price: 200.0,
+            mark_price: 205.0,
+            quantity: 3.0,
+            committed_notional_usdc: 600.0,
+            unrealized_pnl_usdc: 15.0,
+            portfolio_weight: 0.06,
+            protective_stop_px: 190.0,
+            take_profit_px: 230.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 2_000_000),
+        })
+        .unwrap();
+    engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Active,
+            reason: Some("Re-arm before HALTED test".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    let halt_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Halted,
+            reason: Some("Emergency panic test".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(halt_rep.effective_mode, "HALTED");
+    assert_eq!(halt_rep.open_positions_closed, 1);
+    assert_eq!(halt_rep.remaining_open_positions, 0);
+    assert_eq!(halt_rep.cooldown_applied_sec, 0);
+    assert_eq!(
+        db.get_position_by_id(eth_pid_open).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert!(
+        !db.is_asset_in_cooldown(eth.id).unwrap(),
+        "Default 0s cooldown on HALTED must not insert per-asset cooldown lock"
+    );
+
+    // 5. STANDBY succeeds once flat (and updates PriorityMonitor health status cleanly to STANDBY)
+    let standby_ok = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Standby,
+            reason: Some("Idle standby".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(standby_ok.effective_mode, "STANDBY");
+    assert_eq!(standby_ok.remaining_open_positions, 0);
+    let health_raw = db
+        .load_config()
+        .unwrap()
+        .get_str("priority_monitor_health_json", "");
+    assert!(health_raw.contains(r#""status":"STANDBY""#));
+}
+
+#[test]
+fn test_v2_1_testnet_mock_exchange_run_mode_cancels_illiquid_standby_fallback_and_ws_subs() {
+    use aegis_execution::WsSubscriptionSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let cancel_calls = Arc::new(AtomicUsize::new(0));
+    let cancel_calls_srv = Arc::clone(&cancel_calls);
+    let close_order_calls = Arc::new(AtomicUsize::new(0));
+    let close_order_calls_srv = Arc::clone(&close_order_calls);
+    let reject_ioc_close = Arc::new(AtomicBool::new(true));
+    let reject_ioc_srv = Arc::clone(&reject_ioc_close);
+    let sol_closed = Arc::new(AtomicBool::new(false));
+    let sol_closed_srv = Arc::clone(&sol_closed);
+
+    let server = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "clearinghouseState" => {
+                    let asset_positions = if sol_closed_srv.load(Ordering::SeqCst) {
+                        json!([])
+                    } else {
+                        json!([{
+                            "position": {
+                                "coin": "SOL",
+                                "szi": "5.0",
+                                "entryPx": "100.0",
+                                "positionValue": "505.0",
+                                "unrealizedPnl": "5.0"
+                            }
+                        }])
+                    };
+                    (
+                        200,
+                        json!({
+                            "marginSummary": { "accountValue": "2000.0", "totalMarginUsed": "100.0" },
+                            "withdrawable": "1900.0",
+                            "assetPositions": asset_positions
+                        }),
+                    )
+                }
+                "l2Book" => (
+                    200,
+                    json!({
+                        "levels": [
+                            [{"px": "100.9", "sz": "100.0"}],
+                            [{"px": "101.1", "sz": "100.0"}]
+                        ]
+                    }),
+                ),
+                "openOrders" | "frontendOpenOrders" => (200, json!([])),
+                _ => (200, json!([])),
+            };
+        }
+
+        // /exchange
+        let action_type = body
+            .pointer("/action/type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if action_type == "cancel" {
+            cancel_calls_srv.fetch_add(1, Ordering::SeqCst);
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": { "type": "cancel", "data": { "statuses": ["success"] } }
+                }),
+            );
+        }
+        if action_type == "order" {
+            close_order_calls_srv.fetch_add(1, Ordering::SeqCst);
+            if reject_ioc_srv.load(Ordering::SeqCst) {
+                return (
+                    200,
+                    json!({
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [{
+                                    "error": "Order could not immediately match against any resting orders."
+                                }]
+                            }
+                        }
+                    }),
+                );
+            }
+            sol_closed_srv.store(true, Ordering::SeqCst);
+            return (
+                200,
+                json!({
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {
+                            "statuses": [{
+                                "filled": {
+                                    "oid": 8801u64,
+                                    "totalSz": "5.0",
+                                    "avgPx": "101.0",
+                                    "fee": "0.2273"
+                                }
+                            }]
+                        }
+                    }
+                }),
+            );
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = fresh_isolated_db();
+    let engine = ExecutionEngine::new(db.clone());
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, server.port());
+    db.set_config_value(
+        "private_key",
+        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+        None,
+    )
+    .unwrap();
+
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let eth = db.get_asset_by_symbol("ETH-USDC").unwrap().unwrap();
+    update_test_asset_px(&db, &sol, 101.0);
+    update_test_asset_px(&db, &eth, 200.0);
+
+    let now = now_ms();
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: &sol.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 101.0,
+            quantity: 5.0,
+            committed_notional_usdc: 505.0,
+            unrealized_pnl_usdc: 5.0,
+            portfolio_weight: 0.15,
+            protective_stop_px: 95.0,
+            take_profit_px: 120.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now - 600_000),
+        })
+        .unwrap();
+    let eth_work_pid = db
+        .create_working_order(&aegis_db::WorkingOrderInput {
+            asset_id: eth.id,
+            client_order_id: "test-hl-work-7701".to_string(),
+            side: OrderSide::Long,
+            limit_price: 199.0,
+            requested_quantity: 1.0,
+            reserved_margin_usdc: 100.0,
+            portfolio_weight: 0.05,
+            s1_weight_contrib: 0.05,
+            s2_weight_contrib: 0.0,
+            s3_weight_contrib: 0.0,
+            protective_stop_px: 190.0,
+            take_profit_px: None,
+            exchange_order_id: Some("hl-7701".to_string()),
+            reason: "MOCK_HL_WORKING".to_string(),
+        })
+        .unwrap();
+
+    let _ws_sub_rx = engine.ws_subscription_sender().subscribe();
+    engine
+        .ws_subscription_sender()
+        .send_replace(WsSubscriptionSet {
+            ctx_and_candle_coins: vec!["SOL".to_string(), "ETH".to_string()],
+            l2_book_coins: vec!["SOL".to_string()],
+        });
+
+    // 1. DRAIN on live TESTNET mock sends real /exchange cancel for WORKING order while preserving OPEN SOL
+    let drain_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Drain,
+            reason: Some("Testnet cancel working".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(drain_rep.effective_mode, "DRAIN");
+    assert_eq!(drain_rep.working_orders_cancelled, 1);
+    assert_eq!(drain_rep.open_positions_closed, 0);
+    assert!(
+        cancel_calls.load(Ordering::SeqCst) >= 1,
+        "DRAIN must issue real Hyperliquid cancel batch for resting WORKING order"
+    );
+    assert_eq!(
+        db.get_position_by_id(eth_work_pid).unwrap().unwrap().status,
+        "CANCELLED"
+    );
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN"
+    );
+    assert!(db
+        .list_recent_alerts(10)
+        .unwrap()
+        .iter()
+        .any(|a| a.event_type == "RUN_MODE_CHANGED" && a.severity == "INFO"));
+
+    // 2. STANDBY + flatten on illiquid/rejected IOC close MUST fall back into HALTED!
+    let fallback_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Standby,
+            reason: Some("Try standby under illiquid close".to_string()),
+            flatten_open_positions: true,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert!(
+        close_order_calls.load(Ordering::SeqCst) >= 1,
+        "Flatten must attempt Hyperliquid reduceOnly close ladder"
+    );
+    assert_eq!(fallback_rep.requested_mode, "STANDBY");
+    assert_eq!(fallback_rep.effective_mode, "HALTED");
+    assert!(fallback_rep.fallback_to_halted);
+    assert_eq!(fallback_rep.open_positions_closed, 0);
+    assert_eq!(fallback_rep.remaining_open_positions, 1);
+    let cfg_fallback = db.load_config().unwrap();
+    assert_eq!(cfg_fallback.trading_run_mode(), TradingRunMode::Halted);
+    assert!(cfg_fallback
+        .get_str("trading_run_mode_reason", "")
+        .contains("STANDBY BLOCKED"));
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "OPEN",
+        "Illiquid close must leave SOL OPEN so 1s guard stays armed"
+    );
+    assert!(db
+        .list_recent_alerts(10)
+        .unwrap()
+        .iter()
+        .any(|a| a.event_type == "EMERGENCY_HALT" && a.severity == "CRITICAL"));
+
+    // 3. Once liquidity returns, STANDBY + flatten + 900s cooldown closes SOL, applies cooldown, & clears WS subs
+    reject_ioc_close.store(false, Ordering::SeqCst);
+    let standby_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Standby,
+            reason: Some("Clean flatten into standby".to_string()),
+            flatten_open_positions: true,
+            cooldown_seconds: Some(900),
+        })
+        .unwrap();
+    assert_eq!(standby_rep.effective_mode, "STANDBY");
+    assert!(!standby_rep.fallback_to_halted);
+    assert_eq!(standby_rep.open_positions_closed, 1);
+    assert_eq!(standby_rep.remaining_open_positions, 0);
+    assert_eq!(standby_rep.cooldown_applied_sec, 900);
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "CLOSED"
+    );
+    assert!(db.is_asset_in_cooldown(sol.id).unwrap());
+    assert!(
+        engine
+            .ws_subscription_sender()
+            .borrow()
+            .ctx_and_candle_coins
+            .is_empty(),
+        "Entering STANDBY must clear Market WS coin subscriptions"
+    );
+
+    // 4. Resuming STANDBY -> ACTIVE restores Market WS subscriptions from DB assets
+    let active_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Active,
+            reason: Some("Resume live engine".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(active_rep.effective_mode, "ACTIVE");
+    assert!(
+        !engine
+            .ws_subscription_sender()
+            .borrow()
+            .ctx_and_candle_coins
+            .is_empty(),
+        "Resuming from STANDBY -> ACTIVE must repopulate Market WS subscriptions"
+    );
+}
+
+#[test]
+fn test_v2_1_spawn_background_runtime_standby_zero_polling_and_1s_failsafe() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    let info_calls = Arc::new(AtomicUsize::new(0));
+    let info_calls_srv = Arc::clone(&info_calls);
+    let server = MockHttpServer::start_json(move |path, body| {
+        if path == "/info" {
+            info_calls_srv.fetch_add(1, Ordering::SeqCst);
+            let typ = body.get("type").and_then(Value::as_str).unwrap_or("");
+            return match typ {
+                "metaAndAssetCtxs" => (
+                    200,
+                    json!([
+                        { "universe": [{ "name": "SOL", "szDecimals": 2, "maxLeverage": 20 }] },
+                        [{ "markPx": "100.0", "midPx": "100.0", "oraclePx": "100.0", "funding": "0.00001", "openInterest": "100000.0", "dayNtlVlm": "50000000.0", "prevDayPx": "99.0" }]
+                    ]),
+                ),
+                "allMids" => (200, json!({ "SOL": "100.0" })),
+                "clearinghouseState" => (
+                    200,
+                    json!({
+                        "marginSummary": { "accountValue": "5000.0", "totalMarginUsed": "0.0" },
+                        "withdrawable": "5000.0",
+                        "assetPositions": []
+                    }),
+                ),
+                _ => (200, json!([])),
+            };
+        }
+        (200, json!({ "status": "ok" }))
+    });
+
+    let db = fresh_isolated_db();
+    seed_test_assets(&db);
+    configure_testnet_mock_db(&db, server.port());
+    db.set_config_value("priority_monitor_interval_ms", "250", None)
+        .unwrap();
+    db.set_config_value("scanner_interval_ms", "1000", None)
+        .unwrap();
+    db.set_config_value("auto_rebalance_enabled", "false", None)
+        .unwrap();
+
+    let engine = ExecutionEngine::new(db.clone());
+    let standby_rep = engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Standby,
+            reason: Some("Initial standby runtime test".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+    assert_eq!(standby_rep.effective_mode, "STANDBY");
+
+    info_calls.store(0, Ordering::SeqCst);
+    let shutdown_tx = engine.spawn_background_runtime();
+
+    // 1. Flat STANDBY must emit ZERO /info REST polls across background loops for >1.1s
+    std::thread::sleep(Duration::from_millis(1_150));
+    assert_eq!(
+        info_calls.load(Ordering::SeqCst),
+        0,
+        "Flat STANDBY background runtime must suspend all /info REST polling"
+    );
+    assert!(db
+        .load_config()
+        .unwrap()
+        .get_str("priority_monitor_health_json", "")
+        .contains(r#""status":"STANDBY""#));
+
+    // 2. Fail-safe: if an OPEN position appears while still in STANDBY, 1s PriorityMonitor stays active and enforces hard SL!
+    db.set_config_value("execution_mode", "PAPER", None)
+        .unwrap();
+    let sol = db.get_asset_by_symbol("SOL-USDC").unwrap().unwrap();
+    let (sol_pid, _) = db
+        .sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol.id,
+            coin: &sol.coin,
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            mark_price: 93.5,
+            quantity: 5.0,
+            committed_notional_usdc: 467.5,
+            unrealized_pnl_usdc: -32.5,
+            portfolio_weight: 0.05,
+            protective_stop_px: 95.0,
+            take_profit_px: 120.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now_ms() - 600_000),
+        })
+        .unwrap();
+    update_test_asset_px(&db, &sol, 93.5);
+
+    let sl_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < sl_deadline {
+        if db.get_position_by_id(sol_pid).unwrap().unwrap().status == "CLOSED" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        db.get_position_by_id(sol_pid).unwrap().unwrap().status,
+        "CLOSED",
+        "1s PriorityMonitor fail-safe must trigger protective stop even if trading_run_mode=STANDBY"
+    );
+
+    // 3. Switching back to TESTNET + ACTIVE wakes up background 3s scanner polling without restarting threads
+    configure_testnet_mock_db(&db, server.port());
+    info_calls.store(0, Ordering::SeqCst);
+    engine
+        .set_trading_run_mode(&RunModeTransitionRequest {
+            mode: TradingRunMode::Active,
+            reason: Some("Wake background runtime".to_string()),
+            flatten_open_positions: false,
+            cooldown_seconds: None,
+        })
+        .unwrap();
+
+    let wake_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < wake_deadline {
+        if info_calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        info_calls.load(Ordering::SeqCst) > 0,
+        "Switching STANDBY -> ACTIVE must resume background /info polling"
+    );
+
+    let _ = shutdown_tx.send(true);
+    std::thread::sleep(Duration::from_millis(350));
 }

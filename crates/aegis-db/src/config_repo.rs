@@ -5,7 +5,7 @@ use crate::fernet::{is_encrypted_value, FernetCipher};
 use crate::row_decode::{row_get_i64, row_get_string};
 use aegis_core::{
     default_v2_system_config_seeds, is_sensitive_config_key, now_ms, AegisError, ConfigMap, Result,
-    SystemConfigRow,
+    SystemConfigRow, PLATFORM_VERSION,
 };
 use mysql::params;
 use mysql::prelude::*;
@@ -37,6 +37,20 @@ impl DatabaseManager {
             )
             .map_err(|e| AegisError::Database(format!("Failed to seed config key '{k}': {e}")))?;
         }
+        conn.exec_drop(
+            r#"UPDATE system_config
+               SET config_value = :ver,
+                   description = :desc,
+                   updated_at_ms = :ts
+               WHERE config_key = 'platform_version'
+                 AND config_value <> :ver"#,
+            params! {
+                "ver" => PLATFORM_VERSION,
+                "desc" => "Aegis Quant v2.1 Modular Multi-Sleeve Engine",
+                "ts" => ts,
+            },
+        )
+        .map_err(|e| AegisError::Database(format!("Failed updating platform_version: {e}")))?;
         Ok(())
     }
 

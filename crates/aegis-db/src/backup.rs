@@ -61,7 +61,7 @@ impl DatabaseManager {
         let server_ver = self.server_version().unwrap_or_default();
 
         let payload: Value = json!({
-            "version": "2.0.0",
+            "version": aegis_core::PLATFORM_VERSION,
             "database": self.db_name(),
             "server_version": server_ver,
             "timestamp_ms": ts,
@@ -180,7 +180,8 @@ impl DatabaseManager {
             .iter()
             .all(|t| table_counts.contains_key(*t));
 
-        let verified = version == "2.0.0"
+        let verified = (matches!(version.as_str(), "2.0.0" | "2.1.0")
+            || version == aegis_core::PLATFORM_VERSION)
             && !database.is_empty()
             && timestamp_ms > 0
             && parsed.get("portfolio").is_some()

@@ -541,7 +541,7 @@ mod tests {
         });
         let report = engine.run_default_simulation().unwrap();
 
-        assert_eq!(report.platform_version, "2.0.0");
+        assert_eq!(report.platform_version, aegis_core::PLATFORM_VERSION);
         assert_eq!(report.risk_tier, "extreme");
         assert!((report.leverage_multiplier - 1.85).abs() < 1e-9);
         assert!(report.bars_evaluated >= 50);

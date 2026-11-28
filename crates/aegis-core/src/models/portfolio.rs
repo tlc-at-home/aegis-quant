@@ -515,7 +515,9 @@ pub fn compute_equity_basis_summary(
         round_dp(snapshot.available_cash_usdc.max(0.0), 2)
     };
     let synced_at_ms = cfg.get_i64("live_exchange_equity_synced_at_ms", 0).max(0);
+    let is_standby = cfg.trading_run_mode().suspends_background_loops();
     let is_stale = is_live_or_testnet
+        && !is_standby
         && (synced_at_ms <= 0 || now_ms_val.saturating_sub(synced_at_ms) > 90_000);
 
     EquityBasisSummary {
@@ -793,5 +795,13 @@ mod tests {
         assert_eq!(basis.perp_wallet_equity_usdc, 2400.0);
         assert_eq!(basis.total_wallet_equity_usdc, 3200.0);
         assert!(!basis.is_stale);
+
+        // Old sync timestamp is stale in ACTIVE, but suppressed when STANDBY suspends polling.
+        let stale_ts = 300_000;
+        let active_stale = compute_equity_basis_summary(&cfg, &snap, 500.0, stale_ts);
+        assert!(active_stale.is_stale);
+        cfg.insert("trading_run_mode", "STANDBY");
+        let standby_basis = compute_equity_basis_summary(&cfg, &snap, 500.0, stale_ts);
+        assert!(!standby_basis.is_stale);
     }
 }

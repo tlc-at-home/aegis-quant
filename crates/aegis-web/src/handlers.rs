@@ -9,11 +9,12 @@ use crate::auth::{
 };
 use crate::payloads::{
     build_dashboard_payload, build_degraded_dashboard_body, build_health_payload,
-    execute_close_position_or_order, execute_risk_tier_switch, execute_vault_inspect,
-    execute_vault_sync, has_critical_degradation, json_value_to_config_string,
-    map_aegis_error_response, next_error_correlation_id, next_snapshot_seq, server_boot_id,
-    validate_config_key_value, ClosePositionRequest, ConfigUpdateRequest, ConfigUpdateResponse,
-    ReconcileRequest, RiskTierUpdateRequest, VaultInspectRequest,
+    execute_close_position_or_order, execute_risk_tier_switch, execute_run_mode_switch,
+    execute_vault_inspect, execute_vault_sync, has_critical_degradation,
+    json_value_to_config_string, map_aegis_error_response, next_error_correlation_id,
+    next_snapshot_seq, server_boot_id, validate_config_key_value, ClosePositionRequest,
+    ConfigUpdateRequest, ConfigUpdateResponse, ReconcileRequest, RiskTierUpdateRequest,
+    RunModeUpdateRequest, VaultInspectRequest,
 };
 use crate::server::{AppState, ClientIpKey, SESSION_TTL_SECS};
 use aegis_alerts::send_test_alert_async;
@@ -168,13 +169,33 @@ pub async fn post_risk_tier_handler(
     }
 }
 
+/// `POST /api/v1/run-mode` — Dynamically transitions `trading_run_mode` (`ACTIVE`, `DRAIN`, `PAUSED`, `HALTED`, `STANDBY`)
+/// while cancelling `WORKING` orders, optionally flattening `OPEN` positions, and updating background loop state.
+pub async fn post_run_mode_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RunModeUpdateRequest>,
+) -> Response {
+    let db = state.db.clone();
+    let res = tokio::task::spawn_blocking(move || execute_run_mode_switch(&db, &req)).await;
+    match res {
+        Ok(Ok(payload)) => {
+            state.notify_dashboard_refresh();
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Ok(Err(e)) => map_aegis_error_response(e),
+        Err(e) => {
+            map_aegis_error_response(AegisError::Database(format!("Run mode task error: {e}")))
+        }
+    }
+}
+
 fn normalize_pending_config_write(
     key: &str,
     raw_val: String,
 ) -> aegis_core::Result<(String, String)> {
     validate_config_key_value(key, &raw_val)?;
     let clean_k = key.trim().to_ascii_lowercase();
-    let norm_val = if clean_k == "execution_mode" {
+    let norm_val = if clean_k == "execution_mode" || clean_k == "trading_run_mode" {
         raw_val.trim().to_ascii_uppercase()
     } else if clean_k == "vault_role" {
         raw_val.trim().to_ascii_lowercase()
@@ -218,6 +239,8 @@ pub async fn post_config_handler(
         }
 
         // R14-H2: Hold execution_lock() ONLY for atomic MariaDB config writes; release BEFORE unlocked cap enforcement!
+        let mut pending_run_mode: Option<aegis_core::TradingRunMode> = None;
+        let mut pending_run_mode_reason: Option<String> = None;
         let mut updated_keys = {
             let _exec_guard = aegis_execution::execution_lock().lock();
             let requested_modes: Vec<&str> = pending_writes
@@ -259,12 +282,41 @@ pub async fn post_config_handler(
                 }
             }
 
+            let requested_run_modes: Vec<&str> = pending_writes
+                .iter()
+                .filter(|(k, _, _)| k == "trading_run_mode")
+                .map(|(_, v, _)| v.as_str())
+                .collect();
+            if requested_run_modes.windows(2).any(|w| w[0] != w[1]) {
+                return Err(AegisError::Validation(
+                    "Conflicting trading_run_mode values in single config update".to_string(),
+                ));
+            }
+            if let Some(&target_rm_str) = requested_run_modes.first() {
+                let target_rm = aegis_core::TradingRunMode::parse_strict(target_rm_str)?;
+                if target_rm == aegis_core::TradingRunMode::Standby
+                    && (!db.get_assets_held()?.is_empty() || !db.get_assets_ordered()?.is_empty())
+                {
+                    return Err(AegisError::Validation(
+                        "Cannot switch trading_run_mode to STANDBY via /api/v1/config while OPEN positions or WORKING orders exist; use POST /api/v1/run-mode"
+                            .to_string(),
+                    ));
+                }
+                pending_run_mode = Some(target_rm);
+            }
+
             let mut keys = Vec::with_capacity(pending_writes.len());
             let mut risk_tier_updated: Option<String> = None;
             let mut explicit_mult_updated: Option<f64> = None;
             let mut explicit_risk_pct_updated = false;
             let mut explicit_max_weight_updated = false;
             for (k, val_str, desc) in &pending_writes {
+                if k == "trading_run_mode" {
+                    continue;
+                }
+                if k == "trading_run_mode_reason" {
+                    pending_run_mode_reason = Some(val_str.clone());
+                }
                 if k == "risk_tier" {
                     risk_tier_updated = Some(val_str.clone());
                 } else if k == "target_leverage_multiplier" {
@@ -330,6 +382,20 @@ pub async fn post_config_handler(
             keys
         };
 
+        if let Some(target_rm) = pending_run_mode {
+            let engine = aegis_execution::ExecutionEngine::new(db.clone());
+            let reason_str = pending_run_mode_reason
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "CONFIG_API_OVERRIDE".to_string());
+            engine.set_trading_run_mode(&aegis_execution::RunModeTransitionRequest {
+                mode: target_rm,
+                reason: Some(reason_str),
+                flatten_open_positions: target_rm == aegis_core::TradingRunMode::Halted,
+                cooldown_seconds: Some(0),
+            })?;
+            updated_keys.push("trading_run_mode".to_string());
+            updated_keys.push("trading_run_mode_updated_at_ms".to_string());
+        }
         updated_keys.sort();
         updated_keys.dedup();
         if updated_keys.iter().any(|k| {

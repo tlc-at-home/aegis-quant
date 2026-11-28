@@ -8,8 +8,8 @@ use aegis_core::{
     ConfigMap, CooldownAssetView, DrawdownBreakerStatus, EquityBasisSummary, ExchangeAsset,
     HeldAssetView, OrderAuditRecord, OrderedAssetView, PnlSummary, PortfolioSnapshot,
     PriorityMonitorHealth, PriorityWatchView, Result, RiskTier, SleeveS1AssetView,
-    SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord, VaultInfoPayload,
-    VaultPositionInfo, IMMUTABLE_SECURITY_CONFIG_KEYS, PLATFORM_VERSION,
+    SleeveS2AssetView, SleeveS3AssetView, SystemConfigRow, TelemetryLogRecord, TradingRunMode,
+    VaultInfoPayload, VaultPositionInfo, IMMUTABLE_SECURITY_CONFIG_KEYS, PLATFORM_VERSION,
 };
 use aegis_db::DatabaseManager;
 use axum::{
@@ -96,6 +96,10 @@ pub struct HealthPayload {
     pub target_leverage_multiplier: f64,
     pub risk_tier_badge: String,
     pub execution_mode: String,
+    #[serde(default)]
+    pub trading_run_mode: String,
+    #[serde(default)]
+    pub trading_run_mode_badge: String,
     pub loop_cadence: String,
     pub priority_monitor_interval_ms: i64,
     pub scanner_interval_ms: i64,
@@ -110,6 +114,14 @@ pub struct DashboardPayload {
     pub mariadb_version: String,
     pub views_healthy_count: usize,
     pub execution_mode: String,
+    #[serde(default)]
+    pub trading_run_mode: String,
+    #[serde(default)]
+    pub trading_run_mode_badge: String,
+    #[serde(default)]
+    pub trading_run_mode_reason: String,
+    #[serde(default)]
+    pub trading_run_mode_updated_at_ms: i64,
     pub risk_tier: String,
     pub target_leverage_multiplier: f64,
     pub risk_tier_badge: String,
@@ -178,6 +190,37 @@ pub struct RiskTierUpdateResponse {
     pub risk_tier: String,
     pub target_leverage_multiplier: f64,
     pub display_badge: String,
+    pub updated_at_ms: i64,
+}
+
+/// Request payload for `POST /api/v1/run-mode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunModeUpdateRequest {
+    pub run_mode: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub flatten_open_positions: bool,
+    #[serde(default)]
+    pub cooldown_sec: Option<i64>,
+}
+
+/// Response payload for `POST /api/v1/run-mode`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunModeUpdateResponse {
+    pub status: String,
+    pub previous_mode: String,
+    pub trading_run_mode: String,
+    pub requested_mode: String,
+    pub display_badge: String,
+    pub fallback_to_halted: bool,
+    pub working_orders_cancelled: usize,
+    pub open_positions_closed: usize,
+    pub remaining_open_positions: usize,
+    pub remaining_working_orders: usize,
+    pub realized_pnl_usdc: f64,
+    pub cooldown_applied_sec: i64,
+    pub reason: String,
     pub updated_at_ms: i64,
 }
 
@@ -298,8 +341,14 @@ pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
     let cfg = db.load_config()?;
     let tier = cfg.risk_tier();
     let mult = cfg.target_leverage_multiplier();
+    let run_mode = cfg.trading_run_mode();
     let prio_ms = cfg.get_i64("priority_monitor_interval_ms", 1000);
     let scan_ms = cfg.get_i64("scanner_interval_ms", 3000);
+    let loop_cadence = if run_mode.suspends_background_loops() {
+        "STANDBY (Loops Paused)".to_string()
+    } else {
+        "1s Priority / 3s Scanner".to_string()
+    };
 
     Ok(HealthPayload {
         status: "ok".to_string(),
@@ -313,7 +362,9 @@ pub fn build_health_payload(db: &DatabaseManager) -> Result<HealthPayload> {
         target_leverage_multiplier: mult,
         risk_tier_badge: tier.display_badge(Some(mult)),
         execution_mode: cfg.execution_mode().as_str().to_string(),
-        loop_cadence: "1s Priority / 3s Scanner".to_string(),
+        trading_run_mode: run_mode.as_str().to_string(),
+        trading_run_mode_badge: run_mode.display_badge().to_string(),
+        loop_cadence,
         priority_monitor_interval_ms: prio_ms,
         scanner_interval_ms: scan_ms,
         timestamp_utc: now_iso8601_utc(),
@@ -650,13 +701,24 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         fallback_open_orders
     };
 
+    let run_mode = cfg.trading_run_mode();
+    let run_mode_reason = cfg.get_str("trading_run_mode_reason", "");
+    let run_mode_updated_at_ms = cfg.get_i64("trading_run_mode_updated_at_ms", 0);
+
     let mut priority_monitor_health: PriorityMonitorHealth = cfg
         .get("priority_monitor_health_json")
         .and_then(|raw| serde_json::from_str::<PriorityMonitorHealth>(raw.trim()).ok())
         .unwrap_or_default();
     let prio_interval_ms = cfg.get_i64("priority_monitor_interval_ms", 1000).max(250);
     let stale_threshold_ms = (prio_interval_ms * 15).max(30_000);
-    if priority_monitor_health.last_tick_at_ms > 0
+    if run_mode.suspends_background_loops()
+        && v_assets_held.is_empty()
+        && v_assets_ordered.is_empty()
+    {
+        priority_monitor_health.is_stale = false;
+        priority_monitor_health.unmonitored_alert_active = false;
+        priority_monitor_health.status = "STANDBY".to_string();
+    } else if priority_monitor_health.last_tick_at_ms > 0
         && ts.saturating_sub(priority_monitor_health.last_tick_at_ms) > stale_threshold_ms
         && (!v_assets_held.is_empty() || !v_assets_ordered.is_empty())
     {
@@ -671,16 +733,25 @@ pub fn build_dashboard_payload(db: &DatabaseManager) -> Result<DashboardPayload>
         .map(|s| (*s).to_string())
         .collect();
     let degraded = !degraded_sections.is_empty();
+    let loop_cadence = if run_mode.suspends_background_loops() {
+        "STANDBY (Loops Paused)".to_string()
+    } else {
+        "1s Priority / 3s Scanner".to_string()
+    };
 
     Ok(DashboardPayload {
         platform_version: PLATFORM_VERSION.to_string(),
         mariadb_version,
         views_healthy_count: views.len(),
         execution_mode: cfg.execution_mode().as_str().to_string(),
+        trading_run_mode: run_mode.as_str().to_string(),
+        trading_run_mode_badge: run_mode.display_badge().to_string(),
+        trading_run_mode_reason: run_mode_reason,
+        trading_run_mode_updated_at_ms: run_mode_updated_at_ms,
         risk_tier: tier.as_str().to_string(),
         target_leverage_multiplier: mult,
         risk_tier_badge: tier.display_badge(Some(mult)),
-        loop_cadence: "1s Priority / 3s Scanner".to_string(),
+        loop_cadence,
         risk_capital_cap_updated_at_ms: cap_epoch_ms,
         max_open_positions,
         active_cap_open_count,
@@ -906,6 +977,39 @@ pub fn execute_risk_tier_switch(
         target_leverage_multiplier: mult,
         display_badge: badge,
         updated_at_ms: now_ms(),
+    })
+}
+
+/// Applies an operator `TradingRunMode` transition (`ACTIVE`, `DRAIN`, `PAUSED`, `HALTED`, `STANDBY`)
+/// via `ExecutionEngine::set_trading_run_mode`.
+pub fn execute_run_mode_switch(
+    db: &DatabaseManager,
+    req: &RunModeUpdateRequest,
+) -> Result<RunModeUpdateResponse> {
+    let target_mode = TradingRunMode::parse_strict(&req.run_mode)?;
+    let engine = aegis_execution::ExecutionEngine::new(db.clone());
+    let rep = engine.set_trading_run_mode(&aegis_execution::RunModeTransitionRequest {
+        mode: target_mode,
+        reason: req.reason.clone(),
+        flatten_open_positions: req.flatten_open_positions,
+        cooldown_seconds: req.cooldown_sec,
+    })?;
+    let eff_mode = TradingRunMode::parse_strict(&rep.effective_mode)?;
+    Ok(RunModeUpdateResponse {
+        status: "ok".to_string(),
+        previous_mode: rep.previous_mode,
+        trading_run_mode: rep.effective_mode,
+        requested_mode: rep.requested_mode,
+        display_badge: eff_mode.display_badge().to_string(),
+        fallback_to_halted: rep.fallback_to_halted,
+        working_orders_cancelled: rep.working_orders_cancelled,
+        open_positions_closed: rep.open_positions_closed,
+        remaining_open_positions: rep.remaining_open_positions,
+        remaining_working_orders: rep.remaining_working_orders,
+        realized_pnl_usdc: rep.realized_pnl_usdc,
+        cooldown_applied_sec: rep.cooldown_applied_sec,
+        reason: rep.reason,
+        updated_at_ms: rep.updated_at_ms,
     })
 }
 

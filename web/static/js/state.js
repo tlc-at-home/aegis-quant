@@ -35,6 +35,9 @@ export const state = {
     inFlightInspect: false,
     inFlightSync: false,
   },
+  runModeModal: {
+    inFlight: false,
+  },
 };
 
 export const DEFAULT_IMMUTABLE_SECURITY_KEYS = new Set([
@@ -62,6 +65,7 @@ export const DEFAULT_IMMUTABLE_SECURITY_KEYS = new Set([
   'hyperliquid_allowed_hosts',
   'platform_version',
   'schema_migration_version',
+  'trading_run_mode_updated_at_ms',
   'risk_capital_cap_updated_at_ms',
   'hyperliquid_last_nonce',
   'last_db_backup_ms',
@@ -101,6 +105,7 @@ export const SUPPORTS_INVOKER_COMMANDS =
   'command' in HTMLButtonElement.prototype;
 
 const STATIC_ELEMENT_IDS = [
+  'platform-version-pill',
   'badge-mariadb',
   'mariadb-pulse-dot',
   'mariadb-version-text',
@@ -112,6 +117,9 @@ const STATIC_ELEMENT_IDS = [
   'scanner-asset-count',
   'badge-exec-mode',
   'exec-mode-text',
+  'btn-open-run-mode-modal',
+  'run-mode-btn-dot',
+  'run-mode-btn-label',
   'risk-tier-selector',
   'btn-sync-hyperliquid',
   'btn-telegram-test',
@@ -119,6 +127,7 @@ const STATIC_ELEMENT_IDS = [
   'table-sort-status',
   'db-outage-banner',
   'surveillance-alert-banner',
+  'run-mode-banner',
   'pnl-card-daily',
   'pnl-daily-source',
   'pnl-daily-clamp',
@@ -278,6 +287,19 @@ const STATIC_ELEMENT_IDS = [
   'vault-barbell-legend',
   'vault-barbell-metrics',
   'vault-readiness-badges',
+  'run-mode-modal',
+  'run-mode-modal-current-pill',
+  'btn-close-run-mode-modal',
+  'run-mode-exposure-strip',
+  'run-mode-form',
+  'run-mode-flatten-row',
+  'run-mode-flatten-checkbox',
+  'run-mode-cooldown-select',
+  'run-mode-reason-input',
+  'run-mode-impact-warning',
+  'run-mode-form-status',
+  'btn-cancel-run-mode',
+  'btn-apply-run-mode',
   'toast-banner',
 ];
 

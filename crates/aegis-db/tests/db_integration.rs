@@ -405,7 +405,7 @@ fn test_portfolio_snapshot_telemetry_alerts_and_backup() {
     }
     let report = verify_latest_backup(&db).expect("verify_latest_backup");
     assert!(report.verified);
-    assert_eq!(report.version, "2.0.0");
+    assert_eq!(report.version, aegis_core::PLATFORM_VERSION);
     assert_eq!(report.table_counts.len(), CANONICAL_TABLES.len());
     assert!(report.table_counts.contains_key("funding_events"));
     let _ = std::fs::remove_file(backup_path);

@@ -361,10 +361,72 @@ export async function closeAllOpenPositions() {
   }
 }
 
+export async function switchTradingRunMode({
+  run_mode,
+  reason = '',
+  flatten_open_positions = false,
+  cooldown_sec = 0,
+}) {
+  try {
+    const res = await apiFetch('/api/v1/run-mode', {
+      method: 'POST',
+      body: JSON.stringify({
+        run_mode: String(run_mode || 'ACTIVE').trim().toUpperCase(),
+        reason: String(reason || '').trim(),
+        flatten_open_positions: Boolean(flatten_open_positions),
+        cooldown_sec: Number.isFinite(Number(cooldown_sec)) ? Number(cooldown_sec) : 0,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data.detail || data.error || `HTTP ${res.status}`;
+      hooks.onToast(`Run-mode transition failed: ${detail}`, true);
+      return { ok: false, error: detail };
+    }
+    invalidateSection('held');
+    invalidateSection('priority');
+    invalidateSection('config-tab');
+    invalidateSection('config-modal');
+    await refreshAll(true);
+
+    if (data.fallback_to_halted) {
+      hooks.onToast(
+        `STANDBY blocked: ${Number(data.remaining_open_positions || 0)} OPEN / ${Number(
+          data.remaining_working_orders || 0
+        )} WORKING remaining — latched into HALTED so 1s SL/TP guard stays armed.`,
+        true
+      );
+    } else {
+      const cancelled = Number(data.working_orders_cancelled || 0);
+      const closed = Number(data.open_positions_closed || 0);
+      const parts = [`Run Mode -> ${data.trading_run_mode || run_mode}`];
+      if (cancelled > 0) parts.push(`${cancelled} working cancelled`);
+      if (closed > 0) {
+        parts.push(`${closed} closed (${fmtSignedUsd(data.realized_pnl_usdc ?? 0)})`);
+      }
+      hooks.onToast(parts.join(' · '));
+    }
+    return { ok: true, data };
+  } catch (err) {
+    hooks.onToast(`Run-mode update error: ${err.message}`, true);
+    return { ok: false, error: err.message };
+  }
+}
+
 export async function saveConfigKeyValue(key, val) {
   try {
     if (key === 'risk_tier') {
       await switchRiskTier(val);
+      return;
+    }
+    if (key === 'trading_run_mode') {
+      const normMode = String(val || '').trim().toUpperCase();
+      await switchTradingRunMode({
+        run_mode: normMode,
+        reason: 'WEB_CONFIG_INLINE_EDIT',
+        flatten_open_positions: normMode === 'HALTED',
+        cooldown_sec: 0,
+      });
       return;
     }
     const res = await apiFetch('/api/v1/config', {

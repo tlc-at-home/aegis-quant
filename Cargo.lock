@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aegis-alerts"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "aegis-db",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-backtest"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "aegis-risk",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-cli"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-alerts",
  "aegis-backtest",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "hex",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-db"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "aes",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-execution"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-alerts",
  "aegis-core",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-risk"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "serde",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-signals"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "serde",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-telemetry"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-core",
  "aegis-db",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-test-support"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-web"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "aegis-alerts",
  "aegis-core",

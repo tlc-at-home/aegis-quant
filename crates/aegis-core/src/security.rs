@@ -55,6 +55,7 @@ pub const IMMUTABLE_SECURITY_CONFIG_KEYS: &[&str] = &[
     "hyperliquid_allowed_hosts",
     "platform_version",
     "schema_migration_version",
+    "trading_run_mode_updated_at_ms",
     "risk_capital_cap_updated_at_ms",
     "hyperliquid_last_nonce",
     "last_db_backup_ms",

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>AEGIS QUANT v2.0 // Hyperliquid L1 Multi-Sleeve Real-Time Quantitative Terminal</title>
+  <title>AEGIS QUANT v2.1 // Hyperliquid L1 Multi-Sleeve Real-Time Quantitative Terminal</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -22,8 +22,8 @@
        ======================================================================== -->
   <header class="top-telemetry-bar">
     <div class="brand-cluster">
-      <div class="brand-emblem" title="Aegis Quant v2.0 Autonomous Engine">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <div class="brand-emblem" title="Aegis Quant v2.1 Autonomous Engine">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <polygon points="12 2 21 7 21 17 12 22 3 17 3 7 12 2"></polygon>
           <polyline points="12 8 16 12 12 16 8 12 12 8"></polyline>
         </svg>
@@ -31,7 +31,7 @@
       <div class="brand-titles">
         <div class="brand-name">
           AEGIS QUANT
-          <span class="version-pill">v2.0.0</span>
+          <span class="version-pill" id="platform-version-pill">v2.1.0</span>
         </div>
         <div class="brand-tagline">Hyperliquid L1 DEX · MariaDB 13.0 InnoDB · 3-Sleeve Event Engine</div>
       </div>
@@ -67,6 +67,18 @@
     </div>
 
     <div class="telemetry-controls">
+      <button
+        type="button"
+        class="action-btn run-mode-btn is-active"
+        id="btn-open-run-mode-modal"
+        command="show-modal"
+        commandfor="run-mode-modal"
+        title="Control Trading Run-Mode: Pause/Drain Strategy, Freeze Entries, Emergency Kill-Switch, or Quiet Standby"
+      >
+        <span class="pulse-dot emerald" id="run-mode-btn-dot" aria-hidden="true"></span>
+        <span id="run-mode-btn-label">Engine: ACTIVE</span>
+      </button>
+
       <div class="risk-tier-group" id="risk-tier-selector" title="Dynamically Switch Portfolio Leverage Multiplier Tier">
         <span class="risk-tier-label">Risk Tier</span>
         <button type="button" class="tier-btn" data-tier="conservative">Conservative 0.65x</button>
@@ -110,6 +122,7 @@
 
     <div id="db-outage-banner" class="alert-banner alert-banner-critical" role="alert" aria-live="assertive" hidden></div>
     <div id="surveillance-alert-banner" class="alert-banner alert-banner-warn" role="alert" aria-live="assertive" hidden></div>
+    <div id="run-mode-banner" class="alert-banner run-mode-banner" role="status" aria-live="polite" hidden></div>
 
     <!-- ======================================================================
          4-CARD PNL HORIZON RIBBON (DAILY 24H · WEEKLY 7D · MONTHLY 30D · YTD)
@@ -1979,6 +1992,138 @@
           </article>
         </section>
       </div>
+    </div>
+  </dialog>
+
+  <!-- ========================================================================
+       OPERATOR TRADING RUN-MODE & KILL-SWITCH CONTROLLER (<dialog>)
+       ======================================================================== -->
+  <dialog id="run-mode-modal" class="aegis-native-dialog run-mode-modal" closedby="any" aria-labelledby="run-mode-modal-title">
+    <div class="vault-modal-header">
+      <div class="panel-title-cluster">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="12" cy="12" r="10"></circle>
+          <rect x="9" y="9" width="6" height="6" rx="1"></rect>
+        </svg>
+        <div>
+          <h1 class="panel-title" id="run-mode-modal-title">Operator Trading Run-Mode &amp; Kill-Switch</h1>
+          <div class="panel-subtitle">Graduated pause, wind-down, emergency flatten, and loop standby controller (persisted in MariaDB)</div>
+        </div>
+      </div>
+      <div class="vault-modal-header-actions">
+        <span class="status-pill open" id="run-mode-modal-current-pill">ACTIVE</span>
+        <button
+          type="button"
+          class="close-btn"
+          id="btn-close-run-mode-modal"
+          command="close"
+          commandfor="run-mode-modal"
+        >✕ Close</button>
+      </div>
+    </div>
+
+    <div class="vault-modal-body run-mode-modal-body">
+      <div class="run-mode-exposure-strip" id="run-mode-exposure-strip"></div>
+
+      <form id="run-mode-form" action="/api/v1/run-mode" method="POST">
+        <fieldset class="vault-fieldset">
+          <legend>Target Operational Mode</legend>
+          <div class="run-mode-radio-grid">
+            <div class="vault-radio-item run-mode-option is-active">
+              <input type="radio" id="run-mode-opt-active" name="run_mode" value="ACTIVE" checked />
+              <label for="run-mode-opt-active">
+                <span class="vault-radio-title">🟢 ACTIVE — Autonomous Multi-Sleeve Trading</span>
+                <span class="vault-radio-desc">Full 1s SL/TP surveillance, 3s perp scanner, signal exits, and new maker-chaser entries enabled.</span>
+              </label>
+            </div>
+
+            <div class="vault-radio-item run-mode-option is-drain">
+              <input type="radio" id="run-mode-opt-drain" name="run_mode" value="DRAIN" />
+              <label for="run-mode-opt-drain">
+                <span class="vault-radio-title">🟡 DRAIN — Graceful Wind-Down (Recommended Pause)</span>
+                <span class="vault-radio-desc">Cancels resting WORKING entry orders immediately and blocks new entries; lets OPEN positions exit via S1/S2/S3 signals or 1s SL/TP.</span>
+              </label>
+            </div>
+
+            <div class="vault-radio-item run-mode-option is-paused">
+              <input type="radio" id="run-mode-opt-paused" name="run_mode" value="PAUSED" />
+              <label for="run-mode-opt-paused">
+                <span class="vault-radio-title">🟠 PAUSED — Strategy Freeze (Hold &amp; Guard)</span>
+                <span class="vault-radio-desc">Cancels resting WORKING entry orders and suspends all signal rebalances while keeping 1s hard SL/TP, trailing stops, and live telemetry active.</span>
+              </label>
+            </div>
+
+            <div class="vault-radio-item run-mode-option is-halted">
+              <input type="radio" id="run-mode-opt-halted" name="run_mode" value="HALTED" />
+              <label for="run-mode-opt-halted">
+                <span class="vault-radio-title">🔴 HALTED — Emergency Kill-Switch (Flatten &amp; Latch)</span>
+                <span class="vault-radio-desc">Immediately cancels all WORKING orders and market-closes all OPEN positions; latches HALTED across daemon restarts until manually resumed.</span>
+              </label>
+            </div>
+
+            <div class="vault-radio-item run-mode-option is-standby">
+              <input type="radio" id="run-mode-opt-standby" name="run_mode" value="STANDBY" />
+              <label for="run-mode-opt-standby">
+                <span class="vault-radio-title">⚪ STANDBY — Quiet Idle (Pause All Background Loops)</span>
+                <span class="vault-radio-desc">Suspends 1s, 3s, 15s, and 60s Hyperliquid background loops for zero API chatter while keeping the Web UI online. Requires 0 OPEN &amp; 0 WORKING positions.</span>
+              </label>
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset class="vault-fieldset">
+          <legend>Transition Options &amp; Audit Note</legend>
+          <div class="run-mode-check-row" id="run-mode-flatten-row">
+            <input type="checkbox" id="run-mode-flatten-checkbox" name="flatten_open_positions" />
+            <label for="run-mode-flatten-checkbox">
+              <span class="vault-radio-title">Flatten all OPEN positions &amp; cancel WORKING orders on transition</span>
+              <span class="vault-radio-desc">Mandatory for HALTED; optional to auto-flatten into flat STANDBY, DRAIN, or PAUSED.</span>
+            </label>
+          </div>
+
+          <div class="run-mode-options-split">
+            <div class="vault-field">
+              <label for="run-mode-cooldown-select">Per-Asset Post-Flatten Cooldown</label>
+              <span id="run-mode-cooldown-hint" class="vault-field-hint">Defaults to 0s so resuming ACTIVE later is immediate unless a per-coin lockout is desired.</span>
+              <select id="run-mode-cooldown-select" name="cooldown_sec" class="vault-input vault-mono-input" aria-describedby="run-mode-cooldown-hint">
+                <option value="0" selected>0s — No per-asset cooldown (Recommended)</option>
+                <option value="900">900s — 15 minute cooldown</option>
+                <option value="3600">3600s — 1 hour cooldown</option>
+              </select>
+            </div>
+
+            <div class="vault-field">
+              <label for="run-mode-reason-input">Operator Reason (Optional)</label>
+              <span id="run-mode-reason-hint" class="vault-field-hint">Recorded in MariaDB telemetry and Telegram/Discord operational alerts (max 240 chars).</span>
+              <input
+                type="text"
+                id="run-mode-reason-input"
+                name="reason"
+                class="vault-input"
+                maxlength="240"
+                autocomplete="off"
+                placeholder="e.g. Pre-CPI pause, key rotation, emergency flatten..."
+                aria-describedby="run-mode-reason-hint"
+              />
+            </div>
+          </div>
+        </fieldset>
+
+        <div id="run-mode-impact-warning" class="run-mode-impact-warning" role="status" aria-live="polite"></div>
+        <div id="run-mode-form-status" class="vault-form-status" role="status" aria-live="polite" hidden></div>
+
+        <div class="run-mode-modal-actions">
+          <button
+            type="button"
+            class="close-btn run-mode-cancel-btn"
+            id="btn-cancel-run-mode"
+            command="close"
+            commandfor="run-mode-modal"
+            autofocus
+          >Cancel</button>
+          <button type="submit" class="action-btn cycle-btn" id="btn-apply-run-mode">Apply Run Mode</button>
+        </div>
+      </form>
     </div>
   </dialog>
 

@@ -255,6 +255,48 @@ impl PriorityMonitor {
         self.wake_alert_worker();
     }
 
+    /// Records an intentional `STANDBY` suspension state into `priority_monitor_health_json`
+    /// without marking surveillance degraded or stale (`v2.1` run-mode controller).
+    pub fn record_standby_status(&self) {
+        let ts = now_ms();
+        let should_persist = {
+            let mut hs = self.health_state.lock();
+            hs.consecutive_error_ticks = 0;
+            hs.per_position_error_streaks.clear();
+            hs.unmonitored_alert_active = false;
+            let state_changed =
+                hs.last_persisted_status != "STANDBY" || !hs.last_persisted_breaches.is_empty();
+            let heartbeat_due =
+                ts.saturating_sub(hs.last_persisted_ms) >= HEALTH_PERSIST_HEARTBEAT_MS;
+            let persist = state_changed || heartbeat_due;
+            if persist {
+                hs.last_persisted_status = "STANDBY".to_string();
+                hs.last_persisted_breaches.clear();
+                hs.last_persisted_ms = ts;
+            }
+            persist
+        };
+        if should_persist {
+            let snapshot = PriorityMonitorHealth {
+                last_tick_at_ms: ts,
+                consecutive_error_ticks: 0,
+                last_tick_error_count: 0,
+                failed_symbols: Vec::new(),
+                unfilled_stop_breach_symbols: Vec::new(),
+                unmonitored_alert_active: false,
+                is_stale: false,
+                status: "STANDBY".to_string(),
+            };
+            if let Ok(json_str) = serde_json::to_string(&snapshot) {
+                let _ = self.db.set_config_value(
+                    "priority_monitor_health_json",
+                    &json_str,
+                    Some("Cached 1s PriorityMonitor surveillance health snapshot JSON"),
+                );
+            }
+        }
+    }
+
     /// Records a top-level `run_1s_priority_tick()` failure (e.g., DB unreachable in caller loop) (`R14-H3`).
     pub fn record_tick_failure(&self, err: &AegisError) {
         let ts = now_ms();

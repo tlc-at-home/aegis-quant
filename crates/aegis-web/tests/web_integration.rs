@@ -8,7 +8,8 @@ use aegis_db::{
 use aegis_web::{
     build_router, create_web_router, create_web_router_for_host, health_result_to_response,
     serve_web_with_shutdown, validate_config_key_value, AppState, AuthLoginPayload,
-    ClosePositionRequest, ConfigUpdateRequest, RiskTierUpdateRequest, DEFAULT_CSP_POLICY,
+    ClosePositionRequest, ConfigUpdateRequest, RiskTierUpdateRequest, RunModeUpdateRequest,
+    DEFAULT_CSP_POLICY,
 };
 use axum::{
     body::Body,
@@ -4589,4 +4590,445 @@ async fn test_web_risk_tier_switch_and_config_sync_with_override_preservation() 
             .unwrap();
         assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+#[tokio::test]
+async fn test_v2_1_run_mode_endpoint_guard_and_dashboard_exposure() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db_noauth();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        let sol_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "SOL".to_string(),
+                asset_index: 5,
+                sz_decimals: 2,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: 150.0,
+                mid_price: 150.0,
+                oracle_price: 150.0,
+                funding_rate_hourly: 0.00001,
+                day_volume_usdc: 20_000_000.0,
+                open_interest_usdc: 8_000_000.0,
+                prev_day_price: 145.0,
+                is_core_eligible: true,
+                is_event_eligible: true,
+                is_priority_watched: true,
+            })
+            .unwrap();
+        mgr.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol_id,
+            coin: "SOL",
+            side: OrderSide::Long,
+            entry_price: 145.0,
+            mark_price: 150.0,
+            quantity: 4.0,
+            committed_notional_usdc: 600.0,
+            unrealized_pnl_usdc: 20.0,
+            portfolio_weight: 0.06,
+            protective_stop_px: 138.0,
+            take_profit_px: 170.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now_ms() - 600_000),
+        })
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let app = create_web_router(db.clone(), None);
+
+    // 1. Health & Dashboard report v2.1.0 and ACTIVE run mode initially
+    let res_health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_health.status(), StatusCode::OK);
+    let health_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_health.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(health_json["platform_version"], "2.1.0");
+    assert_eq!(health_json["trading_run_mode"], "ACTIVE");
+
+    // 2. Attempting STANDBY via POST /api/v1/run-mode or /api/v1/config with an OPEN position fails with 400
+    let res_bad_standby = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RunModeUpdateRequest {
+                        run_mode: "STANDBY".to_string(),
+                        reason: Some("No flatten".to_string()),
+                        flatten_open_positions: false,
+                        cooldown_sec: None,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_standby.status(), StatusCode::BAD_REQUEST);
+
+    let res_bad_cfg = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config_key":"trading_run_mode","config_value":"STANDBY"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_bad_cfg.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Switch to DRAIN while preserving OPEN position
+    let res_drain = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RunModeUpdateRequest {
+                        run_mode: "drain".to_string(),
+                        reason: Some("Pre-release wind down".to_string()),
+                        flatten_open_positions: false,
+                        cooldown_sec: None,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_drain.status(), StatusCode::OK);
+    let drain_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_drain.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(drain_json["trading_run_mode"], "DRAIN");
+    assert_eq!(drain_json["remaining_open_positions"], 1);
+
+    // 4. Flatten into STANDBY succeeds and updates dashboard payload cleanly
+    let res_standby = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RunModeUpdateRequest {
+                        run_mode: "STANDBY".to_string(),
+                        reason: Some("API key rotation".to_string()),
+                        flatten_open_positions: true,
+                        cooldown_sec: Some(0),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_standby.status(), StatusCode::OK);
+    let standby_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_standby.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(standby_json["trading_run_mode"], "STANDBY");
+    assert_eq!(standby_json["open_positions_closed"], 1);
+    assert_eq!(standby_json["remaining_open_positions"], 0);
+    assert_eq!(standby_json["fallback_to_halted"], false);
+
+    let res_dash = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_dash.status(), StatusCode::OK);
+    let dash_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_dash.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dash_json["platform_version"], "2.1.0");
+    assert_eq!(dash_json["trading_run_mode"], "STANDBY");
+    assert_eq!(dash_json["trading_run_mode_reason"], "API key rotation");
+    assert_eq!(dash_json["priority_monitor_health"]["status"], "STANDBY");
+    assert_eq!(dash_json["priority_monitor_health"]["is_stale"], false);
+    assert_eq!(dash_json["equity_basis"]["is_stale"], false);
+
+    // 5. Resume ACTIVE cleanly
+    let res_resume = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&RunModeUpdateRequest {
+                        run_mode: "ACTIVE".to_string(),
+                        reason: Some("Resume after rotation".to_string()),
+                        flatten_open_positions: false,
+                        cooldown_sec: None,
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_resume.status(), StatusCode::OK);
+    let resume_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_resume.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resume_json["previous_mode"], "STANDBY");
+    assert_eq!(resume_json["trading_run_mode"], "ACTIVE");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_v2_1_run_mode_auth_csrf_sse_and_config_override_parity() {
+    let db = tokio::task::spawn_blocking(|| {
+        let mgr = new_test_db();
+        mgr.set_config_value("web_auth_enabled", "true", None)
+            .unwrap();
+        mgr.set_config_value("web_api_token", "run-mode-auth-secret", None)
+            .unwrap();
+        mgr.set_config_value("execution_mode", "PAPER", None)
+            .unwrap();
+        let sol_id = mgr
+            .upsert_exchange_asset(&AssetUpsertInput {
+                raw_symbol_or_coin: "SOL".to_string(),
+                asset_index: 2,
+                sz_decimals: 2,
+                tick_size: 0.01,
+                lot_step_size: 0.01,
+                max_leverage: 20.0,
+                mark_price: 155.0,
+                mid_price: 155.0,
+                oracle_price: 155.0,
+                funding_rate_hourly: 0.0,
+                day_volume_usdc: 25_000_000.0,
+                open_interest_usdc: 10_000_000.0,
+                prev_day_price: 150.0,
+                is_core_eligible: true,
+                is_event_eligible: false,
+                is_priority_watched: true,
+            })
+            .unwrap();
+        mgr.sync_open_position_from_exchange_v2(&ExchangeOpenPositionSyncInput {
+            asset_id: sol_id,
+            coin: "SOL",
+            side: OrderSide::Long,
+            entry_price: 150.0,
+            mark_price: 155.0,
+            quantity: 4.0,
+            committed_notional_usdc: 620.0,
+            unrealized_pnl_usdc: 20.0,
+            portfolio_weight: 0.06,
+            protective_stop_px: 140.0,
+            take_profit_px: 180.0,
+            funding_accrued_usdc: 0.0,
+            opened_at_ms: Some(now_ms() - 300_000),
+        })
+        .unwrap();
+        mgr
+    })
+    .await
+    .unwrap();
+
+    let state = AppState::new(db.clone(), None);
+    let app = build_router(state.clone());
+
+    // 1. Unauthenticated POST /api/v1/run-mode returns 401
+    let res_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"run_mode":"PAUSED"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Authenticate and extract HttpOnly session cookie
+    let res_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"token":"run-mode-auth-secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_login.status(), StatusCode::OK);
+    let set_cookie = res_login
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+    // 3. Cross-origin CSRF request on POST /api/v1/run-mode -> 403 Forbidden
+    let res_csrf = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "https://evil.attacker.example")
+                .header(header::COOKIE, &cookie_pair)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"run_mode":"HALTED"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_csrf.status(), StatusCode::FORBIDDEN);
+
+    // 4. Open authenticated SSE /api/v1/stream and trigger same-origin POST /api/v1/run-mode (PAUSED)
+    let sse_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/stream")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_stream = sse_resp.into_body().into_data_stream();
+
+    let first_frame = tokio::time::timeout(Duration::from_secs(4), sse_stream.next())
+        .await
+        .expect("initial SSE frame")
+        .expect("chunk present")
+        .expect("chunk ok");
+    assert!(String::from_utf8_lossy(&first_frame).contains(r#""trading_run_mode":"ACTIVE""#));
+
+    let res_paused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/run-mode")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header(header::COOKIE, &cookie_pair)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"run_mode":"PAUSED","reason":"Auth SSE test"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_paused.status(), StatusCode::OK);
+
+    let mut seen_paused_sse = false;
+    let sse_deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < sse_deadline {
+        if let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(500), sse_stream.next()).await
+        {
+            let txt = String::from_utf8_lossy(&chunk);
+            if txt.contains(r#""trading_run_mode":"PAUSED""#) {
+                seen_paused_sse = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        seen_paused_sse,
+        "SSE stream must broadcast updated trading_run_mode=PAUSED immediately after transition"
+    );
+    drop(sse_stream);
+
+    // 5. POST /api/v1/config setting trading_run_mode=HALTED routes through set_trading_run_mode:
+    // flattens SOL-USDC, latches HALTED, and enqueues CRITICAL EMERGENCY_HALT alert
+    let res_cfg_halt = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config")
+                .header(header::HOST, "127.0.0.1:8000")
+                .header(header::ORIGIN, "http://127.0.0.1:8000")
+                .header(header::COOKIE, &cookie_pair)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"updates":{"trading_run_mode":"HALTED"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_cfg_halt.status(), StatusCode::OK);
+    let cfg_resp_json: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res_cfg_halt.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(cfg_resp_json["updated_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|k| k == "trading_run_mode"));
+    assert!(db.get_assets_held().unwrap().is_empty());
+    assert_eq!(
+        db.load_config().unwrap().trading_run_mode(),
+        aegis_core::TradingRunMode::Halted
+    );
+    assert!(db
+        .list_recent_alerts(10)
+        .unwrap()
+        .iter()
+        .any(|a| a.event_type == "EMERGENCY_HALT" && a.severity == "CRITICAL"));
+
+    state.shutdown();
 }

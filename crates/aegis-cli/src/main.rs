@@ -67,7 +67,7 @@ impl BacktestTimeframe {
 #[command(
     name = "aegis-quant",
     version = PLATFORM_VERSION,
-    about = "Aegis Quant v2.0 Autonomous Web3 DEX Quantitative Trading Platform (Hyperliquid L1 + MariaDB 13.0)"
+    about = "Aegis Quant v2.1 Autonomous Web3 DEX Quantitative Trading Platform (Hyperliquid L1 + MariaDB 13.0)"
 )]
 struct Cli {
     /// Path anchor for .aegis_master_key and optional legacy SQLite migration; MariaDB DSN is configured via AEGIS_DB_URL
@@ -1217,7 +1217,7 @@ async fn wait_for_shutdown_signal() {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received SIGINT/Ctrl-C; shutting down Aegis Quant v2.0 daemon...");
+                tracing::info!("Received SIGINT/Ctrl-C; shutting down Aegis Quant v2.1 daemon...");
             }
             _ = async {
                 if let Some(ref mut s) = sigterm {
@@ -1226,14 +1226,14 @@ async fn wait_for_shutdown_signal() {
                     std::future::pending::<()>().await;
                 }
             } => {
-                tracing::info!("Received SIGTERM; shutting down Aegis Quant v2.0 daemon...");
+                tracing::info!("Received SIGTERM; shutting down Aegis Quant v2.1 daemon...");
             }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Received Ctrl-C; shutting down Aegis Quant v2.0 daemon...");
+        tracing::info!("Received Ctrl-C; shutting down Aegis Quant v2.1 daemon...");
     }
 }
 
@@ -1316,15 +1316,20 @@ async fn run_daemon_subcommand(cli: &Cli, db: DatabaseManager) -> anyhow::Result
     }
 
     let db_count = db.clone();
-    let existing_count = tokio::task::spawn_blocking(move || {
-        db_count
+    let (existing_count, suspends_startup_cutover) = tokio::task::spawn_blocking(move || {
+        let count = db_count
             .list_exchange_assets()
             .map(|v| v.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let suspends = db_count
+            .load_config_or_default()
+            .trading_run_mode()
+            .suspends_background_loops();
+        (count, suspends)
     })
     .await
-    .unwrap_or(0);
-    if existing_count == 0 {
+    .unwrap_or((0, false));
+    if existing_count == 0 && !suspends_startup_cutover {
         let eng = engine.clone();
         let _ = tokio::task::spawn_blocking(move || eng.run_cutover_reconciliation(false)).await;
     }
@@ -1346,7 +1351,7 @@ async fn run_daemon_subcommand(cli: &Cli, db: DatabaseManager) -> anyhow::Result
         "INFO",
         "aegis-cli.daemon",
         &format!(
-            "Aegis Quant v2.0 daemon started (1s Priority / 3s Scanner | web=http://{}:{})",
+            "Aegis Quant v2.1 daemon started (1s Priority / 3s Scanner | web=http://{}:{})",
             bind_host, cli.port
         ),
         None,
@@ -1413,7 +1418,7 @@ async fn run_daemon_subcommand(cli: &Cli, db: DatabaseManager) -> anyhow::Result
         let _ = tel_end.log_sync(
             "INFO",
             "aegis-cli.daemon",
-            "Aegis Quant v2.0 daemon shut down cleanly",
+            "Aegis Quant v2.1 daemon shut down cleanly",
             None,
         );
         tel_end.shutdown_and_flush(Duration::from_secs(5));
@@ -1794,11 +1799,12 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 println!(
-                    "AEGIS QUANT v{} // STATUS: {} ({} | Mode={} | Tier={} {:.2}x)",
+                    "AEGIS QUANT v{} // STATUS: {} ({} | Mode={} | RunMode={} | Tier={} {:.2}x)",
                     PLATFORM_VERSION,
                     health.status.to_uppercase(),
                     health.mariadb_version,
                     health.execution_mode,
+                    health.trading_run_mode,
                     health.risk_tier.to_uppercase(),
                     health.target_leverage_multiplier
                 );
