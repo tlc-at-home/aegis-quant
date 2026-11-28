@@ -2,7 +2,7 @@
 //! `close_epoch_id` tracking, and `EXCHANGE_RECONCILED_FLAT` exit fill resolution
 //! (`aegis-execution::reconcile::ledger`, `R14-H4`, `P1-Acct`).
 
-use crate::http_client::HyperliquidHttpClient;
+use crate::http_client::{HyperliquidHttpClient, RequestOptions};
 use crate::ws_client::WsStateCache;
 use aegis_core::{
     normalize_hyperliquid_symbol, parse_hl_f64, parse_hl_f64_opt, parse_hl_i64_opt,
@@ -860,6 +860,7 @@ pub(crate) fn fetch_windowed_fills_with_ws_unlocked(
     earliest_local_open_ms: Option<i64>,
     ts: i64,
     cfg: &ConfigMap,
+    opts: RequestOptions,
 ) -> Result<BTreeMap<String, Vec<ParsedHlFill>>> {
     if !force_rest {
         if let Some(ws) = ws_cache {
@@ -895,7 +896,8 @@ pub(crate) fn fetch_windowed_fills_with_ws_unlocked(
             .max(0);
     }
 
-    let raw_fills = http.fetch_user_fills_by_time(wallet, start_ms, None, false, cfg)?;
+    let raw_fills =
+        http.fetch_user_fills_by_time_with_options(wallet, start_ms, None, false, cfg, opts)?;
     let mut by_coin = merge_raw_fills_into_cache(cache, &raw_fills, earliest_local_open_ms, ts);
     if let Some(ws) = ws_cache {
         if ws.is_user_ws_connected() {

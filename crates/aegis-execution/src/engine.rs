@@ -4099,6 +4099,7 @@ impl ExecutionEngine {
         let rec_engine = self.clone();
         let rec_rx = rx.clone();
         std::thread::spawn(move || {
+            let mut gap_fill_retry_streak: u32 = 0;
             while !*rec_rx.borrow() {
                 let tick_start = Instant::now();
                 let cfg = match rec_engine.db.load_config() {
@@ -4117,12 +4118,20 @@ impl ExecutionEngine {
                     } else {
                         let _ = rec_engine.record_portfolio_snapshot(None, None);
                     }
+                    if rec_engine.ws_cache.needs_rest_gap_reconcile() {
+                        gap_fill_retry_streak = gap_fill_retry_streak.saturating_add(1);
+                    } else {
+                        gap_fill_retry_streak = 0;
+                    }
+                } else {
+                    gap_fill_retry_streak = 0;
                 }
+                let gap_wake_ms = compute_gap_fill_wake_ms(gap_fill_retry_streak, reconcile_ms);
                 let elapsed_ms = tick_start.elapsed().as_millis() as u64;
                 let rem_ms = reconcile_ms.saturating_sub(elapsed_ms).max(250);
                 let mut slept = 0u64;
                 while slept < rem_ms && !*rec_rx.borrow() {
-                    if rec_engine.ws_cache.needs_rest_gap_reconcile() && slept >= 1000 {
+                    if rec_engine.ws_cache.needs_rest_gap_reconcile() && slept >= gap_wake_ms {
                         break;
                     }
                     let chunk = (rem_ms - slept).min(250);
@@ -4148,6 +4157,16 @@ impl ExecutionEngine {
         });
 
         tx
+    }
+}
+
+/// Computes the early-wake backoff (`1s -> 2s -> 4s -> 8s -> reconcile_ms`) for the 15s sync
+/// loop when REST gap-fill fails repeatedly after WebSocket reconnects.
+fn compute_gap_fill_wake_ms(gap_fill_retry_streak: u32, reconcile_ms: u64) -> u64 {
+    if gap_fill_retry_streak == 0 {
+        1000
+    } else {
+        (1000u64.saturating_mul(1u64 << gap_fill_retry_streak.min(4))).min(reconcile_ms)
     }
 }
 
@@ -4933,5 +4952,15 @@ mod tests {
         let c12 = ctxs.get(&12).unwrap();
         assert!((c12.current_weight - (-0.12)).abs() < 1e-9);
         assert!((c12.entry_r0_pct - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_gap_fill_wake_ms_exponential_backoff() {
+        assert_eq!(compute_gap_fill_wake_ms(0, 15_000), 1_000);
+        assert_eq!(compute_gap_fill_wake_ms(1, 15_000), 2_000);
+        assert_eq!(compute_gap_fill_wake_ms(2, 15_000), 4_000);
+        assert_eq!(compute_gap_fill_wake_ms(3, 15_000), 8_000);
+        assert_eq!(compute_gap_fill_wake_ms(4, 15_000), 15_000);
+        assert_eq!(compute_gap_fill_wake_ms(10, 15_000), 15_000);
     }
 }

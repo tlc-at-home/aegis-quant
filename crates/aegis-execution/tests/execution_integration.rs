@@ -5655,7 +5655,7 @@ fn test_wave3_ws_ssrf_url_validation_and_2conn_full_channel_ingestion() {
     .unwrap();
 
     assert!(ws_srv.wait_for_connections(2, Duration::from_secs(3)));
-    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(12, Duration::from_secs(3)));
 
     // Verify all expected subscriptions were sent across Market + User WS
     let subs = ws_srv.received_json();
@@ -5668,6 +5668,8 @@ fn test_wave3_ws_ssrf_url_validation_and_2conn_full_channel_ingestion() {
         "userFills",
         "userFundings",
         "userEvents",
+        "clearinghouseState",
+        "openOrders",
         "webData3",
     ] {
         assert!(
@@ -5912,7 +5914,7 @@ fn test_wave3_ws_heartbeat_reconnect_paced_resubscribe_gap_fill_and_rest_fallbac
     .unwrap();
 
     assert!(ws_srv.wait_for_connections(2, Duration::from_secs(3)));
-    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(16, Duration::from_secs(3))); // 9 market + 7 user subs
 
     // Expect periodic ping -> pong
     let ping_deadline = Instant::now() + Duration::from_secs(2);
@@ -6011,7 +6013,7 @@ fn test_wave3_ws_heartbeat_reconnect_paced_resubscribe_gap_fill_and_rest_fallbac
     let conns_before = ws_srv.connection_count();
     ws_srv.disconnect_all();
     assert!(ws_srv.wait_for_connections(conns_before + 2, Duration::from_secs(3)));
-    assert!(ws_srv.wait_for_received(10, Duration::from_secs(3)));
+    assert!(ws_srv.wait_for_received(16, Duration::from_secs(3))); // 9 market + 7 user subs
     assert!(engine.ws_cache.needs_rest_gap_reconcile());
     engine.reconciler.sync_db_with_hyperliquid().unwrap();
     assert!(!engine.ws_cache.needs_rest_gap_reconcile());
